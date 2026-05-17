@@ -140,6 +140,56 @@ impl QnxRunner {
         }
         None
     }
+
+    /// Find every live qvm process started against this VM's qvm config.
+    ///
+    /// `Command::new("qvm").arg("@<config>")` → argv shape `qvm @<config>`.
+    /// Match against the config path so we only slay qvms whose config we
+    /// own — other VMs' qvms stay untouched.
+    fn find_qvm_pids(qvm_config: &Path) -> Vec<u32> {
+        let needle = format!("@{}", qvm_config.display());
+        let mut pids = Vec::new();
+        let Ok(out) = std::process::Command::new("pidin").args(["-F", "%p %a"]).output() else {
+            return pids;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            if !line.contains(&needle) { continue; }
+            // Confirm argv[0] is `qvm` (not some other process that
+            // happens to reference the config path in its argv).
+            let mut tokens = line.split_whitespace();
+            let Some(pid_tok) = tokens.next() else { continue };
+            let Some(cmd_tok) = tokens.next() else { continue };
+            let is_qvm = cmd_tok == "qvm"
+                || cmd_tok.rsplit('/').next() == Some("qvm");
+            if !is_qvm { continue; }
+            if let Ok(pid) = pid_tok.parse::<u32>() {
+                pids.push(pid);
+            }
+        }
+        pids
+    }
+
+    /// SIGTERM-then-SIGKILL every qvm running against this VM's config.
+    ///
+    /// Defense in depth at start() for orphan qvms that the tracked
+    /// `qvm_child` handle can't reach — e.g. a previous supernova
+    /// lifetime spawned qvm, then supernova got slayed; start-managed.sh
+    /// kicks off the next supernova with a global `slay qvm` but that's
+    /// best-effort with no exit-wait, so the new vm-service can race a
+    /// dying qvm and end up with a fresh VmManager (qvm_child=None)
+    /// while an orphan qvm still holds /dev/qvm/<sys>, vdevpeer
+    /// endpoints, and qvm-shmem slots. Symptom: VMs keep serving the
+    /// OLD rootfs from page cache after an OTA flash — only a device
+    /// reboot dislodges the orphan.
+    fn slay_qvm_for_vm(qvm_config: &Path) {
+        for pid in Self::find_qvm_pids(qvm_config) {
+            tracing::info!(qvm_config = %qvm_config.display(), pid, "killing stale qvm");
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            std::thread::sleep(Duration::from_millis(100));
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+        }
+    }
 }
 
 /// Poll for a device node to appear, with timeout.
@@ -176,6 +226,15 @@ impl VmRunner for QnxRunner {
                 qvm_config.display()
             )));
         }
+
+        // Defense in depth — kill any orphan qvm for THIS VM's config
+        // left from a prior supernova lifetime that didn't reap qvm
+        // cleanly (start-managed.sh's between-supernova `slay qvm` is
+        // best-effort with no exit-wait). Must run BEFORE the loopback
+        // slay so the orphan qvm releases its disk fd before its
+        // devb-loopback is taken out from under it.
+        Self::slay_qvm_for_vm(&qvm_config);
+        std::thread::sleep(Duration::from_millis(100));
 
         // Defense in depth — kill any devb-loopback for THIS VM (rootfs +
         // extras) left over from a stop path that didn't go through
