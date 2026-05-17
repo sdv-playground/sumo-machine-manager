@@ -258,11 +258,11 @@ async fn main() {
                 }
             }
         }
-        // Wire HSM provider into the HSM backend
-        if set == BankSet::Hsm {
-            if let Some(ref provider) = hsm_provider {
-                backend = backend.with_hsm_provider(provider.clone());
-            }
+        // Every bank set needs the HSM provider, not just HSM —
+        // ivd_sign_staged_bank seals each staged bank with the
+        // `ivd-signing` key for verified launch.
+        if let Some(ref provider) = hsm_provider {
+            backend = backend.with_hsm_provider(provider.clone());
         }
         // Wire IFS activator into the boot backend
         if set == BankSet::HostOs {

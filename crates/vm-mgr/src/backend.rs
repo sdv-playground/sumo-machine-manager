@@ -465,30 +465,34 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// sig together; trial flip just exposes the staged bank with
     /// its existing sig intact.
     ///
-    /// `ivd-signing` is generated locally by the HSM at first
-    /// provisioning (see `SimHsm::generate_missing_local_keys`), so
-    /// any provisioned HSM has it. If the sign fails here, that's
-    /// either an unprovisioned HSM or a corrupted keystore — in
-    /// both cases the OTA must fail rather than ship an unsigned
-    /// bank. The only "skip" paths are the test/dev cases where
-    /// either no HSM is attached at all or the component has no
-    /// per-bank images dir.
+    /// Contract: signing is REQUIRED for every flash that produces a
+    /// real bank dir with real payloads. Three skip paths and no
+    /// others:
+    ///
+    /// 1. No `images_dir` (in-memory test) — backend has no place to
+    ///    put files; tests assert via NV state.
+    /// 2. Bank dir missing (pre-streaming code path) — caller hasn't
+    ///    staged anything yet, nothing to sign.
+    /// 3. Bank dir is payload-empty (HSM single-bank, where the
+    ///    keystore lives at `keystore_path` not in the bank dir, and
+    ///    attestation rides on the provisioning envelope chain).
+    ///
+    /// Pre-provisioning exception: if the HSM is reachable but
+    /// `is_provisioned()` is false, the `ivd-signing` key doesn't
+    /// exist yet — log a warning and skip. Banks produced in this
+    /// state aren't boot-eligible once verified launch is wired in;
+    /// the next flash post-provision will land sigs as expected.
+    ///
+    /// Any other condition (no HSM provider when payloads are
+    /// present, signing failure, mutex poisoned) returns an error
+    /// rather than silently shipping an unsigned bank.
     fn ivd_sign_staged_bank(&self, target: Bank) -> BackendResult<()> {
-        let Some(ref hsm_arc) = self.hsm_provider else {
-            tracing::debug!("ivd sign: no hsm provider attached; skipping");
-            return Ok(());
-        };
+        // (1) Test-mode and legitimate no-op skips first — these are
+        //     independent of HSM state.
         let Some(bank_dir) = self.target_bank_dir(target) else {
             tracing::debug!("ivd sign: no images_dir; skipping (in-memory test mode)");
             return Ok(());
         };
-        // Skip components whose content doesn't live under
-        // `images_dir/<set>/<bank>` (e.g. HSM single-bank: the
-        // keystore is at `keystore_path`, the bank dir is empty
-        // because `prepare_target_bank_dir` created it but no
-        // payload lands here). Signing a zero-file manifest is
-        // legal but useless; the HSM has its own out-of-band
-        // attestation via the provisioning envelope chain.
         if !bank_dir.exists() {
             tracing::debug!(
                 bank_dir = %bank_dir.display(),
@@ -499,19 +503,50 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         if bank_dir_is_payload_empty(&bank_dir) {
             tracing::debug!(
                 bank_dir = %bank_dir.display(),
-                "ivd sign: bank dir has no payload files; skipping (out-of-band attestation)",
+                "ivd sign: bank dir has no payload files; skipping (HSM bank / out-of-band attestation)",
             );
             return Ok(());
         }
+
         let bank_id = format!(
             "{}/{}",
             &self.bank_spec.dir_name,
             bank_dir_name(target),
         );
 
+        // (2) Past here we have a real bank with real payloads → HSM
+        //     attachment is required. A missing provider means the
+        //     wiring is broken (component-factory / sovd_main should
+        //     have attached one); fail loud rather than ship unsigned.
+        let hsm_arc = self.hsm_provider.as_ref().ok_or_else(|| {
+            BackendError::Internal(format!(
+                "ivd sign {bank_id}: no HSM provider attached — wiring bug"
+            ))
+        })?;
         let hsm = hsm_arc.lock().map_err(|_| {
             BackendError::Internal("ivd sign: hsm mutex poisoned".into())
         })?;
+
+        // (3) Pre-provisioning exception: the HSM is reachable but the
+        //     `ivd-signing` key doesn't exist yet. Skip with a warning;
+        //     the bank is intentionally un-sealed until the next flash
+        //     after HSM provisioning.
+        match hsm.is_provisioned() {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    bank_id = %bank_id,
+                    "ivd sign: HSM not yet provisioned — skipping (bank is not boot-eligible until re-flashed post-provision)",
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(BackendError::Internal(format!(
+                    "ivd sign {bank_id}: hsm provisioning probe failed: {e}"
+                )));
+            }
+        }
+
         let _manifest = hsm::ivd::sign_bank(&*hsm, &bank_dir, &bank_id)
             .map_err(|e| BackendError::Internal(format!("ivd sign {bank_id}: {e}")))?;
         tracing::info!(

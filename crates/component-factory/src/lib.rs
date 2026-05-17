@@ -250,10 +250,11 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             )
             .with_bank_spec(bank_spec.clone());
 
-            if bank_set == BankSet::Hsm {
-                if let Some(ref provider) = deps.hsm_provider {
-                    backend = backend.with_hsm_provider(provider.clone());
-                }
+            // Every bank set needs the HSM provider, not just HSM —
+            // ivd_sign_staged_bank uses the `ivd-signing` key to seal
+            // each staged bank dir for verified launch.
+            if let Some(ref provider) = deps.hsm_provider {
+                backend = backend.with_hsm_provider(provider.clone());
             }
 
             if bank_set == BankSet::HostOs {
