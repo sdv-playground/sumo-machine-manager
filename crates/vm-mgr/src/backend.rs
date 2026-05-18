@@ -1085,48 +1085,39 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 "no digest for component {comp_idx}"
             )))?;
 
-        let uri = manifest.uri(comp_idx).unwrap_or("#firmware");
+        let uri = manifest.uri(comp_idx).unwrap_or("#firmware").to_string();
 
-        // Target bank dir holds both the final file AND the compressed-input
-        // scratch (so everything lives on the destination partition). Bank
-        // dir was cleared at flash-session start; if process_raw_payload
-        // crashes mid-flight the next session's prepare_target_bank_dir
-        // wipes any survivor.
         let target_bank = self.determine_target_bank()?;
         let bank_dir = self.target_bank_dir(target_bank)
             .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
         std::fs::create_dir_all(&bank_dir)
             .map_err(|e| BackendError::Internal(format!("create {}: {e}", bank_dir.display())))?;
 
-        let raw_path = bank_dir.join(format!("upload-{comp_idx}.tmp"));
-        let (size, _upload_hash) = crate::streaming::save_raw_payload(stream, &raw_path).await?;
-
-        let target_name = crate::bank_spec::payload_target_name(self.bank_spec.layout, uri);
+        let target_name = crate::bank_spec::payload_target_name(self.bank_spec.layout, &uri);
         let output_path = bank_dir.join(&target_name);
 
         tracing::info!(
             component = comp_idx,
             uri = %uri,
-            size,
             output = %output_path.display(),
             "processing payload {}/{}",
             comp_idx + 1, total,
         );
 
-        // Decrypt → decompress → verify → write
+        // Stream straight through: network → decrypt → decompress →
+        // hash → final file. No on-disk ciphertext scratch — flash I/O
+        // is the dominant cost on the device and writing the payload
+        // twice (once as .tmp, once unpacked) doubles it for nothing.
         let process_started = std::time::Instant::now();
-        let (image_size, image_hash) = crate::streaming::process_raw_payload(
-            &raw_path,
-            &manifest_bytes,
+        let (inbound, image_size, image_hash) = crate::streaming::process_payload_stream(
+            stream,
+            manifest_bytes.clone(),
             comp_idx,
-            key_unwrap.as_deref(),
-            &expected_digest,
-            &output_path,
-        ).map_err(|e| BackendError::Internal(format!("payload processing: {e}")))?;
+            key_unwrap.clone(),
+            expected_digest.clone(),
+            output_path.clone(),
+        ).await?;
         let process_elapsed = process_started.elapsed();
-
-        // Clean up temp upload
-        let _ = std::fs::remove_file(&raw_path);
 
         // Record the freshly-hashed file for `ivd_sign_staged_bank` so
         // it doesn't need to re-walk + re-hash this payload from disk
@@ -1142,7 +1133,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             }
         }
 
-        let compressed_mb = size as f64 / 1_048_576.0;
+        let compressed_mb = inbound as f64 / 1_048_576.0;
         let uncompressed_mb = image_size as f64 / 1_048_576.0;
         let secs = process_elapsed.as_secs_f64();
         // Throughput is uncompressed bytes per second — the sustained

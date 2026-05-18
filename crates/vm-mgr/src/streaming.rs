@@ -5,7 +5,8 @@
 //! decrypt → decompress → hash → write-to-disk without buffering the full payload.
 
 use std::io::{self, Read, Write as IoWrite};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -1012,6 +1013,109 @@ pub fn process_raw_payload(
             process_plain(prefixed, expected_digest, Some(output_path))
         }
     }
+}
+
+/// Stream a payload from the network straight through decrypt →
+/// decompress → hash → write to disk in a single pass.
+///
+/// Replaces the older `save_raw_payload` (ciphertext → .tmp) followed
+/// by `process_raw_payload` (.tmp → final) pair. That pattern wrote the
+/// payload to flash twice — once as the encrypted/compressed tmp and
+/// once as the unpacked final file — doubling the I/O cost on the
+/// device's flash storage for no benefit.
+///
+/// Returns `(inbound_bytes, image_size, image_sha256)`:
+/// - `inbound_bytes`: total ciphertext + zstd bytes read from the
+///   stream (i.e. the "on-wire" size — useful for compression-ratio
+///   logging).
+/// - `image_size`: plaintext + decompressed bytes written to disk.
+/// - `image_sha256`: digest of the written bytes (matches the
+///   manifest's `image_digest` for this component).
+pub async fn process_payload_stream(
+    stream: PackageStream,
+    manifest_bytes: Vec<u8>,
+    component_index: usize,
+    key_unwrap: Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>,
+    expected_digest: Vec<u8>,
+    output_path: PathBuf,
+) -> Result<(u64, usize, [u8; 32]), BackendError> {
+    let envelope = sumo_codec::decode::decode_envelope(&manifest_bytes)
+        .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
+    let has_encryption = sumo_onboard::manifest::Manifest { envelope }
+        .encryption_info(component_index)
+        .is_some();
+
+    let reader = StreamReader::new(
+        stream.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::Other, e))),
+    );
+    tokio::pin!(reader);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+
+    let process_handle = tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_payload_sync(
+                rx,
+                &manifest_bytes,
+                has_encryption,
+                component_index,
+                &[],
+                key_unwrap.as_deref(),
+                &expected_digest,
+                Some(&output_path),
+            )
+        }))
+        .unwrap_or_else(|panic| {
+            let msg = panic
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(format!("panic in payload processing: {msg}"))
+        })
+    });
+
+    let mut inbound: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut send_failed = false;
+
+    loop {
+        let n = reader.read(&mut buf).await.map_err(|e| {
+            BackendError::Internal(format!("stream read error: {e}"))
+        })?;
+        if n == 0 {
+            break;
+        }
+        inbound += n as u64;
+        if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+            send_failed = true;
+            break;
+        }
+    }
+    drop(tx);
+
+    let (image_size, image_hash) = match process_handle.await {
+        Ok(Ok(result)) => {
+            if send_failed {
+                return Err(BackendError::Internal(
+                    "payload stream ended early".into(),
+                ));
+            }
+            result
+        }
+        Ok(Err(e)) => {
+            return Err(BackendError::Internal(format!(
+                "payload processing failed: {e}"
+            )));
+        }
+        Err(e) => {
+            return Err(BackendError::Internal(format!(
+                "payload processing panicked: {e}"
+            )));
+        }
+    };
+
+    Ok((inbound, image_size, image_hash))
 }
 
 /// Stream a raw payload from an async stream to disk (no CBOR, no processing).
