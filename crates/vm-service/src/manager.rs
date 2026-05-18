@@ -171,6 +171,10 @@ impl From<RunnerError> for ManagerError {
     }
 }
 
+// `with_clock` and `with_pre_launch_verify` are called by supernova-mm
+// at startup; vm-service's own binary doesn't invoke them, so its
+// dead-code pass flags them. Suppress here rather than on each method.
+#[allow(dead_code)]
 impl VmManager {
     /// Construct a manager from config alone. Builds the configured
     /// `DeviceTransport` internally (via `transport_setup::build_device_transport`)

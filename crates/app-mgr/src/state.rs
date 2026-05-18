@@ -65,6 +65,13 @@ pub fn flip_current_symlink(base_path: &Path, bank: Bank) -> MachineResult<()> {
 }
 
 /// Ensure the base_path directory structure exists (A/, B/, current→A).
+///
+/// Called by integration tests and by manual bootstrap on a fresh
+/// machine; not yet wired into supernova's normal startup path,
+/// which currently relies on the bank dirs existing from device
+/// imaging. Kept as part of the public surface so the bootstrap
+/// route stays accessible.
+#[allow(dead_code)]
 pub fn ensure_layout(base_path: &Path) -> MachineResult<()> {
     fs::create_dir_all(base_path.join("A"))
         .map_err(|e| MachineError::Storage(format!("mkdir A: {e}")))?;

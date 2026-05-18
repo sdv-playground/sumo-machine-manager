@@ -41,8 +41,13 @@ pub struct VmServiceConfig {
 ///
 /// One transport per vm-service instance. All VMs share it; channels are
 /// keyed by `(vm, device, channel)` so namespace collisions can't happen.
+//
+// dead_code: `QvmShmem` is constructed by supernova-mm (which links
+// libhyp), not by vm-service's own build path. The vm-service binary's
+// dead-code pass doesn't see those fields read; supernova-mm does.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[allow(dead_code)]
 pub enum DeviceTransportConfig {
     /// Files at `<base_dir>/ivshmem-{vm}-{device}-{channel}`. Each is
     /// `mmap`'d on the host by `IvshmemTransport` and exposed to the guest

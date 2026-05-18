@@ -15,7 +15,10 @@ use crate::ifs::IfsActivator;
 
 pub struct HostOsComponent<D: BlockDevice> {
     nv: Arc<Mutex<NvStore<D>>>,
-    ifs_activator: Arc<dyn IfsActivator>,
+    // Kept as an owned Arc so the activator outlives any in-flight
+    // host-os work that vm-mgr's backend drives via its own copy.
+    // HostOsComponent itself doesn't call into it (yet).
+    _ifs_activator: Arc<dyn IfsActivator>,
     capabilities: Capabilities,
 }
 
@@ -23,7 +26,7 @@ impl<D: BlockDevice + Send + 'static> HostOsComponent<D> {
     pub fn new(nv: Arc<Mutex<NvStore<D>>>, ifs_activator: Arc<dyn IfsActivator>) -> Self {
         Self {
             nv,
-            ifs_activator,
+            _ifs_activator: ifs_activator,
             capabilities: Capabilities {
                 did_store: true,
                 flash: Some(FlashCaps {
