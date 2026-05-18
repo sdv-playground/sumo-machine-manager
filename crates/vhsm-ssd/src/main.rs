@@ -42,6 +42,7 @@ fn main() {
     let mut policy_path: Option<PathBuf> = None;
     let mut allow_ip_args: Vec<(std::net::IpAddr, String)> = Vec::new();
     let mut persist_dir: Option<PathBuf> = None;
+    let mut extension_handles: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -65,6 +66,10 @@ fn main() {
                 persist_dir = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--extension-handles" if i + 1 < args.len() => {
+                extension_handles = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
             "--allow-ip" if i + 1 < args.len() => {
                 let raw = &args[i + 1];
                 let (ip_str, vm_id) = raw.split_once('=').unwrap_or_else(|| {
@@ -86,6 +91,7 @@ fn main() {
                 eprintln!("  --policy <file>             IP allow-list file (production)");
                 eprintln!("  --allow-ip <ip>=<vm_id>     Grant all permissions to (ip, vm_id) (dev/test, repeatable)");
                 eprintln!("  --persist-dir <dir>         Persist dynamic handles to this directory");
+                eprintln!("  --extension-handles <file>  TOML manifest of project well-known handles (0x0080..0x00FF)");
                 std::process::exit(0);
             }
             other => {
@@ -153,6 +159,29 @@ fn main() {
 
     // Initialize handle table with well-known handles from keystore
     let mut table = init_handle_table(&*crypto);
+
+    // Apply project-extension manifest (0x0080..0x00FF band), if one
+    // was supplied. Sumo doesn't know what's in there; the daemon's
+    // role is just to register the entries as well-known so guests can
+    // address them. Missing keystore keys are skipped (same policy as
+    // the core init_handle_table).
+    if let Some(ref path) = extension_handles {
+        match vhsm_ssd::extension_manifest::load_from_file(path) {
+            Ok(entries) => {
+                let n = vhsm_ssd::extension_manifest::apply(&mut table, &entries, &*crypto);
+                tracing::info!(
+                    path = %path.display(),
+                    declared = entries.len(),
+                    registered = n,
+                    "applied extension-handles manifest"
+                );
+            }
+            Err(e) => {
+                eprintln!("error: failed to load --extension-handles {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Set up secstore for dynamic handle persistence (optional)
     let store: Option<Arc<Secstore<LinuxSimEncryptor, FileBackend>>> =

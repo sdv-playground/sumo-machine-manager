@@ -12,6 +12,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["verifying", "der"] }
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 
 [dev-dependencies]
 p256 = { version = "0.13", features = ["ecdsa"] }

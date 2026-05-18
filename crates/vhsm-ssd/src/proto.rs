@@ -139,6 +139,14 @@ pub const PERM_GET_CERT: u32 = 1 << 9;
 pub const PERM_KEY_GENERATE: u32 = 1 << 10;
 
 // ---- Well-known handles -------------------------------------------------
+//
+// Layout:
+//   0x0000              HANDLE_INVALID
+//   0x0001 .. 0x007F    sumo core well-known (this file owns numbering)
+//   0x0080 .. 0x00FF    project extensions (downstream owns numbering; see
+//                       guest-vm-spec/crates/vhsm-handles-ext and the C
+//                       mirror at guest-vm-spec/shared/include/vhsm_proto.h)
+//   0x0100 ..           dynamic, allocated by handle_table at runtime
 
 pub const HANDLE_INVALID: u32 = 0x0000;
 pub const HANDLE_SW_AUTHORITY: u32 = 0x0002;
@@ -147,10 +155,35 @@ pub const HANDLE_ECU_SIGNING: u32 = 0x0004;
 pub const HANDLE_KEY_AUTHORITY: u32 = 0x0005;
 pub const HANDLE_JWT_SIGNING: u32 = 0x0006;
 pub const HANDLE_STORAGE: u32 = 0x0007;
+
+/// Lower boundary of the project-extension well-known range. Sumo owns
+/// the slots strictly below this; downstream projects own
+/// `HANDLE_PROJECT_BASE..HANDLE_DYNAMIC_BASE` for their own well-known
+/// handles. Reserved here so sumo can renumber its core set without
+/// stepping on downstream allocations.
+pub const HANDLE_PROJECT_BASE: u32 = 0x0080;
+
 pub const HANDLE_DYNAMIC_BASE: u32 = 0x0100;
 
+/// Any reserved well-known handle (sumo core OR project extension).
+/// Used by `HandleTable::register_well_known` to reject dynamic-range
+/// inputs.
 pub fn handle_is_well_known(h: u32) -> bool {
     h >= 0x0001 && h < HANDLE_DYNAMIC_BASE
+}
+
+/// True if `h` is a sumo-owned well-known handle (strictly below the
+/// project extension range).
+pub fn handle_is_sumo_core(h: u32) -> bool {
+    h >= 0x0001 && h < HANDLE_PROJECT_BASE
+}
+
+/// True if `h` is in the project-extension range. Sumo does not know
+/// the semantics of these handles — they are wired up by downstream
+/// (e.g. guest-vm-spec's `vhsm-handles-ext`) and registered via the
+/// same `register_well_known` API as the core set.
+pub fn handle_is_project(h: u32) -> bool {
+    h >= HANDLE_PROJECT_BASE && h < HANDLE_DYNAMIC_BASE
 }
 
 // ---- Wire format structures ---------------------------------------------
@@ -301,6 +334,37 @@ mod tests {
         assert!(!handle_is_well_known(HANDLE_DYNAMIC_BASE));
         assert!(!handle_is_well_known(HANDLE_DYNAMIC_BASE + 1));
         assert!(!handle_is_well_known(0xFFFF_FFFF));
+    }
+
+    #[test]
+    fn sumo_core_does_not_overlap_project_range() {
+        for &h in &[
+            HANDLE_SW_AUTHORITY,
+            HANDLE_DEVICE_DECRYPT,
+            HANDLE_ECU_SIGNING,
+            HANDLE_KEY_AUTHORITY,
+            HANDLE_JWT_SIGNING,
+            HANDLE_STORAGE,
+        ] {
+            assert!(handle_is_sumo_core(h), "0x{h:04x} should be sumo-core");
+            assert!(!handle_is_project(h), "0x{h:04x} must not be in project range");
+        }
+    }
+
+    #[test]
+    fn project_range_predicates_at_boundaries() {
+        // Just below the project range
+        assert!(handle_is_sumo_core(HANDLE_PROJECT_BASE - 1));
+        assert!(!handle_is_project(HANDLE_PROJECT_BASE - 1));
+        // First project slot
+        assert!(!handle_is_sumo_core(HANDLE_PROJECT_BASE));
+        assert!(handle_is_project(HANDLE_PROJECT_BASE));
+        assert!(handle_is_well_known(HANDLE_PROJECT_BASE));
+        // Last project slot
+        assert!(handle_is_project(HANDLE_DYNAMIC_BASE - 1));
+        // Dynamic range — not well-known, not project
+        assert!(!handle_is_project(HANDLE_DYNAMIC_BASE));
+        assert!(!handle_is_sumo_core(HANDLE_DYNAMIC_BASE));
     }
 
     #[test]

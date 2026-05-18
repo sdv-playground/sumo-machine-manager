@@ -27,3 +27,4 @@ pub mod handle_table;
 pub mod policy;
 pub mod handler;
 pub mod transport;
+pub mod extension_manifest;
