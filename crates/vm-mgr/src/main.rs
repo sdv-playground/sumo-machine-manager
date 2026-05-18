@@ -336,6 +336,8 @@ fn main() {
                     programming_date: meta.programming_date,
                     tester_serial: meta.tester_serial,
                     min_security_ver: 0,
+                    // Factory baseline; first OTA install ratchets to 1.
+                    gen: 0,
                 };
                 // Write directly to bank A (factory state, no trial mode)
                 nv.write_fw_meta(set, Bank::A, &mut fw_meta).unwrap();

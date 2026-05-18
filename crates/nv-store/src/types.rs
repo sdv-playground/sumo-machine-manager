@@ -136,6 +136,17 @@ fn get_u32_le(buf: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
 }
 
+fn put_u64_le(buf: &mut [u8], offset: usize, val: u64) {
+    buf[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
+}
+
+fn get_u64_le(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[offset],     buf[offset + 1], buf[offset + 2], buf[offset + 3],
+        buf[offset + 4], buf[offset + 5], buf[offset + 6], buf[offset + 7],
+    ])
+}
+
 fn put_u16_le(buf: &mut [u8], offset: usize, val: u16) {
     buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
 }
@@ -369,8 +380,20 @@ impl NvRecord for NvFactory {
 /// [276..284] programming_date (8)      F199
 /// [284..316] tester_serial (32)        F198
 /// [316..320] min_security_ver
-/// [320..324] padding
+/// [320..328] gen (u64, install-time generation counter)
+/// [328..332] padding
 /// ```
+///
+/// `gen` is the IVD anti-rollback counter:
+/// - At install time the caller writes `nv.committed_gen + 1` here
+///   AND embeds the same value in the bank's signed IVD manifest.
+/// - At commit time the previously-trial bank becomes the new
+///   committed bank; its stored `gen` is now the implicit
+///   `committed_gen` for the bank set (read it via
+///   `nv.read_fw_meta(set, active_committed_bank).gen`).
+/// - The launch-time IVD verifier cross-checks
+///   `manifest.gen == this_bank.gen` (slot binding) and
+///   `manifest.gen >= committed_gen` (rollback floor).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NvFwMeta {
     pub write_seq: u32,
@@ -388,6 +411,7 @@ pub struct NvFwMeta {
     pub programming_date: [u8; 8],
     pub tester_serial: [u8; 32],
     pub min_security_ver: u32,
+    pub gen: u64,
 }
 
 impl Default for NvFwMeta {
@@ -408,6 +432,7 @@ impl Default for NvFwMeta {
             programming_date: [0; 8],
             tester_serial: [0; 32],
             min_security_ver: 0,
+            gen: 0,
         }
     }
 }
@@ -416,7 +441,7 @@ impl NvRecord for NvFwMeta {
     const MAGIC: u32 = MAGIC_FW_META;
 
     fn size() -> usize {
-        324
+        332
     }
 
     fn write_seq(&self) -> u32 {
@@ -444,6 +469,7 @@ impl NvRecord for NvFwMeta {
         put_bytes(buf, 276, &self.programming_date);
         put_bytes(buf, 284, &self.tester_serial);
         put_u32_le(buf, 316, self.min_security_ver);
+        put_u64_le(buf, 320, self.gen);
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
@@ -466,6 +492,7 @@ impl NvRecord for NvFwMeta {
             programming_date: get_bytes(buf, 276),
             tester_serial: get_bytes(buf, 284),
             min_security_ver: get_u32_le(buf, 316),
+            gen: get_u64_le(buf, 320),
         })
     }
 }

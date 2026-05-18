@@ -65,30 +65,44 @@ impl QnxRunner {
         format!("/dev/{}0", Self::extra_prefix(vm_name, role))
     }
 
+    /// Walk `/proc/<pid>/cmdline` for every live process and return
+    /// `(pid, argv_string)` pairs. argv tokens are NUL-separated on
+    /// disk; we substitute spaces so callers can `.contains()`-match.
+    ///
+    /// QNX 7.1's `pidin -F "%p %a"` does NOT include argv — `%a`
+    /// surfaces some other field (priority-ish). procfs is the only
+    /// portable way to read argv on this platform.
+    fn enumerate_pids_with_cmdline() -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(pid) = name.parse::<u32>() else { continue };
+            let cmdline_path = format!("/proc/{pid}/cmdline");
+            let Ok(bytes) = std::fs::read(&cmdline_path) else { continue };
+            if bytes.is_empty() { continue; }
+            let argv = String::from_utf8_lossy(&bytes).replace('\0', " ");
+            out.push((pid, argv));
+        }
+        out
+    }
+
     /// Find every live devb-loopback daemon associated with this VM.
     ///
     /// `Command::spawn`'s child pid points at the (long-dead) fork parent
     /// because devb-loopback daemonizes. The actual driver shows up with
-    /// the same argv vector, so scan `pidin` for processes whose prefix
-    /// arg ends with `-{vm_name}` (matches both `qvmdisk-{vm}` and
-    /// `qvm-{role}-{vm}`).
+    /// the same argv vector. Match argv on the `prefix=…-{vm_name},fd=`
+    /// substring so we hit both `qvmdisk-{vm}` and `qvm-{role}-{vm}`.
     fn find_loopback_pids(vm_name: &str) -> Vec<u32> {
         let needle = format!("-{vm_name},fd=");
-        let mut pids = Vec::new();
-        let Ok(out) = std::process::Command::new("pidin").args(["-F", "%p %a"]).output() else {
-            return pids;
-        };
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        for line in stdout.lines() {
-            if line.contains("devb-loopback") && line.contains(&needle) {
-                if let Some(pid_tok) = line.split_whitespace().next() {
-                    if let Ok(pid) = pid_tok.parse::<u32>() {
-                        pids.push(pid);
-                    }
-                }
-            }
-        }
-        pids
+        Self::enumerate_pids_with_cmdline()
+            .into_iter()
+            .filter(|(_, argv)| argv.contains("devb-loopback") && argv.contains(&needle))
+            .map(|(pid, _)| pid)
+            .collect()
     }
 
     /// SIGTERM-then-SIGKILL every devb-loopback for this VM. Used as
@@ -127,18 +141,10 @@ impl QnxRunner {
 
     fn find_loopback_pid_by_prefix(prefix: &str) -> Option<u32> {
         let needle = format!("prefix={prefix},");
-        let out = std::process::Command::new("pidin").args(["-F", "%p %a"]).output().ok()?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        for line in stdout.lines() {
-            if line.contains("devb-loopback") && line.contains(&needle) {
-                if let Some(pid_tok) = line.split_whitespace().next() {
-                    if let Ok(pid) = pid_tok.parse::<u32>() {
-                        return Some(pid);
-                    }
-                }
-            }
-        }
-        None
+        Self::enumerate_pids_with_cmdline()
+            .into_iter()
+            .find(|(_, argv)| argv.contains("devb-loopback") && argv.contains(&needle))
+            .map(|(pid, _)| pid)
     }
 
     /// Find every live qvm process started against this VM's qvm config.
@@ -148,26 +154,18 @@ impl QnxRunner {
     /// own — other VMs' qvms stay untouched.
     fn find_qvm_pids(qvm_config: &Path) -> Vec<u32> {
         let needle = format!("@{}", qvm_config.display());
-        let mut pids = Vec::new();
-        let Ok(out) = std::process::Command::new("pidin").args(["-F", "%p %a"]).output() else {
-            return pids;
-        };
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        for line in stdout.lines() {
-            if !line.contains(&needle) { continue; }
-            // Confirm argv[0] is `qvm` (not some other process that
-            // happens to reference the config path in its argv).
-            let mut tokens = line.split_whitespace();
-            let Some(pid_tok) = tokens.next() else { continue };
-            let Some(cmd_tok) = tokens.next() else { continue };
-            let is_qvm = cmd_tok == "qvm"
-                || cmd_tok.rsplit('/').next() == Some("qvm");
-            if !is_qvm { continue; }
-            if let Ok(pid) = pid_tok.parse::<u32>() {
-                pids.push(pid);
-            }
-        }
-        pids
+        Self::enumerate_pids_with_cmdline()
+            .into_iter()
+            .filter(|(_, argv)| {
+                if !argv.contains(&needle) { return false; }
+                // Confirm argv[0] is `qvm` (not some other process that
+                // happens to reference the config path in its argv).
+                let mut tokens = argv.split_whitespace();
+                let Some(cmd) = tokens.next() else { return false };
+                cmd == "qvm" || cmd.rsplit('/').next() == Some("qvm")
+            })
+            .map(|(pid, _)| pid)
+            .collect()
     }
 
     /// SIGTERM-then-SIGKILL every qvm running against this VM's config.
@@ -208,6 +206,29 @@ fn wait_for_device(path: &str, timeout: Duration) -> Result<(), RunnerError> {
 }
 
 impl VmRunner for QnxRunner {
+    /// Slay orphan qvm + devb-loopback for this VM. Called by
+    /// VmManager BEFORE the pre-launch verify hook runs so the
+    /// verifier can read `rootfs.img` directly — otherwise a
+    /// leftover devb-loopback from a previous lifetime holds the
+    /// file open (QNX returns EBUSY on second-opener).
+    fn prepare_for_launch(&mut self, name: &str, def: &VmDefinition) {
+        // Compute the same qvm_config path start() will use, so we
+        // can target the orphan qvm by argv.
+        let qvm_config = match def.qvm_config.as_ref() {
+            Some(raw) if raw.is_relative() => def.image_dir.join(raw),
+            Some(raw) => raw.clone(),
+            None => return, // No config → no orphan possible to slay.
+        };
+
+        // Order: qvm first (so it stops reading from the loopback),
+        // then loopback (so it stops holding rootfs.img open).
+        Self::slay_qvm_for_vm(&qvm_config);
+        std::thread::sleep(Duration::from_millis(100));
+        Self::slay_loopbacks_for_vm(name);
+        std::thread::sleep(Duration::from_millis(100));
+        self.vm_name = Some(name.to_string());
+    }
+
     fn start(&mut self, name: &str, def: &VmDefinition) -> Result<VmHandle, RunnerError> {
         let raw_path = def.qvm_config.as_ref().ok_or_else(|| {
             RunnerError::Config(format!("VM {name}: qvm_config not set"))
@@ -227,21 +248,14 @@ impl VmRunner for QnxRunner {
             )));
         }
 
-        // Defense in depth — kill any orphan qvm for THIS VM's config
-        // left from a prior supernova lifetime that didn't reap qvm
-        // cleanly (start-managed.sh's between-supernova `slay qvm` is
-        // best-effort with no exit-wait). Must run BEFORE the loopback
-        // slay so the orphan qvm releases its disk fd before its
-        // devb-loopback is taken out from under it.
-        Self::slay_qvm_for_vm(&qvm_config);
-        std::thread::sleep(Duration::from_millis(100));
-
-        // Defense in depth — kill any devb-loopback for THIS VM (rootfs +
-        // extras) left over from a stop path that didn't go through
-        // cleanup() (process crash, hard reset). Other VMs untouched.
-        Self::slay_loopbacks_for_vm(name);
-        std::thread::sleep(Duration::from_millis(100));
-        self.vm_name = Some(name.to_string());
+        // The slay dance moved to `prepare_for_launch` (called by
+        // VmManager before the pre-launch verify so EBUSY doesn't
+        // fire on `rootfs.img`). vm_name is set there too; we keep
+        // this as belt-and-suspenders in case `start` is invoked
+        // outside the VmManager path (e.g. direct tests).
+        if self.vm_name.is_none() {
+            self.vm_name = Some(name.to_string());
+        }
 
         // Rootfs: per-VM prefix lets multiple VMs run concurrently with
         // distinct /dev/qvmdisk-vmX0 nodes.

@@ -89,6 +89,10 @@ impl Default for ImageMeta {
 pub struct InstallResult {
     pub target_bank: Bank,
     pub image_sha256: [u8; 32],
+    /// Install-time generation counter assigned to the target bank's
+    /// NvFwMeta and required to be embedded in the bank's IVD manifest.
+    /// See `NvFwMeta.gen` for full semantics.
+    pub gen: u64,
 }
 
 /// Install an OTA image for a bank set.
@@ -186,6 +190,10 @@ fn install_inner<D: BlockDevice>(
         // Single-bank install (HSM): overwrite bank A in-place, immediate commit
         let min_security_ver = meta.fw_secver; // raise floor immediately
 
+        // gen ratchets even for single-bank — uniform anti-rollback.
+        let prev_gen = nv.read_fw_meta(set, Bank::A).map(|m| m.gen).unwrap_or(0);
+        let next_gen = prev_gen + 1;
+
         let mut fw_meta = NvFwMeta {
             write_seq: 0,
             fw_version: meta.fw_version,
@@ -202,6 +210,7 @@ fn install_inner<D: BlockDevice>(
             programming_date: meta.programming_date,
             tester_serial: meta.tester_serial,
             min_security_ver,
+            gen: next_gen,
         };
         nv.write_fw_meta(set, Bank::A, &mut fw_meta)?;
 
@@ -214,6 +223,7 @@ fn install_inner<D: BlockDevice>(
         Ok(InstallResult {
             target_bank: Bank::A,
             image_sha256,
+            gen: next_gen,
         })
     } else {
         // A/B banked install: write to inactive bank, enter trial mode
@@ -228,6 +238,14 @@ fn install_inner<D: BlockDevice>(
             .map(|m| m.min_security_ver)
             .unwrap_or(0);
 
+        // Generation: install-time monotonic ratchet. The active bank
+        // is the currently-committed one (precondition `committed=true`
+        // ensures this), so its gen IS the committed_gen floor for
+        // this set. Target gets committed_gen + 1; ivd_sign_staged_bank
+        // reads this back from NV and embeds it in the signed manifest.
+        let committed_gen = nv.read_fw_meta(set, active).map(|m| m.gen).unwrap_or(0);
+        let next_gen = committed_gen + 1;
+
         let mut fw_meta = NvFwMeta {
             write_seq: 0,
             fw_version: meta.fw_version,
@@ -244,6 +262,7 @@ fn install_inner<D: BlockDevice>(
             programming_date: meta.programming_date,
             tester_serial: meta.tester_serial,
             min_security_ver,
+            gen: next_gen,
         };
         nv.write_fw_meta(set, target, &mut fw_meta)?;
 
@@ -256,6 +275,7 @@ fn install_inner<D: BlockDevice>(
         Ok(InstallResult {
             target_bank: target,
             image_sha256,
+            gen: next_gen,
         })
     }
 }

@@ -103,7 +103,27 @@ pub struct VmManager {
     /// via `with_clock` — supernova selects gPTP / simulation per its
     /// startup config.
     clock_source: Arc<dyn Clock>,
+    /// Optional pre-launch verification hook. Called from `start_vm`
+    /// with `(vm_name, bank_dir)` AFTER per-bank config is loaded but
+    /// BEFORE the runner spawns devb-loopback / qvm. Returning `Err`
+    /// fails the start; the resolved bank dir is whatever
+    /// `image_dir/current` points at, so the gate sees the actual
+    /// content about to boot.
+    ///
+    /// Owned by supernova because the verify itself needs NV +
+    /// HsmProvider, which vm-service doesn't depend on. Default is
+    /// `None` (no gate; same behavior as before this was added).
+    pre_launch_verify: Option<PreLaunchVerify>,
 }
+
+/// Closure type for [`VmManager::with_pre_launch_verify`].
+///
+/// Args: `(vm_name, bank_dir)`. Returns `Ok(())` to allow the launch,
+/// `Err(message)` to refuse it. The closure is expected to log its own
+/// outcome (timing, sig status, gen) — `start_vm` only adds a thin
+/// failure breadcrumb on its end.
+pub type PreLaunchVerify =
+    Arc<dyn Fn(&str, &std::path::Path) -> Result<(), String> + Send + Sync>;
 
 /// Returned by `initiate_stop` — carries enough info to wait for exit
 /// without holding the manager lock.
@@ -215,6 +235,7 @@ impl VmManager {
             vms,
             device_transport,
             clock_source: Arc::new(SystemClock::new()),
+            pre_launch_verify: None,
         }
     }
 
@@ -223,6 +244,15 @@ impl VmManager {
     /// or `SimulationClock` based on its startup `time:` config.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock_source = clock;
+        self
+    }
+
+    /// Install a closure called from `start_vm` after the per-bank
+    /// config is loaded but before the runner spawns anything. Lets
+    /// supernova plug in IVD verify (NV + HSM live in supernova, not
+    /// here) without vm-service taking a crypto dependency.
+    pub fn with_pre_launch_verify(mut self, hook: PreLaunchVerify) -> Self {
+        self.pre_launch_verify = Some(hook);
         self
     }
 
@@ -265,6 +295,49 @@ impl VmManager {
             }
             None => vm.def.clone(),
         };
+
+        // Release any resources from a previous lifetime that would
+        // block the pre-launch verify (devb-loopback holding rootfs.img
+        // open → EBUSY on read). No-op for runners without per-VM
+        // host-side state; QnxRunner slays orphan qvm + loopback here.
+        vm.runner.prepare_for_launch(name, &effective_def);
+
+        // Pre-launch verify gate — supernova installs this to run IVD
+        // verify against the bank that `image_dir/current` points at.
+        // The hook owns its own per-call logging (timing, gen, sig
+        // status).
+        //
+        // CURRENT POLICY: log-only. Verify still runs and reports
+        // good/bad with timing, but failure does NOT refuse to start.
+        // Reason: autosd's systemd-remount-fs upgrades rootfs.img to
+        // r/w during boot, so the file's bytes legitimately diverge
+        // from the manifest's claim on subsequent boots. Switching
+        // back to fail-closed needs read-only rootfs + overlay (or
+        // dm-verity) — tracked in
+        // tasks/launch-time-verify-mutable-rootfs.md.
+        if let Some(ref verify) = self.pre_launch_verify {
+            let started = Instant::now();
+            match verify(name, &effective_def.image_dir) {
+                Ok(()) => {
+                    tracing::info!(
+                        vm = name,
+                        bank_dir = %effective_def.image_dir.display(),
+                        verify_us = started.elapsed().as_micros() as u64,
+                        "pre-launch verify OK",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        vm = name,
+                        bank_dir = %effective_def.image_dir.display(),
+                        verify_us = started.elapsed().as_micros() as u64,
+                        error = %e,
+                        "pre-launch verify FAILED — continuing anyway (log-only policy; \
+                         see tasks/launch-time-verify-mutable-rootfs.md)",
+                    );
+                }
+            }
+        }
 
         // Don't start if boot images are missing (e.g. first boot before provisioning)
         if let Some(kernel) = effective_def.kernel_path() {

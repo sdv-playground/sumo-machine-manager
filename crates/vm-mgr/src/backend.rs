@@ -547,11 +547,51 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             }
         }
 
-        let _manifest = hsm::ivd::sign_bank(&*hsm, &bank_dir, &bank_id)
+        // Compute the install-time generation counter (gen) directly
+        // from NV state. This must agree with what ota::install_inner
+        // will write into target's NvFwMeta — they both derive it as
+        // `committed_bank.gen + 1`. Two reasons it has to be computed
+        // here independently (not read back from NvFwMeta):
+        //
+        // - In the multi-POST upload path this function runs at
+        //   "all payloads received" but install_precomputed doesn't
+        //   run until transferexit. NvFwMeta for the target hasn't
+        //   been written yet.
+        // - The OTA flow is serialized (start_flash rejects
+        //   concurrent flashes via InTrial), so both call sites read
+        //   the same NV state and arrive at the same gen.
+        //
+        // The committed bank is whichever of {active, active.other()}
+        // currently has committed=true. If active is committed, that's
+        // the committed bank. If we're already in trial mode (active=
+        // target, committed=false), the OTHER bank is the
+        // previously-committed one.
+        let gen = {
+            let nv = self.nv.lock().map_err(|_| {
+                BackendError::Internal("ivd sign: nv mutex poisoned".into())
+            })?;
+            let state = nv.read_boot_state().ok_or_else(|| {
+                BackendError::Internal(format!("ivd sign {bank_id}: NV boot state missing"))
+            })?;
+            let idx = self.bank_set.as_index();
+            let committed_bank = if state.banks[idx].committed {
+                state.banks[idx].active_bank
+            } else {
+                state.banks[idx].active_bank.other()
+            };
+            let committed_gen = nv
+                .read_fw_meta(self.bank_set, committed_bank)
+                .map(|m| m.gen)
+                .unwrap_or(0);
+            committed_gen + 1
+        };
+
+        let _manifest = hsm::ivd::sign_bank(&*hsm, &bank_dir, gen)
             .map_err(|e| BackendError::Internal(format!("ivd sign {bank_id}: {e}")))?;
         tracing::info!(
             bank_id = %bank_id,
             bank_dir = %bank_dir.display(),
+            gen,
             "ivd sign OK",
         );
         Ok(())

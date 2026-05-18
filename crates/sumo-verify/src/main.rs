@@ -8,14 +8,21 @@
 //! ```text
 //! sumo-verify --bank /persist/banks/vm2/bank_a \
 //!             --keystore /var/lib/hsm/keystore \
-//!             --expect-bank-id vm2/bank_a
+//!             --expect-install-gen 6 \
+//!             --min-committed-gen 5
 //! ```
+//!
+//! The two `gen` flags are the anti-rollback hooks: `--expect-install-gen`
+//! pins the slot identity (NV remembers what gen was assigned at install
+//! time; manifest must match), and `--min-committed-gen` is the run-time
+//! floor (NV's last-successfully-committed gen; manifest must be at least
+//! that).
 //!
 //! Exit codes:
 //!   0  — manifest signature verifies AND every claimed file hashes
 //!         match. Safe to launch.
 //!   1  — verification failed (bad sig, tampered file, missing file,
-//!         unexpected file, bank_id mismatch, ...). DO NOT launch.
+//!         unexpected file, gen mismatch, ...). DO NOT launch.
 //!   2  — usage / setup error (missing args, missing keystore, ...).
 //!         The verifier couldn't run; treat as launch-blocking.
 //!
@@ -27,7 +34,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use hsm::ivd;
+use hsm::ivd::{self, VerifyPins};
 use hsm::sim::SimHsm;
 
 const EXIT_OK: u8 = 0;
@@ -40,23 +47,28 @@ fn usage() {
 sumo-verify — validate a staged bank's IVD signature
 
 Usage:
-  sumo-verify --bank <dir> --keystore <dir> [--expect-bank-id <id>] [--quiet]
+  sumo-verify --bank <dir> --keystore <dir>
+              [--expect-install-gen <N>]
+              [--min-committed-gen <N>]
+              [--quiet]
 
 Arguments:
-  --bank <dir>            Bank directory to verify (contains
-                          ivd-manifest.cbor + ivd-signature.bin and
-                          the payload files they cover).
-  --keystore <dir>        HSM keystore root — same path supernova
-                          uses. SimHsm reads the ivd-signing public
-                          half from <keystore>/keys/ivd-signing.pub.
-  --expect-bank-id <id>   Pin the manifest's `bank_id` field. Set
-                          this when the caller knows which bank is
-                          being verified (e.g. \"vm2/bank_a\") so a
-                          valid sig from a different bank can't be
-                          replayed against this slot.
-  --quiet                 Suppress the success line on stdout. The
-                          exit code still tells the caller what
-                          happened.
+  --bank <dir>                Bank directory to verify (contains
+                              ivd-manifest.cbor + ivd-signature.bin
+                              and the payload files they cover).
+  --keystore <dir>            HSM keystore root — same path supernova
+                              uses. SimHsm reads the ivd-signing
+                              public half from
+                              <keystore>/keys/ivd-signing.pub.
+  --expect-install-gen <N>    Pin the manifest's `gen` field against
+                              the NV-recorded install_gen for this
+                              slot. Catches files swapped between
+                              slots during trial.
+  --min-committed-gen <N>     Run-time floor: refuse if the manifest's
+                              `gen` is below N (the bank set's
+                              committed_gen). Catches rollback below
+                              the last successfully-committed bank.
+  --quiet                     Suppress the success line on stdout.
 
 Exit codes:
   0  verification passed (safe to launch)
@@ -68,14 +80,29 @@ Exit codes:
 struct Args {
     bank: PathBuf,
     keystore: PathBuf,
-    expect_bank_id: Option<String>,
+    expect_install_gen: Option<u64>,
+    min_committed_gen: Option<u64>,
     quiet: bool,
+}
+
+fn parse_u64_arg(name: &str, val: Option<&String>) -> Result<u64, ExitCode> {
+    let Some(v) = val else {
+        usage();
+        eprintln!("\nerror: {name} requires a value");
+        return Err(ExitCode::from(EXIT_USAGE));
+    };
+    v.parse::<u64>().map_err(|e| {
+        usage();
+        eprintln!("\nerror: {name} '{v}' is not a u64: {e}");
+        ExitCode::from(EXIT_USAGE)
+    })
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, ExitCode> {
     let mut bank: Option<PathBuf> = None;
     let mut keystore: Option<PathBuf> = None;
-    let mut expect_bank_id: Option<String> = None;
+    let mut expect_install_gen: Option<u64> = None;
+    let mut min_committed_gen: Option<u64> = None;
     let mut quiet = false;
 
     let mut i = 1;
@@ -99,14 +126,13 @@ fn parse_args(argv: Vec<String>) -> Result<Args, ExitCode> {
                     return Err(ExitCode::from(EXIT_USAGE));
                 }
             }
-            "--expect-bank-id" => {
+            "--expect-install-gen" => {
                 i += 1;
-                expect_bank_id = argv.get(i).cloned();
-                if expect_bank_id.is_none() {
-                    usage();
-                    eprintln!("\nerror: --expect-bank-id requires a value");
-                    return Err(ExitCode::from(EXIT_USAGE));
-                }
+                expect_install_gen = Some(parse_u64_arg("--expect-install-gen", argv.get(i))?);
+            }
+            "--min-committed-gen" => {
+                i += 1;
+                min_committed_gen = Some(parse_u64_arg("--min-committed-gen", argv.get(i))?);
             }
             "--quiet" => quiet = true,
             "--help" | "-h" => {
@@ -136,7 +162,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args, ExitCode> {
     Ok(Args {
         bank,
         keystore,
-        expect_bank_id,
+        expect_install_gen,
+        min_committed_gen,
         quiet,
     })
 }
@@ -197,18 +224,18 @@ fn run() -> ExitCode {
         }
     };
 
-    let result = ivd::verify_bank(
-        &hsm,
-        &args.bank,
-        args.expect_bank_id.as_deref(),
-    );
+    let pins = VerifyPins {
+        expected_install_gen: args.expect_install_gen,
+        min_committed_gen: args.min_committed_gen,
+    };
+    let result = ivd::verify_bank(&hsm, &args.bank, pins);
 
     match result {
         Ok(manifest) => {
             if !args.quiet {
                 println!(
-                    "ok bank_id={} files={} signed_at_unix={}",
-                    manifest.bank_id,
+                    "ok gen={} files={} signed_at_unix={}",
+                    manifest.gen,
                     manifest.files.len(),
                     manifest.signed_at_unix,
                 );

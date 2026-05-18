@@ -46,6 +46,17 @@ pub struct VmHandle {
 }
 
 pub trait VmRunner: Send {
+    /// Release resources from a previous lifetime of this VM (orphan
+    /// qvm processes, lingering devb-loopback daemons holding the
+    /// bank's rootfs.img open). Must be called by VmManager BEFORE
+    /// any pre-launch read of the bank — otherwise verify hits EBUSY
+    /// on the rootfs.img file. Idempotent: a no-op when nothing is
+    /// holding anything.
+    ///
+    /// Default: no-op. QnxRunner overrides to slay leftover qvm +
+    /// devb-loopback for this VM.
+    fn prepare_for_launch(&mut self, _name: &str, _def: &VmDefinition) {}
+
     /// Start a VM with the given definition.
     fn start(&mut self, name: &str, def: &VmDefinition) -> Result<VmHandle, RunnerError>;
 

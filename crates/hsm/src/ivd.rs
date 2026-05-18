@@ -57,7 +57,12 @@ use crate::{HsmError, HsmProvider};
 pub const IVD_KEY_ID: &str = "ivd-signing";
 
 /// Manifest version. Bumped if the CBOR shape changes.
-pub const IVD_MANIFEST_VERSION: u64 = 1;
+///
+/// - v1: bank_id + file inventory only.
+/// - v2: adds `gen` (install-time generation counter) for run-time
+///   anti-rollback. v1 manifests on existing banks will fail to
+///   deserialize after this bump — devices must be re-flashed.
+pub const IVD_MANIFEST_VERSION: u64 = 2;
 
 /// Filenames the IVD machinery owns inside a bank dir.
 pub const IVD_MANIFEST_FILE: &str = "ivd-manifest.cbor";
@@ -69,21 +74,29 @@ pub struct IvdManifest {
     #[serde(rename = "0")]
     pub ivd_version: u64,
 
-    /// Caller-supplied identifier for the bank (e.g. "vm2/bank_a",
-    /// "host-os/bank_b", "hsm/keystore"). Bound into the signed
-    /// payload so a sig from one bank can't be replayed against
-    /// another with the same file contents.
-    #[serde(rename = "1")]
-    pub bank_id: String,
-
     /// Unix seconds at sign time. Informational — verifiers use
-    /// security_version, not timestamps, for rollback policy.
+    /// `gen`, not timestamps, for rollback policy.
     #[serde(rename = "2")]
     pub signed_at_unix: u64,
 
     /// Bank file inventory, sorted by `relative_path` for determinism.
     #[serde(rename = "3")]
     pub files: Vec<IvdFile>,
+
+    /// Install-time generation counter. Monotonic per-device per
+    /// bank set, assigned at OTA install as
+    /// `nv.committed_gen + 1` (where committed_gen is the
+    /// currently-committed bank's stored gen).
+    ///
+    /// Two run-time invariants verifiers check:
+    /// 1. `manifest.gen >= committed_gen` — refuses rollback below
+    ///    whatever was last successfully committed.
+    /// 2. `manifest.gen == NV.bank_install_gen[this_slot]` —
+    ///    catches "files swapped between slots" mid-trial. The NV
+    ///    record was written at install time and the attacker
+    ///    can't manufacture a matching HSM signature.
+    #[serde(rename = "4")]
+    pub gen: u64,
 }
 
 /// One file in the bank inventory.
@@ -125,8 +138,12 @@ pub enum IvdError {
     MissingFile(String),
     /// A file is on disk that the manifest doesn't claim.
     UnexpectedFile(String),
-    /// Manifest's `bank_id` doesn't match what the caller expected.
-    BankIdMismatch { expected: String, claimed: String },
+    /// Manifest's `gen` doesn't match the per-bank install_gen
+    /// recorded in NV — typically a between-slot swap during trial.
+    GenMismatch { expected: u64, claimed: u64 },
+    /// Manifest's `gen` is below the committed_gen floor — rollback
+    /// attempt below a successfully-committed bank.
+    GenBelowFloor { manifest: u64, floor: u64 },
     /// HSM rejected the verify or signature is bad.
     SignatureInvalid,
     /// Manifest carries a version this build doesn't understand.
@@ -145,8 +162,11 @@ impl std::fmt::Display for IvdError {
             }
             IvdError::MissingFile(p) => write!(f, "ivd missing file: {p}"),
             IvdError::UnexpectedFile(p) => write!(f, "ivd unexpected file (not in manifest): {p}"),
-            IvdError::BankIdMismatch { expected, claimed } => {
-                write!(f, "ivd bank_id mismatch: expected {expected}, manifest claims {claimed}")
+            IvdError::GenMismatch { expected, claimed } => {
+                write!(f, "ivd gen mismatch: NV expected {expected}, manifest claims {claimed}")
+            }
+            IvdError::GenBelowFloor { manifest, floor } => {
+                write!(f, "ivd gen below floor: manifest {manifest} < committed_gen {floor}")
             }
             IvdError::SignatureInvalid => write!(f, "ivd signature invalid"),
             IvdError::UnsupportedManifestVersion(v) => {
@@ -168,7 +188,7 @@ impl From<HsmError> for IvdError {
 /// Walk `bank_dir` and produce a sorted file inventory. Skips the
 /// IVD-owned files themselves (manifest + signature) so they don't
 /// shadow themselves. Does not recurse into symlinks.
-pub fn build_manifest(bank_dir: &Path, bank_id: impl Into<String>) -> Result<IvdManifest, IvdError> {
+pub fn build_manifest(bank_dir: &Path, gen: u64) -> Result<IvdManifest, IvdError> {
     let mut files = Vec::new();
     collect_files(bank_dir, bank_dir, &mut files)?;
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -180,9 +200,9 @@ pub fn build_manifest(bank_dir: &Path, bank_id: impl Into<String>) -> Result<Ivd
 
     Ok(IvdManifest {
         ivd_version: IVD_MANIFEST_VERSION,
-        bank_id: bank_id.into(),
         signed_at_unix,
         files,
+        gen,
     })
 }
 
@@ -265,19 +285,24 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<IvdManifest, IvdError> {
 /// write both artefacts into `bank_dir`. Idempotent at the file
 /// level — if called twice the previous artefacts get overwritten.
 ///
+/// `gen` is the install-time generation counter — the caller assigns
+/// it as `nv.committed_gen + 1` and writes the same value into
+/// `NV.bank_install_gen[target_slot]` so the verify-time cross-check
+/// can pin "the manifest in this slot is the one we installed here".
+///
 /// Returns the manifest that was signed (informational; the file on
 /// disk is the source of truth for verifiers).
 #[cfg(feature = "crypto")]
 pub fn sign_bank(
     hsm: &dyn HsmProvider,
     bank_dir: &Path,
-    bank_id: impl Into<String>,
+    gen: u64,
 ) -> Result<IvdManifest, IvdError> {
     let started = std::time::Instant::now();
 
     // Phase 1: walk the bank dir + hash every file into the manifest.
     let hash_start = std::time::Instant::now();
-    let manifest = build_manifest(bank_dir, bank_id)?;
+    let manifest = build_manifest(bank_dir, gen)?;
     let manifest_bytes = encode_manifest(&manifest)?;
     let hash_us = hash_start.elapsed().as_micros() as u64;
 
@@ -294,7 +319,7 @@ pub fn sign_bank(
     let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
     tracing::info!(
         bank_dir = %bank_dir.display(),
-        bank_id = %manifest.bank_id,
+        gen = manifest.gen,
         files = manifest.files.len(),
         total_bytes,
         hash_us,
@@ -306,25 +331,41 @@ pub fn sign_bank(
     Ok(manifest)
 }
 
+/// Verification pins. Both checks are optional but should both be
+/// passed by the launch-time gate; only the developer
+/// "did my sig round-trip" use case omits them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VerifyPins {
+    /// `NV.bank_install_gen[slot]` — value the device assigned when
+    /// this bank was installed. Verifier requires
+    /// `manifest.gen == expected_install_gen`. Catches a swap of
+    /// signed-but-different-gen content into this slot during trial.
+    pub expected_install_gen: Option<u64>,
+    /// `NV.committed_gen` — the per-bank-set ratchet. Verifier
+    /// requires `manifest.gen >= min_committed_gen`. Catches
+    /// rollback below a successfully-committed bank.
+    pub min_committed_gen: Option<u64>,
+}
+
 /// Read manifest + signature from `bank_dir`, verify the sig using
-/// the HSM's IVD public key, then re-hash every file the manifest
-/// claims and confirm it matches what's on disk. Optionally pins the
-/// expected `bank_id` — if provided, mismatches fail.
+/// the HSM's IVD public key, then enforce the supplied [`VerifyPins`]
+/// and re-hash every file the manifest claims.
 #[cfg(feature = "crypto")]
 pub fn verify_bank(
     hsm: &dyn HsmProvider,
     bank_dir: &Path,
-    expected_bank_id: Option<&str>,
+    pins: VerifyPins,
 ) -> Result<IvdManifest, IvdError> {
     let started = std::time::Instant::now();
-    let result = verify_bank_inner(hsm, bank_dir, expected_bank_id, started);
+    let result = verify_bank_inner(hsm, bank_dir, pins, started);
     if let Err(ref e) = result {
         // Inner records its own per-phase timings on success; on the
         // pre-signature error paths (file IO etc.) we still want a
         // single failure line for the operator log.
         tracing::error!(
             bank_dir = %bank_dir.display(),
-            expected_bank_id = ?expected_bank_id,
+            expected_install_gen = ?pins.expected_install_gen,
+            min_committed_gen = ?pins.min_committed_gen,
             total_us = started.elapsed().as_micros() as u64,
             error = %e,
             "ivd verify FAIL",
@@ -337,7 +378,7 @@ pub fn verify_bank(
 fn verify_bank_inner(
     hsm: &dyn HsmProvider,
     bank_dir: &Path,
-    expected_bank_id: Option<&str>,
+    pins: VerifyPins,
     started: std::time::Instant,
 ) -> Result<IvdManifest, IvdError> {
     let manifest_path = bank_dir.join(IVD_MANIFEST_FILE);
@@ -360,11 +401,29 @@ fn verify_bank_inner(
 
     let manifest = decode_manifest(&manifest_bytes)?;
 
-    if let Some(expected) = expected_bank_id {
-        if manifest.bank_id != expected {
-            return Err(IvdError::BankIdMismatch {
-                expected: expected.to_string(),
-                claimed: manifest.bank_id.clone(),
+    // Per-slot install-gen cross-check. The NV record was written
+    // at install time; the manifest carries the same value baked
+    // into the signed payload. A mismatch means the bank dir's
+    // contents are not the ones we installed in this slot.
+    if let Some(expected_gen) = pins.expected_install_gen {
+        if manifest.gen != expected_gen {
+            return Err(IvdError::GenMismatch {
+                expected: expected_gen,
+                claimed: manifest.gen,
+            });
+        }
+    }
+
+    // Run-floor: refuse any bank whose gen has fallen below the
+    // last successfully-committed gen. The active+committed bank
+    // is at `committed_gen` exactly; the trial bank is at
+    // `committed_gen + 1`. Anything below `committed_gen` is a
+    // rollback we don't permit.
+    if let Some(floor) = pins.min_committed_gen {
+        if manifest.gen < floor {
+            return Err(IvdError::GenBelowFloor {
+                manifest: manifest.gen,
+                floor,
             });
         }
     }
@@ -429,7 +488,7 @@ fn verify_bank_inner(
 
     tracing::info!(
         bank_dir = %bank_dir.display(),
-        bank_id = %manifest.bank_id,
+        gen = manifest.gen,
         files = manifest.files.len(),
         total_bytes,
         sig_verify_us,
@@ -481,11 +540,11 @@ mod tests {
         write(&bank.join(IVD_MANIFEST_FILE), b"stale manifest");
         write(&bank.join(IVD_SIGNATURE_FILE), b"stale sig");
 
-        let m = build_manifest(&bank, "test/bank_a").unwrap();
+        let m = build_manifest(&bank, 1).unwrap();
         let paths: Vec<&str> = m.files.iter().map(|f| f.relative_path.as_str()).collect();
         assert_eq!(paths, vec!["kernel", "nested/qvm.conf", "rootfs.img"]);
         assert_eq!(m.files[0].size, b"kernel bytes".len() as u64);
-        assert_eq!(m.bank_id, "test/bank_a");
+        assert_eq!(m.gen, 1);
 
         let _ = std::fs::remove_dir_all(&bank);
     }
@@ -495,11 +554,11 @@ mod tests {
         let bank = temp_bank("roundtrip");
         write(&bank.join("a"), b"alpha");
         write(&bank.join("b"), b"beta");
-        let m = build_manifest(&bank, "test/bank_b").unwrap();
+        let m = build_manifest(&bank, 42).unwrap();
         let bytes = encode_manifest(&m).unwrap();
         let back = decode_manifest(&bytes).unwrap();
-        assert_eq!(back.bank_id, "test/bank_b");
         assert_eq!(back.files.len(), 2);
+        assert_eq!(back.gen, 42);
         let _ = std::fs::remove_dir_all(&bank);
     }
 
@@ -545,14 +604,18 @@ mod tests {
         write(&bank.join("nested/qvm.conf"), b"cmdline foo=bar");
 
         let (hsm, keystore) = provisioned_sim("sign-verify");
-        let manifest = sign_bank(&hsm, &bank, "test/bank_a").unwrap();
-        assert_eq!(manifest.bank_id, "test/bank_a");
+        let manifest = sign_bank(&hsm, &bank, 7).unwrap();
         assert_eq!(manifest.files.len(), 3);
+        assert_eq!(manifest.gen, 7);
         assert!(bank.join(IVD_MANIFEST_FILE).exists());
         assert!(bank.join(IVD_SIGNATURE_FILE).exists());
 
-        let back = verify_bank(&hsm, &bank, Some("test/bank_a")).unwrap();
-        assert_eq!(back.bank_id, "test/bank_a");
+        let pins = VerifyPins {
+            expected_install_gen: Some(7),
+            min_committed_gen: Some(7),
+        };
+        let back = verify_bank(&hsm, &bank, pins).unwrap();
+        assert_eq!(back.gen, 7);
 
         let _ = std::fs::remove_dir_all(&bank);
         let _ = std::fs::remove_dir_all(&keystore);
@@ -567,11 +630,11 @@ mod tests {
         write(&bank.join("kernel"), b"original kernel");
 
         let (hsm, keystore) = provisioned_sim("tamper");
-        sign_bank(&hsm, &bank, "test/bank_t").unwrap();
+        sign_bank(&hsm, &bank, 1).unwrap();
 
         std::fs::write(bank.join("kernel"), b"tampered kernel").unwrap();
 
-        match verify_bank(&hsm, &bank, None) {
+        match verify_bank(&hsm, &bank, VerifyPins::default()) {
             Err(IvdError::HashMismatch { path, .. }) => assert_eq!(path, "kernel"),
             other => panic!("expected HashMismatch, got {other:?}"),
         }
@@ -586,13 +649,13 @@ mod tests {
         write(&bank.join("kernel"), b"k");
 
         let (hsm, keystore) = provisioned_sim("extra");
-        sign_bank(&hsm, &bank, "test/bank_x").unwrap();
+        sign_bank(&hsm, &bank, 1).unwrap();
 
         // Drop an extra file AFTER signing — bank shouldn't have
         // anything the manifest didn't authorize.
         std::fs::write(bank.join("evil-file"), b"unauthorised").unwrap();
 
-        match verify_bank(&hsm, &bank, None) {
+        match verify_bank(&hsm, &bank, VerifyPins::default()) {
             Err(IvdError::UnexpectedFile(p)) => assert_eq!(p, "evil-file"),
             other => panic!("expected UnexpectedFile, got {other:?}"),
         }
@@ -602,20 +665,73 @@ mod tests {
     }
 
     #[test]
-    fn verify_rejects_bank_id_mismatch() {
-        let bank = temp_bank("bankid");
+    fn verify_rejects_gen_mismatch() {
+        let bank = temp_bank("genmm");
         write(&bank.join("f"), b"x");
 
-        let (hsm, keystore) = provisioned_sim("bankid");
-        sign_bank(&hsm, &bank, "vm2/bank_a").unwrap();
+        let (hsm, keystore) = provisioned_sim("genmm");
+        sign_bank(&hsm, &bank, 5).unwrap();
 
-        match verify_bank(&hsm, &bank, Some("vm2/bank_b")) {
-            Err(IvdError::BankIdMismatch { expected, claimed }) => {
-                assert_eq!(expected, "vm2/bank_b");
-                assert_eq!(claimed, "vm2/bank_a");
+        // NV says this slot should have gen=6 (e.g. someone swapped
+        // a gen=5 manifest into a slot the device installed gen=6 to)
+        let pins = VerifyPins {
+            expected_install_gen: Some(6),
+            ..Default::default()
+        };
+        match verify_bank(&hsm, &bank, pins) {
+            Err(IvdError::GenMismatch { expected, claimed }) => {
+                assert_eq!(expected, 6);
+                assert_eq!(claimed, 5);
             }
-            other => panic!("expected BankIdMismatch, got {other:?}"),
+            other => panic!("expected GenMismatch, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn verify_rejects_gen_below_floor() {
+        let bank = temp_bank("genfloor");
+        write(&bank.join("f"), b"x");
+
+        let (hsm, keystore) = provisioned_sim("genfloor");
+        // Sign at gen=3
+        sign_bank(&hsm, &bank, 3).unwrap();
+
+        // Run-floor says we've committed gen=5 elsewhere — refuse.
+        let pins = VerifyPins {
+            min_committed_gen: Some(5),
+            ..Default::default()
+        };
+        match verify_bank(&hsm, &bank, pins) {
+            Err(IvdError::GenBelowFloor { manifest, floor }) => {
+                assert_eq!(manifest, 3);
+                assert_eq!(floor, 5);
+            }
+            other => panic!("expected GenBelowFloor, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn verify_accepts_trial_gen_above_floor() {
+        // Models the trial-mode case: committed bank at gen=5, trial
+        // bank at gen=6. Floor is 5; trial bank verifies fine.
+        let bank = temp_bank("trial");
+        write(&bank.join("f"), b"trial-bank");
+
+        let (hsm, keystore) = provisioned_sim("trial");
+        sign_bank(&hsm, &bank, 6).unwrap();
+
+        let pins = VerifyPins {
+            expected_install_gen: Some(6),
+            min_committed_gen: Some(5),
+        };
+        let back = verify_bank(&hsm, &bank, pins).unwrap();
+        assert_eq!(back.gen, 6);
 
         let _ = std::fs::remove_dir_all(&bank);
         let _ = std::fs::remove_dir_all(&keystore);
