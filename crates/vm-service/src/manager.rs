@@ -326,7 +326,7 @@ impl VmManager {
                     tracing::info!(
                         vm = name,
                         bank_dir = %effective_def.image_dir.display(),
-                        verify_us = started.elapsed().as_micros() as u64,
+                        verify_ms = started.elapsed().as_millis() as u64,
                         "pre-launch verify OK",
                     );
                 }
@@ -334,7 +334,7 @@ impl VmManager {
                     tracing::warn!(
                         vm = name,
                         bank_dir = %effective_def.image_dir.display(),
-                        verify_us = started.elapsed().as_micros() as u64,
+                        verify_ms = started.elapsed().as_millis() as u64,
                         error = %e,
                         "pre-launch verify FAILED — continuing anyway (log-only policy; \
                          see tasks/launch-time-verify-mutable-rootfs.md)",

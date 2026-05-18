@@ -304,12 +304,12 @@ pub fn sign_bank(
     let hash_start = std::time::Instant::now();
     let manifest = build_manifest(bank_dir, gen)?;
     let manifest_bytes = encode_manifest(&manifest)?;
-    let hash_us = hash_start.elapsed().as_micros() as u64;
+    let hash_ms = hash_start.elapsed().as_millis() as u64;
 
     // Phase 2: sign the manifest bytes.
     let sig_start = std::time::Instant::now();
     let sig = hsm.sign(IVD_KEY_ID, &manifest_bytes)?;
-    let sig_us = sig_start.elapsed().as_micros() as u64;
+    let sig_ms = sig_start.elapsed().as_millis() as u64;
 
     fs::write(bank_dir.join(IVD_MANIFEST_FILE), &manifest_bytes)
         .map_err(|e| IvdError::Io(e, bank_dir.join(IVD_MANIFEST_FILE)))?;
@@ -322,9 +322,9 @@ pub fn sign_bank(
         gen = manifest.gen,
         files = manifest.files.len(),
         total_bytes,
-        hash_us,
-        sig_us,
-        total_us = started.elapsed().as_micros() as u64,
+        hash_ms,
+        sig_ms,
+        total_ms = started.elapsed().as_millis() as u64,
         "ivd sign OK",
     );
 
@@ -366,7 +366,7 @@ pub fn verify_bank(
             bank_dir = %bank_dir.display(),
             expected_install_gen = ?pins.expected_install_gen,
             min_committed_gen = ?pins.min_committed_gen,
-            total_us = started.elapsed().as_micros() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
             error = %e,
             "ivd verify FAIL",
         );
@@ -394,7 +394,7 @@ fn verify_bank_inner(
     let ok = hsm
         .verify(IVD_KEY_ID, &manifest_bytes, &sig)
         .map_err(IvdError::Hsm)?;
-    let sig_verify_us = sig_start.elapsed().as_micros() as u64;
+    let sig_verify_ms = sig_start.elapsed().as_millis() as u64;
     if !ok {
         return Err(IvdError::SignatureInvalid);
     }
@@ -483,17 +483,17 @@ fn verify_bank_inner(
         let _ = claimed_map.get(&claim.relative_path);
     }
 
-    let hash_verify_us = hash_start.elapsed().as_micros() as u64;
-    let total_us = started.elapsed().as_micros() as u64;
+    let hash_verify_ms = hash_start.elapsed().as_millis() as u64;
+    let total_ms = started.elapsed().as_millis() as u64;
 
     tracing::info!(
         bank_dir = %bank_dir.display(),
         gen = manifest.gen,
         files = manifest.files.len(),
         total_bytes,
-        sig_verify_us,
-        hash_verify_us,
-        total_us,
+        sig_verify_ms,
+        hash_verify_ms,
+        total_ms,
         "ivd verify OK",
     );
 
