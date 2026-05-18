@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use hsm::ivd::IvdFile;
 use nv_store::types::BankSet;
 use sumo_onboard::decryptor::KeyUnwrap;
 
@@ -35,6 +36,12 @@ pub struct ValidatedFirmware {
     /// Raw SUIT envelope bytes — passed through for HSM key manifests
     /// so the HSM provider can handle decrypt/decompress internally.
     pub raw_envelope: Option<Vec<u8>>,
+    /// Per-file SHA-256 + size captured by the streaming pipeline as
+    /// each payload was decrypted/decompressed/written. Lets the
+    /// IVD-sign step build the manifest without re-hashing the staged
+    /// bank dir from disk. Empty for non-streaming (in-memory or
+    /// header-only) paths — `sign_bank` falls back to a directory walk.
+    pub streamed_files: Vec<IvdFile>,
 }
 
 #[derive(Debug)]
@@ -183,6 +190,7 @@ mod tests {
                 image_sha256: None,
                 image_size: None,
                 raw_envelope: None,
+                streamed_files: Vec::new(),
             })
         }
     }

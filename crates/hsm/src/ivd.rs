@@ -191,6 +191,20 @@ impl From<HsmError> for IvdError {
 pub fn build_manifest(bank_dir: &Path, gen: u64) -> Result<IvdManifest, IvdError> {
     let mut files = Vec::new();
     collect_files(bank_dir, bank_dir, &mut files)?;
+    Ok(build_manifest_from_files(files, gen))
+}
+
+/// Construct a manifest from a pre-computed file inventory.
+///
+/// The OTA streaming pipeline already SHA-256s each payload as it
+/// writes it (and verifies against the OEM-signed SUIT digest); the
+/// resulting `(path, size, hash)` triples are exactly what the IVD
+/// manifest needs. Skipping the re-walk + re-hash here saves the full
+/// rootfs SHA pass — ~2.5 s for an 80 MB rootfs on the CVC.
+///
+/// The function sorts the input by `relative_path` so the signed CBOR
+/// is deterministic regardless of payload-arrival order.
+pub fn build_manifest_from_files(mut files: Vec<IvdFile>, gen: u64) -> IvdManifest {
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
     let signed_at_unix = SystemTime::now()
@@ -198,12 +212,12 @@ pub fn build_manifest(bank_dir: &Path, gen: u64) -> Result<IvdManifest, IvdError
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    Ok(IvdManifest {
+    IvdManifest {
         ivd_version: IVD_MANIFEST_VERSION,
         signed_at_unix,
         files,
         gen,
-    })
+    }
 }
 
 fn collect_files(
@@ -290,6 +304,11 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<IvdManifest, IvdError> {
 /// `NV.bank_install_gen[target_slot]` so the verify-time cross-check
 /// can pin "the manifest in this slot is the one we installed here".
 ///
+/// This variant walks `bank_dir` and hashes every file from scratch.
+/// Use `sign_bank_with_files` when the caller already has a verified
+/// file inventory (e.g. from the OTA streaming pipeline, which hashes
+/// each payload as it writes).
+///
 /// Returns the manifest that was signed (informational; the file on
 /// disk is the source of truth for verifiers).
 #[cfg(feature = "crypto")]
@@ -298,15 +317,48 @@ pub fn sign_bank(
     bank_dir: &Path,
     gen: u64,
 ) -> Result<IvdManifest, IvdError> {
+    let hash_start = std::time::Instant::now();
+    let mut files = Vec::new();
+    collect_files(bank_dir, bank_dir, &mut files)?;
+    let hash_ms = hash_start.elapsed().as_millis() as u64;
+    sign_bank_with_files(hsm, bank_dir, gen, files, Some(hash_ms))
+}
+
+/// Sign a bank using a pre-computed file inventory.
+///
+/// The OTA streaming pipeline already SHA-256s each payload while
+/// writing it to disk and verifies the digest against the OEM-signed
+/// SUIT manifest. Those `(relative_path, size, sha256)` triples are
+/// exactly what the IVD manifest needs — re-walking the bank dir and
+/// re-hashing is duplicate work (~2.5 s for the 80 MB rootfs on the
+/// CVC).
+///
+/// Trust chain: SUIT envelope (OEM-signed) authenticates the
+/// `image_digest` of each payload. The streaming pipeline computes
+/// the hash and compares; on match, the bytes that landed on disk
+/// match the OEM's claim. We then attest to those same bytes here
+/// with the device's `ivd-signing` key — no re-read necessary. If
+/// the disk later disagrees with what we signed, launch-time verify
+/// catches it (same as any post-flash tamper).
+///
+/// `walk_hash_ms` is an optional timing breakdown for the caller's
+/// dir-walk step (None when files came from the streaming path with
+/// effectively zero walk cost). Logged as `hash_ms=0` either way; the
+/// distinction only matters to `sign_bank`.
+#[cfg(feature = "crypto")]
+pub fn sign_bank_with_files(
+    hsm: &dyn HsmProvider,
+    bank_dir: &Path,
+    gen: u64,
+    files: Vec<IvdFile>,
+    walk_hash_ms: Option<u64>,
+) -> Result<IvdManifest, IvdError> {
     let started = std::time::Instant::now();
 
-    // Phase 1: walk the bank dir + hash every file into the manifest.
-    let hash_start = std::time::Instant::now();
-    let manifest = build_manifest(bank_dir, gen)?;
+    let manifest = build_manifest_from_files(files, gen);
     let manifest_bytes = encode_manifest(&manifest)?;
-    let hash_ms = hash_start.elapsed().as_millis() as u64;
+    let hash_ms = walk_hash_ms.unwrap_or(0);
 
-    // Phase 2: sign the manifest bytes.
     let sig_start = std::time::Instant::now();
     let sig = hsm.sign(IVD_KEY_ID, &manifest_bytes)?;
     let sig_ms = sig_start.elapsed().as_millis() as u64;
@@ -732,6 +784,62 @@ mod tests {
         };
         let back = verify_bank(&hsm, &bank, pins).unwrap();
         assert_eq!(back.gen, 6);
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// `sign_bank_with_files` skips the dir walk. Mimics the OTA
+    /// streaming path: caller computed hashes during write, passes
+    /// them in; verifier later re-reads the same files and finds the
+    /// hashes match.
+    #[test]
+    fn sign_with_precomputed_files_roundtrips() {
+        let bank = temp_bank("sign-with-files");
+        // Write the files on disk so verify can re-hash them later.
+        write(&bank.join("kernel"), b"kernel bytes");
+        write(&bank.join("rootfs.img"), b"rootfs bytes");
+
+        // Pre-compute the same hashes the streaming pipeline would
+        // emit. (In production these come from process_raw_payload's
+        // [u8; 32] return; here we hash by hand.)
+        let kernel_bytes = b"kernel bytes".to_vec();
+        let rootfs_bytes = b"rootfs bytes".to_vec();
+        let kernel_hash = sha256(&kernel_bytes);
+        let rootfs_hash = sha256(&rootfs_bytes);
+        // Intentionally pass un-sorted; build_manifest_from_files sorts.
+        let files = vec![
+            IvdFile {
+                relative_path: "rootfs.img".into(),
+                sha256: rootfs_hash,
+                size: rootfs_bytes.len() as u64,
+            },
+            IvdFile {
+                relative_path: "kernel".into(),
+                sha256: kernel_hash,
+                size: kernel_bytes.len() as u64,
+            },
+        ];
+
+        let (hsm, keystore) = provisioned_sim("sign-with-files");
+        let manifest = sign_bank_with_files(&hsm, &bank, 42, files, None).unwrap();
+        assert_eq!(manifest.gen, 42);
+        assert_eq!(manifest.files.len(), 2);
+        // Sorted result.
+        assert_eq!(manifest.files[0].relative_path, "kernel");
+        assert_eq!(manifest.files[1].relative_path, "rootfs.img");
+        assert!(bank.join(IVD_MANIFEST_FILE).exists());
+        assert!(bank.join(IVD_SIGNATURE_FILE).exists());
+
+        // Verifier re-reads from disk and checks the manifest's
+        // claims — proving the streaming-derived hashes are
+        // interchangeable with dir-walk-derived ones.
+        let pins = VerifyPins {
+            expected_install_gen: Some(42),
+            min_committed_gen: Some(42),
+        };
+        let back = verify_bank(&hsm, &bank, pins).unwrap();
+        assert_eq!(back.gen, 42);
 
         let _ = std::fs::remove_dir_all(&bank);
         let _ = std::fs::remove_dir_all(&keystore);

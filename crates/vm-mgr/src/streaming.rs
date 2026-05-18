@@ -9,6 +9,7 @@ use std::path::Path;
 
 use bytes::Bytes;
 use futures::StreamExt;
+use hsm::ivd::IvdFile;
 use nv_store::types::{Bank, BankSet};
 use sha2::{Digest, Sha256};
 use sumo_crypto::RustCryptoBackend;
@@ -117,6 +118,7 @@ pub async fn process_envelope_stream(
     // Step 3: Process each integrated payload sequentially
     let mut last_image_size = 0usize;
     let mut last_image_hash = [0u8; 32];
+    let mut streamed_files: Vec<IvdFile> = Vec::with_capacity(pending_payloads.len());
 
     for pp in &pending_payloads {
         // Find which component this payload belongs to (match by URI)
@@ -133,11 +135,11 @@ pub async fn process_envelope_stream(
 
         let has_encryption = manifest.encryption_info(comp_idx).is_some();
 
+        let target_name = payload_target_name(bank_spec.layout, pp.key.as_str());
+
         // Land payload directly inside the target bank dir under its
         // canonical filename — no rename pass needed downstream.
-        let image_path = bank_dir.as_ref().map(|bd| {
-            bd.join(payload_target_name(bank_spec.layout, pp.key.as_str()))
-        });
+        let image_path = bank_dir.as_ref().map(|bd| bd.join(&target_name));
 
         tracing::info!(
             payload_key = %pp.key,
@@ -227,6 +229,12 @@ pub async fn process_envelope_stream(
             "component payload written to disk"
         );
 
+        streamed_files.push(IvdFile {
+            relative_path: target_name,
+            sha256: image_hash.to_vec(),
+            size: image_size as u64,
+        });
+
         last_image_size = image_size;
         last_image_hash = image_hash;
     }
@@ -245,6 +253,7 @@ pub async fn process_envelope_stream(
         image_sha256: Some(last_image_hash),
         image_size: Some(last_image_size as u64),
         raw_envelope: None,
+        streamed_files,
     })
 }
 

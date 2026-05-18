@@ -126,6 +126,13 @@ struct FlashTransferState {
     /// (vm-service down, factory-provisioning case, etc.). Then any new
     /// running heartbeat is accepted as a fresh boot.
     verify_baseline_boot_id: Option<u32>,
+    /// `(relative_path, size, sha256)` for each payload as the streaming
+    /// pipeline wrote it into the target bank dir. Lets
+    /// `ivd_sign_staged_bank` build the IVD manifest without re-reading
+    /// the bank from disk. Empty for the buffered (non-streaming) path
+    /// and for pre-streaming-pipeline upload flows — `sign_bank` then
+    /// falls back to a directory walk.
+    streamed_files: Vec<hsm::ivd::IvdFile>,
 }
 
 // ---------------------------------------------------------------------------
@@ -586,8 +593,27 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             committed_gen + 1
         };
 
-        let _manifest = hsm::ivd::sign_bank(&*hsm, &bank_dir, gen)
-            .map_err(|e| BackendError::Internal(format!("ivd sign {bank_id}: {e}")))?;
+        // Reuse the per-file hashes captured by the streaming pipeline
+        // when available — the OEM SUIT manifest already authenticated
+        // each payload's digest at write time, so re-hashing the bank
+        // from disk here is duplicate work (~2.5 s on the CVC's 80 MB
+        // rootfs). Empty stash → fall back to walk + hash.
+        let streamed_files = {
+            let ft = self.flash_transfer.lock().map_err(|_| {
+                BackendError::Internal("ivd sign: flash_transfer mutex poisoned".into())
+            })?;
+            ft.as_ref()
+                .map(|t| t.streamed_files.clone())
+                .unwrap_or_default()
+        };
+
+        let _manifest = if streamed_files.is_empty() {
+            hsm::ivd::sign_bank(&*hsm, &bank_dir, gen)
+                .map_err(|e| BackendError::Internal(format!("ivd sign {bank_id}: {e}")))?
+        } else {
+            hsm::ivd::sign_bank_with_files(&*hsm, &bank_dir, gen, streamed_files, None)
+                .map_err(|e| BackendError::Internal(format!("ivd sign {bank_id}: {e}")))?
+        };
         tracing::info!(
             bank_id = %bank_id,
             bank_dir = %bank_dir.display(),
@@ -1089,7 +1115,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
         // Decrypt → decompress → verify → write
         let process_started = std::time::Instant::now();
-        let (image_size, _image_hash) = crate::streaming::process_raw_payload(
+        let (image_size, image_hash) = crate::streaming::process_raw_payload(
             &raw_path,
             &manifest_bytes,
             comp_idx,
@@ -1101,6 +1127,20 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
         // Clean up temp upload
         let _ = std::fs::remove_file(&raw_path);
+
+        // Record the freshly-hashed file for `ivd_sign_staged_bank` so
+        // it doesn't need to re-walk + re-hash this payload from disk
+        // when sealing the bank.
+        {
+            let mut ft = self.flash_transfer.lock().unwrap();
+            if let Some(ref mut t) = *ft {
+                t.streamed_files.push(hsm::ivd::IvdFile {
+                    relative_path: target_name.clone(),
+                    sha256: image_hash.to_vec(),
+                    size: image_size as u64,
+                });
+            }
+        }
 
         let compressed_mb = size as f64 / 1_048_576.0;
         let uncompressed_mb = image_size as f64 / 1_048_576.0;
@@ -1646,6 +1686,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 state: FlashState::Transferring,
                 image_size: content_length.unwrap_or(0),
                 verify_baseline_boot_id: None,
+                streamed_files: Vec::new(),
             });
         }
 
@@ -1677,6 +1718,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             let mut ft = self.flash_transfer.lock().unwrap();
             if let Some(ref mut t) = *ft {
                 t.state = FlashState::Preparing;
+                // Hand the per-file hash inventory captured by the
+                // streaming pipeline through to `ivd_sign_staged_bank`
+                // so it can build the IVD manifest without re-reading
+                // the bank from disk.
+                t.streamed_files = validated.streamed_files.clone();
             }
         }
 
@@ -1817,6 +1863,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 state: FlashState::Transferring,
                 image_size: 0,
                 verify_baseline_boot_id: None,
+                streamed_files: Vec::new(),
             });
             return Ok(transfer_id);
         };
@@ -1893,6 +1940,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     state: FlashState::AwaitingActivation,
                     image_size: 0,
                     verify_baseline_boot_id: None,
+                    streamed_files: Vec::new(),
                 });
             }
             // No-op for HSM single-bank (no bank dir under
@@ -1989,6 +2037,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                         state: FlashState::AwaitingActivation,
                         image_size,
                         verify_baseline_boot_id: None,
+                        streamed_files: Vec::new(),
                     });
                     (id, tb)
                 }

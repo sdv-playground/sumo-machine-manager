@@ -277,6 +277,7 @@ impl SuitProvider {
             image_sha256: None,
             image_size: None,
             raw_envelope: None,
+            streamed_files: Vec::new(),
         })
     }
 }
