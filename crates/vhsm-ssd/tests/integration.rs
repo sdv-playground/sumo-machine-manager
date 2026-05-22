@@ -127,7 +127,10 @@ statements:
             session_id: 1,
             payload,
         };
-        handler::handle_request(&req, caller, &mut self.handle_table, &self.iam, &*self.crypto)
+        // Discard AuthzOutcome — these tests assert on the Response
+        // only. The Phase 7 audit-log integration is unit-tested in
+        // audit.rs.
+        handler::handle_request(&req, caller, &mut self.handle_table, &self.iam, &*self.crypto).0
     }
 
     /// Helper: build payload with handle prefix + data.
@@ -249,7 +252,7 @@ fn sign_and_verify() {
         session_id: 2,
         payload: vp,
     };
-    let resp = handler::handle_request(
+    let (resp, _authz) = handler::handle_request(
         &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::Ok as u32, "verify failed");
@@ -277,7 +280,7 @@ fn verify_rejects_bad_signature() {
         session_id: 1,
         payload: p,
     };
-    let resp = handler::handle_request(
+    let (resp, _authz) = handler::handle_request(
         &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::CryptoError as u32);
@@ -473,7 +476,7 @@ fn host_only_ops_rejected() {
         session_id: 1,
         payload: vec![],
     };
-    let resp = handler::handle_request(
+    let (resp, _authz) = handler::handle_request(
         &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::PolicyReject as u32);
@@ -488,7 +491,7 @@ fn unknown_op_rejected() {
         session_id: 1,
         payload: vec![],
     };
-    let resp = handler::handle_request(
+    let (resp, _authz) = handler::handle_request(
         &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::InvalidParam as u32);

@@ -28,21 +28,46 @@ pub struct CallerId {
 /// add a statement targeting `handles: [system]`.
 pub const SYSTEM_HANDLE_NAME: &str = "system";
 
-/// Handle a single request. Returns the response to send.
+/// IAM gate outcome for one request, captured for audit log emission.
+/// Distinct from `iam::IamDecision` because it has an extra `Bypass`
+/// state for ops that skip IAM entirely (dynamic-handle access,
+/// rejected-before-IAM-eval host-only / handshake ops).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthzOutcome {
+    /// IAM matched a statement → request was authorised.
+    Allow { matched_statement: usize },
+    /// IAM was not consulted (dynamic handles, host-only ops rejected
+    /// upstream, malformed op codes). The dispatcher's downstream
+    /// gates (owner-scoping, per-handle bitmask) still apply.
+    Bypass,
+    /// IAM evaluated and rejected.
+    Deny,
+}
+
+/// Handle a single request. Returns the response to send plus the
+/// IAM gate outcome — caller plumbs the outcome into the audit log
+/// so operators can grep deny lines back to a specific policy
+/// statement (or its absence).
 pub fn handle_request(
     req: &Request,
     caller: &CallerId,
     handle_table: &mut HandleTable,
     iam: &IamPolicy,
     crypto: &dyn HsmCryptoProvider,
-) -> Response {
+) -> (Response, AuthzOutcome) {
     let Some(op) = Op::from_u32(req.op) else {
-        return Response::err(req.op, req.session_id, StatusCode::InvalidParam);
+        return (
+            Response::err(req.op, req.session_id, StatusCode::InvalidParam),
+            AuthzOutcome::Bypass,
+        );
     };
 
     // Reject host-only ops from guest callers.
     if op.is_host_only() {
-        return Response::err(req.op, req.session_id, StatusCode::PolicyReject);
+        return (
+            Response::err(req.op, req.session_id, StatusCode::PolicyReject),
+            AuthzOutcome::Bypass,
+        );
     }
 
     // Handshake ops are consumed by the per-connection auth state
@@ -56,7 +81,10 @@ pub fn handle_request(
             vm = %caller.vm_id,
             "handshake op reached handle_request — dispatcher bug"
         );
-        return Response::err(req.op, req.session_id, StatusCode::InvalidParam);
+        return (
+            Response::err(req.op, req.session_id, StatusCode::InvalidParam),
+            AuthzOutcome::Bypass,
+        );
     }
 
     // For ops that operate on an existing handle (Encrypt/Decrypt/
@@ -64,48 +92,40 @@ pub fn handle_request(
     // first so we can name the handle to IAM. For ops without a
     // handle, use the SYSTEM_HANDLE_NAME sentinel.
     //
-    // Dynamic handles (0x0100+) are owner-scoped by the v2 mechanism
-    // (created by the caller; resolve() rejects non-owners). IAM is
-    // only consulted for well-known handles whose names are
-    // operator-managed.
-    let iam_decision = match op {
+    // Dynamic handles (0x0100+) bypass IAM and rely on owner-scoping
+    // (resolve() rejects non-owners) + per-handle bitmask perms.
+    // Well-known handles always go through IAM.
+    let outcome = match op {
         Op::GetRandom | Op::KeyGenerate => {
-            iam.evaluate(&caller.vm_id, SYSTEM_HANDLE_NAME, op)
+            decision_to_outcome(iam.evaluate(&caller.vm_id, SYSTEM_HANDLE_NAME, op))
         }
         _ => {
-            // Peek the handle out of the payload's first 4 bytes.
-            // If the payload is too short, dispatcher hits the same
-            // check below; for IAM purposes we evaluate against a
-            // bogus name so the decision is a stable Deny rather
-            // than panicking. The op-specific handler will return
-            // InvalidParam for the truncated frame.
             let handle_id = peek_handle(req).unwrap_or(0);
-            let handle_name = handle_table
-                .get(handle_id)
-                .map(|e| e.key_id.as_str())
-                .unwrap_or("<unknown>");
-            // Dynamic handles bypass IAM (per-handle owner check via
-            // resolve() + bitmask perms cover them). Well-known
-            // handles always go through IAM.
             if handle_id >= HANDLE_DYNAMIC_BASE {
-                // Synthetic Allow with sentinel index; never surfaces
-                // to audit beyond the matched_statement field.
-                IamDecision::Allow { matched_statement: usize::MAX }
+                AuthzOutcome::Bypass
             } else {
-                iam.evaluate(&caller.vm_id, handle_name, op)
+                let handle_name = handle_table
+                    .get(handle_id)
+                    .map(|e| e.key_id.as_str())
+                    .unwrap_or("<unknown>");
+                decision_to_outcome(iam.evaluate(&caller.vm_id, handle_name, op))
             }
         }
     };
-    if let IamDecision::Deny = iam_decision {
+
+    if matches!(outcome, AuthzOutcome::Deny) {
         tracing::warn!(
             vm = %caller.vm_id,
             op = ?op,
             "iam.evaluate denied"
         );
-        return Response::err(req.op, req.session_id, StatusCode::PolicyReject);
+        return (
+            Response::err(req.op, req.session_id, StatusCode::PolicyReject),
+            outcome,
+        );
     }
 
-    match op {
+    let resp = match op {
         Op::GetRandom => handle_get_random(req, crypto),
         Op::KeyGenerate => handle_key_generate(req, caller, handle_table, crypto),
         Op::Encrypt => handle_crypto_with_handle(req, op, caller, handle_table, crypto),
@@ -120,6 +140,14 @@ pub fn handle_request(
         // Host-only ops already rejected above
         Op::KeyImport | Op::KeyDerive | Op::KeyDelete => unreachable!(),
         Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll => unreachable!(),
+    };
+    (resp, outcome)
+}
+
+fn decision_to_outcome(d: IamDecision) -> AuthzOutcome {
+    match d {
+        IamDecision::Allow { matched_statement } => AuthzOutcome::Allow { matched_statement },
+        IamDecision::Deny => AuthzOutcome::Deny,
     }
 }
 

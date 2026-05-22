@@ -534,7 +534,7 @@ fn serve_connection(
 
         let table_len_before = handle_table.lock().unwrap().len();
 
-        let resp = {
+        let (resp, authz) = {
             let mut table = handle_table.lock().unwrap();
             handler::handle_request(&req, &caller, &mut table, iam, crypto)
         };
@@ -566,7 +566,7 @@ fn serve_connection(
             }
         }
 
-        if let Err(e) = audit.lock().unwrap().record(&caller, &req, &resp) {
+        if let Err(e) = audit.lock().unwrap().record(&caller, &req, &resp, authz) {
             tracing::error!(vm = %caller.vm_id, error = %e, "audit log write failed");
         }
 

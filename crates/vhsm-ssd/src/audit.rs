@@ -10,14 +10,17 @@
 //! ```jsonc
 //! {
 //!   "ts": "2026-05-22T14:32:01.123456Z",   // RFC 3339 with µs
-//!   "vm_id": "vm2",
-//!   "peer_ip": "10.0.200.2",
+//!   "vm_id": "vm2",                        // cert subject (v3 principal)
+//!   "cert_thumbprint": "5c41…8b",          // SHA-256 of CWT (lower-hex)
+//!   "peer_ip": "10.0.200.2",               // diagnostic only in v3
 //!   "op_code": "0x00000040",
 //!   "op_name": "SIGN",
 //!   "session_id": 4711,
 //!   "status_code": 0,
 //!   "status_name": "OK",
 //!   "handle": "0x00000080",                // optional (only on ops carrying a handle)
+//!   "iam_decision": "allow",               // "allow" | "deny" | "bypass"
+//!   "iam_statement": 1,                    // optional; matched statement index
 //!   "payload_len_in": 64,
 //!   "payload_len_out": 71
 //! }
@@ -51,7 +54,7 @@ use std::path::Path;
 use log_rotate::{RotatingFileConfig, RotatingFileWriter};
 use serde::Serialize;
 
-use crate::handler::CallerId;
+use crate::handler::{AuthzOutcome, CallerId};
 use crate::proto::{Op, Request, Response, StatusCode};
 
 /// Default `max_bytes` for the rotating audit file (64 MiB).
@@ -97,11 +100,17 @@ impl AuditLogger {
     /// via `tracing::error!` and returns the error; the caller may
     /// ignore or fail the op as policy dictates. Disabled instances
     /// always return Ok(()) without touching disk.
-    pub fn record(&mut self, caller: &CallerId, req: &Request, resp: &Response) -> io::Result<()> {
+    pub fn record(
+        &mut self,
+        caller: &CallerId,
+        req: &Request,
+        resp: &Response,
+        authz: AuthzOutcome,
+    ) -> io::Result<()> {
         let Some(w) = self.inner.as_mut() else {
             return Ok(());
         };
-        let rec = AuditRecord::build(caller, req, resp);
+        let rec = AuditRecord::build(caller, req, resp, authz);
         let mut line = serde_json::to_vec(&rec)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serialize audit record: {e}")))?;
         line.push(b'\n');
@@ -121,9 +130,14 @@ impl AuditLogger {
 struct AuditRecord<'a> {
     /// RFC 3339 timestamp with microsecond precision, always UTC.
     ts: String,
-    /// Resolved caller identity (looked up from the policy table at accept time).
+    /// Cert subject — the v3 principal name. Bound at AUTH time.
     vm_id: &'a str,
-    /// Source IP that opened the connection.
+    /// SHA-256 of the CWT cert that authenticated this connection,
+    /// rendered as lower-hex. Lets an operator pin which cert
+    /// authorised which op.
+    cert_thumbprint: String,
+    /// Source IP that opened the connection. Diagnostic only in v3
+    /// (identity comes from the cert, not the IP).
     peer_ip: String,
     /// Operation code, as `0xHHHHHHHH`.
     op_code: String,
@@ -139,6 +153,15 @@ struct AuditRecord<'a> {
     /// Resolved handle if the op carries one in its payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     handle: Option<String>,
+    /// IAM gate outcome: `"allow"`, `"deny"`, or `"bypass"` (latter
+    /// for dynamic handles + host-only-op rejections that didn't go
+    /// through IAM eval).
+    iam_decision: &'static str,
+    /// Zero-based statement index that matched. Only present on
+    /// `iam_decision == "allow"` against a well-known handle;
+    /// absent on deny, bypass, and dynamic-handle allows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iam_statement: Option<usize>,
     /// Payload length on the wire (request side).
     payload_len_in: usize,
     /// Payload length on the wire (response side).
@@ -146,16 +169,18 @@ struct AuditRecord<'a> {
 }
 
 impl<'a> AuditRecord<'a> {
-    fn build(caller: &'a CallerId, req: &Request, resp: &Response) -> Self {
+    fn build(caller: &'a CallerId, req: &Request, resp: &Response, authz: AuthzOutcome) -> Self {
         let op = Op::from_u32(req.op);
         let op_name = op
             .map(|o| op_name_for(o))
             .unwrap_or("<unknown>")
             .to_string();
+        let (iam_decision, iam_statement) = render_authz(authz);
 
         Self {
             ts: now_rfc3339(),
             vm_id: &caller.vm_id,
+            cert_thumbprint: hex_lower(&caller.cert_thumbprint),
             peer_ip: caller.peer_ip.to_string(),
             op_code: format!("0x{:08x}", req.op),
             op_name,
@@ -163,10 +188,28 @@ impl<'a> AuditRecord<'a> {
             status_code: resp.status,
             status_name: status_name(resp.status),
             handle: extract_handle(req).map(|h| format!("0x{:08x}", h)),
+            iam_decision,
+            iam_statement,
             payload_len_in: req.payload.len(),
             payload_len_out: resp.payload.len(),
         }
     }
+}
+
+fn render_authz(o: AuthzOutcome) -> (&'static str, Option<usize>) {
+    match o {
+        AuthzOutcome::Allow { matched_statement } => ("allow", Some(matched_statement)),
+        AuthzOutcome::Deny => ("deny", None),
+        AuthzOutcome::Bypass => ("bypass", None),
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 fn op_name_for(op: Op) -> &'static str {
@@ -283,7 +326,13 @@ mod tests {
             payload: vec![],
         };
         let resp = Response::ok(req.op, 1, vec![]);
-        a.record(&caller("vmX", [127, 0, 0, 1]), &req, &resp).unwrap();
+        a.record(
+            &caller("vmX", [127, 0, 0, 1]),
+            &req,
+            &resp,
+            AuthzOutcome::Allow { matched_statement: 0 },
+        )
+        .unwrap();
         // No file to assert against — just confirm we don't panic.
     }
 
@@ -301,13 +350,21 @@ mod tests {
             payload: handle_bytes.to_vec(),
         };
         let resp = Response::ok(req.op, 4711, vec![0x30, 0x44]); // dummy sig prefix
-        a.record(&caller("vm2", [10, 0, 200, 2]), &req, &resp).unwrap();
+        a.record(
+            &caller("vm2", [10, 0, 200, 2]),
+            &req,
+            &resp,
+            AuthzOutcome::Allow { matched_statement: 3 },
+        )
+        .unwrap();
         drop(a);
 
         let lines = read_lines(&path);
         assert_eq!(lines.len(), 1);
         let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(v["vm_id"], "vm2");
+        // cert_thumbprint: 32 zero bytes → 64 zeros in hex (test fixture)
+        assert_eq!(v["cert_thumbprint"], "0".repeat(64));
         assert_eq!(v["peer_ip"], "10.0.200.2");
         assert_eq!(v["op_code"], "0x00000040");
         assert_eq!(v["op_name"], "SIGN");
@@ -315,6 +372,8 @@ mod tests {
         assert_eq!(v["status_code"], 0);
         assert_eq!(v["status_name"], "OK");
         assert_eq!(v["handle"], "0x00000080");
+        assert_eq!(v["iam_decision"], "allow");
+        assert_eq!(v["iam_statement"], 3);
         assert_eq!(v["payload_len_in"], 4);
         assert_eq!(v["payload_len_out"], 2);
     }
@@ -331,7 +390,13 @@ mod tests {
             payload: 32u32.to_le_bytes().to_vec(), // length param, NOT a handle
         };
         let resp = Response::ok(req.op, 1, vec![0; 32]);
-        a.record(&caller("vm1", [10, 0, 201, 2]), &req, &resp).unwrap();
+        a.record(
+            &caller("vm1", [10, 0, 201, 2]),
+            &req,
+            &resp,
+            AuthzOutcome::Allow { matched_statement: 0 },
+        )
+        .unwrap();
         drop(a);
 
         let lines = read_lines(&path);
@@ -354,7 +419,13 @@ mod tests {
             payload: 0xDEADBEEFu32.to_le_bytes().to_vec(),
         };
         let resp = Response::err(req.op, 1, StatusCode::InvalidHandle);
-        a.record(&caller("vm1", [10, 0, 201, 2]), &req, &resp).unwrap();
+        a.record(
+            &caller("vm1", [10, 0, 201, 2]),
+            &req,
+            &resp,
+            AuthzOutcome::Allow { matched_statement: 0 },
+        )
+        .unwrap();
         drop(a);
 
         let lines = read_lines(&path);
@@ -381,7 +452,13 @@ mod tests {
         let resp = Response::ok(req.op, 1, vec![0; 64]);
 
         for _ in 0..20 {
-            a.record(&caller("vm1", [10, 0, 201, 2]), &req, &resp).unwrap();
+            a.record(
+                &caller("vm1", [10, 0, 201, 2]),
+                &req,
+                &resp,
+                AuthzOutcome::Allow { matched_statement: 0 },
+            )
+            .unwrap();
         }
         drop(a);
 
@@ -410,5 +487,85 @@ mod tests {
         ] {
             assert!(!op_name_for(op).is_empty());
         }
+    }
+
+    #[test]
+    fn iam_deny_omits_statement_field() {
+        // Deny records don't carry a matched-statement index, so the
+        // field must be absent (not serialised as null).
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("audit.log");
+        let mut a = AuditLogger::open(&path, 1024 * 1024, 2).unwrap();
+
+        let req = Request {
+            op: Op::Sign as u32,
+            session_id: 7,
+            payload: 0x80u32.to_le_bytes().to_vec(),
+        };
+        let resp = Response::err(req.op, 7, StatusCode::PolicyReject);
+        a.record(
+            &caller("strang3r", [10, 0, 0, 99]),
+            &req,
+            &resp,
+            AuthzOutcome::Deny,
+        )
+        .unwrap();
+        drop(a);
+
+        let v: serde_json::Value = serde_json::from_str(&read_lines(&path)[0]).unwrap();
+        assert_eq!(v["iam_decision"], "deny");
+        assert!(
+            v.get("iam_statement").is_none(),
+            "deny record must not include iam_statement; got: {v}"
+        );
+        assert_eq!(v["status_name"], "POLICY_REJECT");
+    }
+
+    #[test]
+    fn iam_bypass_records_as_bypass() {
+        // Dynamic-handle ops bypass IAM; the audit log marks them so
+        // an operator can tell them apart from explicit allows.
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("audit.log");
+        let mut a = AuditLogger::open(&path, 1024 * 1024, 2).unwrap();
+
+        // Dynamic handle 0x0100
+        let req = Request {
+            op: Op::Encrypt as u32,
+            session_id: 1,
+            payload: 0x100u32.to_le_bytes().to_vec(),
+        };
+        let resp = Response::ok(req.op, 1, vec![]);
+        a.record(
+            &caller("vm1", [10, 0, 201, 2]),
+            &req,
+            &resp,
+            AuthzOutcome::Bypass,
+        )
+        .unwrap();
+        drop(a);
+
+        let v: serde_json::Value = serde_json::from_str(&read_lines(&path)[0]).unwrap();
+        assert_eq!(v["iam_decision"], "bypass");
+        assert!(v.get("iam_statement").is_none());
+    }
+
+    #[test]
+    fn cert_thumbprint_renders_lower_hex() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("audit.log");
+        let mut a = AuditLogger::open(&path, 1024 * 1024, 2).unwrap();
+
+        // Construct a caller with a non-zero thumbprint so the hex
+        // rendering is exercised.
+        let mut c = caller("vm1", [10, 0, 201, 2]);
+        c.cert_thumbprint = [0xABu8; 32];
+        let req = Request { op: Op::GetRandom as u32, session_id: 1, payload: 32u32.to_le_bytes().to_vec() };
+        let resp = Response::ok(req.op, 1, vec![]);
+        a.record(&c, &req, &resp, AuthzOutcome::Allow { matched_statement: 2 }).unwrap();
+        drop(a);
+
+        let v: serde_json::Value = serde_json::from_str(&read_lines(&path)[0]).unwrap();
+        assert_eq!(v["cert_thumbprint"], "ab".repeat(32));
     }
 }
