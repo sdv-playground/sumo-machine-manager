@@ -56,6 +56,11 @@ pub struct SimHsm {
     allow_list: Vec<(IpAddr, String)>,
     /// TCP port the daemon listens on.
     tcp_port: u16,
+    /// Optional path for the per-op audit log. When Some, the
+    /// spawned daemon receives `--audit-log <path>` and emits one
+    /// fsync'd JSON line per dispatched op there. When None, audit
+    /// logging is off (dev rigs / loopback tests).
+    audit_log: Option<PathBuf>,
     /// Running daemon process handle.
     child: Option<Child>,
 }
@@ -113,8 +118,21 @@ impl SimHsm {
             bind_ip,
             allow_list,
             tcp_port,
+            audit_log: None,
             child: None,
         }
+    }
+
+    /// Builder-style: enable per-op audit logging at the given path.
+    /// Spawned daemon receives `--audit-log <path>`; defaults
+    /// (64 MiB cap × 4 rotated copies) apply unless the deployer
+    /// also overrides via direct CLI args to vhsm-ssd.
+    ///
+    /// Call before `start_service()`. Has no effect on a running
+    /// daemon — kill + relaunch to change.
+    pub fn with_audit_log(mut self, path: impl Into<PathBuf>) -> Self {
+        self.audit_log = Some(path.into());
+        self
     }
 
     /// Factory signing public key as COSE_Key CBOR — the built-in provisioning authority.
@@ -804,6 +822,13 @@ impl HsmProvider for SimHsm {
             .arg("--listen").arg(&listen);
         for entry in &allow_args {
             cmd.arg("--allow-ip").arg(entry);
+        }
+        if let Some(ref audit_path) = self.audit_log {
+            cmd.arg("--audit-log").arg(audit_path);
+            tracing::info!(
+                path = %audit_path.display(),
+                "vhsm-ssd audit log enabled"
+            );
         }
         let child = cmd
             .spawn()
