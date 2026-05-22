@@ -64,6 +64,19 @@ pub fn handle_request(
         Op::GetCert => handle_get_cert(req, caller, handle_table, crypto),
         // Host-only ops already rejected above
         Op::KeyImport | Op::KeyDerive | Op::KeyDelete => unreachable!(),
+        // Handshake ops are consumed by the per-connection auth
+        // state machine (auth.rs in v3) BEFORE the request reaches
+        // handle_request. If we got here with a handshake op the
+        // dispatcher upstream has a bug — reject with InvalidParam
+        // rather than panic so the daemon stays alive.
+        Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll => {
+            tracing::warn!(
+                op = ?op,
+                vm = %caller.vm_id,
+                "handshake op reached handle_request — dispatcher bug"
+            );
+            Response::err(req.op, req.session_id, StatusCode::InvalidParam)
+        }
     }
 }
 

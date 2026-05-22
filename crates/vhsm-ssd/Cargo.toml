@@ -17,6 +17,13 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
+# CWT (RFC 8392) certs + COSE_Sign1 signatures for the IAM identity
+# layer (cert.rs). Already transitive via hsm; making the dep direct
+# so cert.rs can address ciborium::value / coset::CoseSign1 without
+# going through hsm's re-exports.
+ciborium = "0.2"
+coset = "0.3"
+sha2 = "0.10"
 
 [dev-dependencies]
 p256 = { version = "0.13", features = ["ecdsa"] }

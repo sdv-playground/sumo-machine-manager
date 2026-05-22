@@ -185,6 +185,10 @@ fn op_name_for(op: Op) -> &'static str {
         Op::GetHandleInfo => "GET_HANDLE_INFO",
         Op::GetPubkey => "GET_PUBKEY",
         Op::GetCert => "GET_CERT",
+        Op::Hello => "HELLO",
+        Op::Auth => "AUTH",
+        Op::AuthOk => "AUTH_OK",
+        Op::Enroll => "ENROLL",
     }
 }
 
@@ -401,6 +405,7 @@ mod tests {
             Op::KeyDelete, Op::Encrypt, Op::Decrypt, Op::MacGenerate,
             Op::MacVerify, Op::Sign, Op::Verify, Op::GetHandleInfo,
             Op::GetPubkey, Op::GetCert,
+            Op::Hello, Op::Auth, Op::AuthOk, Op::Enroll,
         ] {
             assert!(!op_name_for(op).is_empty());
         }

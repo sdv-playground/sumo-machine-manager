@@ -29,3 +29,7 @@ pub mod handler;
 pub mod transport;
 pub mod extension_manifest;
 pub mod audit;
+pub mod cert;
+pub mod bootstrap;
+pub mod iam;
+pub mod auth;

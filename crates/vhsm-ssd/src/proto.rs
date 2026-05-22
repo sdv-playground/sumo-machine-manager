@@ -22,7 +22,7 @@ pub const VHSM_PORT: u32 = 5100;
 
 // ---- Operation codes (uint32) -------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum Op {
     // Guest-facing: crypto
@@ -52,6 +52,17 @@ pub enum Op {
     GetHandleInfo = 0x0050,
     GetPubkey = 0x0051,
     GetCert = 0x0052,
+
+    // Connection-handshake (v3 IAM identity layer, target). The
+    // dispatcher does NOT route these through `handle_request` —
+    // they're consumed inside the per-connection accept loop by
+    // `auth.rs`. Listed here so codec parses them as valid op codes
+    // and the audit log can name them. Not in `required_perm` /
+    // `is_host_only` tables because they don't carry handles.
+    Hello = 0x00F0,
+    Auth = 0x00F1,
+    AuthOk = 0x00F2,
+    Enroll = 0x00F3,
 }
 
 impl Op {
@@ -71,6 +82,10 @@ impl Op {
             0x0050 => Some(Op::GetHandleInfo),
             0x0051 => Some(Op::GetPubkey),
             0x0052 => Some(Op::GetCert),
+            0x00F0 => Some(Op::Hello),
+            0x00F1 => Some(Op::Auth),
+            0x00F2 => Some(Op::AuthOk),
+            0x00F3 => Some(Op::Enroll),
             _ => None,
         }
     }
@@ -78,6 +93,14 @@ impl Op {
     /// True if this operation is host-only (rejected when the caller is a guest VM).
     pub fn is_host_only(self) -> bool {
         matches!(self, Op::KeyImport | Op::KeyDerive | Op::KeyDelete)
+    }
+
+    /// True if this is a connection-handshake op (HELLO / AUTH /
+    /// AUTH_OK / ENROLL). The handler dispatch table skips these
+    /// — they're consumed by the accept-loop's auth state machine
+    /// before any handle-bearing op can be dispatched.
+    pub fn is_handshake(self) -> bool {
+        matches!(self, Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll)
     }
 
     /// Permission bit required for this operation, if applicable.
@@ -95,6 +118,62 @@ impl Op {
             Op::GetCert => Some(PERM_GET_CERT),
             Op::KeyGenerate => Some(PERM_KEY_GENERATE),
             Op::GetRandom | Op::GetHandleInfo | Op::KeyImport => None,
+            // Handshake ops carry no handle and pre-date principal
+            // resolution; they have their own authn check (the
+            // proof-of-possession signature in AUTH, the
+            // bootstrap-token comparison in ENROLL).
+            Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll => None,
+        }
+    }
+}
+
+// ---- Auth-failure reasons (uint16 in AUTH_FAIL payload) -----------------
+//
+// Returned by the daemon in the response payload of an AUTH-flow op
+// when the client's HELLO/AUTH/ENROLL is refused. The status field
+// of the response carries StatusCode::PolicyReject (for v3 auth-mode
+// rejections) or StatusCode::InvalidParam (for malformed inputs);
+// this enum is the structured "why."
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum AuthFailReason {
+    /// Cert signature didn't verify against ecu-signing pubkey.
+    BadCertSignature = 0x0001,
+    /// Cert is past its `exp` or before its `nbf`.
+    CertExpired = 0x0002,
+    /// Cert `aud` is not `"vhsm-ssd"`.
+    WrongAudience = 0x0003,
+    /// Cert subject (principal name) not present in IAM policy.
+    UnknownPrincipal = 0x0004,
+    /// Proof-of-possession signature didn't verify against
+    /// the cert's `cnf.pubkey`.
+    BadProofSignature = 0x0005,
+    /// ENROLL: bootstrap token didn't match the stored hash.
+    BadBootstrapToken = 0x0006,
+    /// ENROLL: bootstrap token was already consumed.
+    TokenAlreadyConsumed = 0x0007,
+    /// Client sent a v2-or-earlier request to a v3 daemon, or any
+    /// other "wire version doesn't match what's required" condition.
+    ProtocolTooOld = 0x0008,
+    /// Generic malformed-input — short payloads, undecodable CWT
+    /// CBOR, unknown opcode in handshake range, etc.
+    InvalidParam = 0x0009,
+}
+
+impl AuthFailReason {
+    pub fn from_u16(v: u16) -> Option<Self> {
+        match v {
+            0x0001 => Some(AuthFailReason::BadCertSignature),
+            0x0002 => Some(AuthFailReason::CertExpired),
+            0x0003 => Some(AuthFailReason::WrongAudience),
+            0x0004 => Some(AuthFailReason::UnknownPrincipal),
+            0x0005 => Some(AuthFailReason::BadProofSignature),
+            0x0006 => Some(AuthFailReason::BadBootstrapToken),
+            0x0007 => Some(AuthFailReason::TokenAlreadyConsumed),
+            0x0008 => Some(AuthFailReason::ProtocolTooOld),
+            0x0009 => Some(AuthFailReason::InvalidParam),
+            _ => None,
         }
     }
 }
@@ -245,10 +324,50 @@ mod tests {
             Op::GetHandleInfo,
             Op::GetPubkey,
             Op::GetCert,
+            Op::Hello,
+            Op::Auth,
+            Op::AuthOk,
+            Op::Enroll,
         ] {
             let v = op as u32;
             assert_eq!(Op::from_u32(v), Some(op), "op {op:?} (0x{v:04x})");
         }
+    }
+
+    #[test]
+    fn op_is_handshake_matches_spec() {
+        for op in [Op::Hello, Op::Auth, Op::AuthOk, Op::Enroll] {
+            assert!(op.is_handshake(), "{op:?} should be handshake");
+            assert!(!op.is_host_only(), "{op:?} is not host-only");
+            assert_eq!(op.required_perm(), None, "{op:?} has no permission bit");
+        }
+        // None of the regular ops are handshake.
+        for op in [
+            Op::GetRandom, Op::KeyGenerate, Op::Encrypt, Op::Decrypt,
+            Op::Sign, Op::Verify, Op::GetCert,
+        ] {
+            assert!(!op.is_handshake(), "{op:?} is not a handshake op");
+        }
+    }
+
+    #[test]
+    fn auth_fail_reason_roundtrips() {
+        for r in [
+            AuthFailReason::BadCertSignature,
+            AuthFailReason::CertExpired,
+            AuthFailReason::WrongAudience,
+            AuthFailReason::UnknownPrincipal,
+            AuthFailReason::BadProofSignature,
+            AuthFailReason::BadBootstrapToken,
+            AuthFailReason::TokenAlreadyConsumed,
+            AuthFailReason::ProtocolTooOld,
+            AuthFailReason::InvalidParam,
+        ] {
+            let v = r as u16;
+            assert_eq!(AuthFailReason::from_u16(v), Some(r), "reason {r:?}");
+        }
+        assert_eq!(AuthFailReason::from_u16(0), None);
+        assert_eq!(AuthFailReason::from_u16(0xFFFF), None);
     }
 
     #[test]
@@ -276,6 +395,10 @@ mod tests {
             Op::GetHandleInfo,
             Op::GetPubkey,
             Op::GetCert,
+            Op::Hello,
+            Op::Auth,
+            Op::AuthOk,
+            Op::Enroll,
         ] {
             assert!(!op.is_host_only(), "{op:?} should be guest-facing");
         }
