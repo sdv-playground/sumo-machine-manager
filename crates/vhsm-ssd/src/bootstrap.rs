@@ -54,13 +54,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// In-memory state of all known bootstrap tokens.
+/// In-memory state of all known bootstrap tokens + pending
+/// enrolments. Tokens are the off-box ENROLL flow (operator-shipped
+/// secret in firmware bank). Pending enrolments are the on-device
+/// ENROLL_ASSISTED flow: the HSM arms a vm_id; the guest then
+/// connects from its pinned source IP, the daemon resolves identity
+/// from the IP, and consumes the pending flag with no secret on
+/// the wire.
 #[derive(Debug)]
 pub struct BootstrapState {
     /// Path the state is persisted at; `save()` writes here.
     path: PathBuf,
-    /// Token records keyed by vm_id.
+    /// Token records keyed by vm_id (off-box ENROLL).
     entries: BTreeMap<String, TokenEntry>,
+    /// Pending enrolment flags keyed by vm_id (in-band ENROLL_ASSISTED).
+    pending: BTreeMap<String, PendingEnrollment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,10 +85,27 @@ pub struct TokenEntry {
     pub bound_cert_thumbprint: Option<String>,
 }
 
+/// In-band enrolment record. No secret bytes — just a "vm_id may
+/// enroll once" flag, set by the host (e.g. vm-mgr at OTA install
+/// time via the HSM) and consumed by the next successful
+/// ENROLL_ASSISTED from that vm_id's pinned source IP.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingEnrollment {
+    /// Unix seconds when the host armed this entry.
+    pub armed_at: u64,
+    /// Optional TTL; the daemon refuses ENROLL_ASSISTED after
+    /// `armed_at + ttl_secs`. None = no expiry (operator manages
+    /// lifecycle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StateFile {
     #[serde(default)]
     tokens: BTreeMap<String, TokenEntry>,
+    #[serde(default)]
+    pending: BTreeMap<String, PendingEnrollment>,
 }
 
 /// Outcome of a [`BootstrapState::consume`] call.
@@ -96,6 +121,20 @@ pub enum ConsumeOutcome {
     AlreadyConsumed,
 }
 
+/// Outcome of a [`BootstrapState::consume_pending`] call (in-band
+/// ENROLL_ASSISTED flow). Mirrors `ConsumeOutcome` but for the
+/// no-secret path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PendingConsumeOutcome {
+    /// Pending flag found + not expired; now removed (single-use).
+    Accepted,
+    /// vm_id has no pending enrolment (never armed, or already
+    /// consumed).
+    NotPending,
+    /// Pending flag found but past its TTL.
+    Expired,
+}
+
 impl BootstrapState {
     /// Load from `path`, creating an empty file if it doesn't exist.
     /// A malformed file is an error — operator should resolve before
@@ -104,11 +143,12 @@ impl BootstrapState {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
             // No prior state — that's fine on a fresh deployment.
-            // Caller will populate via add() before any ENROLL can
-            // succeed.
+            // Caller will populate via add() / arm_pending() before
+            // any ENROLL or ENROLL_ASSISTED can succeed.
             return Ok(Self {
                 path,
                 entries: BTreeMap::new(),
+                pending: BTreeMap::new(),
             });
         }
         let raw = std::fs::read_to_string(&path)?;
@@ -121,13 +161,37 @@ impl BootstrapState {
         Ok(Self {
             path,
             entries: parsed.tokens,
+            pending: parsed.pending,
         })
+    }
+
+    /// Re-read from disk. Used by the daemon when a `consume*` lookup
+    /// misses — handles the case where another process (e.g. vm-mgr
+    /// via `arm_enrollment`) wrote a fresh entry between the daemon's
+    /// startup load and this lookup.
+    pub fn reload(&mut self) -> io::Result<()> {
+        if !self.path.exists() {
+            self.entries.clear();
+            self.pending.clear();
+            return Ok(());
+        }
+        let raw = std::fs::read_to_string(&self.path)?;
+        let parsed: StateFile = serde_yaml::from_str(&raw).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bootstrap.yaml parse: {e}"),
+            )
+        })?;
+        self.entries = parsed.tokens;
+        self.pending = parsed.pending;
+        Ok(())
     }
 
     /// Persist current state to `self.path`. Atomic via tmp+rename.
     pub fn save(&self) -> io::Result<()> {
         let doc = StateFile {
             tokens: self.entries.clone(),
+            pending: self.pending.clone(),
         };
         let yaml = serde_yaml::to_string(&doc).map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("bootstrap.yaml serialise: {e}"))
@@ -204,6 +268,52 @@ impl BootstrapState {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Arm an in-band enrolment for `vm_id`. Called by the host
+    /// (e.g. vm-mgr at OTA install time, via `HsmProvider::arm_enrollment`).
+    /// Existing armed-but-not-consumed entries for the same `vm_id`
+    /// are REPLACED — a re-install resets the clock.
+    ///
+    /// `ttl_secs = None` means no expiry; caller-controlled lifecycle.
+    pub fn arm_pending(&mut self, vm_id: impl Into<String>, ttl_secs: Option<u64>) {
+        let armed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.pending.insert(
+            vm_id.into(),
+            PendingEnrollment { armed_at, ttl_secs },
+        );
+    }
+
+    /// Attempt to consume a pending enrolment. Returns the outcome;
+    /// caller must `save()` if outcome is `Accepted`. The entry is
+    /// removed from the in-memory table on Accepted (single-use).
+    ///
+    /// `now_unix` is passed in so the daemon can pin a deterministic
+    /// clock during tests and avoid TOCTOU between this check and any
+    /// surrounding I/O.
+    pub fn consume_pending(&mut self, vm_id: &str, now_unix: u64) -> PendingConsumeOutcome {
+        let entry = match self.pending.get(vm_id) {
+            Some(e) => e,
+            None => return PendingConsumeOutcome::NotPending,
+        };
+        if let Some(ttl) = entry.ttl_secs {
+            if now_unix.saturating_sub(entry.armed_at) >= ttl {
+                return PendingConsumeOutcome::Expired;
+            }
+        }
+        self.pending.remove(vm_id);
+        PendingConsumeOutcome::Accepted
+    }
+
+    pub fn get_pending(&self, vm_id: &str) -> Option<&PendingEnrollment> {
+        self.pending.get(vm_id)
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 }
 

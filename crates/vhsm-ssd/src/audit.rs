@@ -232,6 +232,7 @@ fn op_name_for(op: Op) -> &'static str {
         Op::Auth => "AUTH",
         Op::AuthOk => "AUTH_OK",
         Op::Enroll => "ENROLL",
+        Op::EnrollAssisted => "ENROLL_ASSISTED",
     }
 }
 

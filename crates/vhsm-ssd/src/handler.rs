@@ -75,7 +75,7 @@ pub fn handle_request(
     // here with a handshake op the dispatcher upstream has a bug —
     // reject with InvalidParam rather than panic so the daemon stays
     // alive.
-    if matches!(op, Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll) {
+    if matches!(op, Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll | Op::EnrollAssisted) {
         tracing::warn!(
             op = ?op,
             vm = %caller.vm_id,
@@ -139,7 +139,7 @@ pub fn handle_request(
         Op::GetCert => handle_get_cert(req, caller, handle_table, crypto),
         // Host-only ops already rejected above
         Op::KeyImport | Op::KeyDerive | Op::KeyDelete => unreachable!(),
-        Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll => unreachable!(),
+        Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll | Op::EnrollAssisted => unreachable!(),
     };
     (resp, outcome)
 }

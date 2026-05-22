@@ -26,7 +26,7 @@ use std::time::SystemTime;
 use hsm::sim::SimHsm;
 use hsm::{HsmCryptoProvider, HsmProvider};
 
-use vhsm_ssd::auth::{self, EnrollContext, HandshakeState, Principal};
+use vhsm_ssd::auth::{self, EnrollContext, HandshakeState, IpResolver, Principal};
 use vhsm_ssd::bootstrap::BootstrapState;
 use vhsm_ssd::cert::EcuSigner;
 use vhsm_ssd::codec;
@@ -65,6 +65,29 @@ impl EcuSigner for HsmEcuSigner {
     }
 }
 
+/// In-process IP→vm_id resolver. Populated from `--ip-map` CLI args
+/// (or, when SimHsm is the spawner, from `hsm.allow:` entries in the
+/// supernova-mm config that already enumerate the same `(ip, vm_id)`
+/// pairs). Used ONLY by ENROLL_ASSISTED — every other op derives
+/// identity from the cert.
+struct StaticIpResolver {
+    table: std::collections::HashMap<IpAddr, String>,
+}
+
+impl StaticIpResolver {
+    fn new(entries: Vec<(IpAddr, String)>) -> Self {
+        Self {
+            table: entries.into_iter().collect(),
+        }
+    }
+}
+
+impl IpResolver for StaticIpResolver {
+    fn resolve(&self, ip: &IpAddr) -> Option<String> {
+        self.table.get(ip).cloned()
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -85,6 +108,7 @@ fn main() {
     let mut audit_log_max_bytes: u64 = vhsm_ssd::audit::DEFAULT_MAX_BYTES;
     let mut audit_log_max_rotated: u32 = vhsm_ssd::audit::DEFAULT_MAX_ROTATED;
     let mut issuer: String = DEFAULT_ISSUER.to_string();
+    let mut ip_map: Vec<(IpAddr, String)> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -143,6 +167,21 @@ fn main() {
                     eprintln!("invalid --audit-log-max-rotated '{}': {e}", args[i + 1]);
                     std::process::exit(1);
                 });
+                i += 2;
+            }
+            "--ip-map" if i + 1 < args.len() => {
+                // Format: <ip>=<vm_id>. Repeatable. Used ONLY by
+                // ENROLL_ASSISTED to resolve source IP → vm_id.
+                let raw = &args[i + 1];
+                let (ip_str, vm_id) = raw.split_once('=').unwrap_or_else(|| {
+                    eprintln!("invalid --ip-map '{raw}': expected <ip>=<vm_id>");
+                    std::process::exit(1);
+                });
+                let ip: IpAddr = ip_str.parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --ip-map IP '{ip_str}': {e}");
+                    std::process::exit(1);
+                });
+                ip_map.push((ip, vm_id.to_string()));
                 i += 2;
             }
             "--help" | "-h" => {
@@ -255,6 +294,20 @@ fn main() {
     let signer: Arc<dyn EcuSigner> = Arc::new(HsmEcuSigner {
         crypto: Arc::clone(&crypto),
     });
+
+    // IP → vm_id resolver for the ENROLL_ASSISTED handshake. Empty
+    // map = ENROLL_ASSISTED disabled; off-box ENROLL with explicit
+    // tokens still works. Operators typically populate this with the
+    // same `(ip, vm_id)` pairs they use for guest bridge config.
+    let ip_resolver: Arc<dyn IpResolver> = Arc::new(StaticIpResolver::new(ip_map.clone()));
+    if !ip_map.is_empty() {
+        tracing::info!(
+            entries = ip_map.len(),
+            "ENROLL_ASSISTED enabled — IP-to-vm_id resolver configured"
+        );
+    } else {
+        tracing::info!("ENROLL_ASSISTED disabled (no --ip-map entries)");
+    }
 
     // Initialize handle table with well-known handles from keystore
     let mut table = init_handle_table(&*crypto);
@@ -389,6 +442,7 @@ fn main() {
         let store = store.clone();
         let audit = Arc::clone(&audit);
         let issuer = issuer.clone();
+        let ip_resolver = Arc::clone(&ip_resolver);
 
         let join = std::thread::Builder::new()
             .name(format!("vhsm-ssd-{peer_ip}"))
@@ -402,6 +456,7 @@ fn main() {
                     &*signer,
                     &issuer,
                     cert_max_age_secs,
+                    &*ip_resolver,
                     &handle_table,
                     &*crypto,
                     store.as_deref(),
@@ -427,6 +482,7 @@ fn serve_connection(
     signer: &dyn EcuSigner,
     issuer: &str,
     cert_lifetime_secs: u64,
+    ip_resolver: &dyn IpResolver,
     handle_table: &Arc<Mutex<HandleTable>>,
     crypto: &dyn HsmCryptoProvider,
     store: Option<&Secstore<LinuxSimEncryptor, FileBackend>>,
@@ -466,6 +522,8 @@ fn serve_connection(
                     signer,
                     issuer,
                     cert_lifetime_secs,
+                    peer_ip: Some(peer_ip),
+                    ip_resolver: Some(ip_resolver),
                 };
                 auth::step(
                     &mut hs_state,

@@ -31,6 +31,7 @@
 //! direction. Security properties are identical; the client still
 //! gets a server-chosen nonce before having to sign anything.
 
+use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use p256::ecdsa::{signature::Verifier as _, Signature, VerifyingKey};
@@ -38,10 +39,24 @@ use p256::EncodedPoint;
 use rand::RngCore as _;
 use sha2::{Digest, Sha256};
 
-use crate::bootstrap::{BootstrapState, ConsumeOutcome};
+use crate::bootstrap::{BootstrapState, ConsumeOutcome, PendingConsumeOutcome};
 use crate::cert::{mint_cwt, validate as validate_cert, EcuSigner, ParsedCert};
 use crate::iam::IamPolicy;
 use crate::proto::{AuthFailReason, Op, Request, Response, StatusCode};
+
+/// Resolves a source IP address to a vm_id. Used during the
+/// ENROLL_ASSISTED handshake to identify the connecting guest
+/// without a cert — the only pre-AUTH op where transport-level
+/// identity is consulted.
+///
+/// Implementations are expected to be small, in-memory lookups
+/// against an operator-configured table (e.g. `hsm.allow:` entries
+/// in supernova-mm's config.yaml). A reverse-DNS or kernel-side
+/// lookup is NOT appropriate — the daemon needs the same view of
+/// identity that vm-mgr's `arm_enrollment` used.
+pub trait IpResolver: Send + Sync {
+    fn resolve(&self, ip: &IpAddr) -> Option<String>;
+}
 
 /// Domain-separation tag mixed into the proof-of-possession
 /// signature. Prevents a misuse where an attacker reuses a signature
@@ -127,6 +142,14 @@ pub struct EnrollContext<'a> {
     /// CWT lifetime in seconds. Daemon's `--cert-max-age` setting,
     /// typically 30–365 days.
     pub cert_lifetime_secs: u64,
+    /// Source IP that opened the connection. Consulted only by
+    /// ENROLL_ASSISTED — AUTH/ENROLL ignore it. None means the
+    /// daemon couldn't (or chose not to) record the peer; that
+    /// disables ENROLL_ASSISTED for the connection.
+    pub peer_ip: Option<IpAddr>,
+    /// IP → vm_id resolver, consulted only by ENROLL_ASSISTED.
+    /// None means no resolver configured; ENROLL_ASSISTED is rejected.
+    pub ip_resolver: Option<&'a dyn IpResolver>,
 }
 
 impl Default for HandshakeState {
@@ -165,6 +188,10 @@ pub fn step(
         }
         (Op::Enroll, HandshakeState::NonceSent { .. }) => match enroll {
             Some(ctx) => handle_enroll(state, req, ctx, now),
+            None => reject(state, req, AuthFailReason::InvalidParam),
+        },
+        (Op::EnrollAssisted, HandshakeState::NonceSent { .. }) => match enroll {
+            Some(ctx) => handle_enroll_assisted(state, req, ctx, now),
             None => reject(state, req, AuthFailReason::InvalidParam),
         },
         // Out-of-order ops: a client that sends AUTH before HELLO,
@@ -392,6 +419,122 @@ fn parse_enroll_payload(payload: &[u8]) -> Option<(&str, &[u8], &[u8])> {
         return None; // exact frame, no trailing bytes
     }
     Some((vm_id, token, cur))
+}
+
+/// ENROLL_ASSISTED handler. Wire payload:
+///
+/// ```text
+///   [1]   csr_pub_len   u8 (MUST be 65)
+///   [65]  csr_pub       SEC1 uncompressed P-256 (`0x04 || x || y`)
+/// ```
+///
+/// No vm_id, no token. The daemon resolves the vm_id from the
+/// connection's source IP via `ctx.ip_resolver` and looks up a
+/// pending-enrolment flag (armed by the host's `arm_enrollment`
+/// call). On success the daemon mints a CWT bound to `csr_pub`,
+/// records the consume on the bootstrap state file, and returns the
+/// CWT in the response payload (same shape as ENROLL).
+///
+/// All resolver failures (no peer_ip, no resolver, IP not in the
+/// table, no pending flag) collapse to `BadBootstrapToken` so the
+/// daemon doesn't leak which step failed.
+fn handle_enroll_assisted(
+    state: &mut HandshakeState,
+    req: &Request,
+    ctx: &mut EnrollContext<'_>,
+    now: SystemTime,
+) -> Response {
+    // Resolve identity from source IP.
+    let peer_ip = match ctx.peer_ip {
+        Some(ip) => ip,
+        None => return reject(state, req, AuthFailReason::BadBootstrapToken),
+    };
+    let resolver = match ctx.ip_resolver {
+        Some(r) => r,
+        None => return reject(state, req, AuthFailReason::BadBootstrapToken),
+    };
+    let vm_id = match resolver.resolve(&peer_ip) {
+        Some(v) => v,
+        None => return reject(state, req, AuthFailReason::BadBootstrapToken),
+    };
+
+    // Parse + validate the csr_pub.
+    let csr_pub = match parse_enroll_assisted_payload(&req.payload) {
+        Some(p) => p,
+        None => return reject(state, req, AuthFailReason::InvalidParam),
+    };
+    if csr_pub.len() != 65 || csr_pub[0] != 0x04 {
+        return reject(state, req, AuthFailReason::InvalidParam);
+    }
+    let csr_x = &csr_pub[1..33];
+    let csr_y = &csr_pub[33..65];
+
+    let iat = match now.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return reject(state, req, AuthFailReason::InvalidParam),
+    };
+    let exp = iat.saturating_add(ctx.cert_lifetime_secs);
+
+    // Mint first; thumbprint is derived from the CWT bytes and
+    // recorded in the pending-consume audit trail.
+    let cwt_bytes = match mint_cwt(ctx.signer, &vm_id, ctx.issuer, csr_x, csr_y, iat, exp) {
+        Ok(b) => b,
+        Err(_) => return reject(state, req, AuthFailReason::InvalidParam),
+    };
+    let thumbprint = sha256(&cwt_bytes);
+
+    // Look up the pending flag. On miss, reload from disk once and
+    // retry — handles the case where vm-mgr armed this vm_id after
+    // the daemon's startup load.
+    let outcome = match ctx.bootstrap.consume_pending(&vm_id, iat) {
+        PendingConsumeOutcome::Accepted => PendingConsumeOutcome::Accepted,
+        PendingConsumeOutcome::NotPending => {
+            if let Err(e) = ctx.bootstrap.reload() {
+                tracing::warn!(error = %e, "bootstrap reload failed during ENROLL_ASSISTED");
+                return reject(state, req, AuthFailReason::BadBootstrapToken);
+            }
+            ctx.bootstrap.consume_pending(&vm_id, iat)
+        }
+        other => other,
+    };
+    match outcome {
+        PendingConsumeOutcome::Accepted => {}
+        PendingConsumeOutcome::NotPending => {
+            return reject(state, req, AuthFailReason::BadBootstrapToken);
+        }
+        PendingConsumeOutcome::Expired => {
+            return reject(state, req, AuthFailReason::TokenAlreadyConsumed);
+        }
+    }
+
+    if let Err(e) = ctx.bootstrap.save() {
+        tracing::error!(
+            error = %e,
+            vm_id = %vm_id,
+            "bootstrap state save failed; rejecting ENROLL_ASSISTED"
+        );
+        return reject(state, req, AuthFailReason::InvalidParam);
+    }
+
+    *state = HandshakeState::Enrolled {
+        vm_id: vm_id.clone(),
+        cert_thumbprint: thumbprint,
+    };
+    Response::ok(Op::EnrollAssisted as u32, req.session_id, cwt_bytes)
+}
+
+/// Decode the ENROLL_ASSISTED payload. Returns the csr_pub slice on
+/// success; None on framing error.
+fn parse_enroll_assisted_payload(payload: &[u8]) -> Option<&[u8]> {
+    if payload.is_empty() {
+        return None;
+    }
+    let csr_pub_len = payload[0] as usize;
+    let rest = &payload[1..];
+    if rest.len() != csr_pub_len {
+        return None;
+    }
+    Some(rest)
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -884,6 +1027,8 @@ statements:
             signer: &local_signer,
             issuer: "device-test",
             cert_lifetime_secs: 86_400,
+            peer_ip: None,
+            ip_resolver: None,
         };
 
         let mut state = HandshakeState::new();
@@ -936,6 +1081,8 @@ statements:
                 signer: &local_signer,
                 issuer: "device-test",
                 cert_lifetime_secs: 86_400,
+                peer_ip: None,
+                ip_resolver: None,
             };
             let mut state = HandshakeState::new();
             drive_hello(&mut state, &signer_pub, &policy, now);
@@ -957,6 +1104,8 @@ statements:
             signer: &local_signer,
             issuer: "device-test",
             cert_lifetime_secs: 86_400,
+            peer_ip: None,
+            ip_resolver: None,
         };
         let mut state2 = HandshakeState::new();
         drive_hello(&mut state2, &signer_pub, &policy, now);
@@ -990,6 +1139,8 @@ statements:
             signer: &local_signer,
             issuer: "device-test",
             cert_lifetime_secs: 86_400,
+            peer_ip: None,
+            ip_resolver: None,
         };
 
         let mut state = HandshakeState::new();
@@ -1022,6 +1173,8 @@ statements:
             signer: &local_signer,
             issuer: "device-test",
             cert_lifetime_secs: 86_400,
+            peer_ip: None,
+            ip_resolver: None,
         };
 
         let mut state = HandshakeState::new();
@@ -1053,6 +1206,8 @@ statements:
             signer: &local_signer,
             issuer: "device-test",
             cert_lifetime_secs: 86_400,
+            peer_ip: None,
+            ip_resolver: None,
         };
 
         let mut state = HandshakeState::new();
@@ -1085,6 +1240,8 @@ statements:
             signer: &local_signer,
             issuer: "device-test",
             cert_lifetime_secs: 86_400,
+            peer_ip: None,
+            ip_resolver: None,
         };
 
         // CSR pub is the wrong length (64 bytes instead of 65, no 0x04 prefix).
@@ -1123,6 +1280,8 @@ statements:
             signer: &local_signer,
             issuer: "device-test",
             cert_lifetime_secs: 86_400,
+            peer_ip: None,
+            ip_resolver: None,
         };
 
         let mut state = HandshakeState::new();
@@ -1185,6 +1344,8 @@ statements:
                 signer: &local_signer,
                 issuer: "device-test",
                 cert_lifetime_secs: 86_400,
+                peer_ip: None,
+                ip_resolver: None,
             };
             let mut state = HandshakeState::new();
             drive_hello(&mut state, &signer_pub, &policy, now);
@@ -1228,4 +1389,291 @@ statements:
         assert_eq!(p.vm_id, "vm2");
     }
 
+    // ---- ENROLL_ASSISTED tests ------------------------------------
+
+    use std::net::Ipv4Addr;
+
+    /// Fixed-table IpResolver for tests.
+    struct TestResolver(Vec<(IpAddr, String)>);
+
+    impl IpResolver for TestResolver {
+        fn resolve(&self, ip: &IpAddr) -> Option<String> {
+            self.0.iter().find(|(i, _)| i == ip).map(|(_, v)| v.clone())
+        }
+    }
+
+    fn encode_enroll_assisted_payload(csr_pub: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + csr_pub.len());
+        out.push(csr_pub.len() as u8);
+        out.extend_from_slice(csr_pub);
+        out
+    }
+
+    #[test]
+    fn enroll_assisted_happy_path_consumes_pending_and_mints_cwt() {
+        let (signer, signer_pub, _principal, principal_pub) = fixture();
+        let policy = sample_policy();
+        let now = fixed_time(1_500_000);
+        let (mut bootstrap, _tmp) = fresh_bootstrap();
+        // Host pre-arms vm9 (vm-mgr would have called arm_enrollment).
+        bootstrap.arm_pending("vm9", Some(3600));
+        bootstrap.save().unwrap();
+
+        let local_signer = LocalEcuSigner::new(signer.clone());
+        let resolver = TestResolver(vec![(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 201, 2)),
+            "vm9".to_string(),
+        )]);
+        let mut ctx = EnrollContext {
+            bootstrap: &mut bootstrap,
+            signer: &local_signer,
+            issuer: "device-test",
+            cert_lifetime_secs: 86_400,
+            peer_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 201, 2))),
+            ip_resolver: Some(&resolver),
+        };
+
+        let mut state = HandshakeState::new();
+        drive_hello(&mut state, &signer_pub, &policy, now);
+
+        let resp = step(
+            &mut state,
+            &Request {
+                op: Op::EnrollAssisted as u32,
+                session_id: 1,
+                payload: encode_enroll_assisted_payload(&principal_pub),
+            },
+            &signer_pub, &policy, Some(&mut ctx), now,
+        );
+        assert_eq!(resp.status, StatusCode::Ok as u32);
+        assert_eq!(resp.op, Op::EnrollAssisted as u32);
+        assert!(!resp.payload.is_empty(), "CWT bytes should be returned");
+
+        // Terminal Enrolled state with the right vm_id.
+        assert!(matches!(state, HandshakeState::Enrolled { ref vm_id, .. } if vm_id == "vm9"));
+
+        // CWT validates against the signer pub and binds the right subject.
+        let parsed = validate_cert(&resp.payload, &signer_pub, fixed_time(1_500_100)).unwrap();
+        assert_eq!(parsed.subject, "vm9");
+        assert_eq!(parsed.cnf_pubkey, principal_pub);
+
+        // Pending flag is gone (single-use).
+        assert!(bootstrap.get_pending("vm9").is_none());
+    }
+
+    #[test]
+    fn enroll_assisted_unknown_ip_returns_bad_bootstrap_token() {
+        let (signer, signer_pub, _principal, principal_pub) = fixture();
+        let policy = sample_policy();
+        let now = fixed_time(1_500_000);
+        let (mut bootstrap, _tmp) = fresh_bootstrap();
+        bootstrap.arm_pending("vm9", None);
+
+        let local_signer = LocalEcuSigner::new(signer.clone());
+        // Empty resolver: peer IP isn't recognised.
+        let resolver = TestResolver(vec![]);
+        let mut ctx = EnrollContext {
+            bootstrap: &mut bootstrap,
+            signer: &local_signer,
+            issuer: "device-test",
+            cert_lifetime_secs: 86_400,
+            peer_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 201, 2))),
+            ip_resolver: Some(&resolver),
+        };
+
+        let mut state = HandshakeState::new();
+        drive_hello(&mut state, &signer_pub, &policy, now);
+        let resp = step(
+            &mut state,
+            &Request {
+                op: Op::EnrollAssisted as u32,
+                session_id: 1,
+                payload: encode_enroll_assisted_payload(&principal_pub),
+            },
+            &signer_pub, &policy, Some(&mut ctx), now,
+        );
+        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
+            resp.payload[0], resp.payload[1],
+        ]));
+        assert_eq!(reason, Some(AuthFailReason::BadBootstrapToken));
+
+        // Pending flag MUST remain — failed lookup doesn't consume.
+        assert!(bootstrap.get_pending("vm9").is_some());
+    }
+
+    #[test]
+    fn enroll_assisted_no_pending_returns_bad_bootstrap_token() {
+        // IP resolves but the resolved vm_id has no pending flag —
+        // collapses to BadBootstrapToken (same wire signal as unknown IP).
+        let (signer, signer_pub, _principal, principal_pub) = fixture();
+        let policy = sample_policy();
+        let now = fixed_time(1_500_000);
+        let (mut bootstrap, _tmp) = fresh_bootstrap();
+        // Note: no arm_pending call.
+
+        let local_signer = LocalEcuSigner::new(signer.clone());
+        let resolver = TestResolver(vec![(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 201, 2)),
+            "vm9".to_string(),
+        )]);
+        let mut ctx = EnrollContext {
+            bootstrap: &mut bootstrap,
+            signer: &local_signer,
+            issuer: "device-test",
+            cert_lifetime_secs: 86_400,
+            peer_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 201, 2))),
+            ip_resolver: Some(&resolver),
+        };
+
+        let mut state = HandshakeState::new();
+        drive_hello(&mut state, &signer_pub, &policy, now);
+        let resp = step(
+            &mut state,
+            &Request {
+                op: Op::EnrollAssisted as u32,
+                session_id: 1,
+                payload: encode_enroll_assisted_payload(&principal_pub),
+            },
+            &signer_pub, &policy, Some(&mut ctx), now,
+        );
+        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
+            resp.payload[0], resp.payload[1],
+        ]));
+        assert_eq!(reason, Some(AuthFailReason::BadBootstrapToken));
+    }
+
+    #[test]
+    fn enroll_assisted_expired_returns_token_already_consumed() {
+        // armed_at=now-2h, ttl=1h → expired.
+        let (signer, signer_pub, _principal, principal_pub) = fixture();
+        let policy = sample_policy();
+        let now = fixed_time(1_500_000);
+        let (mut bootstrap, _tmp) = fresh_bootstrap();
+        // Inject a stale armed_at by reaching into the table directly
+        // (the public API uses SystemTime::now() so we can't easily
+        // pin armed_at; cheat for the test fixture).
+        bootstrap.arm_pending("vm9", Some(3600));
+        {
+            // Hack: replace the entry to set armed_at in the past.
+            let mut state_yaml = String::new();
+            state_yaml.push_str("tokens: {}\n");
+            state_yaml.push_str("pending:\n");
+            state_yaml.push_str("  vm9:\n");
+            // 7200s ago relative to now (1_500_000).
+            state_yaml.push_str(&format!("    armed_at: {}\n", 1_500_000 - 7200));
+            state_yaml.push_str("    ttl_secs: 3600\n");
+            std::fs::write(_tmp.path().join("bootstrap.yaml"), state_yaml).unwrap();
+            bootstrap.reload().unwrap();
+        }
+
+        let local_signer = LocalEcuSigner::new(signer.clone());
+        let resolver = TestResolver(vec![(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 201, 2)),
+            "vm9".to_string(),
+        )]);
+        let mut ctx = EnrollContext {
+            bootstrap: &mut bootstrap,
+            signer: &local_signer,
+            issuer: "device-test",
+            cert_lifetime_secs: 86_400,
+            peer_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 201, 2))),
+            ip_resolver: Some(&resolver),
+        };
+
+        let mut state = HandshakeState::new();
+        drive_hello(&mut state, &signer_pub, &policy, now);
+        let resp = step(
+            &mut state,
+            &Request {
+                op: Op::EnrollAssisted as u32,
+                session_id: 1,
+                payload: encode_enroll_assisted_payload(&principal_pub),
+            },
+            &signer_pub, &policy, Some(&mut ctx), now,
+        );
+        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
+            resp.payload[0], resp.payload[1],
+        ]));
+        assert_eq!(reason, Some(AuthFailReason::TokenAlreadyConsumed));
+    }
+
+    #[test]
+    fn enroll_assisted_no_peer_ip_rejected() {
+        let (signer, signer_pub, _principal, principal_pub) = fixture();
+        let policy = sample_policy();
+        let now = fixed_time(1_500_000);
+        let (mut bootstrap, _tmp) = fresh_bootstrap();
+        bootstrap.arm_pending("vm9", None);
+        let local_signer = LocalEcuSigner::new(signer.clone());
+        let resolver = TestResolver(vec![]);
+        let mut ctx = EnrollContext {
+            bootstrap: &mut bootstrap,
+            signer: &local_signer,
+            issuer: "device-test",
+            cert_lifetime_secs: 86_400,
+            peer_ip: None,
+            ip_resolver: Some(&resolver),
+        };
+
+        let mut state = HandshakeState::new();
+        drive_hello(&mut state, &signer_pub, &policy, now);
+        let resp = step(
+            &mut state,
+            &Request {
+                op: Op::EnrollAssisted as u32,
+                session_id: 1,
+                payload: encode_enroll_assisted_payload(&principal_pub),
+            },
+            &signer_pub, &policy, Some(&mut ctx), now,
+        );
+        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
+            resp.payload[0], resp.payload[1],
+        ]));
+        assert_eq!(reason, Some(AuthFailReason::BadBootstrapToken));
+    }
+
+    #[test]
+    fn enroll_assisted_reloads_state_on_miss() {
+        // Daemon's in-memory state is empty, but the on-disk file has
+        // an armed entry (written by vm-mgr after daemon startup).
+        // The lookup must reload-from-disk and find it.
+        let (signer, signer_pub, _principal, principal_pub) = fixture();
+        let policy = sample_policy();
+        let now = fixed_time(1_500_000);
+        let (mut bootstrap, tmp) = fresh_bootstrap();
+        // Bootstrap is empty in-memory; arm vm9 by writing the file
+        // directly (simulating an out-of-process write by vm-mgr).
+        let mut other = BootstrapState::load(tmp.path().join("bootstrap.yaml")).unwrap();
+        other.arm_pending("vm9", None);
+        other.save().unwrap();
+        // Don't reload `bootstrap`; the handler should do it on miss.
+        assert!(bootstrap.get_pending("vm9").is_none(), "in-memory miss");
+
+        let local_signer = LocalEcuSigner::new(signer.clone());
+        let resolver = TestResolver(vec![(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 201, 2)),
+            "vm9".to_string(),
+        )]);
+        let mut ctx = EnrollContext {
+            bootstrap: &mut bootstrap,
+            signer: &local_signer,
+            issuer: "device-test",
+            cert_lifetime_secs: 86_400,
+            peer_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 201, 2))),
+            ip_resolver: Some(&resolver),
+        };
+
+        let mut state = HandshakeState::new();
+        drive_hello(&mut state, &signer_pub, &policy, now);
+        let resp = step(
+            &mut state,
+            &Request {
+                op: Op::EnrollAssisted as u32,
+                session_id: 1,
+                payload: encode_enroll_assisted_payload(&principal_pub),
+            },
+            &signer_pub, &policy, Some(&mut ctx), now,
+        );
+        assert_eq!(resp.status, StatusCode::Ok as u32, "reload should have surfaced the entry");
+    }
 }

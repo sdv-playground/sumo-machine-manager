@@ -63,6 +63,12 @@ pub enum Op {
     Auth = 0x00F1,
     AuthOk = 0x00F2,
     Enroll = 0x00F3,
+    /// In-band enrolment: host pre-arms the vm_id via
+    /// `HsmProvider::arm_enrollment`; guest sends just its CSR pubkey
+    /// and the daemon resolves identity from the source IP. No
+    /// bootstrap token bytes ever cross the wire. See §11.4-bis in the
+    /// protocol spec.
+    EnrollAssisted = 0x00F4,
 }
 
 impl Op {
@@ -86,6 +92,7 @@ impl Op {
             0x00F1 => Some(Op::Auth),
             0x00F2 => Some(Op::AuthOk),
             0x00F3 => Some(Op::Enroll),
+            0x00F4 => Some(Op::EnrollAssisted),
             _ => None,
         }
     }
@@ -96,11 +103,15 @@ impl Op {
     }
 
     /// True if this is a connection-handshake op (HELLO / AUTH /
-    /// AUTH_OK / ENROLL). The handler dispatch table skips these
-    /// — they're consumed by the accept-loop's auth state machine
-    /// before any handle-bearing op can be dispatched.
+    /// AUTH_OK / ENROLL / ENROLL_ASSISTED). The handler dispatch
+    /// table skips these — they're consumed by the accept-loop's
+    /// auth state machine before any handle-bearing op can be
+    /// dispatched.
     pub fn is_handshake(self) -> bool {
-        matches!(self, Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll)
+        matches!(
+            self,
+            Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll | Op::EnrollAssisted
+        )
     }
 
     /// Permission bit required for this operation, if applicable.
@@ -122,7 +133,7 @@ impl Op {
             // resolution; they have their own authn check (the
             // proof-of-possession signature in AUTH, the
             // bootstrap-token comparison in ENROLL).
-            Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll => None,
+            Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll | Op::EnrollAssisted => None,
         }
     }
 }
@@ -328,6 +339,7 @@ mod tests {
             Op::Auth,
             Op::AuthOk,
             Op::Enroll,
+            Op::EnrollAssisted,
         ] {
             let v = op as u32;
             assert_eq!(Op::from_u32(v), Some(op), "op {op:?} (0x{v:04x})");

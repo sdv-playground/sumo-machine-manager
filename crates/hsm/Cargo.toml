@@ -10,6 +10,7 @@ libc = "0.2"
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+serde_yaml = "0.9"
 coset = { version = "0.3", default-features = false }
 
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main", optional = true }

@@ -752,6 +752,100 @@ impl HsmProvider for SimHsm {
         Ok(())
     }
 
+    /// Arm an in-band ENROLL_ASSISTED for `vm_id` by editing the
+    /// bootstrap state file shared with vhsm-ssd. The daemon picks
+    /// up the new entry via its reload-on-miss path; no daemon
+    /// restart needed.
+    ///
+    /// Implementation: read-modify-write of `<keystore>/bootstrap.yaml`
+    /// with atomic tmp+rename. The YAML schema is mirrored from
+    /// `vhsm-ssd::bootstrap::BootstrapState` — duplicated here to
+    /// avoid the cycle (vhsm-ssd already depends on hsm).
+    fn arm_enrollment(&mut self, vm_id: &str, ttl_secs: Option<u64>) -> Result<(), HsmError> {
+        let path = self.keystore_path.join("bootstrap.yaml");
+        let armed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Load existing state (or empty if missing).
+        let mut doc: serde_yaml::Value = if path.exists() {
+            let raw = std::fs::read_to_string(&path).map_err(|e| {
+                HsmError::ProcessError(format!("read {}: {e}", path.display()))
+            })?;
+            serde_yaml::from_str(&raw).map_err(|e| {
+                HsmError::ProcessError(format!("parse {}: {e}", path.display()))
+            })?
+        } else {
+            serde_yaml::Value::Mapping(Default::default())
+        };
+
+        let map = doc.as_mapping_mut().ok_or_else(|| {
+            HsmError::ProcessError(format!("{} root is not a mapping", path.display()))
+        })?;
+
+        // Ensure `tokens:` exists (mirrors what vhsm-ssd writes via save()).
+        map.entry(serde_yaml::Value::from("tokens"))
+            .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+
+        // Upsert pending[vm_id] = { armed_at, ttl_secs? }.
+        let pending_v = map
+            .entry(serde_yaml::Value::from("pending"))
+            .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+        let pending = pending_v.as_mapping_mut().ok_or_else(|| {
+            HsmError::ProcessError(format!("{} `pending` is not a mapping", path.display()))
+        })?;
+        let mut entry = serde_yaml::Mapping::new();
+        entry.insert(
+            serde_yaml::Value::from("armed_at"),
+            serde_yaml::Value::from(armed_at),
+        );
+        if let Some(ttl) = ttl_secs {
+            entry.insert(
+                serde_yaml::Value::from("ttl_secs"),
+                serde_yaml::Value::from(ttl),
+            );
+        }
+        pending.insert(
+            serde_yaml::Value::from(vm_id),
+            serde_yaml::Value::Mapping(entry),
+        );
+
+        // Atomic write.
+        let yaml = serde_yaml::to_string(&doc).map_err(|e| {
+            HsmError::ProcessError(format!("serialise bootstrap.yaml: {e}"))
+        })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                HsmError::ProcessError(format!("mkdir {}: {e}", parent.display()))
+            })?;
+        }
+        let tmp = path.with_extension("yaml.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp).map_err(|e| {
+                HsmError::ProcessError(format!("create {}: {e}", tmp.display()))
+            })?;
+            f.write_all(yaml.as_bytes()).map_err(|e| {
+                HsmError::ProcessError(format!("write {}: {e}", tmp.display()))
+            })?;
+            f.sync_data().map_err(|e| {
+                HsmError::ProcessError(format!("sync {}: {e}", tmp.display()))
+            })?;
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            HsmError::ProcessError(format!("rename {} → {}: {e}", tmp.display(), path.display()))
+        })?;
+
+        tracing::info!(
+            vm_id = %vm_id,
+            ttl_secs,
+            path = %path.display(),
+            "armed ENROLL_ASSISTED for vm_id (vhsm-ssd picks up via reload-on-miss)"
+        );
+        Ok(())
+    }
+
     fn list_keys(&self) -> Result<Vec<KeyInfo>, HsmError> {
         if !self.is_provisioned()? {
             return Err(HsmError::NotProvisioned);
@@ -1576,5 +1670,60 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn arm_enrollment_writes_pending_to_bootstrap_yaml() {
+        // Smoke test: arm a vm_id, parse bootstrap.yaml back, check
+        // the pending entry has the right shape vhsm-ssd::BootstrapState
+        // expects.
+        let tmp = tempfile::tempdir().unwrap();
+        let keystore = tmp.path().to_path_buf();
+        let mut sim = SimHsm::new(PathBuf::from("unused"), keystore.clone(), 0);
+        sim.arm_enrollment("vm9", Some(3600)).unwrap();
+
+        let yaml = std::fs::read_to_string(keystore.join("bootstrap.yaml")).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let pending = &parsed["pending"]["vm9"];
+        assert!(pending.is_mapping(), "pending entry should be a map; got: {yaml}");
+        assert_eq!(pending["ttl_secs"].as_u64(), Some(3600));
+        assert!(pending["armed_at"].as_u64().is_some());
+    }
+
+    #[test]
+    fn arm_enrollment_preserves_existing_tokens() {
+        // If an off-box ENROLL flow already populated the `tokens:`
+        // map, arming an ENROLL_ASSISTED entry MUST NOT clobber it.
+        let tmp = tempfile::tempdir().unwrap();
+        let keystore = tmp.path().to_path_buf();
+        let path = keystore.join("bootstrap.yaml");
+        std::fs::write(
+            &path,
+            "tokens:\n  vm1:\n    sha256: deadbeef\n    consumed: false\n",
+        )
+        .unwrap();
+
+        let mut sim = SimHsm::new(PathBuf::from("unused"), keystore.clone(), 0);
+        sim.arm_enrollment("vm9", None).unwrap();
+
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        // Both still there.
+        assert_eq!(parsed["tokens"]["vm1"]["sha256"], "deadbeef");
+        assert!(parsed["pending"]["vm9"].is_mapping());
+    }
+
+    #[test]
+    fn arm_enrollment_replaces_existing_pending_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keystore = tmp.path().to_path_buf();
+        let mut sim = SimHsm::new(PathBuf::from("unused"), keystore.clone(), 0);
+        sim.arm_enrollment("vm9", Some(1)).unwrap();
+        // Re-arm with a different TTL — entry should be replaced.
+        sim.arm_enrollment("vm9", Some(9999)).unwrap();
+
+        let yaml = std::fs::read_to_string(keystore.join("bootstrap.yaml")).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed["pending"]["vm9"]["ttl_secs"].as_u64(), Some(9999));
     }
 }

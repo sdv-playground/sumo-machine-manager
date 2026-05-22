@@ -124,6 +124,25 @@ pub trait HsmProvider: Send {
         Err(HsmError::NotSupported("HsmProvider::sign".into()))
     }
 
+    /// Arm an in-band ENROLL_ASSISTED for `vm_id`. Used by vm-mgr at
+    /// OTA install time: after staging a guest's firmware bank, the
+    /// orchestrator calls this so the daemon will accept the guest's
+    /// next HELLO → ENROLL_ASSISTED handshake. No secret bytes — the
+    /// guest's identity is the source IP, configured in the daemon's
+    /// `--ip-map` resolver.
+    ///
+    /// `ttl_secs = None` means no expiry (operator-managed lifecycle).
+    /// Re-arming an already-armed vm_id replaces the entry (resets the
+    /// clock); re-arming after a successful consume re-enables enrolment
+    /// (used for cert rotation).
+    ///
+    /// Default impl returns `NotSupported`; concrete providers
+    /// (SimHsm today; HSE-backed later) override.
+    fn arm_enrollment(&mut self, vm_id: &str, ttl_secs: Option<u64>) -> Result<(), HsmError> {
+        let _ = (vm_id, ttl_secs);
+        Err(HsmError::NotSupported("HsmProvider::arm_enrollment".into()))
+    }
+
     /// ECDSA-SHA256 verify delegated to the HSM. Mirror of `sign`,
     /// used by `sumo-verify` on the management path.
     fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
