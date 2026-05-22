@@ -2494,6 +2494,42 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             Err(ota::OtaError::AlreadyCommitted) => {} // CRL or idempotent commit — OK
             Err(e) => return Err(map_ota_error(e)),
         }
+        // Drop the NV write lock before acquiring the HSM mutex —
+        // arm_enrollment may itself touch on-disk state.
+        drop(nv);
+
+        // Arm in-band enrolment for this VM's principal. The guest
+        // will boot the just-promoted bank, connect to vhsm-ssd,
+        // and run HELLO → ENROLL_ASSISTED; the daemon resolves
+        // identity by source IP and consumes this pending flag.
+        // Non-VM banks (e.g. host-os, hsm) skip — enrol is a
+        // vm-principal concept.
+        if matches!(self.bank_set, BankSet::Vm1 | BankSet::Vm2) {
+            if let Some(ref hsm) = self.hsm_provider {
+                let mut guard = hsm.lock().map_err(|_| {
+                    BackendError::Internal("hsm provider mutex poisoned".into())
+                })?;
+                // ttl=None: operator-managed lifecycle. Pending stays
+                // until consumed; re-installs simply re-arm.
+                if let Err(e) = guard.arm_enrollment(&self.entity_info.id, None) {
+                    // Non-fatal — operator can re-arm manually, or the
+                    // existing cert (if any) lets the guest keep
+                    // working. Trial-boot rollback also handles the
+                    // "new bank can't enrol" case.
+                    tracing::warn!(
+                        vm_id = %self.entity_info.id,
+                        error = %e,
+                        "arm_enrollment after commit failed; guest may need manual arm"
+                    );
+                } else {
+                    tracing::info!(
+                        vm_id = %self.entity_info.id,
+                        "armed ENROLL_ASSISTED after commit_flash"
+                    );
+                }
+            }
+        }
+
         // Clear flash transfer state
         *self.flash_transfer.lock().unwrap() = None;
         Ok(())

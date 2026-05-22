@@ -143,6 +143,34 @@ pub trait HsmProvider: Send {
         Err(HsmError::NotSupported("HsmProvider::arm_enrollment".into()))
     }
 
+    /// True if `vm_id` has completed an ENROLL_ASSISTED at least once
+    /// (the daemon recorded an `EnrolledRecord` in bootstrap.yaml).
+    /// Host-side auto-arm paths (supernova startup, recovery scripts)
+    /// gate on this to avoid re-arming cert-bound vm_ids — re-arming
+    /// re-opens an IP-spoof rotation window for a vm that's already
+    /// happily running with a valid cert.
+    ///
+    /// To intentionally re-arm (e.g. cert compromise → operator-driven
+    /// rotation), call `clear_enrolled` first.
+    ///
+    /// Default impl returns `NotSupported`.
+    fn is_enrolled(&self, vm_id: &str) -> Result<bool, HsmError> {
+        let _ = vm_id;
+        Err(HsmError::NotSupported("HsmProvider::is_enrolled".into()))
+    }
+
+    /// Forcibly forget that `vm_id` has enrolled. After this returns,
+    /// a subsequent `arm_enrollment` is allowed by the auto-arm guard.
+    /// Used by recovery / rotation flows; should NOT be called as part
+    /// of normal install (use the OTA `commit_flash` hook instead,
+    /// which arm_enrollments directly).
+    ///
+    /// Default impl returns `NotSupported`.
+    fn clear_enrolled(&mut self, vm_id: &str) -> Result<bool, HsmError> {
+        let _ = vm_id;
+        Err(HsmError::NotSupported("HsmProvider::clear_enrolled".into()))
+    }
+
     /// ECDSA-SHA256 verify delegated to the HSM. Mirror of `sign`,
     /// used by `sumo-verify` on the management path.
     fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {

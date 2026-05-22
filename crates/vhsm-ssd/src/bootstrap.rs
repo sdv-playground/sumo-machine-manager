@@ -55,12 +55,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// In-memory state of all known bootstrap tokens + pending
-/// enrolments. Tokens are the off-box ENROLL flow (operator-shipped
-/// secret in firmware bank). Pending enrolments are the on-device
-/// ENROLL_ASSISTED flow: the HSM arms a vm_id; the guest then
-/// connects from its pinned source IP, the daemon resolves identity
-/// from the IP, and consumes the pending flag with no secret on
-/// the wire.
+/// enrolments + already-enrolled vm_ids. Tokens are the off-box
+/// ENROLL flow (operator-shipped secret in firmware bank). Pending
+/// enrolments are the on-device ENROLL_ASSISTED flow: the HSM arms
+/// a vm_id; the guest connects from its pinned source IP, the
+/// daemon resolves identity from the IP, and consumes the pending
+/// flag with no secret on the wire. Enrolled is the "has ever
+/// enrolled" marker the host consults before auto-arming at startup
+/// — without it, restarts would silently re-arm cert-bound vm_ids
+/// and re-open the IP-spoof rotation window.
 #[derive(Debug)]
 pub struct BootstrapState {
     /// Path the state is persisted at; `save()` writes here.
@@ -69,6 +72,23 @@ pub struct BootstrapState {
     entries: BTreeMap<String, TokenEntry>,
     /// Pending enrolment flags keyed by vm_id (in-band ENROLL_ASSISTED).
     pending: BTreeMap<String, PendingEnrollment>,
+    /// vm_ids that have completed at least one ENROLL_ASSISTED
+    /// (recorded here when consume_pending returns Accepted). The
+    /// host's auto-arm path checks this and refuses to re-arm
+    /// already-enrolled vm_ids; explicit operator intent (e.g.
+    /// re-flash via vm-mgr's commit_flash hook) bypasses by calling
+    /// arm_pending directly.
+    enrolled: BTreeMap<String, EnrolledRecord>,
+}
+
+/// Persistent "has enrolled at least once" record. Mirrors the
+/// `consumed_at` / `bound_cert_thumbprint` fields that the off-box
+/// flow's `TokenEntry` carries — same audit trail shape on both
+/// flows.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnrolledRecord {
+    pub consumed_at: u64,
+    pub bound_cert_thumbprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +126,8 @@ struct StateFile {
     tokens: BTreeMap<String, TokenEntry>,
     #[serde(default)]
     pending: BTreeMap<String, PendingEnrollment>,
+    #[serde(default)]
+    enrolled: BTreeMap<String, EnrolledRecord>,
 }
 
 /// Outcome of a [`BootstrapState::consume`] call.
@@ -142,13 +164,11 @@ impl BootstrapState {
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
-            // No prior state — that's fine on a fresh deployment.
-            // Caller will populate via add() / arm_pending() before
-            // any ENROLL or ENROLL_ASSISTED can succeed.
             return Ok(Self {
                 path,
                 entries: BTreeMap::new(),
                 pending: BTreeMap::new(),
+                enrolled: BTreeMap::new(),
             });
         }
         let raw = std::fs::read_to_string(&path)?;
@@ -162,6 +182,7 @@ impl BootstrapState {
             path,
             entries: parsed.tokens,
             pending: parsed.pending,
+            enrolled: parsed.enrolled,
         })
     }
 
@@ -173,6 +194,7 @@ impl BootstrapState {
         if !self.path.exists() {
             self.entries.clear();
             self.pending.clear();
+            self.enrolled.clear();
             return Ok(());
         }
         let raw = std::fs::read_to_string(&self.path)?;
@@ -184,6 +206,7 @@ impl BootstrapState {
         })?;
         self.entries = parsed.tokens;
         self.pending = parsed.pending;
+        self.enrolled = parsed.enrolled;
         Ok(())
     }
 
@@ -192,6 +215,7 @@ impl BootstrapState {
         let doc = StateFile {
             tokens: self.entries.clone(),
             pending: self.pending.clone(),
+            enrolled: self.enrolled.clone(),
         };
         let yaml = serde_yaml::to_string(&doc).map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("bootstrap.yaml serialise: {e}"))
@@ -287,14 +311,20 @@ impl BootstrapState {
         );
     }
 
-    /// Attempt to consume a pending enrolment. Returns the outcome;
-    /// caller must `save()` if outcome is `Accepted`. The entry is
-    /// removed from the in-memory table on Accepted (single-use).
+    /// Attempt to consume a pending enrolment. On `Accepted`, the
+    /// pending entry is removed and an `EnrolledRecord` is added —
+    /// the daemon then `save()`s. The thumbprint goes into the
+    /// audit-visible record.
     ///
     /// `now_unix` is passed in so the daemon can pin a deterministic
     /// clock during tests and avoid TOCTOU between this check and any
     /// surrounding I/O.
-    pub fn consume_pending(&mut self, vm_id: &str, now_unix: u64) -> PendingConsumeOutcome {
+    pub fn consume_pending(
+        &mut self,
+        vm_id: &str,
+        now_unix: u64,
+        cert_thumbprint: &[u8; 32],
+    ) -> PendingConsumeOutcome {
         let entry = match self.pending.get(vm_id) {
             Some(e) => e,
             None => return PendingConsumeOutcome::NotPending,
@@ -305,6 +335,15 @@ impl BootstrapState {
             }
         }
         self.pending.remove(vm_id);
+        // Record persistent "has enrolled" so auto-arm at host
+        // startup won't re-open the cert-rotation window for this vm.
+        self.enrolled.insert(
+            vm_id.to_string(),
+            EnrolledRecord {
+                consumed_at: now_unix,
+                bound_cert_thumbprint: hex_lower(cert_thumbprint),
+            },
+        );
         PendingConsumeOutcome::Accepted
     }
 
@@ -314,6 +353,24 @@ impl BootstrapState {
 
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// True if `vm_id` has completed an ENROLL_ASSISTED at any point
+    /// in this device's lifetime. Used by the host's auto-arm path to
+    /// avoid re-arming cert-bound vm_ids.
+    pub fn is_enrolled(&self, vm_id: &str) -> bool {
+        self.enrolled.contains_key(vm_id)
+    }
+
+    pub fn get_enrolled(&self, vm_id: &str) -> Option<&EnrolledRecord> {
+        self.enrolled.get(vm_id)
+    }
+
+    /// Forcibly clear an enrolment record. Operator-only path (e.g.
+    /// after a cert-compromise rotation). Subsequent auto-arm at
+    /// startup will re-arm the vm_id.
+    pub fn clear_enrolled(&mut self, vm_id: &str) -> bool {
+        self.enrolled.remove(vm_id).is_some()
     }
 }
 

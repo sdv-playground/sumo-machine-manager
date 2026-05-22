@@ -486,14 +486,14 @@ fn handle_enroll_assisted(
     // Look up the pending flag. On miss, reload from disk once and
     // retry — handles the case where vm-mgr armed this vm_id after
     // the daemon's startup load.
-    let outcome = match ctx.bootstrap.consume_pending(&vm_id, iat) {
+    let outcome = match ctx.bootstrap.consume_pending(&vm_id, iat, &thumbprint) {
         PendingConsumeOutcome::Accepted => PendingConsumeOutcome::Accepted,
         PendingConsumeOutcome::NotPending => {
             if let Err(e) = ctx.bootstrap.reload() {
                 tracing::warn!(error = %e, "bootstrap reload failed during ENROLL_ASSISTED");
                 return reject(state, req, AuthFailReason::BadBootstrapToken);
             }
-            ctx.bootstrap.consume_pending(&vm_id, iat)
+            ctx.bootstrap.consume_pending(&vm_id, iat, &thumbprint)
         }
         other => other,
     };

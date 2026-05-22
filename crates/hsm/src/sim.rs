@@ -846,6 +846,65 @@ impl HsmProvider for SimHsm {
         Ok(())
     }
 
+    fn is_enrolled(&self, vm_id: &str) -> Result<bool, HsmError> {
+        let path = self.keystore_path.join("bootstrap.yaml");
+        if !path.exists() {
+            return Ok(false);
+        }
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            HsmError::ProcessError(format!("read {}: {e}", path.display()))
+        })?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|e| {
+            HsmError::ProcessError(format!("parse {}: {e}", path.display()))
+        })?;
+        Ok(doc["enrolled"]
+            .as_mapping()
+            .map(|m| m.contains_key(serde_yaml::Value::from(vm_id)))
+            .unwrap_or(false))
+    }
+
+    fn clear_enrolled(&mut self, vm_id: &str) -> Result<bool, HsmError> {
+        let path = self.keystore_path.join("bootstrap.yaml");
+        if !path.exists() {
+            return Ok(false);
+        }
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            HsmError::ProcessError(format!("read {}: {e}", path.display()))
+        })?;
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|e| {
+            HsmError::ProcessError(format!("parse {}: {e}", path.display()))
+        })?;
+        let removed = doc
+            .as_mapping_mut()
+            .and_then(|m| m.get_mut(serde_yaml::Value::from("enrolled")))
+            .and_then(|v| v.as_mapping_mut())
+            .map(|m| m.remove(serde_yaml::Value::from(vm_id)).is_some())
+            .unwrap_or(false);
+        if removed {
+            let yaml = serde_yaml::to_string(&doc).map_err(|e| {
+                HsmError::ProcessError(format!("serialise: {e}"))
+            })?;
+            let tmp = path.with_extension("yaml.tmp");
+            {
+                use std::io::Write as _;
+                let mut f = std::fs::File::create(&tmp).map_err(|e| {
+                    HsmError::ProcessError(format!("create {}: {e}", tmp.display()))
+                })?;
+                f.write_all(yaml.as_bytes()).map_err(|e| {
+                    HsmError::ProcessError(format!("write {}: {e}", tmp.display()))
+                })?;
+                f.sync_data().map_err(|e| {
+                    HsmError::ProcessError(format!("sync {}: {e}", tmp.display()))
+                })?;
+            }
+            std::fs::rename(&tmp, &path).map_err(|e| {
+                HsmError::ProcessError(format!("rename: {e}"))
+            })?;
+            tracing::info!(vm_id, "cleared enrolled record");
+        }
+        Ok(removed)
+    }
+
     fn list_keys(&self) -> Result<Vec<KeyInfo>, HsmError> {
         if !self.is_provisioned()? {
             return Err(HsmError::NotProvisioned);
