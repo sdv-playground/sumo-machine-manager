@@ -919,6 +919,13 @@ impl HsmProvider for SimHsm {
             .arg("--listen").arg(&listen)
             .arg("--iam-policy").arg(&iam_path)
             .arg("--bootstrap-state").arg(&bootstrap_path);
+        // Pass the (ip, vm_id) pairs the orchestrator already has
+        // through to the daemon's ENROLL_ASSISTED resolver. Same
+        // entries that get baked into the default IAM policy above.
+        // Each becomes one `--ip-map <ip>=<vm_id>` arg.
+        for (ip, vm) in &self.allow_list {
+            cmd.arg("--ip-map").arg(format!("{ip}={vm}"));
+        }
         if let Some(ref audit_path) = self.audit_log {
             cmd.arg("--audit-log").arg(audit_path);
             tracing::info!(
