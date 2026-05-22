@@ -16,4 +16,5 @@ members = [
     "crates/secstore",
     "crates/component-factory",
     "crates/host-metrics",
+    "crates/log-rotate",
 ]

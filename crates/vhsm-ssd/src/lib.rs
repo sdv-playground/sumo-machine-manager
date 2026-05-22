@@ -28,3 +28,4 @@ pub mod policy;
 pub mod handler;
 pub mod transport;
 pub mod extension_manifest;
+pub mod audit;

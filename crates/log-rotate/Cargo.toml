@@ -1,0 +1,12 @@
+[package]
+name = "log-rotate"
+version = "0.1.0"
+edition = "2021"
+description = "Size-bounded rotating file writer. Atomic shift via rename; max-rotated-files cap; optional fsync-per-line for audit semantics. Used by vhsm-ssd's audit logger and supernova-machine-manager's main log."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = "3"

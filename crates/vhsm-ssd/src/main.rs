@@ -43,6 +43,9 @@ fn main() {
     let mut allow_ip_args: Vec<(std::net::IpAddr, String)> = Vec::new();
     let mut persist_dir: Option<PathBuf> = None;
     let mut extension_handles: Option<PathBuf> = None;
+    let mut audit_log_path: Option<PathBuf> = None;
+    let mut audit_log_max_bytes: u64 = vhsm_ssd::audit::DEFAULT_MAX_BYTES;
+    let mut audit_log_max_rotated: u32 = vhsm_ssd::audit::DEFAULT_MAX_ROTATED;
 
     let mut i = 1;
     while i < args.len() {
@@ -70,6 +73,24 @@ fn main() {
                 extension_handles = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--audit-log" if i + 1 < args.len() => {
+                audit_log_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--audit-log-max-bytes" if i + 1 < args.len() => {
+                audit_log_max_bytes = args[i + 1].parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --audit-log-max-bytes '{}': {e}", args[i + 1]);
+                    std::process::exit(1);
+                });
+                i += 2;
+            }
+            "--audit-log-max-rotated" if i + 1 < args.len() => {
+                audit_log_max_rotated = args[i + 1].parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --audit-log-max-rotated '{}': {e}", args[i + 1]);
+                    std::process::exit(1);
+                });
+                i += 2;
+            }
             "--allow-ip" if i + 1 < args.len() => {
                 let raw = &args[i + 1];
                 let (ip_str, vm_id) = raw.split_once('=').unwrap_or_else(|| {
@@ -91,7 +112,10 @@ fn main() {
                 eprintln!("  --policy <file>             IP allow-list file (production)");
                 eprintln!("  --allow-ip <ip>=<vm_id>     Grant all permissions to (ip, vm_id) (dev/test, repeatable)");
                 eprintln!("  --persist-dir <dir>         Persist dynamic handles to this directory");
-                eprintln!("  --extension-handles <file>  TOML manifest of project well-known handles (0x0080..0x00FF)");
+                eprintln!("  --extension-handles <file>  YAML manifest of project well-known handles (0x0080..0x00FF)");
+                eprintln!("  --audit-log <path>          Enable per-op audit log at this path (size-rotated, fsync per line)");
+                eprintln!("  --audit-log-max-bytes <N>   Cap on the active audit log size (default 67108864 = 64 MiB)");
+                eprintln!("  --audit-log-max-rotated <K> Number of rotated copies to keep (default 4)");
                 std::process::exit(0);
             }
             other => {
@@ -214,6 +238,36 @@ fn main() {
 
     let handle_table = Arc::new(Mutex::new(table));
 
+    // Open the per-op audit log if requested. Fail-loud on open
+    // error: an operator who passed --audit-log expects audit; a
+    // silently-disabled logger would be the worst kind of bug.
+    let audit = match audit_log_path.as_ref() {
+        Some(path) => match vhsm_ssd::audit::AuditLogger::open(
+            path,
+            audit_log_max_bytes,
+            audit_log_max_rotated,
+        ) {
+            Ok(a) => {
+                tracing::info!(
+                    path = %path.display(),
+                    max_bytes = audit_log_max_bytes,
+                    max_rotated = audit_log_max_rotated,
+                    "audit log enabled"
+                );
+                a
+            }
+            Err(e) => {
+                eprintln!("error: failed to open --audit-log {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        },
+        None => {
+            tracing::info!("audit log disabled (no --audit-log path supplied)");
+            vhsm_ssd::audit::AuditLogger::disabled()
+        }
+    };
+    let audit = Arc::new(Mutex::new(audit));
+
     tracing::info!(
         keystore = %keystore_path.display(),
         handles = handle_table.lock().unwrap().len(),
@@ -266,6 +320,7 @@ fn main() {
         let policy = Arc::clone(&policy);
         let crypto = Arc::clone(&crypto);
         let store = store.clone();
+        let audit = Arc::clone(&audit);
 
         let join = std::thread::Builder::new()
             .name(format!("vhsm-ssd-{vm_id}"))
@@ -274,7 +329,7 @@ fn main() {
                     peer_ip,
                     vm_id: vm_id.clone(),
                 };
-                serve_connection(&mut conn, &caller, &handle_table, &policy, &*crypto, store.as_deref());
+                serve_connection(&mut conn, &caller, &handle_table, &policy, &*crypto, store.as_deref(), &audit);
                 handle_table.lock().unwrap().remove_by_vm_id(&caller.vm_id);
                 tracing::info!(vm = %caller.vm_id, "connection closed, dynamic handles released");
             });
@@ -294,6 +349,7 @@ fn serve_connection(
     policy: &Policy,
     crypto: &dyn HsmCryptoProvider,
     store: Option<&Secstore<LinuxSimEncryptor, FileBackend>>,
+    audit: &Arc<Mutex<vhsm_ssd::audit::AuditLogger>>,
 ) {
     loop {
         let req = match codec::read_request(conn.reader()) {
@@ -344,6 +400,17 @@ fn serve_connection(
                     }
                 }
             }
+        }
+
+        // Emit the audit record AFTER status is final and BEFORE
+        // we send the response on the wire. A failed audit write
+        // logs at error level but does NOT take down the connection
+        // — fail-closed policy belongs to the caller, not to the
+        // audit subsystem itself. (Tracked: a future config knob
+        // could turn this into "refuse the op if audit write fails"
+        // for Common-Criteria-style deployments.)
+        if let Err(e) = audit.lock().unwrap().record(caller, &req, &resp) {
+            tracing::error!(vm = %caller.vm_id, error = %e, "audit log write failed");
         }
 
         if let Err(e) = codec::write_response(conn.writer(), &resp) {
