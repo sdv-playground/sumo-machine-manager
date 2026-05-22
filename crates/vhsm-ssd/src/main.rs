@@ -1,32 +1,69 @@
-//! vHSM Secure Storage Daemon (v2) — host-side crypto service for guest VMs.
+//! vHSM Secure Storage Daemon (v3) — host-side crypto service for guest VMs.
 //!
 //! Listens on TCP on a private host bridge (`vbr-vhsm`, 192.168.99.0/24).
-//! Identity is derived from the source IP of the connecting socket;
-//! the policy file maps each allowed source IP to a `vm_id` plus a
-//! permitted-ops bitmask.
+//! Identity is established by a cert-based handshake on each accepted
+//! connection (see [`vhsm_ssd::auth`]): HELLO → AUTH (or ENROLL on first
+//! boot). Authorisation is statement-based; see [`vhsm_ssd::iam`].
 //!
 //! Usage:
-//!   vhsm-ssd --keystore <path> [--listen <ip:port>] [--policy <file>]
-//!            [--allow-ip <ip>=<vm_id>]... [--persist-dir <dir>]
+//!   vhsm-ssd --keystore <path>
+//!            --iam-policy <path>
+//!            --bootstrap-state <path>
+//!            [--listen <ip:port>]
+//!            [--cert-max-age <secs>]
+//!            [--persist-dir <dir>]
+//!            [--audit-log <path>]
+//!            [--audit-log-max-bytes <N>]
+//!            [--audit-log-max-rotated <K>]
+//!            [--extension-handles <file>]
+//!            [--issuer <string>]
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use hsm::sim::SimHsm;
 use hsm::{HsmCryptoProvider, HsmProvider};
 
+use vhsm_ssd::auth::{self, EnrollContext, HandshakeState, Principal};
+use vhsm_ssd::bootstrap::BootstrapState;
+use vhsm_ssd::cert::EcuSigner;
 use vhsm_ssd::codec;
 use vhsm_ssd::handle_table::HandleTable;
 use vhsm_ssd::handler::{self, CallerId};
-use vhsm_ssd::policy::Policy;
+use vhsm_ssd::iam::IamPolicy;
 use vhsm_ssd::proto::*;
-use vhsm_ssd::transport::Connection;
-use vhsm_ssd::transport::TcpListener;
+use vhsm_ssd::transport::{Connection, TcpListener};
 
 use secstore::{FileBackend, KeyMetadata, LinuxSimEncryptor, Secstore};
 
 const DEFAULT_LISTEN: &str = "10.0.200.1:5100";
+const DEFAULT_CERT_LIFETIME_SECS: u64 = 365 * 24 * 60 * 60; // 1 year
+const DEFAULT_ISSUER: &str = "device-vhsm-ssd";
+
+/// EcuSigner adapter that signs through the configured HSM provider's
+/// `ecu-signing` key. Lives at the daemon boundary so the cert.rs
+/// trait stays HSM-agnostic.
+struct HsmEcuSigner {
+    crypto: Arc<dyn HsmCryptoProvider>,
+}
+
+impl EcuSigner for HsmEcuSigner {
+    fn sign(&self, data: &[u8]) -> Vec<u8> {
+        match self.crypto.sign("ecu-signing", data) {
+            Ok(sig) => sig,
+            Err(e) => {
+                // Return an empty sig so the resulting CWT will fail
+                // validation on the next AUTH attempt. The client
+                // surface this as BadCertSignature; operators see this
+                // tracing error in the daemon log.
+                tracing::error!(error = %e, "ecu-signing HSM sign failed; minted CWT will be unusable");
+                Vec::new()
+            }
+        }
+    }
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -39,13 +76,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut keystore_path: Option<PathBuf> = None;
     let mut listen_addr: Option<SocketAddr> = None;
-    let mut policy_path: Option<PathBuf> = None;
-    let mut allow_ip_args: Vec<(std::net::IpAddr, String)> = Vec::new();
+    let mut iam_policy_path: Option<PathBuf> = None;
+    let mut bootstrap_state_path: Option<PathBuf> = None;
+    let mut cert_max_age_secs: u64 = DEFAULT_CERT_LIFETIME_SECS;
     let mut persist_dir: Option<PathBuf> = None;
     let mut extension_handles: Option<PathBuf> = None;
     let mut audit_log_path: Option<PathBuf> = None;
     let mut audit_log_max_bytes: u64 = vhsm_ssd::audit::DEFAULT_MAX_BYTES;
     let mut audit_log_max_rotated: u32 = vhsm_ssd::audit::DEFAULT_MAX_ROTATED;
+    let mut issuer: String = DEFAULT_ISSUER.to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -61,8 +100,23 @@ fn main() {
                 }));
                 i += 2;
             }
-            "--policy" if i + 1 < args.len() => {
-                policy_path = Some(PathBuf::from(&args[i + 1]));
+            "--iam-policy" if i + 1 < args.len() => {
+                iam_policy_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--bootstrap-state" if i + 1 < args.len() => {
+                bootstrap_state_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--cert-max-age" if i + 1 < args.len() => {
+                cert_max_age_secs = args[i + 1].parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --cert-max-age '{}': {e}", args[i + 1]);
+                    std::process::exit(1);
+                });
+                i += 2;
+            }
+            "--issuer" if i + 1 < args.len() => {
+                issuer = args[i + 1].clone();
                 i += 2;
             }
             "--persist-dir" if i + 1 < args.len() => {
@@ -91,31 +145,8 @@ fn main() {
                 });
                 i += 2;
             }
-            "--allow-ip" if i + 1 < args.len() => {
-                let raw = &args[i + 1];
-                let (ip_str, vm_id) = raw.split_once('=').unwrap_or_else(|| {
-                    eprintln!("invalid --allow-ip '{raw}': expected <ip>=<vm_id>");
-                    std::process::exit(1);
-                });
-                let ip: std::net::IpAddr = ip_str.parse().unwrap_or_else(|e| {
-                    eprintln!("invalid --allow-ip IP '{ip_str}': {e}");
-                    std::process::exit(1);
-                });
-                allow_ip_args.push((ip, vm_id.to_string()));
-                i += 2;
-            }
             "--help" | "-h" => {
-                eprintln!("Usage: vhsm-ssd --keystore <path> [--listen <ip:port>] [--policy <file>] [--allow-ip <ip>=<vm_id>]...");
-                eprintln!();
-                eprintln!("  --keystore <path>           HSM keystore directory (required)");
-                eprintln!("  --listen <ip:port>          Bind address (default: {DEFAULT_LISTEN})");
-                eprintln!("  --policy <file>             IP allow-list file (production)");
-                eprintln!("  --allow-ip <ip>=<vm_id>     Grant all permissions to (ip, vm_id) (dev/test, repeatable)");
-                eprintln!("  --persist-dir <dir>         Persist dynamic handles to this directory");
-                eprintln!("  --extension-handles <file>  YAML manifest of project well-known handles (0x0080..0x00FF)");
-                eprintln!("  --audit-log <path>          Enable per-op audit log at this path (size-rotated, fsync per line)");
-                eprintln!("  --audit-log-max-bytes <N>   Cap on the active audit log size (default 67108864 = 64 MiB)");
-                eprintln!("  --audit-log-max-rotated <K> Number of rotated copies to keep (default 4)");
+                print_usage();
                 std::process::exit(0);
             }
             other => {
@@ -127,6 +158,14 @@ fn main() {
 
     let keystore_path = keystore_path.unwrap_or_else(|| {
         eprintln!("error: --keystore is required");
+        std::process::exit(1);
+    });
+    let iam_policy_path = iam_policy_path.unwrap_or_else(|| {
+        eprintln!("error: --iam-policy is required (v3 has no IP allow-list fallback)");
+        std::process::exit(1);
+    });
+    let bootstrap_state_path = bootstrap_state_path.unwrap_or_else(|| {
+        eprintln!("error: --bootstrap-state is required");
         std::process::exit(1);
     });
 
@@ -155,31 +194,67 @@ fn main() {
 
     let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(hsm);
 
-    // Load policy.
-    let policy = if let Some(ref path) = policy_path {
-        match Policy::load_from_file(path) {
-            Ok(p) => {
-                tracing::info!(
-                    path = %path.display(),
-                    entries = p.num_entries(),
-                    "policy loaded"
-                );
-                p
-            }
-            Err(e) => {
-                eprintln!("error: failed to load policy: {e}");
-                std::process::exit(1);
-            }
+    // Load IAM policy. Default-deny if the file declares no statements —
+    // operator's intent. Refuse to start on parse error / missing file.
+    let iam = match IamPolicy::load_from_file(&iam_policy_path) {
+        Ok(p) => {
+            tracing::info!(
+                path = %iam_policy_path.display(),
+                statements = p.num_statements(),
+                "IAM policy loaded"
+            );
+            p
         }
-    } else if !allow_ip_args.is_empty() {
-        tracing::info!(?allow_ip_args, "using --allow-ip policy");
-        Policy::allow_all(allow_ip_args.into_iter())
-    } else {
-        eprintln!("error: no --policy or --allow-ip specified");
-        eprintln!("       Use --policy <file> for production, or --allow-ip <ip>=<vm_id> for dev/test");
-        std::process::exit(1);
+        Err(e) => {
+            eprintln!("error: failed to load --iam-policy {}: {e}", iam_policy_path.display());
+            std::process::exit(1);
+        }
     };
-    let policy = Arc::new(policy);
+    let iam = Arc::new(iam);
+
+    // Load bootstrap state. Missing file is fine — creates an empty state
+    // (no tokens, so all ENROLL attempts will fail with BadBootstrapToken
+    // until an operator populates it).
+    let bootstrap = match BootstrapState::load(&bootstrap_state_path) {
+        Ok(s) => {
+            tracing::info!(
+                path = %bootstrap_state_path.display(),
+                tokens = s.len(),
+                "bootstrap state loaded"
+            );
+            s
+        }
+        Err(e) => {
+            eprintln!("error: failed to load --bootstrap-state {}: {e}", bootstrap_state_path.display());
+            std::process::exit(1);
+        }
+    };
+    let bootstrap = Arc::new(Mutex::new(bootstrap));
+
+    // Read ecu-signing pubkey once at startup. AUTH verifies CWTs
+    // against this; ENROLL signs new CWTs via HsmEcuSigner.
+    // The HSM stores the DER-encoded SPKI; convert to raw SEC1
+    // (0x04 || x || y) which is what cert::validate expects.
+    let ecu_signing_pub = match crypto.get_public_key_der("ecu-signing") {
+        Ok(der) => match der_to_sec1_p256(&der) {
+            Some(raw) => Arc::<[u8]>::from(raw.into_boxed_slice()),
+            None => {
+                tracing::warn!("ecu-signing pubkey DER didn't decode to a P-256 point; AUTH will reject until restart");
+                Arc::<[u8]>::from(Box::<[u8]>::default())
+            }
+        },
+        Err(e) => {
+            // Don't fatal — keystore might be pre-provisioning. Log
+            // and continue with an empty pub; every AUTH will fail
+            // until the keystore lands and we restart.
+            tracing::warn!(error = %e, "ecu-signing pubkey not in keystore; AUTH will reject until provisioned");
+            Arc::<[u8]>::from(Box::<[u8]>::default())
+        }
+    };
+
+    let signer: Arc<dyn EcuSigner> = Arc::new(HsmEcuSigner {
+        crypto: Arc::clone(&crypto),
+    });
 
     // Initialize handle table with well-known handles from keystore
     let mut table = init_handle_table(&*crypto);
@@ -214,7 +289,6 @@ fn main() {
                 LinuxSimEncryptor::default_test(),
                 FileBackend::new(dir),
             );
-            // Load persisted dynamic handles
             match s.load_all() {
                 Ok(metas) => {
                     for m in &metas {
@@ -272,7 +346,8 @@ fn main() {
         keystore = %keystore_path.display(),
         handles = handle_table.lock().unwrap().len(),
         persist = persist_dir.is_some(),
-        "vhsm-ssd v2 starting"
+        cert_max_age_secs,
+        "vhsm-ssd v3 starting"
     );
 
     // Bind TCP listener.
@@ -290,8 +365,9 @@ fn main() {
     // Accept loop — spawn a thread per accepted connection so a
     // long-lived client (e.g. Linux's /dev/vhsm kernel module which
     // keeps a persistent TCP session open) doesn't block other guests
-    // from connecting. All shared state (handle_table, policy, crypto,
-    // store) is already Arc-wrapped and thread-safe.
+    // from connecting. All shared state (handle_table, iam, bootstrap,
+    // crypto, signer, store, audit) is already Arc-wrapped and
+    // thread-safe.
     loop {
         let mut conn = match listener.accept() {
             Ok(c) => c,
@@ -301,37 +377,36 @@ fn main() {
                 continue;
             }
         };
-
-        // Resolve peer IP → vm_id via the policy. A connection from an
-        // unallowed IP is rejected immediately, before any bytes are
-        // accepted from the wire.
         let peer_ip = conn.peer_ip();
-        let vm_id = match policy.lookup(peer_ip) {
-            Some(entry) => entry.vm_id.clone(),
-            None => {
-                tracing::warn!(peer = %peer_ip, "rejecting connection: source IP not in policy");
-                drop(conn);
-                continue;
-            }
-        };
 
         // Clone the per-connection state we'll move into the worker.
         let handle_table = Arc::clone(&handle_table);
-        let policy = Arc::clone(&policy);
+        let iam = Arc::clone(&iam);
+        let bootstrap = Arc::clone(&bootstrap);
+        let signer = Arc::clone(&signer);
+        let ecu_signing_pub = Arc::clone(&ecu_signing_pub);
         let crypto = Arc::clone(&crypto);
         let store = store.clone();
         let audit = Arc::clone(&audit);
+        let issuer = issuer.clone();
 
         let join = std::thread::Builder::new()
-            .name(format!("vhsm-ssd-{vm_id}"))
+            .name(format!("vhsm-ssd-{peer_ip}"))
             .spawn(move || {
-                let caller = CallerId {
+                serve_connection(
+                    &mut conn,
                     peer_ip,
-                    vm_id: vm_id.clone(),
-                };
-                serve_connection(&mut conn, &caller, &handle_table, &policy, &*crypto, store.as_deref(), &audit);
-                handle_table.lock().unwrap().remove_by_vm_id(&caller.vm_id);
-                tracing::info!(vm = %caller.vm_id, "connection closed, dynamic handles released");
+                    &ecu_signing_pub,
+                    &iam,
+                    &bootstrap,
+                    &*signer,
+                    &issuer,
+                    cert_max_age_secs,
+                    &handle_table,
+                    &*crypto,
+                    store.as_deref(),
+                    &audit,
+                );
             });
         if let Err(e) = join {
             tracing::warn!(error = %e, "failed to spawn worker thread, dropping connection");
@@ -339,26 +414,115 @@ fn main() {
     }
 }
 
-/// Per-connection request-loop. Runs on its own thread so the accept
-/// loop in main() stays responsive while a client (e.g. Linux's
-/// /dev/vhsm) holds a long-lived TCP session.
+/// Per-connection request loop. First runs the v3 handshake to bind a
+/// principal, then dispatches subsequent ops through `handler::handle_request`.
+/// On Failed or Enrolled (terminal) states the connection closes.
+#[allow(clippy::too_many_arguments)]
 fn serve_connection(
     conn: &mut Connection,
-    caller: &CallerId,
+    peer_ip: IpAddr,
+    ecu_signing_pub: &[u8],
+    iam: &Arc<IamPolicy>,
+    bootstrap: &Arc<Mutex<BootstrapState>>,
+    signer: &dyn EcuSigner,
+    issuer: &str,
+    cert_lifetime_secs: u64,
     handle_table: &Arc<Mutex<HandleTable>>,
-    policy: &Policy,
     crypto: &dyn HsmCryptoProvider,
     store: Option<&Secstore<LinuxSimEncryptor, FileBackend>>,
     audit: &Arc<Mutex<vhsm_ssd::audit::AuditLogger>>,
 ) {
+    tracing::info!(peer = %peer_ip, "vhsm v3 connection accepted; awaiting HELLO");
+
+    let mut hs_state = HandshakeState::new();
+    let mut principal: Option<Principal> = None;
+
     loop {
         let req = match codec::read_request(conn.reader()) {
             Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
-                tracing::debug!(vm = %caller.vm_id, error = %e, "connection closed");
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                tracing::debug!(peer = %peer_ip, "client closed");
                 break;
             }
+            Err(e) => {
+                tracing::debug!(peer = %peer_ip, error = %e, "connection closed (read error)");
+                break;
+            }
+        };
+
+        if principal.is_none() {
+            // Pre-handshake: route through auth::step.
+            tracing::debug!(
+                peer = %peer_ip,
+                op = req.op,
+                session_id = req.session_id,
+                "handshake request"
+            );
+
+            let resp = {
+                let mut bootstrap_guard = bootstrap.lock().unwrap();
+                let mut ctx = EnrollContext {
+                    bootstrap: &mut *bootstrap_guard,
+                    signer,
+                    issuer,
+                    cert_lifetime_secs,
+                };
+                auth::step(
+                    &mut hs_state,
+                    &req,
+                    ecu_signing_pub,
+                    iam,
+                    Some(&mut ctx),
+                    SystemTime::now(),
+                )
+            };
+
+            if let Err(e) = codec::write_response(conn.writer(), &resp) {
+                tracing::warn!(peer = %peer_ip, error = %e, "handshake write error");
+                break;
+            }
+
+            // Inspect the state transition.
+            match &hs_state {
+                HandshakeState::Authenticated(p) => {
+                    tracing::info!(
+                        peer = %peer_ip,
+                        vm = %p.vm_id,
+                        thumbprint = %hex_short(&p.cert_thumbprint),
+                        "principal authenticated"
+                    );
+                    principal = Some(p.clone());
+                }
+                HandshakeState::Enrolled { vm_id, cert_thumbprint } => {
+                    tracing::info!(
+                        peer = %peer_ip,
+                        vm = %vm_id,
+                        thumbprint = %hex_short(cert_thumbprint),
+                        "principal enrolled (terminal — client must reconnect)"
+                    );
+                    break;
+                }
+                HandshakeState::Failed(reason) => {
+                    tracing::warn!(
+                        peer = %peer_ip,
+                        ?reason,
+                        "handshake failed, closing"
+                    );
+                    break;
+                }
+                _ => {
+                    // AwaitHello or NonceSent — handshake in progress, keep reading.
+                }
+            }
+            continue;
+        }
+
+        // Post-handshake: normal op dispatch.
+        let p = principal.as_ref().expect("principal is Some here");
+        let caller = CallerId {
+            peer_ip,
+            vm_id: p.vm_id.clone(),
+            cert_thumbprint: p.cert_thumbprint,
         };
 
         tracing::debug!(
@@ -372,7 +536,7 @@ fn serve_connection(
 
         let resp = {
             let mut table = handle_table.lock().unwrap();
-            handler::handle_request(&req, caller, &mut table, policy, crypto)
+            handler::handle_request(&req, &caller, &mut table, iam, crypto)
         };
 
         // Persist if a dynamic handle was added (KEY_GENERATE success)
@@ -402,14 +566,7 @@ fn serve_connection(
             }
         }
 
-        // Emit the audit record AFTER status is final and BEFORE
-        // we send the response on the wire. A failed audit write
-        // logs at error level but does NOT take down the connection
-        // — fail-closed policy belongs to the caller, not to the
-        // audit subsystem itself. (Tracked: a future config knob
-        // could turn this into "refuse the op if audit write fails"
-        // for Common-Criteria-style deployments.)
-        if let Err(e) = audit.lock().unwrap().record(caller, &req, &resp) {
+        if let Err(e) = audit.lock().unwrap().record(&caller, &req, &resp) {
             tracing::error!(vm = %caller.vm_id, error = %e, "audit log write failed");
         }
 
@@ -417,6 +574,14 @@ fn serve_connection(
             tracing::warn!(vm = %caller.vm_id, error = %e, "write error, closing connection");
             break;
         }
+    }
+
+    // Release dynamic handles owned by this connection (if any).
+    if let Some(p) = principal.as_ref() {
+        handle_table.lock().unwrap().remove_by_vm_id(&p.vm_id);
+        tracing::info!(vm = %p.vm_id, "connection closed, dynamic handles released");
+    } else {
+        tracing::debug!(peer = %peer_ip, "connection closed before handshake completed");
     }
 }
 
@@ -436,7 +601,6 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     ];
 
     for (handle, key_id, alg, perms) in &well_known {
-        // Only register if the key exists in the keystore
         if crypto.get_key_info(key_id).is_ok() {
             table.register_well_known(*handle, key_id, *alg, *perms);
             tracing::debug!(handle, key_id, "registered well-known handle");
@@ -444,4 +608,53 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     }
 
     table
+}
+
+/// Short lower-hex prefix of a SHA-256 (first 8 bytes / 16 hex chars).
+/// Enough for log-line correlation; full thumbprint is in the audit log.
+fn hex_short(tp: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(16);
+    for b in &tp[..8] {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+/// Decode a DER-encoded SubjectPublicKeyInfo into a raw 65-byte SEC1
+/// uncompressed P-256 point (`0x04 || x[32] || y[32]`). Returns None
+/// on parse failure or non-P-256 curve.
+fn der_to_sec1_p256(der: &[u8]) -> Option<Vec<u8>> {
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::pkcs8::DecodePublicKey;
+    let pk = p256::PublicKey::from_public_key_der(der).ok()?;
+    let encoded = pk.to_encoded_point(false);
+    let bytes = encoded.as_bytes();
+    if bytes.len() == 65 && bytes[0] == 0x04 {
+        Some(bytes.to_vec())
+    } else {
+        None
+    }
+}
+
+fn print_usage() {
+    eprintln!("Usage: vhsm-ssd --keystore <path> --iam-policy <path> --bootstrap-state <path> [options]");
+    eprintln!();
+    eprintln!("Required:");
+    eprintln!("  --keystore <path>           HSM keystore directory");
+    eprintln!("  --iam-policy <path>         YAML policy file (statements + principals + handles + ops)");
+    eprintln!("  --bootstrap-state <path>    YAML bootstrap token state");
+    eprintln!();
+    eprintln!("Connection:");
+    eprintln!("  --listen <ip:port>          Bind address (default: {DEFAULT_LISTEN})");
+    eprintln!("  --cert-max-age <secs>       Lifetime of CWTs minted via ENROLL (default {DEFAULT_CERT_LIFETIME_SECS})");
+    eprintln!("  --issuer <string>           CWT `iss` claim value (default '{DEFAULT_ISSUER}')");
+    eprintln!();
+    eprintln!("Storage / handles:");
+    eprintln!("  --persist-dir <dir>         Persist dynamic handles to this directory");
+    eprintln!("  --extension-handles <file>  YAML manifest of project well-known handles (0x0080..0x00FF)");
+    eprintln!();
+    eprintln!("Audit:");
+    eprintln!("  --audit-log <path>          Enable per-op audit log at this path (size-rotated, fsync per line)");
+    eprintln!("  --audit-log-max-bytes <N>   Cap on the active audit log size (default 67108864 = 64 MiB)");
+    eprintln!("  --audit-log-max-rotated <K> Number of rotated copies to keep (default 4)");
 }

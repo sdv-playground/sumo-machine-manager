@@ -1,28 +1,39 @@
-/// Request dispatch (v2) — routes opcodes via handle table + policy.
+/// Request dispatch (v3) — routes opcodes via handle table + IAM policy.
 
 use std::net::IpAddr;
 
 use hsm::{HsmCryptoProvider, HsmError};
 
 use crate::handle_table::HandleTable;
-use crate::policy::Policy;
+use crate::iam::{IamDecision, IamPolicy};
 use crate::proto::*;
 
-/// Caller identity passed through the dispatch chain. The `vm_id` is
-/// resolved from the source IP via the policy table at accept time and
-/// is used both to scope dynamic-handle ownership and to label log lines.
+/// Caller identity passed through the dispatch chain. In v3 the
+/// `vm_id` is the cert `sub` claim, cryptographically bound at
+/// handshake time (see [`crate::auth::Principal`]). `cert_thumbprint`
+/// is the SHA-256 of the CWT bytes, logged in audit for traceability.
+/// `peer_ip` is retained as a diagnostic for log lines but is NOT
+/// security-relevant in v3.
 #[derive(Debug, Clone)]
 pub struct CallerId {
     pub peer_ip: IpAddr,
     pub vm_id: String,
+    pub cert_thumbprint: [u8; 32],
 }
+
+/// Sentinel "handle name" used when evaluating IAM for ops that
+/// don't operate on a specific keystore handle. Today: `GetRandom`
+/// (returns entropy, no key access) and `KeyGenerate` (creates a
+/// new dynamic handle). Operators who want to gate these explicitly
+/// add a statement targeting `handles: [system]`.
+pub const SYSTEM_HANDLE_NAME: &str = "system";
 
 /// Handle a single request. Returns the response to send.
 pub fn handle_request(
     req: &Request,
     caller: &CallerId,
     handle_table: &mut HandleTable,
-    policy: &Policy,
+    iam: &IamPolicy,
     crypto: &dyn HsmCryptoProvider,
 ) -> Response {
     let Some(op) = Op::from_u32(req.op) else {
@@ -34,20 +45,64 @@ pub fn handle_request(
         return Response::err(req.op, req.session_id, StatusCode::PolicyReject);
     }
 
-    // Policy check: is this caller allowed to perform this op at all?
-    if let Some(required) = op.required_perm() {
-        if let Err(status) = policy.check(caller.peer_ip, required) {
-            tracing::warn!(
-                peer = %caller.peer_ip,
-                vm = %caller.vm_id,
-                op = ?op,
-                op_code = format!("0x{:08x}", req.op),
-                required_perm = format!("0x{:08x}", required),
-                ?status,
-                "policy.check denied"
-            );
-            return Response::err(req.op, req.session_id, status);
+    // Handshake ops are consumed by the per-connection auth state
+    // machine BEFORE the request reaches handle_request. If we got
+    // here with a handshake op the dispatcher upstream has a bug —
+    // reject with InvalidParam rather than panic so the daemon stays
+    // alive.
+    if matches!(op, Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll) {
+        tracing::warn!(
+            op = ?op,
+            vm = %caller.vm_id,
+            "handshake op reached handle_request — dispatcher bug"
+        );
+        return Response::err(req.op, req.session_id, StatusCode::InvalidParam);
+    }
+
+    // For ops that operate on an existing handle (Encrypt/Decrypt/
+    // Sign/Verify/Mac*/GetHandleInfo/GetPubkey/GetCert), resolve
+    // first so we can name the handle to IAM. For ops without a
+    // handle, use the SYSTEM_HANDLE_NAME sentinel.
+    //
+    // Dynamic handles (0x0100+) are owner-scoped by the v2 mechanism
+    // (created by the caller; resolve() rejects non-owners). IAM is
+    // only consulted for well-known handles whose names are
+    // operator-managed.
+    let iam_decision = match op {
+        Op::GetRandom | Op::KeyGenerate => {
+            iam.evaluate(&caller.vm_id, SYSTEM_HANDLE_NAME, op)
         }
+        _ => {
+            // Peek the handle out of the payload's first 4 bytes.
+            // If the payload is too short, dispatcher hits the same
+            // check below; for IAM purposes we evaluate against a
+            // bogus name so the decision is a stable Deny rather
+            // than panicking. The op-specific handler will return
+            // InvalidParam for the truncated frame.
+            let handle_id = peek_handle(req).unwrap_or(0);
+            let handle_name = handle_table
+                .get(handle_id)
+                .map(|e| e.key_id.as_str())
+                .unwrap_or("<unknown>");
+            // Dynamic handles bypass IAM (per-handle owner check via
+            // resolve() + bitmask perms cover them). Well-known
+            // handles always go through IAM.
+            if handle_id >= HANDLE_DYNAMIC_BASE {
+                // Synthetic Allow with sentinel index; never surfaces
+                // to audit beyond the matched_statement field.
+                IamDecision::Allow { matched_statement: usize::MAX }
+            } else {
+                iam.evaluate(&caller.vm_id, handle_name, op)
+            }
+        }
+    };
+    if let IamDecision::Deny = iam_decision {
+        tracing::warn!(
+            vm = %caller.vm_id,
+            op = ?op,
+            "iam.evaluate denied"
+        );
+        return Response::err(req.op, req.session_id, StatusCode::PolicyReject);
     }
 
     match op {
@@ -64,20 +119,22 @@ pub fn handle_request(
         Op::GetCert => handle_get_cert(req, caller, handle_table, crypto),
         // Host-only ops already rejected above
         Op::KeyImport | Op::KeyDerive | Op::KeyDelete => unreachable!(),
-        // Handshake ops are consumed by the per-connection auth
-        // state machine (auth.rs in v3) BEFORE the request reaches
-        // handle_request. If we got here with a handshake op the
-        // dispatcher upstream has a bug — reject with InvalidParam
-        // rather than panic so the daemon stays alive.
-        Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll => {
-            tracing::warn!(
-                op = ?op,
-                vm = %caller.vm_id,
-                "handshake op reached handle_request — dispatcher bug"
-            );
-            Response::err(req.op, req.session_id, StatusCode::InvalidParam)
-        }
+        Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll => unreachable!(),
     }
+}
+
+/// Read the handle id from the first 4 bytes of the payload, if
+/// present. Used by the IAM-evaluation prelude in [`handle_request`].
+fn peek_handle(req: &Request) -> Option<u32> {
+    if req.payload.len() < 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        req.payload[0],
+        req.payload[1],
+        req.payload[2],
+        req.payload[3],
+    ]))
 }
 
 fn handle_get_random(req: &Request, crypto: &dyn HsmCryptoProvider) -> Response {
@@ -477,6 +534,7 @@ mod tests {
         CallerId {
             peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             vm_id: vm_id.to_string(),
+            cert_thumbprint: [0u8; 32],
         }
     }
 

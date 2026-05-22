@@ -792,37 +792,39 @@ impl HsmProvider for SimHsm {
         // case and kills the orphan before we proceed.
         self.kill_stale_daemon_if_port_busy(&listen);
 
-        // Build the allow-list arg vector. If the caller didn't supply
-        // an explicit list, fall back to the /30 `bind_ip + 1` heuristic
-        // so legacy single-VM callers keep working without code changes.
-        //
-        // vsock note: this whole loop is IP-identity scaffolding. Once
-        // virtio-vsock lands on QNX 8 we'll switch the wire to vsock
-        // and identity becomes the peer CID — `--allow-cid` instead of
-        // `--allow-ip`. Same shape, different addressing.
-        let allow_args: Vec<String> = if self.allow_list.is_empty() {
-            vec![match self.bind_ip {
-                IpAddr::V4(v4) if v4.is_loopback() => "127.0.0.1=test-vm".to_string(),
-                IpAddr::V4(v4) => {
-                    let o = v4.octets();
-                    let g = std::net::Ipv4Addr::new(o[0], o[1], o[2], o[3].wrapping_add(1));
-                    format!("{g}=vm-guest")
-                }
-                IpAddr::V6(_) => format!("{}=local", self.bind_ip),
-            }]
-        } else {
-            self.allow_list
-                .iter()
-                .map(|(ip, vm)| format!("{ip}={vm}"))
-                .collect()
-        };
+        // v3 (cert-based handshake) replaces the v2 source-IP allow-list.
+        // `allow_list` is still consulted here, but only to extract the
+        // set of vm_ids — IP is ignored (identity is the cert subject,
+        // not the source IP). We generate a default permissive IAM
+        // policy at `<keystore>/iam-policy.yaml` if one doesn't already
+        // exist, and an empty `<keystore>/bootstrap.yaml`. Production
+        // deployments overwrite these with operator-managed files.
+        let iam_path = self.keystore_path.join("iam-policy.yaml");
+        let bootstrap_path = self.keystore_path.join("bootstrap.yaml");
+        if !iam_path.exists() {
+            if let Err(e) = write_default_iam_policy(&iam_path, &self.allow_list) {
+                return Err(HsmError::ProcessError(format!(
+                    "failed to write default IAM policy at {}: {e}",
+                    iam_path.display()
+                )));
+            }
+            tracing::info!(path = %iam_path.display(), "wrote default IAM policy (allow-all for configured vms)");
+        }
+        if !bootstrap_path.exists() {
+            if let Err(e) = std::fs::write(&bootstrap_path, "tokens: {}\n") {
+                return Err(HsmError::ProcessError(format!(
+                    "failed to write empty bootstrap state at {}: {e}",
+                    bootstrap_path.display()
+                )));
+            }
+            tracing::info!(path = %bootstrap_path.display(), "wrote empty bootstrap state");
+        }
 
         let mut cmd = Command::new(&self.daemon_bin);
         cmd.arg("--keystore").arg(&self.keystore_path)
-            .arg("--listen").arg(&listen);
-        for entry in &allow_args {
-            cmd.arg("--allow-ip").arg(entry);
-        }
+            .arg("--listen").arg(&listen)
+            .arg("--iam-policy").arg(&iam_path)
+            .arg("--bootstrap-state").arg(&bootstrap_path);
         if let Some(ref audit_path) = self.audit_log {
             cmd.arg("--audit-log").arg(audit_path);
             tracing::info!(
@@ -1291,6 +1293,47 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Write a default IAM policy at `path` that allows the configured
+/// vms to do anything on any handle. Used by SimHsm on first spawn
+/// when no operator-managed policy is present.
+///
+/// Schema (vhsm-ssd::iam):
+///   version: 1
+///   statements:
+///     - principals: [<each vm_id>]
+///       handles: ["*"]
+///       ops: ["*"]
+fn write_default_iam_policy(path: &Path, allow_list: &[(IpAddr, String)]) -> std::io::Result<()> {
+    // Collect unique vm_ids. If the list is empty, fall back to a
+    // single "test-vm" entry so a dev rig with no explicit config
+    // can still come up.
+    let mut vms: Vec<&str> = allow_list.iter().map(|(_, v)| v.as_str()).collect();
+    vms.sort();
+    vms.dedup();
+    if vms.is_empty() {
+        vms.push("test-vm");
+    }
+
+    let mut doc = String::new();
+    doc.push_str("version: 1\n");
+    doc.push_str("statements:\n");
+    doc.push_str("  - principals: [");
+    for (i, vm) in vms.iter().enumerate() {
+        if i > 0 {
+            doc.push_str(", ");
+        }
+        doc.push_str(vm);
+    }
+    doc.push_str("]\n");
+    doc.push_str("    handles: [\"*\"]\n");
+    doc.push_str("    ops: [\"*\"]\n");
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, doc)
 }
 
 #[cfg(test)]

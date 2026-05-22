@@ -5,7 +5,7 @@
 // ---- Magic and version --------------------------------------------------
 
 pub const VHSM_MAGIC: [u8; 3] = [0x56, 0x48, 0x53]; // "VHS"
-pub const VHSM_VERSION: u8 = 0x02;
+pub const VHSM_VERSION: u8 = 0x03;
 pub const REQUEST_HEADER_SIZE: usize = 16;
 pub const RESPONSE_HEADER_SIZE: usize = 20;
 
@@ -508,9 +508,9 @@ mod tests {
     }
 
     #[test]
-    fn magic_and_version_are_vhs_v2() {
+    fn magic_and_version_are_vhs_v3() {
         assert_eq!(&VHSM_MAGIC, b"VHS");
-        assert_eq!(VHSM_VERSION, 0x02);
+        assert_eq!(VHSM_VERSION, 0x03);
     }
 
     #[test]

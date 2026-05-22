@@ -264,6 +264,7 @@ mod tests {
         CallerId {
             peer_ip: IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])),
             vm_id: vm.to_string(),
+            cert_thumbprint: [0u8; 32],
         }
     }
 

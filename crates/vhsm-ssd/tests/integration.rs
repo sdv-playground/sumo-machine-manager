@@ -1,8 +1,10 @@
-/// Integration tests for vhsm-ssd (v2).
+/// Integration tests for vhsm-ssd (v3).
 ///
 /// Tests the handler dispatch chain directly: build keystore, init handle
-/// table + policy, call handle_request(), verify responses.
+/// table + IAM policy, call handle_request(), verify responses.
 /// No network transport needed — tests the full protocol logic in-process.
+/// The handshake state machine (auth.rs) has its own unit tests; this
+/// suite exercises the post-handshake dispatch path.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -14,22 +16,23 @@ use hsm::HsmCryptoProvider;
 
 use vhsm_ssd::handle_table::HandleTable;
 use vhsm_ssd::handler::{self, CallerId};
-use vhsm_ssd::policy::Policy;
+use vhsm_ssd::iam::IamPolicy;
 use vhsm_ssd::proto::*;
 
 static TEST_ID: AtomicU32 = AtomicU32::new(0);
 
-/// Simulated callers for tests.
+/// Simulated callers for tests. peer_ip is retained as a diagnostic
+/// only in v3; vm_id is the identity (cert subject in production).
 const TEST_VM: &str = "vm1";
 const OTHER_VM: &str = "vm2";
 const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 10));
 const OTHER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 11));
-const UNKNOWN_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 99, 99));
 
 fn caller(ip: IpAddr, vm_id: &str) -> CallerId {
     CallerId {
         peer_ip: ip,
         vm_id: vm_id.to_string(),
+        cert_thumbprint: [0u8; 32],
     }
 }
 
@@ -38,7 +41,7 @@ fn caller(ip: IpAddr, vm_id: &str) -> CallerId {
 struct TestFixture {
     crypto: Arc<dyn HsmCryptoProvider>,
     handle_table: HandleTable,
-    policy: Policy,
+    iam: IamPolicy,
     keystore_path: PathBuf,
 }
 
@@ -83,20 +86,37 @@ impl TestFixture {
             &label,
         );
 
-        // Allow-all policy for TEST_VM, restricted for OTHER_VM
-        let mut policy = Policy::empty();
-        policy.add(
-            TEST_IP,
-            TEST_VM,
-            PERM_SIGN | PERM_VERIFY | PERM_ENCRYPT | PERM_DECRYPT
-                | PERM_GET_PUBKEY | PERM_GET_CERT | PERM_KEY_GENERATE,
-        );
-        policy.add(OTHER_IP, OTHER_VM, PERM_ENCRYPT | PERM_DECRYPT);
+        // IAM policy:
+        //  - vm1 may use mykey (signing) for sign/verify/get-pubkey/get-cert.
+        //  - vm1 may use storage-key for encrypt/decrypt.
+        //  - vm1 may use the SYSTEM_HANDLE for get-random + key-generate.
+        //  - vm2 may use storage-key for encrypt/decrypt only (no sign).
+        //  - Unknown principals match no statement → Deny by default.
+        //
+        // Dynamic handles (allocated below) bypass IAM and rely on
+        // owner-scoping + the per-handle permitted_ops bitmask.
+        let iam = IamPolicy::parse(r#"
+version: 1
+statements:
+  # vm1 has broad access on mykey, INCLUDING the unrealistic
+  # encrypt/get-handle-info ops — needed by tests that exercise
+  # the per-handle bitmask defense (bitmask rejects encrypt on a
+  # sign-only key even though IAM allows it).
+  - principals: [vm1]
+    handles: [mykey]
+    ops: [sign, verify, get-pubkey, get-cert, get-handle-info, encrypt]
+  - principals: [vm1, vm2]
+    handles: [storage-key]
+    ops: [encrypt, decrypt]
+  - principals: [vm1, vm2]
+    handles: [system]
+    ops: [get-random, key-generate]
+"#).expect("test IAM policy parses");
 
         Self {
             crypto,
             handle_table,
-            policy,
+            iam,
             keystore_path,
         }
     }
@@ -107,7 +127,7 @@ impl TestFixture {
             session_id: 1,
             payload,
         };
-        handler::handle_request(&req, caller, &mut self.handle_table, &self.policy, &*self.crypto)
+        handler::handle_request(&req, caller, &mut self.handle_table, &self.iam, &*self.crypto)
     }
 
     /// Helper: build payload with handle prefix + data.
@@ -230,7 +250,7 @@ fn sign_and_verify() {
         payload: vp,
     };
     let resp = handler::handle_request(
-        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.policy, &*fix.crypto,
+        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::Ok as u32, "verify failed");
 }
@@ -258,7 +278,7 @@ fn verify_rejects_bad_signature() {
         payload: p,
     };
     let resp = handler::handle_request(
-        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.policy, &*fix.crypto,
+        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::CryptoError as u32);
 }
@@ -404,12 +424,14 @@ fn well_known_handles_shared() {
 }
 
 #[test]
-fn policy_rejects_unknown_ip() {
+fn iam_rejects_unknown_principal() {
     let mut fix = TestFixture::new();
 
-    // UNKNOWN_IP is not in the policy
+    // "stranger" isn't named in any IAM statement → default-deny.
+    // peer_ip is no longer security-relevant in v3, but we pass
+    // TEST_IP for log realism.
     let resp = fix.request(
-        &caller(UNKNOWN_IP, "stranger"),
+        &caller(TEST_IP, "stranger"),
         Op::Sign,
         TestFixture::with_handle(HANDLE_ECU_SIGNING, b"data"),
     );
@@ -417,16 +439,16 @@ fn policy_rejects_unknown_ip() {
 }
 
 #[test]
-fn policy_denies_unpermitted_op() {
+fn iam_denies_unpermitted_op() {
     let mut fix = TestFixture::new();
 
-    // OTHER_VM only has ENCRYPT|DECRYPT — not SIGN
+    // vm2 may use storage-key for encrypt/decrypt but not mykey for sign.
     let resp = fix.request(
         &caller(OTHER_IP, OTHER_VM),
         Op::Sign,
         TestFixture::with_handle(HANDLE_ECU_SIGNING, b"data"),
     );
-    assert_eq!(resp.status, StatusCode::PermissionDeny as u32);
+    assert_eq!(resp.status, StatusCode::PolicyReject as u32);
 }
 
 #[test]
@@ -452,7 +474,7 @@ fn host_only_ops_rejected() {
         payload: vec![],
     };
     let resp = handler::handle_request(
-        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.policy, &*fix.crypto,
+        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::PolicyReject as u32);
 }
@@ -467,7 +489,7 @@ fn unknown_op_rejected() {
         payload: vec![],
     };
     let resp = handler::handle_request(
-        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.policy, &*fix.crypto,
+        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::InvalidParam as u32);
 }
