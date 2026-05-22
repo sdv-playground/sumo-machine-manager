@@ -37,14 +37,42 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ciborium::value::Value as CborValue;
+use ciborium::value::{Integer, Value as CborValue};
 use coset::iana::{Algorithm as CoseAlg, EllipticCurve as CoseEc};
-use coset::{CborSerializable, CoseSign1};
+use coset::{AsCborValue, CborSerializable, CoseKey, CoseSign1, CoseSign1Builder, HeaderBuilder};
 use p256::ecdsa::{signature::Verifier as _, Signature, VerifyingKey};
 use p256::EncodedPoint;
+use rand::RngCore as _;
 use sha2::{Digest, Sha256};
 
 use crate::proto::AuthFailReason;
+
+/// Abstraction over the ECU's signing key. Production wires this to
+/// `HsmCryptoProvider::sign("ecu-signing")`; tests use a local
+/// `SigningKey` via [`LocalEcuSigner`].
+///
+/// `sign` returns the **raw** 64-byte ECDSA P-256 signature (r||s).
+/// Implementations MUST NOT return ASN.1 DER — the COSE_Sign1 builder
+/// expects the raw form.
+pub trait EcuSigner: Send + Sync {
+    fn sign(&self, data: &[u8]) -> Vec<u8>;
+}
+
+/// Error produced by [`mint_cwt`] when the CBOR encoder or signer
+/// misbehaves. The variants exist only so we can return a typed
+/// failure to the daemon without panicking; both variants collapse
+/// to the same wire signal (`InvalidParam`) since neither can be
+/// triggered by a well-formed client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintError {
+    /// `ciborium::ser::into_writer` failed — shouldn't happen for
+    /// the fixed-shape claim map we build, but propagate rather than
+    /// unwrap.
+    EncodePayload,
+    /// `CoseSign1Builder::build()` consumed a signer that returned a
+    /// non-64-byte signature, or `to_vec()` rejected the structure.
+    EncodeCose,
+}
 
 /// CWT claim labels (RFC 8392 §3.1.1).
 const CLAIM_ISS: i64 = 1;
@@ -52,9 +80,7 @@ const CLAIM_SUB: i64 = 2;
 const CLAIM_AUD: i64 = 3;
 const CLAIM_EXP: i64 = 4;
 const CLAIM_NBF: i64 = 5;
-#[allow(dead_code)] // Read on the off-box builder side (test_helpers); not consulted at validate time.
 const CLAIM_IAT: i64 = 6;
-#[allow(dead_code)] // Same — informational claim, not used in validation.
 const CLAIM_CTI: i64 = 7;
 /// RFC 8747 §3.1: confirmation method, "cnf".
 const CLAIM_CNF: i64 = -65537;
@@ -293,18 +319,178 @@ fn read_bytes_map_val(map: &[(CborValue, CborValue)], key: i64) -> Option<Vec<u8
     None
 }
 
+// ---- CWT mint (issuer-side) -------------------------------------
+
+/// Build + sign a CWT certificate.
+///
+/// Used by the ENROLL handler when a guest presents a valid
+/// bootstrap token; the daemon mints a CWT binding the guest's CSR
+/// pubkey (`cnf_pub_x` / `cnf_pub_y`) to its principal name
+/// (`subject`).
+///
+/// The resulting CWT is consumed by [`validate`] on every subsequent
+/// AUTH from the same guest.
+///
+/// `cnf_pub_x` / `cnf_pub_y` are the 32-byte coordinates of the
+/// guest's P-256 pubkey. Caller is responsible for splitting the
+/// SEC1 `0x04 || x || y` representation if that's what they have.
+///
+/// `iat` / `exp` are Unix seconds; the daemon picks a lifetime
+/// based on its `--cert-max-age` setting. `nbf` is set to `iat`.
+///
+/// The 16-byte `cti` (CWT ID) is filled with cryptographic random
+/// bytes.
+pub fn mint_cwt(
+    signer: &dyn EcuSigner,
+    subject: &str,
+    issuer: &str,
+    cnf_pub_x: &[u8],
+    cnf_pub_y: &[u8],
+    iat: u64,
+    exp: u64,
+) -> Result<Vec<u8>, MintError> {
+    let cnf_cose_key = CoseKey {
+        kty: coset::RegisteredLabel::Assigned(coset::iana::KeyType::EC2),
+        alg: Some(coset::RegisteredLabelWithPrivate::Assigned(CoseAlg::ES256)),
+        params: vec![
+            (
+                coset::Label::Int(COSE_KEY_EC2_CRV),
+                CborValue::Integer(Integer::from(CoseEc::P_256 as i64)),
+            ),
+            (
+                coset::Label::Int(COSE_KEY_EC2_X),
+                CborValue::Bytes(cnf_pub_x.to_vec()),
+            ),
+            (
+                coset::Label::Int(COSE_KEY_EC2_Y),
+                CborValue::Bytes(cnf_pub_y.to_vec()),
+            ),
+        ],
+        ..Default::default()
+    };
+
+    let cnf_val = cnf_cose_key
+        .to_cbor_value()
+        .map_err(|_| MintError::EncodePayload)?;
+    let cnf_wrapped = CborValue::Map(vec![(CborValue::Integer(Integer::from(1i64)), cnf_val)]);
+
+    let mut cti = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut cti);
+
+    let claims = CborValue::Map(vec![
+        (
+            CborValue::Integer(Integer::from(CLAIM_ISS)),
+            CborValue::Text(issuer.to_string()),
+        ),
+        (
+            CborValue::Integer(Integer::from(CLAIM_SUB)),
+            CborValue::Text(subject.to_string()),
+        ),
+        (
+            CborValue::Integer(Integer::from(CLAIM_AUD)),
+            CborValue::Text(VHSM_AUDIENCE.to_string()),
+        ),
+        (
+            CborValue::Integer(Integer::from(CLAIM_EXP)),
+            CborValue::Integer(Integer::from(exp)),
+        ),
+        (
+            CborValue::Integer(Integer::from(CLAIM_NBF)),
+            CborValue::Integer(Integer::from(iat)),
+        ),
+        (
+            CborValue::Integer(Integer::from(CLAIM_IAT)),
+            CborValue::Integer(Integer::from(iat)),
+        ),
+        (
+            CborValue::Integer(Integer::from(CLAIM_CTI)),
+            CborValue::Bytes(cti.to_vec()),
+        ),
+        (
+            CborValue::Integer(Integer::from(CLAIM_CNF)),
+            cnf_wrapped,
+        ),
+    ]);
+
+    let mut payload_bytes = Vec::new();
+    ciborium::ser::into_writer(&claims, &mut payload_bytes).map_err(|_| MintError::EncodePayload)?;
+
+    let cose = CoseSign1Builder::new()
+        .protected(HeaderBuilder::new().algorithm(CoseAlg::ES256).build())
+        .payload(payload_bytes)
+        .create_signature(b"", |data| signer.sign(data))
+        .build();
+    cose.to_vec().map_err(|_| MintError::EncodeCose)
+}
+
+/// Local-key `EcuSigner` impl. Used in tests and in the SimHsm path
+/// where the ecu-signing private key happens to be in process
+/// memory. Production deployments wire `EcuSigner` to
+/// `HsmCryptoProvider::sign("ecu-signing")` (Phase 6).
+pub struct LocalEcuSigner {
+    signing_key: p256::ecdsa::SigningKey,
+}
+
+impl LocalEcuSigner {
+    pub fn new(signing_key: p256::ecdsa::SigningKey) -> Self {
+        Self { signing_key }
+    }
+}
+
+impl EcuSigner for LocalEcuSigner {
+    fn sign(&self, data: &[u8]) -> Vec<u8> {
+        use p256::ecdsa::{signature::Signer as _, Signature};
+        let sig: Signature = self.signing_key.sign(data);
+        sig.to_vec()
+    }
+}
+
 // ---- Test helpers (also reused by auth.rs tests) ----------------
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
-    use ciborium::value::Integer;
-    use coset::{AsCborValue, CoseKey, CoseSign1Builder, HeaderBuilder};
-    use p256::ecdsa::{signature::Signer as _, Signature, SigningKey};
+    use p256::ecdsa::SigningKey;
 
     /// Build a CWT signed by `signer_key` with the given claims.
-    /// Returns (cwt_bytes, signer_pub_uncompressed).
+    /// Thin wrapper over [`mint_cwt`] that keeps the legacy positional
+    /// arg order existing auth.rs tests rely on.
     pub fn build_signed_cwt(
+        signer_key: &SigningKey,
+        subject: &str,
+        audience: &str,
+        cnf_pub_x: &[u8],
+        cnf_pub_y: &[u8],
+        not_before: u64,
+        expires: u64,
+    ) -> Vec<u8> {
+        // Most tests build CWTs with the standard audience; a few
+        // intentionally pass a wrong audience to exercise the rejection
+        // path. mint_cwt always uses VHSM_AUDIENCE, so we patch the
+        // CWT after-the-fact for that case.
+        if audience == VHSM_AUDIENCE {
+            let signer = LocalEcuSigner::new(signer_key.clone());
+            mint_cwt(
+                &signer,
+                subject,
+                "device-test",
+                cnf_pub_x,
+                cnf_pub_y,
+                not_before,
+                expires,
+            )
+            .expect("mint_cwt should not fail for well-formed inputs")
+        } else {
+            // Construct a CWT with a non-standard audience to exercise
+            // the WrongAudience rejection. Inline the full builder
+            // here since mint_cwt hard-codes VHSM_AUDIENCE.
+            build_signed_cwt_with_audience(
+                signer_key, subject, audience, cnf_pub_x, cnf_pub_y, not_before, expires,
+            )
+        }
+    }
+
+    fn build_signed_cwt_with_audience(
         signer_key: &SigningKey,
         subject: &str,
         audience: &str,
@@ -332,11 +518,9 @@ pub(crate) mod test_helpers {
             ],
             ..Default::default()
         };
-
         let cnf_val = cnf_cose_key.to_cbor_value().unwrap();
-        // cnf = { 1: <COSE_Key> } per RFC 8747 §3.2
-        let cnf_wrapped = CborValue::Map(vec![(CborValue::Integer(Integer::from(1i64)), cnf_val)]);
-
+        let cnf_wrapped =
+            CborValue::Map(vec![(CborValue::Integer(Integer::from(1i64)), cnf_val)]);
         let claims = CborValue::Map(vec![
             (
                 CborValue::Integer(Integer::from(CLAIM_ISS)),
@@ -371,21 +555,13 @@ pub(crate) mod test_helpers {
                 cnf_wrapped,
             ),
         ]);
-
         let mut payload_bytes = Vec::new();
         ciborium::ser::into_writer(&claims, &mut payload_bytes).unwrap();
-
+        let signer = LocalEcuSigner::new(signer_key.clone());
         let cose = CoseSign1Builder::new()
-            .protected(
-                HeaderBuilder::new()
-                    .algorithm(CoseAlg::ES256)
-                    .build(),
-            )
+            .protected(HeaderBuilder::new().algorithm(CoseAlg::ES256).build())
             .payload(payload_bytes)
-            .create_signature(b"", |data| {
-                let sig: Signature = signer_key.sign(data);
-                sig.to_vec()
-            })
+            .create_signature(b"", |data| signer.sign(data))
             .build();
         cose.to_vec().unwrap()
     }
@@ -520,5 +696,82 @@ mod tests {
         let a = validate(&cwt, &signer_pub, fixed_time(1_500_000)).unwrap();
         let b = validate(&cwt, &signer_pub, fixed_time(1_500_001)).unwrap();
         assert_eq!(a.thumbprint, b.thumbprint);
+    }
+
+    // ---- mint_cwt round-trip tests --------------------------------
+
+    #[test]
+    fn mint_then_validate_round_trips() {
+        let (signer, signer_pub, _, px, py) = fresh_fixture();
+        let local = LocalEcuSigner::new(signer);
+        let cwt = mint_cwt(
+            &local,
+            "vm3",
+            "device-fleet-7",
+            &px,
+            &py,
+            1_500_000,
+            1_500_000 + 86_400,
+        )
+        .unwrap();
+        let parsed = validate(&cwt, &signer_pub, fixed_time(1_500_100)).unwrap();
+        assert_eq!(parsed.subject, "vm3");
+        assert_eq!(parsed.issuer, "device-fleet-7");
+        assert_eq!(parsed.exp_unix, 1_500_000 + 86_400);
+        assert_eq!(parsed.cnf_pubkey.len(), 65);
+        assert_eq!(parsed.cnf_pubkey[0], 0x04);
+        assert_eq!(&parsed.cnf_pubkey[1..33], &px[..]);
+        assert_eq!(&parsed.cnf_pubkey[33..65], &py[..]);
+    }
+
+    #[test]
+    fn mint_uses_hardcoded_audience() {
+        // Minted CWTs always have aud = VHSM_AUDIENCE; validation
+        // against any other audience-checker would fail. The
+        // hard-coded value is what binds a cert to "this device's
+        // vhsm-ssd" — fleet-wide forgery resistance.
+        let (signer, signer_pub, _, px, py) = fresh_fixture();
+        let local = LocalEcuSigner::new(signer);
+        let cwt = mint_cwt(&local, "vm3", "device-7", &px, &py, 0, 9_999_999_999).unwrap();
+        let parsed = validate(&cwt, &signer_pub, fixed_time(1_500_000)).unwrap();
+        // No public field for `aud`; validate() succeeded which means
+        // the CWT carried VHSM_AUDIENCE. (Build via cert.rs's
+        // wrong-aud helper to confirm the negative.)
+        let _ = parsed;
+    }
+
+    #[test]
+    fn mint_signed_by_wrong_signer_rejected_on_validate() {
+        let (_, _, _, px, py) = fresh_fixture();
+        let imposter = SigningKey::random(&mut OsRng);
+        let imposter_signer = LocalEcuSigner::new(imposter.clone());
+        // Mint with imposter signing key…
+        let cwt = mint_cwt(
+            &imposter_signer,
+            "vm3",
+            "device-7",
+            &px,
+            &py,
+            0,
+            9_999_999_999,
+        )
+        .unwrap();
+        // …but validate against an unrelated pubkey.
+        let other_pub = sec1_pub_from_signing(&SigningKey::random(&mut OsRng));
+        let err = validate(&cwt, &other_pub, fixed_time(1_500_000)).unwrap_err();
+        assert_eq!(err, AuthFailReason::BadCertSignature);
+    }
+
+    #[test]
+    fn mint_cti_is_unique_across_calls() {
+        // Two CWTs minted with identical inputs should still produce
+        // distinct thumbprints because the random CTI claim differs.
+        // Catches a regression where someone replaces OsRng with a
+        // zero-filled cti.
+        let (signer, _, _, px, py) = fresh_fixture();
+        let local = LocalEcuSigner::new(signer);
+        let a = mint_cwt(&local, "vm3", "device-7", &px, &py, 0, 9_999_999_999).unwrap();
+        let b = mint_cwt(&local, "vm3", "device-7", &px, &py, 0, 9_999_999_999).unwrap();
+        assert_ne!(a, b);
     }
 }
