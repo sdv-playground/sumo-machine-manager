@@ -283,29 +283,14 @@ impl VmRunner for QnxRunner {
             tracing::info!(vm = %name, role = %disk.role, device, path = %disk.path.display(), "extra disk attached");
         }
 
-        // Materialise a per-launch qvm.conf that carries the VM's
-        // vm_id on the kernel cmdline. Source config lives in the bank
-        // (operator-shipped); we copy + inject so the bank stays
-        // immutable and the rootfs init script can read VHSM_VM_ID
-        // from procnto's env. Per the QNX mkifs env-var convention,
-        // KEY=value tokens on cmdline become env vars for user-mode
-        // children. See guest-vm-spec spec §11.4-bis / Phase 12c.
-        let launch_config = match build_launch_qvm_config(&qvm_config, name) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(
-                    vm = %name,
-                    error = %e,
-                    "qvm.conf vm_id injection failed; launching with template as-is (vhsm-daemon will skip)"
-                );
-                qvm_config.clone()
-            }
-        };
-
-        // Launch qvm with the (possibly injected) config file
-        tracing::info!("starting qvm for {name}: @{}", launch_config.display());
+        // Launch qvm with the bank's config file. (No per-launch
+        // mutation: QNX `load`-style boots have no cmdline override
+        // mechanism we can use to pass vm_id — the guest's IFS reads
+        // its own vm_name from /etc/sumo/vm-host.toml, which is
+        // baked per-VM at mkifs time.)
+        tracing::info!("starting qvm for {name}: @{}", qvm_config.display());
         let child = Command::new("qvm")
-            .arg(format!("@{}", launch_config.display()))
+            .arg(format!("@{}", qvm_config.display()))
             .spawn()
             .map_err(|e| RunnerError::ProcessFailed(format!("qvm: {e}")))?;
 
@@ -380,104 +365,5 @@ impl VmRunner for QnxRunner {
 impl Drop for QnxRunner {
     fn drop(&mut self) {
         self.cleanup();
-    }
-}
-
-/// Read `template` qvm.conf, inject `VHSM_VM_ID=<vm_name>` into its
-/// cmdline if not already present, write to a /tmp file, return the
-/// path. The bank's qvm.conf stays untouched so subsequent installs
-/// see it as the operator delivered it.
-///
-/// If the cmdline already contains `VHSM_VM_ID=`, the template is
-/// returned as-is (operator override; we don't second-guess).
-fn build_launch_qvm_config(template: &std::path::Path, vm_name: &str) -> std::io::Result<std::path::PathBuf> {
-    let content = std::fs::read_to_string(template)?;
-    if content.contains("VHSM_VM_ID=") {
-        return Ok(template.to_path_buf());
-    }
-    let injected = inject_vhsm_vm_id(&content, vm_name);
-    let out = std::env::temp_dir().join(format!("qvm-{vm_name}-launch.conf"));
-    std::fs::write(&out, injected)?;
-    Ok(out)
-}
-
-/// Append ` VHSM_VM_ID=<vm_name>` to the `cmdline "..."` line of a
-/// qvm.conf-shaped text. If there's no `cmdline` line we leave the
-/// content as-is (the rootfs init will then skip vhsm-daemon — same
-/// safe default as the no-qvm.conf-write path).
-fn inject_vhsm_vm_id(content: &str, vm_name: &str) -> String {
-    let mut out = String::with_capacity(content.len() + 32);
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("cmdline ") || trimmed.starts_with("cmdline\t") {
-            // Inject before the closing quote of the cmdline string.
-            if let Some(close) = line.rfind('"') {
-                if let Some(open) = line.find('"') {
-                    if open < close {
-                        out.push_str(&line[..close]);
-                        out.push(' ');
-                        out.push_str("VHSM_VM_ID=");
-                        out.push_str(vm_name);
-                        out.push_str(&line[close..]);
-                        out.push('\n');
-                        continue;
-                    }
-                }
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inject_appends_before_closing_quote() {
-        let src = r#"# preamble
-memory 256M
-cmdline "console=ttyAMA0,115200 root=/dev/vda"
-rootfs "/path/to/rootfs"
-"#;
-        let out = inject_vhsm_vm_id(src, "vm1");
-        assert!(out.contains(r#"cmdline "console=ttyAMA0,115200 root=/dev/vda VHSM_VM_ID=vm1""#));
-        // Other lines untouched.
-        assert!(out.contains("memory 256M"));
-        assert!(out.contains(r#"rootfs "/path/to/rootfs""#));
-    }
-
-    #[test]
-    fn inject_leaves_non_cmdline_lines_alone() {
-        let src = "memory 256M\nrootfs \"/x\"\n";
-        let out = inject_vhsm_vm_id(src, "vm2");
-        assert_eq!(out, "memory 256M\nrootfs \"/x\"\n");
-    }
-
-    #[test]
-    fn inject_preserves_existing_cmdline_tokens() {
-        // Existing args like console=ttyAMA0 should still be there.
-        let src = "cmdline \"a=1 b=2 c=3\"\n";
-        let out = inject_vhsm_vm_id(src, "vm9");
-        assert!(out.contains("a=1 b=2 c=3 VHSM_VM_ID=vm9"));
-    }
-
-    #[test]
-    fn inject_handles_indented_cmdline() {
-        let src = "    cmdline \"foo=bar\"\n";
-        let out = inject_vhsm_vm_id(src, "vm1");
-        assert!(out.contains("foo=bar VHSM_VM_ID=vm1"));
-    }
-
-    #[test]
-    fn build_launch_skips_when_vhsm_vm_id_already_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("qvm.conf");
-        std::fs::write(&path, "cmdline \"foo=bar VHSM_VM_ID=preset\"\n").unwrap();
-        let out = build_launch_qvm_config(&path, "vm9").unwrap();
-        // Should return the template path unchanged, not a /tmp copy.
-        assert_eq!(out, path);
     }
 }
