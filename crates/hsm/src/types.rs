@@ -86,9 +86,14 @@ pub enum KeyRole {
     /// the HSM; envelopes are encrypted to its public half.
     DeviceDecryption,
 
-    /// EC-P256 signing key with cert — ECU's outbound signing
-    /// identity for vehicle-bus auth, attestations, etc.
-    EcuSigning,
+    /// EC-P256 signing key used by vhsm-ssd as the device's IAM
+    /// certificate-issuing authority — every CWT minted via ENROLL
+    /// / ENROLL_ASSISTED is signed with this key, and every AUTH
+    /// validates against its public half. Daemon-internal; not
+    /// addressable from guest principals via the IAM policy.
+    /// Format contract: signs return raw 64-byte ECDSA-P256 (r||s),
+    /// not DER — COSE_Sign1 is what's downstream.
+    IamSigning,
 
     /// EC-P256 signing key generated **inside the HSM at provisioning
     /// time, private NEVER leaves**. Used to self-sign provisioned
@@ -109,7 +114,7 @@ impl KeyRole {
             KeyRole::PlatformAuthority => "platform-authority",
             KeyRole::ApplicationAuthority => "application-authority",
             KeyRole::DeviceDecryption => "device-decrypt",
-            KeyRole::EcuSigning => "ecu-signing",
+            KeyRole::IamSigning => "iam-signing",
             KeyRole::IvdSigning => "ivd-signing",
         }
     }
@@ -125,7 +130,7 @@ impl KeyRole {
             KeyRole::PlatformAuthority,
             KeyRole::ApplicationAuthority,
             KeyRole::DeviceDecryption,
-            KeyRole::EcuSigning,
+            KeyRole::IamSigning,
             KeyRole::IvdSigning,
         ]
     }
@@ -144,7 +149,7 @@ impl KeyRole {
     pub fn is_device_generated(self) -> bool {
         matches!(
             self,
-            KeyRole::DeviceDecryption | KeyRole::EcuSigning | KeyRole::IvdSigning,
+            KeyRole::DeviceDecryption | KeyRole::IamSigning | KeyRole::IvdSigning,
         )
     }
 }
@@ -266,7 +271,7 @@ mod tests {
             KeyRole::PlatformAuthority,
             KeyRole::ApplicationAuthority,
             KeyRole::DeviceDecryption,
-            KeyRole::EcuSigning,
+            KeyRole::IamSigning,
             KeyRole::IvdSigning,
         ];
         let ids: HashSet<_> = roles.iter().map(|r| r.key_id()).collect();
@@ -280,7 +285,7 @@ mod tests {
         assert_eq!(KeyRole::PlatformAuthority.key_id(), "platform-authority");
         assert_eq!(KeyRole::ApplicationAuthority.key_id(), "application-authority");
         assert_eq!(KeyRole::DeviceDecryption.key_id(), "device-decrypt");
-        assert_eq!(KeyRole::EcuSigning.key_id(), "ecu-signing");
+        assert_eq!(KeyRole::IamSigning.key_id(), "iam-signing");
         assert_eq!(KeyRole::IvdSigning.key_id(), "ivd-signing");
     }
 
@@ -306,7 +311,7 @@ mod tests {
         // (no push, no pull). Trust anchors are public-only.
         let device_generated = [
             KeyRole::DeviceDecryption,
-            KeyRole::EcuSigning,
+            KeyRole::IamSigning,
             KeyRole::IvdSigning,
         ];
         let trust_anchors = [

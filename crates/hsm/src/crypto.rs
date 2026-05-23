@@ -38,6 +38,24 @@ impl HsmCryptoProvider for SimHsm {
         Ok(signature.to_bytes().to_vec())
     }
 
+    fn sign_raw_p256(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        let key_info = self.get_key_info(key_id)?;
+        if key_info.key_type != KeyType::EcP256 {
+            return Err(HsmError::CryptoError(format!(
+                "sign_raw_p256 requires EC-P256 key, got {}",
+                key_info.key_type
+            )));
+        }
+
+        let scalar = load_ec_private_scalar(self, key_id)?;
+        let signing_key = SigningKey::from_bytes((&scalar[..]).into())
+            .map_err(|e| HsmError::CryptoError(format!("invalid signing key: {e}")))?;
+
+        // Non-DER `Signature` returns raw 64-byte `r || s`.
+        let signature: ecdsa::Signature<p256::NistP256> = signing_key.sign(data);
+        Ok(signature.to_bytes().to_vec())
+    }
+
     fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
         let key_info = self.get_key_info(key_id)?;
         if key_info.key_type != KeyType::EcP256 {

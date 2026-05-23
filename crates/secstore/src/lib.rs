@@ -190,7 +190,7 @@ mod tests {
     fn metadata_roundtrip() {
         let meta = KeyMetadata {
             vhsm_handle: 0x0042,
-            key_id: "ecu-signing".into(),
+            key_id: "iam-signing".into(),
             algorithm: 0x0021,
             permitted_ops: 0x0330,
             owner_vm_id: "vm1".into(),
@@ -200,7 +200,7 @@ mod tests {
         let bytes = serialize_metadata(&meta);
         let back = deserialize_metadata(&bytes).unwrap();
         assert_eq!(back.vhsm_handle, 0x0042);
-        assert_eq!(back.key_id, "ecu-signing");
+        assert_eq!(back.key_id, "iam-signing");
         assert_eq!(back.algorithm, 0x0021);
         assert_eq!(back.permitted_ops, 0x0330);
         assert_eq!(back.owner_vm_id, "vm1");

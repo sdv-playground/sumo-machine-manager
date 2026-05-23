@@ -1,7 +1,7 @@
 //! CWT (CBOR Web Token, RFC 8392) certificate validation.
 //!
 //! Guest identity certs in v3 are CWTs signed by the device's
-//! `ecu-signing` private key. The cert binds a principal name (cert
+//! `iam-signing` private key. The cert binds a principal name (cert
 //! `sub`) to a guest-held identity pubkey (cert `cnf`); vhsm-ssd
 //! validates the cert chain + proves the client holds the matching
 //! private during AUTH.
@@ -26,13 +26,13 @@
 //!   where protected_hdr = bstr(map(1 → -7))           ; ES256
 //!   where unprotected_hdr = {}                         ; empty
 //!   where payload = bstr(claims_cbor_map)
-//!   where signature = ES256(ecu-signing.priv, Sig_structure)
+//!   where signature = ES256(iam-signing.priv, Sig_structure)
 //! ```
 //!
 //! Validation is read-only against an externally-supplied
-//! `ecu-signing` public point — this module does not touch the HSM
+//! `iam-signing` public point — this module does not touch the HSM
 //! itself; the caller resolves the public point from
-//! `HsmCryptoProvider::get_pubkey("ecu-signing")` once at daemon
+//! `HsmCryptoProvider::get_pubkey("iam-signing")` once at daemon
 //! startup and passes it in.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,7 +48,7 @@ use sha2::{Digest, Sha256};
 use crate::proto::AuthFailReason;
 
 /// Abstraction over the ECU's signing key. Production wires this to
-/// `HsmCryptoProvider::sign("ecu-signing")`; tests use a local
+/// `HsmCryptoProvider::sign("iam-signing")`; tests use a local
 /// `SigningKey` via [`LocalEcuSigner`].
 ///
 /// `sign` returns the **raw** 64-byte ECDSA P-256 signature (r||s).
@@ -122,7 +122,7 @@ pub struct ParsedCert {
     pub thumbprint: [u8; 32],
 }
 
-/// Validate a CWT against an `ecu-signing` public key.
+/// Validate a CWT against an `iam-signing` public key.
 ///
 /// Steps:
 ///   1. Parse the outer COSE_Sign1 structure.
@@ -134,7 +134,7 @@ pub struct ParsedCert {
 ///
 /// `ecu_signing_pub` is the 65-byte uncompressed SEC1 P-256 point
 /// (`0x04 || x[32] || y[32]`). Callers typically read this from the
-/// HSM via `HsmCryptoProvider::get_pubkey("ecu-signing")` once at
+/// HSM via `HsmCryptoProvider::get_pubkey("iam-signing")` once at
 /// daemon startup.
 ///
 /// `now` is the time used for exp/nbf checks; pass
@@ -148,7 +148,7 @@ pub fn validate(
     // Step 1: parse COSE_Sign1.
     let cose = CoseSign1::from_slice(cwt_bytes).map_err(|_| AuthFailReason::InvalidParam)?;
 
-    // Step 2: verify the ES256 signature against ecu-signing.
+    // Step 2: verify the ES256 signature against iam-signing.
     let verifying_key = parse_p256_pub(ecu_signing_pub).ok_or(AuthFailReason::InvalidParam)?;
     cose.verify_signature(b"", |sig, data| {
         let signature =
@@ -424,9 +424,9 @@ pub fn mint_cwt(
 }
 
 /// Local-key `EcuSigner` impl. Used in tests and in the SimHsm path
-/// where the ecu-signing private key happens to be in process
+/// where the iam-signing private key happens to be in process
 /// memory. Production deployments wire `EcuSigner` to
-/// `HsmCryptoProvider::sign("ecu-signing")` (Phase 6).
+/// `HsmCryptoProvider::sign("iam-signing")` (Phase 6).
 pub struct LocalEcuSigner {
     signing_key: p256::ecdsa::SigningKey,
 }

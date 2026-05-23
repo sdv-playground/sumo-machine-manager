@@ -191,6 +191,20 @@ pub trait HsmCryptoProvider: Send + Sync {
     /// ECDSA-SHA256 sign with EC-P256 key. Returns DER-encoded signature.
     fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError>;
 
+    /// ECDSA-SHA256 sign with EC-P256 key. Returns the raw 64-byte
+    /// `r || s` signature (each 32 bytes, big-endian, zero-padded).
+    /// This is what COSE_Sign1 (RFC 9053) and JWS ES256 (RFC 7515)
+    /// expect; `sign` returns DER which is wrong for both.
+    ///
+    /// Default impl errors with NotSupported; concrete providers
+    /// MUST override if they want CWT minting / JWT signing to work.
+    fn sign_raw_p256(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        let _ = (key_id, data);
+        Err(HsmError::NotSupported(
+            "HsmCryptoProvider::sign_raw_p256".into(),
+        ))
+    }
+
     /// ECDSA-SHA256 verify with EC-P256 key. Returns true if valid.
     fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError>;
 

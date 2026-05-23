@@ -163,7 +163,7 @@ pub const KEY_TYPE_AES_256: u64 = 1;
 /// `OP_GET_CERT` stays in the list even though v2 envelopes never
 /// deliver certificates — the runtime cert query is fed by the
 /// CSR-issuance flow that issues certs for device-generated keys
-/// (e.g. `ecu-signing`) post-provisioning, and the slot policy must
+/// (e.g. `iam-signing`) post-provisioning, and the slot policy must
 /// permit the op.
 pub const OP_SIGN: u64 = 0;
 pub const OP_VERIFY: u64 = 1;
@@ -341,7 +341,7 @@ mod tests {
                 anchor("platform-authority", 0xCC),
                 anchor("application-authority", 0xDD),
                 device_generated_ec("device-decrypt", "bali-vm-1"),
-                device_generated_ec("ecu-signing", "bali-vm-1"),
+                device_generated_ec("iam-signing", "bali-vm-1"),
                 device_generated_ec("ivd-signing", "bali-vm-1"),
                 device_generated_aes("storage-key", "bali-vm-1"),
             ],

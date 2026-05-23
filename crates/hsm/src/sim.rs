@@ -1090,7 +1090,7 @@ impl HsmProvider for SimHsm {
             | KeyRole::SoftwareAuthority
             | KeyRole::PlatformAuthority
             | KeyRole::ApplicationAuthority
-            | KeyRole::EcuSigning
+            | KeyRole::IamSigning
             | KeyRole::IvdSigning => Some(coset::iana::Algorithm::ES256),
             KeyRole::DeviceDecryption => None,
         };

@@ -42,23 +42,27 @@ const DEFAULT_LISTEN: &str = "10.0.200.1:5100";
 const DEFAULT_CERT_LIFETIME_SECS: u64 = 365 * 24 * 60 * 60; // 1 year
 const DEFAULT_ISSUER: &str = "device-vhsm-ssd";
 
-/// EcuSigner adapter that signs through the configured HSM provider's
-/// `ecu-signing` key. Lives at the daemon boundary so the cert.rs
-/// trait stays HSM-agnostic.
-struct HsmEcuSigner {
+/// `EcuSigner` adapter that signs through the configured HSM
+/// provider's `iam-signing` key. Lives at the daemon boundary so
+/// the cert.rs trait stays HSM-agnostic.
+///
+/// Calls `sign_raw_p256` (not `sign`) because COSE_Sign1 expects
+/// raw 64-byte ECDSA-P256 (r||s); the generic `HsmCryptoProvider::sign`
+/// returns DER and would produce CWTs that fail validation.
+struct HsmIamSigner {
     crypto: Arc<dyn HsmCryptoProvider>,
 }
 
-impl EcuSigner for HsmEcuSigner {
+impl EcuSigner for HsmIamSigner {
     fn sign(&self, data: &[u8]) -> Vec<u8> {
-        match self.crypto.sign("ecu-signing", data) {
+        match self.crypto.sign_raw_p256("iam-signing", data) {
             Ok(sig) => sig,
             Err(e) => {
                 // Return an empty sig so the resulting CWT will fail
                 // validation on the next AUTH attempt. The client
                 // surface this as BadCertSignature; operators see this
                 // tracing error in the daemon log.
-                tracing::error!(error = %e, "ecu-signing HSM sign failed; minted CWT will be unusable");
+                tracing::error!(error = %e, "iam-signing HSM sign failed; minted CWT will be unusable");
                 Vec::new()
             }
         }
@@ -270,15 +274,16 @@ fn main() {
     };
     let bootstrap = Arc::new(Mutex::new(bootstrap));
 
-    // Read ecu-signing pubkey once at startup. AUTH verifies CWTs
-    // against this; ENROLL signs new CWTs via HsmEcuSigner.
-    // The HSM stores the DER-encoded SPKI; convert to raw SEC1
-    // (0x04 || x || y) which is what cert::validate expects.
-    let ecu_signing_pub = match crypto.get_public_key_der("ecu-signing") {
+    // Read iam-signing pubkey once at startup. AUTH verifies CWTs
+    // against this; ENROLL / ENROLL_ASSISTED sign new CWTs via
+    // HsmIamSigner. The HSM stores the DER-encoded SPKI; convert
+    // to raw SEC1 (0x04 || x || y) which is what cert::validate
+    // expects.
+    let ecu_signing_pub = match crypto.get_public_key_der("iam-signing") {
         Ok(der) => match der_to_sec1_p256(&der) {
             Some(raw) => Arc::<[u8]>::from(raw.into_boxed_slice()),
             None => {
-                tracing::warn!("ecu-signing pubkey DER didn't decode to a P-256 point; AUTH will reject until restart");
+                tracing::warn!("iam-signing pubkey DER didn't decode to a P-256 point; AUTH will reject until restart");
                 Arc::<[u8]>::from(Box::<[u8]>::default())
             }
         },
@@ -286,12 +291,12 @@ fn main() {
             // Don't fatal — keystore might be pre-provisioning. Log
             // and continue with an empty pub; every AUTH will fail
             // until the keystore lands and we restart.
-            tracing::warn!(error = %e, "ecu-signing pubkey not in keystore; AUTH will reject until provisioned");
+            tracing::warn!(error = %e, "iam-signing pubkey not in keystore; AUTH will reject until provisioned");
             Arc::<[u8]>::from(Box::<[u8]>::default())
         }
     };
 
-    let signer: Arc<dyn EcuSigner> = Arc::new(HsmEcuSigner {
+    let signer: Arc<dyn EcuSigner> = Arc::new(HsmIamSigner {
         crypto: Arc::clone(&crypto),
     });
 
@@ -649,10 +654,15 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
 
     // Map well-known handles to keystore key_ids.
     // These match KeyRole in hsm/src/types.rs.
+    //
+    // `iam-signing` (HANDLE_IAM_SIGNING = 0x0004) is intentionally
+    // NOT registered: it's the daemon-internal cert-issuing key,
+    // never addressable by guest principals. CWT mint goes through
+    // the HsmIamSigner adapter (which calls sign_raw_p256 directly,
+    // host-privileged path bypassing the handle table).
     let well_known = [
         (HANDLE_SW_AUTHORITY, "sw-authority", ALG_ECC_P256, PERM_VERIFY),
         (HANDLE_DEVICE_DECRYPT, "device-decrypt", ALG_ECC_P256, PERM_DECRYPT | PERM_GET_PUBKEY),
-        (HANDLE_ECU_SIGNING, "ecu-signing", ALG_ECC_P256, PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY | PERM_GET_CERT),
         (HANDLE_KEY_AUTHORITY, "key-authority", ALG_ECC_P256, PERM_VERIFY),
         (HANDLE_JWT_SIGNING, "jwt-signing", ALG_ECC_P256, PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY),
         (HANDLE_STORAGE, "storage-key", ALG_AES_256, PERM_ENCRYPT | PERM_DECRYPT),

@@ -241,7 +241,7 @@ fn handle_auth(
         None => return reject(state, req, AuthFailReason::InvalidParam),
     };
 
-    // 1. Cert validation against ecu-signing pubkey.
+    // 1. Cert validation against iam-signing pubkey.
     let cert: ParsedCert = match validate_cert(cwt, ecu_signing_pub, now) {
         Ok(c) => c,
         Err(reason) => return reject(state, req, reason),

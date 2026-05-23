@@ -149,7 +149,7 @@ impl Op {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum AuthFailReason {
-    /// Cert signature didn't verify against ecu-signing pubkey.
+    /// Cert signature didn't verify against iam-signing pubkey.
     BadCertSignature = 0x0001,
     /// Cert is past its `exp` or before its `nbf`.
     CertExpired = 0x0002,
@@ -241,7 +241,7 @@ pub const PERM_KEY_GENERATE: u32 = 1 << 10;
 pub const HANDLE_INVALID: u32 = 0x0000;
 pub const HANDLE_SW_AUTHORITY: u32 = 0x0002;
 pub const HANDLE_DEVICE_DECRYPT: u32 = 0x0003;
-pub const HANDLE_ECU_SIGNING: u32 = 0x0004;
+pub const HANDLE_IAM_SIGNING: u32 = 0x0004;
 pub const HANDLE_KEY_AUTHORITY: u32 = 0x0005;
 pub const HANDLE_JWT_SIGNING: u32 = 0x0006;
 pub const HANDLE_STORAGE: u32 = 0x0007;
@@ -476,7 +476,7 @@ mod tests {
         for &h in &[
             HANDLE_SW_AUTHORITY,
             HANDLE_DEVICE_DECRYPT,
-            HANDLE_ECU_SIGNING,
+            HANDLE_IAM_SIGNING,
             HANDLE_KEY_AUTHORITY,
             HANDLE_JWT_SIGNING,
             HANDLE_STORAGE,
@@ -507,7 +507,7 @@ mod tests {
         let hs = [
             HANDLE_SW_AUTHORITY,
             HANDLE_DEVICE_DECRYPT,
-            HANDLE_ECU_SIGNING,
+            HANDLE_IAM_SIGNING,
             HANDLE_KEY_AUTHORITY,
             HANDLE_JWT_SIGNING,
             HANDLE_STORAGE,

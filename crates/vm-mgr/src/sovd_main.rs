@@ -164,7 +164,7 @@ async fn main() {
             None
         };
 
-        // Ensure device-side EC keys exist (device-decrypt, ivd-signing, ecu-signing)
+        // Ensure device-side EC keys exist (device-decrypt, ivd-signing, iam-signing)
         if let Err(e) = provider.ensure_device_keys() {
             tracing::warn!("failed to ensure device keys: {e}");
         }

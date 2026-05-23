@@ -64,7 +64,7 @@ impl TestFixture {
         // Init handle table with well-known handles
         let mut handle_table = HandleTable::new();
         handle_table.register_well_known(
-            HANDLE_ECU_SIGNING,
+            HANDLE_IAM_SIGNING,
             "mykey",
             ALG_ECC_P256,
             PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY | PERM_GET_CERT,
@@ -233,7 +233,7 @@ fn sign_and_verify() {
     let resp = fix.request(
         &caller(TEST_IP, TEST_VM),
         Op::Sign,
-        TestFixture::with_handle(HANDLE_ECU_SIGNING, data),
+        TestFixture::with_handle(HANDLE_IAM_SIGNING, data),
     );
     assert_eq!(resp.status, StatusCode::Ok as u32, "sign failed");
     let sig = resp.payload;
@@ -241,7 +241,7 @@ fn sign_and_verify() {
 
     // VERIFY: handle(4) + sig_len(4) + sig + hash_len(4) + hash
     let mut vp = Vec::new();
-    vp.extend_from_slice(&HANDLE_ECU_SIGNING.to_le_bytes());
+    vp.extend_from_slice(&HANDLE_IAM_SIGNING.to_le_bytes());
     vp.extend_from_slice(&(sig.len() as u32).to_le_bytes());
     vp.extend_from_slice(&sig);
     vp.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -269,7 +269,7 @@ fn verify_rejects_bad_signature() {
     bad.extend_from_slice(&[0xFF; 32]);
 
     let mut p = Vec::new();
-    p.extend_from_slice(&HANDLE_ECU_SIGNING.to_le_bytes());
+    p.extend_from_slice(&HANDLE_IAM_SIGNING.to_le_bytes());
     p.extend_from_slice(&(bad.len() as u32).to_le_bytes());
     p.extend_from_slice(&bad);
     p.extend_from_slice(&(4u32).to_le_bytes());
@@ -319,7 +319,7 @@ fn get_pubkey() {
     let resp = fix.request(
         &caller(TEST_IP, TEST_VM),
         Op::GetPubkey,
-        HANDLE_ECU_SIGNING.to_le_bytes().to_vec(),
+        HANDLE_IAM_SIGNING.to_le_bytes().to_vec(),
     );
     assert_eq!(resp.status, StatusCode::Ok as u32, "get_pubkey failed");
     // Response: pubkey_len(4) + pubkey
@@ -338,7 +338,7 @@ fn get_cert() {
     let resp = fix.request(
         &caller(TEST_IP, TEST_VM),
         Op::GetCert,
-        HANDLE_ECU_SIGNING.to_le_bytes().to_vec(),
+        HANDLE_IAM_SIGNING.to_le_bytes().to_vec(),
     );
     assert_eq!(resp.status, StatusCode::Ok as u32, "get_cert failed");
     assert!(resp.payload.len() >= 4);
@@ -355,7 +355,7 @@ fn get_handle_info() {
     let resp = fix.request(
         &caller(TEST_IP, TEST_VM),
         Op::GetHandleInfo,
-        HANDLE_ECU_SIGNING.to_le_bytes().to_vec(),
+        HANDLE_IAM_SIGNING.to_le_bytes().to_vec(),
     );
     assert_eq!(resp.status, StatusCode::Ok as u32, "handle_info failed");
     assert_eq!(resp.payload.len(), 48);
@@ -365,7 +365,7 @@ fn get_handle_info() {
     let alg = u32::from_le_bytes([
         resp.payload[4], resp.payload[5], resp.payload[6], resp.payload[7],
     ]);
-    assert_eq!(handle, HANDLE_ECU_SIGNING);
+    assert_eq!(handle, HANDLE_IAM_SIGNING);
     assert_eq!(alg, ALG_ECC_P256);
 }
 
@@ -436,7 +436,7 @@ fn iam_rejects_unknown_principal() {
     let resp = fix.request(
         &caller(TEST_IP, "stranger"),
         Op::Sign,
-        TestFixture::with_handle(HANDLE_ECU_SIGNING, b"data"),
+        TestFixture::with_handle(HANDLE_IAM_SIGNING, b"data"),
     );
     assert_eq!(resp.status, StatusCode::PolicyReject as u32);
 }
@@ -449,7 +449,7 @@ fn iam_denies_unpermitted_op() {
     let resp = fix.request(
         &caller(OTHER_IP, OTHER_VM),
         Op::Sign,
-        TestFixture::with_handle(HANDLE_ECU_SIGNING, b"data"),
+        TestFixture::with_handle(HANDLE_IAM_SIGNING, b"data"),
     );
     assert_eq!(resp.status, StatusCode::PolicyReject as u32);
 }
@@ -458,11 +458,11 @@ fn iam_denies_unpermitted_op() {
 fn handle_permission_denies_wrong_op() {
     let mut fix = TestFixture::new();
 
-    // HANDLE_ECU_SIGNING has SIGN|VERIFY|GET_PUBKEY|GET_CERT — not ENCRYPT
+    // HANDLE_IAM_SIGNING has SIGN|VERIFY|GET_PUBKEY|GET_CERT — not ENCRYPT
     let resp = fix.request(
         &caller(TEST_IP, TEST_VM),
         Op::Encrypt,
-        TestFixture::with_handle(HANDLE_ECU_SIGNING, b"test"),
+        TestFixture::with_handle(HANDLE_IAM_SIGNING, b"test"),
     );
     assert_eq!(resp.status, StatusCode::PermissionDeny as u32);
 }

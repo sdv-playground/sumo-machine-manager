@@ -16,7 +16,7 @@
 //!     ops: [verify, get-pubkey]
 //!
 //!   - principals: [vm1]
-//!     handles: [ecu-signing, jwt-signing]
+//!     handles: [iam-signing, jwt-signing]
 //!     ops: [sign, verify, get-pubkey, get-cert]
 //!
 //!   - principals: ["*"]
@@ -47,7 +47,7 @@
 //! - **Handle name strings** are the `key_id` field from
 //!   `HandleEntry` (the same string passed to
 //!   `register_well_known`). Standard well-known names:
-//!   `sw-authority`, `key-authority`, `device-decrypt`, `ecu-signing`,
+//!   `sw-authority`, `key-authority`, `device-decrypt`, `iam-signing`,
 //!   `jwt-signing`, `storage`. Project-extension key_ids
 //!   (e.g. `mqtt-client-cert`) are allowed verbatim.
 //!
@@ -325,7 +325,7 @@ statements:
     handles: [sw-authority, key-authority]
     ops: [verify, get-pubkey]
   - principals: [vm1]
-    handles: [ecu-signing, jwt-signing]
+    handles: [iam-signing, jwt-signing]
     ops: [sign, verify, get-pubkey, get-cert]
   - principals: ["*"]
     handles: [device-decrypt]
@@ -369,9 +369,9 @@ statements:
     #[test]
     fn default_deny_for_unmatched_combinations() {
         let p = IamPolicy::parse(sample()).unwrap();
-        // vm2 + ecu-signing + sign → no statement covers this.
-        // Statement 1 is vm1-only for ecu-signing.
-        let d = p.evaluate("vm2", "ecu-signing", Op::Sign);
+        // vm2 + iam-signing + sign → no statement covers this.
+        // Statement 1 is vm1-only for iam-signing.
+        let d = p.evaluate("vm2", "iam-signing", Op::Sign);
         assert_eq!(d, IamDecision::Deny);
     }
 
