@@ -722,4 +722,44 @@ mod tests {
         assert_eq!(mac.len(), 16, "AES-CMAC tag");
         assert!(hsm.mac_verify(&key_id, b"hello", &mac).unwrap());
     }
+
+    /// Host-only ops (KeyImport / KeyDerive / KeyDelete) must return
+    /// POLICY_REJECT for guest callers, regardless of IAM policy. This
+    /// is enforced at `handle_request` entry — earlier than IAM
+    /// evaluation — so even a wildcard-allow policy can't open them up
+    /// to guests. The gate is the only thing keeping a guest from
+    /// trying to import keys into the host keystore over the wire.
+    #[test]
+    fn host_only_ops_rejected_from_guest_with_policy_reject() {
+        use crate::iam::IamPolicy;
+        let (hsm, _keys_dir, _tmp) = new_hsm();
+        let mut table = HandleTable::new();
+        // Wildcard-allow policy — proves the host-only gate fires
+        // BEFORE IAM evaluation. If IAM were the only gate, this
+        // wide-open policy would let KeyImport through.
+        let iam = IamPolicy::parse(
+            "version: 1\nstatements:\n  - principals: [\"*\"]\n    handles: [\"*\"]\n    ops: [\"*\"]\n",
+        )
+        .expect("policy parses");
+
+        for op in [Op::KeyImport, Op::KeyDerive, Op::KeyDelete] {
+            let req = Request {
+                op: op as u32,
+                session_id: 0,
+                payload: vec![],
+            };
+            let (resp, outcome) = handle_request(&req, &caller("vm1"), &mut table, &iam, &hsm);
+            assert_eq!(
+                resp.status,
+                StatusCode::PolicyReject as u32,
+                "host-only op {op:?} must return POLICY_REJECT to guests",
+            );
+            // The gate fires before IAM, so outcome is Bypass — there's
+            // no statement to attribute the reject to in the audit log.
+            assert!(
+                matches!(outcome, AuthzOutcome::Bypass),
+                "host-only reject should bypass IAM (got {outcome:?})"
+            );
+        }
+    }
 }
