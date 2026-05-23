@@ -12,30 +12,36 @@ use crate::sim::{decode_pem, extract_ec_scalar_from_pem, SimHsm};
 use crate::{HsmCryptoProvider, HsmError, HsmProvider, KeyInfo, KeyType};
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
 use ecdsa::signature::Signer;
 use ecdsa::signature::Verifier;
 use hkdf::Hkdf;
+use hmac::Hmac;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use sha2::Sha256;
 
+type HmacSha256 = Hmac<Sha256>;
+
 impl HsmCryptoProvider for SimHsm {
     fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
         let key_info = self.get_key_info(key_id)?;
-        if key_info.key_type != KeyType::EcP256 {
-            return Err(HsmError::CryptoError(format!(
-                "sign requires EC-P256 key, got {}",
-                key_info.key_type
-            )));
+        match key_info.key_type {
+            KeyType::EcP256 => {
+                let scalar = load_ec_private_scalar(self, key_id)?;
+                let signing_key = SigningKey::from_bytes((&scalar[..]).into())
+                    .map_err(|e| HsmError::CryptoError(format!("invalid signing key: {e}")))?;
+                let signature: ecdsa::der::Signature<p256::NistP256> = signing_key.sign(data);
+                Ok(signature.to_bytes().to_vec())
+            }
+            KeyType::Ed25519 => {
+                let sk = load_ed25519_signing_key(self, key_id)?;
+                Ok(sk.sign(data).to_bytes().to_vec())
+            }
+            other => Err(HsmError::CryptoError(format!(
+                "sign requires asymmetric signing key (EC-P256 or Ed25519), got {other}"
+            ))),
         }
-
-        let scalar = load_ec_private_scalar(self, key_id)?;
-        let signing_key = SigningKey::from_bytes((&scalar[..]).into())
-            .map_err(|e| HsmError::CryptoError(format!("invalid signing key: {e}")))?;
-
-        let signature: ecdsa::der::Signature<p256::NistP256> = signing_key.sign(data);
-        Ok(signature.to_bytes().to_vec())
     }
 
     fn sign_raw_p256(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
@@ -58,43 +64,60 @@ impl HsmCryptoProvider for SimHsm {
 
     fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
         let key_info = self.get_key_info(key_id)?;
-        if key_info.key_type != KeyType::EcP256 {
-            return Err(HsmError::CryptoError(format!(
-                "verify requires EC-P256 key, got {}",
-                key_info.key_type
-            )));
-        }
-
-        let verifying_key = load_ec_verifying_key(self, key_id)?;
-        let sig = ecdsa::der::Signature::<p256::NistP256>::from_bytes(signature)
-            .map_err(|e| HsmError::CryptoError(format!("invalid signature: {e}")))?;
-
-        match verifying_key.verify(data, &sig) {
-            Ok(()) => Ok(true),
-            Err(_) => Ok(false),
+        match key_info.key_type {
+            KeyType::EcP256 => {
+                let verifying_key = load_ec_verifying_key(self, key_id)?;
+                let sig = ecdsa::der::Signature::<p256::NistP256>::from_bytes(signature)
+                    .map_err(|e| HsmError::CryptoError(format!("invalid signature: {e}")))?;
+                match verifying_key.verify(data, &sig) {
+                    Ok(()) => Ok(true),
+                    Err(_) => Ok(false),
+                }
+            }
+            KeyType::Ed25519 => {
+                let vk = load_ed25519_verifying_key(self, key_id)?;
+                let sig_arr: &[u8; 64] = signature
+                    .try_into()
+                    .map_err(|_| HsmError::CryptoError(
+                        format!("Ed25519 signature must be 64 bytes, got {}", signature.len())
+                    ))?;
+                let sig = ed25519_dalek::Signature::from_bytes(sig_arr);
+                Ok(vk.verify(data, &sig).is_ok())
+            }
+            other => Err(HsmError::CryptoError(format!(
+                "verify requires asymmetric signing key (EC-P256 or Ed25519), got {other}"
+            ))),
         }
     }
 
     fn encrypt(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, HsmError> {
         let key_info = self.get_key_info(key_id)?;
-        if key_info.key_type != KeyType::Aes256 {
-            return Err(HsmError::CryptoError(format!(
-                "encrypt requires AES-256 key, got {}",
-                key_info.key_type
-            )));
-        }
-
-        let raw_key = load_aes_key(self, key_id)?;
-        let cipher = Aes256Gcm::new_from_slice(&raw_key)
-            .map_err(|e| HsmError::CryptoError(format!("invalid AES key: {e}")))?;
+        let (raw_key, expected_len) = match key_info.key_type {
+            KeyType::Aes256 => (load_aes_key_bytes(self, key_id, 32)?, 32),
+            KeyType::Aes128 => (load_aes_key_bytes(self, key_id, 16)?, 16),
+            other => {
+                return Err(HsmError::CryptoError(format!(
+                    "encrypt requires AES-128 or AES-256 key, got {other}"
+                )));
+            }
+        };
+        debug_assert_eq!(raw_key.len(), expected_len);
 
         let mut iv_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut iv_bytes);
         let nonce = Nonce::from_slice(&iv_bytes);
 
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| HsmError::CryptoError(format!("AES-GCM encrypt: {e}")))?;
+        let ciphertext = if expected_len == 32 {
+            Aes256Gcm::new_from_slice(&raw_key)
+                .map_err(|e| HsmError::CryptoError(format!("invalid AES-256 key: {e}")))?
+                .encrypt(nonce, plaintext)
+                .map_err(|e| HsmError::CryptoError(format!("AES-256-GCM encrypt: {e}")))?
+        } else {
+            Aes128Gcm::new_from_slice(&raw_key)
+                .map_err(|e| HsmError::CryptoError(format!("invalid AES-128 key: {e}")))?
+                .encrypt(nonce, plaintext)
+                .map_err(|e| HsmError::CryptoError(format!("AES-128-GCM encrypt: {e}")))?
+        };
 
         // Return iv(12) || ciphertext || tag (tag is appended by aes-gcm)
         let mut result = Vec::with_capacity(12 + ciphertext.len());
@@ -105,12 +128,16 @@ impl HsmCryptoProvider for SimHsm {
 
     fn decrypt(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
         let key_info = self.get_key_info(key_id)?;
-        if key_info.key_type != KeyType::Aes256 {
-            return Err(HsmError::CryptoError(format!(
-                "decrypt requires AES-256 key, got {}",
-                key_info.key_type
-            )));
-        }
+        let (raw_key, expected_len) = match key_info.key_type {
+            KeyType::Aes256 => (load_aes_key_bytes(self, key_id, 32)?, 32),
+            KeyType::Aes128 => (load_aes_key_bytes(self, key_id, 16)?, 16),
+            other => {
+                return Err(HsmError::CryptoError(format!(
+                    "decrypt requires AES-128 or AES-256 key, got {other}"
+                )));
+            }
+        };
+        debug_assert_eq!(raw_key.len(), expected_len);
 
         if data.len() < 12 + 16 {
             return Err(HsmError::CryptoError(
@@ -118,62 +145,99 @@ impl HsmCryptoProvider for SimHsm {
             ));
         }
 
-        let raw_key = load_aes_key(self, key_id)?;
-        let cipher = Aes256Gcm::new_from_slice(&raw_key)
-            .map_err(|e| HsmError::CryptoError(format!("invalid AES key: {e}")))?;
-
         let nonce = Nonce::from_slice(&data[..12]);
         let ciphertext_and_tag = &data[12..];
 
-        cipher
-            .decrypt(nonce, ciphertext_and_tag)
-            .map_err(|e| HsmError::CryptoError(format!("AES-GCM decrypt: {e}")))
+        if expected_len == 32 {
+            Aes256Gcm::new_from_slice(&raw_key)
+                .map_err(|e| HsmError::CryptoError(format!("invalid AES-256 key: {e}")))?
+                .decrypt(nonce, ciphertext_and_tag)
+                .map_err(|e| HsmError::CryptoError(format!("AES-256-GCM decrypt: {e}")))
+        } else {
+            Aes128Gcm::new_from_slice(&raw_key)
+                .map_err(|e| HsmError::CryptoError(format!("invalid AES-128 key: {e}")))?
+                .decrypt(nonce, ciphertext_and_tag)
+                .map_err(|e| HsmError::CryptoError(format!("AES-128-GCM decrypt: {e}")))
+        }
     }
 
     fn mac_generate(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
         use cmac::{Cmac, Mac};
 
         let key_info = self.get_key_info(key_id)?;
-        if key_info.key_type != KeyType::Aes256 {
-            return Err(HsmError::CryptoError(format!(
-                "mac_generate requires AES-256 key, got {}", key_info.key_type
-            )));
+        match key_info.key_type {
+            KeyType::Aes256 => {
+                let raw_key = load_aes_key_bytes(self, key_id, 32)?;
+                let mut mac = <Cmac<aes::Aes256> as Mac>::new_from_slice(&raw_key)
+                    .map_err(|e| HsmError::CryptoError(format!("invalid AES-256 key for CMAC: {e}")))?;
+                mac.update(data);
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
+            KeyType::Aes128 => {
+                let raw_key = load_aes_key_bytes(self, key_id, 16)?;
+                let mut mac = <Cmac<aes::Aes128> as Mac>::new_from_slice(&raw_key)
+                    .map_err(|e| HsmError::CryptoError(format!("invalid AES-128 key for CMAC: {e}")))?;
+                mac.update(data);
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
+            KeyType::HmacSha256 => {
+                let raw_key = load_hmac_key(self, key_id)?;
+                let mut mac = <HmacSha256 as Mac>::new_from_slice(&raw_key)
+                    .map_err(|e| HsmError::CryptoError(format!("invalid HMAC key: {e}")))?;
+                mac.update(data);
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
+            other => Err(HsmError::CryptoError(format!(
+                "mac_generate requires AES-{{128,256}} (CMAC) or HMAC-SHA256 key, got {other}"
+            ))),
         }
-
-        let raw_key = load_aes_key(self, key_id)?;
-        let mut mac = <Cmac<aes::Aes256> as Mac>::new_from_slice(&raw_key)
-            .map_err(|e| HsmError::CryptoError(format!("invalid AES key for CMAC: {e}")))?;
-        mac.update(data);
-        Ok(mac.finalize().into_bytes().to_vec())
     }
 
     fn mac_verify(&self, key_id: &str, data: &[u8], tag: &[u8]) -> Result<bool, HsmError> {
         use cmac::{Cmac, Mac};
 
         let key_info = self.get_key_info(key_id)?;
-        if key_info.key_type != KeyType::Aes256 {
-            return Err(HsmError::CryptoError(format!(
-                "mac_verify requires AES-256 key, got {}", key_info.key_type
-            )));
+        match key_info.key_type {
+            KeyType::Aes256 => {
+                let raw_key = load_aes_key_bytes(self, key_id, 32)?;
+                let mut mac = <Cmac<aes::Aes256> as Mac>::new_from_slice(&raw_key)
+                    .map_err(|e| HsmError::CryptoError(format!("invalid AES-256 key for CMAC: {e}")))?;
+                mac.update(data);
+                Ok(mac.verify_slice(tag).is_ok())
+            }
+            KeyType::Aes128 => {
+                let raw_key = load_aes_key_bytes(self, key_id, 16)?;
+                let mut mac = <Cmac<aes::Aes128> as Mac>::new_from_slice(&raw_key)
+                    .map_err(|e| HsmError::CryptoError(format!("invalid AES-128 key for CMAC: {e}")))?;
+                mac.update(data);
+                Ok(mac.verify_slice(tag).is_ok())
+            }
+            KeyType::HmacSha256 => {
+                let raw_key = load_hmac_key(self, key_id)?;
+                let mut mac = <HmacSha256 as Mac>::new_from_slice(&raw_key)
+                    .map_err(|e| HsmError::CryptoError(format!("invalid HMAC key: {e}")))?;
+                mac.update(data);
+                Ok(mac.verify_slice(tag).is_ok())
+            }
+            other => Err(HsmError::CryptoError(format!(
+                "mac_verify requires AES-{{128,256}} (CMAC) or HMAC-SHA256 key, got {other}"
+            ))),
         }
-
-        let raw_key = load_aes_key(self, key_id)?;
-        let mut mac = <Cmac<aes::Aes256> as Mac>::new_from_slice(&raw_key)
-            .map_err(|e| HsmError::CryptoError(format!("invalid AES key for CMAC: {e}")))?;
-        mac.update(data);
-        Ok(mac.verify_slice(tag).is_ok())
     }
 
     fn derive(&self, key_id: &str, context: &[u8], len: usize) -> Result<Vec<u8>, HsmError> {
         let key_info = self.get_key_info(key_id)?;
-        if key_info.key_type != KeyType::Aes256 {
-            return Err(HsmError::CryptoError(format!(
-                "derive requires AES-256 key, got {}",
-                key_info.key_type
-            )));
-        }
+        let raw_key = match key_info.key_type {
+            KeyType::Aes256 => load_aes_key_bytes(self, key_id, 32)?,
+            KeyType::Aes128 => load_aes_key_bytes(self, key_id, 16)?,
+            KeyType::HmacSha256 => load_hmac_key(self, key_id)?,
+            other => {
+                return Err(HsmError::CryptoError(format!(
+                    "derive requires symmetric key (AES-128, AES-256, or HMAC-SHA256), got {other}"
+                )));
+            }
+        };
 
-        let raw_key = load_aes_key(self, key_id)?;
         let hk = Hkdf::<Sha256>::new(None, &raw_key);
         let mut okm = vec![0u8; len];
         hk.expand(context, &mut okm)
@@ -208,17 +272,25 @@ impl HsmCryptoProvider for SimHsm {
 
     fn get_public_key_der(&self, key_id: &str) -> Result<Vec<u8>, HsmError> {
         let key_info = self.get_key_info(key_id)?;
-        if key_info.key_type != KeyType::EcP256 {
-            return Err(HsmError::CryptoError(format!(
-                "get_public_key_der requires EC-P256 key, got {}",
-                key_info.key_type
-            )));
+        match key_info.key_type {
+            KeyType::EcP256 => {
+                let pub_path = self.keys_dir().join(format!("{key_id}.pub"));
+                let pem = std::fs::read_to_string(&pub_path).map_err(|e| {
+                    HsmError::KeystoreError(format!("read {}: {e}", pub_path.display()))
+                })?;
+                decode_pem(&pem, "PUBLIC KEY")
+            }
+            KeyType::Ed25519 => {
+                let pub_path = self.keys_dir().join(format!("{key_id}.ed25519.pub"));
+                let pem = std::fs::read_to_string(&pub_path).map_err(|e| {
+                    HsmError::KeystoreError(format!("read {}: {e}", pub_path.display()))
+                })?;
+                decode_pem(&pem, "PUBLIC KEY")
+            }
+            other => Err(HsmError::CryptoError(format!(
+                "get_public_key_der requires asymmetric key (EC-P256 or Ed25519), got {other}"
+            ))),
         }
-
-        let pub_path = self.keys_dir().join(format!("{key_id}.pub"));
-        let pem = std::fs::read_to_string(&pub_path)
-            .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", pub_path.display())))?;
-        decode_pem(&pem, "PUBLIC KEY")
     }
 
     fn get_key_info(&self, key_id: &str) -> Result<KeyInfo, HsmError> {
@@ -232,27 +304,29 @@ impl HsmCryptoProvider for SimHsm {
 
         // Disk fallback (dynamically-generated keys). Infer type from the
         // file extension produced by `generate_key`:
-        //   `{key_id}.bin`  → AES-256
-        //   `{key_id}.priv` → EC-P256
-        let aes_path = self.keys_dir().join(format!("{key_id}.bin"));
-        if aes_path.exists() {
-            return Ok(KeyInfo {
-                key_id: key_id.to_string(),
-                key_type: KeyType::Aes256,
-                has_certificate: false,
-                allowed_guests: None,
-                allowed_ops: None,
-            });
-        }
-        let ec_priv_path = self.keys_dir().join(format!("{key_id}.priv"));
-        if ec_priv_path.exists() {
-            return Ok(KeyInfo {
-                key_id: key_id.to_string(),
-                key_type: KeyType::EcP256,
-                has_certificate: false,
-                allowed_guests: None,
-                allowed_ops: None,
-            });
+        //   `{key_id}.bin`           → AES-256 (32-byte raw)
+        //   `{key_id}.aes128.bin`    → AES-128 (16-byte raw)
+        //   `{key_id}.hmac256.bin`   → HMAC-SHA256 (32-byte raw)
+        //   `{key_id}.priv`          → EC-P256 (PEM)
+        //   `{key_id}.ed25519.priv`  → Ed25519 (PEM)
+        let kd = self.keys_dir();
+        let probes: [(&str, KeyType); 5] = [
+            ("ed25519.priv", KeyType::Ed25519),
+            ("priv", KeyType::EcP256),
+            ("aes128.bin", KeyType::Aes128),
+            ("hmac256.bin", KeyType::HmacSha256),
+            ("bin", KeyType::Aes256),
+        ];
+        for (ext, kt) in probes {
+            if kd.join(format!("{key_id}.{ext}")).exists() {
+                return Ok(KeyInfo {
+                    key_id: key_id.to_string(),
+                    key_type: kt,
+                    has_certificate: false,
+                    allowed_guests: None,
+                    allowed_ops: None,
+                });
+            }
         }
 
         if !self.is_provisioned().unwrap_or(false) {
@@ -262,25 +336,38 @@ impl HsmCryptoProvider for SimHsm {
     }
 
     fn generate_key(&self, key_id: &str, alg: u32) -> Result<Vec<u8>, HsmError> {
-        // Algorithm constants mirror vHSM wire protocol (vhsm_proto.h /
-        // vhsm-ssd/src/proto.rs). Keep in sync.
+        // Algorithm constants mirror vHSM wire protocol — see
+        // `vhsm-ssd::proto::ALG_*`. Keep in sync.
+        const ALG_AES_128: u32 = 0x0001;
         const ALG_AES_256: u32 = 0x0002;
+        const ALG_HMAC_SHA256: u32 = 0x0010;
+        const ALG_ED25519: u32 = 0x0020;
         const ALG_ECC_P256: u32 = 0x0021;
 
         std::fs::create_dir_all(self.keys_dir())
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
 
+        let write_raw = |ext: &str, len: usize| -> Result<(), HsmError> {
+            let mut key = vec![0u8; len];
+            OsRng.fill_bytes(&mut key);
+            let path = self.keys_dir().join(format!("{key_id}.{ext}"));
+            std::fs::write(&path, &key)
+                .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))?;
+            Ok(())
+        };
+
         match alg {
+            ALG_AES_128 => {
+                write_raw("aes128.bin", 16)?;
+                Ok(Vec::new())
+            }
             ALG_AES_256 => {
-                // `load_aes_key` requires a 32-byte key; AES-128 isn't
-                // supported end-to-end in this backend, reject it explicitly.
-                let mut key = vec![0u8; 32];
-                OsRng.fill_bytes(&mut key);
-                let path = self.keys_dir().join(format!("{key_id}.bin"));
-                std::fs::write(&path, &key).map_err(|e| {
-                    HsmError::KeystoreError(format!("write {}: {e}", path.display()))
-                })?;
-                // Symmetric — no public material to return.
+                write_raw("bin", 32)?;
+                Ok(Vec::new())
+            }
+            ALG_HMAC_SHA256 => {
+                // 32-byte HMAC key — matches SHA-256 block boundary.
+                write_raw("hmac256.bin", 32)?;
                 Ok(Vec::new())
             }
             ALG_ECC_P256 => {
@@ -299,6 +386,32 @@ impl HsmCryptoProvider for SimHsm {
                     HsmError::KeystoreError(format!("read back {}: {e}", pub_path.display()))
                 })?;
                 decode_pem(&pem, "PUBLIC KEY")
+            }
+            ALG_ED25519 => {
+                use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
+                use rand::rngs::OsRng as DalekOsRng;
+
+                let sk = ed25519_dalek::SigningKey::generate(&mut DalekOsRng);
+                let vk = sk.verifying_key();
+
+                let priv_pem = sk
+                    .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+                    .map_err(|e| HsmError::CryptoError(format!("Ed25519 PKCS8 PEM: {e}")))?;
+                let priv_path = self.keys_dir().join(format!("{key_id}.ed25519.priv"));
+                std::fs::write(&priv_path, priv_pem.as_bytes()).map_err(|e| {
+                    HsmError::KeystoreError(format!("write {}: {e}", priv_path.display()))
+                })?;
+
+                let pub_pem = vk
+                    .to_public_key_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+                    .map_err(|e| HsmError::CryptoError(format!("Ed25519 SPKI PEM: {e}")))?;
+                let pub_path = self.keys_dir().join(format!("{key_id}.ed25519.pub"));
+                std::fs::write(&pub_path, pub_pem.as_bytes()).map_err(|e| {
+                    HsmError::KeystoreError(format!("write {}: {e}", pub_path.display()))
+                })?;
+
+                // Return SPKI DER — same convention as EC.
+                decode_pem(&pub_pem, "PUBLIC KEY")
             }
             other => Err(HsmError::NotSupported(format!(
                 "generate_key algorithm 0x{other:04x}"
@@ -523,17 +636,69 @@ fn push_der_len(buf: &mut Vec<u8>, len: usize) {
     }
 }
 
-fn load_aes_key(hsm: &SimHsm, key_id: &str) -> Result<Vec<u8>, HsmError> {
-    let path = hsm.keys_dir().join(format!("{key_id}.bin"));
+/// Load a raw symmetric key of the expected size.
+///
+/// `expected_bytes` selects the on-disk extension:
+///   * 16 → `{key_id}.aes128.bin`
+///   * 32 → `{key_id}.bin`            (AES-256 — legacy/default symmetric)
+///
+/// Use `load_hmac_key` for HMAC-SHA256 (also 32 bytes but a different
+/// extension to disambiguate from AES-256 at the `get_key_info` layer).
+fn load_aes_key_bytes(hsm: &SimHsm, key_id: &str, expected_bytes: usize) -> Result<Vec<u8>, HsmError> {
+    let ext = match expected_bytes {
+        16 => "aes128.bin",
+        32 => "bin",
+        _ => {
+            return Err(HsmError::CryptoError(format!(
+                "unsupported AES key size: {expected_bytes}"
+            )));
+        }
+    };
+    let path = hsm.keys_dir().join(format!("{key_id}.{ext}"));
     let key = std::fs::read(&path)
         .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", path.display())))?;
-    if key.len() != 32 {
+    if key.len() != expected_bytes {
         return Err(HsmError::CryptoError(format!(
-            "AES key must be 32 bytes, got {}",
+            "AES-{} key must be {expected_bytes} bytes, got {}",
+            expected_bytes * 8,
             key.len()
         )));
     }
     Ok(key)
+}
+
+fn load_hmac_key(hsm: &SimHsm, key_id: &str) -> Result<Vec<u8>, HsmError> {
+    let path = hsm.keys_dir().join(format!("{key_id}.hmac256.bin"));
+    let key = std::fs::read(&path)
+        .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", path.display())))?;
+    if key.is_empty() {
+        return Err(HsmError::CryptoError("HMAC key is empty".into()));
+    }
+    Ok(key)
+}
+
+fn load_ed25519_signing_key(
+    hsm: &SimHsm,
+    key_id: &str,
+) -> Result<ed25519_dalek::SigningKey, HsmError> {
+    use ed25519_dalek::pkcs8::DecodePrivateKey;
+    let priv_path = hsm.keys_dir().join(format!("{key_id}.ed25519.priv"));
+    let pem = std::fs::read_to_string(&priv_path)
+        .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", priv_path.display())))?;
+    ed25519_dalek::SigningKey::from_pkcs8_pem(&pem)
+        .map_err(|e| HsmError::CryptoError(format!("invalid Ed25519 private key: {e}")))
+}
+
+fn load_ed25519_verifying_key(
+    hsm: &SimHsm,
+    key_id: &str,
+) -> Result<ed25519_dalek::VerifyingKey, HsmError> {
+    use ed25519_dalek::pkcs8::DecodePublicKey;
+    let pub_path = hsm.keys_dir().join(format!("{key_id}.ed25519.pub"));
+    let pem = std::fs::read_to_string(&pub_path)
+        .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", pub_path.display())))?;
+    ed25519_dalek::VerifyingKey::from_public_key_pem(&pem)
+        .map_err(|e| HsmError::CryptoError(format!("invalid Ed25519 public key: {e}")))
 }
 
 // =============================================================================
@@ -548,9 +713,11 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    const ALG_AES_128: u32 = 0x0001;
     const ALG_AES_256: u32 = 0x0002;
-    const ALG_ECC_P256: u32 = 0x0021;
+    const ALG_HMAC_SHA256: u32 = 0x0010;
     const ALG_ED25519: u32 = 0x0020;
+    const ALG_ECC_P256: u32 = 0x0021;
 
     fn new_hsm() -> (SimHsm, TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -609,23 +776,120 @@ mod tests {
     #[test]
     fn generate_key_rejects_unsupported_alg() {
         let (hsm, _tmp) = new_hsm();
-        let err = hsm.generate_key("k-ed", ALG_ED25519).unwrap_err();
+        // 0x0099 isn't on the wire; should be rejected with NotSupported.
+        let err = hsm.generate_key("k-bogus", 0x0099).unwrap_err();
         assert!(matches!(err, HsmError::NotSupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn generate_key_ed25519_signs_and_verifies() {
+        let (hsm, _tmp) = new_hsm();
+
+        let spki = hsm.generate_key("k-ed", ALG_ED25519).unwrap();
+        assert!(!spki.is_empty(), "Ed25519 must return public key DER");
+        assert_eq!(spki[0], 0x30, "SPKI should be ASN.1 SEQUENCE");
+
+        let info = hsm.get_key_info("k-ed").unwrap();
+        assert_eq!(info.key_type, KeyType::Ed25519);
+
+        // get_public_key_der returns the same SPKI bytes
+        let spki_via_getter = hsm.get_public_key_der("k-ed").unwrap();
+        assert_eq!(spki, spki_via_getter);
+
+        // Ed25519 produces a fixed-size 64-byte signature.
+        let msg = b"hello ed25519 from SimHsm";
+        let sig = HsmCryptoProvider::sign(&hsm, "k-ed", msg).unwrap();
+        assert_eq!(sig.len(), 64, "Ed25519 signatures are 64 bytes");
+        assert!(HsmCryptoProvider::verify(&hsm, "k-ed", msg, &sig).unwrap());
+
+        // Tampered message must not verify
+        let bad = b"hello ed25519 from SimHsm!";
+        assert!(!HsmCryptoProvider::verify(&hsm, "k-ed", bad, &sig).unwrap());
+    }
+
+    #[test]
+    fn generate_key_aes128_encrypts_decrypts_and_macs() {
+        let (hsm, _tmp) = new_hsm();
+        let pk = hsm.generate_key("k-aes128", ALG_AES_128).unwrap();
+        assert!(pk.is_empty(), "symmetric — no public material");
+
+        let info = hsm.get_key_info("k-aes128").unwrap();
+        assert_eq!(info.key_type, KeyType::Aes128);
+
+        let pt = b"AES-128 round trip";
+        let ct = hsm.encrypt("k-aes128", pt).unwrap();
+        let rt = hsm.decrypt("k-aes128", &ct).unwrap();
+        assert_eq!(rt, pt);
+
+        // CMAC-AES128 tag is 16 bytes (one AES block)
+        let mac = hsm.mac_generate("k-aes128", pt).unwrap();
+        assert_eq!(mac.len(), 16);
+        assert!(hsm.mac_verify("k-aes128", pt, &mac).unwrap());
+    }
+
+    #[test]
+    fn generate_key_hmac_sha256_macs_and_verifies() {
+        let (hsm, _tmp) = new_hsm();
+        let pk = hsm.generate_key("k-hmac", ALG_HMAC_SHA256).unwrap();
+        assert!(pk.is_empty(), "symmetric — no public material");
+
+        let info = hsm.get_key_info("k-hmac").unwrap();
+        assert_eq!(info.key_type, KeyType::HmacSha256);
+
+        let data = b"hmac-sha256 round trip";
+        let tag = hsm.mac_generate("k-hmac", data).unwrap();
+        assert_eq!(tag.len(), 32, "HMAC-SHA256 tag is 32 bytes");
+        assert!(hsm.mac_verify("k-hmac", data, &tag).unwrap());
+
+        // Tampered data must not verify
+        assert!(!hsm.mac_verify("k-hmac", b"different", &tag).unwrap());
+    }
+
+    #[test]
+    fn encrypt_rejects_non_aes_keys() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-ed", ALG_ED25519).unwrap();
+        let err = hsm.encrypt("k-ed", b"data").unwrap_err();
+        assert!(matches!(err, HsmError::CryptoError(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn sign_rejects_symmetric_keys() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-aes", ALG_AES_256).unwrap();
+        let err = HsmCryptoProvider::sign(&hsm, "k-aes", b"data").unwrap_err();
+        assert!(matches!(err, HsmError::CryptoError(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn mac_rejects_asymmetric_keys() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-ec", ALG_ECC_P256).unwrap();
+        let err = hsm.mac_generate("k-ec", b"data").unwrap_err();
+        assert!(matches!(err, HsmError::CryptoError(_)), "got {err:?}");
     }
 
     #[test]
     fn generate_key_creates_files_in_keystore() {
         let (hsm, _tmp) = new_hsm();
-        hsm.generate_key("sym", ALG_AES_256).unwrap();
-        hsm.generate_key("asym", ALG_ECC_P256).unwrap();
+        hsm.generate_key("sym256", ALG_AES_256).unwrap();
+        hsm.generate_key("sym128", ALG_AES_128).unwrap();
+        hsm.generate_key("hmac", ALG_HMAC_SHA256).unwrap();
+        hsm.generate_key("asym-ec", ALG_ECC_P256).unwrap();
+        hsm.generate_key("asym-ed", ALG_ED25519).unwrap();
 
-        assert!(hsm.keys_dir().join("sym.bin").exists());
-        assert!(hsm.keys_dir().join("asym.priv").exists());
-        assert!(hsm.keys_dir().join("asym.pub").exists());
+        assert!(hsm.keys_dir().join("sym256.bin").exists());
+        assert!(hsm.keys_dir().join("sym128.aes128.bin").exists());
+        assert!(hsm.keys_dir().join("hmac.hmac256.bin").exists());
+        assert!(hsm.keys_dir().join("asym-ec.priv").exists());
+        assert!(hsm.keys_dir().join("asym-ec.pub").exists());
+        assert!(hsm.keys_dir().join("asym-ed.ed25519.priv").exists());
+        assert!(hsm.keys_dir().join("asym-ed.ed25519.pub").exists());
 
-        // .bin is exactly 32 bytes
-        let aes_bytes = std::fs::read(hsm.keys_dir().join("sym.bin")).unwrap();
-        assert_eq!(aes_bytes.len(), 32);
+        // File-size invariants we rely on at load time
+        assert_eq!(std::fs::read(hsm.keys_dir().join("sym256.bin")).unwrap().len(), 32);
+        assert_eq!(std::fs::read(hsm.keys_dir().join("sym128.aes128.bin")).unwrap().len(), 16);
+        assert_eq!(std::fs::read(hsm.keys_dir().join("hmac.hmac256.bin")).unwrap().len(), 32);
     }
 
     #[test]

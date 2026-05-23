@@ -20,9 +20,11 @@ sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "
 # RustCrypto — used by HsmCryptoProvider for software crypto (simulation)
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "der"], optional = true }
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"], optional = true }
 aes-gcm = { version = "0.10", optional = true }
 hkdf = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
 rand = { version = "0.8", optional = true }
 cmac = { version = "0.7", optional = true }
 aes = { version = "0.8", optional = true }
@@ -33,4 +35,4 @@ tempfile = "3"
 [features]
 default = ["suit"]
 suit = ["dep:sumo-onboard", "dep:sumo-crypto", "dep:sumo-codec"]
-crypto = ["dep:p256", "dep:ecdsa", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:rand", "dep:cmac", "dep:aes"]
+crypto = ["dep:p256", "dep:ecdsa", "dep:ed25519-dalek", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:hmac", "dep:rand", "dep:cmac", "dep:aes"]

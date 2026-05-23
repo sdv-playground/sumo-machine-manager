@@ -155,6 +155,9 @@ pub struct KeySlot {
 /// Key kinds. Single u64 on the wire to keep CBOR compact.
 pub const KEY_TYPE_EC_P256: u64 = 0;
 pub const KEY_TYPE_AES_256: u64 = 1;
+pub const KEY_TYPE_ED25519: u64 = 2;
+pub const KEY_TYPE_AES_128: u64 = 3;
+pub const KEY_TYPE_HMAC_SHA256: u64 = 4;
 
 /// Operation codes for the `allowed_ops` field. These name the
 /// runtime vHSM wire operations a slot may serve once provisioned;
@@ -191,6 +194,9 @@ impl KeySlot {
         match self.key_kind {
             KEY_TYPE_EC_P256 => Some(KeyType::EcP256),
             KEY_TYPE_AES_256 => Some(KeyType::Aes256),
+            KEY_TYPE_ED25519 => Some(KeyType::Ed25519),
+            KEY_TYPE_AES_128 => Some(KeyType::Aes128),
+            KEY_TYPE_HMAC_SHA256 => Some(KeyType::HmacSha256),
             _ => None,
         }
     }

@@ -636,10 +636,11 @@ mod tests {
         let (hsm, _keys_dir, _tmp) = new_hsm();
         let mut table = HandleTable::new();
 
+        // 0x0099 isn't on the wire; SimHsm returns NotSupported, handler maps to InvalidParam.
         let req = Request {
             op: Op::KeyGenerate as u32,
             session_id: 0,
-            payload: make_keygen_payload(ALG_ED25519, 0),
+            payload: make_keygen_payload(0x0099, 0),
         };
         let resp = handle_key_generate(&req, &caller("vm1"), &mut table, &hsm);
         assert_eq!(
@@ -647,6 +648,52 @@ mod tests {
             StatusCode::InvalidParam as u32,
             "unsupported alg should map to InvalidParam"
         );
+    }
+
+    #[test]
+    fn key_generate_ed25519_returns_pubkey_and_allocates_handle() {
+        let (hsm, _keys_dir, _tmp) = new_hsm();
+        let mut table = HandleTable::new();
+
+        let req = Request {
+            op: Op::KeyGenerate as u32,
+            session_id: 0,
+            payload: make_keygen_payload(ALG_ED25519, PERM_SIGN | PERM_VERIFY),
+        };
+        let resp = handle_key_generate(&req, &caller("vm1"), &mut table, &hsm);
+        assert_eq!(resp.status, StatusCode::Ok as u32);
+        // result layout: handle(4) + pubkey_len(4) + pubkey
+        assert!(resp.payload.len() > 8, "expected pubkey DER, got len={}", resp.payload.len());
+        let pubkey_len = u32::from_le_bytes([
+            resp.payload[4], resp.payload[5], resp.payload[6], resp.payload[7],
+        ]) as usize;
+        assert!(pubkey_len > 32, "Ed25519 SPKI is ~44 bytes, got {pubkey_len}");
+    }
+
+    #[test]
+    fn key_generate_aes128_allocates_handle() {
+        let (hsm, _keys_dir, _tmp) = new_hsm();
+        let mut table = HandleTable::new();
+        let req = Request {
+            op: Op::KeyGenerate as u32,
+            session_id: 0,
+            payload: make_keygen_payload(ALG_AES_128, PERM_ENCRYPT | PERM_DECRYPT),
+        };
+        let resp = handle_key_generate(&req, &caller("vm1"), &mut table, &hsm);
+        assert_eq!(resp.status, StatusCode::Ok as u32);
+    }
+
+    #[test]
+    fn key_generate_hmac_sha256_allocates_handle() {
+        let (hsm, _keys_dir, _tmp) = new_hsm();
+        let mut table = HandleTable::new();
+        let req = Request {
+            op: Op::KeyGenerate as u32,
+            session_id: 0,
+            payload: make_keygen_payload(ALG_HMAC_SHA256, PERM_MAC_GEN | PERM_MAC_VFY),
+        };
+        let resp = handle_key_generate(&req, &caller("vm1"), &mut table, &hsm);
+        assert_eq!(resp.status, StatusCode::Ok as u32);
     }
 
     #[test]

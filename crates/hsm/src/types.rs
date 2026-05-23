@@ -158,14 +158,20 @@ impl KeyRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyType {
     EcP256,
+    Ed25519,
+    Aes128,
     Aes256,
+    HmacSha256,
 }
 
 impl std::fmt::Display for KeyType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KeyType::EcP256 => write!(f, "EC-P256"),
+            KeyType::Ed25519 => write!(f, "Ed25519"),
+            KeyType::Aes128 => write!(f, "AES-128"),
             KeyType::Aes256 => write!(f, "AES-256"),
+            KeyType::HmacSha256 => write!(f, "HMAC-SHA256"),
         }
     }
 }
