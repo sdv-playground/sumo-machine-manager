@@ -58,8 +58,19 @@ pub enum Principal {
         cert_thumbprint: Option<[u8; 32]>,
     },
     /// A container running inside a VM, authenticated via JWT.
+    ///
+    /// `namespace` encodes the container's trust tier and is assigned
+    /// authoritatively by the launcher (e.g. jwt-mgr) based on the
+    /// image's signing chain — not requested by the container itself.
+    /// Conventional namespace roots:
+    ///   * `system/...`   — OEM platform components, highest trust
+    ///   * `vendor/<supplier>/...` — tier-1 supplier components
+    ///   * `app/<publisher>/...`   — third-party apps
+    ///   * `dev/...`              — unsigned / dev builds, lowest trust
+    /// See AUTH-ARCH-001 §7.4 (launcher policy) for the assignment flow.
     Container {
         vm_id: String,
+        namespace: String,
         container: String,
         image_digest: Option<String>,
     },
@@ -84,8 +95,8 @@ impl Principal {
     pub fn display_id(&self) -> String {
         match self {
             Principal::Vm { vm_id, .. } => format!("vm:{vm_id}"),
-            Principal::Container { vm_id, container, .. } => {
-                format!("vm:{vm_id}/container:{container}")
+            Principal::Container { vm_id, namespace, container, .. } => {
+                format!("vm:{vm_id}/ns:{namespace}/container:{container}")
             }
             Principal::Tester { idp, sub, .. } => format!("tester:{idp}/{sub}"),
             Principal::Device { serial } => format!("device:{serial}"),
@@ -131,6 +142,11 @@ pub enum RawPrincipalSelector {
 pub struct TypedPrincipalSelector {
     #[serde(default)]
     pub vm: Option<String>,
+    /// Container namespace. Glob form `"system/*"` matches anything
+    /// under `system/`. Bare `"system"` matches that exact namespace.
+    /// `"*"` matches any namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
     #[serde(default)]
     pub container: Option<String>,
     #[serde(default)]
@@ -160,10 +176,13 @@ pub enum PrincipalSelector {
     /// Matches `Principal::Vm` with the given vm_id.
     Vm { vm_id: String },
     /// Matches `Principal::Container` with the given vm_id and optional
-    /// container name + image_digest. `None` fields are wildcards
-    /// within the Container variant.
+    /// namespace / container name / image_digest. `None` fields are
+    /// wildcards within the Container variant. `namespace` accepts a
+    /// glob suffix: `"system/*"` matches anything under `system/`,
+    /// `"system"` matches that exact namespace.
     Container {
         vm_id: String,
+        namespace: Option<NamespacePattern>,
         container: Option<String>,
         image_digest: Option<String>,
     },
@@ -177,6 +196,42 @@ pub enum PrincipalSelector {
     Device { serial: String },
     /// Matches the literal `Principal::Anonymous`.
     Anonymous,
+}
+
+/// Compiled namespace matcher. Built by [`NamespacePattern::parse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespacePattern {
+    /// Pattern `"*"` — matches any namespace.
+    Any,
+    /// Pattern `"prefix/*"` — matches strings beginning with `"prefix/"`.
+    /// The trailing slash is part of the stored prefix.
+    Prefix(String),
+    /// Pattern with no glob — exact-match.
+    Exact(String),
+}
+
+impl NamespacePattern {
+    pub fn parse(s: &str) -> Self {
+        if s == "*" {
+            NamespacePattern::Any
+        } else if let Some(prefix) = s.strip_suffix("/*") {
+            // Store the prefix WITH the trailing slash so a pattern
+            // `"system/*"` matches `"system/foo"` but not `"system"`.
+            let mut with_slash = prefix.to_string();
+            with_slash.push('/');
+            NamespacePattern::Prefix(with_slash)
+        } else {
+            NamespacePattern::Exact(s.to_string())
+        }
+    }
+
+    pub fn matches(&self, ns: &str) -> bool {
+        match self {
+            NamespacePattern::Any => true,
+            NamespacePattern::Prefix(p) => ns.starts_with(p.as_str()),
+            NamespacePattern::Exact(s) => ns == s,
+        }
+    }
 }
 
 impl PrincipalSelector {
@@ -198,9 +253,14 @@ impl PrincipalSelector {
                     )));
                 }
                 if let Some(vm) = &t.vm {
-                    if t.container.is_some() || t.image_digest.is_some() {
+                    // Container if ANY container-shaped field is set.
+                    let is_container = t.namespace.is_some()
+                        || t.container.is_some()
+                        || t.image_digest.is_some();
+                    if is_container {
                         Ok(PrincipalSelector::Container {
                             vm_id: vm.clone(),
+                            namespace: t.namespace.as_deref().map(NamespacePattern::parse),
                             container: t.container.clone(),
                             image_digest: t.image_digest.clone(),
                         })
@@ -231,16 +291,19 @@ impl PrincipalSelector {
             (
                 PrincipalSelector::Container {
                     vm_id: w_vm,
+                    namespace: w_ns,
                     container: w_c,
                     image_digest: w_img,
                 },
                 Principal::Container {
                     vm_id: g_vm,
+                    namespace: g_ns,
                     container: g_c,
                     image_digest: g_img,
                 },
             ) => {
                 (w_vm == g_vm || w_vm == "*")
+                    && w_ns.as_ref().map_or(true, |w| w.matches(g_ns))
                     && w_c.as_ref().map_or(true, |w| w == g_c)
                     && w_img
                         .as_ref()
@@ -675,6 +738,7 @@ statements:
         // (selector requires exact variant).
         let container = Principal::Container {
             vm_id: "vm1".to_string(),
+            namespace: "system".to_string(),
             container: "telemetry".to_string(),
             image_digest: None,
         };
@@ -700,6 +764,7 @@ statements:
         .expect("parses");
         let container = Principal::Container {
             vm_id: "vm1".to_string(),
+            namespace: "system".to_string(),
             container: "telemetry".to_string(),
             image_digest: None,
         };
@@ -709,6 +774,7 @@ statements:
         // Different container — denied.
         let other = Principal::Container {
             vm_id: "vm1".to_string(),
+            namespace: "system".to_string(),
             container: "other".to_string(),
             image_digest: None,
         };
@@ -909,10 +975,11 @@ statements:
 
         let p = Principal::Container {
             vm_id: "vm1".into(),
+            namespace: "system".into(),
             container: "telemetry".into(),
             image_digest: None,
         };
-        assert_eq!(p.display_id(), "vm:vm1/container:telemetry");
+        assert_eq!(p.display_id(), "vm:vm1/ns:system/container:telemetry");
 
         let p = Principal::Tester {
             idp: "prod".into(),
@@ -924,5 +991,251 @@ statements:
 
         let p = Principal::Anonymous;
         assert_eq!(p.display_id(), "anonymous");
+    }
+
+    // -- Namespace pattern matching ---------------------------------------
+
+    fn container(vm: &str, ns: &str, name: &str) -> Principal {
+        Principal::Container {
+            vm_id: vm.into(),
+            namespace: ns.into(),
+            container: name.into(),
+            image_digest: None,
+        }
+    }
+
+    #[test]
+    fn namespace_pattern_parses_three_forms() {
+        assert_eq!(NamespacePattern::parse("*"), NamespacePattern::Any);
+        assert_eq!(
+            NamespacePattern::parse("system/*"),
+            NamespacePattern::Prefix("system/".into())
+        );
+        assert_eq!(
+            NamespacePattern::parse("vendor/bosch/*"),
+            NamespacePattern::Prefix("vendor/bosch/".into())
+        );
+        assert_eq!(
+            NamespacePattern::parse("system"),
+            NamespacePattern::Exact("system".into())
+        );
+    }
+
+    #[test]
+    fn namespace_prefix_does_not_match_unrelated() {
+        let pat = NamespacePattern::parse("system/*");
+        assert!(pat.matches("system/foo"));
+        assert!(pat.matches("system/foo/bar"));
+        // The trailing-slash invariant: bare "system" doesn't match
+        // "system/*" — operators who want both must write "system" too.
+        assert!(!pat.matches("system"));
+        assert!(!pat.matches("vendor/foo"));
+        assert!(!pat.matches("systems/foo")); // not a substring match
+    }
+
+    #[test]
+    fn namespace_glob_matches_system_containers_only() {
+        let p = Policy::parse(
+            r#"
+version: 2
+statements:
+  - principals:
+      - vm: vm1
+        namespace: "system/*"
+    resources:
+      test: { value: "*" }
+    ops: [sign]
+"#,
+            normalize_identity,
+        )
+        .expect("parses");
+
+        let sys_a = container("vm1", "system/telemetry", "telemetry");
+        let sys_b = container("vm1", "system/jwt-mgr", "jwt-mgr");
+        let vendor = container("vm1", "vendor/bosch/brakes", "brakes");
+        let app = container("vm1", "app/com.example/foo", "foo");
+
+        assert_eq!(
+            evaluate(&p, &sys_a, &"x".into(), "sign", &TestMatcher),
+            Decision::Allow { matched_statement: 0 }
+        );
+        assert_eq!(
+            evaluate(&p, &sys_b, &"x".into(), "sign", &TestMatcher),
+            Decision::Allow { matched_statement: 0 }
+        );
+        assert_eq!(
+            evaluate(&p, &vendor, &"x".into(), "sign", &TestMatcher),
+            Decision::Deny
+        );
+        assert_eq!(
+            evaluate(&p, &app, &"x".into(), "sign", &TestMatcher),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn namespace_exact_matches_only_exact() {
+        let p = Policy::parse(
+            r#"
+version: 2
+statements:
+  - principals:
+      - vm: vm1
+        namespace: "system"
+    resources:
+      test: { value: "*" }
+    ops: [sign]
+"#,
+            normalize_identity,
+        )
+        .expect("parses");
+
+        let exact = container("vm1", "system", "x");
+        let sub = container("vm1", "system/foo", "x");
+        assert_eq!(
+            evaluate(&p, &exact, &"x".into(), "sign", &TestMatcher),
+            Decision::Allow { matched_statement: 0 }
+        );
+        assert_eq!(
+            evaluate(&p, &sub, &"x".into(), "sign", &TestMatcher),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn namespace_wildcard_matches_anything() {
+        let p = Policy::parse(
+            r#"
+version: 2
+statements:
+  - principals:
+      - vm: vm1
+        namespace: "*"
+    resources:
+      test: { value: "*" }
+    ops: [sign]
+"#,
+            normalize_identity,
+        )
+        .expect("parses");
+
+        for ns in ["system/telemetry", "vendor/bosch/x", "app/foo/bar", "dev/scratch"] {
+            let c = container("vm1", ns, "x");
+            assert_eq!(
+                evaluate(&p, &c, &"x".into(), "sign", &TestMatcher),
+                Decision::Allow { matched_statement: 0 },
+                "ns={ns}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_selector_without_namespace_matches_any_namespace() {
+        // `{vm: vm1, container: foo}` — namespace omitted — matches
+        // the container by name regardless of namespace. Used by
+        // operators who care about the container identity rather than
+        // its trust tier.
+        let p = Policy::parse(
+            r#"
+version: 2
+statements:
+  - principals:
+      - vm: vm1
+        container: telemetry
+    resources:
+      test: { value: "*" }
+    ops: [sign]
+"#,
+            normalize_identity,
+        )
+        .expect("parses");
+        let c1 = container("vm1", "system/telemetry", "telemetry");
+        let c2 = container("vm1", "vendor/bosch", "telemetry");
+        assert_eq!(
+            evaluate(&p, &c1, &"x".into(), "sign", &TestMatcher),
+            Decision::Allow { matched_statement: 0 }
+        );
+        assert_eq!(
+            evaluate(&p, &c2, &"x".into(), "sign", &TestMatcher),
+            Decision::Allow { matched_statement: 0 }
+        );
+    }
+
+    #[test]
+    fn tiered_policy_allows_each_tier_what_it_should() {
+        // The canonical tiered example from the architecture spec:
+        // system can sign JWTs, vendor can use vendor key, apps only
+        // read signals.
+        let p = Policy::parse(
+            r#"
+version: 2
+statements:
+  # Tier 1: system containers — broad HSM access
+  - principals: [{ vm: vm1, namespace: "system/*" }]
+    resources: { hsm: { handles: [jwt-signing] } }
+    ops: [sign]
+  # Tier 2: Bosch vendor — vendor-scoped signing only
+  - principals: [{ vm: vm1, namespace: "vendor/bosch/*" }]
+    resources: { hsm: { handles: [bosch-vendor-signing] } }
+    ops: [sign]
+  # Tier 3: third-party apps — read-only signals
+  - principals: [{ vm: vm1, namespace: "app/*" }]
+    resources: { signals: { read: [vehicle.speed] } }
+    ops: [read]
+"#,
+            normalize_identity,
+        )
+        .expect("parses");
+
+        // We need an HSM-shaped matcher for this test — reuse the
+        // shape from the spec example.
+        struct HsmMatcher;
+        impl ResourceMatcher for HsmMatcher {
+            type Request = String; // the requested handle name
+            fn matches(&self, stmt: &serde_yaml::Value, req: &String) -> bool {
+                stmt.get("hsm")
+                    .and_then(|h| h.get("handles"))
+                    .and_then(|v| v.as_sequence())
+                    .map_or(false, |seq| {
+                        seq.iter().filter_map(|v| v.as_str()).any(|h| h == "*" || h == req)
+                    })
+            }
+        }
+
+        let sys = container("vm1", "system/jwt-mgr", "jwt-mgr");
+        let bosch = container("vm1", "vendor/bosch/brakes", "brakes");
+        let app = container("vm1", "app/com.example", "foo");
+
+        // System can sign with jwt-signing.
+        assert_eq!(
+            evaluate(&p, &sys, &"jwt-signing".into(), "sign", &HsmMatcher),
+            Decision::Allow { matched_statement: 0 }
+        );
+        // System CANNOT use bosch-vendor-signing (statement 1 is for
+        // bosch principals).
+        assert_eq!(
+            evaluate(&p, &sys, &"bosch-vendor-signing".into(), "sign", &HsmMatcher),
+            Decision::Deny
+        );
+        // Bosch CAN use its own vendor key.
+        assert_eq!(
+            evaluate(&p, &bosch, &"bosch-vendor-signing".into(), "sign", &HsmMatcher),
+            Decision::Allow { matched_statement: 1 }
+        );
+        // Bosch CANNOT use jwt-signing (would let bosch impersonate
+        // the system).
+        assert_eq!(
+            evaluate(&p, &bosch, &"jwt-signing".into(), "sign", &HsmMatcher),
+            Decision::Deny
+        );
+        // Apps have NO HSM access at all.
+        assert_eq!(
+            evaluate(&p, &app, &"jwt-signing".into(), "sign", &HsmMatcher),
+            Decision::Deny
+        );
+        assert_eq!(
+            evaluate(&p, &app, &"bosch-vendor-signing".into(), "sign", &HsmMatcher),
+            Decision::Deny
+        );
     }
 }
