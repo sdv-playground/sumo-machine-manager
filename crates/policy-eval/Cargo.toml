@@ -1,0 +1,11 @@
+[package]
+name = "policy-eval"
+version = "0.1.0"
+edition = "2021"
+description = "Shared policy schema + evaluator for sumo / supernova services"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+[dev-dependencies]
