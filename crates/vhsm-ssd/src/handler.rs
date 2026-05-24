@@ -762,4 +762,262 @@ mod tests {
             );
         }
     }
+
+    // -- IAM integration tests through `handle_request` --------------------
+    //
+    // The matcher chain is unit-tested in iam.rs; these cover the
+    // dispatcher's translation of an IAM decision into the wire-level
+    // status code + audit outcome. IAM gating happens BEFORE the op
+    // runs, so the underlying op may still fail downstream — we only
+    // assert on the IAM gate's outcome + the dispatcher's response
+    // status for the gate path.
+
+    /// Helper: HandleTable with the two well-known handles
+    /// (`jwt-signing`, `sw-authority`) registered. The keys behind them
+    /// don't need to exist on disk because the IAM gate fires before
+    /// the op tries to load any key material.
+    fn table_with_well_known() -> HandleTable {
+        let mut table = HandleTable::new();
+        table.register_well_known(
+            HANDLE_JWT_SIGNING,
+            "jwt-signing",
+            ALG_ECC_P256,
+            PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY,
+        );
+        table.register_well_known(
+            HANDLE_SW_AUTHORITY,
+            "sw-authority",
+            ALG_ECC_P256,
+            PERM_VERIFY,
+        );
+        table
+    }
+
+    /// Build a Verify request payload: handle(4) + sig_len(4) + sig +
+    /// data. The signature is bogus on purpose — we only care about
+    /// the IAM gate outcome, not the verification result.
+    fn make_verify_payload(handle: u32) -> Vec<u8> {
+        let mut p = Vec::with_capacity(8 + 70 + 32);
+        p.extend_from_slice(&handle.to_le_bytes());
+        let sig = [0u8; 70];
+        p.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+        p.extend_from_slice(&sig);
+        p.extend_from_slice(&[0xAA; 32]); // verify data
+        p
+    }
+
+    /// Policy explicitly authorises vm1 on jwt-signing+verify but
+    /// doesn't mention vm2. vm2 defaults to deny → POLICY_REJECT.
+    /// Verifies the principal matcher fires through the dispatcher.
+    #[test]
+    fn iam_per_principal_policy_allows_one_vm_denies_other() {
+        let (hsm, _keys_dir, _tmp) = new_hsm();
+        let mut table = table_with_well_known();
+        let iam = IamPolicy::parse(
+            r#"
+version: 1
+statements:
+  - principals: [vm1]
+    handles: [jwt-signing]
+    ops: [verify]
+"#,
+        )
+        .expect("policy parses");
+
+        let req = Request {
+            op: Op::Verify as u32,
+            session_id: 0,
+            payload: make_verify_payload(HANDLE_JWT_SIGNING),
+        };
+
+        // vm1 hits statement 0 — outcome is Allow.
+        let (resp, outcome) = handle_request(&req, &caller("vm1"), &mut table, &iam, &hsm);
+        assert!(
+            matches!(outcome, AuthzOutcome::Allow { matched_statement: 0 }),
+            "vm1 should be allowed by statement 0, got {outcome:?}"
+        );
+        assert_ne!(
+            resp.status,
+            StatusCode::PolicyReject as u32,
+            "vm1 should NOT get POLICY_REJECT (status was {:#x})",
+            resp.status,
+        );
+
+        // vm2 isn't named in any statement → default-deny.
+        let (resp, outcome) = handle_request(&req, &caller("vm2"), &mut table, &iam, &hsm);
+        assert_eq!(resp.status, StatusCode::PolicyReject as u32);
+        assert!(matches!(outcome, AuthzOutcome::Deny), "got {outcome:?}");
+    }
+
+    /// Statement allows vm1 for sign only — verify isn't listed, must
+    /// default-deny. Proves the op matcher fires.
+    #[test]
+    fn iam_per_op_policy_denies_unlisted_ops() {
+        let (hsm, _keys_dir, _tmp) = new_hsm();
+        let mut table = table_with_well_known();
+        let iam = IamPolicy::parse(
+            r#"
+version: 1
+statements:
+  - principals: [vm1]
+    handles: [jwt-signing]
+    ops: [sign]
+"#,
+        )
+        .expect("policy parses");
+
+        let req = Request {
+            op: Op::Verify as u32,
+            session_id: 0,
+            payload: make_verify_payload(HANDLE_JWT_SIGNING),
+        };
+        let (resp, outcome) = handle_request(&req, &caller("vm1"), &mut table, &iam, &hsm);
+        assert_eq!(resp.status, StatusCode::PolicyReject as u32);
+        assert!(matches!(outcome, AuthzOutcome::Deny), "got {outcome:?}");
+    }
+
+    /// Statement allows vm1 for jwt-signing only — same vm/op on a
+    /// different handle (sw-authority) defaults to deny. Proves the
+    /// handle matcher fires.
+    #[test]
+    fn iam_per_handle_policy_denies_unlisted_handles() {
+        let (hsm, _keys_dir, _tmp) = new_hsm();
+        let mut table = table_with_well_known();
+        let iam = IamPolicy::parse(
+            r#"
+version: 1
+statements:
+  - principals: [vm1]
+    handles: [jwt-signing]
+    ops: [verify]
+"#,
+        )
+        .expect("policy parses");
+
+        // verify on sw-authority should be denied — handle isn't listed
+        let req = Request {
+            op: Op::Verify as u32,
+            session_id: 0,
+            payload: make_verify_payload(HANDLE_SW_AUTHORITY),
+        };
+        let (resp, outcome) = handle_request(&req, &caller("vm1"), &mut table, &iam, &hsm);
+        assert_eq!(resp.status, StatusCode::PolicyReject as u32);
+        assert!(matches!(outcome, AuthzOutcome::Deny), "got {outcome:?}");
+    }
+
+    /// Empty policy → default-deny on every op for every principal.
+    #[test]
+    fn iam_empty_policy_denies_everything() {
+        let (hsm, _keys_dir, _tmp) = new_hsm();
+        let mut table = table_with_well_known();
+        let iam = IamPolicy::empty();
+
+        let req = Request {
+            op: Op::Verify as u32,
+            session_id: 0,
+            payload: make_verify_payload(HANDLE_JWT_SIGNING),
+        };
+        let (resp, outcome) = handle_request(&req, &caller("vm1"), &mut table, &iam, &hsm);
+        assert_eq!(resp.status, StatusCode::PolicyReject as u32);
+        assert!(matches!(outcome, AuthzOutcome::Deny), "got {outcome:?}");
+    }
+
+    /// First-match-wins: specific statement BEFORE wildcard wins.
+    /// IAM has no explicit Deny, so we test ordering by confirming
+    /// the matched_statement index — vm1 hits statement 0 (specific),
+    /// vm2 hits statement 1 (wildcard fallback).
+    #[test]
+    fn iam_first_match_wins_picks_specific_over_wildcard() {
+        let (hsm, _keys_dir, _tmp) = new_hsm();
+        let mut table = table_with_well_known();
+        let iam = IamPolicy::parse(
+            r#"
+version: 1
+statements:
+  - principals: [vm1]
+    handles: [jwt-signing]
+    ops: [verify]
+  - principals: ["*"]
+    handles: ["*"]
+    ops: ["*"]
+"#,
+        )
+        .expect("policy parses");
+
+        let req = Request {
+            op: Op::Verify as u32,
+            session_id: 0,
+            payload: make_verify_payload(HANDLE_JWT_SIGNING),
+        };
+        let (_resp, outcome) = handle_request(&req, &caller("vm1"), &mut table, &iam, &hsm);
+        assert!(
+            matches!(outcome, AuthzOutcome::Allow { matched_statement: 0 }),
+            "vm1 should hit specific statement 0, got {outcome:?}"
+        );
+
+        let (_resp, outcome) = handle_request(&req, &caller("vm2"), &mut table, &iam, &hsm);
+        assert!(
+            matches!(outcome, AuthzOutcome::Allow { matched_statement: 1 }),
+            "vm2 should fall through to wildcard statement 1, got {outcome:?}"
+        );
+    }
+
+    /// Dynamic handles bypass IAM evaluation and rely on owner-scoping
+    /// at `handle_table.resolve`. A handle minted by vm1 must return
+    /// InvalidHandle to vm2 — even under a wildcard-allow IAM policy.
+    #[test]
+    fn iam_dynamic_handle_owner_scoped_across_vms() {
+        let (hsm, _keys_dir, _tmp) = new_hsm();
+        let mut table = HandleTable::new();
+        let iam = IamPolicy::parse(
+            "version: 1\nstatements:\n  - principals: [\"*\"]\n    handles: [\"*\"]\n    ops: [\"*\"]\n",
+        )
+        .expect("policy parses");
+
+        // vm1 mints a dynamic AES key.
+        let keygen_req = Request {
+            op: Op::KeyGenerate as u32,
+            session_id: 0,
+            payload: make_keygen_payload(
+                ALG_AES_256,
+                PERM_ENCRYPT | PERM_DECRYPT | PERM_MAC_GEN | PERM_MAC_VFY,
+            ),
+        };
+        let (resp, _) = handle_request(&keygen_req, &caller("vm1"), &mut table, &iam, &hsm);
+        assert_eq!(resp.status, StatusCode::Ok as u32);
+        let handle = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert!(
+            handle >= HANDLE_DYNAMIC_BASE,
+            "expected dynamic handle, got {handle:#x}"
+        );
+
+        // vm2 tries to encrypt with vm1's handle — must fail with
+        // InvalidHandle, not POLICY_REJECT (dynamic handles bypass IAM)
+        // and not OK (cross-VM access blocked at handle_table.resolve).
+        let mut encrypt_payload = handle.to_le_bytes().to_vec();
+        encrypt_payload.extend_from_slice(b"victim plaintext");
+        let encrypt_req = Request {
+            op: Op::Encrypt as u32,
+            session_id: 0,
+            payload: encrypt_payload.clone(),
+        };
+        let (resp, outcome) = handle_request(&encrypt_req, &caller("vm2"), &mut table, &iam, &hsm);
+        assert_eq!(
+            resp.status,
+            StatusCode::InvalidHandle as u32,
+            "vm2 should not see vm1's dynamic handle (got status {:#x})",
+            resp.status
+        );
+        // Dynamic handles bypass IAM eval.
+        assert!(matches!(outcome, AuthzOutcome::Bypass), "got {outcome:?}");
+
+        // vm1 (the owner) can still use it.
+        let owner_req = Request {
+            op: Op::Encrypt as u32,
+            session_id: 0,
+            payload: encrypt_payload,
+        };
+        let (resp, _) = handle_request(&owner_req, &caller("vm1"), &mut table, &iam, &hsm);
+        assert_eq!(resp.status, StatusCode::Ok as u32);
+    }
 }

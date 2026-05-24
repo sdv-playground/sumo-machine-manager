@@ -893,6 +893,134 @@ mod tests {
     }
 
     #[test]
+    fn aes256_gcm_decrypt_rejects_tampered_ciphertext() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-aes", ALG_AES_256).unwrap();
+        let pt = b"some plaintext that needs an auth tag";
+        let mut ct = hsm.encrypt("k-aes", pt).unwrap();
+
+        // Flip a byte in the ciphertext (not the 12-byte nonce prefix).
+        // AES-GCM's auth tag MUST reject this.
+        ct[15] ^= 0x01;
+        let err = hsm.decrypt("k-aes", &ct).unwrap_err();
+        assert!(matches!(err, HsmError::CryptoError(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn aes128_gcm_decrypt_rejects_tampered_ciphertext() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-aes128", ALG_AES_128).unwrap();
+        let pt = b"aes-128 plaintext for tamper test";
+        let mut ct = hsm.encrypt("k-aes128", pt).unwrap();
+        ct[15] ^= 0x01;
+        let err = hsm.decrypt("k-aes128", &ct).unwrap_err();
+        assert!(matches!(err, HsmError::CryptoError(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn hmac_sha256_verify_rejects_bad_tag() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-hmac", ALG_HMAC_SHA256).unwrap();
+        let data = b"data with mac";
+        let mut tag = hsm.mac_generate("k-hmac", data).unwrap();
+        tag[0] ^= 0x01; // flip one bit
+        assert!(!hsm.mac_verify("k-hmac", data, &tag).unwrap());
+    }
+
+    #[test]
+    fn aes256_cmac_verify_rejects_bad_tag() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-aes", ALG_AES_256).unwrap();
+        let data = b"cmac round trip data";
+        let mut tag = hsm.mac_generate("k-aes", data).unwrap();
+        tag[0] ^= 0x01;
+        assert!(!hsm.mac_verify("k-aes", data, &tag).unwrap());
+    }
+
+    #[test]
+    fn aes128_cmac_roundtrip_and_rejects_bad_tag() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-aes128", ALG_AES_128).unwrap();
+        let data = b"cmac aes-128 data";
+        let tag = hsm.mac_generate("k-aes128", data).unwrap();
+        assert_eq!(tag.len(), 16, "CMAC-AES128 tag is 16 bytes");
+        assert!(hsm.mac_verify("k-aes128", data, &tag).unwrap());
+        let mut bad = tag.clone();
+        bad[0] ^= 0x01;
+        assert!(!hsm.mac_verify("k-aes128", data, &bad).unwrap());
+    }
+
+    #[test]
+    fn hkdf_derive_is_deterministic_per_key_and_context() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-aes", ALG_AES_256).unwrap();
+        let a = hsm.derive("k-aes", b"info-a", 32).unwrap();
+        let b = hsm.derive("k-aes", b"info-a", 32).unwrap();
+        let c = hsm.derive("k-aes", b"info-b", 32).unwrap();
+        assert_eq!(a.len(), 32);
+        assert_eq!(a, b, "same key+context must produce same output");
+        assert_ne!(a, c, "different context must produce different output");
+    }
+
+    #[test]
+    fn hkdf_derive_works_for_all_symmetric_key_types() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-aes256", ALG_AES_256).unwrap();
+        hsm.generate_key("k-aes128", ALG_AES_128).unwrap();
+        hsm.generate_key("k-hmac", ALG_HMAC_SHA256).unwrap();
+        for key in ["k-aes256", "k-aes128", "k-hmac"] {
+            let okm = hsm.derive(key, b"info", 48).unwrap();
+            assert_eq!(okm.len(), 48, "derive({key}) wrong length");
+        }
+    }
+
+    #[test]
+    fn hkdf_derive_rejects_asymmetric_keys() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-ec", ALG_ECC_P256).unwrap();
+        hsm.generate_key("k-ed", ALG_ED25519).unwrap();
+        for key in ["k-ec", "k-ed"] {
+            let err = hsm.derive(key, b"info", 32).unwrap_err();
+            assert!(matches!(err, HsmError::CryptoError(_)), "{key}: got {err:?}");
+        }
+    }
+
+    #[test]
+    fn ed25519_verify_rejects_tampered_signature() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-ed", ALG_ED25519).unwrap();
+        let msg = b"ed25519 negative-verify message";
+        let mut sig = HsmCryptoProvider::sign(&hsm, "k-ed", msg).unwrap();
+        sig[0] ^= 0x01;
+        assert!(!HsmCryptoProvider::verify(&hsm, "k-ed", msg, &sig).unwrap());
+    }
+
+    #[test]
+    fn ed25519_verify_rejects_wrong_length_signature() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key("k-ed", ALG_ED25519).unwrap();
+        // Ed25519 signatures must be exactly 64 bytes.
+        let too_short = vec![0u8; 63];
+        let err = HsmCryptoProvider::verify(&hsm, "k-ed", b"x", &too_short).unwrap_err();
+        assert!(matches!(err, HsmError::CryptoError(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn ed25519_get_public_key_der_returns_spki() {
+        let (hsm, _tmp) = new_hsm();
+        let spki_from_keygen = hsm.generate_key("k-ed", ALG_ED25519).unwrap();
+        let spki_via_getter = hsm.get_public_key_der("k-ed").unwrap();
+        assert_eq!(spki_from_keygen, spki_via_getter, "keygen + getter must agree");
+        assert_eq!(spki_via_getter[0], 0x30, "SPKI must be ASN.1 SEQUENCE");
+        // Ed25519 SPKI is 44 bytes — 12-byte AlgorithmIdentifier + 32-byte pub.
+        assert!(
+            spki_via_getter.len() >= 40 && spki_via_getter.len() <= 50,
+            "Ed25519 SPKI length should be ~44, got {}",
+            spki_via_getter.len()
+        );
+    }
+
+    #[test]
     fn get_key_info_falls_back_to_disk_when_not_provisioned() {
         let (hsm, _tmp) = new_hsm();
         // HSM is not provisioned — but generate_key still creates disk files.
