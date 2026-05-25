@@ -7,7 +7,7 @@
 //!
 //! Usage:
 //!   vhsm-ssd --keystore <path>
-//!            --iam-policy <path>
+//!            (--policy-dir <dir> | --iam-policy <file>)
 //!            --bootstrap-state <path>
 //!            [--listen <ip:port>]
 //!            [--cert-max-age <secs>]
@@ -17,6 +17,16 @@
 //!            [--audit-log-max-rotated <K>]
 //!            [--extension-handles <file>]
 //!            [--issuer <string>]
+//!
+//! Policy source:
+//!   --policy-dir is the AUTH-ARCH-001 §4 path — points at the policy
+//!   directory shipped inside the host-os rootfs bank (typically
+//!   `/etc/sumo/policy/`). Reads `policy.yaml` for the IAM policy and
+//!   surfaces the rest of the partition's contents (roots/, crl.yaml,
+//!   launcher-policy.yaml) via diagnostic log lines.
+//!
+//!   --iam-policy is the legacy single-file path. Still supported for
+//!   dev rigs and SimHsm spawn lines that haven't migrated.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -104,6 +114,7 @@ fn main() {
     let mut keystore_path: Option<PathBuf> = None;
     let mut listen_addr: Option<SocketAddr> = None;
     let mut iam_policy_path: Option<PathBuf> = None;
+    let mut policy_dir: Option<PathBuf> = None;
     let mut bootstrap_state_path: Option<PathBuf> = None;
     let mut cert_max_age_secs: u64 = DEFAULT_CERT_LIFETIME_SECS;
     let mut persist_dir: Option<PathBuf> = None;
@@ -130,6 +141,10 @@ fn main() {
             }
             "--iam-policy" if i + 1 < args.len() => {
                 iam_policy_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--policy-dir" if i + 1 < args.len() => {
+                policy_dir = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--bootstrap-state" if i + 1 < args.len() => {
@@ -203,10 +218,26 @@ fn main() {
         eprintln!("error: --keystore is required");
         std::process::exit(1);
     });
-    let iam_policy_path = iam_policy_path.unwrap_or_else(|| {
-        eprintln!("error: --iam-policy is required (v3 has no IP allow-list fallback)");
-        std::process::exit(1);
-    });
+    // Policy source resolution. `--policy-dir` is the AUTH-ARCH-001
+    // Phase 3 path (the in-bank policy directory at /etc/sumo/policy).
+    // `--iam-policy` remains for back-compat with SimHsm spawn lines
+    // and dev rigs that still pass a single file. Both are mutually
+    // exclusive — operators picking one or the other.
+    match (&policy_dir, &iam_policy_path) {
+        (Some(_), Some(_)) => {
+            eprintln!(
+                "error: --policy-dir and --iam-policy are mutually exclusive; pass one"
+            );
+            std::process::exit(1);
+        }
+        (None, None) => {
+            eprintln!(
+                "error: --policy-dir or --iam-policy is required (v3 has no IP allow-list fallback)"
+            );
+            std::process::exit(1);
+        }
+        _ => {}
+    }
     let bootstrap_state_path = bootstrap_state_path.unwrap_or_else(|| {
         eprintln!("error: --bootstrap-state is required");
         std::process::exit(1);
@@ -239,18 +270,43 @@ fn main() {
 
     // Load IAM policy. Default-deny if the file declares no statements —
     // operator's intent. Refuse to start on parse error / missing file.
-    let iam = match IamPolicy::load_from_file(&iam_policy_path) {
-        Ok(p) => {
-            tracing::info!(
-                path = %iam_policy_path.display(),
-                statements = p.num_statements(),
-                "IAM policy loaded"
-            );
-            p
+    let iam = if let Some(dir) = policy_dir.as_ref() {
+        // Phase 3 path: the in-bank policy directory carries
+        // policy.yaml + roots/ + (optional) crl.yaml. We only consume
+        // the authorisation policy here; roots/ + crl are wired in
+        // by later phases (SOVD cert verification, auth-time CRL).
+        match vhsm_ssd::iam::load_iam_from_partition(dir) {
+            Ok((iam, statements, partition_loaded_other)) => {
+                tracing::info!(
+                    path = %dir.display(),
+                    statements,
+                    roots = partition_loaded_other.roots,
+                    crl_present = partition_loaded_other.crl,
+                    launcher_policy_present = partition_loaded_other.launcher_policy,
+                    "IAM policy loaded from policy directory"
+                );
+                iam
+            }
+            Err(e) => {
+                eprintln!("error: failed to load --policy-dir {}: {e}", dir.display());
+                std::process::exit(1);
+            }
         }
-        Err(e) => {
-            eprintln!("error: failed to load --iam-policy {}: {e}", iam_policy_path.display());
-            std::process::exit(1);
+    } else {
+        let path = iam_policy_path.expect("CLI validation above guarantees one is set");
+        match IamPolicy::load_from_file(&path) {
+            Ok(p) => {
+                tracing::info!(
+                    path = %path.display(),
+                    statements = p.num_statements(),
+                    "IAM policy loaded from file (legacy --iam-policy)"
+                );
+                p
+            }
+            Err(e) => {
+                eprintln!("error: failed to load --iam-policy {}: {e}", path.display());
+                std::process::exit(1);
+            }
         }
     };
     let iam = Arc::new(iam);
@@ -705,11 +761,16 @@ fn der_to_sec1_p256(der: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn print_usage() {
-    eprintln!("Usage: vhsm-ssd --keystore <path> --iam-policy <path> --bootstrap-state <path> [options]");
+    eprintln!("Usage: vhsm-ssd --keystore <path> (--policy-dir <dir> | --iam-policy <file>) --bootstrap-state <path> [options]");
     eprintln!();
     eprintln!("Required:");
     eprintln!("  --keystore <path>           HSM keystore directory");
-    eprintln!("  --iam-policy <path>         YAML policy file (statements + principals + handles + ops)");
+    eprintln!("  --policy-dir <dir>          Policy directory (AUTH-ARCH-001 §4 — Phase 3 path).");
+    eprintln!("                              Contains policy.yaml + roots/ + (optional) crl.yaml.");
+    eprintln!("                              Typically /etc/sumo/policy/ shipped inside the host-os");
+    eprintln!("                              rootfs bank.");
+    eprintln!("  --iam-policy <file>         YAML policy file (legacy; mutually exclusive with --policy-dir).");
+    eprintln!("                              Statements + principals + handles + ops.");
     eprintln!("  --bootstrap-state <path>    YAML bootstrap token state");
     eprintln!();
     eprintln!("Connection:");

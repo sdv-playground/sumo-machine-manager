@@ -163,6 +163,14 @@ impl IamPolicy {
         Self::parse(&raw)
     }
 
+    /// Construct an `IamPolicy` directly from a parsed
+    /// `policy_eval::Policy`. Useful when the caller has already
+    /// loaded the policy through some other route (e.g. the
+    /// `policy-partition` crate's directory loader).
+    pub fn from_policy_eval(policy: policy_eval::Policy) -> Self {
+        Self { inner: policy }
+    }
+
     pub fn parse(text: &str) -> Result<Self, LoadError> {
         let policy = Policy::parse(text, normalize_op)?;
         Ok(Self { inner: policy })
@@ -190,6 +198,37 @@ impl IamPolicy {
     pub fn num_statements(&self) -> usize {
         self.inner.num_statements()
     }
+}
+
+/// Diagnostic counts for the non-IAM contents of a loaded policy
+/// partition. Returned alongside the IAM policy from
+/// [`load_iam_from_partition`] so main.rs can log them, but the
+/// daemon itself only consumes the IAM half in Phase 3.5.
+#[derive(Debug, Clone, Copy)]
+pub struct PartitionContents {
+    pub roots: usize,
+    pub crl: bool,
+    pub launcher_policy: bool,
+}
+
+/// Load the IAM policy from a Phase 3 policy directory at `dir`.
+/// Returns (iam, statement_count, other_contents) so the caller
+/// can emit a structured log line describing what landed.
+///
+/// Errors bubble up from [`policy_partition`] with the original
+/// PartitionError display preserved.
+pub fn load_iam_from_partition(
+    dir: &Path,
+) -> Result<(IamPolicy, usize, PartitionContents), Box<dyn std::error::Error>> {
+    let partition = policy_partition::PolicyPartition::load_from_dir(dir, normalize_op)?;
+    let statements = partition.authorisation.num_statements();
+    let contents = PartitionContents {
+        roots: partition.roots.len(),
+        crl: partition.crl.is_some(),
+        launcher_policy: partition.launcher_policy.is_some(),
+    };
+    let iam = IamPolicy::from_policy_eval(partition.authorisation);
+    Ok((iam, statements, contents))
 }
 
 // =============================================================================
@@ -546,5 +585,103 @@ statements:
             assert_eq!(v1.evaluate("vm1", handle, op), expected, "v1: handle={handle} op={op:?}");
             assert_eq!(v2.evaluate("vm1", handle, op), expected, "v2: handle={handle} op={op:?}");
         }
+    }
+
+    // -- policy-partition integration (Phase 3.5) -------------------------
+
+    fn write_partition(dir: &std::path::Path, policy_yaml: &str) {
+        std::fs::write(dir.join("policy.yaml"), policy_yaml).unwrap();
+        std::fs::create_dir(dir.join("roots")).unwrap();
+        std::fs::write(
+            dir.join("roots/sumo-sign.pem"),
+            b"-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+    }
+
+    /// Loading a partition gives the same IAM evaluation result as
+    /// loading the same policy.yaml content as a single file. The
+    /// partition layer must not mutate semantics.
+    #[test]
+    fn partition_path_matches_file_path_semantics() {
+        let yaml = r#"
+version: 1
+statements:
+  - principals: [vm1]
+    handles: [jwt-signing]
+    ops: [sign, verify]
+"#;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_partition(tmp.path(), yaml);
+        let (from_dir, statements, contents) =
+            load_iam_from_partition(tmp.path()).expect("partition loads");
+        assert_eq!(statements, 1);
+        assert_eq!(contents.roots, 1);
+        assert!(!contents.crl);
+        assert!(!contents.launcher_policy);
+
+        let from_file = IamPolicy::parse(yaml).unwrap();
+
+        // Identical decisions across a sample of cases.
+        for (vm, handle, op, expected) in [
+            ("vm1", "jwt-signing", Op::Sign, IamDecision::Allow { matched_statement: 0 }),
+            ("vm1", "jwt-signing", Op::Verify, IamDecision::Allow { matched_statement: 0 }),
+            ("vm1", "jwt-signing", Op::Encrypt, IamDecision::Deny),
+            ("vm2", "jwt-signing", Op::Sign, IamDecision::Deny),
+            ("vm1", "sw-authority", Op::Sign, IamDecision::Deny),
+        ] {
+            assert_eq!(
+                from_dir.evaluate(vm, handle, op),
+                expected,
+                "partition: vm={vm} handle={handle} op={op:?}"
+            );
+            assert_eq!(
+                from_file.evaluate(vm, handle, op),
+                expected,
+                "file: vm={vm} handle={handle} op={op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_load_reports_optional_contents() {
+        let yaml = "version: 1\nstatements: []\n";
+        let tmp = tempfile::tempdir().unwrap();
+        write_partition(tmp.path(), yaml);
+        // Add optional crl + launcher-policy.
+        std::fs::write(
+            tmp.path().join("crl.yaml"),
+            "cert_thumbprints: [aabbcc]\njwt_jti: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("launcher-policy.yaml"),
+            "version: 1\nrules: []\n",
+        )
+        .unwrap();
+
+        let (_iam, statements, contents) = load_iam_from_partition(tmp.path()).expect("loads");
+        assert_eq!(statements, 0);
+        assert!(contents.crl, "crl.yaml should be reported as present");
+        assert!(
+            contents.launcher_policy,
+            "launcher-policy.yaml should be reported as present"
+        );
+    }
+
+    #[test]
+    fn partition_load_missing_policy_yaml_surfaces_partition_error() {
+        // No policy.yaml in the directory — partition loader rejects.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("roots")).unwrap();
+        let err = load_iam_from_partition(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        // Don't assert on the exact phrasing — just confirm the error
+        // mentions the missing required file by name.
+        assert!(
+            msg.contains("policy.yaml"),
+            "error should name the missing file: {msg}"
+        );
     }
 }
