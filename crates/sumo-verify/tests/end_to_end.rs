@@ -81,14 +81,16 @@ fn verifies_a_signed_bank() {
     std::fs::write(bank.join("kernel"), b"kernel bytes").unwrap();
     std::fs::write(bank.join("rootfs.img"), &vec![0xAB; 4096]).unwrap();
 
-    // Sign with the HSM the CLI will use.
+    // Sign with the HSM the CLI will use. `gen=7` here is the
+    // per-install generation counter the NV layer would assign; the
+    // CLI's `--expect-install-gen` pins it on read.
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
-    ivd::sign_bank(&hsm, &bank, "vm2/bank_a").unwrap();
+    ivd::sign_bank(&hsm, &bank, 7).unwrap();
 
     let out = Command::new(binary())
         .arg("--bank").arg(&bank)
         .arg("--keystore").arg(&keystore)
-        .arg("--expect-bank-id").arg("vm2/bank_a")
+        .arg("--expect-install-gen").arg("7")
         .output()
         .expect("run sumo-verify");
 
@@ -99,7 +101,7 @@ fn verifies_a_signed_bank() {
         String::from_utf8_lossy(&out.stderr),
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.starts_with("ok bank_id=vm2/bank_a"));
+    assert!(stdout.starts_with("ok gen=7"), "got: {stdout}");
     assert!(stdout.contains("files=2"));
 }
 
@@ -116,7 +118,7 @@ fn rejects_tampered_file() {
     std::fs::write(bank.join("rootfs.img"), &vec![0u8; 2048]).unwrap();
 
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
-    ivd::sign_bank(&hsm, &bank, "vm1/bank_b").unwrap();
+    ivd::sign_bank(&hsm, &bank, 11).unwrap();
 
     // Tamper post-sign.
     std::fs::write(bank.join("kernel"), b"tampered\0\0\0\0").unwrap();
@@ -142,7 +144,7 @@ fn rejects_unexpected_extra_file() {
     std::fs::write(bank.join("kernel"), b"k").unwrap();
 
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
-    ivd::sign_bank(&hsm, &bank, "vm2/bank_a").unwrap();
+    ivd::sign_bank(&hsm, &bank, 1).unwrap();
 
     // Drop an extra file the manifest never authorised.
     std::fs::write(bank.join("evil-payload"), b"sneaky").unwrap();
@@ -162,30 +164,32 @@ fn rejects_unexpected_extra_file() {
 }
 
 #[test]
-fn rejects_bank_id_mismatch() {
-    let s = Scratch::new("bankid");
+fn rejects_install_gen_mismatch() {
+    let s = Scratch::new("gen-mismatch");
     let keystore = provisioned_keystore(&s);
 
     let bank = s.path("vm2/bank_a");
     std::fs::create_dir_all(&bank).unwrap();
     std::fs::write(bank.join("kernel"), b"k").unwrap();
 
+    // Sign with gen=5; verifier pins gen=6 → must reject (the
+    // between-slot swap detection case that motivated the v2
+    // manifest format).
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
-    ivd::sign_bank(&hsm, &bank, "vm2/bank_a").unwrap();
+    ivd::sign_bank(&hsm, &bank, 5).unwrap();
 
-    // Caller pins the wrong bank_id (replay-protection check).
     let out = Command::new(binary())
         .arg("--bank").arg(&bank)
         .arg("--keystore").arg(&keystore)
-        .arg("--expect-bank-id").arg("vm2/bank_b")
+        .arg("--expect-install-gen").arg("6")
         .output()
         .expect("run sumo-verify");
 
     assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("bank_id mismatch"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr),
+        stderr.contains("gen mismatch"),
+        "stderr should mention gen mismatch: {stderr}"
     );
 }
 
@@ -242,7 +246,7 @@ fn quiet_suppresses_stdout_on_success() {
     std::fs::write(bank.join("kernel"), b"k").unwrap();
 
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
-    ivd::sign_bank(&hsm, &bank, "vm2/bank_a").unwrap();
+    ivd::sign_bank(&hsm, &bank, 3).unwrap();
 
     let out = Command::new(binary())
         .arg("--bank").arg(&bank)
