@@ -464,6 +464,89 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         })
     }
 
+    /// Copy any files in the active bank that don't already exist in
+    /// the target bank. This makes every OTA implicitly partial: a
+    /// SUIT envelope that carried only some components ends with a
+    /// complete target bank, with unstreamed files seeded from active.
+    /// A full envelope that streamed every file is a no-op for this
+    /// step (every file already exists in target).
+    ///
+    /// Must run AFTER all streaming finishes and BEFORE IVD signing,
+    /// so the signature covers the final bank contents.
+    ///
+    /// No-op cases (returns Ok without doing anything):
+    ///   - single-bank bank-sets (HSM) — no "other" bank to seed from
+    ///   - no images_dir configured (in-memory test backends)
+    ///   - active bank dir doesn't exist (factory first-flash)
+    pub(crate) fn seed_target_from_active(&self, target: Bank) -> BackendResult<()> {
+        if self.config.single_bank {
+            // HSM-style single-bank — no peer to seed from.
+            return Ok(());
+        }
+
+        let Some(images_dir) = self.images_dir.as_ref() else {
+            // In-memory test backends — no on-disk bank to seed.
+            return Ok(());
+        };
+
+        let nv = self
+            .nv
+            .lock()
+            .map_err(|_| BackendError::Internal("nv lock".into()))?;
+        let state = nv
+            .read_boot_state()
+            .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+        let idx = self.bank_set.as_index();
+        let active = state.banks[idx].active_bank;
+        drop(nv);
+
+        if active == target {
+            // Defensive — `determine_target_bank` always returns the
+            // .other() of active, but a future refactor that breaks
+            // this invariant shouldn't silently corrupt the active
+            // bank by self-seeding.
+            return Ok(());
+        }
+
+        let set_name = &self.bank_spec.dir_name;
+        let source_dir = images_dir.join(set_name).join(bank_dir_name(active));
+        let target_dir = images_dir.join(set_name).join(bank_dir_name(target));
+
+        match crate::bank_seed::seed_missing_files(&source_dir, &target_dir) {
+            Ok(seeded) if seeded.is_empty() => {
+                tracing::debug!(
+                    target = %target_dir.display(),
+                    source = %source_dir.display(),
+                    "bank seed: no files copied (full update or empty active)"
+                );
+                Ok(())
+            }
+            Ok(seeded) => {
+                tracing::info!(
+                    target = %target_dir.display(),
+                    source = %source_dir.display(),
+                    count = seeded.len(),
+                    paths = ?seeded,
+                    "bank seed: copied unstreamed files from active bank"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(
+                    target = %target_dir.display(),
+                    source = %source_dir.display(),
+                    error = %e,
+                    "bank seed failed — refusing to sign/activate a partial bank"
+                );
+                Err(BackendError::Internal(format!(
+                    "bank seed from {} to {}: {e}",
+                    source_dir.display(),
+                    target_dir.display()
+                )))
+            }
+        }
+    }
+
     /// Self-sign the staged bank with the HSM's `ivd-signing` key so
     /// external secure boot can validate it before launch. Called at
     /// each `AwaitingActivation` transition — bank contents are
@@ -1012,6 +1095,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             // for soft-skip policy (no-op when HSM has no
             // ivd-signing slot yet).
             let target_bank = self.determine_target_bank()?;
+            // Seed unstreamed files from the active bank so the IVD
+            // signature below covers a complete bank, not a partial
+            // one. No-op for full updates / single-bank / factory.
+            self.seed_target_from_active(target_bank)?;
             self.ivd_sign_staged_bank(target_bank)?;
 
             return Ok(id);
@@ -1179,6 +1266,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             // Bank dir is content-final; IVD-sign before the caller
             // proceeds to finalize_flash. See `ivd_sign_staged_bank`.
             let target_bank = self.determine_target_bank()?;
+            // Seed unstreamed files from the active bank so the IVD
+            // signature below covers a complete bank, not a partial
+            // one. No-op for full updates / single-bank / factory.
+            self.seed_target_from_active(target_bank)?;
             self.ivd_sign_staged_bank(target_bank)?;
         }
 
@@ -1939,6 +2030,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             // for uniformity — any future component with content
             // here gets signed automatically.
             let target_bank = self.determine_target_bank()?;
+            // Seed unstreamed files from the active bank so the IVD
+            // signature below covers a complete bank, not a partial
+            // one. No-op for full updates / single-bank / factory.
+            self.seed_target_from_active(target_bank)?;
             self.ivd_sign_staged_bank(target_bank)?;
             return Ok(transfer_id);
         }
@@ -2036,6 +2131,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             // Self-sign before returning. `ivd_sign_staged_bank`
             // no-ops when the bank dir is absent (e.g. HSM
             // single-bank components).
+            // Seed unstreamed files from the active bank so the IVD
+            // signature below covers a complete bank, not a partial
+            // one. No-op for full updates / single-bank / factory.
+            self.seed_target_from_active(target_bank)?;
             self.ivd_sign_staged_bank(target_bank)?;
             return Ok(transfer_id);
         }

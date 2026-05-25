@@ -66,3 +66,6 @@ mod diag_backend_tests;
 
 #[cfg(test)]
 mod wrapper_http_tests;
+
+#[cfg(test)]
+mod bank_seed_integration_tests;
