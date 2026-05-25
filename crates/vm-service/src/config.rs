@@ -229,6 +229,14 @@ pub struct ImagePaths {
     /// that haven't migrated yet. See AUTH-ARCH-001 §4.
     #[serde(default)]
     pub policy: Option<String>,
+    /// CA-bundle partition filename (e.g., "ca-bundle") — a read-only
+    /// image (qnx6 / squashfs) the guest mounts at `/etc/ssl/certs`
+    /// (QNX) or `/etc/pki/ca-trust/extracted` (Linux). Ships in the
+    /// bank alongside kernel + rootfs. No backward-compat fallback:
+    /// guests without this component will not have TLS until the
+    /// bank is reflashed with one.
+    #[serde(default)]
+    pub ca_bundle: Option<String>,
 }
 
 /// Extra disk not managed by the banking system.
@@ -331,6 +339,20 @@ impl VmDefinition {
         })
     }
 
+    /// Resolve the CA-bundle partition path (image_dir + images.ca_bundle).
+    /// Returns None when the bank doesn't carry a CA bundle. The runner
+    /// then doesn't attach the device and the guest can't mount it —
+    /// TLS clients in that guest will fail to validate certificates.
+    pub fn ca_bundle_path(&self) -> Option<PathBuf> {
+        self.images.ca_bundle.as_ref().map(|p| {
+            if Path::new(p).is_absolute() {
+                PathBuf::from(p)
+            } else {
+                self.image_dir.join(p)
+            }
+        })
+    }
+
     /// Shutdown timeout in seconds (default 10).
     pub fn shutdown_timeout_secs(&self) -> u64 {
         self.shutdown.as_ref().map(|s| s.timeout_secs).unwrap_or(10)
@@ -363,6 +385,9 @@ impl VmDefinition {
             }
             if imgs.policy.is_some() {
                 merged.images.policy = imgs.policy.clone();
+            }
+            if imgs.ca_bundle.is_some() {
+                merged.images.ca_bundle = imgs.ca_bundle.clone();
             }
         }
         merged
@@ -574,7 +599,7 @@ mod tests {
             ram_mb: 2048,
             cpu_model: None,
             image_dir: PathBuf::from("/tmp/test"),
-            images: ImagePaths { kernel: Some("bzImage".into()), rootfs: Some("rootfs.img".into()), policy: None },
+            images: ImagePaths { kernel: Some("bzImage".into()), rootfs: Some("rootfs.img".into()), policy: None, ca_bundle: None },
             devices: vec![],
             disks: vec![],
             health: None,
@@ -617,6 +642,7 @@ mod tests {
                 kernel: Some("vmlinuz".into()),
                 rootfs: Some("root.ext4".into()),
                 policy: None,
+                ca_bundle: None,
             }),
         };
 
@@ -690,6 +716,7 @@ extra_cmdline: "debug"
                 kernel: Some("vmlinuz-new".into()),
                 rootfs: None,
                 policy: None,
+                ca_bundle: None,
             }),
             ..Default::default()
         };

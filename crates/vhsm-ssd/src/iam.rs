@@ -9,7 +9,7 @@
 //! - [`HsmResourceMatcher`] interprets `resources.hsm.handles` in a
 //!   statement against the (key_id) request.
 //! - [`IamPolicy`] keeps its v1 public surface (callers don't change):
-//!   `empty()`, `parse()`, `load_from_file()`, `evaluate()`,
+//!   `empty()`, `parse()`, `evaluate()`,
 //!   `num_statements()` — semantics identical to pre-refactor.
 //!
 //! ## Schema
@@ -155,12 +155,6 @@ impl IamPolicy {
         Self {
             inner: Policy::empty(),
         }
-    }
-
-    pub fn load_from_file(path: &Path) -> Result<Self, LoadError> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| LoadError::Io(format!("{}: {e}", path.display())))?;
-        Self::parse(&raw)
     }
 
     /// Construct an `IamPolicy` directly from a parsed

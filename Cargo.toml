@@ -13,6 +13,7 @@ members = [
     "crates/policy-eval",
     "crates/policy-partition",
     "crates/policy-build",
+    "crates/ca-bundle-build",
     "crates/vhsm-ssd",
     "crates/vm-wire",
     "crates/vm-devices",

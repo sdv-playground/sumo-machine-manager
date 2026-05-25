@@ -113,7 +113,6 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut keystore_path: Option<PathBuf> = None;
     let mut listen_addr: Option<SocketAddr> = None;
-    let mut iam_policy_path: Option<PathBuf> = None;
     let mut policy_dir: Option<PathBuf> = None;
     let mut bootstrap_state_path: Option<PathBuf> = None;
     let mut cert_max_age_secs: u64 = DEFAULT_CERT_LIFETIME_SECS;
@@ -137,10 +136,6 @@ fn main() {
                     eprintln!("invalid --listen '{}': {e}", args[i + 1]);
                     std::process::exit(1);
                 }));
-                i += 2;
-            }
-            "--iam-policy" if i + 1 < args.len() => {
-                iam_policy_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--policy-dir" if i + 1 < args.len() => {
@@ -218,26 +213,15 @@ fn main() {
         eprintln!("error: --keystore is required");
         std::process::exit(1);
     });
-    // Policy source resolution. `--policy-dir` is the AUTH-ARCH-001
-    // Phase 3 path (the in-bank policy directory at /etc/sumo/policy).
-    // `--iam-policy` remains for back-compat with SimHsm spawn lines
-    // and dev rigs that still pass a single file. Both are mutually
-    // exclusive — operators picking one or the other.
-    match (&policy_dir, &iam_policy_path) {
-        (Some(_), Some(_)) => {
-            eprintln!(
-                "error: --policy-dir and --iam-policy are mutually exclusive; pass one"
-            );
-            std::process::exit(1);
-        }
-        (None, None) => {
-            eprintln!(
-                "error: --policy-dir or --iam-policy is required (v3 has no IP allow-list fallback)"
-            );
-            std::process::exit(1);
-        }
-        _ => {}
-    }
+    // Policy source is the in-bank policy directory at /etc/sumo/policy
+    // (AUTH-ARCH-001 §4). Required — there is no fallback. The legacy
+    // single-file `--iam-policy` switch was retired once the partition
+    // path was proven on the managed-cvc; operators must now ship a
+    // policy.yaml (and roots/, crl.yaml) under --policy-dir.
+    let policy_dir = policy_dir.unwrap_or_else(|| {
+        eprintln!("error: --policy-dir is required");
+        std::process::exit(1);
+    });
     let bootstrap_state_path = bootstrap_state_path.unwrap_or_else(|| {
         eprintln!("error: --bootstrap-state is required");
         std::process::exit(1);
@@ -268,45 +252,24 @@ fn main() {
 
     let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(hsm);
 
-    // Load IAM policy. Default-deny if the file declares no statements —
-    // operator's intent. Refuse to start on parse error / missing file.
-    let iam = if let Some(dir) = policy_dir.as_ref() {
-        // Phase 3 path: the in-bank policy directory carries
-        // policy.yaml + roots/ + (optional) crl.yaml. We only consume
-        // the authorisation policy here; roots/ + crl are wired in
-        // by later phases (SOVD cert verification, auth-time CRL).
-        match vhsm_ssd::iam::load_iam_from_partition(dir) {
-            Ok((iam, statements, partition_loaded_other)) => {
-                tracing::info!(
-                    path = %dir.display(),
-                    statements,
-                    roots = partition_loaded_other.roots,
-                    crl_present = partition_loaded_other.crl,
-                    launcher_policy_present = partition_loaded_other.launcher_policy,
-                    "IAM policy loaded from policy directory"
-                );
-                iam
-            }
-            Err(e) => {
-                eprintln!("error: failed to load --policy-dir {}: {e}", dir.display());
-                std::process::exit(1);
-            }
+    // Load IAM policy from the in-bank policy directory. Default-deny
+    // if the file declares no statements — operator's intent. Refuse
+    // to start on parse error / missing file.
+    let iam = match vhsm_ssd::iam::load_iam_from_partition(&policy_dir) {
+        Ok((iam, statements, partition_loaded_other)) => {
+            tracing::info!(
+                path = %policy_dir.display(),
+                statements,
+                roots = partition_loaded_other.roots,
+                crl_present = partition_loaded_other.crl,
+                launcher_policy_present = partition_loaded_other.launcher_policy,
+                "IAM policy loaded from policy directory"
+            );
+            iam
         }
-    } else {
-        let path = iam_policy_path.expect("CLI validation above guarantees one is set");
-        match IamPolicy::load_from_file(&path) {
-            Ok(p) => {
-                tracing::info!(
-                    path = %path.display(),
-                    statements = p.num_statements(),
-                    "IAM policy loaded from file (legacy --iam-policy)"
-                );
-                p
-            }
-            Err(e) => {
-                eprintln!("error: failed to load --iam-policy {}: {e}", path.display());
-                std::process::exit(1);
-            }
+        Err(e) => {
+            eprintln!("error: failed to load --policy-dir {}: {e}", policy_dir.display());
+            std::process::exit(1);
         }
     };
     let iam = Arc::new(iam);

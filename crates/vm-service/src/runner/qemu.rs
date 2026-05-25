@@ -201,6 +201,15 @@ impl QemuRunner {
                 ]);
             }
 
+            // CA-bundle partition — read-only image, single concatenated
+            // PEM mounted at /etc/ssl/certs/ by the guest's IFS startup.
+            if let Some(bundle) = def.ca_bundle_path() {
+                args.extend_from_slice(&[
+                    "-drive".into(),
+                    format!("file={},format=raw,readonly=on", bundle.display()),
+                ]);
+            }
+
             // Extra disks (data partition, etc.)
             for disk in &def.disks {
                 args.extend_from_slice(&[
@@ -270,6 +279,22 @@ impl QemuRunner {
                     ),
                     "-device".into(),
                     format!("{blk_device},drive=hd_policy"),
+                ]);
+            }
+
+            // CA-bundle partition — full /etc/pki/ca-trust/extracted/
+            // tree as squashfs; mounted by a systemd .mount unit in
+            // the guest. Same disk_args ordering as policy so the
+            // virtio-blk enumeration order stays stable across rebuilds.
+            if let Some(bundle) = def.ca_bundle_path() {
+                disk_args.push(vec![
+                    "-drive".into(),
+                    format!(
+                        "file={},format=raw,if=none,id=hd_cabundle,readonly=on",
+                        bundle.display()
+                    ),
+                    "-device".into(),
+                    format!("{blk_device},drive=hd_cabundle"),
                 ]);
             }
 

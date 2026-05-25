@@ -78,6 +78,17 @@ impl QnxRunner {
         format!("/dev/{}0", Self::policy_prefix(vm_name))
     }
 
+    /// Dedicated prefix for the CA-bundle partition's devb-loopback.
+    /// 3-char role token (`cab`) stays inside the same io-blk-friendly
+    /// prefix-length envelope as `qvmpols-{vm}` (see `policy_prefix`).
+    fn ca_bundle_prefix(vm_name: &str) -> String {
+        format!("qvmcab-{vm_name}")
+    }
+
+    fn ca_bundle_device(vm_name: &str) -> String {
+        format!("/dev/{}0", Self::ca_bundle_prefix(vm_name))
+    }
+
     /// Walk `/proc/<pid>/cmdline` for every live process and return
     /// `(pid, argv_string)` pairs. argv tokens are NUL-separated on
     /// disk; we substitute spaces so callers can `.contains()`-match.
@@ -306,6 +317,29 @@ impl VmRunner for QnxRunner {
                 tracing::warn!(
                     "VM {name}: policy image not found: {} — guest will boot without /etc/sumo/policy",
                     policy.display()
+                );
+            }
+        }
+
+        // CA-bundle partition — a small read-only image carrying the
+        // TLS trust anchors. Mounted by the guest at `/etc/ssl/certs`
+        // (QNX) or `/etc/pki/ca-trust/extracted` (Linux). Ships in the
+        // bank alongside the policy partition. Same short-prefix
+        // pattern as policy (`qvmcab-{vm}`) to dodge the io-blk
+        // silent-drop trap on long prefixes.
+        if let Some(bundle) = def.ca_bundle_path() {
+            if bundle.exists() {
+                let prefix = Self::ca_bundle_prefix(name);
+                self.spawn_loopback(&prefix, &bundle)?;
+                let device = Self::ca_bundle_device(name);
+                tracing::info!(
+                    vm = %name, device, path = %bundle.display(),
+                    "ca-bundle partition attached"
+                );
+            } else {
+                tracing::warn!(
+                    "VM {name}: ca-bundle image not found: {} — guest TLS clients will fail",
+                    bundle.display()
                 );
             }
         }

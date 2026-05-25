@@ -61,6 +61,14 @@ pub struct SimHsm {
     /// fsync'd JSON line per dispatched op there. When None, audit
     /// logging is off (dev rigs / loopback tests).
     audit_log: Option<PathBuf>,
+    /// Policy directory passed to vhsm-ssd via `--policy-dir`. Must
+    /// contain `policy.yaml` (+ optional `roots/`, `crl.yaml`,
+    /// `launcher-policy.yaml`). Set via [`Self::with_policy_dir`]
+    /// before [`start_service`]; required — `start_service` errors
+    /// out when None. The legacy `--iam-policy` single-file path
+    /// + synthetic wildcard generator was retired once the in-bank
+    /// policy partition proved out on managed-cvc (AUTH-ARCH-001 §4).
+    policy_dir: Option<PathBuf>,
     /// Running daemon process handle.
     child: Option<Child>,
 }
@@ -119,8 +127,20 @@ impl SimHsm {
             allow_list,
             tcp_port,
             audit_log: None,
+            policy_dir: None,
             child: None,
         }
+    }
+
+    /// Builder-style: set the policy directory the spawned vhsm-ssd
+    /// should consult (`--policy-dir`). Required before `start_service`;
+    /// `start_service` returns an error if this isn't set. The dir must
+    /// contain at minimum a `policy.yaml`; production deployments
+    /// ship it via OTA (managed-cvc: `/etc/sumo/policy/` from the
+    /// per-VM ca-bundle-adjacent policy partition).
+    pub fn with_policy_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.policy_dir = Some(path.into());
+        self
     }
 
     /// Builder-style: enable per-op audit logging at the given path.
@@ -945,24 +965,21 @@ impl HsmProvider for SimHsm {
         // case and kills the orphan before we proceed.
         self.kill_stale_daemon_if_port_busy(&listen);
 
-        // v3 (cert-based handshake) replaces the v2 source-IP allow-list.
-        // `allow_list` is still consulted here, but only to extract the
-        // set of vm_ids — IP is ignored (identity is the cert subject,
-        // not the source IP). We generate a default permissive IAM
-        // policy at `<keystore>/iam-policy.yaml` if one doesn't already
-        // exist, and an empty `<keystore>/bootstrap.yaml`. Production
-        // deployments overwrite these with operator-managed files.
-        let iam_path = self.keystore_path.join("iam-policy.yaml");
+        // Policy directory is operator-managed (shipped via OTA to
+        // /etc/sumo/policy on managed-cvc). No synthetic fallback —
+        // the daemon errors out at startup if policy.yaml is missing
+        // from the directory.
+        let policy_dir = self.policy_dir.as_ref().ok_or_else(|| {
+            HsmError::ProcessError(
+                "policy_dir is required (call SimHsm::with_policy_dir before start_service)".into(),
+            )
+        })?;
+
+        // Bootstrap state — still synthesized lazily because it's
+        // per-deployment runtime state, not authored content. Empty
+        // file is meaningful (no ENROLL tokens issued yet); operator
+        // populates via the orchestrator's enrolment flow.
         let bootstrap_path = self.keystore_path.join("bootstrap.yaml");
-        if !iam_path.exists() {
-            if let Err(e) = write_default_iam_policy(&iam_path, &self.allow_list) {
-                return Err(HsmError::ProcessError(format!(
-                    "failed to write default IAM policy at {}: {e}",
-                    iam_path.display()
-                )));
-            }
-            tracing::info!(path = %iam_path.display(), "wrote default IAM policy (allow-all for configured vms)");
-        }
         if !bootstrap_path.exists() {
             if let Err(e) = std::fs::write(&bootstrap_path, "tokens: {}\n") {
                 return Err(HsmError::ProcessError(format!(
@@ -976,7 +993,7 @@ impl HsmProvider for SimHsm {
         let mut cmd = Command::new(&self.daemon_bin);
         cmd.arg("--keystore").arg(&self.keystore_path)
             .arg("--listen").arg(&listen)
-            .arg("--iam-policy").arg(&iam_path)
+            .arg("--policy-dir").arg(policy_dir)
             .arg("--bootstrap-state").arg(&bootstrap_path);
         // Pass the (ip, vm_id) pairs the orchestrator already has
         // through to the daemon's ENROLL_ASSISTED resolver. Same
@@ -1453,47 +1470,6 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
-}
-
-/// Write a default IAM policy at `path` that allows the configured
-/// vms to do anything on any handle. Used by SimHsm on first spawn
-/// when no operator-managed policy is present.
-///
-/// Schema (vhsm-ssd::iam):
-///   version: 1
-///   statements:
-///     - principals: [<each vm_id>]
-///       handles: ["*"]
-///       ops: ["*"]
-fn write_default_iam_policy(path: &Path, allow_list: &[(IpAddr, String)]) -> std::io::Result<()> {
-    // Collect unique vm_ids. If the list is empty, fall back to a
-    // single "test-vm" entry so a dev rig with no explicit config
-    // can still come up.
-    let mut vms: Vec<&str> = allow_list.iter().map(|(_, v)| v.as_str()).collect();
-    vms.sort();
-    vms.dedup();
-    if vms.is_empty() {
-        vms.push("test-vm");
-    }
-
-    let mut doc = String::new();
-    doc.push_str("version: 1\n");
-    doc.push_str("statements:\n");
-    doc.push_str("  - principals: [");
-    for (i, vm) in vms.iter().enumerate() {
-        if i > 0 {
-            doc.push_str(", ");
-        }
-        doc.push_str(vm);
-    }
-    doc.push_str("]\n");
-    doc.push_str("    handles: [\"*\"]\n");
-    doc.push_str("    ops: [\"*\"]\n");
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, doc)
 }
 
 #[cfg(test)]
