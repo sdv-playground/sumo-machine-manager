@@ -225,8 +225,28 @@ pub struct TimeDevice {
 impl TimeDevice {
     /// Construct and start the periodic writer. `interval` is wall time
     /// between writes; `TIME_DEFAULT_INTERVAL` is a sensible default.
+    ///
+    /// Single-channel constructor — bidirectional vtime over ONE channel
+    /// using offset-based directional split (regs at 0x00-0x3F, cmd at
+    /// 0x40-0x7F). Suits qvm-shmem where each peer writes its own slot.
     pub fn new(
         channel: Arc<dyn DeviceChannel>,
+        clock: Arc<dyn Clock>,
+        interval: Duration,
+    ) -> Self {
+        // Pass same Arc twice; writer_loop_inner uses Arc::ptr_eq to
+        // detect aliasing and emits a single combined write.
+        Self::with_split_channels(channel.clone(), channel, clock, interval)
+    }
+
+    /// Two-channel constructor — host→guest regs on one channel,
+    /// bidirectional adjust on a second. Used by transports that don't
+    /// natively split direction (HTTP today). The two channels each
+    /// carry a 128-byte payload; regs-channel writes leave the cmd
+    /// half zero, adjust-channel writes leave the regs half zero.
+    pub fn with_split_channels(
+        regs_channel: Arc<dyn DeviceChannel>,
+        adjust_channel: Arc<dyn DeviceChannel>,
         clock: Arc<dyn Clock>,
         interval: Duration,
     ) -> Self {
@@ -234,7 +254,7 @@ impl TimeDevice {
         let cancel_clone = cancel.clone();
         let writer = thread::Builder::new()
             .name("vtime-writer".into())
-            .spawn(move || writer_loop(channel, clock, interval, cancel_clone))
+            .spawn(move || writer_loop(regs_channel, adjust_channel, clock, interval, cancel_clone))
             .expect("spawn vtime-writer thread");
 
         Self {
@@ -294,7 +314,8 @@ impl WriterState {
 }
 
 fn writer_loop(
-    channel: Arc<dyn DeviceChannel>,
+    regs_channel: Arc<dyn DeviceChannel>,
+    adjust_channel: Arc<dyn DeviceChannel>,
     clock: Arc<dyn Clock>,
     interval: Duration,
     cancel: Arc<AtomicBool>,
@@ -308,7 +329,7 @@ fn writer_loop(
     // (stop_vm + start_vm) to recover. We deliberately don't
     // auto-restart the loop until we know what's panicking.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        writer_loop_inner(channel, clock, interval, cancel);
+        writer_loop_inner(regs_channel, adjust_channel, clock, interval, cancel);
     }));
     if let Err(payload) = result {
         let msg = payload
@@ -327,12 +348,25 @@ fn writer_loop(
 }
 
 fn writer_loop_inner(
-    channel: Arc<dyn DeviceChannel>,
+    regs_channel: Arc<dyn DeviceChannel>,
+    adjust_channel: Arc<dyn DeviceChannel>,
     clock: Arc<dyn Clock>,
     interval: Duration,
     cancel: Arc<AtomicBool>,
 ) {
     use vm_wire::{VtimeCmd, VtimeRegs, VTIME_FLAG_SYNC_VALID, VTIME_REGS_SIZE, VTIME_WIRE_SIZE};
+
+    // Single-channel mode (qvm-shmem): regs and adjust are the same Arc;
+    // direction is split via offsets within the host's slot. The combined
+    // 128-byte buffer goes out as one write.
+    //
+    // Two-channel mode (HTTP): separate channels for regs and adjust.
+    // The regs channel is host→guest only — regs in first 64 bytes,
+    // cmd half zero. The adjust channel is bidirectional — guest writes
+    // cmd (regs half zero, cmd half = cmd + status=PENDING), host writes
+    // back the same buffer with status updated (regs half stays zero).
+    // Detect by Arc::ptr_eq to avoid an explicit transport-kind argument.
+    let single_channel_mode = Arc::ptr_eq(&regs_channel, &adjust_channel);
 
     // Threshold for the host self-election step below. Any wall_ns
     // beyond 2024-01-01 UTC is "obviously not the systemd built-in
@@ -346,11 +380,15 @@ fn writer_loop_inner(
     let mut st = WriterState::new();
 
     while !cancel.load(Ordering::Relaxed) {
-        // 1. Poll guest's slot for a new TIME_ADJUST cmd. The paired
-        //    DeviceChannel's read() returns the peer's slot — the
-        //    guest's writes. The cmd half lives at offsets 0x40..0x80
-        //    of that buffer.
-        if let Ok(peer_buf) = channel.read() {
+        // 1. Poll for a new TIME_ADJUST cmd.
+        //    - Single-channel (qvm-shmem): read peer's slot (the guest's
+        //      writes); cmd at offsets 0x40..0x80.
+        //    - Two-channel (HTTP): read the adjust channel; cmd at the
+        //      same offsets. Guest writes leave the regs half zero;
+        //      our own ack-writes also leave regs zero so the seq-dedup
+        //      check below correctly skips reads that are echoes of
+        //      our previous ack.
+        if let Ok(peer_buf) = adjust_channel.read() {
             if peer_buf.len() >= VTIME_WIRE_SIZE {
                 if let Some(cmd) = VtimeCmd::from_cmd_bytes(&peer_buf[VTIME_REGS_SIZE..]) {
                     if cmd.seq != 0 && cmd.seq != st.last_cmd_seq {
@@ -422,14 +460,36 @@ fn writer_loop_inner(
             guest_id: 0,
         };
 
-        let mut buf = [0u8; VTIME_WIRE_SIZE];
-        buf[..VTIME_REGS_SIZE].copy_from_slice(&regs.to_regs_bytes());
-        buf[VTIME_REGS_SIZE..].copy_from_slice(&reply.to_cmd_bytes());
+        if single_channel_mode {
+            // qvm-shmem path: regs + reply combined in one 128-byte
+            // buffer, written to the single channel (host's own slot).
+            let mut buf = [0u8; VTIME_WIRE_SIZE];
+            buf[..VTIME_REGS_SIZE].copy_from_slice(&regs.to_regs_bytes());
+            buf[VTIME_REGS_SIZE..].copy_from_slice(&reply.to_cmd_bytes());
+            if let Err(e) = regs_channel.write(&buf) {
+                tracing::warn!("vtime write failed: {e}");
+            }
+            let _ = regs_channel.notify();
+        } else {
+            // HTTP path: regs to regs channel (cmd half zero), reply
+            // to adjust channel (regs half zero). The adjust write is
+            // idempotent — it always carries the latest ack, regardless
+            // of whether a new cmd was processed this tick. Same shape
+            // makes the guest's poll-for-ack code transport-agnostic.
+            let mut regs_buf = [0u8; VTIME_WIRE_SIZE];
+            regs_buf[..VTIME_REGS_SIZE].copy_from_slice(&regs.to_regs_bytes());
+            if let Err(e) = regs_channel.write(&regs_buf) {
+                tracing::warn!("vtime regs write failed: {e}");
+            }
+            let _ = regs_channel.notify();
 
-        if let Err(e) = channel.write(&buf) {
-            tracing::warn!("vtime write failed: {e}");
+            let mut adj_buf = [0u8; VTIME_WIRE_SIZE];
+            adj_buf[VTIME_REGS_SIZE..].copy_from_slice(&reply.to_cmd_bytes());
+            if let Err(e) = adjust_channel.write(&adj_buf) {
+                tracing::warn!("vtime adjust write failed: {e}");
+            }
+            let _ = adjust_channel.notify();
         }
-        let _ = channel.notify();
 
         thread::sleep(interval);
     }

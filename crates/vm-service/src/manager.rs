@@ -389,23 +389,35 @@ impl VmManager {
 
         // Time device — host periodically writes vtime registers into a
         // shared region; guest's vtime driver reads them and disciplines
-        // local CLOCK_REALTIME. Single 128-byte bidirectional channel:
-        // host writes regs (0x00-0x3F) + status reply (0x40-0x7F),
-        // guest writes TIME_ADJUST commands via the peer slot.
+        // local CLOCK_REALTIME. Two channels:
+        //   * regs   — host→guest. host writes VtimeRegs, guest reads.
+        //   * adjust — bidirectional. guest writes TIME_ADJUST cmds
+        //              (status=PENDING); host reads cmd, applies it,
+        //              writes back the same buffer with status updated;
+        //              guest polls until status changes.
+        // For qvm-shmem the same transport returns the same channel
+        // object for both triples (peer-slot routing handles direction
+        // via offsets), and TimeDevice's writer detects the Arc::ptr_eq
+        // case and emits a single combined write. For HTTP the two
+        // triples resolve to two distinct endpoints under
+        // /vm/{vm}/dev/time/{ch}.
         let has_time = effective_def.devices.iter()
             .any(|d| matches!(d, crate::config::DeviceConfig::Time { .. }));
         if has_time {
             if let Some(ref tx) = self.device_transport {
-                match tx.open_channel(name, "time", "regs", vtime_regs::REGION_SIZE) {
-                    Ok(ch) => {
-                        vm.time = Some(TimeDevice::new(
-                            ch,
+                let regs_ch = tx.open_channel(name, "time", "regs", vtime_regs::REGION_SIZE);
+                let adjust_ch = tx.open_channel(name, "time", "adjust", vtime_regs::REGION_SIZE);
+                match (regs_ch, adjust_ch) {
+                    (Ok(regs), Ok(adjust)) => {
+                        vm.time = Some(TimeDevice::with_split_channels(
+                            regs,
+                            adjust,
                             self.clock_source.clone(),
                             TIME_DEFAULT_INTERVAL,
                         ));
                         tracing::info!("VM {name}: vtime publisher started");
                     }
-                    Err(e) => {
+                    (Err(e), _) | (_, Err(e)) => {
                         tracing::warn!("VM {name}: time channel open failed: {e}");
                     }
                 }
