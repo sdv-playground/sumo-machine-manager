@@ -37,6 +37,7 @@
 //! - [`streaming`] — upload pipeline (decompress + decrypt + hash streaming)
 
 pub mod backend;
+pub mod bank_seed;
 pub mod bank_spec;
 pub mod component_adapter;
 pub mod diag_backend;
