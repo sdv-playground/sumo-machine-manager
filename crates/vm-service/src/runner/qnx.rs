@@ -268,6 +268,31 @@ impl VmRunner for QnxRunner {
             }
         }
 
+        // Policy partition (AUTH-ARCH-001 §4): a small read-only image
+        // shipped in the bank alongside the rootfs. We expose it
+        // through the same `qvm{role}-{vm}` devb-loopback pattern as
+        // the extra-disks below; the qvm.conf wires a virtio-blk
+        // pointing at the resulting device. The guest's IFS mounts
+        // it at /etc/sumo/policy/ before any policy-reading service
+        // starts. Optional — banks that haven't migrated yet just
+        // don't get a mount on the guest.
+        if let Some(policy) = def.policy_path() {
+            if policy.exists() {
+                let prefix = Self::extra_prefix(name, "policy");
+                self.spawn_loopback(&prefix, &policy)?;
+                let device = Self::extra_device(name, "policy");
+                tracing::info!(
+                    vm = %name, device, path = %policy.display(),
+                    "policy partition attached"
+                );
+            } else {
+                tracing::warn!(
+                    "VM {name}: policy image not found: {} — guest will boot without /etc/sumo/policy",
+                    policy.display()
+                );
+            }
+        }
+
         // Extra disks (data, swap, …) from def.disks. Uses a distinct
         // `qvm-{role}-{vm}` prefix so io-blk doesn't see name-prefix
         // collisions with the rootfs's `qvmdisk-{vm}` namespace.

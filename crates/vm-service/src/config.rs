@@ -223,6 +223,12 @@ pub struct ImagePaths {
     /// Root filesystem filename (e.g., "rootfs.qcow2").
     #[serde(default)]
     pub rootfs: Option<String>,
+    /// Policy partition filename (e.g., "policy") — a read-only image
+    /// (qnx6 / squashfs) the guest mounts at `/etc/sumo/policy`.
+    /// Ships in the bank alongside kernel + rootfs; absent on banks
+    /// that haven't migrated yet. See AUTH-ARCH-001 §4.
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
 /// Extra disk not managed by the banking system.
@@ -311,6 +317,20 @@ impl VmDefinition {
         })
     }
 
+    /// Resolve the policy partition path (image_dir + images.policy).
+    /// Returns None on banks that don't carry a policy image yet —
+    /// the runner falls back to no-policy-attached, and the guest
+    /// services see no /etc/sumo/policy mount.
+    pub fn policy_path(&self) -> Option<PathBuf> {
+        self.images.policy.as_ref().map(|p| {
+            if Path::new(p).is_absolute() {
+                PathBuf::from(p)
+            } else {
+                self.image_dir.join(p)
+            }
+        })
+    }
+
     /// Shutdown timeout in seconds (default 10).
     pub fn shutdown_timeout_secs(&self) -> u64 {
         self.shutdown.as_ref().map(|s| s.timeout_secs).unwrap_or(10)
@@ -340,6 +360,9 @@ impl VmDefinition {
             }
             if imgs.rootfs.is_some() {
                 merged.images.rootfs = imgs.rootfs.clone();
+            }
+            if imgs.policy.is_some() {
+                merged.images.policy = imgs.policy.clone();
             }
         }
         merged
@@ -551,7 +574,7 @@ mod tests {
             ram_mb: 2048,
             cpu_model: None,
             image_dir: PathBuf::from("/tmp/test"),
-            images: ImagePaths { kernel: Some("bzImage".into()), rootfs: Some("rootfs.img".into()) },
+            images: ImagePaths { kernel: Some("bzImage".into()), rootfs: Some("rootfs.img".into()), policy: None },
             devices: vec![],
             disks: vec![],
             health: None,
@@ -593,6 +616,7 @@ mod tests {
             images: Some(ImagePaths {
                 kernel: Some("vmlinuz".into()),
                 rootfs: Some("root.ext4".into()),
+                policy: None,
             }),
         };
 
@@ -665,6 +689,7 @@ extra_cmdline: "debug"
             images: Some(ImagePaths {
                 kernel: Some("vmlinuz-new".into()),
                 rootfs: None,
+                policy: None,
             }),
             ..Default::default()
         };

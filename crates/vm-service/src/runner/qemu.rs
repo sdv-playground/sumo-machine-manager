@@ -192,6 +192,15 @@ impl QemuRunner {
                 ]);
             }
 
+            // Policy partition (AUTH-ARCH-001 §4) — read-only image
+            // mounted at /etc/sumo/policy by the guest's startup.
+            if let Some(policy) = def.policy_path() {
+                args.extend_from_slice(&[
+                    "-drive".into(),
+                    format!("file={},format=raw,readonly=on", policy.display()),
+                ]);
+            }
+
             // Extra disks (data partition, etc.)
             for disk in &def.disks {
                 args.extend_from_slice(&[
@@ -245,6 +254,23 @@ impl QemuRunner {
                 if disk.role == "swap" {
                     cmdline_parts.push("resume=/dev/vdc".into());
                 }
+            }
+
+            // Policy partition (AUTH-ARCH-001 §4) — read-only image.
+            // Appended to disk_args so it shares the same ordering
+            // logic as data/swap disks. The guest's init mounts it
+            // at /etc/sumo/policy/ from whichever virtio-blk node it
+            // enumerates as.
+            if let Some(policy) = def.policy_path() {
+                disk_args.push(vec![
+                    "-drive".into(),
+                    format!(
+                        "file={},format=raw,if=none,id=hd_policy,readonly=on",
+                        policy.display()
+                    ),
+                    "-device".into(),
+                    format!("{blk_device},drive=hd_policy"),
+                ]);
             }
 
             let rootfs = def.rootfs_path()
