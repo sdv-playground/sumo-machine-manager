@@ -65,6 +65,19 @@ impl QnxRunner {
         format!("/dev/{}0", Self::extra_prefix(vm_name, role))
     }
 
+    /// Dedicated prefix for the policy partition's devb-loopback.
+    /// 4-char role token (`pols`) mirrors `qvmdisk-{vm}`'s structure
+    /// (4-char role + dash + vm_name); 6-char tokens like the natural
+    /// `qvmpolicy-{vm}` tripped a silent io-blk registration drop on
+    /// managed-cvc QNX 7.1 hosts. Pattern proven empirically.
+    fn policy_prefix(vm_name: &str) -> String {
+        format!("qvmpols-{vm_name}")
+    }
+
+    fn policy_device(vm_name: &str) -> String {
+        format!("/dev/{}0", Self::policy_prefix(vm_name))
+    }
+
     /// Walk `/proc/<pid>/cmdline` for every live process and return
     /// `(pid, argv_string)` pairs. argv tokens are NUL-separated on
     /// disk; we substitute spaces so callers can `.contains()`-match.
@@ -269,18 +282,22 @@ impl VmRunner for QnxRunner {
         }
 
         // Policy partition (AUTH-ARCH-001 §4): a small read-only image
-        // shipped in the bank alongside the rootfs. We expose it
-        // through the same `qvm{role}-{vm}` devb-loopback pattern as
-        // the extra-disks below; the qvm.conf wires a virtio-blk
-        // pointing at the resulting device. The guest's IFS mounts
-        // it at /etc/sumo/policy/ before any policy-reading service
-        // starts. Optional — banks that haven't migrated yet just
-        // don't get a mount on the guest.
+        // shipped in the bank alongside the rootfs. The on-host
+        // devb-loopback registers as `/dev/qvmpols-{vm}0` — short
+        // 4-char role token matching the rootfs's `qvmdisk-{vm}`
+        // structure (the `qvm{role}-{vm}` pattern with 6-char role
+        // "policy" was tried first and tripped a silent io-blk
+        // registration drop on managed-cvc QNX 7.1; shorter prefix
+        // fixed it). The qvm.conf wires a virtio-blk pointing at
+        // /dev/qvmpols-{vm}0; the guest's IFS mounts it at
+        // /etc/sumo/policy/ before any policy-reading service starts.
+        // Optional — banks without policy.qnx6 just don't get a
+        // mount on the guest.
         if let Some(policy) = def.policy_path() {
             if policy.exists() {
-                let prefix = Self::extra_prefix(name, "policy");
+                let prefix = Self::policy_prefix(name);
                 self.spawn_loopback(&prefix, &policy)?;
-                let device = Self::extra_device(name, "policy");
+                let device = Self::policy_device(name);
                 tracing::info!(
                     vm = %name, device, path = %policy.display(),
                     "policy partition attached"
