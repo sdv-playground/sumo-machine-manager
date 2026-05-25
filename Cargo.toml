@@ -12,6 +12,7 @@ members = [
     "crates/sumo-verify",
     "crates/policy-eval",
     "crates/policy-partition",
+    "crates/policy-build",
     "crates/vhsm-ssd",
     "crates/vm-wire",
     "crates/vm-devices",
