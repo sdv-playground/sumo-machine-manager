@@ -187,9 +187,12 @@ impl PolicyImageBuilder {
         //                   image variability across build hosts).
         // `-noappend`     — don't try to append to an existing file
         //                   (we removed it above, but defensive).
-        // `-comp xz`      — best compression for static text content
-        //                   (policy files are tiny YAML/PEM, but
-        //                   we still care about over-the-air bytes).
+        // `-comp gzip`    — the only squashfs compressor the
+        //                   guest-vm-kernel build enables
+        //                   (CONFIG_SQUASHFS_ZLIB=y; XZ/ZSTD/LZ4/LZO
+        //                   all off). If you change this, also flip
+        //                   the matching CONFIG_SQUASHFS_<COMP>=y in
+        //                   guest-vm-kernel and rebuild the kernel.
         // `-no-progress`  — quieter CI output.
         let status = Command::new(&tool)
             .arg(&self.source_dir)
@@ -199,7 +202,7 @@ impl PolicyImageBuilder {
                 "-no-xattrs",
                 "-noappend",
                 "-comp",
-                "xz",
+                "gzip",
                 "-no-progress",
             ])
             .status()

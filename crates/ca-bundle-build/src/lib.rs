@@ -149,9 +149,13 @@ impl CaBundleImageBuilder {
             .clone()
             .unwrap_or_else(|| PathBuf::from("mksquashfs"));
 
-        // Same flags as policy-build's squashfs path:
-        // -all-root, -no-xattrs, -noappend, -comp xz (best ratio for
-        // PEM text content), -no-progress (quiet CI output).
+        // -comp gzip — the only compression the guest-vm-kernel build
+        // enables (CONFIG_SQUASHFS_ZLIB=y; XZ/ZSTD/LZ4/LZO all off).
+        // xz would shave ~3% off the bundle but `mount` refuses with
+        // "Filesystem uses 'xz' compression. This is not supported."
+        // If you change this, also flip CONFIG_SQUASHFS_<COMP>=y in
+        // guest-vm-kernel/configs/{common,arm64,amd64}.config and
+        // rebuild the kernel.
         let status = Command::new(&tool)
             .arg(&self.source_dir)
             .arg(output)
@@ -160,7 +164,7 @@ impl CaBundleImageBuilder {
                 "-no-xattrs",
                 "-noappend",
                 "-comp",
-                "xz",
+                "gzip",
                 "-no-progress",
             ])
             .status()
