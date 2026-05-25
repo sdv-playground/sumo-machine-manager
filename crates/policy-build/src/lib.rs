@@ -84,8 +84,13 @@ pub struct PolicyImageBuilder {
     /// container).
     pub tool_path: Option<PathBuf>,
     /// Override the qnx6 image's `num_sectors` (512-byte sectors).
-    /// `None` → 1024 (512 KB), enough for ~10 KB of policy YAML.
-    /// Bigger only if your policy directory grows past that.
+    /// `None` → 8192 (4 MB). mkqnx6fsimg prepends a 16-sector boot
+    /// wrapper that doubles as an MBR with type-0xB1 partition entry
+    /// 0; values below ~2048 sectors leave the partition extending
+    /// past the file end, which makes io-blk silently drop the
+    /// registration in devb-loopback (`fs-qnx6.so's strict size check
+    /// num_sectors == medium size` fails). 4 MB gives plenty of
+    /// slack while staying small enough to ship in a partial OTA.
     pub qnx6_num_sectors: Option<u32>,
     /// Skip the `policy-partition` validation step. Used by tests
     /// that intentionally produce broken images for verification.
@@ -219,18 +224,25 @@ impl PolicyImageBuilder {
             .unwrap_or_else(|| PathBuf::from("mkqnx6fsimg"));
 
         // mkqnx6fsimg syntax: `mkqnx6fsimg [opts] <buildfile> <in-dir> <out-file>`.
-        // The buildfile carries image attributes — the most important
-        // for us is `num_sectors`, which controls how big the image
-        // ends up. Without it, mkqnx6fsimg pads to a default ~256 MB
-        // partition. We want a small image (typically a few KB of
-        // policy YAML) so 1024 sectors = 512 KB is plenty.
         //
-        // We also pass `-n` (one of them) to strip per-run timestamps
-        // for reproducible builds — same image bytes from the same
-        // source dir regardless of when the build runs.
-        let num_sectors = self.qnx6_num_sectors.unwrap_or(1024);
+        // The build-file carries image attributes. Critical ones:
+        //   - num_sectors: total disk size in 512-byte sectors,
+        //     INCLUDING the 16-sector boot wrapper. Values below
+        //     ~2048 leave the qnx6 partition extending past the
+        //     file end, which makes io-blk reject the registration
+        //     in devb-loopback. Default 8192 (4 MB) — plenty of
+        //     slack with room for policies to grow.
+        //   - num_inodes + blksize: match what the working QEMU
+        //     data.img / opt.img builds use.
+        //
+        // `-n` strips per-run timestamps for reproducible builds —
+        // same image bytes from the same source dir regardless of
+        // when the build runs.
+        let num_sectors = self.qnx6_num_sectors.unwrap_or(8192);
         let build_file = output.with_extension("qnx6.buildfile");
-        let buildfile_contents = format!("[num_sectors={num_sectors}]\n");
+        let buildfile_contents = format!(
+            "[num_sectors={num_sectors}]\n[num_inodes=512]\n[blksize=4096]\n"
+        );
         std::fs::write(&build_file, &buildfile_contents).map_err(|e| BuildError::Io {
             op: "write qnx6 build-file",
             path: build_file.clone(),
