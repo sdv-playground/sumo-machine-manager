@@ -20,7 +20,7 @@ presented read-only to VMs.
 | 7  | `vm2-b`        | 2 GB    | ext4    | VM2 image (kernel + rootfs), bank B      |
 | 8  | `nv`           | 32 MB   | raw     | NV data store (bank manager managed)     |
 | 9  | `data`         | 2 GB    | ext4    | Persistent data (keys, config, app state)|
-| 10 | `containers`   | varies  | ext4    | Container image store (Podman/Docker)    |
+| 10 | `containers`   | varies  | ext4    | Container image store (Docker/Podman/containerd) |
 | 11 | `swap`         | >= RAM  | raw     | Linux VM hibernate (resume=)             |
 
 ### Notes
@@ -43,9 +43,9 @@ presented read-only to VMs.
 - **data**: Not banked. Persists across OS updates. Contains HSM wrapped keys,
   runtime configuration, application state. Mounted read-write by the guest VM.
 
-- **containers**: Not banked. Stores container images pulled at runtime. Base
-  containers may be baked into the OS image; this partition holds runtime layers.
-  Size depends on workload.
+- **containers**: Not banked. Stores container images imported or pulled at
+  runtime by Docker, Podman, or containerd. Base containers may be baked into
+  the OS image; this partition holds runtime layers. Size depends on workload.
 
 - **swap**: Not banked. Used for Linux VM hibernate (S4). Must be at least as
   large as VM RAM allocation. Kernel cmdline: `resume=/dev/vdX`.

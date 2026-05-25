@@ -37,6 +37,10 @@ Cargo workspace with 10 crates. Bottom-up:
 - **host-os-mgr** (lib): Host OS update management — IFS activation, A/B
   boot partition switching, reboot coordination. `IfsActivator` trait with
   dev (mount+copy) and production (raw partition write) implementations.
+- **app-mgr** (lib): Application/container update management through the
+  `Component` lifecycle. `ContainerImageComponent` validates detached
+  `#container-image` payloads and imports them into Docker, Podman, or
+  containerd.
 - **vm-mgr** (lib+bins: `vm-sovd`): SUIT validation, encrypted firmware
   streaming pipeline, OTA engine (install/commit/rollback), DID resolution,
   and the SOVD wire adapter. `VmBackend` per-component state machine;
@@ -66,6 +70,7 @@ machine-mgr    — Abstract trait layer connecting them all
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA)
 - **Per-bank VM config**: `vm-config.yaml` in bank directories, delivered alongside firmware
 - **Multi-payload SUIT**: host-os carries `#ifs` + `#rootfs` in one envelope; VMs carry kernel + rootfs + config
+- **Container image payloads**: app updates use detached `#container-image` payloads imported by Docker, Podman, or containerd
 - **Trial boot**: up to 10 reboots before auto-rollback to previous bank
 - **Copy-on-update**: clone runtime DIDs to target bank before OTA write
 - **NV persistence**: boot state, security floor survive power cycles (sector-rotated, CRC-protected)
@@ -95,6 +100,9 @@ crates/host-os-mgr/src/
   ifs/mod.rs              — IfsActivator trait + IfsError
   ifs/dev.rs              — DevIfsActivator (mount + atomic copy)
   ifs/partition.rs        — PartitionIfsActivator (raw block device write)
+
+crates/app-mgr/src/
+  docker_image.rs         — ContainerImageComponent and runtime import backends
 
 crates/machine-mgr/src/
   component.rs            — Component trait (async, ~35 methods)

@@ -1,7 +1,9 @@
 mod boot;
+pub mod docker_image;
 mod install;
 mod state;
 
+pub use docker_image::{ContainerImageComponent, ContainerImageConfig, ContainerRuntimeKind};
 pub use state::AppConfig;
 
 use std::path::PathBuf;

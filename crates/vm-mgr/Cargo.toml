@@ -41,6 +41,7 @@ sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch 
 coset = "0.3"
 ciborium = "0.2"
 tempfile = "3"
+app-mgr = { path = "../app-mgr" }
 
 [[bin]]
 name = "vm-diagserver"

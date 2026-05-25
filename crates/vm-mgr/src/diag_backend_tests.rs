@@ -1,6 +1,8 @@
 //! Tests for `ComponentDiagBackend` — verifies the fallback wiring and the
 //! Component-routed method groups.
 
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -21,6 +23,8 @@ use crate::diag_backend::ComponentDiagBackend;
 use crate::manifest_provider::ManifestProvider;
 use crate::sovd::security::TestSecurityProvider;
 use crate::suit_provider::SuitProvider;
+
+const DOCKER_IMAGE_REF: &str = "localhost/sumo-sovd-test:1.0.0";
 
 fn make_vm_backend() -> Arc<VmBackend<MemBlockDevice>> {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
@@ -555,6 +559,44 @@ async fn upload_envelope_routes_through_component() {
 }
 
 #[tokio::test]
+#[ignore = "requires generated Docker SUIT fixture and local Docker daemon"]
+async fn docker_image_diag_backend_routes_generated_suit_manifest_and_payload() {
+    let archive = std::env::var_os("SUMO_DOCKER_IMAGE_ARCHIVE")
+        .map(PathBuf::from)
+        .expect("set SUMO_DOCKER_IMAGE_ARCHIVE to generated Docker save .tar.gz fixture");
+    let manifest = std::env::var_os("SUMO_DOCKER_IMAGE_MANIFEST")
+        .map(PathBuf::from)
+        .expect("set SUMO_DOCKER_IMAGE_MANIFEST to generated docker-image-v1.0.0.suit fixture");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _guard = DockerImageCleanup::new(DOCKER_IMAGE_REF);
+
+    let component: Arc<dyn Component> = Arc::new(app_mgr::ContainerImageComponent::new(
+        app_mgr::ContainerImageConfig::new("docker_image", tmp.path().join("staging")),
+    ));
+    let diag = ComponentDiagBackend::new(component, make_vm_backend());
+
+    let transfer_id = diag.start_flash().await.unwrap();
+    assert_eq!(transfer_id, "docker-image");
+    let manifest_id = diag
+        .receive_package(&std::fs::read(manifest).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(manifest_id, "docker-image-manifest");
+    let payload_id = diag
+        .receive_package(&std::fs::read(archive).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(payload_id, "docker-image-payload");
+    diag.finalize_flash().await.unwrap();
+    diag.commit_flash().await.unwrap();
+
+    assert!(
+        docker_image_present(DOCKER_IMAGE_REF),
+        "expected docker image inspect to find {DOCKER_IMAGE_REF} after SOVD DiagnosticBackend lifecycle"
+    );
+}
+
+#[tokio::test]
 async fn capabilities_carry_abortable_after_finalize() {
     use machine_mgr::{Component, MachineRegistry};
     let nv = make_vm_backend();
@@ -580,6 +622,38 @@ async fn capabilities_carry_abortable_after_finalize() {
         .expect("vm has flash caps");
     // Honest about current impl: VmBackendComponent doesn't yet wire abort.
     assert!(!flash.abortable_after_finalize);
+}
+
+fn docker_image_present(image_ref: &str) -> bool {
+    Command::new("docker")
+        .args(["image", "inspect", image_ref])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+struct DockerImageCleanup<'a> {
+    image_ref: &'a str,
+}
+
+impl<'a> DockerImageCleanup<'a> {
+    fn new(image_ref: &'a str) -> Self {
+        let cleanup = Self { image_ref };
+        cleanup.remove();
+        cleanup
+    }
+
+    fn remove(&self) {
+        let _ = Command::new("docker")
+            .args(["image", "rm", "-f", self.image_ref])
+            .output();
+    }
+}
+
+impl Drop for DockerImageCleanup<'_> {
+    fn drop(&mut self) {
+        self.remove();
+    }
 }
 
 // -------------------------------------------------------------------------

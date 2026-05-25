@@ -55,6 +55,9 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  host-os-mgr     Host OS update: IFS activation, A/B boot  │
 │  (lib)           partition, reboot coordination             │
 │                                                            │
+│  app-mgr         App/container updates via Component        │
+│  (lib)           container image import for local runtimes  │
+│                                                            │
 │  vm-mgr          SUIT validation, OTA engine, DID          │
 │  (lib+bins)      resolution, SOVD wire adapter             │
 │       │                                                    │
@@ -78,6 +81,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `vm-service` | `vm-service` | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config, ivshmem |
 | `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic) |
 | `host-os-mgr` | — | Host OS Component: IFS activation, A/B partition, reboot |
+| `app-mgr` | — | App/container Component: local container image import for Docker, Podman, or containerd |
 | `vm-mgr` | `vm-sovd` | SUIT + SOVD: validation, OTA engine, DID resolution |
 
 ### Separation of concerns
@@ -158,6 +162,7 @@ Flash operations require programming session + security unlock:
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA via SOVD)
 - **Per-bank VM config**: vm-config.yaml in bank directories, delivered alongside firmware via OTA
 - **Multi-payload SUIT**: host-os carries IFS + rootfs; VMs carry kernel + rootfs + config
+- **Container image updates**: `app-mgr` accepts detached `#container-image` payloads and imports them into Docker, Podman, or containerd through the normal Component flash lifecycle
 - **Trial boot**: Up to 10 reboots before auto-rollback to previous bank
 - **Copy-on-update**: Runtime DIDs/DTCs cloned to target bank before OTA write
 - **NV persistence**: Boot state, security floor survive power cycles (sector-rotated, CRC-protected)
