@@ -50,9 +50,11 @@ pub enum ImageFormat {
     /// squashfs — Linux guests. Requires `mksquashfs` (squashfs-tools)
     /// on the host build machine.
     Squashfs,
-    /// qnx6 — QNX guests + QNX host. Requires `mkqnx6fs` from the QNX SDP
-    /// on the host build machine (typically inside the QNX builder
-    /// container).
+    /// qnx6 — QNX guests + QNX host. Requires `mkqnx6fsimg` from the
+    /// QNX SDP on the host build machine. Honours `QNX_TARGET` /
+    /// `QNX_HOST` from the SDP env, so callers must source
+    /// `qnxsdp-env.sh` before invoking (or set the env vars
+    /// equivalently).
     Qnx6,
 }
 
@@ -77,10 +79,14 @@ pub struct PolicyImageBuilder {
     pub source_dir: PathBuf,
     pub format: ImageFormat,
     /// Override the build tool. By default we look up `mksquashfs` /
-    /// `mkqnx6fs` on `$PATH`. Set this to an absolute path for
+    /// `mkqnx6fsimg` on `$PATH`. Set this to an absolute path for
     /// reproducible cross-build invocations (e.g. inside the QNX SDP
     /// container).
     pub tool_path: Option<PathBuf>,
+    /// Override the qnx6 image's `num_sectors` (512-byte sectors).
+    /// `None` → 1024 (512 KB), enough for ~10 KB of policy YAML.
+    /// Bigger only if your policy directory grows past that.
+    pub qnx6_num_sectors: Option<u32>,
     /// Skip the `policy-partition` validation step. Used by tests
     /// that intentionally produce broken images for verification.
     /// Production callers should leave this `false`.
@@ -93,8 +99,14 @@ impl PolicyImageBuilder {
             source_dir: source_dir.as_ref().to_path_buf(),
             format,
             tool_path: None,
+            qnx6_num_sectors: None,
             skip_validation: false,
         }
+    }
+
+    pub fn with_qnx6_num_sectors(mut self, sectors: u32) -> Self {
+        self.qnx6_num_sectors = Some(sectors);
+        self
     }
 
     pub fn with_tool_path(mut self, tool: impl AsRef<Path>) -> Self {
@@ -204,16 +216,36 @@ impl PolicyImageBuilder {
         let tool = self
             .tool_path
             .clone()
-            .unwrap_or_else(|| PathBuf::from("mkqnx6fs"));
+            .unwrap_or_else(|| PathBuf::from("mkqnx6fsimg"));
 
-        // `-n vol=sumo-policy`  — volume label, makes the resulting
-        //                        image identifiable on the device.
-        // `-r <dir>`            — populate from this directory.
-        // QNX 7.1's mkqnx6fs takes the output last as a positional arg.
+        // mkqnx6fsimg syntax: `mkqnx6fsimg [opts] <buildfile> <in-dir> <out-file>`.
+        // The buildfile carries image attributes — the most important
+        // for us is `num_sectors`, which controls how big the image
+        // ends up. Without it, mkqnx6fsimg pads to a default ~256 MB
+        // partition. We want a small image (typically a few KB of
+        // policy YAML) so 1024 sectors = 512 KB is plenty.
+        //
+        // We also pass `-n` (one of them) to strip per-run timestamps
+        // for reproducible builds — same image bytes from the same
+        // source dir regardless of when the build runs.
+        let num_sectors = self.qnx6_num_sectors.unwrap_or(1024);
+        let build_file = output.with_extension("qnx6.buildfile");
+        let buildfile_contents = format!("[num_sectors={num_sectors}]\n");
+        std::fs::write(&build_file, &buildfile_contents).map_err(|e| BuildError::Io {
+            op: "write qnx6 build-file",
+            path: build_file.clone(),
+            error: e.to_string(),
+        })?;
+
+        // mkqnx6fsimg reads QNX_TARGET from the environment. If the
+        // caller hasn't sourced qnxsdp-env.sh, the tool errors out
+        // immediately ("QNX_TARGET environment variable must be set").
+        // We don't try to second-guess the SDP layout here — callers
+        // pass `with_tool_path()` for a non-default install, but the
+        // env vars are theirs to manage.
         let status = Command::new(&tool)
             .arg("-n")
-            .arg("vol=sumo-policy")
-            .arg("-r")
+            .arg(&build_file)
             .arg(&self.source_dir)
             .arg(output)
             .status()
@@ -221,6 +253,10 @@ impl PolicyImageBuilder {
                 tool: tool.clone(),
                 error: e.to_string(),
             })?;
+
+        // Clean up the build-file regardless of success — caller
+        // doesn't need it past this point.
+        let _ = std::fs::remove_file(&build_file);
 
         if !status.success() {
             return Err(BuildError::ToolFailed {
