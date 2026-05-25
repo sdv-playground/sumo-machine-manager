@@ -2385,10 +2385,18 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // and the new daemon's seq counter is observed continuing from
         // whatever the previous lifetime left there.
         //
-        // Only meaningful if the VM was actually running pre-reset. For
-        // the factory-provision case (VM was offline) we leave the
-        // baseline as `None`; `guest_is_running` then accepts any
-        // "running" heartbeat as proof of activation.
+        // Capture the boot_id whenever ANY heartbeat is present, regardless
+        // of guest_state. Previously this gated on `guest_state == 1` which
+        // caused a real bug: if the guest happened to be in Booting /
+        // Degraded / ShuttingDown / momentarily-stale at probe time, the
+        // baseline was discarded → guest_is_running then accepted any
+        // running heartbeat → Activated declared 45ms after the new qvm
+        // spawn, reading the previous lifetime's stale shmem.
+        //
+        // For factory-provision (truly never-started VM) shmem has no
+        // valid heartbeat → query_vm_health returns None → baseline
+        // remains None → guest_is_running fallback accepts any running
+        // heartbeat. That path is preserved.
         let baseline_boot_id = if self.config.single_bank {
             None
         } else {
@@ -2396,7 +2404,13 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 Some(sock) => query_vm_health(sock, &self.entity_info.id).await,
                 None => None,
             };
-            health.filter(|h| h.guest_state == 1).map(|h| h.boot_id)
+            let baseline = health.map(|h| h.boot_id);
+            tracing::info!(
+                component = %self.entity_info.id,
+                baseline_boot_id = ?baseline,
+                "captured baseline boot_id for activation check"
+            );
+            baseline
         };
 
         // Advance flash state.

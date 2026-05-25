@@ -88,9 +88,12 @@ async fn stop_vm(
     // Phase 2: wait for process to exit (blocking, NO lock held)
     if let Some(pid) = stop_handle.pid {
         let timeout = stop_handle.timeout_secs;
-        tokio::task::spawn_blocking(move || {
-            manager::wait_for_exit(pid, timeout);
-        }).await.ok();
+        let _ = tokio::task::spawn_blocking(move || {
+            // bool return is "exited cleanly?"; finalize_stop force-kills
+            // on false, so the result is informational here. Caller logs
+            // its own elapsed metric.
+            manager::wait_for_exit(pid, timeout)
+        }).await;
     }
 
     // Phase 3: force-kill if needed + cleanup (fast, under lock)
@@ -130,17 +133,38 @@ async fn ensure_vm_running(
     let mgr_clone = mgr.clone();
     let name_clone = name.clone();
     tokio::spawn(async move {
+        // Per-phase timing so a stuck restart is greppable in the log.
+        // Resolution is whole seconds — matches operator intuition;
+        // sub-second jitter on Linux shutdown isn't actionable.
+        let total_started = std::time::Instant::now();
+
         if let Some(sh) = stop_handle {
             if let Some(pid) = sh.pid {
                 let timeout = sh.timeout_secs;
-                tokio::task::spawn_blocking(move || {
-                    manager::wait_for_exit(pid, timeout);
-                }).await.ok();
+                let phase_started = std::time::Instant::now();
+                let exited = tokio::task::spawn_blocking(move || {
+                    manager::wait_for_exit(pid, timeout)
+                })
+                .await
+                .unwrap_or(false);
+                let elapsed_secs = phase_started.elapsed().as_secs();
+                if exited {
+                    tracing::info!(
+                        vm = %name_clone, elapsed_secs,
+                        "ensure_vm_running: guest shutdown completed"
+                    );
+                } else {
+                    tracing::warn!(
+                        vm = %name_clone, elapsed_secs, timeout_secs = timeout,
+                        "ensure_vm_running: guest shutdown timed out — will force-kill"
+                    );
+                }
             }
             let mut mgr = mgr_clone.lock().await;
             mgr.finalize_stop(&name_clone);
         }
 
+        let phase_started = std::time::Instant::now();
         let start_name = name_clone.clone();
         let start_mgr = mgr_clone.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -148,11 +172,22 @@ async fn ensure_vm_running(
             let mut mgr = rt.block_on(start_mgr.lock());
             mgr.start_vm(&start_name)
         }).await;
+        let start_elapsed_secs = phase_started.elapsed().as_secs();
 
+        let total_elapsed_secs = total_started.elapsed().as_secs();
         match result {
-            Ok(Ok(())) => tracing::info!(vm = %name_clone, "ensure_vm_running: VM is running"),
-            Ok(Err(e)) => tracing::error!(vm = %name_clone, error = %e, "ensure_vm_running: background start_vm failed"),
-            Err(e)     => tracing::error!(vm = %name_clone, error = %e, "ensure_vm_running: background task panicked"),
+            Ok(Ok(())) => tracing::info!(
+                vm = %name_clone, start_elapsed_secs, total_elapsed_secs,
+                "ensure_vm_running: VM is running"
+            ),
+            Ok(Err(e)) => tracing::error!(
+                vm = %name_clone, start_elapsed_secs, total_elapsed_secs, error = %e,
+                "ensure_vm_running: background start_vm failed"
+            ),
+            Err(e) => tracing::error!(
+                vm = %name_clone, start_elapsed_secs, total_elapsed_secs, error = %e,
+                "ensure_vm_running: background task panicked"
+            ),
         }
     });
 

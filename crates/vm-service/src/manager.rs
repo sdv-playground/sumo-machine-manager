@@ -135,15 +135,18 @@ pub struct StopHandle {
 }
 
 /// Wait for a process to exit, polling with a timeout. No locks held.
-pub fn wait_for_exit(pid: u32, timeout_secs: u64) {
+/// Returns `true` if the process exited within the timeout, `false`
+/// on timeout (caller is expected to force-kill in that case).
+pub fn wait_for_exit(pid: u32, timeout_secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
         if unsafe { libc::kill(pid as i32, 0) != 0 } {
-            return; // process gone
+            return true; // process gone
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     tracing::warn!("pid {pid} did not exit within {timeout_secs}s — will force-kill");
+    false
 }
 
 #[derive(Debug)]
@@ -437,14 +440,26 @@ impl VmManager {
 
         // Send PowerCommand::Shutdown via the host→guest power channel.
         // If no power device exists (no transport configured / no health
-        // device), skip the graceful wait and force-kill immediately.
+        // device / qvm-shmem slot leak exhausted the libhyp pool), skip
+        // the graceful wait and force-kill immediately.
         let timeout_secs = match vm.power.as_ref().map(|p| p.send(PowerCommand::Shutdown)) {
             Some(Ok(_seq)) => vm.def.shutdown_timeout_secs(),
             Some(Err(e)) => {
                 tracing::warn!("VM {name}: failed to send shutdown command: {e} — force-kill");
                 0
             }
-            None => 0,
+            None => {
+                // Used to silently default to 0 — operators looking at
+                // a `timeout: 0s` line had no signal as to why. Make it
+                // loud: this only happens when the power channel was
+                // never opened (transport-less config) or got torn down
+                // (qvm-shmem slot leak — see reference_qvm_shmem_slot_leak).
+                tracing::warn!(
+                    "VM {name}: no power channel — can't send Shutdown, will force-kill. \
+                     If this is unexpected, check qvm-shmem slot leaks (reboot the host)."
+                );
+                0
+            }
         };
 
         let pid = handle.pid;
@@ -486,7 +501,9 @@ impl VmManager {
     pub fn stop_vm(&mut self, name: &str) -> Result<(), ManagerError> {
         let sh = self.initiate_stop(name)?;
         if let Some(pid) = sh.pid {
-            wait_for_exit(pid, sh.timeout_secs);
+            // finalize_stop force-kills on a timeout; the bool result is
+            // informational (logged inside wait_for_exit on timeout).
+            let _ = wait_for_exit(pid, sh.timeout_secs);
         }
         self.finalize_stop(name);
         Ok(())

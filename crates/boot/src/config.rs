@@ -311,7 +311,10 @@ pub struct ShutdownConfig {
     pub method: String,
 }
 
-fn default_shutdown_timeout() -> u64 { 10 }
+// 60s — Linux systemd shutdown takes 5-30s on managed-cvc; was 10s,
+// which always force-killed before linux finished. Mirror of the
+// vm-service default; both knobs read the same env-name.
+fn default_shutdown_timeout() -> u64 { 60 }
 fn default_shutdown_method() -> String { "health".to_string() }
 
 /// How to detect when a VM is ready after start.

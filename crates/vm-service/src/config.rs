@@ -268,7 +268,11 @@ pub struct ShutdownConfig {
     pub timeout_secs: u64,
 }
 
-fn default_shutdown_timeout() -> u64 { 10 }
+// 60s — Linux (autosd / debian) systemd shutdown takes 5-30s on
+// managed-cvc; QNX is faster but the orchestrator amortises the
+// extra ceiling. Was 10s, which always force-killed before linux
+// finished, leaving fsck-on-next-mount as the cleanup path.
+fn default_shutdown_timeout() -> u64 { 60 }
 
 impl VmServiceConfig {
     pub fn from_file(path: &Path) -> Result<Self, String> {
@@ -355,7 +359,8 @@ impl VmDefinition {
 
     /// Shutdown timeout in seconds (default 10).
     pub fn shutdown_timeout_secs(&self) -> u64 {
-        self.shutdown.as_ref().map(|s| s.timeout_secs).unwrap_or(10)
+        // Default kept in sync with `default_shutdown_timeout` above.
+        self.shutdown.as_ref().map(|s| s.timeout_secs).unwrap_or(60)
     }
 
     /// Merge per-bank overrides into this definition. Only present fields are overridden.
