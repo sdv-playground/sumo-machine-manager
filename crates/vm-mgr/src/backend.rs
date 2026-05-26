@@ -2633,11 +2633,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 Bank::B => "bank_b",
             };
             let symlink_path = images_dir.join(set_name).join("current");
-            let target = images_dir.join(set_name).join(bank_dir_name);
+            // Relative target — symlink is a sibling of bank_a/bank_b.
+            let target = Path::new(bank_dir_name);
             // Atomic symlink swap: create temp, rename over existing
             let tmp_link = symlink_path.with_extension("tmp");
             let _ = std::fs::remove_file(&tmp_link);
-            if let Err(e) = std::os::unix::fs::symlink(&target, &tmp_link)
+            if let Err(e) = std::os::unix::fs::symlink(target, &tmp_link)
                 .and_then(|()| std::fs::rename(&tmp_link, &symlink_path))
             {
                 tracing::warn!("failed to flip current symlink for {set_name}: {e}");

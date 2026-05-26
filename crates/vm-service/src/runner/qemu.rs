@@ -179,16 +179,18 @@ impl QemuRunner {
             // QNX: IFS boot disk + QNX6 root filesystem as separate drives.
             // Boot disk (IFS): loaded by BIOS/IPL into RAM.
             // Root filesystem: mounted at / by IFS startup script.
+            // Both are read-only — matches qvm/devb-loopback semantics on
+            // real hardware where the bank images are never written by the guest.
             if let Some(boot) = def.kernel_path() {
                 args.extend_from_slice(&[
                     "-drive".into(),
-                    format!("file={},format=raw", boot.display()),
+                    format!("file={},format=raw,readonly=on", boot.display()),
                 ]);
             }
             if let Some(rootfs) = def.rootfs_path() {
                 args.extend_from_slice(&[
                     "-drive".into(),
-                    format!("file={},format=raw", rootfs.display()),
+                    format!("file={},format=raw,readonly=on", rootfs.display()),
                 ]);
             }
 
