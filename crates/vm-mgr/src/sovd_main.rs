@@ -8,6 +8,7 @@ use nv_store::types::{BankSet, NvBootState};
 
 use sovd_core::DiagnosticBackend;
 
+use vm_mgr::app_install_router::AppInstallRouterComponent;
 use vm_mgr::backend::{ComponentConfig, VmBackend};
 use vm_mgr::component_adapter::VmBackendComponent;
 use vm_mgr::diag_backend::ComponentDiagBackend;
@@ -53,7 +54,9 @@ async fn main() {
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  vm-sovd /tmp/nv.bin");
-        eprintln!("  vm-sovd /data/nv.bin --images-dir /data/images --hsm-keystore /data/vhsm-keys");
+        eprintln!(
+            "  vm-sovd /data/nv.bin --images-dir /data/images --hsm-keystore /data/vhsm-keys"
+        );
         std::process::exit(1);
     }
 
@@ -130,11 +133,7 @@ async fn main() {
         let daemon_bin = hsm_daemon_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("vhsm-test-ssd"));
-        let provider = SimHsm::new(
-            daemon_bin.clone(),
-            hsm_keystore_path.clone(),
-            hsm_port,
-        );
+        let provider = SimHsm::new(daemon_bin.clone(), hsm_keystore_path.clone(), hsm_port);
 
         if hsm_daemon_path.is_some() {
             tracing::info!(
@@ -175,9 +174,8 @@ async fn main() {
             // CEK unwrap routed through the HSM, never extracts the
             // device decryption private key. Same Arc backs the
             // lifecycle ops below — no second view of the provider.
-            let unwrap: Arc<
-                dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync,
-            > = Arc::new(hsm::HsmKeyUnwrap::new(hsm_arc.clone(), "device-decrypt"));
+            let unwrap: Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync> =
+                Arc::new(hsm::HsmKeyUnwrap::new(hsm_arc.clone(), "device-decrypt"));
             manifest_provider.update_keys(sw_key, Some(unwrap), ka);
             tracing::info!("loaded sw-authority from HSM keystore; CEK unwrap routed through HSM");
         } else if provisioned {
@@ -200,7 +198,10 @@ async fn main() {
             std::process::exit(1);
         });
         manifest_provider.update_keys(sw_key, None, None);
-        tracing::info!("loaded software authority from --sw-authority {}", sw_path.display());
+        tracing::info!(
+            "loaded software authority from --sw-authority {}",
+            sw_path.display()
+        );
     }
 
     // Create one backend per bank set
@@ -283,7 +284,26 @@ async fn main() {
             component_inner =
                 component_inner.with_csr_keystore(hsm_keystore_path.clone(), hsm_port);
         }
-        let component: Arc<dyn machine_mgr::Component> = Arc::new(component_inner);
+        let vm_component: Arc<dyn machine_mgr::Component> = Arc::new(component_inner);
+        let component: Arc<dyn machine_mgr::Component> = if id == "vm2" {
+            let container_images_dir = images_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/tmp/sumo-container-images"))
+                .join("vm2")
+                .join("container-images");
+            let container_image: Arc<dyn machine_mgr::Component> =
+                Arc::new(app_mgr::ContainerImageComponent::new(
+                    app_mgr::ContainerImageConfig::new("container_image", container_images_dir),
+                ));
+            Arc::new(AppInstallRouterComponent::new(
+                "vm2",
+                vm_component,
+                container_image,
+                manifest_provider.clone(),
+            ))
+        } else {
+            vm_component
+        };
 
         machine_builder = machine_builder.with_arc(component.clone());
 

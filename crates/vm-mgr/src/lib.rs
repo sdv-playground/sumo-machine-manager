@@ -36,6 +36,7 @@
 //! - [`suit_provider`] + [`manifest_provider`] — SUIT envelope validation
 //! - [`streaming`] — upload pipeline (decompress + decrypt + hash streaming)
 
+pub mod app_install_router;
 pub mod backend;
 pub mod bank_seed;
 pub mod bank_spec;

@@ -31,6 +31,7 @@ sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = 
 sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 hsm = { path = "../hsm", features = ["crypto"] }
 host-os-mgr = { path = "../host-os-mgr" }
+app-mgr = { path = "../app-mgr" }
 hex = "0.4.3"
 
 [dev-dependencies]
@@ -41,7 +42,6 @@ sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch 
 coset = "0.3"
 ciborium = "0.2"
 tempfile = "3"
-app-mgr = { path = "../app-mgr" }
 
 [[bin]]
 name = "vm-diagserver"

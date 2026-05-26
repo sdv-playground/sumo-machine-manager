@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use machine_mgr::component::Component;
 use machine_mgr::error::{MachineError, MachineResult};
 use machine_mgr::types::{Capabilities, FlashCaps, FlashId, FlashSession, LifecycleCaps};
+use machine_mgr::{FlashState, FlashStatus};
 
 /// Configuration for the container image-store validation/import seam.
 ///
@@ -24,6 +25,7 @@ pub struct ContainerImageConfig {
     pub images_dir: PathBuf,
     pub expected_ref: String,
     pub runtime: ContainerRuntimeKind,
+    allow_unsigned_text_manifest: bool,
 }
 
 impl ContainerImageConfig {
@@ -33,6 +35,7 @@ impl ContainerImageConfig {
             images_dir: images_dir.into(),
             expected_ref: DEFAULT_CONTAINER_IMAGE_REF.into(),
             runtime: ContainerRuntimeKind::Docker,
+            allow_unsigned_text_manifest: false,
         }
     }
 
@@ -40,9 +43,15 @@ impl ContainerImageConfig {
         self.runtime = runtime;
         self
     }
+
+    #[cfg(test)]
+    fn with_unsigned_text_manifests_for_tests(mut self) -> Self {
+        self.allow_unsigned_text_manifest = true;
+        self
+    }
 }
 
-pub const DEFAULT_CONTAINER_IMAGE_REF: &str = "localhost/sumo-sovd-test:1.0.0";
+pub const DEFAULT_CONTAINER_IMAGE_REF: &str = "localhost/sumo-container-image-test:1.0.0";
 pub const CONTAINER_IMAGE_PAYLOAD_URI: &str = "#container-image";
 const COPY_BUF_SIZE: usize = 64 * 1024;
 const MANIFEST_JSON_LIMIT: usize = 1024 * 1024;
@@ -261,9 +270,13 @@ impl Drop for StagedDockerArchive {
 fn parse_docker_image_manifest(
     bytes: &[u8],
     expected_ref: &str,
+    allow_unsigned_text_manifest: bool,
 ) -> MachineResult<DockerImageManifest> {
-    parse_suit_docker_image_manifest(bytes, expected_ref)
-        .or_else(|_| parse_pending_text_manifest(bytes, expected_ref))
+    match parse_suit_docker_image_manifest(bytes, expected_ref) {
+        Ok(manifest) => Ok(manifest),
+        Err(_) if allow_unsigned_text_manifest => parse_pending_text_manifest(bytes, expected_ref),
+        Err(err) => Err(err),
+    }
 }
 
 fn parse_suit_docker_image_manifest(
@@ -728,7 +741,7 @@ impl Component for ContainerImageComponent {
         }
         *session = Some(DockerImageSession::new());
         Ok(FlashSession {
-            id: FlashId::new("docker-image"),
+            id: FlashId::new("container-image"),
             target_bank: None,
             max_chunk_size: 16 * 1024 * 1024,
         })
@@ -749,7 +762,11 @@ impl Component for ContainerImageComponent {
 
         if manifest.is_none() {
             let manifest_bytes = collect_manifest_stream(stream).await?;
-            let manifest = parse_docker_image_manifest(&manifest_bytes, &self.config.expected_ref)?;
+            let manifest = parse_docker_image_manifest(
+                &manifest_bytes,
+                &self.config.expected_ref,
+                self.config.allow_unsigned_text_manifest,
+            )?;
             let mut session = self.session.lock().unwrap();
             let session = session.as_mut().ok_or_else(|| {
                 MachineError::UnknownFlashSession("no active docker_image session".into())
@@ -760,7 +777,7 @@ impl Component for ContainerImageComponent {
                 ));
             }
             session.manifest = Some(manifest);
-            Ok("docker-image-manifest".into())
+            Ok("container-image-manifest".into())
         } else {
             let manifest = manifest.expect("manifest checked above");
             {
@@ -785,7 +802,7 @@ impl Component for ContainerImageComponent {
             save_payload_stream(stream, &payload_path, manifest.expected_size).await?;
             let mut session = self.session.lock().unwrap();
             assign_payload_path(&mut *session, payload_path)?;
-            Ok("docker-image-payload".into())
+            Ok("container-image-payload".into())
         }
     }
 
@@ -818,6 +835,16 @@ impl Component for ContainerImageComponent {
 
     async fn commit_install(&self, _id: &FlashId) -> MachineResult<()> {
         Ok(())
+    }
+
+    async fn install_status(&self, id: &FlashId) -> MachineResult<FlashStatus> {
+        Ok(FlashStatus {
+            transfer_id: id.to_string(),
+            package_id: "container-image".into(),
+            state: FlashState::AwaitingActivation,
+            progress: None,
+            error: None,
+        })
     }
 }
 
@@ -882,7 +909,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    const BAD_DOCKER_IMAGE_REF: &str = "localhost/sumo-sovd-test:bad";
+    const BAD_DOCKER_IMAGE_REF: &str = "localhost/sumo-container-image-test:bad";
 
     #[test]
     fn docker_image_component_names_image_store_owner() {
@@ -1051,7 +1078,7 @@ mod tests {
                 br#"[{
                     "Config":"cfg.json",
                     "RepoTags":["localhost/other:1.0.0"],
-                    "Labels":{"looks-like-tag":"localhost/sumo-sovd-test:1.0.0"},
+                    "Labels":{"looks-like-tag":"localhost/sumo-container-image-test:1.0.0"},
                     "Layers":[]
                 }]"#,
             )),
@@ -1070,7 +1097,7 @@ mod tests {
             Some((
                 "manifest.json",
                 br#"[
-                    {"Config":"cfg-a.json","RepoTags":["localhost/other:1.0.0","localhost/sumo-sovd-test:1.0.0"],"Layers":[]},
+                    {"Config":"cfg-a.json","RepoTags":["localhost/other:1.0.0","localhost/sumo-container-image-test:1.0.0"],"Layers":[]},
                     {"Config":"cfg-b.json","RepoTags":["localhost/other:2.0.0"],"Layers":[]}
                 ]"#,
             )),
@@ -1100,7 +1127,7 @@ mod tests {
             &source,
             Some((
                 "manifest.json",
-                br#"[{"Config":"cfg.json","RepoTags":["localhost/sumo-sovd-test:1.0.0"],"Layers":[]}]"#,
+                br#"[{"Config":"cfg.json","RepoTags":["localhost/sumo-container-image-test:1.0.0"],"Layers":[]}]"#,
             )),
         );
 
@@ -1174,7 +1201,7 @@ mod tests {
                         "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                         "size": 1,
                         "annotations": {
-                            "org.opencontainers.image.ref.name": "localhost/sumo-sovd-test:1.0.0"
+                            "org.opencontainers.image.ref.name": "localhost/sumo-container-image-test:1.0.0"
                         }
                     }]
                 }"#,
@@ -1234,8 +1261,8 @@ mod tests {
     #[test]
     fn manifest_stream_allows_exact_limit_and_rejects_one_byte_over() {
         let exact = vec![b'a'; MANIFEST_UPLOAD_LIMIT];
-        let collected = futures::executor::block_on(collect_manifest_stream(bytes_stream(exact)))
-            .unwrap();
+        let collected =
+            futures::executor::block_on(collect_manifest_stream(bytes_stream(exact))).unwrap();
         assert_eq!(collected.len(), MANIFEST_UPLOAD_LIMIT);
 
         let oversized = vec![b'a'; MANIFEST_UPLOAD_LIMIT + 1];
@@ -1263,10 +1290,10 @@ mod tests {
     #[test]
     fn lifecycle_rejects_payload_uri_mismatch_before_payload_upload() {
         let tmp = TempDir::new().unwrap();
-        let component = ContainerImageComponent::new(ContainerImageConfig::new(
-            "docker_image",
-            tmp.path().join("staging"),
-        ));
+        let component = ContainerImageComponent::new(
+            ContainerImageConfig::new("docker_image", tmp.path().join("staging"))
+                .with_unsigned_text_manifests_for_tests(),
+        );
 
         futures::executor::block_on(component.start_install()).unwrap();
         let err = futures::executor::block_on(component.upload_envelope(
@@ -1287,10 +1314,10 @@ mod tests {
     #[test]
     fn lifecycle_rejects_external_payload_uri_for_mvp() {
         let tmp = TempDir::new().unwrap();
-        let component = ContainerImageComponent::new(ContainerImageConfig::new(
-            "docker_image",
-            tmp.path().join("staging"),
-        ));
+        let component = ContainerImageComponent::new(
+            ContainerImageConfig::new("docker_image", tmp.path().join("staging"))
+                .with_unsigned_text_manifests_for_tests(),
+        );
 
         futures::executor::block_on(component.start_install()).unwrap();
         let err = futures::executor::block_on(component.upload_envelope(
@@ -1311,10 +1338,10 @@ mod tests {
     #[test]
     fn lifecycle_rejects_legacy_docker_payload_uri_after_alias_removal() {
         let tmp = TempDir::new().unwrap();
-        let component = ContainerImageComponent::new(ContainerImageConfig::new(
-            "container_image",
-            tmp.path().join("staging"),
-        ));
+        let component = ContainerImageComponent::new(
+            ContainerImageConfig::new("container_image", tmp.path().join("staging"))
+                .with_unsigned_text_manifests_for_tests(),
+        );
 
         futures::executor::block_on(component.start_install()).unwrap();
         let err = futures::executor::block_on(component.upload_envelope(
@@ -1335,10 +1362,10 @@ mod tests {
     #[test]
     fn lifecycle_rejects_corrupt_payload_before_docker_import() {
         let tmp = TempDir::new().unwrap();
-        let component = ContainerImageComponent::new(ContainerImageConfig::new(
-            "docker_image",
-            tmp.path().join("staging"),
-        ));
+        let component = ContainerImageComponent::new(
+            ContainerImageConfig::new("docker_image", tmp.path().join("staging"))
+                .with_unsigned_text_manifests_for_tests(),
+        );
         let payload = b"not a gzip-compressed Docker save archive".to_vec();
         let digest: [u8; 32] = Sha256::digest(&payload).into();
 
@@ -1368,10 +1395,10 @@ mod tests {
     #[test]
     fn lifecycle_rejects_duplicate_payload_without_replacing_or_leaking_upload() {
         let tmp = TempDir::new().unwrap();
-        let component = ContainerImageComponent::new(ContainerImageConfig::new(
-            "docker_image",
-            tmp.path().join("staging"),
-        ));
+        let component = ContainerImageComponent::new(
+            ContainerImageConfig::new("docker_image", tmp.path().join("staging"))
+                .with_unsigned_text_manifests_for_tests(),
+        );
         let payload = b"first payload bytes".to_vec();
         let digest: [u8; 32] = Sha256::digest(&payload).into();
 
@@ -1417,10 +1444,10 @@ mod tests {
     #[test]
     fn lifecycle_rejects_oversized_payload_and_cleans_partial_upload() {
         let tmp = TempDir::new().unwrap();
-        let component = ContainerImageComponent::new(ContainerImageConfig::new(
-            "docker_image",
-            tmp.path().join("staging"),
-        ));
+        let component = ContainerImageComponent::new(
+            ContainerImageConfig::new("docker_image", tmp.path().join("staging"))
+                .with_unsigned_text_manifests_for_tests(),
+        );
         let payload = b"too many bytes".to_vec();
         let digest: [u8; 32] = Sha256::digest(&payload).into();
 
@@ -1448,10 +1475,10 @@ mod tests {
     #[test]
     fn lifecycle_rejects_manifest_bytes_in_payload_phase_without_leaking_upload() {
         let tmp = TempDir::new().unwrap();
-        let component = ContainerImageComponent::new(ContainerImageConfig::new(
-            "docker_image",
-            tmp.path().join("staging"),
-        ));
+        let component = ContainerImageComponent::new(
+            ContainerImageConfig::new("docker_image", tmp.path().join("staging"))
+                .with_unsigned_text_manifests_for_tests(),
+        );
 
         futures::executor::block_on(component.start_install()).unwrap();
         futures::executor::block_on(component.upload_envelope(
@@ -1483,9 +1510,9 @@ mod tests {
     #[test]
     #[ignore = "requires local Docker daemon and fixture archive"]
     fn valid_docker_archive_imports_and_inspects_expected_ref() {
-        let archive = std::env::var_os("SUMO_DOCKER_IMAGE_ARCHIVE")
+        let archive = std::env::var_os("SUMO_CONTAINER_IMAGE_ARCHIVE")
             .map(PathBuf::from)
-            .expect("set SUMO_DOCKER_IMAGE_ARCHIVE to a Docker save .tar.gz fixture");
+            .expect("set SUMO_CONTAINER_IMAGE_ARCHIVE to a container image .tar.gz fixture");
         let tmp = TempDir::new().unwrap();
         let _guard = DockerImageCleanup::new(DEFAULT_CONTAINER_IMAGE_REF);
         let component = ContainerImageComponent::new(ContainerImageConfig::new(
@@ -1502,15 +1529,15 @@ mod tests {
     #[test]
     #[ignore = "requires local Docker daemon and fixture archive"]
     fn lifecycle_imports_valid_docker_archive_idempotently_and_inspects_expected_ref() {
-        let archive = std::env::var_os("SUMO_DOCKER_IMAGE_ARCHIVE")
+        let archive = std::env::var_os("SUMO_CONTAINER_IMAGE_ARCHIVE")
             .map(PathBuf::from)
-            .expect("set SUMO_DOCKER_IMAGE_ARCHIVE to a Docker save .tar.gz fixture");
+            .expect("set SUMO_CONTAINER_IMAGE_ARCHIVE to a container image .tar.gz fixture");
         let tmp = TempDir::new().unwrap();
         let _guard = DockerImageCleanup::new(DEFAULT_CONTAINER_IMAGE_REF);
-        let component = ContainerImageComponent::new(ContainerImageConfig::new(
-            "docker_image",
-            tmp.path().join("staging"),
-        ));
+        let component = ContainerImageComponent::new(
+            ContainerImageConfig::new("docker_image", tmp.path().join("staging"))
+                .with_unsigned_text_manifests_for_tests(),
+        );
 
         run_valid_lifecycle(&component, &archive);
         assert!(
@@ -1529,9 +1556,9 @@ mod tests {
     #[test]
     #[ignore = "requires local Docker daemon and fixture archive"]
     fn invalid_expected_ref_does_not_leave_bad_image_inspectable() {
-        let archive = std::env::var_os("SUMO_DOCKER_IMAGE_ARCHIVE")
+        let archive = std::env::var_os("SUMO_CONTAINER_IMAGE_ARCHIVE")
             .map(PathBuf::from)
-            .expect("set SUMO_DOCKER_IMAGE_ARCHIVE to a Docker save .tar.gz fixture");
+            .expect("set SUMO_CONTAINER_IMAGE_ARCHIVE to a container image .tar.gz fixture");
         let tmp = TempDir::new().unwrap();
         let _guard = DockerImageCleanup::new(BAD_DOCKER_IMAGE_REF);
         let component = ContainerImageComponent::new(ContainerImageConfig::new(
@@ -1554,7 +1581,7 @@ mod tests {
     fn run_valid_lifecycle(component: &ContainerImageComponent, archive: &Path) {
         let digest = sha256_file(&archive);
         let size = fs::metadata(&archive).unwrap().len();
-        let manifest = std::env::var_os("SUMO_DOCKER_IMAGE_MANIFEST")
+        let manifest = std::env::var_os("SUMO_CONTAINER_IMAGE_MANIFEST")
             .map(fs::read)
             .map(Result::unwrap)
             .unwrap_or_else(|| {
@@ -1599,7 +1626,7 @@ mod tests {
     fn pending_manifest(uri: &str, image: &str, digest: [u8; 32], size: u64) -> Vec<u8> {
         let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         format!(
-            "SUIT-L2-DETACHED-PENDING\ncomponent=docker_image\nimage={image}\npayload_uri={uri}\npayload_digest=sha256:{digest_hex}\npayload_size={size}\ndigest_size_source=compressed-bytes\n"
+            "SUIT-L2-DETACHED-PENDING\ncomponent=container_image\nimage={image}\npayload_uri={uri}\npayload_digest=sha256:{digest_hex}\npayload_size={size}\ndigest_size_source=compressed-bytes\n"
         )
         .into_bytes()
     }

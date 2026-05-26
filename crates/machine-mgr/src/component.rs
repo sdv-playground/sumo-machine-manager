@@ -6,7 +6,7 @@ use crate::types::{
     Capabilities, Csr, DidFilter, DidKind, DtcFilter, EnvelopeStream, FlashId, FlashSession,
     RuntimeState,
 };
-use crate::{ActivationState, ClearFaultsResult, Fault};
+use crate::{ActivationState, ClearFaultsResult, Fault, FlashStatus};
 
 /// One independently-updatable thing on the machine: the host OS, a guest VM,
 /// the HSM, an attached ECU.
@@ -63,6 +63,10 @@ pub trait Component: Send + Sync {
         Err(MachineError::NotSupported("start_install"))
     }
 
+    async fn authorize_install(&self) -> MachineResult<()> {
+        Ok(())
+    }
+
     /// Stream a SUIT envelope into staging. Validates signature + security
     /// version + command sequence inline. Decrypts and decompresses payloads
     /// as they stream. Does NOT apply the install — staging only.
@@ -110,6 +114,10 @@ pub trait Component: Send + Sync {
     /// only works if `FlashCaps.abortable_after_finalize` is true.
     async fn abort_install(&self, _id: &FlashId) -> MachineResult<()> {
         Err(MachineError::NotSupported("abort_install"))
+    }
+
+    async fn install_status(&self, _id: &FlashId) -> MachineResult<FlashStatus> {
+        Err(MachineError::NotSupported("install_status"))
     }
 
     /// State of bank activation (which bank is active, supports rollback,

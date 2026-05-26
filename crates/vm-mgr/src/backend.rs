@@ -5,7 +5,6 @@
 /// - Fault (DTC) management
 /// - SUIT-based firmware flash with A/B banking
 /// - Session/security mode control
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -226,7 +225,15 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         security_provider: Arc<dyn SecurityProvider>,
         config: ComponentConfig,
     ) -> Self {
-        Self::with_options(bank_set, nv, manifest_provider, security_provider, config, None, None)
+        Self::with_options(
+            bank_set,
+            nv,
+            manifest_provider,
+            security_provider,
+            config,
+            None,
+            None,
+        )
     }
 
     pub fn with_vm_service(
@@ -237,7 +244,15 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         config: ComponentConfig,
         vm_service_addr: Option<String>,
     ) -> Self {
-        Self::with_options(bank_set, nv, manifest_provider, security_provider, config, vm_service_addr, None)
+        Self::with_options(
+            bank_set,
+            nv,
+            manifest_provider,
+            security_provider,
+            config,
+            vm_service_addr,
+            None,
+        )
     }
 
     pub fn with_options(
@@ -267,7 +282,8 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             Bank::A // single-banked components always run on bank A
         } else {
             let nv_guard = nv.lock().unwrap();
-            nv_guard.read_boot_state()
+            nv_guard
+                .read_boot_state()
                 .map(|s| s.banks[bank_set.as_index()].active_bank)
                 .unwrap_or(Bank::A)
         };
@@ -348,7 +364,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     }
 
     /// Set an IFS activator for boot image activation (BankSet::HostOs only).
-    pub fn with_ifs_activator(mut self, activator: Arc<dyn host_os_mgr::ifs::IfsActivator>) -> Self {
+    pub fn with_ifs_activator(
+        mut self,
+        activator: Arc<dyn host_os_mgr::ifs::IfsActivator>,
+    ) -> Self {
         self.ifs_activator = Some(activator);
         self
     }
@@ -391,7 +410,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             if entry.did == did::DID_GUEST_STATE || entry.did == did::DID_HEARTBEAT_SEQ {
                 continue;
             }
-            if let did::DidValue::Bytes(bytes) = did::read_did(nv, self.bank_set, entry.did, Some(rb)) {
+            if let did::DidValue::Bytes(bytes) =
+                did::read_did(nv, self.bank_set, entry.did, Some(rb))
+            {
                 new_cache.insert(entry.did, bytes);
             }
         }
@@ -419,7 +440,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             .nv
             .lock()
             .map_err(|_| BackendError::Internal("nv lock poisoned".into()))?;
-        Ok(NvWriteGuard { backend: self, inner: Some(inner) })
+        Ok(NvWriteGuard {
+            backend: self,
+            inner: Some(inner),
+        })
     }
 
     // =================================================================
@@ -449,8 +473,12 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         if self.config.single_bank {
             return Ok(Bank::A);
         }
-        let nv = self.nv.lock().map_err(|_| BackendError::Internal("nv lock".into()))?;
-        let state = nv.read_boot_state()
+        let nv = self
+            .nv
+            .lock()
+            .map_err(|_| BackendError::Internal("nv lock".into()))?;
+        let state = nv
+            .read_boot_state()
             .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
         let idx = self.bank_set.as_index();
         Ok(state.banks[idx].active_bank.other())
@@ -460,7 +488,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// images_dir is configured (tests / in-memory only).
     fn target_bank_dir(&self, target: Bank) -> Option<PathBuf> {
         self.images_dir.as_ref().map(|images_dir| {
-            images_dir.join(&self.bank_spec.dir_name).join(bank_dir_name(target))
+            images_dir
+                .join(&self.bank_spec.dir_name)
+                .join(bank_dir_name(target))
         })
     }
 
@@ -598,11 +628,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             return Ok(());
         }
 
-        let bank_id = format!(
-            "{}/{}",
-            &self.bank_spec.dir_name,
-            bank_dir_name(target),
-        );
+        let bank_id = format!("{}/{}", &self.bank_spec.dir_name, bank_dir_name(target),);
 
         // (2) Past here we have a real bank with real payloads → HSM
         //     attachment is required. A missing provider means the
@@ -613,9 +639,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 "ivd sign {bank_id}: no HSM provider attached — wiring bug"
             ))
         })?;
-        let hsm = hsm_arc.lock().map_err(|_| {
-            BackendError::Internal("ivd sign: hsm mutex poisoned".into())
-        })?;
+        let hsm = hsm_arc
+            .lock()
+            .map_err(|_| BackendError::Internal("ivd sign: hsm mutex poisoned".into()))?;
 
         // (3) Pre-provisioning exception: the HSM is reachable but the
         //     `ivd-signing` key doesn't exist yet. Skip with a warning;
@@ -657,9 +683,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         // target, committed=false), the OTHER bank is the
         // previously-committed one.
         let gen = {
-            let nv = self.nv.lock().map_err(|_| {
-                BackendError::Internal("ivd sign: nv mutex poisoned".into())
-            })?;
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("ivd sign: nv mutex poisoned".into()))?;
             let state = nv.read_boot_state().ok_or_else(|| {
                 BackendError::Internal(format!("ivd sign {bank_id}: NV boot state missing"))
             })?;
@@ -711,11 +738,14 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// Called at flash-session start so the incoming payload lands in a clean,
     /// space-reclaimed location on the same filesystem as its final home.
     fn prepare_target_bank_dir(&self, target: Bank) -> BackendResult<()> {
-        let Some(images_dir) = self.images_dir.as_ref() else { return Ok(()); };
+        let Some(images_dir) = self.images_dir.as_ref() else {
+            return Ok(());
+        };
         let set_name = &self.bank_spec.dir_name;
         let bank_dir = images_dir.join(set_name).join(bank_dir_name(target));
-        std::fs::create_dir_all(&bank_dir)
-            .map_err(|e| BackendError::Internal(format!("create bank dir {}: {e}", bank_dir.display())))?;
+        std::fs::create_dir_all(&bank_dir).map_err(|e| {
+            BackendError::Internal(format!("create bank dir {}: {e}", bank_dir.display()))
+        })?;
         let mut cleared = 0usize;
         if let Ok(entries) = std::fs::read_dir(&bank_dir) {
             for entry in entries.flatten() {
@@ -738,7 +768,12 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         // Wipe legacy staged files in images_dir root (pre-refactor layout).
         // Free standing here so an upgrade path doesn't leave them squatting
         // on space the new upload needs.
-        for suffix in &["staged.img", "kernel-staged.img", "config-staged.yaml", "qvm-config-staged.conf"] {
+        for suffix in &[
+            "staged.img",
+            "kernel-staged.img",
+            "config-staged.yaml",
+            "qvm-config-staged.conf",
+        ] {
             let p = images_dir.join(format!("{set_name}-{suffix}"));
             if p.exists() {
                 let _ = std::fs::remove_file(&p);
@@ -800,21 +835,27 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         }
     }
 
-    pub fn running_bank(&self) -> Result<Bank, std::sync::PoisonError<std::sync::MutexGuard<'_, Bank>>> {
+    pub fn running_bank(
+        &self,
+    ) -> Result<Bank, std::sync::PoisonError<std::sync::MutexGuard<'_, Bank>>> {
         self.running_bank.lock().map(|g| *g)
     }
 
     pub fn nv_lock(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, NvStore<D>>, std::sync::PoisonError<std::sync::MutexGuard<'_, NvStore<D>>>>
-    {
+    ) -> Result<
+        std::sync::MutexGuard<'_, NvStore<D>>,
+        std::sync::PoisonError<std::sync::MutexGuard<'_, NvStore<D>>>,
+    > {
         self.nv.lock()
     }
 
     pub fn nv_lock_mut(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, NvStore<D>>, std::sync::PoisonError<std::sync::MutexGuard<'_, NvStore<D>>>>
-    {
+    ) -> Result<
+        std::sync::MutexGuard<'_, NvStore<D>>,
+        std::sync::PoisonError<std::sync::MutexGuard<'_, NvStore<D>>>,
+    > {
         self.nv.lock()
     }
 
@@ -860,6 +901,30 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         }
     }
 
+    pub fn ensure_flash_can_start(&self) -> BackendResult<()> {
+        self.require_flash_access()?;
+
+        if !self.config.single_bank {
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("nv lock".into()))?;
+            let state = nv
+                .read_boot_state()
+                .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+            let idx = self.bank_set.as_index();
+            if !state.banks[idx].committed {
+                return Err(BackendError::Busy(format!(
+                    "bank set {:?} is in trial mode (active={:?}, uncommitted) — \
+                     commit or rollback the pending upgrade before starting a new one",
+                    self.bank_set, state.banks[idx].active_bank
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     // =================================================================
     // Separate manifest + payload upload methods (new flash path)
     // =================================================================
@@ -870,7 +935,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         self.require_flash_access()?;
 
         let min_security_ver = {
-            let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("lock".into()))?;
             let rb = *self.running_bank.lock().unwrap();
             nv.read_fw_meta(self.bank_set, rb)
                 .map(|m| m.min_security_ver)
@@ -885,9 +953,12 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
         let id = self.next_id();
         let mut manifests = self.manifests.lock().unwrap();
-        manifests.insert(id.clone(), StoredManifest {
-            raw_bytes: data.to_vec(),
-        });
+        manifests.insert(
+            id.clone(),
+            StoredManifest {
+                raw_bytes: data.to_vec(),
+            },
+        );
 
         tracing::info!(manifest_id = %id, "manifest uploaded and validated");
         Ok(id)
@@ -901,7 +972,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         filename: Option<&str>,
     ) -> BackendResult<String> {
         let id = self.next_id();
-        let dir = self.images_dir.as_ref()
+        let dir = self
+            .images_dir
+            .as_ref()
             .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
 
         let fname = filename.unwrap_or("payload");
@@ -910,9 +983,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let (size, _sha256) = crate::streaming::save_raw_payload(stream, &path).await?;
 
         let mut payloads = self.payloads.lock().unwrap();
-        payloads.insert(id.clone(), StoredPayload {
-            path,
-        });
+        payloads.insert(id.clone(), StoredPayload { path });
 
         tracing::info!(payload_id = %id, size, "payload uploaded to disk");
         Ok(id)
@@ -926,8 +997,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         payload_ids: &std::collections::HashMap<String, String>, // uri → payload_id
     ) -> BackendResult<String> {
         let manifests = self.manifests.lock().unwrap();
-        let manifest = manifests.get(manifest_id)
-            .ok_or_else(|| BackendError::InvalidRequest(format!("manifest {manifest_id} not found")))?;
+        let manifest = manifests.get(manifest_id).ok_or_else(|| {
+            BackendError::InvalidRequest(format!("manifest {manifest_id} not found"))
+        })?;
 
         let payloads = self.payloads.lock().unwrap();
 
@@ -939,33 +1011,42 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let key_unwrap = self.manifest_provider.key_unwrap_for_decryption();
 
         let target_bank = self.determine_target_bank()?;
-        let bank_dir = self.target_bank_dir(target_bank)
+        let bank_dir = self
+            .target_bank_dir(target_bank)
             .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
         std::fs::create_dir_all(&bank_dir)
             .map_err(|e| BackendError::Internal(format!("create {}: {e}", bank_dir.display())))?;
 
         // Process each payload
         for (uri, payload_id) in payload_ids {
-            let stored_payload = payloads.get(payload_id)
-                .ok_or_else(|| BackendError::InvalidRequest(format!("payload {payload_id} not found")))?;
+            let stored_payload = payloads.get(payload_id).ok_or_else(|| {
+                BackendError::InvalidRequest(format!("payload {payload_id} not found"))
+            })?;
 
             // Find component index by URI
             let comp_count = suit_manifest.component_count();
             let comp_idx = (0..comp_count)
-                .find(|&i| suit_manifest.uri(i).map(|u| u == uri.as_str()).unwrap_or(false))
-                .ok_or_else(|| BackendError::InvalidRequest(format!(
-                    "no component with uri={uri} in manifest"
-                )))?;
+                .find(|&i| {
+                    suit_manifest
+                        .uri(i)
+                        .map(|u| u == uri.as_str())
+                        .unwrap_or(false)
+                })
+                .ok_or_else(|| {
+                    BackendError::InvalidRequest(format!("no component with uri={uri} in manifest"))
+                })?;
 
-            let expected_digest = suit_manifest.image_digest(comp_idx)
+            let expected_digest = suit_manifest
+                .image_digest(comp_idx)
                 .map(|d| d.0.bytes.clone())
-                .ok_or_else(|| BackendError::Internal(format!(
-                    "no digest for component {comp_idx}"
-                )))?;
+                .ok_or_else(|| {
+                    BackendError::Internal(format!("no digest for component {comp_idx}"))
+                })?;
 
-            let output_path = bank_dir.join(
-                crate::bank_spec::payload_target_name(self.bank_spec.layout, uri.as_str()),
-            );
+            let output_path = bank_dir.join(crate::bank_spec::payload_target_name(
+                self.bank_spec.layout,
+                uri.as_str(),
+            ));
 
             tracing::info!(
                 uri = %uri,
@@ -988,15 +1069,18 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 key_unwrap.as_deref(),
                 &expected_digest,
                 &output_path,
-            ).map_err(|e| BackendError::Internal(format!(
-                "payload processing ({uri}): {e}"
-            )))?;
+            )
+            .map_err(|e| BackendError::Internal(format!("payload processing ({uri}): {e}")))?;
             let process_elapsed = process_started.elapsed();
 
             let compressed_mb = compressed as f64 / 1_048_576.0;
             let uncompressed_mb = image_size as f64 / 1_048_576.0;
             let secs = process_elapsed.as_secs_f64();
-            let mb_per_sec = if secs > 0.0 { uncompressed_mb / secs } else { 0.0 };
+            let mb_per_sec = if secs > 0.0 {
+                uncompressed_mb / secs
+            } else {
+                0.0
+            };
             tracing::info!(
                 uri = %uri,
                 elapsed_ms = process_elapsed.as_millis() as u64,
@@ -1026,7 +1110,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             let bytes = chunk.map_err(|e| BackendError::Internal(format!("stream: {e}")))?;
             data.extend_from_slice(&bytes);
             if data.len() > 100 * 1024 {
-                return Err(BackendError::InvalidRequest("manifest too large (>100KB)".into()));
+                return Err(BackendError::InvalidRequest(
+                    "manifest too large (>100KB)".into(),
+                ));
             }
         }
 
@@ -1034,7 +1120,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
         // Validate
         let min_security_ver = {
-            let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("lock".into()))?;
             let rb = *self.running_bank.lock().unwrap();
             nv.read_fw_meta(self.bank_set, rb)
                 .map(|m| m.min_security_ver)
@@ -1061,18 +1150,22 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             // Validate and stage. Actual installation happens at ecu_reset.
             tracing::info!(manifest_id = %id, "integrated envelope — validating and staging");
 
-            let full_validated = self.manifest_provider
+            let full_validated = self
+                .manifest_provider
                 .validate(&data, min_security_ver)
                 .map_err(|e| BackendError::InvalidRequest(format!("manifest: {e}")))?;
 
             // Store as verified+staged package (ready for install at reset time)
             {
                 let mut packages = self.packages.lock().unwrap();
-                packages.insert(id.clone(), StoredPackage {
-                    id: id.clone(),
-                    validated: full_validated,
-                    status: PackageStatus::Verified,
-                });
+                packages.insert(
+                    id.clone(),
+                    StoredPackage {
+                        id: id.clone(),
+                        validated: full_validated,
+                        status: PackageStatus::Verified,
+                    },
+                );
             }
 
             // Session complete — no payload uploads needed
@@ -1114,11 +1207,14 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             // Store as package so finalize_flash can find it
             {
                 let mut packages = self.packages.lock().unwrap();
-                packages.insert(id.clone(), StoredPackage {
-                    id: id.clone(),
-                    validated: validated.clone(),
-                    status: PackageStatus::Verified,
-                });
+                packages.insert(
+                    id.clone(),
+                    StoredPackage {
+                        id: id.clone(),
+                        validated: validated.clone(),
+                        status: PackageStatus::Verified,
+                    },
+                );
             }
 
             // Set package_id on flash transfer
@@ -1153,9 +1249,16 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             let session = self.flash_session.lock().unwrap();
             match session.as_ref() {
                 Some(FlashSessionState::AwaitingPayload {
-                    manifest_bytes, next_component, total_components, ..
+                    manifest_bytes,
+                    next_component,
+                    total_components,
+                    ..
                 }) => (manifest_bytes.clone(), *next_component, *total_components),
-                _ => return Err(BackendError::InvalidRequest("no active flash session".into())),
+                _ => {
+                    return Err(BackendError::InvalidRequest(
+                        "no active flash session".into(),
+                    ))
+                }
             }
         };
 
@@ -1166,16 +1269,16 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
         let manifest = sumo_onboard::manifest::Manifest { envelope };
 
-        let expected_digest = manifest.image_digest(comp_idx)
+        let expected_digest = manifest
+            .image_digest(comp_idx)
             .map(|d| d.0.bytes.clone())
-            .ok_or_else(|| BackendError::Internal(format!(
-                "no digest for component {comp_idx}"
-            )))?;
+            .ok_or_else(|| BackendError::Internal(format!("no digest for component {comp_idx}")))?;
 
         let uri = manifest.uri(comp_idx).unwrap_or("#firmware").to_string();
 
         let target_bank = self.determine_target_bank()?;
-        let bank_dir = self.target_bank_dir(target_bank)
+        let bank_dir = self
+            .target_bank_dir(target_bank)
             .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
         std::fs::create_dir_all(&bank_dir)
             .map_err(|e| BackendError::Internal(format!("create {}: {e}", bank_dir.display())))?;
@@ -1203,7 +1306,8 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             key_unwrap.clone(),
             expected_digest.clone(),
             output_path.clone(),
-        ).await?;
+        )
+        .await?;
         let process_elapsed = process_started.elapsed();
 
         // Record the freshly-hashed file for `ivd_sign_staged_bank` so
@@ -1225,7 +1329,11 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let secs = process_elapsed.as_secs_f64();
         // Throughput is uncompressed bytes per second — the sustained
         // decrypt+decompress+write rate, which is what determines wall time.
-        let mb_per_sec = if secs > 0.0 { uncompressed_mb / secs } else { 0.0 };
+        let mb_per_sec = if secs > 0.0 {
+            uncompressed_mb / secs
+        } else {
+            0.0
+        };
         tracing::info!(
             component = comp_idx,
             uri = %uri,
@@ -1254,8 +1362,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             } else {
                 // Update to next component
                 if let Some(FlashSessionState::AwaitingPayload {
-                    ref mut next_component, ..
-                }) = *session {
+                    ref mut next_component,
+                    ..
+                }) = *session
+                {
                     *next_component = next;
                 }
                 false
@@ -1329,20 +1439,18 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
              \r\n"
         );
 
-        stream.write_all(request.as_bytes())
+        stream
+            .write_all(request.as_bytes())
             .await
             .map_err(|e| format!("write to vm-service: {e}"))?;
 
         // Read the status line (with a generous timeout — the handler
         // returns once restart is initiated, ~100s of ms).
         let mut buf = [0u8; 64];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            stream.read(&mut buf),
-        )
-        .await
-        .map_err(|_| "vm-service didn't respond within 15s".to_string())?
-        .map_err(|e| format!("read from vm-service: {e}"))?;
+        let n = tokio::time::timeout(std::time::Duration::from_secs(15), stream.read(&mut buf))
+            .await
+            .map_err(|_| "vm-service didn't respond within 15s".to_string())?
+            .map_err(|e| format!("read from vm-service: {e}"))?;
 
         let resp = String::from_utf8_lossy(&buf[..n]);
         let status_line = resp.lines().next().unwrap_or("(empty)");
@@ -1460,13 +1568,18 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     // --- Data ---
 
     async fn list_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {
-        let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+        let nv = self
+            .nv
+            .lock()
+            .map_err(|_| BackendError::Internal("lock".into()))?;
         let comp_id = &self.entity_info.id;
 
         let has_health = self.vm_service_addr.is_some();
         let mut params: Vec<ParameterInfo> = DID_REGISTRY
             .iter()
-            .filter(|d| has_health || (d.did != did::DID_GUEST_STATE && d.did != did::DID_HEARTBEAT_SEQ))
+            .filter(|d| {
+                has_health || (d.did != did::DID_GUEST_STATE && d.did != did::DID_HEARTBEAT_SEQ)
+            })
             .map(|d| ParameterInfo {
                 id: d.id.to_string(),
                 name: d.name.to_string(),
@@ -1528,11 +1641,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 let (value, raw) = match (did_num, &health) {
                     (did::DID_GUEST_STATE, Some(h)) => {
                         let s = guest_state_str(h.guest_state);
-                        (serde_json::Value::String(s.to_string()), format!("{:08x}", h.guest_state))
+                        (
+                            serde_json::Value::String(s.to_string()),
+                            format!("{:08x}", h.guest_state),
+                        )
                     }
-                    (did::DID_GUEST_STATE, None) => {
-                        (serde_json::Value::String("offline".to_string()), "ffffffff".to_string())
-                    }
+                    (did::DID_GUEST_STATE, None) => (
+                        serde_json::Value::String("offline".to_string()),
+                        "ffffffff".to_string(),
+                    ),
                     (did::DID_HEARTBEAT_SEQ, Some(h)) => {
                         (serde_json::json!(h.hb_seq), format!("{:08x}", h.hb_seq))
                     }
@@ -1555,7 +1672,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 continue;
             }
 
-            let cached = self.did_cache.read().expect("did_cache poisoned").get(&did_num).cloned();
+            let cached = self
+                .did_cache
+                .read()
+                .expect("did_cache poisoned")
+                .get(&did_num)
+                .cloned();
             match cached {
                 Some(bytes) => {
                     let value = did_value_to_json(did_num, &bytes, reg);
@@ -1605,7 +1727,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     // --- Faults ---
 
     async fn get_faults(&self, _filter: Option<&FaultFilter>) -> BackendResult<FaultsResult> {
-        let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+        let nv = self
+            .nv
+            .lock()
+            .map_err(|_| BackendError::Internal("lock".into()))?;
         let active = *self.running_bank.lock().unwrap();
         let runtime = nv.read_runtime(self.bank_set, active).unwrap_or_default();
 
@@ -1617,7 +1742,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 Fault {
                     id: format!("dtc_{code}"),
                     code: code.clone(),
-                    severity: if active { FaultSeverity::Error } else { FaultSeverity::Warning },
+                    severity: if active {
+                        FaultSeverity::Error
+                    } else {
+                        FaultSeverity::Warning
+                    },
                     message: format!("DTC {code}"),
                     category: None,
                     first_occurrence: None,
@@ -1625,7 +1754,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     occurrence_count: None,
                     active,
                     status: Some(serde_json::json!(dtc.status)),
-                    href: format!("/vehicle/v1/components/{}/faults/dtc_{code}", self.entity_info.id),
+                    href: format!(
+                        "/vehicle/v1/components/{}/faults/dtc_{code}",
+                        self.entity_info.id
+                    ),
                 }
             })
             .collect();
@@ -1675,7 +1807,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         self.require_flash_access()?;
 
         let min_security_ver = {
-            let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("lock".into()))?;
             let rb = *self.running_bank.lock().unwrap();
             nv.read_fw_meta(self.bank_set, rb)
                 .map(|m| m.min_security_ver)
@@ -1740,7 +1875,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // --- Legacy path: integrated SUIT envelope (HSM keys, etc.) ---
 
         let min_security_ver = {
-            let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("lock".into()))?;
             let rb = *self.running_bank.lock().unwrap();
             nv.read_fw_meta(self.bank_set, rb)
                 .map(|m| m.min_security_ver)
@@ -1783,7 +1921,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             &self.bank_spec,
             target_bank,
         )
-        .await {
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
                 *self.upload_phase.lock().unwrap() = None;
@@ -1858,7 +1997,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             .get(package_id)
             .ok_or_else(|| BackendError::EntityNotFound(package_id.to_string()))?;
 
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let hash: [u8; 32] = Sha256::digest(&p.validated.image_data).into();
         let hash_hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
 
@@ -1881,29 +2020,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     // --- Flash ---
 
     async fn start_flash(&self) -> BackendResult<String> {
-        self.require_flash_access()?;
-
-        // Refuse to start a new upgrade while a previous one is still in
-        // trial mode (uncommitted). Otherwise the second OTA would write to
-        // what's currently the inactive bank, but `ota::install_precomputed`
-        // would only catch this after the whole payload has streamed in
-        // (returning InTrial → Busy), and `current/` would be a confusing
-        // mix of "just-written" and "still-trial" depending on which bank
-        // got staged where. The orchestrator must commit or rollback the
-        // pending trial before kicking off a new flash.
-        if !self.config.single_bank {
-            let nv = self.nv.lock().map_err(|_| BackendError::Internal("nv lock".into()))?;
-            let state = nv.read_boot_state()
-                .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-            let idx = self.bank_set.as_index();
-            if !state.banks[idx].committed {
-                return Err(BackendError::Busy(format!(
-                    "bank set {:?} is in trial mode (active={:?}, uncommitted) — \
-                     commit or rollback the pending upgrade before starting a new one",
-                    self.bank_set, state.banks[idx].active_bank
-                )));
-            }
-        }
+        self.ensure_flash_can_start()?;
 
         // Clear the target bank dir (and any orphaned staged files) BEFORE
         // any payload starts streaming in. Frees ~1 image worth of space on
@@ -1930,7 +2047,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // Check if we already have a verified package (legacy integrated envelope path)
         let package_id = {
             let packages = self.packages.lock().unwrap();
-            packages.iter()
+            packages
+                .iter()
                 .find(|(_, p)| p.status == PackageStatus::Verified)
                 .map(|(id, _)| id.clone())
         };
@@ -1979,7 +2097,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 BackendError::Internal("no HSM provider configured for key provisioning".into())
             })?;
             {
-                let mut hsm_guard = hsm.lock()
+                let mut hsm_guard = hsm
+                    .lock()
                     .map_err(|_| BackendError::Internal("HSM provider lock".into()))?;
                 hsm_guard
                     .provision(envelope)
@@ -2000,7 +2119,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                             "device-decrypt",
                         ));
                         self.manifest_provider.update_keys(sw_key, Some(unwrap), ka);
-                        tracing::info!("loaded sw-authority + key-authority; CEK unwrap routed through HSM");
+                        tracing::info!(
+                            "loaded sw-authority + key-authority; CEK unwrap routed through HSM"
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("HSM provisioned but failed to load sw-authority: {e}");
@@ -2010,8 +2131,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
             // Update NV metadata (security_version, fw_version) via single-bank path
             let mut nv = self.nv_write()?;
-            let _result = ota::install(&mut *nv, self.bank_set, &[], &meta, true)
-                .map_err(map_ota_error)?;
+            let _result =
+                ota::install(&mut *nv, self.bank_set, &[], &meta, true).map_err(map_ota_error)?;
 
             let transfer_id = self.next_id();
             {
@@ -2077,8 +2198,14 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         } else {
             // Buffered path — install from memory
             let mut nv = self.nv_write()?;
-            let result = ota::install(&mut *nv, self.bank_set, &image_data, &meta, self.config.single_bank)
-                .map_err(map_ota_error)?;
+            let result = ota::install(
+                &mut *nv,
+                self.bank_set,
+                &image_data,
+                &meta,
+                self.config.single_bank,
+            )
+            .map_err(map_ota_error)?;
 
             // Write firmware payload to bank directory
             if let Some(ref images_dir) = self.images_dir {
@@ -2145,7 +2272,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
     async fn get_flash_status(&self, transfer_id: &str) -> BackendResult<FlashStatus> {
         let ft = self.flash_transfer.lock().unwrap();
-        let t = ft.as_ref().ok_or_else(|| BackendError::EntityNotFound(transfer_id.to_string()))?;
+        let t = ft
+            .as_ref()
+            .ok_or_else(|| BackendError::EntityNotFound(transfer_id.to_string()))?;
 
         Ok(FlashStatus {
             transfer_id: t.transfer_id.clone(),
@@ -2166,7 +2295,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // Process staged package (HSM keys, firmware OTA install)
         let package_id = {
             let ft = self.flash_transfer.lock().unwrap();
-            ft.as_ref().map(|t| t.package_id.clone()).unwrap_or_default()
+            ft.as_ref()
+                .map(|t| t.package_id.clone())
+                .unwrap_or_default()
         };
 
         if !package_id.is_empty() {
@@ -2180,10 +2311,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 if manifest_type == ManifestType::HsmKeys {
                     if let Some(envelope) = raw_envelope.as_deref() {
                         if let Some(ref hsm) = self.hsm_provider {
-                            let mut hsm_guard = hsm.lock()
+                            let mut hsm_guard = hsm
+                                .lock()
                                 .map_err(|_| BackendError::Internal("HSM lock".into()))?;
-                            hsm_guard.provision(envelope)
-                                .map_err(|e| BackendError::Internal(format!("HSM provision: {e}")))?;
+                            hsm_guard.provision(envelope).map_err(|e| {
+                                BackendError::Internal(format!("HSM provision: {e}"))
+                            })?;
 
                             // Restart the HSM service so it reloads with the
                             // freshly-written keystore. The daemon was already
@@ -2195,7 +2328,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                                 Err(e) => tracing::warn!("stop HSM service post-provision: {e}"),
                             }
                             match hsm_guard.start_service() {
-                                Ok(port) => tracing::info!(port, "HSM service restarted post-provision"),
+                                Ok(port) => {
+                                    tracing::info!(port, "HSM service restarted post-provision")
+                                }
                                 Err(hsm::HsmError::AlreadyRunning) => {}
                                 Err(e) => tracing::warn!("start HSM service post-provision: {e}"),
                             }
@@ -2215,10 +2350,14 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                                         "device-decrypt",
                                     ));
                                     self.manifest_provider.update_keys(sw_key, Some(unwrap), ka);
-                                    tracing::info!("HSM keys provisioned; CEK unwrap routed through HSM");
+                                    tracing::info!(
+                                        "HSM keys provisioned; CEK unwrap routed through HSM"
+                                    );
                                 }
                                 Err(e) => {
-                                    tracing::warn!("HSM provisioned but failed to load sw-authority: {e}");
+                                    tracing::warn!(
+                                        "HSM provisioned but failed to load sw-authority: {e}"
+                                    );
                                 }
                             }
                         }
@@ -2290,9 +2429,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             .as_mut()
             .ok_or_else(|| BackendError::EntityNotFound("No flash transfer in progress".into()))?;
         match transfer.state {
-            FlashState::AwaitingActivation
-            | FlashState::Validated
-            | FlashState::AwaitingReboot => {
+            FlashState::AwaitingActivation | FlashState::Validated | FlashState::AwaitingReboot => {
                 transfer.state = FlashState::Validated;
                 Ok(())
             }
@@ -2441,16 +2578,24 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
         // IFS boot image: copy to boot partition via IfsActivator, then reboot
         if self.bank_set == BankSet::HostOs {
-            if let (Some(ref activator), Some(ref images_dir)) = (&self.ifs_activator, &self.images_dir) {
+            if let (Some(ref activator), Some(ref images_dir)) =
+                (&self.ifs_activator, &self.images_dir)
+            {
                 let target_bank = *self.running_bank.lock().unwrap();
                 let bank_dir_name = match target_bank {
                     Bank::A => "bank_a",
                     Bank::B => "bank_b",
                 };
-                let ifs_source = images_dir.join("boot").join(bank_dir_name).join("primary_boot_image.bin");
+                let ifs_source = images_dir
+                    .join("boot")
+                    .join(bank_dir_name)
+                    .join("primary_boot_image.bin");
                 match activator.activate(&ifs_source) {
                     Ok(()) => {
-                        tracing::info!("IFS activated from {}, triggering reboot", ifs_source.display());
+                        tracing::info!(
+                            "IFS activated from {}, triggering reboot",
+                            ifs_source.display()
+                        );
                         let _ = std::process::Command::new("shutdown")
                             .args(["-r", "now"])
                             .status();
@@ -2471,10 +2616,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // orchestrator-/GUI-visible intent should be "start", not "restart",
         // so the cluster tile doesn't display "Shutting Down" for a guest
         // that never ran.
-        let action = if baseline_boot_id.is_some() { "restart" } else { "start" };
+        let action = if baseline_boot_id.is_some() {
+            "restart"
+        } else {
+            "start"
+        };
 
         // Flip the `current` symlink so vm-service boots the right bank
-        if let (Some(ref images_dir), Some(ref socket_path)) = (&self.images_dir, &self.vm_service_addr) {
+        if let (Some(ref images_dir), Some(ref socket_path)) =
+            (&self.images_dir, &self.vm_service_addr)
+        {
             let set_name = self.bank_spec.dir_name.as_str();
             let target_bank = *self.running_bank.lock().unwrap();
             let bank_dir_name = match target_bank {
@@ -2561,7 +2712,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             ft.as_ref().map(|t| t.state)
         };
 
-        let nv = self.nv.lock().map_err(|_| BackendError::Internal("lock".into()))?;
+        let nv = self
+            .nv
+            .lock()
+            .map_err(|_| BackendError::Internal("lock".into()))?;
         let status = ota::status(&*nv, self.bank_set)
             .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
 
@@ -2581,7 +2735,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 Some(s) => s,
                 None if active_meta.is_none() && previous_meta.is_none() => FlashState::Initial,
                 None if !status.committed => FlashState::Activated, // trial without transfer (e.g. after restart)
-                None => FlashState::Complete, // idle — no active update
+                None => FlashState::Complete,                       // idle — no active update
             },
         };
 
@@ -2619,9 +2773,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // vm-principal concept.
         if matches!(self.bank_set, BankSet::Vm1 | BankSet::Vm2) {
             if let Some(ref hsm) = self.hsm_provider {
-                let mut guard = hsm.lock().map_err(|_| {
-                    BackendError::Internal("hsm provider mutex poisoned".into())
-                })?;
+                let mut guard = hsm
+                    .lock()
+                    .map_err(|_| BackendError::Internal("hsm provider mutex poisoned".into()))?;
                 // ttl=None: operator-managed lifecycle. Pending stays
                 // until consumed; re-installs simply re-arm.
                 if let Err(e) = guard.arm_enrollment(&self.entity_info.id, None) {
@@ -2680,7 +2834,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         let new_state = match session.to_lowercase().as_str() {
             "default" => SessionState::Default,
             "programming" => SessionState::Programming,
-            _ => return Err(BackendError::InvalidRequest(format!("unknown session: {session}"))),
+            _ => {
+                return Err(BackendError::InvalidRequest(format!(
+                    "unknown session: {session}"
+                )))
+            }
         };
 
         {
@@ -2754,9 +2912,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                         "no pending seed — call requestseed first".into(),
                     ));
                 }
-                sec.pending_seed.clone().ok_or_else(|| {
-                    BackendError::Internal("seed state inconsistency".into())
-                })?
+                sec.pending_seed
+                    .clone()
+                    .ok_or_else(|| BackendError::Internal("seed state inconsistency".into()))?
             };
 
             if !self
@@ -2793,29 +2951,167 @@ pub(crate) struct DidEntry {
 }
 
 pub(crate) static DID_REGISTRY: &[DidEntry] = &[
-    DidEntry { id: "spare_part_number", did: did::DID_SPARE_PART_NUMBER, name: "Spare Part Number", data_type: "string", writable: false },
-    DidEntry { id: "ecu_sw_number", did: did::DID_ECU_SW_NUMBER, name: "ECU Software Number", data_type: "string", writable: false },
-    DidEntry { id: "fw_version", did: did::DID_FW_VERSION, name: "Firmware Version", data_type: "string", writable: false },
-    DidEntry { id: "supplier_id", did: did::DID_SUPPLIER_ID, name: "Supplier ID", data_type: "string", writable: false },
-    DidEntry { id: "manufacturing_date", did: did::DID_MANUFACTURING_DATE, name: "Manufacturing Date", data_type: "string", writable: false },
-    DidEntry { id: "serial_number", did: did::DID_SERIAL_NUMBER, name: "Serial Number", data_type: "string", writable: false },
-    DidEntry { id: "vin", did: did::DID_VIN, name: "VIN", data_type: "string", writable: false },
-    DidEntry { id: "ecu_hw_number", did: did::DID_ECU_HW_NUMBER, name: "ECU Hardware Number", data_type: "string", writable: false },
-    DidEntry { id: "supplier_hw_number", did: did::DID_SUPPLIER_HW_NUMBER, name: "Supplier HW Number", data_type: "string", writable: false },
-    DidEntry { id: "supplier_hw_version", did: did::DID_SUPPLIER_HW_VERSION, name: "Supplier HW Version", data_type: "string", writable: false },
-    DidEntry { id: "supplier_sw_number", did: did::DID_SUPPLIER_SW_NUMBER, name: "Supplier SW Number", data_type: "string", writable: false },
-    DidEntry { id: "supplier_sw_version", did: did::DID_SUPPLIER_SW_VERSION, name: "Supplier SW Version", data_type: "string", writable: false },
-    DidEntry { id: "system_name", did: did::DID_SYSTEM_NAME, name: "System Name", data_type: "string", writable: false },
-    DidEntry { id: "tester_serial", did: did::DID_TESTER_SERIAL, name: "Tester Serial", data_type: "string", writable: false },
-    DidEntry { id: "programming_date", did: did::DID_PROGRAMMING_DATE, name: "Programming Date", data_type: "string", writable: false },
-    DidEntry { id: "odx_file_id", did: did::DID_ODX_FILE_ID, name: "ODX File ID", data_type: "string", writable: false },
-    DidEntry { id: "active_bank", did: did::DID_ACTIVE_BANK, name: "Active Bank", data_type: "string", writable: false },
-    DidEntry { id: "committed", did: did::DID_COMMITTED, name: "Committed", data_type: "bool", writable: false },
-    DidEntry { id: "min_security_ver", did: did::DID_MIN_SECURITY_VER, name: "Min Security Version", data_type: "uint32", writable: false },
-    DidEntry { id: "current_security_ver", did: did::DID_CURRENT_SECURITY_VER, name: "Current Security Version", data_type: "uint32", writable: false },
-    DidEntry { id: "boot_count", did: did::DID_BOOT_COUNT, name: "Boot Count", data_type: "uint8", writable: false },
-    DidEntry { id: "guest_state", did: did::DID_GUEST_STATE, name: "Guest State", data_type: "string", writable: false },
-    DidEntry { id: "heartbeat_seq", did: did::DID_HEARTBEAT_SEQ, name: "Heartbeat Seq", data_type: "uint32", writable: false },
+    DidEntry {
+        id: "spare_part_number",
+        did: did::DID_SPARE_PART_NUMBER,
+        name: "Spare Part Number",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "ecu_sw_number",
+        did: did::DID_ECU_SW_NUMBER,
+        name: "ECU Software Number",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "fw_version",
+        did: did::DID_FW_VERSION,
+        name: "Firmware Version",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "supplier_id",
+        did: did::DID_SUPPLIER_ID,
+        name: "Supplier ID",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "manufacturing_date",
+        did: did::DID_MANUFACTURING_DATE,
+        name: "Manufacturing Date",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "serial_number",
+        did: did::DID_SERIAL_NUMBER,
+        name: "Serial Number",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "vin",
+        did: did::DID_VIN,
+        name: "VIN",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "ecu_hw_number",
+        did: did::DID_ECU_HW_NUMBER,
+        name: "ECU Hardware Number",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "supplier_hw_number",
+        did: did::DID_SUPPLIER_HW_NUMBER,
+        name: "Supplier HW Number",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "supplier_hw_version",
+        did: did::DID_SUPPLIER_HW_VERSION,
+        name: "Supplier HW Version",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "supplier_sw_number",
+        did: did::DID_SUPPLIER_SW_NUMBER,
+        name: "Supplier SW Number",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "supplier_sw_version",
+        did: did::DID_SUPPLIER_SW_VERSION,
+        name: "Supplier SW Version",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "system_name",
+        did: did::DID_SYSTEM_NAME,
+        name: "System Name",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "tester_serial",
+        did: did::DID_TESTER_SERIAL,
+        name: "Tester Serial",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "programming_date",
+        did: did::DID_PROGRAMMING_DATE,
+        name: "Programming Date",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "odx_file_id",
+        did: did::DID_ODX_FILE_ID,
+        name: "ODX File ID",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "active_bank",
+        did: did::DID_ACTIVE_BANK,
+        name: "Active Bank",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "committed",
+        did: did::DID_COMMITTED,
+        name: "Committed",
+        data_type: "bool",
+        writable: false,
+    },
+    DidEntry {
+        id: "min_security_ver",
+        did: did::DID_MIN_SECURITY_VER,
+        name: "Min Security Version",
+        data_type: "uint32",
+        writable: false,
+    },
+    DidEntry {
+        id: "current_security_ver",
+        did: did::DID_CURRENT_SECURITY_VER,
+        name: "Current Security Version",
+        data_type: "uint32",
+        writable: false,
+    },
+    DidEntry {
+        id: "boot_count",
+        did: did::DID_BOOT_COUNT,
+        name: "Boot Count",
+        data_type: "uint8",
+        writable: false,
+    },
+    DidEntry {
+        id: "guest_state",
+        did: did::DID_GUEST_STATE,
+        name: "Guest State",
+        data_type: "string",
+        writable: false,
+    },
+    DidEntry {
+        id: "heartbeat_seq",
+        did: did::DID_HEARTBEAT_SEQ,
+        name: "Heartbeat Seq",
+        data_type: "uint32",
+        writable: false,
+    },
 ];
 
 pub(crate) fn resolve_param(param_id: &str) -> Option<(u16, Option<&'static DidEntry>)> {
@@ -2833,7 +3129,11 @@ pub(crate) fn resolve_param(param_id: &str) -> Option<(u16, Option<&'static DidE
     None
 }
 
-pub(crate) fn did_value_to_json(_did_num: u16, value: &[u8], reg: Option<&DidEntry>) -> serde_json::Value {
+pub(crate) fn did_value_to_json(
+    _did_num: u16,
+    value: &[u8],
+    reg: Option<&DidEntry>,
+) -> serde_json::Value {
     let data_type = reg.map(|r| r.data_type).unwrap_or("bytes");
     match data_type {
         "bool" => serde_json::Value::Bool(value.first().copied().unwrap_or(0) != 0),
@@ -2904,11 +3204,9 @@ fn map_ota_error(e: ota::OtaError) -> BackendError {
         ota::OtaError::InTrial => BackendError::Busy("bank set is in trial mode".into()),
         ota::OtaError::AlreadyCommitted => BackendError::Busy("already committed".into()),
         ota::OtaError::NotInTrial => BackendError::Busy("not in trial mode".into()),
-        ota::OtaError::SecurityVersionTooLow { image, floor } => {
-            BackendError::InvalidRequest(format!(
-                "security version {image} below anti-rollback floor {floor}"
-            ))
-        }
+        ota::OtaError::SecurityVersionTooLow { image, floor } => BackendError::InvalidRequest(
+            format!("security version {image} below anti-rollback floor {floor}"),
+        ),
         other => BackendError::Internal(format!("{other}")),
     }
 }
@@ -2953,7 +3251,9 @@ async fn query_vm_health(addr: &str, vm_name: &str) -> Option<GuestHealth> {
     let deadline = std::time::Duration::from_secs(2);
 
     let mut stream = tokio::time::timeout(deadline, TcpStream::connect(addr))
-        .await.ok()?.ok()?;
+        .await
+        .ok()?
+        .ok()?;
 
     let request = format!(
         "GET /vms/{vm_name}/health HTTP/1.1\r\n\
@@ -2962,11 +3262,15 @@ async fn query_vm_health(addr: &str, vm_name: &str) -> Option<GuestHealth> {
          \r\n"
     );
     tokio::time::timeout(deadline, stream.write_all(request.as_bytes()))
-        .await.ok()?.ok()?;
+        .await
+        .ok()?
+        .ok()?;
 
     let mut buf = Vec::with_capacity(1024);
     tokio::time::timeout(deadline, stream.read_to_end(&mut buf))
-        .await.ok()?.ok()?;
+        .await
+        .ok()?
+        .ok()?;
     let response = std::str::from_utf8(&buf).ok()?;
 
     let body = response.split("\r\n\r\n").nth(1)?;
@@ -2975,9 +3279,18 @@ async fn query_vm_health(addr: &str, vm_name: &str) -> Option<GuestHealth> {
     let guest_state = json.get("guest_state")?.as_u64()? as u32;
     let hb_seq = json.get("hb_seq")?.as_u64()? as u32;
     let boot_id = json.get("boot_id")?.as_u64()? as u32;
-    let status = json.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let status = json
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-    Some(GuestHealth { guest_state, hb_seq, boot_id, status })
+    Some(GuestHealth {
+        guest_state,
+        hb_seq,
+        boot_id,
+        status,
+    })
 }
 
 fn guest_state_str(state: u32) -> &'static str {

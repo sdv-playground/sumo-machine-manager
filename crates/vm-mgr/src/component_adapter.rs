@@ -17,8 +17,8 @@ use nv_store::block::BlockDevice;
 use machine_mgr::component::DidEntry;
 use machine_mgr::{
     ActivationState, Capabilities, ClearFaultsResult, Component, Csr, DidFilter, DidKind,
-    DtcFilter, EnvelopeStream, Fault, FlashCaps, FlashId, FlashSession, HsmCaps, LifecycleCaps,
-    MachineError, MachineResult, RuntimeState, RuntimeStatus,
+    DtcFilter, EnvelopeStream, Fault, FlashCaps, FlashId, FlashSession, FlashStatus, HsmCaps,
+    LifecycleCaps, MachineError, MachineResult, RuntimeState, RuntimeStatus,
 };
 
 use crate::backend::{VmBackend, DID_REGISTRY};
@@ -210,6 +210,12 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for VmBackendComponent<D>
         })
     }
 
+    async fn authorize_install(&self) -> MachineResult<()> {
+        self.inner
+            .ensure_flash_can_start()
+            .map_err(map_backend_error)
+    }
+
     async fn upload_envelope(
         &self,
         _id: &FlashId,
@@ -256,6 +262,12 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for VmBackendComponent<D>
         }
         self.inner.clear_flash_session();
         Ok(())
+    }
+
+    async fn install_status(&self, id: &FlashId) -> MachineResult<FlashStatus> {
+        DiagnosticBackend::get_flash_status(&*self.inner, id.as_str())
+            .await
+            .map_err(map_backend_error)
     }
 
     async fn read_dtcs(&self, _filter: &DtcFilter) -> MachineResult<Vec<Fault>> {
@@ -313,11 +325,8 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for VmBackendComponent<D>
 
         // Transient SimHsm just for CSR signing. The keystore on disk is the
         // authoritative state; this instance reads the device key and signs.
-        let tmp = hsm::sim::SimHsm::new(
-            PathBuf::from("unused"),
-            keystore.clone(),
-            self.csr_hsm_port,
-        );
+        let tmp =
+            hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
         use hsm::HsmCryptoProvider;
         let der = tmp
             .generate_csr("device-decrypt", "cvc-vm-device")

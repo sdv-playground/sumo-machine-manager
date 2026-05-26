@@ -259,7 +259,12 @@ impl DiagnosticBackend for ComponentDiagBackend {
     }
 
     async fn get_flash_status(&self, transfer_id: &str) -> BackendResult<FlashStatus> {
-        self.fallback.get_flash_status(transfer_id).await
+        let id = machine_mgr::FlashId::new(transfer_id);
+        match self.component.install_status(&id).await {
+            Ok(status) => Ok(status),
+            Err(MachineError::NotSupported(_)) => self.fallback.get_flash_status(transfer_id).await,
+            Err(e) => Err(map_machine_error(e)),
+        }
     }
 
     async fn finalize_flash(&self) -> BackendResult<()> {
