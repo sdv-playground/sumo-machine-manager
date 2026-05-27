@@ -484,32 +484,24 @@ pub enum DeviceConfig {
     Can {
         #[serde(default)]
         index: u8,
-        #[serde(default = "default_device_backend")]
-        backend: String,
+        transport: String,
         #[serde(default)]
         interface: Option<String>,
     },
     #[serde(rename = "health")]
     Health {
-        #[allow(dead_code)] // parsed from YAML config
-        #[serde(default = "default_device_backend")]
-        backend: String,
+        transport: String,
     },
     #[serde(rename = "time")]
     Time {
-        #[allow(dead_code)] // parsed from YAML config
-        #[serde(default = "default_device_backend")]
-        backend: String,
+        transport: String,
     },
     #[serde(rename = "hsm")]
     Hsm {
-        #[allow(dead_code)] // parsed from YAML config
         #[serde(default)]
         keystore: Option<String>,
-        #[allow(dead_code)] // parsed from YAML config
         #[serde(default)]
         keygen_bin: Option<String>,
-        #[allow(dead_code)] // parsed from YAML config
         #[serde(default = "default_hsm_port")]
         port: u16,
     },
@@ -520,31 +512,23 @@ pub enum DeviceConfig {
         #[serde(default)]
         ssh_port: Option<u16>,
     },
-    /// TAP NIC attached to a host Linux bridge. Used for the private
-    /// vHSM network (typically `vbr-vhsm`, 192.168.99.0/24). The MAC
-    /// is fixed at QEMU launch so dnsmasq can pin a deterministic IP
-    /// to it via static lease — that IP becomes the guest's identity
-    /// to the host vHSM daemon.
     #[serde(rename = "bridge")]
     Bridge {
-        /// Host bridge name (e.g. `vbr-vhsm`).
         bridge: String,
-        /// QEMU-assigned MAC address.
         mac: String,
     },
     #[serde(rename = "console")]
     Console,
 }
 
-fn default_device_backend() -> String { "simulated".to_string() }
 fn default_hsm_port() -> u16 { 5100 }
 
 impl DeviceConfig {
     pub fn needs_ivshmem(&self) -> bool {
         match self {
-            DeviceConfig::Health { .. } => true,
-            DeviceConfig::Time { .. } => true,
-            DeviceConfig::Can { backend, .. } => backend != "host-passthrough",
+            DeviceConfig::Health { transport }
+            | DeviceConfig::Time { transport }
+            | DeviceConfig::Can { transport, .. } => transport == "ivshmem",
             _ => false,
         }
     }

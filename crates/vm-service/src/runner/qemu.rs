@@ -177,29 +177,30 @@ impl QemuRunner {
 
         if is_qnx {
             // QNX: IFS boot disk + QNX6 root filesystem as separate drives.
-            // Boot disk (IFS): loaded by BIOS/IPL into RAM.
-            // Root filesystem: mounted at / by IFS startup script.
-            // Both are read-only — matches qvm/devb-loopback semantics on
-            // real hardware where the bank images are never written by the guest.
+            // Boot disk (boot.img): BIOS+IPL wrapper — must be writable because
+            // SeaBIOS probes the disk with writes during early boot.
+            // Root filesystem: read-only (matches qvm/devb-loopback semantics).
             if let Some(boot) = def.kernel_path() {
                 args.extend_from_slice(&[
                     "-drive".into(),
-                    format!("file={},format=raw,readonly=on", boot.display()),
+                    format!("file={},format=raw", boot.display()),
                 ]);
             }
             if let Some(rootfs) = def.rootfs_path() {
                 args.extend_from_slice(&[
                     "-drive".into(),
-                    format!("file={},format=raw,readonly=on", rootfs.display()),
+                    format!("file={},format=raw", rootfs.display()),
                 ]);
             }
 
             // Policy partition (AUTH-ARCH-001 §4) — read-only image
             // mounted at /etc/sumo/policy by the guest's startup.
+            // No readonly=on: QNX uses bare -drive (IDE interface) which
+            // doesn't support read-only on q35. The guest mounts ro.
             if let Some(policy) = def.policy_path() {
                 args.extend_from_slice(&[
                     "-drive".into(),
-                    format!("file={},format=raw,readonly=on", policy.display()),
+                    format!("file={},format=raw", policy.display()),
                 ]);
             }
 
@@ -208,7 +209,7 @@ impl QemuRunner {
             if let Some(bundle) = def.ca_bundle_path() {
                 args.extend_from_slice(&[
                     "-drive".into(),
-                    format!("file={},format=raw,readonly=on", bundle.display()),
+                    format!("file={},format=raw", bundle.display()),
                 ]);
             }
 
@@ -500,6 +501,7 @@ impl VmRunner for QemuRunner {
 
         // Build and launch QEMU
         let args = self.build_qemu_args(name, def, &ivshmem)?;
+        tracing::info!("QEMU command: {}", args.join(" "));
 
         let child = Command::new(&args[0])
             .args(&args[1..])

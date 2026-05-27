@@ -6,9 +6,6 @@ edition = "2021"
 [dependencies]
 nv-store = { path = "../nv-store" }
 sha2 = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
-toml = "0.8"
 
 [[bin]]
 name = "vm-boot"

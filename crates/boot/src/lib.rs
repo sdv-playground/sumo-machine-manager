@@ -19,7 +19,6 @@ use nv_store::store::NvStore;
 use nv_store::types::*;
 use sha2::{Sha256, Digest};
 
-pub mod config;
 
 /// Result of processing boot for a single bank set.
 #[derive(Debug, Clone, PartialEq, Eq)]

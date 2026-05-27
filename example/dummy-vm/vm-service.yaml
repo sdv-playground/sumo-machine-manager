@@ -17,7 +17,7 @@ vms:
       rootfs: rootfs.qcow2
     devices:
       - type: health
-        backend: simulated
+        transport: ivshmem
       - type: network
         ssh_port: 2222
     health:

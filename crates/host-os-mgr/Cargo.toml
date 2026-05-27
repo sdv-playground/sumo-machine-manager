@@ -7,7 +7,6 @@ description = "Host OS update manager — A/B boot partition, IFS activation, re
 [dependencies]
 nv-store = { path = "../nv-store" }
 machine-mgr = { path = "../machine-mgr" }
-vm-boot = { path = "../boot" }
 sha2 = "0.10"
 async-trait = "0.1"
 tracing = "0.1"
