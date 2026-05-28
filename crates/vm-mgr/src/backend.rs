@@ -2437,6 +2437,46 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             }
         }
 
+        // Bank activation: if a bank_activator is configured, invoke it now.
+        // The NV flip already happened — active_bank is the just-installed bank.
+        // On failure, roll back the NV state and return an error.
+        if let (Some(ref activator), Some(ref images_dir)) =
+            (&self.bank_activator, &self.images_dir)
+        {
+            let installed_bank = {
+                let nv = self.nv.lock()
+                    .map_err(|_| BackendError::Internal("nv lock".into()))?;
+                let state = nv.read_boot_state()
+                    .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+                state.banks[self.bank_set.as_index()].active_bank
+            };
+            let bank_dir_name = match installed_bank {
+                Bank::A => "bank_a",
+                Bank::B => "bank_b",
+            };
+            let bank_dir = images_dir
+                .join(self.bank_spec.dir_name.as_str())
+                .join(bank_dir_name);
+            if let Err(e) = activator.activate(&bank_dir) {
+                tracing::error!(
+                    bank_set = ?self.bank_set,
+                    bank_dir = %bank_dir.display(),
+                    error = %e,
+                    "bank activation failed during finalize — rolling back"
+                );
+                let mut nv = self.nv_write()?;
+                let _ = ota::rollback(&mut *nv, self.bank_set);
+                return Err(BackendError::Internal(format!(
+                    "bank activation failed: {e}"
+                )));
+            }
+            tracing::info!(
+                bank_set = ?self.bank_set,
+                bank_dir = %bank_dir.display(),
+                "bank activated during finalize"
+            );
+        }
+
         let mut ft = self.flash_transfer.lock().unwrap();
         if let Some(ref mut t) = *ft {
             // Single-bank components (HSM): finalize *writes* the new keys
