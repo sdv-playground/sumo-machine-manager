@@ -2232,13 +2232,20 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         }
 
         // Bank activation: if a bank_activator is configured, invoke it now.
+        // The NV flip already happened — active_bank is the just-installed bank.
         // On failure, roll back the NV state and return an error.
         if !is_crl {
             if let (Some(ref activator), Some(ref images_dir)) =
                 (&self.bank_activator, &self.images_dir)
             {
-                let target_bank = self.determine_target_bank()?;
-                let bank_dir_name = match target_bank {
+                let installed_bank = {
+                    let nv = self.nv.lock()
+                        .map_err(|_| BackendError::Internal("nv lock".into()))?;
+                    let state = nv.read_boot_state()
+                        .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+                    state.banks[self.bank_set.as_index()].active_bank
+                };
+                let bank_dir_name = match installed_bank {
                     Bank::A => "bank_a",
                     Bank::B => "bank_b",
                 };
@@ -2611,33 +2618,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         *self.session.lock().unwrap() = SessionState::Default;
         *self.security.lock().unwrap() = SecurityAccessState::default();
 
-        // Bank activation: invoke the bank_activator if configured.
-        if let (Some(ref activator), Some(ref images_dir)) =
-            (&self.bank_activator, &self.images_dir)
-        {
-            let target_bank = *self.running_bank.lock().unwrap();
-            let bank_dir_name = match target_bank {
-                Bank::A => "bank_a",
-                Bank::B => "bank_b",
-            };
-            let bank_dir = images_dir
-                .join(self.bank_spec.dir_name.as_str())
-                .join(bank_dir_name);
-            match activator.activate(&bank_dir) {
-                Ok(()) => {
-                    tracing::info!(
-                        bank_set = ?self.bank_set,
-                        bank_dir = %bank_dir.display(),
-                        "bank activated successfully"
-                    );
-                }
-                Err(e) => tracing::warn!(
-                    bank_set = ?self.bank_set,
-                    "bank activation failed: {e}"
-                ),
-            }
-            return Ok(None);
-        }
+        // Bank activation happens at install-finalize (finalize_flash),
+        // not here. ecu_reset just transitions the flash state machine.
 
         // Pick "restart" vs "start" based on whether the guest was actually
         // running pre-reset. The baseline_hb_seq probe above already told us
