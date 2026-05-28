@@ -67,11 +67,11 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub bank_layout: Option<String>,
 
-    /// Path to a bank-activator binary for this component. The caller
-    /// (e.g. supernova main) reads this and constructs the appropriate
-    /// activator, then inserts it into `FactoryDeps::bank_activators`.
+    /// Bank-activator marker. When set, the caller constructs the
+    /// appropriate activator and inserts it into `FactoryDeps::bank_activators`.
+    /// Also suppresses vm-service notifications for this component.
     #[serde(default)]
-    pub activator: Option<PathBuf>,
+    pub activator: Option<String>,
 }
 
 /// Result of building a component — includes the Component trait object,
