@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -65,6 +66,14 @@ pub struct ComponentSpec {
     /// Defaults to the well-known layout for the resolved BankSet.
     #[serde(default)]
     pub bank_layout: Option<String>,
+
+    /// Path to a bank-activator binary for this component. When set,
+    /// the factory constructs an `RtBankActivator` that calls the
+    /// binary with `--bank <dir> --clear-first` at install-finalize.
+    /// Used for RT/co-processor slots whose activation requires
+    /// running an external tool (e.g. `rt-launcher` → `m7loader`).
+    #[serde(default)]
+    pub activator: Option<PathBuf>,
 }
 
 /// Result of building a component — includes the Component trait object,
@@ -89,7 +98,9 @@ pub struct FactoryDeps<D: BlockDevice> {
     pub hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
     pub hsm_keystore: Option<PathBuf>,
     pub hsm_port: u16,
-    pub bank_activator: Option<Arc<dyn machine_mgr::BankActivator>>,
+    /// Per-component bank activators, keyed by component id.
+    /// Only components with an entry here get post-install activation.
+    pub bank_activators: HashMap<String, Arc<dyn machine_mgr::BankActivator>>,
 }
 
 pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
@@ -257,8 +268,15 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 backend = backend.with_hsm_provider(provider.clone());
             }
 
-            if let Some(ref activator) = deps.bank_activator {
-                backend = backend.with_bank_activator(activator.clone());
+            let activator = deps.bank_activators.get(&spec.id).cloned().or_else(|| {
+                spec.activator.as_ref().map(|path| {
+                    Arc::new(vm_mgr::rt_activator::RtBankActivator::new(
+                        path.to_string_lossy(),
+                    )) as Arc<dyn machine_mgr::BankActivator>
+                })
+            });
+            if let Some(activator) = activator {
+                backend = backend.with_bank_activator(activator);
             }
 
             let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);
