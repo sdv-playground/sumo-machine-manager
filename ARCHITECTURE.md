@@ -334,7 +334,7 @@ Re-exports `ActivationState`, `FlashState`, `FlashStatus`, `FlashProgress`, `Fau
 | `streaming` | Upload pipeline | Streaming decrypt (AES-128-GCM + ECDH-ES+A128KW) + decompress (zstd) |
 | `did` | DID resolution | `read_did`, `write_did`, `DidValue`, DID constants (F187-F19E + FD00-FD06) |
 | `ota` | OTA lifecycle | `install`, `commit`, `rollback`, `status`, `OtaError`, `BankStatus` |
-| `ifs` | Boot-image activation | `IfsActivator` trait, `IfsError`, `dev::` + `hardware::` impls |
+| `ifs` | Boot-image activation | `DevBankActivator`, `PartitionBankActivator` impls of `machine_mgr::BankActivator` |
 | `sovd/security` | Security provider | `SecurityProvider` trait, `TestSecurityProvider` (XOR 0xFF for dev) |
 | `main` | CLI | `vm-diagserver <nv-path> <cmd> [...]` |
 | `sovd_main` | HTTP server | `vm-sovd <nv-path> <provisioning-authority> [options] [bind-addr]` |

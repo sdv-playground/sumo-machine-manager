@@ -64,6 +64,7 @@
 //!   missing: `QnxHsm` is a stub, `HseEncryptor` for `SecstoreEncryptor`
 //!   isn't written yet, real CAN adapter pending.
 
+pub mod bank_activator;
 pub mod component;
 pub mod error;
 pub mod machine;
@@ -72,6 +73,7 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
+pub use bank_activator::{BankActivator, BankActivatorError};
 pub use component::Component;
 pub use error::{MachineError, MachineResult};
 pub use machine::{Machine, MachineRegistry};

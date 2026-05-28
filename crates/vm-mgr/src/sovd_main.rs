@@ -265,12 +265,12 @@ async fn main() {
         if let Some(ref provider) = hsm_provider {
             backend = backend.with_hsm_provider(provider.clone());
         }
-        // Wire IFS activator into the boot backend
+        // Wire bank activator into the boot backend
         if set == BankSet::HostOs {
             if let Some(ref dev) = boot_device {
                 let activator =
-                    host_os_mgr::ifs::dev::DevIfsActivator::new(dev.clone(), boot_mount.clone());
-                backend = backend.with_ifs_activator(Arc::new(activator));
+                    host_os_mgr::ifs::dev::DevBankActivator::new(dev.clone(), boot_mount.clone());
+                backend = backend.with_bank_activator(Arc::new(activator));
             }
         }
         // Wrap as ComponentDiagBackend so wired Component methods route through

@@ -204,9 +204,9 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// (component_id `["hsm", "keys"]`) are routed to this provider
     /// instead of being written as a disk image.
     hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
-    /// Optional IFS activator — when set (for BankSet::HostOs), ecu_reset()
-    /// copies the IFS to the boot partition instead of symlink switching.
-    ifs_activator: Option<Arc<dyn host_os_mgr::ifs::IfsActivator>>,
+    /// Optional bank activator — when set, ecu_reset() invokes activate()
+    /// on the target bank directory instead of (or in addition to) symlink switching.
+    bank_activator: Option<Arc<dyn machine_mgr::BankActivator>>,
     /// In-memory cache of all NV-backed DID values. Populated at startup
     /// and updated atomically whenever NV is written (under the NV mutex
     /// + cache write lock). Reads bypass NV entirely — eliminates the
@@ -330,7 +330,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             images_dir,
             upload_phase: Mutex::new(None),
             hsm_provider: None,
-            ifs_activator: None,
+            bank_activator: None,
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         };
         // Populate DID cache from NV once at construction time. After this,
@@ -363,12 +363,12 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         self
     }
 
-    /// Set an IFS activator for boot image activation (BankSet::HostOs only).
-    pub fn with_ifs_activator(
+    /// Set a bank activator for post-install bank activation.
+    pub fn with_bank_activator(
         mut self,
-        activator: Arc<dyn host_os_mgr::ifs::IfsActivator>,
+        activator: Arc<dyn machine_mgr::BankActivator>,
     ) -> Self {
-        self.ifs_activator = Some(activator);
+        self.bank_activator = Some(activator);
         self
     }
 
@@ -2231,6 +2231,41 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             }
         }
 
+        // Bank activation: if a bank_activator is configured, invoke it now.
+        // On failure, roll back the NV state and return an error.
+        if !is_crl {
+            if let (Some(ref activator), Some(ref images_dir)) =
+                (&self.bank_activator, &self.images_dir)
+            {
+                let target_bank = self.determine_target_bank()?;
+                let bank_dir_name = match target_bank {
+                    Bank::A => "bank_a",
+                    Bank::B => "bank_b",
+                };
+                let bank_dir = images_dir
+                    .join(self.bank_spec.dir_name.as_str())
+                    .join(bank_dir_name);
+                if let Err(e) = activator.activate(&bank_dir) {
+                    tracing::error!(
+                        bank_set = ?self.bank_set,
+                        bank_dir = %bank_dir.display(),
+                        error = %e,
+                        "bank activation failed during install finalize — rolling back"
+                    );
+                    let mut nv = self.nv_write()?;
+                    let _ = ota::rollback(&mut *nv, self.bank_set);
+                    return Err(BackendError::Internal(format!(
+                        "bank activation failed: {e}"
+                    )));
+                }
+                tracing::info!(
+                    bank_set = ?self.bank_set,
+                    bank_dir = %bank_dir.display(),
+                    "bank activated during install finalize"
+                );
+            }
+        }
+
         if !is_crl {
             let (transfer_id, target_bank) = {
                 let mut ft = self.flash_transfer.lock().unwrap();
@@ -2576,34 +2611,30 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         *self.session.lock().unwrap() = SessionState::Default;
         *self.security.lock().unwrap() = SecurityAccessState::default();
 
-        // IFS boot image: copy to boot partition via IfsActivator, then reboot
-        if self.bank_set == BankSet::HostOs {
-            if let (Some(ref activator), Some(ref images_dir)) =
-                (&self.ifs_activator, &self.images_dir)
-            {
-                let target_bank = *self.running_bank.lock().unwrap();
-                let bank_dir_name = match target_bank {
-                    Bank::A => "bank_a",
-                    Bank::B => "bank_b",
-                };
-                let ifs_source = images_dir
-                    .join("boot")
-                    .join(bank_dir_name)
-                    .join("primary_boot_image.bin");
-                match activator.activate(&ifs_source) {
-                    Ok(()) => {
-                        tracing::info!(
-                            "IFS activated from {}, triggering reboot",
-                            ifs_source.display()
-                        );
-                        let _ = std::process::Command::new("shutdown")
-                            .args(["-r", "now"])
-                            .status();
-                    }
-                    Err(e) => tracing::warn!("IFS activation failed: {e}"),
+        // Bank activation: invoke the bank_activator if configured.
+        if let (Some(ref activator), Some(ref images_dir)) =
+            (&self.bank_activator, &self.images_dir)
+        {
+            let target_bank = *self.running_bank.lock().unwrap();
+            let bank_dir_name = match target_bank {
+                Bank::A => "bank_a",
+                Bank::B => "bank_b",
+            };
+            let bank_dir = images_dir
+                .join(self.bank_spec.dir_name.as_str())
+                .join(bank_dir_name);
+            match activator.activate(&bank_dir) {
+                Ok(()) => {
+                    tracing::info!(
+                        bank_set = ?self.bank_set,
+                        bank_dir = %bank_dir.display(),
+                        "bank activated successfully"
+                    );
                 }
-            } else {
-                tracing::info!("boot component: no IFS activator configured — reboot manually");
+                Err(e) => tracing::warn!(
+                    bank_set = ?self.bank_set,
+                    "bank activation failed: {e}"
+                ),
             }
             return Ok(None);
         }

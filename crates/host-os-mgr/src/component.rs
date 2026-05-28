@@ -11,22 +11,22 @@ use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
 use nv_store::types::{Bank, BankSet};
 
-use crate::ifs::IfsActivator;
+use machine_mgr::BankActivator;
 
 pub struct HostOsComponent<D: BlockDevice> {
     nv: Arc<Mutex<NvStore<D>>>,
     // Kept as an owned Arc so the activator outlives any in-flight
     // host-os work that vm-mgr's backend drives via its own copy.
     // HostOsComponent itself doesn't call into it (yet).
-    _ifs_activator: Arc<dyn IfsActivator>,
+    _bank_activator: Arc<dyn BankActivator>,
     capabilities: Capabilities,
 }
 
 impl<D: BlockDevice + Send + 'static> HostOsComponent<D> {
-    pub fn new(nv: Arc<Mutex<NvStore<D>>>, ifs_activator: Arc<dyn IfsActivator>) -> Self {
+    pub fn new(nv: Arc<Mutex<NvStore<D>>>, bank_activator: Arc<dyn BankActivator>) -> Self {
         Self {
             nv,
-            _ifs_activator: ifs_activator,
+            _bank_activator: bank_activator,
             capabilities: Capabilities {
                 did_store: true,
                 flash: Some(FlashCaps {

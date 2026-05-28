@@ -9,7 +9,6 @@ machine-mgr = { path = "../machine-mgr" }
 nv-store = { path = "../nv-store" }
 vm-mgr = { path = "../vm-mgr" }
 app-mgr = { path = "../app-mgr" }
-host-os-mgr = { path = "../host-os-mgr" }
 hsm = { path = "../hsm", features = ["crypto"] }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"

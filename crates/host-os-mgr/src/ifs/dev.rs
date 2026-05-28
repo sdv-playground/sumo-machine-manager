@@ -6,15 +6,15 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{IfsActivator, IfsError};
+use machine_mgr::{BankActivator, BankActivatorError};
 
-pub struct DevIfsActivator {
+pub struct DevBankActivator {
     boot_device: String,
     mount_point: PathBuf,
     boot_image_rel: String,
 }
 
-impl DevIfsActivator {
+impl DevBankActivator {
     pub fn new(boot_device: String, mount_point: PathBuf) -> Self {
         Self {
             boot_device,
@@ -24,13 +24,13 @@ impl DevIfsActivator {
     }
 }
 
-impl IfsActivator for DevIfsActivator {
-    fn activate(&self, ifs_source: &Path) -> Result<(), IfsError> {
+impl BankActivator for DevBankActivator {
+    fn activate(&self, ifs_source: &Path) -> Result<(), BankActivatorError> {
         std::fs::create_dir_all(&self.mount_point)?;
 
         let mount_check = std::process::Command::new("mount")
             .output()
-            .map_err(IfsError::Io)?;
+            .map_err(|e| BankActivatorError::Io(e))?;
         let mount_output = String::from_utf8_lossy(&mount_check.stdout);
         let mp_str = self.mount_point.to_string_lossy();
 
@@ -39,9 +39,9 @@ impl IfsActivator for DevIfsActivator {
             let status = std::process::Command::new("mount")
                 .args(["-t", "qnx6", &self.boot_device, &mp_str])
                 .status()
-                .map_err(IfsError::Io)?;
+                .map_err(|e| BankActivatorError::Io(e))?;
             if !status.success() {
-                return Err(IfsError::NotMounted(format!(
+                return Err(BankActivatorError::Failed(format!(
                     "mount {} failed (exit {})",
                     self.boot_device,
                     status.code().unwrap_or(-1)

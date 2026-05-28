@@ -6,20 +6,20 @@
 
 use std::path::Path;
 
-use super::{IfsActivator, IfsError};
+use machine_mgr::{BankActivator, BankActivatorError};
 
-pub struct PartitionIfsActivator {
+pub struct PartitionBankActivator {
     boot_partition: String,
 }
 
-impl PartitionIfsActivator {
+impl PartitionBankActivator {
     pub fn new(boot_partition: String) -> Self {
         Self { boot_partition }
     }
 }
 
-impl IfsActivator for PartitionIfsActivator {
-    fn activate(&self, ifs_source: &Path) -> Result<(), IfsError> {
+impl BankActivator for PartitionBankActivator {
+    fn activate(&self, ifs_source: &Path) -> Result<(), BankActivatorError> {
         let image_data = std::fs::read(ifs_source)?;
 
         tracing::info!(

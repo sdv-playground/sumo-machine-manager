@@ -20,4 +20,4 @@ pub mod ifs;
 pub mod component;
 
 pub use component::HostOsComponent;
-pub use ifs::{IfsActivator, IfsError};
+pub use ifs::{BankActivator, BankActivatorError};

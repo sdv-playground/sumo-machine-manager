@@ -33,10 +33,11 @@ Cargo workspace with 10 crates. Bottom-up:
 - **vm-service** (lib+bin): QEMU / `qvm` lifecycle, per-bank VM config,
   ivshmem-server management, QMP integration, IPC to the diagnostics daemon.
 - **machine-mgr** (lib): platform-agnostic `Machine` / `Component` trait
-  layer. Connects all updatable things under a single registry.
+  layer. Connects all updatable things under a single registry. Also owns
+  the `BankActivator` trait + `BankActivatorError` enum.
 - **host-os-mgr** (lib): Host OS update management — IFS activation, A/B
-  boot partition switching, reboot coordination. `IfsActivator` trait with
-  dev (mount+copy) and production (raw partition write) implementations.
+  boot partition switching, reboot coordination. `DevBankActivator` (mount+copy)
+  and `PartitionBankActivator` (raw partition write) implement `machine_mgr::BankActivator`.
 - **app-mgr** (lib): Application/container update management through the
   `Component` lifecycle. `ContainerImageComponent` validates detached
   `#container-image` payloads and imports them into Docker, Podman, or
@@ -97,9 +98,9 @@ crates/vm-mgr/src/
 
 crates/host-os-mgr/src/
   component.rs            — HostOsComponent (implements machine_mgr::Component)
-  ifs/mod.rs              — IfsActivator trait + IfsError
-  ifs/dev.rs              — DevIfsActivator (mount + atomic copy)
-  ifs/partition.rs        — PartitionIfsActivator (raw block device write)
+  ifs/mod.rs              — re-exports BankActivator + BankActivatorError from machine-mgr
+  ifs/dev.rs              — DevBankActivator (mount + atomic copy)
+  ifs/partition.rs        — PartitionBankActivator (raw block device write)
 
 crates/app-mgr/src/
   docker_image.rs         — ContainerImageComponent and runtime import backends

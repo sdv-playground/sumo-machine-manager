@@ -89,7 +89,7 @@ pub struct FactoryDeps<D: BlockDevice> {
     pub hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
     pub hsm_keystore: Option<PathBuf>,
     pub hsm_port: u16,
-    pub ifs_activator: Option<Arc<dyn host_os_mgr::ifs::IfsActivator>>,
+    pub bank_activator: Option<Arc<dyn machine_mgr::BankActivator>>,
 }
 
 pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
@@ -257,10 +257,8 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 backend = backend.with_hsm_provider(provider.clone());
             }
 
-            if bank_set == BankSet::HostOs {
-                if let Some(ref activator) = deps.ifs_activator {
-                    backend = backend.with_ifs_activator(activator.clone());
-                }
+            if let Some(ref activator) = deps.bank_activator {
+                backend = backend.with_bank_activator(activator.clone());
             }
 
             let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);
