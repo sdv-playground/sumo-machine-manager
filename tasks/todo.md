@@ -247,7 +247,7 @@ HSM key install today goes through the standard SOVD package flow (`receive_pack
 
 ## PR 4 — split `VmBackend` into per-component types
 
-Replace the single `VmBackend` (with internal `ComponentConfig` map) with concrete component types: `VmComponent`, `HostComponent`, `HsmComponent`. Each composed of pluggable subsystem traits (`NvBackend`, `HsmProvider`, `VmLifecycle`, `IfsActivator`).
+Replace the single `VmBackend` (with internal `ComponentConfig` map) with concrete component types: `VmComponent`, `HostComponent`, `HsmComponent`. Each composed of pluggable subsystem traits (`NvBackend`, `HsmProvider`, `VmLifecycle`, `BankActivator`).
 
 - [ ] Extract `VmComponent` for vm1/vm2.
 - [ ] Extract `HostComponent` for the hypervisor component (host OS itself).

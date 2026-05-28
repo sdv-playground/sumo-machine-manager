@@ -12,6 +12,7 @@
 /// No file-based fallbacks for software authority or device key.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use coset::{iana, CborSerializable, CoseKeyBuilder};
@@ -87,6 +88,10 @@ pub struct SuitProvider {
     /// hood so the EC private scalar never reaches host memory. Old
     /// design held the raw bytes here; the HSE refactor inverted that.
     device_unwrap: Arc<RwLock<Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>>>,
+    /// Deployment-specific component-ID → BankSet aliases. Lets custom
+    /// slot names (e.g. "rt") resolve without polluting nv-store's
+    /// well-known list.
+    component_aliases: HashMap<String, BankSet>,
 }
 
 impl SuitProvider {
@@ -96,11 +101,20 @@ impl SuitProvider {
             key_authority: Arc::new(RwLock::new(None)),
             software_authority: Arc::new(RwLock::new(None)),
             device_unwrap: Arc::new(RwLock::new(None)),
+            component_aliases: HashMap::new(),
         }
     }
 
     pub fn with_factory_authority() -> Self {
         Self::new(factory_provisioning_authority())
+    }
+
+    /// Register deployment-specific component-ID → BankSet mappings
+    /// so SUIT manifests with custom component IDs (e.g. `["rt", "firmware"]`)
+    /// resolve to the correct NV slot.
+    pub fn with_component_aliases(mut self, aliases: HashMap<String, BankSet>) -> Self {
+        self.component_aliases = aliases;
+        self
     }
 
     /// Load all trust keys from HSM after provisioning.
@@ -197,11 +211,12 @@ impl SuitProvider {
             });
         }
 
-        Self::extract_metadata(&manifest, secver)
+        self.extract_metadata(&manifest, secver)
     }
 
     /// Extract metadata from a validated manifest (shared by validate and validate_header_only).
     fn extract_metadata(
+        &self,
         manifest: &sumo_onboard::manifest::Manifest,
         secver: u64,
     ) -> Result<ValidatedFirmware, ManifestError> {
@@ -209,11 +224,13 @@ impl SuitProvider {
             ManifestError::ComponentUnknown("missing component_id".into())
         })?;
 
-        // Resolve bank_set from the first segment that matches a BankSet.
+        // Resolve bank_set from the first segment that matches a BankSet,
+        // falling back to deployment-registered component aliases.
         let bank_set = segments
             .iter()
             .find_map(|seg| {
-                std::str::from_utf8(seg).ok().and_then(BankSet::from_str)
+                let s = std::str::from_utf8(seg).ok()?;
+                BankSet::from_str(s).or_else(|| self.component_aliases.get(s).copied())
             })
             .ok_or_else(|| {
                 let comp_str = segments
@@ -316,7 +333,7 @@ impl ManifestProvider for SuitProvider {
             });
         }
 
-        let mut validated = Self::extract_metadata(&manifest, secver)?;
+        let mut validated = self.extract_metadata(&manifest, secver)?;
 
         // HSM key manifests: pass raw envelope through — HSM handles
         // decrypt/decompress internally (matches production HSM firmware).

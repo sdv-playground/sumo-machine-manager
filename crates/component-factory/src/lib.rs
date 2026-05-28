@@ -67,11 +67,9 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub bank_layout: Option<String>,
 
-    /// Path to a bank-activator binary for this component. When set,
-    /// the factory constructs an `RtBankActivator` that calls the
-    /// binary with `--bank <dir> --clear-first` at install-finalize.
-    /// Used for RT/co-processor slots whose activation requires
-    /// running an external tool (e.g. `rt-launcher` → `m7loader`).
+    /// Path to a bank-activator binary for this component. The caller
+    /// (e.g. supernova main) reads this and constructs the appropriate
+    /// activator, then inserts it into `FactoryDeps::bank_activators`.
     #[serde(default)]
     pub activator: Option<PathBuf>,
 }
@@ -268,15 +266,8 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 backend = backend.with_hsm_provider(provider.clone());
             }
 
-            let activator = deps.bank_activators.get(&spec.id).cloned().or_else(|| {
-                spec.activator.as_ref().map(|path| {
-                    Arc::new(vm_mgr::rt_activator::RtBankActivator::new(
-                        path.to_string_lossy(),
-                    )) as Arc<dyn machine_mgr::BankActivator>
-                })
-            });
-            if let Some(activator) = activator {
-                backend = backend.with_bank_activator(activator);
+            if let Some(activator) = deps.bank_activators.get(&spec.id) {
+                backend = backend.with_bank_activator(activator.clone());
             }
 
             let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);

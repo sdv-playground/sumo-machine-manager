@@ -46,7 +46,6 @@ pub mod did;
 pub mod manifest;
 pub mod manifest_provider;
 pub mod ota;
-pub mod rt_activator;
 pub mod streaming;
 pub mod suit_provider;
 
