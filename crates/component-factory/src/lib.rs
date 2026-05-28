@@ -248,13 +248,21 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
 
             let images_dir = spec.storage_path.clone();
 
+            // Components with a bank activator (RT, co-processor) are not
+            // VMs — they don't need vm-service notifications or symlink flips.
+            let vm_service = if deps.bank_activators.contains_key(&spec.id) {
+                None
+            } else {
+                deps.vm_service_addr.clone()
+            };
+
             let mut backend = VmBackend::with_options(
                 bank_set,
                 deps.nv.clone(),
                 deps.manifest_provider.clone(),
                 deps.security_provider.clone(),
                 comp_config,
-                deps.vm_service_addr.clone(),
+                vm_service,
                 images_dir,
             )
             .with_bank_spec(bank_spec.clone());
