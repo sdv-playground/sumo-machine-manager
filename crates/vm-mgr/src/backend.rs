@@ -468,10 +468,20 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     }
 
     /// The bank an OTA upload should write to: the *inactive* bank for dual-bank
-    /// components, or `Bank::A` for single-bank ones (HSM). Cheap NV read.
+    /// components, or `Bank::A` for single-bank ones (HSM).
+    ///
+    /// For activator-backed components the `current` symlink under
+    /// `images_dir/<dir_name>/` is the source of truth — it survives
+    /// factory resets and doesn't depend on NV flip timing. Falls back
+    /// to NV when no symlink exists (first-ever flash).
     fn determine_target_bank(&self) -> BackendResult<Bank> {
         if self.config.single_bank {
             return Ok(Bank::A);
+        }
+        if self.bank_activator.is_some() {
+            if let Some(active) = self.read_current_symlink() {
+                return Ok(active.other());
+            }
         }
         let nv = self
             .nv
@@ -482,6 +492,47 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
         let idx = self.bank_set.as_index();
         Ok(state.banks[idx].active_bank.other())
+    }
+
+    /// Read the `current` symlink under `images_dir/<dir_name>/` and return
+    /// the bank it points to, or `None` if missing / unreadable.
+    fn read_current_symlink(&self) -> Option<Bank> {
+        let images_dir = self.images_dir.as_ref()?;
+        let symlink_path = images_dir
+            .join(&self.bank_spec.dir_name)
+            .join("current");
+        let target = std::fs::read_link(&symlink_path).ok()?;
+        let name = target.file_name()?.to_str()?;
+        match name {
+            "bank_a" => Some(Bank::A),
+            "bank_b" => Some(Bank::B),
+            _ => None,
+        }
+    }
+
+    /// Atomically flip the `current` symlink to point at `bank`.
+    fn flip_current_symlink(&self, bank: Bank) {
+        let Some(images_dir) = self.images_dir.as_ref() else { return };
+        let dir = images_dir.join(&self.bank_spec.dir_name);
+        let symlink_path = dir.join("current");
+        let target = Path::new(bank_dir_name(bank));
+        let tmp_link = symlink_path.with_extension("tmp");
+        let _ = std::fs::remove_file(&tmp_link);
+        if let Err(e) = std::os::unix::fs::symlink(target, &tmp_link)
+            .and_then(|()| std::fs::rename(&tmp_link, &symlink_path))
+        {
+            tracing::warn!(
+                bank_set = ?self.bank_set,
+                "failed to flip current symlink: {e}"
+            );
+        } else {
+            tracing::info!(
+                bank_set = ?self.bank_set,
+                bank = ?bank,
+                "flipped current -> {}",
+                bank_dir_name(bank),
+            );
+        }
     }
 
     /// Path of the target bank directory under `images_dir`. `None` if no
@@ -2232,26 +2283,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         }
 
         // Bank activation: if a bank_activator is configured, invoke it now.
-        // The NV flip already happened — active_bank is the just-installed bank.
-        // On failure, roll back the NV state and return an error.
+        // determine_target_bank() reads the `current` symlink to find the
+        // inactive bank (where payloads were written). On success, flip it.
         if !is_crl {
             if let (Some(ref activator), Some(ref images_dir)) =
                 (&self.bank_activator, &self.images_dir)
             {
-                let installed_bank = {
-                    let nv = self.nv.lock()
-                        .map_err(|_| BackendError::Internal("nv lock".into()))?;
-                    let state = nv.read_boot_state()
-                        .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-                    state.banks[self.bank_set.as_index()].active_bank
-                };
-                let bank_dir_name = match installed_bank {
-                    Bank::A => "bank_a",
-                    Bank::B => "bank_b",
-                };
+                let wrote_to = self.determine_target_bank()?;
                 let bank_dir = images_dir
                     .join(self.bank_spec.dir_name.as_str())
-                    .join(bank_dir_name);
+                    .join(bank_dir_name(wrote_to));
                 if let Err(e) = activator.activate(&bank_dir) {
                     tracing::error!(
                         bank_set = ?self.bank_set,
@@ -2265,6 +2306,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                         "bank activation failed: {e}"
                     )));
                 }
+                self.flip_current_symlink(wrote_to);
                 tracing::info!(
                     bank_set = ?self.bank_set,
                     bank_dir = %bank_dir.display(),
@@ -2438,25 +2480,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         }
 
         // Bank activation: if a bank_activator is configured, invoke it now.
-        // The NV flip already happened — active_bank is the just-installed bank.
-        // On failure, roll back the NV state and return an error.
+        // The `current` symlink is the source of truth for which bank is
+        // active; determine_target_bank() already read it to pick the write
+        // bank. The bank we just wrote to is target (inactive per symlink).
         if let (Some(ref activator), Some(ref images_dir)) =
             (&self.bank_activator, &self.images_dir)
         {
-            let installed_bank = {
-                let nv = self.nv.lock()
-                    .map_err(|_| BackendError::Internal("nv lock".into()))?;
-                let state = nv.read_boot_state()
-                    .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-                state.banks[self.bank_set.as_index()].active_bank
-            };
-            let bank_dir_name = match installed_bank {
-                Bank::A => "bank_a",
-                Bank::B => "bank_b",
-            };
+            let wrote_to = self.determine_target_bank()?;
             let bank_dir = images_dir
                 .join(self.bank_spec.dir_name.as_str())
-                .join(bank_dir_name);
+                .join(bank_dir_name(wrote_to));
             if let Err(e) = activator.activate(&bank_dir) {
                 tracing::error!(
                     bank_set = ?self.bank_set,
@@ -2470,6 +2503,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     "bank activation failed: {e}"
                 )));
             }
+            self.flip_current_symlink(wrote_to);
             tracing::info!(
                 bank_set = ?self.bank_set,
                 bank_dir = %bank_dir.display(),
