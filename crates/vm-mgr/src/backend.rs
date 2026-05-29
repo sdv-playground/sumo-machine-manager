@@ -207,6 +207,12 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// Optional bank activator — when set, ecu_reset() invokes activate()
     /// on the target bank directory instead of (or in addition to) symlink switching.
     bank_activator: Option<Arc<dyn machine_mgr::BankActivator>>,
+    /// Synthetic health source — consulted by `read_data` for
+    /// `guest_state` / `heartbeat_seq` when `vm_service_addr` is None.
+    /// Set via `with_health_probe` (typically by supernova-mm for the
+    /// RT component, wrapping `m7loader -q`). VMs leave this as None
+    /// and use the vm-service HTTP path instead.
+    health_probe: Option<Arc<dyn HealthProbe>>,
     /// In-memory cache of all NV-backed DID values. Populated at startup
     /// and updated atomically whenever NV is written (under the NV mutex
     /// + cache write lock). Reads bypass NV entirely — eliminates the
@@ -331,6 +337,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             upload_phase: Mutex::new(None),
             hsm_provider: None,
             bank_activator: None,
+            health_probe: None,
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         };
         // Populate DID cache from NV once at construction time. After this,
@@ -369,6 +376,16 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         activator: Arc<dyn machine_mgr::BankActivator>,
     ) -> Self {
         self.bank_activator = Some(activator);
+        self
+    }
+
+    /// Set a synthetic health probe used by `read_data` for `guest_state`
+    /// / `heartbeat_seq` when the component has no vm-service backing
+    /// (activator-backed components like RT/M7). Wraps something like
+    /// `m7loader -q` with internal caching to keep the SOVD hot path
+    /// cheap. Returning `None` from the probe → `guest_state = "offline"`.
+    pub fn with_health_probe(mut self, probe: Arc<dyn HealthProbe>) -> Self {
+        self.health_probe = Some(probe);
         self
     }
 
@@ -1694,11 +1711,14 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             let (did_num, reg) = resolve_param(param_id)
                 .ok_or_else(|| BackendError::ParameterNotFound(param_id.clone()))?;
 
-            // Health DIDs — query vm-service HTTP API
+            // Health DIDs — query vm-service HTTP API, or fall back to a
+            // configured health probe for activator-backed components that
+            // have no vm-service (RT/M7 surfaces its state via `m7loader -q`
+            // wrapped by `HealthProbe`).
             if did_num == did::DID_GUEST_STATE || did_num == did::DID_HEARTBEAT_SEQ {
                 let health = match self.vm_service_addr.as_ref() {
                     Some(sock) => query_vm_health(sock, &self.entity_info.id).await,
-                    None => None,
+                    None => self.health_probe.as_ref().and_then(|p| p.probe()),
                 };
                 let (value, raw) = match (did_num, &health) {
                     (did::DID_GUEST_STATE, Some(h)) => {
@@ -3356,19 +3376,32 @@ fn map_ota_error(e: ota::OtaError) -> BackendError {
 // Guest health (via vm-service HTTP API)
 // ---------------------------------------------------------------------------
 
-struct GuestHealth {
-    guest_state: u32,
-    hb_seq: u32,
+#[derive(Clone)]
+pub struct GuestHealth {
+    pub guest_state: u32,
+    pub hb_seq: u32,
     /// Random per-guest-lifetime id from the heartbeat wire format. Used
     /// by `guest_is_running` to confirm we're reading data from the
     /// post-reset lifetime, not stale shmem data from the previous one
     /// (qvm-shmem regions persist across stop/start).
-    boot_id: u32,
-    /// vm-service's coarse health status string. We treat anything not
-    /// "running" as not-yet-activated — captures the stale-heartbeat case
-    /// (vm-service flips to "unhealthy" after 5s of stuck seq) without
-    /// duplicating that timeout here.
-    status: String,
+    pub boot_id: u32,
+    /// Coarse health status string ("running" / "stopped" / "unhealthy").
+    /// VmBackend treats anything not "running" as not-yet-activated —
+    /// captures the stale-heartbeat case (vm-service flips to
+    /// "unhealthy" after 5s of stuck seq) without duplicating that
+    /// timeout here.
+    pub status: String,
+}
+
+/// Synthesise a [`GuestHealth`] snapshot for a component that has no
+/// vm-service backing (e.g. activator-backed components like RT/M7).
+/// Called from `VmBackend::read_data` when `vm_service_addr` is None.
+///
+/// Implementations should be cheap (the call lands on the SOVD read-data
+/// hot path served by the campaign viewer). Internal caching is fine
+/// when the underlying source is expensive (`m7loader -q` shells out).
+pub trait HealthProbe: Send + Sync {
+    fn probe(&self) -> Option<GuestHealth>;
 }
 
 /// Query vm-service health endpoint via TCP loopback.

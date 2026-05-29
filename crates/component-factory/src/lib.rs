@@ -99,6 +99,11 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// Per-component bank activators, keyed by component id.
     /// Only components with an entry here get post-install activation.
     pub bank_activators: HashMap<String, Arc<dyn machine_mgr::BankActivator>>,
+    /// Per-component synthetic health probes, keyed by component id.
+    /// Used by activator-backed components that have no vm-service backing
+    /// (e.g. RT/M7 surfaces `guest_state` via `m7loader -q`). VMs leave
+    /// this empty and use vm-service over loopback HTTP instead.
+    pub health_probes: HashMap<String, Arc<dyn vm_mgr::backend::HealthProbe>>,
 }
 
 pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
@@ -276,6 +281,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
 
             if let Some(activator) = deps.bank_activators.get(&spec.id) {
                 backend = backend.with_bank_activator(activator.clone());
+            }
+            if let Some(probe) = deps.health_probes.get(&spec.id) {
+                backend = backend.with_health_probe(probe.clone());
             }
 
             let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);
