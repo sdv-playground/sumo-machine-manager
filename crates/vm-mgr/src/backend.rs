@@ -2463,17 +2463,20 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     };
                     if let Some(meta) = meta {
                         let mut nv = self.nv_write()?;
-                        let _ = crate::ota::install_precomputed(
+                        if let Err(e) = crate::ota::install_precomputed(
                             &mut *nv,
                             self.bank_set,
                             sha.unwrap_or([0; 32]),
                             size,
                             &meta,
                             self.config.single_bank,
-                        );
-
-                        // Payloads were already streamed directly into the
-                        // target bank dir at upload time; no rename here.
+                        ) {
+                            tracing::warn!(
+                                bank_set = ?self.bank_set,
+                                error = %e,
+                                "install_precomputed failed during finalize (NV metadata not updated)"
+                            );
+                        }
                     }
                 }
             }
