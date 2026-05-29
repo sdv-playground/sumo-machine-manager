@@ -2225,6 +2225,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         let is_streamed = image_data.is_empty() && pre_sha256.is_some();
         let is_crl = image_data.is_empty() && pre_sha256.is_none();
 
+        // The bank that install_precomputed / install just made active.
+        // Captured here so the activator block below uses the
+        // authoritative answer instead of re-deriving via
+        // determine_target_bank() — which is racy on first-ever flash
+        // (no `current` symlink yet → falls back to NV, which
+        // install_precomputed has by then flipped, returning the WRONG
+        // bank). For CRL (no install), stays None and the activator
+        // block is skipped via `if !is_crl`.
+        let mut installed_bank: Option<Bank> = None;
         if is_crl {
             // CRL / security-floor-only manifest — raise floor without flashing.
             let mut nv = self.nv_write()?;
@@ -2257,6 +2266,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 target_bank = ?result.target_bank,
                 "OTA install committed (files already in bank dir)"
             );
+            installed_bank = Some(result.target_bank);
         } else {
             // Buffered path — install from memory
             let mut nv = self.nv_write()?;
@@ -2291,16 +2301,25 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     ))
                 })?;
             }
+            installed_bank = Some(result.target_bank);
         }
 
         // Bank activation: if a bank_activator is configured, invoke it now.
-        // determine_target_bank() reads the `current` symlink to find the
-        // inactive bank (where payloads were written). On success, flip it.
+        // Use installed_bank captured from install_precomputed / install
+        // above — that's the authoritative answer. Re-deriving via
+        // determine_target_bank() here would return the OLD (now-inactive)
+        // bank on first-ever flash because NV has been flipped but the
+        // `current` symlink doesn't exist yet to override. Activator runs
+        // on the bank we just wrote payloads to; success flips the symlink
+        // so the next flash's determine_target_bank() reads correctly.
         if !is_crl {
             if let (Some(ref activator), Some(ref images_dir)) =
                 (&self.bank_activator, &self.images_dir)
             {
-                let wrote_to = self.determine_target_bank()?;
+                let wrote_to = installed_bank
+                    .ok_or_else(|| BackendError::Internal(
+                        "installed_bank unset — unreachable for !is_crl".into()
+                    ))?;
                 let bank_dir = images_dir
                     .join(self.bank_spec.dir_name.as_str())
                     .join(bank_dir_name(wrote_to));
@@ -2494,13 +2513,28 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         }
 
         // Bank activation: if a bank_activator is configured, invoke it now.
-        // The `current` symlink is the source of truth for which bank is
-        // active; determine_target_bank() already read it to pick the write
-        // bank. The bank we just wrote to is target (inactive per symlink).
+        // Read NV.active_bank directly — install_precomputed (above, when
+        // it ran) just flipped it to the just-installed bank, which is
+        // exactly the bank that has the payloads the activator needs.
+        // determine_target_bank() would return the OTHER bank (active.other())
+        // when no `current` symlink exists yet (first flash) — that's
+        // empty and would make the activator fail with "firmware not found".
+        // See 2c9d2d8 for the original fix to this race; d25d967 re-introduced
+        // the determine_target_bank() call and reopened the bug for
+        // first-ever-flash on activator-backed components.
         if let (Some(ref activator), Some(ref images_dir)) =
             (&self.bank_activator, &self.images_dir)
         {
-            let wrote_to = self.determine_target_bank()?;
+            let wrote_to = {
+                let nv = self
+                    .nv
+                    .lock()
+                    .map_err(|_| BackendError::Internal("nv lock".into()))?;
+                let state = nv
+                    .read_boot_state()
+                    .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+                state.banks[self.bank_set.as_index()].active_bank
+            };
             let bank_dir = images_dir
                 .join(self.bank_spec.dir_name.as_str())
                 .join(bank_dir_name(wrote_to));
