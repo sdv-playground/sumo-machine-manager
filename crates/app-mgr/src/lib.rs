@@ -300,6 +300,8 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
                 Some(version)
             },
             previous_version: None,
+            // Container image import + service restart — local-only.
+            reset_kind: ResetKind::Local,
         }))
     }
 

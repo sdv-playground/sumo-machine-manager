@@ -7,6 +7,12 @@
 
 use serde::{Deserialize, Serialize};
 
+// `ResetKind` is part of the SOVD wire (ActivationState carries it), so the
+// canonical definition lives in sovd-core. We re-export here so existing
+// `machine_mgr::ResetKind` import paths keep working and BankActivator's
+// trait method can reference it without an extra dep edge for callers.
+pub use sovd_core::ResetKind;
+
 /// Capability descriptor for a `Component`.
 ///
 /// Optional groups: `None` means the component does not support that
@@ -57,31 +63,6 @@ pub struct FlashCaps {
     pub reset_kind: ResetKind,
 }
 
-/// Which level of reset is needed to activate a newly-staged image.
-///
-/// Declared by `BankActivator::reset_kind()` (the activator knows what
-/// partition it wrote and whether that partition's contents only run after
-/// a host reboot). Propagated to `FlashCaps` via `derive_capabilities` and
-/// surfaced on the SOVD wire as part of `ActivationState` so the
-/// orchestrator can pick the right SOVD `status/restart` target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResetKind {
-    /// Activation needs no reset — the new image is live the moment the
-    /// component finalises (e.g. HSM keystore swap, container hot-reload).
-    None,
-    /// Activation cycles the component itself (e.g. qvm process restart,
-    /// daemon SIGHUP). Orchestrator PUTs the component's own
-    /// `status/restart`. **Default** — most components fall here.
-    #[default]
-    Local,
-    /// Activation requires rebooting the parent ECU because the component's
-    /// freshly-flashed image only runs after a host boot (e.g. M7 firmware
-    /// via m7loader, host-OS IFS via Dev/Partition activators). Orchestrator
-    /// coalesces all `RequiresEcuReset` components in the same ECU into one
-    /// `PUT {ecu-path}/status/restart`.
-    RequiresEcuReset,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LifecycleCaps {

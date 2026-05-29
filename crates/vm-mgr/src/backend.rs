@@ -2853,6 +2853,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             state,
             active_version,
             previous_version,
+            // Surface the activator's declared reset kind on the wire so the
+            // orchestrator can route restarts correctly (Phase 2 of
+            // tasks/reset-kind-and-status-restart.md). Default Local when no
+            // activator is configured.
+            reset_kind: self.reset_kind(),
         })
     }
 
