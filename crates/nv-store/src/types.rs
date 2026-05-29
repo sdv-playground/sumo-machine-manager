@@ -90,7 +90,13 @@ impl BankSet {
 /// Capacity of the NV `banks` array — how many bank slots the
 /// store can address. Deployments use 0..N of these; slots beyond
 /// what a deployment registers are unused but still allocated.
-pub const NUM_BANK_SETS: usize = 6;
+///
+/// Currently 6 are named (HostOs, Vm1, Vm2, Hsm, App, Custom) and
+/// in production use (the Custom slot holds the RT/Cortex-M7
+/// component). Slots 6..9 are reserved headroom — adding a new
+/// component just picks an unused index without bumping this
+/// constant + the NV partition size + the on-device file.
+pub const NUM_BANK_SETS: usize = 10;
 pub const MAX_TRIAL_BOOTS: u8 = 10;
 
 // NV partition magic numbers (sector validation)

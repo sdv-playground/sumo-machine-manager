@@ -258,6 +258,18 @@ impl<D: BlockDevice> NvStore<D> {
     }
 }
 
-/// Minimum device size to hold the full NV layout.
-/// App (bank set 4) Runtime B ends at 0x070000 + 0x010000 + 8*4096 = 0x088000.
-pub const MIN_NV_DEVICE_SIZE: u64 = 0x088000; // 544 KB
+/// Minimum device size to hold the full NV layout for all `NUM_BANK_SETS`
+/// slots. Computed as `BANKSET_BASE + NUM_BANK_SETS * BANKSET_STRIDE`
+/// (with current values: `0x10000 + 10*0x18000 = 0x100000` = 1 MiB).
+///
+/// Bumped from 0x88000 (544 KiB, 5 slots) → 0x100000 (1 MiB, 10 slots)
+/// on 2026-05-29 when the RT/Cortex-M7 component landed using slot 5
+/// and we found the existing NV file was sized for only 5 slots. The
+/// bump gives 4 slots of headroom for future components without another
+/// migration.
+///
+/// On-device NV files smaller than this are re-created (wiped) at next
+/// supernova start — the existing bootstrap path handles this via
+/// `tracing::warn!("NV store too small, recreating")`. Operators
+/// re-provision via the factory_reset / provisioning flow.
+pub const MIN_NV_DEVICE_SIZE: u64 = 0x100000; // 1 MiB (10 slots × 96 KiB + 64 KiB header)

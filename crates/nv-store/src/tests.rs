@@ -13,14 +13,12 @@ fn boot_state_roundtrip() {
     let mut store = make_store();
     let mut state = NvBootState {
         write_seq: 0,
-        banks: [
-            BankBootState { active_bank: Bank::A, committed: true, boot_count: 0 },
-            BankBootState { active_bank: Bank::B, committed: false, boot_count: 7 },
-            BankBootState { active_bank: Bank::A, committed: true, boot_count: 0 },
-            BankBootState::default(),
-            BankBootState::default(),
-            BankBootState::default(), // Custom slot — unused by this test
-        ],
+        banks: std::array::from_fn(|i| match i {
+            0 => BankBootState { active_bank: Bank::A, committed: true, boot_count: 0 },
+            1 => BankBootState { active_bank: Bank::B, committed: false, boot_count: 7 },
+            2 => BankBootState { active_bank: Bank::A, committed: true, boot_count: 0 },
+            _ => BankBootState::default(),
+        }),
     };
 
     store.write_boot_state(&mut state).unwrap();
