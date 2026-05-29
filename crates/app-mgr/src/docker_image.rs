@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use machine_mgr::component::Component;
 use machine_mgr::error::{MachineError, MachineResult};
-use machine_mgr::types::{Capabilities, FlashCaps, FlashId, FlashSession, LifecycleCaps};
+use machine_mgr::types::{Capabilities, FlashCaps, FlashId, FlashSession, LifecycleCaps, ResetKind};
 use machine_mgr::{FlashState, FlashStatus};
 
 /// Configuration for the container image-store validation/import seam.
@@ -120,6 +120,8 @@ impl ContainerImageComponent {
                     supports_rollback: false,
                     supports_trial_boot: false,
                     abortable_after_finalize: true,
+                    // Container image import + restart — local-only.
+                    reset_kind: ResetKind::Local,
                 }),
                 lifecycle: Some(LifecycleCaps {
                     restartable: false,

@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+use crate::types::ResetKind;
+
 /// Errors returned by [`BankActivator::activate`].
 #[derive(Debug)]
 pub enum BankActivatorError {
@@ -52,4 +54,21 @@ impl From<std::io::Error> for BankActivatorError {
 /// - **Container import**: load an OCI tarball into the container runtime
 pub trait BankActivator: Send + Sync {
     fn activate(&self, bank_dir: &Path) -> Result<(), BankActivatorError>;
+
+    /// What kind of reset is needed to actually run the newly-activated bank.
+    ///
+    /// Default: [`ResetKind::Local`] — the activator's component can reset
+    /// itself locally (qvm process cycle, container restart, daemon SIGHUP).
+    ///
+    /// Override to [`ResetKind::RequiresEcuReset`] when the activator writes
+    /// to a partition whose contents only run after the host reboots
+    /// (m7loader writing to the M7 boot partition; IFS activators writing
+    /// the next-boot IFS). The orchestrator uses this to coalesce per-
+    /// component restarts into a single `PUT {ecu-path}/status/restart`
+    /// when the campaign mixes EcuReset-class and Local-class updates.
+    ///
+    /// See `tasks/reset-kind-and-status-restart.md`.
+    fn reset_kind(&self) -> ResetKind {
+        ResetKind::Local
+    }
 }

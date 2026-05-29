@@ -6,12 +6,13 @@
 //! (duplicate-id rejection, lookup, iteration), and wire-format
 //! round-trips for the capability descriptors.
 
+use crate::bank_activator::BankActivator;
 use crate::component::{Component, DidEntry};
 use crate::error::{MachineError, MachineResult};
 use crate::machine::{DuplicateComponentId, Machine, MachineRegistry};
 use crate::types::{
     Capabilities, Csr, DidFilter, DidKind, DtcFilter, FlashCaps, FlashId, FlashSession, HsmCaps,
-    LifecycleCaps, RuntimeState, RuntimeStatus,
+    LifecycleCaps, ResetKind, RuntimeState, RuntimeStatus,
 };
 use crate::EntityInfo;
 
@@ -291,6 +292,7 @@ fn capabilities_json_roundtrip() {
             supports_rollback: true,
             supports_trial_boot: true,
             abortable_after_finalize: false,
+            reset_kind: ResetKind::Local,
         }),
         lifecycle: Some(LifecycleCaps {
             restartable: true,
@@ -311,6 +313,86 @@ fn capabilities_json_roundtrip() {
         Some(true)
     );
     assert_eq!(back.hsm.as_ref().map(|h| h.supports_csr), Some(true));
+}
+
+// ---------------------------------------------------------------------------
+// ResetKind — capability declared by BankActivator implementations,
+// surfaced via FlashCaps so the orchestrator can coalesce per-component
+// restarts into one ECU-level reboot when required.
+// See tasks/reset-kind-and-status-restart.md (Phase 1).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reset_kind_defaults_to_local() {
+    // Both the enum's Default and the BankActivator trait default land on Local.
+    assert_eq!(ResetKind::default(), ResetKind::Local);
+
+    struct DefaultActivator;
+    impl crate::bank_activator::BankActivator for DefaultActivator {
+        fn activate(&self, _: &std::path::Path) -> Result<(), crate::bank_activator::BankActivatorError> {
+            Ok(())
+        }
+        // No reset_kind override — should fall back to Local.
+    }
+    let a = DefaultActivator;
+    assert_eq!(a.reset_kind(), ResetKind::Local);
+}
+
+#[test]
+fn reset_kind_override_is_honoured() {
+    struct EcuResetActivator;
+    impl crate::bank_activator::BankActivator for EcuResetActivator {
+        fn activate(&self, _: &std::path::Path) -> Result<(), crate::bank_activator::BankActivatorError> {
+            Ok(())
+        }
+        fn reset_kind(&self) -> ResetKind {
+            ResetKind::RequiresEcuReset
+        }
+    }
+    let a = EcuResetActivator;
+    assert_eq!(a.reset_kind(), ResetKind::RequiresEcuReset);
+}
+
+#[test]
+fn reset_kind_serializes_snake_case() {
+    // Wire-visible names — orchestrator parses these. Lock them down.
+    assert_eq!(serde_json::to_string(&ResetKind::None).unwrap(), "\"none\"");
+    assert_eq!(serde_json::to_string(&ResetKind::Local).unwrap(), "\"local\"");
+    assert_eq!(
+        serde_json::to_string(&ResetKind::RequiresEcuReset).unwrap(),
+        "\"requires_ecu_reset\""
+    );
+}
+
+#[test]
+fn flash_caps_reset_kind_round_trips() {
+    // Verify reset_kind survives JSON round-trip on FlashCaps.
+    let caps = FlashCaps {
+        dual_bank: true,
+        supports_rollback: true,
+        supports_trial_boot: true,
+        abortable_after_finalize: false,
+        reset_kind: ResetKind::RequiresEcuReset,
+    };
+    let json = serde_json::to_string(&caps).unwrap();
+    let back: FlashCaps = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.reset_kind, ResetKind::RequiresEcuReset);
+}
+
+#[test]
+fn flash_caps_reset_kind_defaults_for_old_payloads() {
+    // Pre-Phase-1 JSON (no reset_kind field) must still deserialise — the
+    // #[serde(default)] attribute keeps callers using older wire formats
+    // working, defaulting to Local which matches their actual behaviour
+    // before the field existed.
+    let legacy_json = r#"{
+        "dual_bank": true,
+        "supports_rollback": true,
+        "supports_trial_boot": true,
+        "abortable_after_finalize": false
+    }"#;
+    let caps: FlashCaps = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(caps.reset_kind, ResetKind::Local);
 }
 
 #[test]

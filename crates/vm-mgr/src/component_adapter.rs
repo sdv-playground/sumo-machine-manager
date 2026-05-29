@@ -79,6 +79,12 @@ fn derive_capabilities<D: BlockDevice + Send + 'static>(b: &VmBackend<D>) -> Cap
             // Today's VmBackend has no public abort hook — wired in a follow-up.
             // Keep this honest with the actual implementation: false.
             abortable_after_finalize: false,
+            // Phase 1 of Issue 2: surface the activator's declared reset kind
+            // so the orchestrator can coalesce per-component restarts into a
+            // single ECU-level `PUT status/restart` when needed. RT and host-os
+            // activators override to `RequiresEcuReset`; everything else gets
+            // the default `Local`. See tasks/reset-kind-and-status-restart.md.
+            reset_kind: b.reset_kind(),
         }),
         lifecycle: Some(LifecycleCaps {
             restartable: true,

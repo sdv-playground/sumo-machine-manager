@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use machine_mgr::{BankActivator, BankActivatorError};
+use machine_mgr::{BankActivator, BankActivatorError, ResetKind};
 
 pub struct DevBankActivator {
     boot_device: String,
@@ -67,5 +67,12 @@ impl BankActivator for DevBankActivator {
 
         tracing::info!("IFS activated — reboot required");
         Ok(())
+    }
+
+    fn reset_kind(&self) -> ResetKind {
+        // New IFS only runs after the host reboots — the boot partition's
+        // contents don't take effect until the bootloader picks them up
+        // on next boot.
+        ResetKind::RequiresEcuReset
     }
 }

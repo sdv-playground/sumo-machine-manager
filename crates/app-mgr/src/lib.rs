@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use machine_mgr::component::Component;
 use machine_mgr::error::{MachineError, MachineResult};
 use machine_mgr::types::{
-    Capabilities, FlashCaps, FlashId, FlashSession, LifecycleCaps, RuntimeState, RuntimeStatus,
+    Capabilities, FlashCaps, FlashId, FlashSession, LifecycleCaps, ResetKind, RuntimeState,
+    RuntimeStatus,
 };
 use machine_mgr::{ActivationState, FlashState};
 use nv_store::block::BlockDevice;
@@ -52,6 +53,9 @@ impl<D: BlockDevice + Send + 'static> AppComponent<D> {
                     supports_rollback: true,
                     supports_trial_boot: true,
                     abortable_after_finalize: true,
+                    // App / container component activates by image swap +
+                    // service restart — no host reboot needed.
+                    reset_kind: ResetKind::Local,
                 }),
                 lifecycle: Some(LifecycleCaps {
                     restartable: true,

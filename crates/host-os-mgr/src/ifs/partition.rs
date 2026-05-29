@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use machine_mgr::{BankActivator, BankActivatorError};
+use machine_mgr::{BankActivator, BankActivatorError, ResetKind};
 
 pub struct PartitionBankActivator {
     boot_partition: String,
@@ -34,5 +34,10 @@ impl BankActivator for PartitionBankActivator {
 
         tracing::info!("IFS written to partition — reboot required");
         Ok(())
+    }
+
+    fn reset_kind(&self) -> ResetKind {
+        // Raw partition write — new IFS runs only after the host reboots.
+        ResetKind::RequiresEcuReset
     }
 }

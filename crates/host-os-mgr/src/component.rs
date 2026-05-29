@@ -24,6 +24,7 @@ pub struct HostOsComponent<D: BlockDevice> {
 
 impl<D: BlockDevice + Send + 'static> HostOsComponent<D> {
     pub fn new(nv: Arc<Mutex<NvStore<D>>>, bank_activator: Arc<dyn BankActivator>) -> Self {
+        let reset_kind = bank_activator.reset_kind();
         Self {
             nv,
             _bank_activator: bank_activator,
@@ -34,6 +35,10 @@ impl<D: BlockDevice + Send + 'static> HostOsComponent<D> {
                     supports_rollback: true,
                     supports_trial_boot: true,
                     abortable_after_finalize: true,
+                    // Inherits from the underlying activator — both Dev and
+                    // Partition impls return RequiresEcuReset since the new
+                    // IFS doesn't run until the host reboots.
+                    reset_kind,
                 }),
                 lifecycle: Some(LifecycleCaps {
                     restartable: true,

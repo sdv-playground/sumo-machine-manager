@@ -46,6 +46,41 @@ pub struct FlashCaps {
     /// A/B-style components are typically `true` (finalize just flips a
     /// pointer that can be flipped back before reboot).
     pub abortable_after_finalize: bool,
+    /// What kind of reset is needed to activate a newly-staged image.
+    /// The orchestrator coalesces resets across components — multiple
+    /// `RequiresEcuReset` components in one campaign collapse into a single
+    /// `PUT {ecu-path}/status/restart` instead of N per-component restarts.
+    /// `#[serde(default)]` keeps older JSON payloads (pre-Phase-1) deserialising
+    /// — they get `Local` which matches their actual behaviour today.
+    /// See `tasks/reset-kind-and-status-restart.md` for the full design.
+    #[serde(default)]
+    pub reset_kind: ResetKind,
+}
+
+/// Which level of reset is needed to activate a newly-staged image.
+///
+/// Declared by `BankActivator::reset_kind()` (the activator knows what
+/// partition it wrote and whether that partition's contents only run after
+/// a host reboot). Propagated to `FlashCaps` via `derive_capabilities` and
+/// surfaced on the SOVD wire as part of `ActivationState` so the
+/// orchestrator can pick the right SOVD `status/restart` target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetKind {
+    /// Activation needs no reset — the new image is live the moment the
+    /// component finalises (e.g. HSM keystore swap, container hot-reload).
+    None,
+    /// Activation cycles the component itself (e.g. qvm process restart,
+    /// daemon SIGHUP). Orchestrator PUTs the component's own
+    /// `status/restart`. **Default** — most components fall here.
+    #[default]
+    Local,
+    /// Activation requires rebooting the parent ECU because the component's
+    /// freshly-flashed image only runs after a host boot (e.g. M7 firmware
+    /// via m7loader, host-OS IFS via Dev/Partition activators). Orchestrator
+    /// coalesces all `RequiresEcuReset` components in the same ECU into one
+    /// `PUT {ecu-path}/status/restart`.
+    RequiresEcuReset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

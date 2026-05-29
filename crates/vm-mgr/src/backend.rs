@@ -467,6 +467,17 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         self.vm_service_addr.is_some()
     }
 
+    /// Reset kind declared by this component's bank activator, or
+    /// [`ResetKind::Local`] when no activator is configured (e.g. VM
+    /// components without a custom activator: qvm/process cycle is local).
+    /// `derive_capabilities` reads this to populate `FlashCaps.reset_kind`.
+    pub fn reset_kind(&self) -> machine_mgr::ResetKind {
+        self.bank_activator
+            .as_ref()
+            .map(|a| a.reset_kind())
+            .unwrap_or(machine_mgr::ResetKind::Local)
+    }
+
     /// The bank an OTA upload should write to: the *inactive* bank for dual-bank
     /// components, or `Bank::A` for single-bank ones (HSM).
     ///

@@ -258,7 +258,7 @@ mod tests {
     use crate::manifest_provider::{ManifestError, ManifestType, ValidatedFirmware};
     use crate::ota::ImageMeta;
     use async_trait::async_trait;
-    use machine_mgr::{FlashCaps, LifecycleCaps};
+    use machine_mgr::{FlashCaps, LifecycleCaps, ResetKind};
     use nv_store::types::BankSet;
     use sumo_offboard::keygen::{self, ES256};
     use sumo_offboard::ImageManifestBuilder;
@@ -283,6 +283,7 @@ mod tests {
                         supports_rollback: false,
                         supports_trial_boot: false,
                         abortable_after_finalize: false,
+                        reset_kind: ResetKind::Local,
                     }),
                     lifecycle: Some(LifecycleCaps {
                         restartable: false,
