@@ -1,0 +1,43 @@
+[package]
+name = "puller"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# HTTP client.  Default features are fine — TLS via rustls (sumo-mm
+# workspace standard); JSON support pulled in transitively but
+# unused here (manifests are CBOR per FLEET-REPO-001 Q1).
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "fs"] }
+futures = "0.3"
+bytes = "1"
+
+# Hashing for content-addressable verification.
+sha2 = "0.10"
+hex = "0.4"
+
+# CBOR + COSE for manifest decode / signature verification.  The
+# manifest format mirrors SUIT (RFC 9019); we share sumo-rs's CBOR
+# helpers + verification primitives so the device path is identical
+# to the off-board signing path.
+sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+coset = "0.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+thiserror = "1"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
+tempfile = "3"
+sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
