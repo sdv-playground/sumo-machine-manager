@@ -151,15 +151,17 @@ pub fn validate(
     // Step 2: verify the ES256 signature against iam-signing.
     let verifying_key = parse_p256_pub(ecu_signing_pub).ok_or(AuthFailReason::InvalidParam)?;
     cose.verify_signature(b"", |sig, data| {
-        let signature =
-            Signature::from_slice(sig).map_err(|_| AuthFailReason::BadCertSignature)?;
+        let signature = Signature::from_slice(sig).map_err(|_| AuthFailReason::BadCertSignature)?;
         verifying_key
             .verify(data, &signature)
             .map_err(|_| AuthFailReason::BadCertSignature)
     })?;
 
     // Step 3: CBOR-decode payload.
-    let payload_bytes = cose.payload.as_deref().ok_or(AuthFailReason::InvalidParam)?;
+    let payload_bytes = cose
+        .payload
+        .as_deref()
+        .ok_or(AuthFailReason::InvalidParam)?;
     let payload_val: CborValue =
         ciborium::de::from_reader(payload_bytes).map_err(|_| AuthFailReason::InvalidParam)?;
     let claim_map = match payload_val {
@@ -168,7 +170,8 @@ pub fn validate(
     };
 
     // Step 4: aud check.
-    let aud: String = read_text_claim(&claim_map, CLAIM_AUD).ok_or(AuthFailReason::WrongAudience)?;
+    let aud: String =
+        read_text_claim(&claim_map, CLAIM_AUD).ok_or(AuthFailReason::WrongAudience)?;
     if aud != VHSM_AUDIENCE {
         return Err(AuthFailReason::WrongAudience);
     }
@@ -254,10 +257,14 @@ fn read_u64_claim(map: &[(CborValue, CborValue)], key: i64) -> Option<u64> {
 /// COSE_Key under label 1.
 fn extract_cnf_ec2_pub(claims: &[(CborValue, CborValue)]) -> Option<Vec<u8>> {
     let cnf = claims.iter().find(|(k, _)| matches_int(k, CLAIM_CNF))?;
-    let CborValue::Map(cnf_map) = &cnf.1 else { return None };
+    let CborValue::Map(cnf_map) = &cnf.1 else {
+        return None;
+    };
     // cnf must contain "COSE_Key" at label 1.
     let key_entry = cnf_map.iter().find(|(k, _)| matches_int(k, 1))?;
-    let CborValue::Map(key_map) = &key_entry.1 else { return None };
+    let CborValue::Map(key_map) = &key_entry.1 else {
+        return None;
+    };
 
     // Require: kty = EC2 (2), alg = ES256 (-7), crv = P-256 (1).
     let kty = read_int_map_val(key_map, COSE_KEY_KTY)?;
@@ -406,14 +413,12 @@ pub fn mint_cwt(
             CborValue::Integer(Integer::from(CLAIM_CTI)),
             CborValue::Bytes(cti.to_vec()),
         ),
-        (
-            CborValue::Integer(Integer::from(CLAIM_CNF)),
-            cnf_wrapped,
-        ),
+        (CborValue::Integer(Integer::from(CLAIM_CNF)), cnf_wrapped),
     ]);
 
     let mut payload_bytes = Vec::new();
-    ciborium::ser::into_writer(&claims, &mut payload_bytes).map_err(|_| MintError::EncodePayload)?;
+    ciborium::ser::into_writer(&claims, &mut payload_bytes)
+        .map_err(|_| MintError::EncodePayload)?;
 
     let cose = CoseSign1Builder::new()
         .protected(HeaderBuilder::new().algorithm(CoseAlg::ES256).build())
@@ -519,8 +524,7 @@ pub(crate) mod test_helpers {
             ..Default::default()
         };
         let cnf_val = cnf_cose_key.to_cbor_value().unwrap();
-        let cnf_wrapped =
-            CborValue::Map(vec![(CborValue::Integer(Integer::from(1i64)), cnf_val)]);
+        let cnf_wrapped = CborValue::Map(vec![(CborValue::Integer(Integer::from(1i64)), cnf_val)]);
         let claims = CborValue::Map(vec![
             (
                 CborValue::Integer(Integer::from(CLAIM_ISS)),
@@ -550,10 +554,7 @@ pub(crate) mod test_helpers {
                 CborValue::Integer(Integer::from(CLAIM_CTI)),
                 CborValue::Bytes(vec![0xCA; 16]),
             ),
-            (
-                CborValue::Integer(Integer::from(CLAIM_CNF)),
-                cnf_wrapped,
-            ),
+            (CborValue::Integer(Integer::from(CLAIM_CNF)), cnf_wrapped),
         ]);
         let mut payload_bytes = Vec::new();
         ciborium::ser::into_writer(&claims, &mut payload_bytes).unwrap();

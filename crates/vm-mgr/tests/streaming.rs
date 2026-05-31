@@ -17,7 +17,7 @@ use nv_store::types::{Bank, BankSet};
 use sumo_crypto::{CryptoBackend, RustCryptoBackend};
 use sumo_offboard::cose_key::CoseKey;
 use sumo_offboard::encryptor;
-use sumo_offboard::image_builder::{ImageManifestBuilder, MultiComponentBuilder, ComponentSpec};
+use sumo_offboard::image_builder::{ComponentSpec, ImageManifestBuilder, MultiComponentBuilder};
 use sumo_offboard::keygen;
 use sumo_offboard::recipient::Recipient;
 
@@ -44,14 +44,12 @@ fn test_provider(signing_key: &CoseKey, device_key: Option<&CoseKey>) -> SuitPro
     let provider = SuitProvider::new(pub_bytes);
     // Owned CoseKey + a static-RustCrypto-backend boxed into an Arc'd
     // `KeyUnwrap` so it satisfies the trait object's `'static` bound.
-    let unwrap: Option<
-        std::sync::Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>,
-    > = device_key.map(|dk| {
-        std::sync::Arc::new(OwnedInMemoryUnwrap {
-            device_key_cbor: dk.to_cose_key_bytes(),
-        })
-            as std::sync::Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>
-    });
+    let unwrap: Option<std::sync::Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>> =
+        device_key.map(|dk| {
+            std::sync::Arc::new(OwnedInMemoryUnwrap {
+                device_key_cbor: dk.to_cose_key_bytes(),
+            }) as std::sync::Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>
+        });
     provider.update_keys(signing_key.public_key_bytes(), unwrap, None);
     provider
 }
@@ -88,8 +86,11 @@ impl sumo_onboard::decryptor::KeyUnwrap for OwnedInMemoryUnwrap {
     ) -> Result<Vec<u8>, sumo_onboard::error::Sum2Error> {
         let key = self.parsed();
         let crypto = sumo_crypto::RustCryptoBackend::new();
-        sumo_onboard::decryptor::InMemoryKeyUnwrap::new(&key, &crypto)
-            .unwrap_cek_ecdh_es(ephem_pub, wrapped_cek, recipient_protected)
+        sumo_onboard::decryptor::InMemoryKeyUnwrap::new(&key, &crypto).unwrap_cek_ecdh_es(
+            ephem_pub,
+            wrapped_cek,
+            recipient_protected,
+        )
     }
 }
 
@@ -108,16 +109,16 @@ fn stream_chunked(data: Vec<u8>, chunk_size: usize) -> PackageStream {
 }
 
 /// Helper: encrypt a payload with ECDH-ES+A128KW.
-fn encrypt_payload(
-    plaintext: &[u8],
-    device_key: &CoseKey,
-) -> encryptor::EncryptedPayload {
+fn encrypt_payload(plaintext: &[u8], device_key: &CoseKey) -> encryptor::EncryptedPayload {
     let sender = keygen::generate_device_key(keygen::ES256).unwrap();
     let pub_key = CoseKey::from_cose_key_bytes(&device_key.public_key_bytes()).unwrap();
     encryptor::encrypt_firmware_ecdh(
         plaintext,
         &sender,
-        &[Recipient { public_key: pub_key, kid: b"test".to_vec() }],
+        &[Recipient {
+            public_key: pub_key,
+            kid: b"test".to_vec(),
+        }],
     )
     .unwrap()
 }
@@ -263,15 +264,27 @@ fn multi_component_separate_uploads() {
     // Step 3: Process each payload using manifest encryption info
     let kernel_out = tmp.path().join("vm1-kernel-staged.img");
     let (ksize, khash) = process_raw_payload(
-        &kernel_path, &manifest, 0, None, &kernel_digest, &kernel_out,
-    ).unwrap();
+        &kernel_path,
+        &manifest,
+        0,
+        None,
+        &kernel_digest,
+        &kernel_out,
+    )
+    .unwrap();
     assert_eq!(ksize, 2048);
     assert_eq!(khash, kernel_digest);
 
     let rootfs_out = tmp.path().join("vm1-staged.img");
     let (rsize, rhash) = process_raw_payload(
-        &rootfs_path, &manifest, 1, None, &rootfs_digest, &rootfs_out,
-    ).unwrap();
+        &rootfs_path,
+        &manifest,
+        1,
+        None,
+        &rootfs_digest,
+        &rootfs_out,
+    )
+    .unwrap();
     assert_eq!(rsize, 16384);
     assert_eq!(rhash, rootfs_digest);
 
@@ -321,7 +334,9 @@ fn multi_component_encrypted_separate() {
     // gets the same shape as production. Test-only — production wires
     // an HSM-backed HsmKeyUnwrap instead, which keeps the EC scalar
     // inside the secure element.
-    let dk_unwrap = OwnedInMemoryUnwrap { device_key_cbor: device_key.to_cose_key_bytes() };
+    let dk_unwrap = OwnedInMemoryUnwrap {
+        device_key_cbor: device_key.to_cose_key_bytes(),
+    };
 
     // Save encrypted payloads as raw files
     let kernel_path = tmp.path().join("upload-kernel.bin");
@@ -332,15 +347,27 @@ fn multi_component_encrypted_separate() {
     // Process each — decrypt + verify
     let kernel_out = tmp.path().join("vm1-kernel-staged.img");
     let (ksize, _) = process_raw_payload(
-        &kernel_path, &manifest, 0, Some(&dk_unwrap as &(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)), &kernel_digest, &kernel_out,
-    ).unwrap();
+        &kernel_path,
+        &manifest,
+        0,
+        Some(&dk_unwrap as &(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)),
+        &kernel_digest,
+        &kernel_out,
+    )
+    .unwrap();
     assert_eq!(ksize, 2048);
     assert_eq!(std::fs::read(&kernel_out).unwrap(), kernel);
 
     let rootfs_out = tmp.path().join("vm1-staged.img");
     let (rsize, _) = process_raw_payload(
-        &rootfs_path, &manifest, 1, Some(&dk_unwrap as &(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)), &rootfs_digest, &rootfs_out,
-    ).unwrap();
+        &rootfs_path,
+        &manifest,
+        1,
+        Some(&dk_unwrap as &(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)),
+        &rootfs_digest,
+        &rootfs_out,
+    )
+    .unwrap();
     assert_eq!(rsize, 8192);
     assert_eq!(std::fs::read(&rootfs_out).unwrap(), rootfs);
 }

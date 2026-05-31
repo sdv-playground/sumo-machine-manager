@@ -3,7 +3,7 @@ use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
 use vm_mgr::did;
-use vm_mgr::manifest::{FirmwareManifest, FactoryManifest};
+use vm_mgr::manifest::{FactoryManifest, FirmwareManifest};
 use vm_mgr::ota;
 
 use std::path::PathBuf;
@@ -31,11 +31,12 @@ fn parse_set(s: &str) -> BankSet {
 }
 
 fn parse_did(s: &str) -> u16 {
-    u16::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
-        .unwrap_or_else(|_| {
+    u16::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap_or_else(
+        |_| {
             eprintln!("Invalid DID '{s}'. Use hex, e.g. F189 or 0xFD10");
             std::process::exit(1);
-        })
+        },
+    )
 }
 
 fn bank_letter(b: Bank) -> &'static str {
@@ -88,7 +89,10 @@ fn main() {
                     println!("Boot count: {}", s.boot_count);
                     if let Some(v) = s.fw_version {
                         let end = v.iter().position(|&c| c == 0).unwrap_or(v.len());
-                        println!("FW version: {}", std::str::from_utf8(&v[..end]).unwrap_or("?"));
+                        println!(
+                            "FW version: {}",
+                            std::str::from_utf8(&v[..end]).unwrap_or("?")
+                        );
                     }
                     if let Some(v) = s.fw_secver {
                         println!("Security version: {v}");
@@ -127,7 +131,10 @@ fn main() {
 
             match ota::install(&mut nv, set, &image_data, &meta, false) {
                 Ok(result) => {
-                    println!("[diag] installed to bank {}", bank_letter(result.target_bank));
+                    println!(
+                        "[diag] installed to bank {}",
+                        bank_letter(result.target_bank)
+                    );
                     println!("[diag] SHA-256: {}", hex(&result.image_sha256));
                     println!("[diag] reboot to activate (trial mode)");
                 }
@@ -261,7 +268,10 @@ fn main() {
                     });
                     let mut nv_factory = fm.to_nv_factory();
                     nv.write_factory(&mut nv_factory).unwrap();
-                    println!("[factory] provisioned: serial={} vin={}", fm.serial_number, fm.vin);
+                    println!(
+                        "[factory] provisioned: serial={} vin={}",
+                        fm.serial_number, fm.vin
+                    );
                 }
             }
 
@@ -290,10 +300,13 @@ fn main() {
                             eprintln!("[factory] failed to read runner binary: {e}");
                             std::process::exit(1);
                         });
-                        use sha2::{Sha256, Digest};
+                        use sha2::{Digest, Sha256};
                         image_sha256 = Sha256::digest(&data).into();
                         fw_crc = crc32fast::hash(&data);
-                        println!("[factory] {name}: hashed runner binary ({} bytes)", data.len());
+                        println!(
+                            "[factory] {name}: hashed runner binary ({} bytes)",
+                            data.len()
+                        );
                     } else {
                         // No runner binary — use zero hash
                         image_sha256 = [0; 32];
@@ -308,7 +321,7 @@ fn main() {
                             eprintln!("[factory] failed to read {}: {e}", img_path.display());
                             std::process::exit(1);
                         });
-                        use sha2::{Sha256, Digest};
+                        use sha2::{Digest, Sha256};
                         image_sha256 = Sha256::digest(&data).into();
                         fw_crc = crc32fast::hash(&data);
                         println!("[factory] {name}: hashed image ({} bytes)", data.len());
@@ -341,7 +354,10 @@ fn main() {
                 };
                 // Write directly to bank A (factory state, no trial mode)
                 nv.write_fw_meta(set, Bank::A, &mut fw_meta).unwrap();
-                println!("[factory] {name}: wrote FW meta bank A (version: {})", manifest.version);
+                println!(
+                    "[factory] {name}: wrote FW meta bank A (version: {})",
+                    manifest.version
+                );
             }
 
             println!("[factory] initialization complete");

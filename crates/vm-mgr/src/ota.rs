@@ -1,14 +1,20 @@
-/// OTA update flow — download, verify, commit, rollback.
-///
-/// The diagserver manages the update lifecycle:
-/// 1. install()  — validate, copy-on-update, write image, verify hash, update NV
-/// 2. commit()   — mark trial as committed, raise anti-rollback floor
-/// 3. rollback() — swap back to previous bank
+//! OTA update flow — download, verify, commit, rollback.
+//!
+//! The diagserver manages the update lifecycle:
+//!
+//! 1. `install()`  — validate, copy-on-update, write image, verify hash, update NV
+//! 2. `commit()`   — mark trial as committed, raise anti-rollback floor
+//! 3. `rollback()` — swap back to previous bank
+//!
+//! Per-call NV record builders use `Default::default()` then assign
+//! fields for readability; the struct-init alternative would spell
+//! every default at each call site for negligible benefit.
+#![allow(clippy::field_reassign_with_default, clippy::too_many_arguments)]
 
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
 use nv_store::types::*;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum OtaError {
@@ -17,7 +23,10 @@ pub enum OtaError {
     /// Image security version below anti-rollback floor
     SecurityVersionTooLow { image: u32, floor: u32 },
     /// Image hash mismatch after write (read-back verification failed)
-    VerifyFailed { expected: [u8; 32], actual: [u8; 32] },
+    VerifyFailed {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
     /// Bank set is already committed — nothing to commit
     AlreadyCommitted,
     /// Bank set is already committed — nothing to rollback
@@ -51,7 +60,7 @@ impl std::fmt::Display for OtaError {
 }
 
 /// Metadata for an incoming OTA image (parsed from image header).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ImageMeta {
     pub fw_version: [u8; 32],
     pub fw_seq: u32,
@@ -64,24 +73,6 @@ pub struct ImageMeta {
     pub system_name: [u8; 32],
     pub programming_date: [u8; 8],
     pub tester_serial: [u8; 32],
-}
-
-impl Default for ImageMeta {
-    fn default() -> Self {
-        Self {
-            fw_version: [0; 32],
-            fw_seq: 0,
-            fw_secver: 0,
-            spare_part_number: [0; 32],
-            ecu_sw_number: [0; 32],
-            supplier_sw_number: [0; 32],
-            supplier_sw_version: [0; 32],
-            odx_file_id: [0; 32],
-            system_name: [0; 32],
-            programming_date: [0; 8],
-            tester_serial: [0; 32],
-        }
-    }
 }
 
 /// Result of a successful install.
@@ -140,7 +131,17 @@ pub fn install<D: BlockDevice>(
     let image_sha256: [u8; 32] = Sha256::digest(image_data).into();
     let fw_crc = crc32fast::hash(image_data);
 
-    install_inner(nv, set, state, idx, active, image_sha256, fw_crc, meta, single_bank)
+    install_inner(
+        nv,
+        set,
+        state,
+        idx,
+        active,
+        image_sha256,
+        fw_crc,
+        meta,
+        single_bank,
+    )
 }
 
 /// Install with pre-computed hash (streaming path — image already on disk).
@@ -172,7 +173,17 @@ pub fn install_precomputed<D: BlockDevice>(
 
     let fw_crc = crc32fast::hash(&image_size.to_le_bytes()); // Placeholder CRC for streamed data
 
-    install_inner(nv, set, state, idx, active, image_sha256, fw_crc, meta, single_bank)
+    install_inner(
+        nv,
+        set,
+        state,
+        idx,
+        active,
+        image_sha256,
+        fw_crc,
+        meta,
+        single_bank,
+    )
 }
 
 fn install_inner<D: BlockDevice>(
@@ -284,10 +295,7 @@ fn install_inner<D: BlockDevice>(
 ///
 /// Sets committed=true, resets boot count, and raises the anti-rollback
 /// floor if the new firmware's security version exceeds it.
-pub fn commit<D: BlockDevice>(
-    nv: &mut NvStore<D>,
-    set: BankSet,
-) -> Result<(), OtaError> {
+pub fn commit<D: BlockDevice>(nv: &mut NvStore<D>, set: BankSet) -> Result<(), OtaError> {
     let mut state = nv.read_boot_state().ok_or(OtaError::NoBootState)?;
     let idx = set.as_index();
 
@@ -315,10 +323,7 @@ pub fn commit<D: BlockDevice>(
 /// Rollback the current trial to the previous bank.
 ///
 /// Swaps active_bank back, sets committed=true.
-pub fn rollback<D: BlockDevice>(
-    nv: &mut NvStore<D>,
-    set: BankSet,
-) -> Result<Bank, OtaError> {
+pub fn rollback<D: BlockDevice>(nv: &mut NvStore<D>, set: BankSet) -> Result<Bank, OtaError> {
     let mut state = nv.read_boot_state().ok_or(OtaError::NoBootState)?;
     let idx = set.as_index();
 
@@ -346,10 +351,7 @@ pub struct BankStatus {
     pub min_security_ver: Option<u32>,
 }
 
-pub fn status<D: BlockDevice>(
-    nv: &NvStore<D>,
-    set: BankSet,
-) -> Option<BankStatus> {
+pub fn status<D: BlockDevice>(nv: &NvStore<D>, set: BankSet) -> Option<BankStatus> {
     let state = nv.read_boot_state()?;
     let bs = &state.banks[set.as_index()];
     let meta = nv.read_fw_meta(set, bs.active_bank);
@@ -398,14 +400,16 @@ mod tests {
     #[test]
     fn ota_error_display_covers_all_variants() {
         assert!(format!("{}", OtaError::InTrial).contains("trial"));
+        assert!(
+            format!("{}", OtaError::SecurityVersionTooLow { image: 1, floor: 2 })
+                .contains("below floor 2")
+        );
         assert!(format!(
             "{}",
-            OtaError::SecurityVersionTooLow { image: 1, floor: 2 }
-        )
-        .contains("below floor 2"));
-        assert!(format!(
-            "{}",
-            OtaError::VerifyFailed { expected: [0; 32], actual: [1; 32] }
+            OtaError::VerifyFailed {
+                expected: [0; 32],
+                actual: [1; 32]
+            }
         )
         .contains("verification failed"));
         assert!(format!("{}", OtaError::AlreadyCommitted).contains("already committed"));
@@ -464,7 +468,8 @@ mod tests {
         let mut initial = NvFwMeta::default();
         initial.fw_secver = 5;
         initial.min_security_ver = 5;
-        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut initial).unwrap();
+        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut initial)
+            .unwrap();
 
         install(&mut nv, BankSet::Vm1, b"img", &meta_v(1, 7), false).unwrap();
 
@@ -497,7 +502,13 @@ mod tests {
         nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut cur).unwrap();
 
         let err = install(&mut nv, BankSet::Vm1, b"img", &meta_v(1, 3), false).unwrap_err();
-        assert_eq!(err, OtaError::SecurityVersionTooLow { image: 3, floor: 10 });
+        assert_eq!(
+            err,
+            OtaError::SecurityVersionTooLow {
+                image: 3,
+                floor: 10
+            }
+        );
     }
 
     #[test]
@@ -536,11 +547,14 @@ mod tests {
         init_boot(&mut nv);
 
         let sha = [0xAA; 32];
-        let res = install_precomputed(&mut nv, BankSet::Vm1, sha, 1234, &meta_v(1, 0), false)
-            .unwrap();
+        let res =
+            install_precomputed(&mut nv, BankSet::Vm1, sha, 1234, &meta_v(1, 0), false).unwrap();
         assert_eq!(res.target_bank, Bank::B);
         assert_eq!(res.image_sha256, sha);
-        assert_eq!(nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap().image_sha256, sha);
+        assert_eq!(
+            nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap().image_sha256,
+            sha
+        );
     }
 
     #[test]
@@ -551,10 +565,8 @@ mod tests {
         cur.min_security_ver = 9;
         nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut cur).unwrap();
 
-        let err = install_precomputed(
-            &mut nv, BankSet::Vm1, [0; 32], 10, &meta_v(1, 2), false,
-        )
-        .unwrap_err();
+        let err = install_precomputed(&mut nv, BankSet::Vm1, [0; 32], 10, &meta_v(1, 2), false)
+            .unwrap_err();
         assert_eq!(err, OtaError::SecurityVersionTooLow { image: 2, floor: 9 });
     }
 
@@ -629,7 +641,11 @@ mod tests {
         assert_eq!(prev, Bank::A);
 
         let s = status(&nv, BankSet::Vm1).unwrap();
-        assert_eq!(s.active_bank, Bank::A, "rollback must restore previous bank");
+        assert_eq!(
+            s.active_bank,
+            Bank::A,
+            "rollback must restore previous bank"
+        );
         assert!(s.committed);
         assert_eq!(s.boot_count, 0);
     }
@@ -689,7 +705,9 @@ mod tests {
         commit(&mut nv, BankSet::Vm1).unwrap();
         assert_eq!(status(&nv, BankSet::Vm1).unwrap().active_bank, Bank::A);
         assert_eq!(
-            nv.read_fw_meta(BankSet::Vm1, Bank::A).unwrap().min_security_ver,
+            nv.read_fw_meta(BankSet::Vm1, Bank::A)
+                .unwrap()
+                .min_security_ver,
             2,
             "floor tracks committed secver across cycles"
         );

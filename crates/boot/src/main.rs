@@ -1,8 +1,8 @@
 use nv_store::block::FileBlockDevice;
 use nv_store::store::MIN_NV_DEVICE_SIZE;
 use nv_store::types::BankSet;
-use vm_boot::{BootAction, BootManager, HashCheck};
 use std::path::PathBuf;
+use vm_boot::{BootAction, BootManager, HashCheck};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -18,7 +18,7 @@ fn main() {
         }
     };
 
-    let init = args.get(2).map_or(false, |a| a == "--init");
+    let init = args.get(2).is_some_and(|a| a == "--init");
 
     let dev = if init && !nv_path.exists() {
         eprintln!("[bootmgr] creating NV store: {}", nv_path.display());
@@ -74,9 +74,7 @@ fn main() {
                 );
             }
             BootAction::HashRollback { from, to } => {
-                eprintln!(
-                    "[bootmgr] {name}: HASH ROLLBACK from bank {from:?} to {to:?}"
-                );
+                eprintln!("[bootmgr] {name}: HASH ROLLBACK from bank {from:?} to {to:?}");
             }
             BootAction::HashFatal { bank } => {
                 eprintln!(
@@ -87,8 +85,7 @@ fn main() {
 
         // Verify image hash if we have a bank to boot
         let bank = match action {
-            BootAction::Boot { bank }
-            | BootAction::TrialBoot { bank, .. } => Some(*bank),
+            BootAction::Boot { bank } | BootAction::TrialBoot { bank, .. } => Some(*bank),
             _ => None,
         };
         if let Some(bank) = bank {
@@ -99,7 +96,9 @@ fn main() {
                 HashCheck::Mismatch { .. } => {
                     eprintln!("[bootmgr] {name}: IMAGE HASH MISMATCH");
                     match mgr.handle_hash_failure(set) {
-                        Ok(recovery) => eprintln!("[bootmgr] {name}: recovery action: {recovery:?}"),
+                        Ok(recovery) => {
+                            eprintln!("[bootmgr] {name}: recovery action: {recovery:?}")
+                        }
                         Err(e) => eprintln!("[bootmgr] {name}: recovery failed: {e}"),
                     }
                 }

@@ -227,9 +227,8 @@ fn main() {
         std::process::exit(1);
     });
 
-    let listen_addr = listen_addr.unwrap_or_else(|| {
-        DEFAULT_LISTEN.parse().expect("DEFAULT_LISTEN parse")
-    });
+    let listen_addr =
+        listen_addr.unwrap_or_else(|| DEFAULT_LISTEN.parse().expect("DEFAULT_LISTEN parse"));
 
     // Create HSM provider (reads keys from keystore)
     let hsm = SimHsm::new(
@@ -268,7 +267,10 @@ fn main() {
             iam
         }
         Err(e) => {
-            eprintln!("error: failed to load --policy-dir {}: {e}", policy_dir.display());
+            eprintln!(
+                "error: failed to load --policy-dir {}: {e}",
+                policy_dir.display()
+            );
             std::process::exit(1);
         }
     };
@@ -287,7 +289,10 @@ fn main() {
             s
         }
         Err(e) => {
-            eprintln!("error: failed to load --bootstrap-state {}: {e}", bootstrap_state_path.display());
+            eprintln!(
+                "error: failed to load --bootstrap-state {}: {e}",
+                bootstrap_state_path.display()
+            );
             std::process::exit(1);
         }
     };
@@ -353,7 +358,10 @@ fn main() {
                 );
             }
             Err(e) => {
-                eprintln!("error: failed to load --extension-handles {}: {e}", path.display());
+                eprintln!(
+                    "error: failed to load --extension-handles {}: {e}",
+                    path.display()
+                );
                 std::process::exit(1);
             }
         }
@@ -362,10 +370,7 @@ fn main() {
     // Set up secstore for dynamic handle persistence (optional)
     let store: Option<Arc<Secstore<LinuxSimEncryptor, FileBackend>>> =
         persist_dir.as_ref().map(|dir| {
-            let s = Secstore::new(
-                LinuxSimEncryptor::default_test(),
-                FileBackend::new(dir),
-            );
+            let s = Secstore::new(LinuxSimEncryptor::default_test(), FileBackend::new(dir));
             match s.load_all() {
                 Ok(metas) => {
                     for m in &metas {
@@ -374,8 +379,12 @@ fn main() {
                         let copy_len = bytes.len().min(LABEL_LEN - 1);
                         label[..copy_len].copy_from_slice(&bytes[..copy_len]);
                         table.allocate(
-                            &m.key_id, m.algorithm, m.permitted_ops,
-                            &m.owner_vm_id, m.persistent, &label,
+                            &m.key_id,
+                            m.algorithm,
+                            m.permitted_ops,
+                            &m.owner_vm_id,
+                            m.persistent,
+                            &label,
                         );
                     }
                     tracing::info!(count = metas.len(), "loaded persisted handles");
@@ -542,7 +551,7 @@ fn serve_connection(
             let resp = {
                 let mut bootstrap_guard = bootstrap.lock().unwrap();
                 let mut ctx = EnrollContext {
-                    bootstrap: &mut *bootstrap_guard,
+                    bootstrap: &mut bootstrap_guard,
                     signer,
                     issuer,
                     cert_lifetime_secs,
@@ -575,7 +584,10 @@ fn serve_connection(
                     );
                     principal = Some(p.clone());
                 }
-                HandshakeState::Enrolled { vm_id, cert_thumbprint } => {
+                HandshakeState::Enrolled {
+                    vm_id,
+                    cert_thumbprint,
+                } => {
                     tracing::info!(
                         peer = %peer_ip,
                         vm = %vm_id,
@@ -680,11 +692,36 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     // the HsmIamSigner adapter (which calls sign_raw_p256 directly,
     // host-privileged path bypassing the handle table).
     let well_known = [
-        (HANDLE_SW_AUTHORITY, "sw-authority", ALG_ECC_P256, PERM_VERIFY),
-        (HANDLE_DEVICE_DECRYPT, "device-decrypt", ALG_ECC_P256, PERM_DECRYPT | PERM_GET_PUBKEY),
-        (HANDLE_KEY_AUTHORITY, "key-authority", ALG_ECC_P256, PERM_VERIFY),
-        (HANDLE_JWT_SIGNING, "jwt-signing", ALG_ECC_P256, PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY),
-        (HANDLE_STORAGE, "storage-key", ALG_AES_256, PERM_ENCRYPT | PERM_DECRYPT),
+        (
+            HANDLE_SW_AUTHORITY,
+            "sw-authority",
+            ALG_ECC_P256,
+            PERM_VERIFY,
+        ),
+        (
+            HANDLE_DEVICE_DECRYPT,
+            "device-decrypt",
+            ALG_ECC_P256,
+            PERM_DECRYPT | PERM_GET_PUBKEY,
+        ),
+        (
+            HANDLE_KEY_AUTHORITY,
+            "key-authority",
+            ALG_ECC_P256,
+            PERM_VERIFY,
+        ),
+        (
+            HANDLE_JWT_SIGNING,
+            "jwt-signing",
+            ALG_ECC_P256,
+            PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY,
+        ),
+        (
+            HANDLE_STORAGE,
+            "storage-key",
+            ALG_AES_256,
+            PERM_ENCRYPT | PERM_DECRYPT,
+        ),
     ];
 
     for (handle, key_id, alg, perms) in &well_known {
@@ -730,7 +767,9 @@ fn print_usage() {
     eprintln!("  --keystore <path>           HSM keystore directory");
     eprintln!("  --policy-dir <dir>          Policy directory (AUTH-ARCH-001 §4 — Phase 3 path).");
     eprintln!("                              Contains policy.yaml + roots/ + (optional) crl.yaml.");
-    eprintln!("                              Typically /etc/sumo/policy/ shipped inside the host-os");
+    eprintln!(
+        "                              Typically /etc/sumo/policy/ shipped inside the host-os"
+    );
     eprintln!("                              rootfs bank.");
     eprintln!("  --iam-policy <file>         YAML policy file (legacy; mutually exclusive with --policy-dir).");
     eprintln!("                              Statements + principals + handles + ops.");

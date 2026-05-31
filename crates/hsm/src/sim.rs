@@ -26,7 +26,6 @@
 ///     {key_id}.cert      — X.509 certificate (PEM, optional)
 ///     {key_id}.bin       — AES-256 raw key (32 bytes)
 /// ```
-
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -61,12 +60,12 @@ pub struct SimHsm {
     /// fsync'd JSON line per dispatched op there. When None, audit
     /// logging is off (dev rigs / loopback tests).
     audit_log: Option<PathBuf>,
-    /// Policy directory passed to vhsm-ssd via `--policy-dir`. Must
+    /// Policy directory passed to vhsm-ssd via `--policy-dir`.  Must
     /// contain `policy.yaml` (+ optional `roots/`, `crl.yaml`,
-    /// `launcher-policy.yaml`). Set via [`Self::with_policy_dir`]
+    /// `launcher-policy.yaml`).  Set via [`Self::with_policy_dir`]
     /// before [`start_service`]; required — `start_service` errors
-    /// out when None. The legacy `--iam-policy` single-file path
-    /// + synthetic wildcard generator was retired once the in-bank
+    /// out when None.  The legacy `--iam-policy` single-file path +
+    /// synthetic wildcard generator was retired once the in-bank
     /// policy partition proved out on managed-cvc (AUTH-ARCH-001 §4).
     policy_dir: Option<PathBuf>,
     /// Running daemon process handle.
@@ -77,11 +76,7 @@ impl SimHsm {
     /// Construct with the default `127.0.0.1` bind — suitable for
     /// tests and dev workstations where the daemon and clients all
     /// run in the same network namespace.
-    pub fn new(
-        daemon_bin: PathBuf,
-        keystore_path: PathBuf,
-        tcp_port: u16,
-    ) -> Self {
+    pub fn new(daemon_bin: PathBuf, keystore_path: PathBuf, tcp_port: u16) -> Self {
         Self::with_bind(
             daemon_bin,
             keystore_path,
@@ -336,17 +331,11 @@ impl SimHsm {
                     let scalar = sk.to_bytes();
                     let pk = sk.verifying_key().to_encoded_point(false);
                     write_pem_ec_private(&priv_path, &scalar).map_err(|e| {
-                        HsmError::KeystoreError(format!(
-                            "generate {} priv: {e}",
-                            slot.key_id,
-                        ))
+                        HsmError::KeystoreError(format!("generate {} priv: {e}", slot.key_id,))
                     })?;
                     let pub_path = keys_dir.join(format!("{}.pub", slot.key_id));
                     write_pem_ec_public(&pub_path, pk.as_bytes()).map_err(|e| {
-                        HsmError::KeystoreError(format!(
-                            "generate {} pub: {e}",
-                            slot.key_id,
-                        ))
+                        HsmError::KeystoreError(format!("generate {} pub: {e}", slot.key_id,))
                     })?;
                     tracing::info!(key_id = %slot.key_id, "generated EC-P256 keypair locally");
                 }
@@ -359,10 +348,7 @@ impl SimHsm {
                     use rand::RngCore;
                     rand::rngs::OsRng.fill_bytes(&mut bytes);
                     std::fs::write(&path, &bytes).map_err(|e| {
-                        HsmError::KeystoreError(format!(
-                            "write generated {}: {e}",
-                            path.display(),
-                        ))
+                        HsmError::KeystoreError(format!("write generated {}: {e}", path.display(),))
                     })?;
                     tracing::info!(key_id = %slot.key_id, "generated AES-256 key locally");
                 }
@@ -429,8 +415,7 @@ impl SimHsm {
                     .map_err(|e| HsmError::KeystoreError(format!("write manifest: {e}")))?;
             }
 
-            writeln!(f)
-                .map_err(|e| HsmError::KeystoreError(format!("write manifest: {e}")))?;
+            writeln!(f).map_err(|e| HsmError::KeystoreError(format!("write manifest: {e}")))?;
         }
 
         Ok(())
@@ -484,13 +469,9 @@ impl SimHsm {
             let mut allowed_ops = None;
             for part in parts.iter().skip(4) {
                 if let Some(guests) = part.strip_prefix("allowed_guests=") {
-                    allowed_guests = Some(
-                        guests.split(',').map(|s| s.to_string()).collect(),
-                    );
+                    allowed_guests = Some(guests.split(',').map(|s| s.to_string()).collect());
                 } else if let Some(ops) = part.strip_prefix("allowed_ops=") {
-                    allowed_ops = Some(
-                        ops.split(',').map(|s| s.to_string()).collect(),
-                    );
+                    allowed_ops = Some(ops.split(',').map(|s| s.to_string()).collect());
                 }
             }
 
@@ -535,7 +516,10 @@ impl SimHsm {
 
         // Probe: can we bind ourselves? If yes, no orphan, nothing to do.
         match std::net::TcpListener::bind(listen) {
-            Ok(l) => { drop(l); return; }
+            Ok(l) => {
+                drop(l);
+                return;
+            }
             Err(e) => {
                 tracing::warn!(
                     addr = listen, error = %e,
@@ -548,17 +532,18 @@ impl SimHsm {
         // anywhere in argv0; we don't want to whack random processes,
         // so use the executable basename which should be uniquely
         // ours.
-        let bin_name = self.daemon_bin
+        let bin_name = self
+            .daemon_bin
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("vhsm-test-ssd");
 
         let attempts: &[(&str, &[&str])] = &[
             ("pkill", &["-TERM", "-x", bin_name]),
-            ("slay",  &["-T1", bin_name]),
+            ("slay", &["-T1", bin_name]),
             // Final fallback if the running daemon ignored SIGTERM.
             ("pkill", &["-KILL", "-x", bin_name]),
-            ("slay",  &["-9", bin_name]),
+            ("slay", &["-9", bin_name]),
         ];
         for (cmd, args) in attempts {
             let _ = Command::new(cmd)
@@ -620,10 +605,7 @@ impl SimHsm {
 
         // Verify component ID is ["hsm", "keys"]
         if let Some(cid) = manifest.component_id(0) {
-            if cid.len() != 2
-                || cid[0].as_slice() != b"hsm"
-                || cid[1].as_slice() != b"keys"
-            {
+            if cid.len() != 2 || cid[0].as_slice() != b"hsm" || cid[1].as_slice() != b"keys" {
                 return Err(HsmError::EnvelopeInvalid(
                     "unexpected component_id (expected [\"hsm\", \"keys\"])".into(),
                 ));
@@ -646,11 +628,9 @@ impl SimHsm {
         // Decrypt with device key (slot 2) — always the same key
         let device_key = self.load_device_decrypt_key()?;
 
-        let ciphertext = manifest
-            .integrated_payload("#hsm-keys")
-            .ok_or_else(|| {
-                HsmError::EnvelopeInvalid("missing integrated payload #hsm-keys".into())
-            })?;
+        let ciphertext = manifest.integrated_payload("#hsm-keys").ok_or_else(|| {
+            HsmError::EnvelopeInvalid("missing integrated payload #hsm-keys".into())
+        })?;
 
         // Internal SimHsm flow: extracting the bootstrap device key
         // here is fine because we own the keystore on disk and the
@@ -673,7 +653,7 @@ impl SimHsm {
         plaintext.truncate(total);
 
         // Decompress if zstd-compressed (detect magic bytes)
-        let payload = if plaintext.len() >= 4 && &plaintext[..4] == &[0x28, 0xB5, 0x2F, 0xFD] {
+        let payload = if plaintext.len() >= 4 && plaintext[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
             decompress_zstd(&plaintext)?
         } else {
             plaintext
@@ -713,8 +693,7 @@ impl SimHsm {
         envelope_bytes: &[u8],
         _is_factory: bool,
     ) -> Result<(Vec<u8>, u64), HsmError> {
-        let ks = payload::decode(envelope_bytes)
-            .map_err(|e| HsmError::PayloadInvalid(e))?;
+        let ks = payload::decode(envelope_bytes).map_err(|e| HsmError::PayloadInvalid(e))?;
         let sv = ks.security_version;
         Ok((envelope_bytes.to_vec(), sv))
     }
@@ -729,12 +708,10 @@ impl HsmProvider for SimHsm {
         let is_factory = !self.is_provisioned()?;
 
         // Extract and validate the CBOR payload from the SUIT envelope
-        let (cbor_payload, _security_version) =
-            self.extract_payload(suit_envelope, is_factory)?;
+        let (cbor_payload, _security_version) = self.extract_payload(suit_envelope, is_factory)?;
 
         // Parse the key material
-        let keystore = payload::decode(&cbor_payload)
-            .map_err(|e| HsmError::PayloadInvalid(e))?;
+        let keystore = payload::decode(&cbor_payload).map_err(HsmError::PayloadInvalid)?;
 
         tracing::info!(
             slots = keystore.slots.len(),
@@ -790,12 +767,10 @@ impl HsmProvider for SimHsm {
 
         // Load existing state (or empty if missing).
         let mut doc: serde_yaml::Value = if path.exists() {
-            let raw = std::fs::read_to_string(&path).map_err(|e| {
-                HsmError::ProcessError(format!("read {}: {e}", path.display()))
-            })?;
-            serde_yaml::from_str(&raw).map_err(|e| {
-                HsmError::ProcessError(format!("parse {}: {e}", path.display()))
-            })?
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| HsmError::ProcessError(format!("read {}: {e}", path.display())))?;
+            serde_yaml::from_str(&raw)
+                .map_err(|e| HsmError::ProcessError(format!("parse {}: {e}", path.display())))?
         } else {
             serde_yaml::Value::Mapping(Default::default())
         };
@@ -832,29 +807,28 @@ impl HsmProvider for SimHsm {
         );
 
         // Atomic write.
-        let yaml = serde_yaml::to_string(&doc).map_err(|e| {
-            HsmError::ProcessError(format!("serialise bootstrap.yaml: {e}"))
-        })?;
+        let yaml = serde_yaml::to_string(&doc)
+            .map_err(|e| HsmError::ProcessError(format!("serialise bootstrap.yaml: {e}")))?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                HsmError::ProcessError(format!("mkdir {}: {e}", parent.display()))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| HsmError::ProcessError(format!("mkdir {}: {e}", parent.display())))?;
         }
         let tmp = path.with_extension("yaml.tmp");
         {
             use std::io::Write as _;
-            let mut f = std::fs::File::create(&tmp).map_err(|e| {
-                HsmError::ProcessError(format!("create {}: {e}", tmp.display()))
-            })?;
-            f.write_all(yaml.as_bytes()).map_err(|e| {
-                HsmError::ProcessError(format!("write {}: {e}", tmp.display()))
-            })?;
-            f.sync_data().map_err(|e| {
-                HsmError::ProcessError(format!("sync {}: {e}", tmp.display()))
-            })?;
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| HsmError::ProcessError(format!("create {}: {e}", tmp.display())))?;
+            f.write_all(yaml.as_bytes())
+                .map_err(|e| HsmError::ProcessError(format!("write {}: {e}", tmp.display())))?;
+            f.sync_data()
+                .map_err(|e| HsmError::ProcessError(format!("sync {}: {e}", tmp.display())))?;
         }
         std::fs::rename(&tmp, &path).map_err(|e| {
-            HsmError::ProcessError(format!("rename {} → {}: {e}", tmp.display(), path.display()))
+            HsmError::ProcessError(format!(
+                "rename {} → {}: {e}",
+                tmp.display(),
+                path.display()
+            ))
         })?;
 
         tracing::info!(
@@ -871,12 +845,10 @@ impl HsmProvider for SimHsm {
         if !path.exists() {
             return Ok(false);
         }
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            HsmError::ProcessError(format!("read {}: {e}", path.display()))
-        })?;
-        let doc: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|e| {
-            HsmError::ProcessError(format!("parse {}: {e}", path.display()))
-        })?;
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| HsmError::ProcessError(format!("read {}: {e}", path.display())))?;
+        let doc: serde_yaml::Value = serde_yaml::from_str(&raw)
+            .map_err(|e| HsmError::ProcessError(format!("parse {}: {e}", path.display())))?;
         Ok(doc["enrolled"]
             .as_mapping()
             .map(|m| m.contains_key(serde_yaml::Value::from(vm_id)))
@@ -888,12 +860,10 @@ impl HsmProvider for SimHsm {
         if !path.exists() {
             return Ok(false);
         }
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            HsmError::ProcessError(format!("read {}: {e}", path.display()))
-        })?;
-        let mut doc: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|e| {
-            HsmError::ProcessError(format!("parse {}: {e}", path.display()))
-        })?;
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| HsmError::ProcessError(format!("read {}: {e}", path.display())))?;
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(&raw)
+            .map_err(|e| HsmError::ProcessError(format!("parse {}: {e}", path.display())))?;
         let removed = doc
             .as_mapping_mut()
             .and_then(|m| m.get_mut(serde_yaml::Value::from("enrolled")))
@@ -901,25 +871,21 @@ impl HsmProvider for SimHsm {
             .map(|m| m.remove(serde_yaml::Value::from(vm_id)).is_some())
             .unwrap_or(false);
         if removed {
-            let yaml = serde_yaml::to_string(&doc).map_err(|e| {
-                HsmError::ProcessError(format!("serialise: {e}"))
-            })?;
+            let yaml = serde_yaml::to_string(&doc)
+                .map_err(|e| HsmError::ProcessError(format!("serialise: {e}")))?;
             let tmp = path.with_extension("yaml.tmp");
             {
                 use std::io::Write as _;
                 let mut f = std::fs::File::create(&tmp).map_err(|e| {
                     HsmError::ProcessError(format!("create {}: {e}", tmp.display()))
                 })?;
-                f.write_all(yaml.as_bytes()).map_err(|e| {
-                    HsmError::ProcessError(format!("write {}: {e}", tmp.display()))
-                })?;
-                f.sync_data().map_err(|e| {
-                    HsmError::ProcessError(format!("sync {}: {e}", tmp.display()))
-                })?;
+                f.write_all(yaml.as_bytes())
+                    .map_err(|e| HsmError::ProcessError(format!("write {}: {e}", tmp.display())))?;
+                f.sync_data()
+                    .map_err(|e| HsmError::ProcessError(format!("sync {}: {e}", tmp.display())))?;
             }
-            std::fs::rename(&tmp, &path).map_err(|e| {
-                HsmError::ProcessError(format!("rename: {e}"))
-            })?;
+            std::fs::rename(&tmp, &path)
+                .map_err(|e| HsmError::ProcessError(format!("rename: {e}")))?;
             tracing::info!(vm_id, "cleared enrolled record");
         }
         Ok(removed)
@@ -991,10 +957,14 @@ impl HsmProvider for SimHsm {
         }
 
         let mut cmd = Command::new(&self.daemon_bin);
-        cmd.arg("--keystore").arg(&self.keystore_path)
-            .arg("--listen").arg(&listen)
-            .arg("--policy-dir").arg(policy_dir)
-            .arg("--bootstrap-state").arg(&bootstrap_path);
+        cmd.arg("--keystore")
+            .arg(&self.keystore_path)
+            .arg("--listen")
+            .arg(&listen)
+            .arg("--policy-dir")
+            .arg(policy_dir)
+            .arg("--bootstrap-state")
+            .arg(&bootstrap_path);
         // Pass the (ip, vm_id) pairs the orchestrator already has
         // through to the daemon's ENROLL_ASSISTED resolver. Same
         // entries that get baked into the default IAM policy above.
@@ -1258,8 +1228,7 @@ pub(crate) fn decode_pem(pem: &str, expected_label: &str) -> Result<Vec<u8>, Hsm
         .filter(|c| !c.is_whitespace())
         .collect();
 
-    base64_decode(&b64)
-        .map_err(|e| HsmError::KeystoreError(format!("base64 decode: {e}")))
+    base64_decode(&b64).map_err(|e| HsmError::KeystoreError(format!("base64 decode: {e}")))
 }
 
 /// Simple base64 decoder.
@@ -1444,10 +1413,9 @@ fn build_public_cose_key_with_alg(
 
 /// Simple base64 encoder (no external dep needed).
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
@@ -1526,11 +1494,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("hsm-test-provision");
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let hsm = SimHsm::new(
-            PathBuf::from("/dev/null"),
-            tmp.clone(),
-            5100,
-        );
+        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
 
         let ks = sample_keystore();
         let _cbor = payload::encode(&ks).unwrap();
@@ -1598,11 +1562,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let hsm = SimHsm::new(
-            PathBuf::from("/dev/null"),
-            tmp.clone(),
-            5100,
-        );
+        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
 
         // No state file → version 0
         assert_eq!(hsm.load_security_version().unwrap(), 0);
@@ -1727,7 +1687,10 @@ mod tests {
         let yaml = std::fs::read_to_string(keystore.join("bootstrap.yaml")).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let pending = &parsed["pending"]["vm9"];
-        assert!(pending.is_mapping(), "pending entry should be a map; got: {yaml}");
+        assert!(
+            pending.is_mapping(),
+            "pending entry should be a map; got: {yaml}"
+        );
         assert_eq!(pending["ttl_secs"].as_u64(), Some(3600));
         assert!(pending["armed_at"].as_u64().is_some());
     }

@@ -5,7 +5,6 @@
 /// No network transport needed — tests the full protocol logic in-process.
 /// The handshake state machine (auth.rs) has its own unit tests; this
 /// suite exercises the post-handshake dispatch path.
-
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -49,16 +48,11 @@ impl TestFixture {
     fn new() -> Self {
         let id = TEST_ID.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        let keystore_path =
-            std::env::temp_dir().join(format!("vhsm-ssd-test-v2-{pid}-{id}"));
+        let keystore_path = std::env::temp_dir().join(format!("vhsm-ssd-test-v2-{pid}-{id}"));
 
         Self::build_keystore(&keystore_path);
 
-        let hsm = SimHsm::new(
-            PathBuf::from("unused"),
-            keystore_path.clone(),
-            5100,
-        );
+        let hsm = SimHsm::new(PathBuf::from("unused"), keystore_path.clone(), 5100);
         let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(hsm);
 
         // Init handle table with well-known handles
@@ -95,7 +89,8 @@ impl TestFixture {
         //
         // Dynamic handles (allocated below) bypass IAM and rely on
         // owner-scoping + the per-handle permitted_ops bitmask.
-        let iam = IamPolicy::parse(r#"
+        let iam = IamPolicy::parse(
+            r#"
 version: 1
 statements:
   # vm1 has broad access on mykey, INCLUDING the unrealistic
@@ -111,7 +106,9 @@ statements:
   - principals: [vm1, vm2]
     handles: [system]
     ops: [get-random, key-generate]
-"#).expect("test IAM policy parses");
+"#,
+        )
+        .expect("test IAM policy parses");
 
         Self {
             crypto,
@@ -130,7 +127,14 @@ statements:
         // Discard AuthzOutcome — these tests assert on the Response
         // only. The Phase 7 audit-log integration is unit-tested in
         // audit.rs.
-        handler::handle_request(&req, caller, &mut self.handle_table, &self.iam, &*self.crypto).0
+        handler::handle_request(
+            &req,
+            caller,
+            &mut self.handle_table,
+            &self.iam,
+            &*self.crypto,
+        )
+        .0
     }
 
     /// Helper: build payload with handle prefix + data.
@@ -194,11 +198,7 @@ statements:
             -----END CERTIFICATE-----\n";
         std::fs::write(path.join("keys").join("mykey.cert"), cert_pem).unwrap();
 
-        let hsm = SimHsm::new(
-            PathBuf::from("unused"),
-            path.to_path_buf(),
-            5100,
-        );
+        let hsm = SimHsm::new(PathBuf::from("unused"), path.to_path_buf(), 5100);
         hsm.write_keystore(&ks).unwrap();
         std::fs::write(path.join("provision_state"), b"1\n").unwrap();
     }
@@ -217,7 +217,11 @@ fn random_bytes() {
     let mut fix = TestFixture::new();
 
     let count: u32 = 32;
-    let resp = fix.request(&caller(TEST_IP, TEST_VM), Op::GetRandom, count.to_le_bytes().to_vec());
+    let resp = fix.request(
+        &caller(TEST_IP, TEST_VM),
+        Op::GetRandom,
+        count.to_le_bytes().to_vec(),
+    );
 
     assert_eq!(resp.status, StatusCode::Ok as u32, "random failed");
     assert_eq!(resp.payload.len(), 32);
@@ -237,7 +241,11 @@ fn sign_and_verify() {
     );
     assert_eq!(resp.status, StatusCode::Ok as u32, "sign failed");
     let sig = resp.payload;
-    assert!(sig.len() >= 64 && sig.len() <= 80, "bad sig len: {}", sig.len());
+    assert!(
+        sig.len() >= 64 && sig.len() <= 80,
+        "bad sig len: {}",
+        sig.len()
+    );
 
     // VERIFY: handle(4) + sig_len(4) + sig + hash_len(4) + hash
     let mut vp = Vec::new();
@@ -253,7 +261,11 @@ fn sign_and_verify() {
         payload: vp,
     };
     let (resp, _authz) = handler::handle_request(
-        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
+        &req,
+        &caller(TEST_IP, TEST_VM),
+        &mut fix.handle_table,
+        &fix.iam,
+        &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::Ok as u32, "verify failed");
 }
@@ -281,7 +293,11 @@ fn verify_rejects_bad_signature() {
         payload: p,
     };
     let (resp, _authz) = handler::handle_request(
-        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
+        &req,
+        &caller(TEST_IP, TEST_VM),
+        &mut fix.handle_table,
+        &fix.iam,
+        &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::CryptoError as u32);
 }
@@ -325,7 +341,10 @@ fn get_pubkey() {
     // Response: pubkey_len(4) + pubkey
     assert!(resp.payload.len() >= 4);
     let pk_len = u32::from_le_bytes([
-        resp.payload[0], resp.payload[1], resp.payload[2], resp.payload[3],
+        resp.payload[0],
+        resp.payload[1],
+        resp.payload[2],
+        resp.payload[3],
     ]) as usize;
     assert_eq!(pk_len, 91, "expected 91-byte SPKI DER");
     assert_eq!(resp.payload.len(), 4 + pk_len);
@@ -343,7 +362,10 @@ fn get_cert() {
     assert_eq!(resp.status, StatusCode::Ok as u32, "get_cert failed");
     assert!(resp.payload.len() >= 4);
     let c_len = u32::from_le_bytes([
-        resp.payload[0], resp.payload[1], resp.payload[2], resp.payload[3],
+        resp.payload[0],
+        resp.payload[1],
+        resp.payload[2],
+        resp.payload[3],
     ]) as usize;
     assert!(c_len > 0);
 }
@@ -360,10 +382,16 @@ fn get_handle_info() {
     assert_eq!(resp.status, StatusCode::Ok as u32, "handle_info failed");
     assert_eq!(resp.payload.len(), 48);
     let handle = u32::from_le_bytes([
-        resp.payload[0], resp.payload[1], resp.payload[2], resp.payload[3],
+        resp.payload[0],
+        resp.payload[1],
+        resp.payload[2],
+        resp.payload[3],
     ]);
     let alg = u32::from_le_bytes([
-        resp.payload[4], resp.payload[5], resp.payload[6], resp.payload[7],
+        resp.payload[4],
+        resp.payload[5],
+        resp.payload[6],
+        resp.payload[7],
     ]);
     assert_eq!(handle, HANDLE_IAM_SIGNING);
     assert_eq!(alg, ALG_ECC_P256);
@@ -393,8 +421,11 @@ fn dynamic_handle_ownership() {
         Op::Encrypt,
         TestFixture::with_handle(dynamic_handle, b"test"),
     );
-    assert_eq!(resp.status, StatusCode::InvalidHandle as u32,
-        "TEST_VM should not access OTHER_VM's dynamic handle");
+    assert_eq!(
+        resp.status,
+        StatusCode::InvalidHandle as u32,
+        "TEST_VM should not access OTHER_VM's dynamic handle"
+    );
 
     // OTHER_VM can access its own handle
     let resp = fix.request(
@@ -402,8 +433,11 @@ fn dynamic_handle_ownership() {
         Op::Encrypt,
         TestFixture::with_handle(dynamic_handle, b"test"),
     );
-    assert_eq!(resp.status, StatusCode::Ok as u32,
-        "OTHER_VM should access its own handle");
+    assert_eq!(
+        resp.status,
+        StatusCode::Ok as u32,
+        "OTHER_VM should access its own handle"
+    );
 }
 
 #[test]
@@ -477,7 +511,11 @@ fn host_only_ops_rejected() {
         payload: vec![],
     };
     let (resp, _authz) = handler::handle_request(
-        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
+        &req,
+        &caller(TEST_IP, TEST_VM),
+        &mut fix.handle_table,
+        &fix.iam,
+        &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::PolicyReject as u32);
 }
@@ -492,7 +530,11 @@ fn unknown_op_rejected() {
         payload: vec![],
     };
     let (resp, _authz) = handler::handle_request(
-        &req, &caller(TEST_IP, TEST_VM), &mut fix.handle_table, &fix.iam, &*fix.crypto,
+        &req,
+        &caller(TEST_IP, TEST_VM),
+        &mut fix.handle_table,
+        &fix.iam,
+        &*fix.crypto,
     );
     assert_eq!(resp.status, StatusCode::InvalidParam as u32);
 }

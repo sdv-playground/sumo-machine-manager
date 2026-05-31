@@ -1,11 +1,12 @@
-/// Core types for the NV store bank management system.
-///
-/// Five independent A/B bank sets:
-///   - HostOs (IFS + rootfs, updated atomically)
-///   - VM1 (Linux or QNX VM)
-///   - VM2 (Linux or QNX VM)
-///   - HSM (Hardware Security Module — single-banked, non-rollbackable)
-///   - App (self-updating application component, filesystem A/B banks)
+//! Core types for the NV store bank management system.
+//!
+//! Five independent A/B bank sets:
+//!
+//! - HostOs (IFS + rootfs, updated atomically)
+//! - VM1 (Linux or QNX VM)
+//! - VM2 (Linux or QNX VM)
+//! - HSM (Hardware Security Module — single-banked, non-rollbackable)
+//! - App (self-updating application component, filesystem A/B banks)
 
 /// Identifies which bank is active within a bank set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +75,12 @@ impl BankSet {
     /// Parse a config-string name to a well-known slot. Phase 3 will
     /// remove this entirely — slot assignment moves into the
     /// component spec, no string-to-slot lookups left.
+    ///
+    /// Intentionally not the `std::str::FromStr` trait method — the
+    /// trait requires an `Err` type and an infallible parse semantics
+    /// we don't want here (unknown strings legitimately return None,
+    /// not a hard error).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "host-os" | "host_os" => Some(BankSet::HostOs),
@@ -139,7 +146,12 @@ fn put_u32_le(buf: &mut [u8], offset: usize, val: u32) {
 }
 
 fn get_u32_le(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+    u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ])
 }
 
 fn put_u64_le(buf: &mut [u8], offset: usize, val: u64) {
@@ -148,8 +160,14 @@ fn put_u64_le(buf: &mut [u8], offset: usize, val: u64) {
 
 fn get_u64_le(buf: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes([
-        buf[offset],     buf[offset + 1], buf[offset + 2], buf[offset + 3],
-        buf[offset + 4], buf[offset + 5], buf[offset + 6], buf[offset + 7],
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
     ])
 }
 
@@ -260,6 +278,7 @@ impl NvRecord for NvBootState {
         }
         let write_seq = get_u32_le(buf, 4);
         let mut banks: [BankBootState; NUM_BANK_SETS] = Default::default();
+        #[allow(clippy::needless_range_loop)]
         for i in 0..NUM_BANK_SETS {
             let off = 8 + i * 3;
             banks[i] = BankBootState {
@@ -268,10 +287,7 @@ impl NvRecord for NvBootState {
                 boot_count: buf[off + 2],
             };
         }
-        Some(Self {
-            write_seq,
-            banks,
-        })
+        Some(Self { write_seq, banks })
     }
 }
 
@@ -291,7 +307,7 @@ impl NvRecord for NvBootState {
 /// [193]      device_type
 /// [194..200] padding
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NvFactory {
     pub write_seq: u32,
     pub serial_number: [u8; 32],
@@ -302,22 +318,6 @@ pub struct NvFactory {
     pub supplier_hw_version: [u8; 32],
     pub supplier_id: [u8; 32],
     pub device_type: u8,
-}
-
-impl Default for NvFactory {
-    fn default() -> Self {
-        Self {
-            write_seq: 0,
-            serial_number: [0; 32],
-            manufacturing_date: [0; 8],
-            vin: [0; 17],
-            ecu_hw_number: [0; 32],
-            supplier_hw_number: [0; 32],
-            supplier_hw_version: [0; 32],
-            supplier_id: [0; 32],
-            device_type: 0,
-        }
-    }
 }
 
 impl NvRecord for NvFactory {
@@ -400,7 +400,7 @@ impl NvRecord for NvFactory {
 /// - The launch-time IVD verifier cross-checks
 ///   `manifest.gen == this_bank.gen` (slot binding) and
 ///   `manifest.gen >= committed_gen` (rollback floor).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NvFwMeta {
     pub write_seq: u32,
     pub fw_version: [u8; 32],
@@ -418,29 +418,6 @@ pub struct NvFwMeta {
     pub tester_serial: [u8; 32],
     pub min_security_ver: u32,
     pub gen: u64,
-}
-
-impl Default for NvFwMeta {
-    fn default() -> Self {
-        Self {
-            write_seq: 0,
-            fw_version: [0; 32],
-            fw_seq: 0,
-            fw_secver: 0,
-            fw_crc: 0,
-            image_sha256: [0; 32],
-            spare_part_number: [0; 32],
-            ecu_sw_number: [0; 32],
-            supplier_sw_number: [0; 32],
-            supplier_sw_version: [0; 32],
-            odx_file_id: [0; 32],
-            system_name: [0; 32],
-            programming_date: [0; 8],
-            tester_serial: [0; 32],
-            min_security_ver: 0,
-            gen: 0,
-        }
-    }
 }
 
 impl NvRecord for NvFwMeta {
@@ -504,21 +481,11 @@ impl NvRecord for NvFwMeta {
 }
 
 /// A single writable DID entry in the runtime partition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DidEntry {
     pub did: u16,
     pub len: u8,
     pub data: [u8; 32],
-}
-
-impl Default for DidEntry {
-    fn default() -> Self {
-        Self {
-            did: 0,
-            len: 0,
-            data: [0; 32],
-        }
-    }
 }
 
 impl DidEntry {
@@ -526,19 +493,10 @@ impl DidEntry {
 }
 
 /// A single DTC entry in the runtime partition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DtcEntry {
     pub dtc_number: u32,
     pub status: u8,
-}
-
-impl Default for DtcEntry {
-    fn default() -> Self {
-        Self {
-            dtc_number: 0,
-            status: 0,
-        }
-    }
 }
 
 impl DtcEntry {
@@ -625,6 +583,7 @@ impl NvRecord for NvRuntime {
             return None;
         }
         let mut dids: [DidEntry; MAX_DIDS] = std::array::from_fn(|_| DidEntry::default());
+        #[allow(clippy::needless_range_loop)]
         for i in 0..MAX_DIDS {
             let off = 9 + i * DidEntry::WIRE_SIZE;
             dids[i] = DidEntry {
@@ -639,6 +598,7 @@ impl NvRecord for NvRuntime {
             return None;
         }
         let mut dtcs: [DtcEntry; MAX_DTCS] = std::array::from_fn(|_| DtcEntry::default());
+        #[allow(clippy::needless_range_loop)]
         for i in 0..MAX_DTCS {
             let off = dtc_count_off + 1 + i * DtcEntry::WIRE_SIZE;
             dtcs[i] = DtcEntry {

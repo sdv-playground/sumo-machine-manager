@@ -140,10 +140,16 @@ pub enum IvdError {
     UnexpectedFile(String),
     /// Manifest's `gen` doesn't match the per-bank install_gen
     /// recorded in NV — typically a between-slot swap during trial.
-    GenMismatch { expected: u64, claimed: u64 },
+    GenMismatch {
+        expected: u64,
+        claimed: u64,
+    },
     /// Manifest's `gen` is below the committed_gen floor — rollback
     /// attempt below a successfully-committed bank.
-    GenBelowFloor { manifest: u64, floor: u64 },
+    GenBelowFloor {
+        manifest: u64,
+        floor: u64,
+    },
     /// HSM rejected the verify or signature is bad.
     SignatureInvalid,
     /// Manifest carries a version this build doesn't understand.
@@ -157,16 +163,29 @@ impl std::fmt::Display for IvdError {
             IvdError::Io(e, p) => write!(f, "ivd io {}: {e}", p.display()),
             IvdError::Cbor(s) => write!(f, "ivd cbor: {s}"),
             IvdError::HashMismatch { path, .. } => write!(f, "ivd hash mismatch: {path}"),
-            IvdError::SizeMismatch { path, claimed, actual } => {
-                write!(f, "ivd size mismatch {path}: manifest says {claimed}, on disk {actual}")
+            IvdError::SizeMismatch {
+                path,
+                claimed,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "ivd size mismatch {path}: manifest says {claimed}, on disk {actual}"
+                )
             }
             IvdError::MissingFile(p) => write!(f, "ivd missing file: {p}"),
             IvdError::UnexpectedFile(p) => write!(f, "ivd unexpected file (not in manifest): {p}"),
             IvdError::GenMismatch { expected, claimed } => {
-                write!(f, "ivd gen mismatch: NV expected {expected}, manifest claims {claimed}")
+                write!(
+                    f,
+                    "ivd gen mismatch: NV expected {expected}, manifest claims {claimed}"
+                )
             }
             IvdError::GenBelowFloor { manifest, floor } => {
-                write!(f, "ivd gen below floor: manifest {manifest} < committed_gen {floor}")
+                write!(
+                    f,
+                    "ivd gen below floor: manifest {manifest} < committed_gen {floor}"
+                )
             }
             IvdError::SignatureInvalid => write!(f, "ivd signature invalid"),
             IvdError::UnsupportedManifestVersion(v) => {
@@ -220,13 +239,8 @@ pub fn build_manifest_from_files(mut files: Vec<IvdFile>, gen: u64) -> IvdManife
     }
 }
 
-fn collect_files(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<IvdFile>,
-) -> Result<(), IvdError> {
-    let entries =
-        fs::read_dir(dir).map_err(|e| IvdError::Io(e, dir.to_path_buf()))?;
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<IvdFile>) -> Result<(), IvdError> {
+    let entries = fs::read_dir(dir).map_err(|e| IvdError::Io(e, dir.to_path_buf()))?;
     for entry in entries {
         let entry = entry.map_err(|e| IvdError::Io(e, dir.to_path_buf()))?;
         let path = entry.path();
@@ -235,9 +249,7 @@ fn collect_files(
 
         // Skip the IVD-owned files when scanning the bank — the
         // manifest must not enumerate itself or the signature.
-        if dir == root
-            && (file_name == IVD_MANIFEST_FILE || file_name == IVD_SIGNATURE_FILE)
-        {
+        if dir == root && (file_name == IVD_MANIFEST_FILE || file_name == IVD_SIGNATURE_FILE) {
             continue;
         }
 
@@ -287,8 +299,8 @@ pub fn encode_manifest(manifest: &IvdManifest) -> Result<Vec<u8>, IvdError> {
 /// CBOR-decode a manifest from bytes (e.g. read from
 /// `ivd-manifest.cbor`). Rejects unsupported versions.
 pub fn decode_manifest(bytes: &[u8]) -> Result<IvdManifest, IvdError> {
-    let manifest: IvdManifest = ciborium::from_reader(bytes)
-        .map_err(|e| IvdError::Cbor(format!("decode: {e}")))?;
+    let manifest: IvdManifest =
+        ciborium::from_reader(bytes).map_err(|e| IvdError::Cbor(format!("decode: {e}")))?;
     if manifest.ivd_version != IVD_MANIFEST_VERSION {
         return Err(IvdError::UnsupportedManifestVersion(manifest.ivd_version));
     }
@@ -436,10 +448,9 @@ fn verify_bank_inner(
     let manifest_path = bank_dir.join(IVD_MANIFEST_FILE);
     let signature_path = bank_dir.join(IVD_SIGNATURE_FILE);
 
-    let manifest_bytes = fs::read(&manifest_path)
-        .map_err(|e| IvdError::Io(e, manifest_path.clone()))?;
-    let sig = fs::read(&signature_path)
-        .map_err(|e| IvdError::Io(e, signature_path.clone()))?;
+    let manifest_bytes =
+        fs::read(&manifest_path).map_err(|e| IvdError::Io(e, manifest_path.clone()))?;
+    let sig = fs::read(&signature_path).map_err(|e| IvdError::Io(e, signature_path.clone()))?;
 
     // ---- Phase 1: signature verification ----
     let sig_start = std::time::Instant::now();
@@ -502,8 +513,11 @@ fn verify_bank_inner(
 
     // Detect manifest claims with no matching file, plus per-file
     // hash/size verification.
-    let claimed_map: BTreeMap<&String, &IvdFile> =
-        manifest.files.iter().map(|f| (&f.relative_path, f)).collect();
+    let claimed_map: BTreeMap<&String, &IvdFile> = manifest
+        .files
+        .iter()
+        .map(|f| (&f.relative_path, f))
+        .collect();
     let mut total_bytes: u64 = 0;
     for claim in manifest.files.iter() {
         let path = bank_dir.join(&claim.relative_path);
@@ -621,11 +635,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&keystore);
         std::fs::create_dir_all(&keystore).unwrap();
 
-        let hsm = crate::sim::SimHsm::new(
-            PathBuf::from("/dev/null"),
-            keystore.clone(),
-            5100,
-        );
+        let hsm = crate::sim::SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 5100);
 
         // Minimal v2 keystore: just `ivd-signing` as a device-
         // generated EC slot. generate_missing_local_keys produces the

@@ -11,7 +11,9 @@ use sha2::{Digest, Sha256};
 
 use machine_mgr::component::Component;
 use machine_mgr::error::{MachineError, MachineResult};
-use machine_mgr::types::{Capabilities, FlashCaps, FlashId, FlashSession, LifecycleCaps, ResetKind};
+use machine_mgr::types::{
+    Capabilities, FlashCaps, FlashId, FlashSession, LifecycleCaps, ResetKind,
+};
 use machine_mgr::{FlashState, FlashStatus};
 
 /// Configuration for the container image-store validation/import seam.
@@ -781,7 +783,9 @@ impl Component for ContainerImageComponent {
             session.manifest = Some(manifest);
             Ok("container-image-manifest".into())
         } else {
-            let manifest = manifest.expect("manifest checked above");
+            let Some(manifest) = manifest else {
+                unreachable!("manifest presence checked above");
+            };
             {
                 let session = self.session.lock().unwrap();
                 let session = session.as_ref().ok_or_else(|| {
@@ -803,7 +807,7 @@ impl Component for ContainerImageComponent {
             ));
             save_payload_stream(stream, &payload_path, manifest.expected_size).await?;
             let mut session = self.session.lock().unwrap();
-            assign_payload_path(&mut *session, payload_path)?;
+            assign_payload_path(&mut session, payload_path)?;
             Ok("container-image-payload".into())
         }
     }
@@ -1581,8 +1585,8 @@ mod tests {
     }
 
     fn run_valid_lifecycle(component: &ContainerImageComponent, archive: &Path) {
-        let digest = sha256_file(&archive);
-        let size = fs::metadata(&archive).unwrap().len();
+        let digest = sha256_file(archive);
+        let size = fs::metadata(archive).unwrap().len();
         let manifest = std::env::var_os("SUMO_CONTAINER_IMAGE_MANIFEST")
             .map(fs::read)
             .map(Result::unwrap)
@@ -1600,7 +1604,7 @@ mod tests {
             component.upload_envelope(&FlashId::new(""), bytes_stream(manifest)),
         )
         .unwrap();
-        let payload = fs::read(&archive).unwrap();
+        let payload = fs::read(archive).unwrap();
         futures::executor::block_on(
             component.upload_envelope(&FlashId::new(""), bytes_stream(payload)),
         )

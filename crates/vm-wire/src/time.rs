@@ -180,8 +180,7 @@ impl VtimeRegs {
         let wall_offset_ns = i64::from_le_bytes(data[16..24].try_into().ok()?);
         let last_sync_mono_ns = u64::from_le_bytes(data[24..32].try_into().ok()?);
         let sync_source = SyncSource::from_u32(u32::from_le_bytes(data[32..36].try_into().ok()?));
-        let sync_quality =
-            SyncQuality::from_u32(u32::from_le_bytes(data[36..40].try_into().ok()?));
+        let sync_quality = SyncQuality::from_u32(u32::from_le_bytes(data[36..40].try_into().ok()?));
         let min_wall_ns = u64::from_le_bytes(data[40..48].try_into().ok()?);
         let flags = u32::from_le_bytes(data[48..52].try_into().ok()?);
         let update_seq = u32::from_le_bytes(data[52..56].try_into().ok()?);
@@ -245,8 +244,7 @@ impl VtimeCmd {
         let op = (u32::from_le_bytes(data[4..8].try_into().ok()?) & 0xFF) as u8;
         let correction_ns = i64::from_le_bytes(data[8..16].try_into().ok()?);
         let sync_source = SyncSource::from_u32(u32::from_le_bytes(data[16..20].try_into().ok()?));
-        let sync_quality =
-            SyncQuality::from_u32(u32::from_le_bytes(data[20..24].try_into().ok()?));
+        let sync_quality = SyncQuality::from_u32(u32::from_le_bytes(data[20..24].try_into().ok()?));
         let status = u32::from_le_bytes(data[24..28].try_into().ok()?);
         let guest_id = u32::from_le_bytes(data[28..32].try_into().ok()?);
         Some(Self {
@@ -380,7 +378,7 @@ mod tests {
     #[test]
     fn wall_ns_addition() {
         let r = VtimeRegs {
-            mono_ns: 1_000_000_000,           // 1 s of mono
+            mono_ns: 1_000_000_000,                    // 1 s of mono
             wall_offset_ns: 1_700_000_000_000_000_000, // ~2023 epoch
             last_sync_mono_ns: 0,
             sync_source: SyncSource::None,

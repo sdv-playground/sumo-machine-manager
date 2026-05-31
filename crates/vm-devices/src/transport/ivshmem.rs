@@ -247,9 +247,7 @@ impl Drop for EventfdDoorbell {
 impl Doorbell for EventfdDoorbell {
     fn notify(&self) -> Result<(), TransportError> {
         let val: u64 = 1;
-        let ret = unsafe {
-            libc::write(self.fd, &val as *const u64 as *const libc::c_void, 8)
-        };
+        let ret = unsafe { libc::write(self.fd, &val as *const u64 as *const libc::c_void, 8) };
         if ret != 8 {
             return Err(TransportError::Io(std::io::Error::last_os_error()));
         }
@@ -258,9 +256,7 @@ impl Doorbell for EventfdDoorbell {
 
     fn wait(&self) -> Result<(), TransportError> {
         let mut val: u64 = 0;
-        let ret = unsafe {
-            libc::read(self.fd, &mut val as *mut u64 as *mut libc::c_void, 8)
-        };
+        let ret = unsafe { libc::read(self.fd, &mut val as *mut u64 as *mut libc::c_void, 8) };
         if ret != 8 {
             return Err(TransportError::Io(std::io::Error::last_os_error()));
         }
@@ -293,9 +289,15 @@ impl Doorbell for EventfdDoorbell {
 pub struct NullDoorbell;
 
 impl Doorbell for NullDoorbell {
-    fn notify(&self) -> Result<(), TransportError> { Ok(()) }
-    fn wait(&self) -> Result<(), TransportError> { Ok(()) }
-    fn try_wait(&self) -> Result<bool, TransportError> { Ok(false) }
+    fn notify(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn wait(&self) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn try_wait(&self) -> Result<bool, TransportError> {
+        Ok(false)
+    }
 }
 
 /// Connect to an ivshmem-server Unix socket and receive the peer's eventfd.
@@ -310,12 +312,8 @@ impl Doorbell for NullDoorbell {
 /// eventfd which we use as the doorbell to wake NAPI.
 ///
 /// Returns (our_eventfds, guest_eventfd_for_vector_0) or None if no guest connected yet.
-pub fn connect_ivshmem_server(
-    socket_path: &Path,
-) -> Result<EventfdDoorbell, TransportError> {
-    let fd = unsafe {
-        libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0)
-    };
+pub fn connect_ivshmem_server(socket_path: &Path) -> Result<EventfdDoorbell, TransportError> {
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(TransportError::Io(std::io::Error::last_os_error()));
     }
@@ -463,9 +461,7 @@ fn recv_ivshmem_msg(sock_fd: i32) -> Result<(i64, Option<i32>), TransportError> 
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET
-                && (*cmsg).cmsg_type == libc::SCM_RIGHTS
-            {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
                 let fd_ptr = libc::CMSG_DATA(cmsg) as *const i32;
                 recv_fd = Some(*fd_ptr);
             }

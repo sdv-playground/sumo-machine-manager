@@ -63,7 +63,6 @@ pub struct FlashCaps {
     pub reset_kind: ResetKind,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LifecycleCaps {
     /// `restart()` will actually restart the component.

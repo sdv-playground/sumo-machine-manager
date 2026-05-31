@@ -1,15 +1,14 @@
 /// QEMU runner — translates VM definitions into QEMU command lines
 /// and manages host-side processes (ivshmem-server, simulators).
-
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::*;
 use crate::config::*;
 use crate::ivshmem::{self, HostProcess, IvshmemSockets};
-use super::*;
 
 pub struct QemuRunner {
     /// Override QEMU binary path. If None, resolved from arch.
@@ -26,6 +25,12 @@ pub struct QemuRunner {
     /// Health used to be in this list — now `VmManager` reads heartbeat
     /// directly via `HeartbeatDevice` over the configured `DeviceTransport`.
     sim_cancellers: Vec<Arc<AtomicBool>>,
+}
+
+impl Default for QemuRunner {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl QemuRunner {
@@ -58,16 +63,17 @@ impl QemuRunner {
     }
 
     fn resolve_qemu_bin(&self, arch: Arch) -> String {
-        self.qemu_bin.as_ref()
+        self.qemu_bin
+            .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| arch.qemu_binary().to_string())
     }
 
     /// Start the Rust time simulator on a background thread.
     fn start_time_sim(&mut self, vm_name: &str) -> Result<(), RunnerError> {
-        use vm_devices::transport::ivshmem::{IvshmemSharedMemory, NullDoorbell};
         use vm_devices::clock::system::SystemClock;
         use vm_devices::time::TimeSim;
+        use vm_devices::transport::ivshmem::{IvshmemSharedMemory, NullDoorbell};
 
         let shm = IvshmemSharedMemory::open_by_name(vm_name, "time")
             .map_err(|e| RunnerError::ProcessFailed(format!("time shm: {e}")))?;
@@ -91,10 +97,17 @@ impl QemuRunner {
     }
 
     /// Start the Rust CAN bridge on a background thread.
-    fn start_can_bridge(&mut self, vm_name: &str, index: u8, ifname: &str) -> Result<(), RunnerError> {
-        use vm_devices::transport::ivshmem::{IvshmemSharedMemory, connect_ivshmem_server, NullDoorbell};
+    fn start_can_bridge(
+        &mut self,
+        vm_name: &str,
+        index: u8,
+        ifname: &str,
+    ) -> Result<(), RunnerError> {
+        use vm_devices::can::{socketcan::SocketCanBackend, CanBridge};
+        use vm_devices::transport::ivshmem::{
+            connect_ivshmem_server, IvshmemSharedMemory, NullDoorbell,
+        };
         use vm_devices::transport::Doorbell;
-        use vm_devices::can::{CanBridge, socketcan::SocketCanBackend};
 
         let label = format!("can{index}");
         let shm = IvshmemSharedMemory::open_by_name(vm_name, &label)
@@ -144,14 +157,17 @@ impl QemuRunner {
         let cpu = if use_kvm {
             "host".to_string()
         } else {
-            def.cpu_model.clone()
+            def.cpu_model
+                .clone()
                 .unwrap_or_else(|| arch.default_cpu().to_string())
         };
 
         args.extend_from_slice(&[
             self.resolve_qemu_bin(arch),
-            "-machine".into(), arch.machine_type().into(),
-            "-cpu".into(), cpu,
+            "-machine".into(),
+            arch.machine_type().into(),
+            "-cpu".into(),
+            cpu,
         ]);
 
         if use_kvm {
@@ -159,18 +175,17 @@ impl QemuRunner {
         }
 
         args.extend_from_slice(&[
-            "-m".into(), format!("{}M", def.ram_mb),
-            "-smp".into(), def.cpus.to_string(),
+            "-m".into(),
+            format!("{}M", def.ram_mb),
+            "-smp".into(),
+            def.cpus.to_string(),
             "-nographic".into(),
             "-no-reboot".into(),
         ]);
 
         // QMP socket for vCPU pause/resume (simulation stepping)
         let qmp_sock = format!("/tmp/vm-svc-{name}-qmp.sock");
-        args.extend_from_slice(&[
-            "-qmp".into(),
-            format!("unix:{qmp_sock},server,nowait"),
-        ]);
+        args.extend_from_slice(&["-qmp".into(), format!("unix:{qmp_sock},server,nowait")]);
 
         // Boot mode depends on OS type
         let is_qnx = def.os_type == crate::config::OsType::Qnx;
@@ -220,7 +235,6 @@ impl QemuRunner {
                     format!("file={},format=raw", disk.path.display()),
                 ]);
             }
-
         } else {
             // Linux: kernel + rootfs + cmdline
 
@@ -258,7 +272,10 @@ impl QemuRunner {
                 let ro = if disk.readonly { ",readonly=on" } else { "" };
                 disk_args.push(vec![
                     "-drive".into(),
-                    format!("file={},format=raw,if=none,id={drive_id}{ro}", disk.path.display()),
+                    format!(
+                        "file={},format=raw,if=none,id={drive_id}{ro}",
+                        disk.path.display()
+                    ),
                     "-device".into(),
                     format!("{blk_device},drive={drive_id}"),
                 ]);
@@ -301,10 +318,11 @@ impl QemuRunner {
                 ]);
             }
 
-            let rootfs = def.rootfs_path()
-                .ok_or_else(|| RunnerError::Config(format!(
+            let rootfs = def.rootfs_path().ok_or_else(|| {
+                RunnerError::Config(format!(
                     "{name}: no rootfs image configured (set images.rootfs in config)"
-                )))?;
+                ))
+            })?;
             let rootfs_args = vec![
                 "-drive".into(),
                 format!("file={},format=raw,if=none,id=hd_rootfs", rootfs.display()),
@@ -334,16 +352,19 @@ impl QemuRunner {
         } // end Linux boot
 
         // Network devices (shared for both OS types — spec mandates virtio-net)
-        let networks: Vec<_> = def.devices.iter()
+        let networks: Vec<_> = def
+            .devices
+            .iter()
             .filter(|d| matches!(d, DeviceConfig::Network { .. }))
             .collect();
         let net_device = arch.virtio_device("net");
 
-        let net_iter: Box<dyn Iterator<Item = (usize, &&DeviceConfig)>> = if arch.reverse_disk_order() {
-            Box::new(networks.iter().enumerate().rev())
-        } else {
-            Box::new(networks.iter().enumerate())
-        };
+        let net_iter: Box<dyn Iterator<Item = (usize, &&DeviceConfig)>> =
+            if arch.reverse_disk_order() {
+                Box::new(networks.iter().enumerate().rev())
+            } else {
+                Box::new(networks.iter().enumerate())
+            };
 
         let mut net_idx = 0;
         for (i, dev) in net_iter {
@@ -355,7 +376,9 @@ impl QemuRunner {
                 }
                 if i > 0 {
                     let subnet = i + 2;
-                    netdev.push_str(&format!(",net=10.0.{subnet}.0/24,dhcpstart=10.0.{subnet}.15"));
+                    netdev.push_str(&format!(
+                        ",net=10.0.{subnet}.0/24,dhcpstart=10.0.{subnet}.15"
+                    ));
                 }
                 args.extend_from_slice(&["-netdev".into(), netdev]);
                 let mut dev_str = format!("{net_device},netdev={id}");
@@ -385,7 +408,9 @@ impl QemuRunner {
 
         // ivshmem devices (time, health, CAN)
         for dev in &def.devices {
-            if !dev.needs_ivshmem() { continue; }
+            if !dev.needs_ivshmem() {
+                continue;
+            }
             match dev {
                 DeviceConfig::Time { .. } => {
                     if let Some(sock) = &ivshmem_sockets.time {
@@ -414,13 +439,16 @@ impl QemuRunner {
         // CAN interfaces in reverse order (so can0 gets lowest PCI address)
         let mut can_devs: Vec<(u8, &Option<String>)> = Vec::new();
         for dev in &def.devices {
-            if let DeviceConfig::Can { index, interface, .. } = dev {
+            if let DeviceConfig::Can {
+                index, interface, ..
+            } = dev
+            {
                 if dev.needs_ivshmem() {
                     can_devs.push((*index, interface));
                 }
             }
         }
-        can_devs.sort_by(|a, b| b.0.cmp(&a.0));
+        can_devs.sort_by_key(|d| std::cmp::Reverse(d.0));
         for (idx, _) in &can_devs {
             if let Some(sock) = ivshmem_sockets.can.get(idx) {
                 args.extend_from_slice(&[
@@ -443,26 +471,40 @@ impl VmRunner for QemuRunner {
 
         // Start ivshmem servers for devices that need shared memory
         for dev in &def.devices {
-            if !dev.needs_ivshmem() { continue; }
+            if !dev.needs_ivshmem() {
+                continue;
+            }
             match dev {
                 DeviceConfig::Can { index, .. } => {
                     let sock = ivshmem::start_ivshmem(
-                        name, &format!("can{index}"), "1M",
-                        &self.ivshmem_bin, &mut self.host_processes, &mut self.sockets,
+                        name,
+                        &format!("can{index}"),
+                        "1M",
+                        &self.ivshmem_bin,
+                        &mut self.host_processes,
+                        &mut self.sockets,
                     )?;
                     ivshmem.can.insert(*index, sock);
                 }
                 DeviceConfig::Health { .. } => {
                     let sock = ivshmem::start_ivshmem(
-                        name, "health", "4K",
-                        &self.ivshmem_bin, &mut self.host_processes, &mut self.sockets,
+                        name,
+                        "health",
+                        "4K",
+                        &self.ivshmem_bin,
+                        &mut self.host_processes,
+                        &mut self.sockets,
                     )?;
                     ivshmem.health = Some(sock);
                 }
                 DeviceConfig::Time { .. } => {
                     let sock = ivshmem::start_ivshmem(
-                        name, "time", "4K",
-                        &self.ivshmem_bin, &mut self.host_processes, &mut self.sockets,
+                        name,
+                        "time",
+                        "4K",
+                        &self.ivshmem_bin,
+                        &mut self.host_processes,
+                        &mut self.sockets,
                     )?;
                     ivshmem.time = Some(sock);
                 }
@@ -472,7 +514,9 @@ impl VmRunner for QemuRunner {
 
         // Start Rust device simulators (health, time) or write magic headers
         for dev in &def.devices {
-            if !dev.needs_ivshmem() { continue; }
+            if !dev.needs_ivshmem() {
+                continue;
+            }
             match dev {
                 DeviceConfig::Health { .. } => {
                     // Heartbeat / power channels are owned by VmManager via
@@ -518,13 +562,19 @@ impl VmRunner for QemuRunner {
         // (we need the guest peer's eventfd for the doorbell)
         std::thread::sleep(std::time::Duration::from_millis(500));
         for dev in &def.devices {
-            if let DeviceConfig::Can { index, interface, .. } = dev {
+            if let DeviceConfig::Can {
+                index, interface, ..
+            } = dev
+            {
                 let ifname = interface.as_deref().unwrap_or("vcan1");
                 self.start_can_bridge(name, *index, ifname)?;
             }
         }
 
-        Ok(VmHandle { name: name.to_string(), pid: Some(pid) })
+        Ok(VmHandle {
+            name: name.to_string(),
+            pid: Some(pid),
+        })
     }
 
     fn wait(&mut self, handle: &VmHandle) -> Result<Option<i32>, RunnerError> {
@@ -579,7 +629,11 @@ impl VmRunner for QemuRunner {
         self.sockets.clear();
     }
 
-    fn graceful_shutdown(&mut self, handle: &VmHandle, _timeout: Duration) -> Result<(), RunnerError> {
+    fn graceful_shutdown(
+        &mut self,
+        handle: &VmHandle,
+        _timeout: Duration,
+    ) -> Result<(), RunnerError> {
         // Heartbeat-driven graceful shutdown is now `VmManager`'s job —
         // it sends `PowerCommand::Shutdown` over the device transport before
         // calling stop(). The runner just force-kills if VmManager arrives here.

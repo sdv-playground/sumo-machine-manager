@@ -1,7 +1,11 @@
+// Tests build NV records via `Default::default()` then mutate fields
+// for readability — allow the lint module-wide.
+#![allow(clippy::field_reassign_with_default)]
+
 use nv_store::block::MemBlockDevice;
 use nv_store::store::MIN_NV_DEVICE_SIZE;
 use nv_store::types::*;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::*;
 
@@ -72,10 +76,22 @@ fn trial_boot_increments_count() {
     mgr.nv_mut().write_boot_state(&mut state).unwrap();
 
     let actions = mgr.process_boot().unwrap();
-    assert_eq!(actions[1], BootAction::TrialBoot { bank: Bank::B, boot_count: 1 });
+    assert_eq!(
+        actions[1],
+        BootAction::TrialBoot {
+            bank: Bank::B,
+            boot_count: 1
+        }
+    );
 
     let actions = mgr.process_boot().unwrap();
-    assert_eq!(actions[1], BootAction::TrialBoot { bank: Bank::B, boot_count: 2 });
+    assert_eq!(
+        actions[1],
+        BootAction::TrialBoot {
+            bank: Bank::B,
+            boot_count: 2
+        }
+    );
 
     // Hyp and VM2 should still be committed
     assert_eq!(actions[0], BootAction::Boot { bank: Bank::A });
@@ -96,7 +112,10 @@ fn trial_boot_at_max_still_boots() {
     let actions = mgr.process_boot().unwrap();
     assert_eq!(
         actions[0],
-        BootAction::TrialBoot { bank: Bank::B, boot_count: MAX_TRIAL_BOOTS }
+        BootAction::TrialBoot {
+            bank: Bank::B,
+            boot_count: MAX_TRIAL_BOOTS
+        }
     );
 }
 
@@ -117,7 +136,10 @@ fn auto_rollback_after_max_trial_boots() {
     let actions = mgr.process_boot().unwrap();
     assert_eq!(
         actions[1],
-        BootAction::AutoRollback { from: Bank::B, to: Bank::A }
+        BootAction::AutoRollback {
+            from: Bank::B,
+            to: Bank::A
+        }
     );
 
     // Verify NV state: rolled back to A, committed
@@ -141,7 +163,10 @@ fn auto_rollback_from_a_to_b() {
     let actions = mgr.process_boot().unwrap();
     assert_eq!(
         actions[0],
-        BootAction::AutoRollback { from: Bank::A, to: Bank::B }
+        BootAction::AutoRollback {
+            from: Bank::A,
+            to: Bank::B
+        }
     );
 }
 
@@ -162,7 +187,10 @@ fn full_trial_cycle_10_boots_then_rollback() {
         let actions = mgr.process_boot().unwrap();
         assert_eq!(
             actions[0],
-            BootAction::TrialBoot { bank: Bank::B, boot_count: i }
+            BootAction::TrialBoot {
+                bank: Bank::B,
+                boot_count: i
+            }
         );
     }
 
@@ -170,7 +198,10 @@ fn full_trial_cycle_10_boots_then_rollback() {
     let actions = mgr.process_boot().unwrap();
     assert_eq!(
         actions[0],
-        BootAction::AutoRollback { from: Bank::B, to: Bank::A }
+        BootAction::AutoRollback {
+            from: Bank::B,
+            to: Bank::A
+        }
     );
 
     // Subsequent boots are committed on A
@@ -194,7 +225,13 @@ fn bank_sets_independent_trial() {
 
     let actions = mgr.process_boot().unwrap();
     assert_eq!(actions[0], BootAction::Boot { bank: Bank::A }); // hyp committed
-    assert_eq!(actions[1], BootAction::TrialBoot { bank: Bank::B, boot_count: 1 }); // vm1 trial
+    assert_eq!(
+        actions[1],
+        BootAction::TrialBoot {
+            bank: Bank::B,
+            boot_count: 1
+        }
+    ); // vm1 trial
     assert_eq!(actions[2], BootAction::Boot { bank: Bank::A }); // vm2 committed
 }
 
@@ -214,9 +251,21 @@ fn multiple_bank_sets_in_trial() {
     mgr.nv_mut().write_boot_state(&mut state).unwrap();
 
     let actions = mgr.process_boot().unwrap();
-    assert_eq!(actions[0], BootAction::TrialBoot { bank: Bank::B, boot_count: 1 });
+    assert_eq!(
+        actions[0],
+        BootAction::TrialBoot {
+            bank: Bank::B,
+            boot_count: 1
+        }
+    );
     assert_eq!(actions[1], BootAction::Boot { bank: Bank::A }); // VM1 committed
-    assert_eq!(actions[2], BootAction::TrialBoot { bank: Bank::B, boot_count: 6 });
+    assert_eq!(
+        actions[2],
+        BootAction::TrialBoot {
+            bank: Bank::B,
+            boot_count: 6
+        }
+    );
 }
 
 // --- Hash verification ---
@@ -231,7 +280,9 @@ fn verify_image_correct_hash() {
 
     let mut meta = NvFwMeta::default();
     meta.image_sha256 = expected_hash;
-    mgr.nv_mut().write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+    mgr.nv_mut()
+        .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta)
+        .unwrap();
 
     let result = mgr.verify_image(BankSet::Vm1, Bank::A, image_data);
     assert_eq!(result, HashCheck::Ok);
@@ -247,7 +298,9 @@ fn verify_image_wrong_hash() {
 
     let mut meta = NvFwMeta::default();
     meta.image_sha256 = Sha256::digest(wrong_data).into();
-    mgr.nv_mut().write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+    mgr.nv_mut()
+        .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta)
+        .unwrap();
 
     let result = mgr.verify_image(BankSet::Vm1, Bank::A, image_data);
     match result {
@@ -274,7 +327,9 @@ fn verify_image_zero_hash_is_no_meta() {
     mgr.process_boot().unwrap();
 
     let mut meta = NvFwMeta::default(); // all zeros including hash
-    mgr.nv_mut().write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+    mgr.nv_mut()
+        .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta)
+        .unwrap();
 
     let result = mgr.verify_image(BankSet::Vm1, Bank::A, b"anything");
     assert_eq!(result, HashCheck::NoMeta);
@@ -295,7 +350,13 @@ fn hash_failure_in_trial_triggers_rollback() {
     mgr.nv_mut().write_boot_state(&mut state).unwrap();
 
     let action = mgr.handle_hash_failure(BankSet::Vm1).unwrap();
-    assert_eq!(action, BootAction::HashRollback { from: Bank::B, to: Bank::A });
+    assert_eq!(
+        action,
+        BootAction::HashRollback {
+            from: Bank::B,
+            to: Bank::A
+        }
+    );
 
     // Verify NV state
     let state = mgr.nv().read_boot_state().unwrap();
@@ -361,7 +422,9 @@ fn ota_trial_commit_cycle() {
     meta.fw_secver = 2;
     meta.min_security_ver = 1;
     meta.image_sha256 = hash;
-    mgr.nv_mut().write_fw_meta(BankSet::Vm1, Bank::B, &mut meta).unwrap();
+    mgr.nv_mut()
+        .write_fw_meta(BankSet::Vm1, Bank::B, &mut meta)
+        .unwrap();
 
     // Switch to trial
     let mut state = mgr.nv().read_boot_state().unwrap();
@@ -372,10 +435,19 @@ fn ota_trial_commit_cycle() {
 
     // Boot 1: trial
     let actions = mgr.process_boot().unwrap();
-    assert_eq!(actions[1], BootAction::TrialBoot { bank: Bank::B, boot_count: 1 });
+    assert_eq!(
+        actions[1],
+        BootAction::TrialBoot {
+            bank: Bank::B,
+            boot_count: 1
+        }
+    );
 
     // Verify image
-    assert_eq!(mgr.verify_image(BankSet::Vm1, Bank::B, image), HashCheck::Ok);
+    assert_eq!(
+        mgr.verify_image(BankSet::Vm1, Bank::B, image),
+        HashCheck::Ok
+    );
 
     // Commit (simulating diagserver command)
     let mut state = mgr.nv().read_boot_state().unwrap();
@@ -388,7 +460,9 @@ fn ota_trial_commit_cycle() {
     if meta.fw_secver > meta.min_security_ver {
         meta.min_security_ver = meta.fw_secver;
     }
-    mgr.nv_mut().write_fw_meta(BankSet::Vm1, Bank::B, &mut meta).unwrap();
+    mgr.nv_mut()
+        .write_fw_meta(BankSet::Vm1, Bank::B, &mut meta)
+        .unwrap();
 
     // Next boot: committed on B
     let actions = mgr.process_boot().unwrap();
@@ -422,7 +496,13 @@ fn ota_trial_auto_rollback_cycle() {
 
     // 11th boot: auto-rollback
     let actions = mgr.process_boot().unwrap();
-    assert_eq!(actions[1], BootAction::AutoRollback { from: Bank::B, to: Bank::A });
+    assert_eq!(
+        actions[1],
+        BootAction::AutoRollback {
+            from: Bank::B,
+            to: Bank::A
+        }
+    );
 
     // Now committed on A
     let actions = mgr.process_boot().unwrap();

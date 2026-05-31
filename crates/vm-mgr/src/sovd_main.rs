@@ -222,7 +222,6 @@ async fn main() {
                 supports_rollback: false,
                 single_bank: true,
                 entity_type: "hsm".into(),
-                ..ComponentConfig::default()
             },
         ),
     ];

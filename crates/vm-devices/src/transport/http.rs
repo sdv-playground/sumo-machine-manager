@@ -92,7 +92,9 @@ impl TransportState {
             .channels
             .lock()
             .expect("HttpTransport channels mutex poisoned");
-        map.entry(key).or_insert_with(|| Arc::new(ChannelState::new())).clone()
+        map.entry(key)
+            .or_insert_with(|| Arc::new(ChannelState::new()))
+            .clone()
     }
 
     fn get(&self, key: &ChannelKey) -> Option<Arc<ChannelState>> {
@@ -140,10 +142,7 @@ impl HttpTransport {
                 "/vm/{vm}/dev/{device}/ch/{channel}/notify",
                 post(handle_notify),
             )
-            .route(
-                "/vm/{vm}/dev/{device}/ch/{channel}/wait",
-                get(handle_wait),
-            )
+            .route("/vm/{vm}/dev/{device}/ch/{channel}/wait", get(handle_wait))
             .with_state(self.state.clone())
     }
 }
@@ -407,7 +406,8 @@ mod tests {
         let t = make_transport();
         let addr = bind_test_server(&t).await;
 
-        let client: Client<_, Full<HyperBytes>> = Client::builder(TokioExecutor::new()).build_http();
+        let client: Client<_, Full<HyperBytes>> =
+            Client::builder(TokioExecutor::new()).build_http();
         let url = format!("http://{addr}/vm/vm2/dev/heartbeat/ch/data");
 
         // PUT
@@ -436,7 +436,8 @@ mod tests {
         let t = make_transport();
         let addr = bind_test_server(&t).await;
 
-        let client: Client<_, Full<HyperBytes>> = Client::builder(TokioExecutor::new()).build_http();
+        let client: Client<_, Full<HyperBytes>> =
+            Client::builder(TokioExecutor::new()).build_http();
         let url = format!("http://{addr}/vm/nope/dev/nope/ch/nope");
         let get_req = hyper::Request::builder()
             .method("GET")
@@ -454,7 +455,8 @@ mod tests {
         let _ch = t.open_channel("vm2", "hb", "data", 32).unwrap();
         let addr = bind_test_server(&t).await;
 
-        let client: Client<_, Full<HyperBytes>> = Client::builder(TokioExecutor::new()).build_http();
+        let client: Client<_, Full<HyperBytes>> =
+            Client::builder(TokioExecutor::new()).build_http();
         let url = format!("http://{addr}/vm/vm2/dev/hb/ch/data/wait?timeout=50");
         let req = hyper::Request::builder()
             .method("GET")

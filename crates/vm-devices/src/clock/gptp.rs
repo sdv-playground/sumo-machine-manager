@@ -25,8 +25,8 @@
 
 use std::path::Path;
 
-use super::Clock;
 use super::system::SystemClock;
+use super::Clock;
 
 /// Maximum age before gPTP data is considered stale (5 seconds).
 const STALENESS_THRESHOLD_NS: u64 = 5_000_000_000;
@@ -48,6 +48,12 @@ pub struct GptpClock {
 
 unsafe impl Send for GptpClock {}
 unsafe impl Sync for GptpClock {}
+
+impl Default for GptpClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl GptpClock {
     /// Create without gPTP — behaves like SystemClock.
@@ -138,9 +144,8 @@ impl GptpClock {
             return None;
         }
 
-        let last_update = unsafe {
-            core::ptr::read_volatile(ptr.add(OFFSET_LAST_UPDATE) as *const u64)
-        };
+        let last_update =
+            unsafe { core::ptr::read_volatile(ptr.add(OFFSET_LAST_UPDATE) as *const u64) };
         let now = self.system.now_mono_ns();
 
         // Check staleness
@@ -148,9 +153,8 @@ impl GptpClock {
             return None;
         }
 
-        let offset = unsafe {
-            core::ptr::read_volatile(ptr.add(OFFSET_MASTER_OFFSET) as *const i64)
-        };
+        let offset =
+            unsafe { core::ptr::read_volatile(ptr.add(OFFSET_MASTER_OFFSET) as *const i64) };
         Some(offset)
     }
 }

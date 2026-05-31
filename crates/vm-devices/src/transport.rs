@@ -19,13 +19,13 @@
 //!
 //! See `tasks/device-transport-design.md` for the full design.
 
+#[cfg(feature = "http-transport")]
+pub mod http;
+#[cfg(target_os = "linux")]
+pub mod ivshmem;
 pub mod mem;
 pub mod shmem;
 pub mod tcp_stream;
-#[cfg(target_os = "linux")]
-pub mod ivshmem;
-#[cfg(feature = "http-transport")]
-pub mod http;
 
 // Re-export the contract so `use vm_devices::transport::DeviceChannel`
 // keeps working for host-side callers.

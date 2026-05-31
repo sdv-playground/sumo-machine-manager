@@ -3,7 +3,6 @@
 /// Implement this trait to plug in a production HSM or proprietary
 /// key derivation algorithm. The default [`TestSecurityProvider`] uses
 /// a simple XOR scheme suitable for development and testing.
-
 use nv_store::types::BankSet;
 
 /// Security algorithm abstraction — seed generation + key validation.

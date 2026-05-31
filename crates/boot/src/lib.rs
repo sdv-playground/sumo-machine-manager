@@ -17,35 +17,21 @@
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
 use nv_store::types::*;
-use sha2::{Sha256, Digest};
-
+use sha2::{Digest, Sha256};
 
 /// Result of processing boot for a single bank set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootAction {
     /// Normal boot from committed bank.
-    Boot {
-        bank: Bank,
-    },
+    Boot { bank: Bank },
     /// Trial boot — bank was updated but not yet committed.
-    TrialBoot {
-        bank: Bank,
-        boot_count: u8,
-    },
+    TrialBoot { bank: Bank, boot_count: u8 },
     /// Auto-rollback triggered (exceeded MAX_TRIAL_BOOTS).
-    AutoRollback {
-        from: Bank,
-        to: Bank,
-    },
+    AutoRollback { from: Bank, to: Bank },
     /// Image hash verification failed in trial mode — immediate rollback.
-    HashRollback {
-        from: Bank,
-        to: Bank,
-    },
+    HashRollback { from: Bank, to: Bank },
     /// Image hash verification failed in committed mode — fatal.
-    HashFatal {
-        bank: Bank,
-    },
+    HashFatal { bank: Bank },
     /// No boot state initialized yet — first boot.
     FirstBoot,
 }
@@ -56,7 +42,10 @@ pub enum HashCheck {
     /// Hash matches expected value.
     Ok,
     /// Hash mismatch.
-    Mismatch { expected: [u8; 32], actual: [u8; 32] },
+    Mismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
     /// No FW meta found — no expected hash to verify against.
     NoMeta,
 }
@@ -115,12 +104,15 @@ impl<D: BlockDevice> BootManager<D> {
             }
         };
 
-        let mut actions: [BootAction; NUM_BANK_SETS] = std::array::from_fn(|_| BootAction::FirstBoot);
+        let mut actions: [BootAction; NUM_BANK_SETS] =
+            std::array::from_fn(|_| BootAction::FirstBoot);
         let mut state_changed = false;
 
         for (i, bs) in state.banks.iter_mut().enumerate() {
             if bs.committed {
-                actions[i] = BootAction::Boot { bank: bs.active_bank };
+                actions[i] = BootAction::Boot {
+                    bank: bs.active_bank,
+                };
             } else {
                 // Trial mode
                 bs.boot_count += 1;
@@ -154,12 +146,7 @@ impl<D: BlockDevice> BootManager<D> {
     }
 
     /// Verify an image's SHA-256 hash against the expected hash in FW Meta.
-    pub fn verify_image(
-        &self,
-        set: BankSet,
-        bank: Bank,
-        image_data: &[u8],
-    ) -> HashCheck {
+    pub fn verify_image(&self, set: BankSet, bank: Bank, image_data: &[u8]) -> HashCheck {
         let meta = match self.nv.read_fw_meta(set, bank) {
             Some(m) => m,
             None => return HashCheck::NoMeta,
@@ -185,10 +172,7 @@ impl<D: BlockDevice> BootManager<D> {
     }
 
     /// Handle hash verification failure — rollback if trial, fatal if committed.
-    pub fn handle_hash_failure(
-        &mut self,
-        set: BankSet,
-    ) -> Result<BootAction, BootError> {
+    pub fn handle_hash_failure(&mut self, set: BankSet) -> Result<BootAction, BootError> {
         let mut state = match self.nv.read_boot_state() {
             Some(s) => s,
             None => return Ok(BootAction::FirstBoot),
@@ -197,7 +181,9 @@ impl<D: BlockDevice> BootManager<D> {
         let idx = set.as_index();
 
         if state.banks[idx].committed {
-            Ok(BootAction::HashFatal { bank: state.banks[idx].active_bank })
+            Ok(BootAction::HashFatal {
+                bank: state.banks[idx].active_bank,
+            })
         } else {
             let from = state.banks[idx].active_bank;
             let to = from.other();
@@ -211,13 +197,15 @@ impl<D: BlockDevice> BootManager<D> {
 
     /// Get the current active bank for a bank set.
     pub fn active_bank(&self, set: BankSet) -> Option<Bank> {
-        self.nv.read_boot_state()
+        self.nv
+            .read_boot_state()
             .map(|s| s.banks[set.as_index()].active_bank)
     }
 
     /// Check if a bank set is in trial mode.
     pub fn is_trial(&self, set: BankSet) -> Option<bool> {
-        self.nv.read_boot_state()
+        self.nv
+            .read_boot_state()
             .map(|s| !s.banks[set.as_index()].committed)
     }
 }

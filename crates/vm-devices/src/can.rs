@@ -70,8 +70,8 @@ pub struct CanBridge<S: SharedMemory, B: CanBackend> {
     doorbell: Box<dyn crate::transport::Doorbell>,
     backend: B,
     ring_size: u32,
-    rx_base: usize,  // host→guest ring offset in shm
-    tx_base: usize,  // guest→host ring offset in shm
+    rx_base: usize, // host→guest ring offset in shm
+    tx_base: usize, // guest→host ring offset in shm
 }
 
 impl<S: SharedMemory, B: CanBackend> CanBridge<S, B> {
@@ -95,7 +95,8 @@ impl<S: SharedMemory, B: CanBackend> CanBridge<S, B> {
             self.shm.write_u32(base + r::RING_OFF_HEAD, 0);
             self.shm.write_u32(base + r::RING_OFF_TAIL, 0);
             self.shm.write_u32(base + r::RING_OFF_SIZE, self.ring_size);
-            self.shm.write_u32(base + r::RING_OFF_FLAGS, r::RING_FLAG_FD as u32);
+            self.shm
+                .write_u32(base + r::RING_OFF_FLAGS, r::RING_FLAG_FD);
         }
         self.shm.fence(Ordering::SeqCst);
     }
@@ -169,7 +170,8 @@ impl<S: SharedMemory, B: CanBackend> CanBridge<S, B> {
         let frame = self.read_frame(slot);
 
         self.shm.fence(Ordering::Release);
-        self.shm.write_u32(base + r::RING_OFF_TAIL, (tail + 1) % self.ring_size);
+        self.shm
+            .write_u32(base + r::RING_OFF_TAIL, (tail + 1) % self.ring_size);
         Some(frame)
     }
 
@@ -183,18 +185,27 @@ impl<S: SharedMemory, B: CanBackend> CanBridge<S, B> {
         meta[0] = frame.len;
         meta[1] = frame.flags;
         self.shm.write_bytes(offset + r::FRAME_OFF_LEN, &meta);
-        self.shm.write_bytes(offset + r::FRAME_OFF_DATA, &frame.data[..frame.len.min(64) as usize]);
+        self.shm.write_bytes(
+            offset + r::FRAME_OFF_DATA,
+            &frame.data[..frame.len.min(64) as usize],
+        );
     }
 
     fn read_frame(&self, offset: usize) -> CanFrame {
-        let mut frame = CanFrame::default();
-        frame.id = self.shm.read_u32(offset + r::FRAME_OFF_ID);
+        let id = self.shm.read_u32(offset + r::FRAME_OFF_ID);
         let mut meta = [0u8; 4];
         self.shm.read_bytes(offset + r::FRAME_OFF_LEN, &mut meta);
-        frame.len = meta[0];
-        frame.flags = meta[1];
-        let dlen = frame.len.min(64) as usize;
-        self.shm.read_bytes(offset + r::FRAME_OFF_DATA, &mut frame.data[..dlen]);
+        let len = meta[0];
+        let flags = meta[1];
+        let mut frame = CanFrame {
+            id,
+            len,
+            flags,
+            ..CanFrame::default()
+        };
+        let dlen = len.min(64) as usize;
+        self.shm
+            .read_bytes(offset + r::FRAME_OFF_DATA, &mut frame.data[..dlen]);
         frame
     }
 }
@@ -211,7 +222,10 @@ mod tests {
 
     impl NullBackend {
         fn new() -> Self {
-            Self { outbox: Vec::new(), inbox: Vec::new() }
+            Self {
+                outbox: Vec::new(),
+                inbox: Vec::new(),
+            }
         }
     }
 
@@ -231,9 +245,11 @@ mod tests {
     }
 
     fn make_frame(id: u32, data: &[u8]) -> CanFrame {
-        let mut frame = CanFrame::default();
-        frame.id = id;
-        frame.len = data.len() as u8;
+        let mut frame = CanFrame {
+            id,
+            len: data.len() as u8,
+            ..CanFrame::default()
+        };
         frame.data[..data.len()].copy_from_slice(data);
         frame
     }
@@ -241,7 +257,11 @@ mod tests {
     #[test]
     fn init_writes_ring_headers() {
         let shm = MemSharedMemory::new(1024 * 1024);
-        let bridge = CanBridge::new(shm, Box::new(crate::transport::mem::MemDoorbell), NullBackend::new());
+        let bridge = CanBridge::new(
+            shm,
+            Box::new(crate::transport::mem::MemDoorbell),
+            NullBackend::new(),
+        );
         bridge.init();
 
         // RX ring header
@@ -256,7 +276,11 @@ mod tests {
     #[test]
     fn rx_write_and_read_roundtrip() {
         let shm = MemSharedMemory::new(1024 * 1024);
-        let bridge = CanBridge::new(shm, Box::new(crate::transport::mem::MemDoorbell), NullBackend::new());
+        let bridge = CanBridge::new(
+            shm,
+            Box::new(crate::transport::mem::MemDoorbell),
+            NullBackend::new(),
+        );
         bridge.init();
 
         let frame = make_frame(0x123, &[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -276,7 +300,11 @@ mod tests {
     #[test]
     fn tx_read_returns_none_when_empty() {
         let shm = MemSharedMemory::new(1024 * 1024);
-        let bridge = CanBridge::new(shm, Box::new(crate::transport::mem::MemDoorbell), NullBackend::new());
+        let bridge = CanBridge::new(
+            shm,
+            Box::new(crate::transport::mem::MemDoorbell),
+            NullBackend::new(),
+        );
         bridge.init();
 
         assert!(bridge.tx_read().is_none());
@@ -285,7 +313,11 @@ mod tests {
     #[test]
     fn tx_read_returns_guest_written_frame() {
         let shm = MemSharedMemory::new(1024 * 1024);
-        let bridge = CanBridge::new(shm, Box::new(crate::transport::mem::MemDoorbell), NullBackend::new());
+        let bridge = CanBridge::new(
+            shm,
+            Box::new(crate::transport::mem::MemDoorbell),
+            NullBackend::new(),
+        );
         bridge.init();
 
         // Simulate guest writing to TX ring
@@ -295,7 +327,9 @@ mod tests {
         let mut meta = [0u8; 4];
         meta[0] = 3; // len
         bridge.shm.write_bytes(slot + r::FRAME_OFF_LEN, &meta);
-        bridge.shm.write_bytes(slot + r::FRAME_OFF_DATA, &[0xCA, 0xFE, 0x01]);
+        bridge
+            .shm
+            .write_bytes(slot + r::FRAME_OFF_DATA, &[0xCA, 0xFE, 0x01]);
 
         // Advance TX head (guest writes this)
         bridge.shm.write_u32(tx_base + r::RING_OFF_HEAD, 1);
@@ -312,7 +346,11 @@ mod tests {
     #[test]
     fn rx_ring_full_returns_error() {
         let shm = MemSharedMemory::new(1024 * 1024);
-        let bridge = CanBridge::new(shm, Box::new(crate::transport::mem::MemDoorbell), NullBackend::new());
+        let bridge = CanBridge::new(
+            shm,
+            Box::new(crate::transport::mem::MemDoorbell),
+            NullBackend::new(),
+        );
         bridge.init();
 
         // Simulate tail at 0, fill ring to capacity-1

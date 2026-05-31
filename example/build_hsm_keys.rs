@@ -23,7 +23,6 @@
 /// Or pipe to sumo-tool:
 ///   cargo run --example build_hsm_keys -- --cbor-only --signing-key <path> --device-key <path> \
 ///     | sumo-tool build --manifest hsm-keys.yaml
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -62,8 +61,7 @@ const NUM_TEST_SLOTS: usize = 3;
 /// dropped in unchanged.
 fn load_or_generate_ec_keypair(path: &Path, label: &str) -> (Vec<u8>, Vec<u8>) {
     if path.exists() {
-        let bytes = fs::read(path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         assert_eq!(
             bytes.len(),
             97,
@@ -78,8 +76,7 @@ fn load_or_generate_ec_keypair(path: &Path, label: &str) -> (Vec<u8>, Vec<u8>) {
         let mut on_disk = Vec::with_capacity(97);
         on_disk.extend_from_slice(&priv_vec);
         on_disk.extend_from_slice(&pub_vec);
-        fs::write(path, &on_disk)
-            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        fs::write(path, &on_disk).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
         eprintln!("[hsm-keys] generated {label}: {}", path.display());
         (priv_vec, pub_vec)
     }
@@ -96,7 +93,9 @@ fn usage() {
     eprintln!("  --device-pub <path>    Device public key (COSE_Key CBOR) — encryption target.");
     eprintln!("  --device-csr <path>    Device CSR (PKCS#10 DER) — extracts public key.");
     eprintln!("                         Either --device-pub or --device-csr is required.");
-    eprintln!("  --output-dir <path>    Directory for .suit output files (required unless --cbor-only)");
+    eprintln!(
+        "  --output-dir <path>    Directory for .suit output files (required unless --cbor-only)"
+    );
     eprintln!("  --cbor-only            Write raw CBOR keystore to stdout, skip SUIT wrapping.");
     eprintln!("                         Key Authority files are still written to --output-dir or example/keys/.");
     eprintln!("                         Pipe to: sumo-tool build --manifest hsm-keys.yaml");
@@ -196,8 +195,8 @@ fn main() {
     // `sumo-tool keygen --output sw-authority.key`.
     let signing_key = match signing_key_path.as_ref() {
         Some(path) => {
-            let bytes = fs::read(path)
-                .unwrap_or_else(|e| panic!("failed to read signing key {path}: {e}"));
+            let bytes =
+                fs::read(path).unwrap_or_else(|e| panic!("failed to read signing key {path}: {e}"));
             CoseKey::from_cose_key_bytes(&bytes).unwrap()
         }
         None => {
@@ -220,14 +219,20 @@ fn main() {
             .unwrap_or_else(|e| panic!("failed to read device CSR {csr_path}: {e}"));
         let pub_key = extract_ec_pubkey_from_csr(&csr_der)
             .unwrap_or_else(|e| panic!("failed to extract public key from CSR: {e}"));
-        eprintln!("[hsm-keys] device public key extracted from CSR ({} bytes)", pub_key.len());
+        eprintln!(
+            "[hsm-keys] device public key extracted from CSR ({} bytes)",
+            pub_key.len()
+        );
         pub_key
     } else {
         let pub_path = device_pub_path.unwrap();
         let bytes = fs::read(&pub_path)
             .unwrap_or_else(|e| panic!("failed to read device public key {pub_path}: {e}"));
         let pub_bytes = extract_ec_pub_only(&bytes);
-        eprintln!("[hsm-keys] device public key loaded ({} bytes)", pub_bytes.len());
+        eprintln!(
+            "[hsm-keys] device public key loaded ({} bytes)",
+            pub_bytes.len()
+        );
         pub_bytes
     };
 
@@ -246,10 +251,8 @@ fn main() {
     // enumerates those slots with empty material so SimHsm's
     // `generate_missing_local_keys` knows to create them.
     // ---------------------------------------------------------------
-    let (ka_priv, ka_pub) = load_or_generate_ec_keypair(
-        &keys_dir.join("key-authority.keypair"),
-        "key-authority",
-    );
+    let (ka_priv, ka_pub) =
+        load_or_generate_ec_keypair(&keys_dir.join("key-authority.keypair"), "key-authority");
     let (_pa_priv, pa_pub) = load_or_generate_ec_keypair(
         &keys_dir.join("platform-authority.keypair"),
         "platform-authority",
@@ -425,10 +428,17 @@ fn main() {
         }
     }
 
-    println!("[hsm-keys] {} slots: {} EC-P256, {} AES-256",
+    println!(
+        "[hsm-keys] {} slots: {} EC-P256, {} AES-256",
         slots.len(),
-        slots.iter().filter(|s| s.key_kind == KEY_TYPE_EC_P256).count(),
-        slots.iter().filter(|s| s.key_kind == KEY_TYPE_AES_256).count(),
+        slots
+            .iter()
+            .filter(|s| s.key_kind == KEY_TYPE_EC_P256)
+            .count(),
+        slots
+            .iter()
+            .filter(|s| s.key_kind == KEY_TYPE_AES_256)
+            .count(),
     );
 
     // ---------------------------------------------------------------
@@ -465,31 +475,27 @@ fn main() {
     // ---------------------------------------------------------------
     // Export Key Authority files (needed for re-provisioning)
     // ---------------------------------------------------------------
-    let ka_full_cose = build_device_cose_key(
-        &ka_priv,
-        &ka_pub[1..33],
-        &ka_pub[33..65],
-    );
-    let ka_pub_cose = build_public_cose_key(
-        &ka_pub[1..33],
-        &ka_pub[33..65],
-    );
+    let ka_full_cose = build_device_cose_key(&ka_priv, &ka_pub[1..33], &ka_pub[33..65]);
+    let ka_pub_cose = build_public_cose_key(&ka_pub[1..33], &ka_pub[33..65]);
 
     let ka_pub_path = keys_dir.join("key-authority.pub");
     fs::write(&ka_pub_path, &ka_pub_cose).unwrap();
     let ka_key_path = keys_dir.join("key-authority.key");
     fs::write(&ka_key_path, &ka_full_cose).unwrap();
     eprintln!("[hsm-keys] Key Authority public: {}", ka_pub_path.display());
-    eprintln!("[hsm-keys] Key Authority private: {}", ka_key_path.display());
+    eprintln!(
+        "[hsm-keys] Key Authority private: {}",
+        ka_key_path.display()
+    );
 
     // Export device public key as COSE_Key (needed by sumo-tool --encrypt)
-    let device_pub_cose = build_public_cose_key(
-        &dk_pub[1..33],
-        &dk_pub[33..65],
-    );
+    let device_pub_cose = build_public_cose_key(&dk_pub[1..33], &dk_pub[33..65]);
     let device_pub_path = keys_dir.join("device-decrypt.cosekey");
     fs::write(&device_pub_path, &device_pub_cose).unwrap();
-    eprintln!("[hsm-keys] Device public key (COSE): {}", device_pub_path.display());
+    eprintln!(
+        "[hsm-keys] Device public key (COSE): {}",
+        device_pub_path.display()
+    );
 
     // ---------------------------------------------------------------
     // --cbor-only: write raw CBOR to stdout, skip SUIT envelope wrapping
@@ -526,13 +532,18 @@ fn main() {
 
     let factory_path = output_dir.join("hsm-keys-v1.suit");
     fs::write(&factory_path, &factory_envelope).unwrap();
-    println!("[hsm-keys] {} ({} bytes)",
-        factory_path.display(), factory_envelope.len());
+    println!(
+        "[hsm-keys] {} ({} bytes)",
+        factory_path.display(),
+        factory_envelope.len()
+    );
 
     // ---------------------------------------------------------------
     // 5. Re-provision envelope (signed: key authority, encrypted: device key)
     // ---------------------------------------------------------------
-    println!("\n[hsm-keys] === Re-provision envelope (signed: key authority, encrypted: device key) ===");
+    println!(
+        "\n[hsm-keys] === Re-provision envelope (signed: key authority, encrypted: device key) ==="
+    );
 
     let mut keystore_v2 = keystore.clone();
     keystore_v2.security_version = 2;
@@ -565,18 +576,27 @@ fn main() {
 
     let reprov_path = output_dir.join("hsm-keys-v2.suit");
     fs::write(&reprov_path, &reprov_envelope).unwrap();
-    println!("[hsm-keys] {} ({} bytes)",
-        reprov_path.display(), reprov_envelope.len());
+    println!(
+        "[hsm-keys] {} ({} bytes)",
+        reprov_path.display(),
+        reprov_envelope.len()
+    );
 
     // ---------------------------------------------------------------
     // 6. Summary
     // ---------------------------------------------------------------
     println!("\n=== HSM Key Provisioning Artifacts ===");
     println!();
-    println!("  Factory envelope:      {} ({} bytes, signed: factory, encrypted: device)",
-        factory_path.display(), factory_envelope.len());
-    println!("  Re-provision envelope: {} ({} bytes, signed: key-authority, encrypted: device)",
-        reprov_path.display(), reprov_envelope.len());
+    println!(
+        "  Factory envelope:      {} ({} bytes, signed: factory, encrypted: device)",
+        factory_path.display(),
+        factory_envelope.len()
+    );
+    println!(
+        "  Re-provision envelope: {} ({} bytes, signed: key-authority, encrypted: device)",
+        reprov_path.display(),
+        reprov_envelope.len()
+    );
     println!("  Key Authority public:  {}", ka_pub_path.display());
     println!("  Key Authority private: {}", ka_key_path.display());
     println!("  Device public key:     {}", device_pub_path.display());
@@ -590,6 +610,7 @@ fn main() {
 }
 
 /// Build a compressed + encrypted SUIT envelope.
+#[allow(clippy::too_many_arguments)]
 fn build_encrypted_envelope(
     signing_key: &CoseKey,
     recipient_pub_cbor: &[u8],
@@ -611,11 +632,8 @@ fn build_encrypted_envelope(
         public_key: recipient_pub,
         kid: b"device-decrypt".to_vec(),
     }];
-    let encrypted = encryptor::encrypt_firmware_ecdh(
-        &compressed,
-        &ephemeral_sender,
-        &recipients,
-    ).unwrap();
+    let encrypted =
+        encryptor::encrypt_firmware_ecdh(&compressed, &ephemeral_sender, &recipients).unwrap();
 
     // Build SUIT envelope
     ImageManifestBuilder::new()
@@ -649,12 +667,9 @@ fn build_device_cose_key(d: &[u8], x: &[u8], y: &[u8]) -> Vec<u8> {
 
 /// Build a COSE_Key (EC2, P-256, public only) as CBOR bytes.
 fn build_public_cose_key(x: &[u8], y: &[u8]) -> Vec<u8> {
-    let mut key = coset::CoseKeyBuilder::new_ec2_pub_key(
-        iana::EllipticCurve::P_256,
-        x.to_vec(),
-        y.to_vec(),
-    )
-    .build();
+    let mut key =
+        coset::CoseKeyBuilder::new_ec2_pub_key(iana::EllipticCurve::P_256, x.to_vec(), y.to_vec())
+            .build();
     key.alg = None;
     key.to_vec().unwrap()
 }

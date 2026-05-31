@@ -51,13 +51,12 @@ pub async fn process_envelope_stream(
     target_bank: Bank,
 ) -> Result<ValidatedFirmware, BackendError> {
     // Convert PackageStream → AsyncRead
-    let reader = StreamReader::new(
-        stream.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::Other, e))),
-    );
+    let reader = StreamReader::new(stream.map(|r| r.map_err(io::Error::other)));
     tokio::pin!(reader);
 
     // Step 1: Parse CBOR envelope header, collect pending payloads
-    let (header_bytes, pending_payloads, map_entry_count) = parse_envelope_header(&mut reader).await?;
+    let (header_bytes, pending_payloads, map_entry_count) =
+        parse_envelope_header(&mut reader).await?;
 
     // Step 2: Validate using header-only envelope (no payload)
     let validated = validate_header(manifest_provider, &header_bytes, min_security_ver, bank_set)?;
@@ -74,7 +73,8 @@ pub async fn process_envelope_stream(
         let pp = &pending_payloads[0];
         if pp.len > HSM_ENVELOPE_MAX {
             return Err(BackendError::InvalidRequest(format!(
-                "HSM key envelope too large: {} bytes (max {HSM_ENVELOPE_MAX})", pp.len
+                "HSM key envelope too large: {} bytes (max {HSM_ENVELOPE_MAX})",
+                pp.len
             )));
         }
         let mut payload = vec![0u8; pp.len as usize];
@@ -96,17 +96,18 @@ pub async fn process_envelope_stream(
     let manifest = sumo_onboard::manifest::Manifest { envelope };
 
     // Set up decryptor keys (shared across all components)
-    let suit_trust_anchor = manifest_provider
-        .software_authority_key()
-        .ok_or_else(|| BackendError::Internal(
+    let suit_trust_anchor = manifest_provider.software_authority_key().ok_or_else(|| {
+        BackendError::Internal(
             "no software authority key for streaming — HSM not yet provisioned".into(),
-        ))?;
+        )
+    })?;
     // CEK unwrap is delegated to the HSM via the KeyUnwrap trait —
     // no raw device-key bytes flow through this pipeline anymore.
     let suit_key_unwrap = manifest_provider.key_unwrap_for_decryption();
 
     let bank_dir = images_dir.map(|dir| {
-        dir.join(&bank_spec.dir_name).join(bank_dir_name(target_bank))
+        dir.join(&bank_spec.dir_name)
+            .join(bank_dir_name(target_bank))
     });
     if let Some(ref bd) = bank_dir {
         std::fs::create_dir_all(bd)
@@ -130,9 +131,12 @@ pub async fn process_envelope_stream(
         let expected_digest = manifest
             .image_digest(comp_idx)
             .map(|d| d.0.bytes.clone())
-            .ok_or_else(|| BackendError::Internal(format!(
-                "no digest for component {} (payload {})", comp_idx, pp.key
-            )))?;
+            .ok_or_else(|| {
+                BackendError::Internal(format!(
+                    "no digest for component {} (payload {})",
+                    comp_idx, pp.key
+                ))
+            })?;
 
         let has_encryption = manifest.encryption_info(comp_idx).is_some();
 
@@ -207,19 +211,22 @@ pub async fn process_envelope_stream(
             Ok(Ok(result)) => {
                 if send_failed {
                     return Err(BackendError::Internal(format!(
-                        "payload stream {} ended early", pp.key
+                        "payload stream {} ended early",
+                        pp.key
                     )));
                 }
                 result
             }
             Ok(Err(e)) => {
                 return Err(BackendError::Internal(format!(
-                    "payload processing failed ({}): {e}", pp.key
+                    "payload processing failed ({}): {e}",
+                    pp.key
                 )));
             }
             Err(e) => {
                 return Err(BackendError::Internal(format!(
-                    "payload processing panicked ({}): {e}", pp.key
+                    "payload processing panicked ({}): {e}",
+                    pp.key
                 )));
             }
         };
@@ -308,7 +315,9 @@ async fn parse_envelope_header<R: AsyncRead + Unpin>(
         all_bytes.push(map_byte);
         let (m, a) = (map_byte >> 5, map_byte & 0x1f);
         if m != 5 {
-            return Err(BackendError::Internal("expected CBOR map in envelope".into()));
+            return Err(BackendError::Internal(
+                "expected CBOR map in envelope".into(),
+            ));
         }
         map_entry_count = read_cbor_uint(reader, a, &mut all_bytes).await?;
     } else if major == 5 {
@@ -495,7 +504,8 @@ fn rebuild_envelope_with_payload(
     if major == 6 {
         // Tag — copy tag header
         result.push(first);
-        let (_tag_val, bytes_consumed) = decode_cbor_uint(additional, &header_without_firmware[pos..]);
+        let (_tag_val, bytes_consumed) =
+            decode_cbor_uint(additional, &header_without_firmware[pos..]);
         result.extend_from_slice(&header_without_firmware[pos..pos + bytes_consumed]);
         pos += bytes_consumed;
 
@@ -538,6 +548,7 @@ fn rebuild_envelope_with_payload(
 /// Process the firmware payload synchronously: decrypt → decompress → hash → write.
 ///
 /// Runs in a blocking thread. Returns (total_image_size, image_sha256).
+#[allow(clippy::too_many_arguments)]
 fn process_payload_sync(
     rx: tokio::sync::mpsc::Receiver<Bytes>,
     header_bytes: &[u8],
@@ -561,8 +572,8 @@ fn process_payload_sync(
             .map_err(|e| format!("re-parse envelope: {e:?}"))?;
         let manifest = sumo_onboard::manifest::Manifest { envelope };
 
-        let unwrap = key_unwrap
-            .ok_or("encrypted payload but no CEK unwrapper (HSM not provisioned?)")?;
+        let unwrap =
+            key_unwrap.ok_or("encrypted payload but no CEK unwrapper (HSM not provisioned?)")?;
 
         let decryptor = StreamingDecryptor::new(&manifest, component_index, unwrap, &crypto)
             .map_err(|e| format!("decryptor setup: {e:?}"))?;
@@ -608,10 +619,7 @@ fn process_plain<R: Read>(
     let mut buf = vec![0u8; 64 * 1024];
 
     let mut file = image_path
-        .map(|p| {
-            std::fs::File::create(p)
-                .map_err(|e| format!("create {}: {e}", p.display()))
-        })
+        .map(|p| std::fs::File::create(p).map_err(|e| format!("create {}: {e}", p.display())))
         .transpose()?;
 
     loop {
@@ -621,8 +629,7 @@ fn process_plain<R: Read>(
         }
         hasher.update(&buf[..n]);
         if let Some(ref mut f) = file {
-            f.write_all(&buf[..n])
-                .map_err(|e| format!("write: {e}"))?;
+            f.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
         }
         total += n;
     }
@@ -637,29 +644,27 @@ fn process_decompressed<R: Read>(
     expected_digest: &[u8],
     image_path: Option<&Path>,
 ) -> Result<(usize, [u8; 32]), String> {
-    let mut decoder = ruzstd::StreamingDecoder::new(reader)
-        .map_err(|e| format!("zstd init: {e}"))?;
+    let mut decoder =
+        ruzstd::StreamingDecoder::new(reader).map_err(|e| format!("zstd init: {e}"))?;
 
     let mut hasher = Sha256::new();
     let mut total = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
 
     let mut file = image_path
-        .map(|p| {
-            std::fs::File::create(p)
-                .map_err(|e| format!("create {}: {e}", p.display()))
-        })
+        .map(|p| std::fs::File::create(p).map_err(|e| format!("create {}: {e}", p.display())))
         .transpose()?;
 
     loop {
-        let n = decoder.read(&mut buf).map_err(|e| format!("decompress: {e}"))?;
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|e| format!("decompress: {e}"))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
         if let Some(ref mut f) = file {
-            f.write_all(&buf[..n])
-                .map_err(|e| format!("write: {e}"))?;
+            f.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
         }
         total += n;
     }
@@ -981,8 +986,8 @@ pub fn process_raw_payload(
     let mut reader = std::io::BufReader::new(file);
 
     if has_encryption {
-        let unwrap = key_unwrap
-            .ok_or("encrypted payload but no CEK unwrapper (HSM not provisioned?)")?;
+        let unwrap =
+            key_unwrap.ok_or("encrypted payload but no CEK unwrapper (HSM not provisioned?)")?;
 
         let decryptor = StreamingDecryptor::new(&manifest, component_index, unwrap, &crypto)
             .map_err(|e| format!("decryptor setup: {e:?}"))?;
@@ -1045,9 +1050,7 @@ pub async fn process_payload_stream(
         .encryption_info(component_index)
         .is_some();
 
-    let reader = StreamReader::new(
-        stream.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::Other, e))),
-    );
+    let reader = StreamReader::new(stream.map(|r| r.map_err(io::Error::other)));
     tokio::pin!(reader);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
@@ -1080,9 +1083,10 @@ pub async fn process_payload_stream(
     let mut send_failed = false;
 
     loop {
-        let n = reader.read(&mut buf).await.map_err(|e| {
-            BackendError::Internal(format!("stream read error: {e}"))
-        })?;
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| BackendError::Internal(format!("stream read error: {e}")))?;
         if n == 0 {
             break;
         }
@@ -1097,9 +1101,7 @@ pub async fn process_payload_stream(
     let (image_size, image_hash) = match process_handle.await {
         Ok(Ok(result)) => {
             if send_failed {
-                return Err(BackendError::Internal(
-                    "payload stream ended early".into(),
-                ));
+                return Err(BackendError::Internal("payload stream ended early".into()));
             }
             result
         }
@@ -1124,28 +1126,29 @@ pub async fn save_raw_payload(
     stream: PackageStream,
     output_path: &Path,
 ) -> Result<(u64, [u8; 32]), BackendError> {
-    let reader = StreamReader::new(
-        stream.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::Other, e))),
-    );
+    let reader = StreamReader::new(stream.map(|r| r.map_err(io::Error::other)));
     tokio::pin!(reader);
 
-    let mut file = tokio::fs::File::create(output_path).await.map_err(|e| {
-        BackendError::Internal(format!("create {}: {e}", output_path.display()))
-    })?;
+    let mut file = tokio::fs::File::create(output_path)
+        .await
+        .map_err(|e| BackendError::Internal(format!("create {}: {e}", output_path.display())))?;
 
     let mut hasher = Sha256::new();
     let mut total: u64 = 0;
     let mut buf = vec![0u8; 64 * 1024];
 
     loop {
-        let n = reader.read(&mut buf).await.map_err(|e| {
-            BackendError::Internal(format!("stream read: {e}"))
-        })?;
-        if n == 0 { break; }
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| BackendError::Internal(format!("stream read: {e}")))?;
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
-        tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await.map_err(|e| {
-            BackendError::Internal(format!("write: {e}"))
-        })?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n])
+            .await
+            .map_err(|e| BackendError::Internal(format!("write: {e}")))?;
         total += n as u64;
     }
 

@@ -18,14 +18,14 @@
 //! Today that's `SimHsm` (RustCrypto + on-disk keys); production brings up
 //! a board-specific provider talking to HSE/TRNG hardware.
 
-pub mod proto;
+pub mod audit;
+pub mod auth;
+pub mod bootstrap;
+pub mod cert;
 pub mod codec;
+pub mod extension_manifest;
 pub mod handle_table;
 pub mod handler;
-pub mod transport;
-pub mod extension_manifest;
-pub mod audit;
-pub mod cert;
-pub mod bootstrap;
 pub mod iam;
-pub mod auth;
+pub mod proto;
+pub mod transport;

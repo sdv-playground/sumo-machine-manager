@@ -176,8 +176,10 @@ impl RotatingFileWriter {
                 // base path so the writer is not permanently broken.
                 // If even that fails, return both errors via the
                 // primary.
-                if let Ok(file) =
-                    OpenOptions::new().create(true).append(true).open(&self.cfg.path)
+                if let Ok(file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.cfg.path)
                 {
                     self.current_size = file.metadata().map(|m| m.len()).unwrap_or(0);
                     self.current = Some(BufWriter::new(file));
@@ -212,16 +214,13 @@ impl RotatingFileWriter {
         // It may not exist if some external actor removed it between
         // open and rotate; that's fine — we'll just create fresh.
         if base.exists() {
-            fs::rename(base, &rotated_path(base, 1))?;
+            fs::rename(base, rotated_path(base, 1))?;
         }
 
         // Step d: open a fresh file at the base path. Use create_new
         // so we fail loud if something else has racily put a file
         // back; that's an operator error worth surfacing.
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(base)?;
+        let file = OpenOptions::new().create_new(true).write(true).open(base)?;
         self.current = Some(BufWriter::new(file));
         Ok(())
     }
@@ -293,8 +292,7 @@ mod tests {
     #[test]
     fn rejects_zero_max_rotated() {
         let tmp = tempdir().unwrap();
-        let cfg = RotatingFileConfig::new(tmp.path().join("x.log"), 1024)
-            .with_max_rotated(0);
+        let cfg = RotatingFileConfig::new(tmp.path().join("x.log"), 1024).with_max_rotated(0);
         assert!(RotatingFileWriter::open(cfg).is_err());
     }
 
@@ -302,9 +300,7 @@ mod tests {
     fn creates_parent_dir() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("nested/dir/here.log");
-        let mut w = RotatingFileWriter::open(
-            RotatingFileConfig::new(&path, 1024),
-        ).unwrap();
+        let mut w = RotatingFileWriter::open(RotatingFileConfig::new(&path, 1024)).unwrap();
         writeln!(w, "hi").unwrap();
         w.flush().unwrap();
         assert!(path.exists());
@@ -314,15 +310,18 @@ mod tests {
     fn writes_below_cap_dont_rotate() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("x.log");
-        let mut w = RotatingFileWriter::open(
-            RotatingFileConfig::new(&path, 1024).with_max_rotated(3),
-        ).unwrap();
+        let mut w =
+            RotatingFileWriter::open(RotatingFileConfig::new(&path, 1024).with_max_rotated(3))
+                .unwrap();
         for _ in 0..3 {
             writeln!(w, "a small line").unwrap();
         }
         w.flush().unwrap();
         assert!(path.exists());
-        assert!(!rotated_path(&path, 1).exists(), "no rotation should have happened");
+        assert!(
+            !rotated_path(&path, 1).exists(),
+            "no rotation should have happened"
+        );
     }
 
     #[test]
@@ -331,19 +330,24 @@ mod tests {
         let path = tmp.path().join("x.log");
         // Cap at 30 bytes; each line is "0123456789\n" = 11 bytes.
         // 1 line = 11, 2 lines = 22, 3 lines would be 33 > 30 → rotate.
-        let mut w = RotatingFileWriter::open(
-            RotatingFileConfig::new(&path, 30).with_max_rotated(2),
-        ).unwrap();
+        let mut w =
+            RotatingFileWriter::open(RotatingFileConfig::new(&path, 30).with_max_rotated(2))
+                .unwrap();
         writeln!(w, "0123456789").unwrap();
         writeln!(w, "0123456789").unwrap();
         writeln!(w, "0123456789").unwrap(); // triggers rotation
         w.flush().unwrap();
 
-        assert!(rotated_path(&path, 1).exists(),
-            "expected {} to exist after rotation", rotated_path(&path, 1).display());
+        assert!(
+            rotated_path(&path, 1).exists(),
+            "expected {} to exist after rotation",
+            rotated_path(&path, 1).display()
+        );
         // .1 holds the two pre-rotation lines.
-        assert_eq!(read_file(&rotated_path(&path, 1)),
-                   "0123456789\n0123456789\n");
+        assert_eq!(
+            read_file(&rotated_path(&path, 1)),
+            "0123456789\n0123456789\n"
+        );
         // Base holds the post-rotation line.
         assert_eq!(read_file(&path), "0123456789\n");
     }
@@ -352,9 +356,9 @@ mod tests {
     fn rotated_copies_shift_and_oldest_is_dropped() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("x.log");
-        let mut w = RotatingFileWriter::open(
-            RotatingFileConfig::new(&path, 11).with_max_rotated(2),
-        ).unwrap();
+        let mut w =
+            RotatingFileWriter::open(RotatingFileConfig::new(&path, 11).with_max_rotated(2))
+                .unwrap();
 
         // Each writeln is 11 bytes ("aaaaaaaaaa\n") — exactly fills
         // the cap. Next writeln rotates.
@@ -378,9 +382,8 @@ mod tests {
         let path = tmp.path().join("x.log");
         // Pre-write a file that's already over cap.
         fs::write(&path, "x".repeat(100)).unwrap();
-        let _w = RotatingFileWriter::open(
-            RotatingFileConfig::new(&path, 50).with_max_rotated(2),
-        ).unwrap();
+        let _w = RotatingFileWriter::open(RotatingFileConfig::new(&path, 50).with_max_rotated(2))
+            .unwrap();
         // The original 100-byte content should now be at .1; base is fresh empty.
         assert_eq!(read_file(&rotated_path(&path, 1)).len(), 100);
         assert_eq!(read_file(&path).len(), 0);
@@ -391,9 +394,9 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("x.log");
         let mut w = RotatingFileWriter::open(
-            RotatingFileConfig::new(&path, 1024)
-                .with_sync_each_line(true),
-        ).unwrap();
+            RotatingFileConfig::new(&path, 1024).with_sync_each_line(true),
+        )
+        .unwrap();
         // Just confirm the sync codepath returns Ok — actual fsync
         // observability would require a filesystem test rig.
         for _ in 0..10 {
@@ -407,9 +410,9 @@ mod tests {
     fn rotate_now_force_rotates_even_under_cap() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("x.log");
-        let mut w = RotatingFileWriter::open(
-            RotatingFileConfig::new(&path, 1024).with_max_rotated(2),
-        ).unwrap();
+        let mut w =
+            RotatingFileWriter::open(RotatingFileConfig::new(&path, 1024).with_max_rotated(2))
+                .unwrap();
         writeln!(w, "first").unwrap();
         w.flush().unwrap();
         w.rotate_now().unwrap();

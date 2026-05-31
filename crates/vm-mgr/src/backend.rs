@@ -1,8 +1,15 @@
-/// VmBackend — DiagnosticBackend implementation for vm-mgr bank sets.
-///
-/// Each instance manages one bank set (hypervisor, vm1, vm2, hsm) and provides:
-/// - Parameter read/write via NV DIDs
-/// - Fault (DTC) management
+//! VmBackend — DiagnosticBackend implementation for vm-mgr bank sets.
+//!
+//! Each instance manages one bank set (hypervisor, vm1, vm2, hsm) and provides:
+//!
+//! - Parameter read/write via NV DIDs
+//! - Fault (DTC) management
+
+#![allow(
+    clippy::large_enum_variant,
+    clippy::doc_lazy_continuation,
+    clippy::match_like_matches_macro
+)]
 /// - SUIT-based firmware flash with A/B banking
 /// - Session/security mode control
 use std::collections::HashMap;
@@ -371,10 +378,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     }
 
     /// Set a bank activator for post-install bank activation.
-    pub fn with_bank_activator(
-        mut self,
-        activator: Arc<dyn machine_mgr::BankActivator>,
-    ) -> Self {
+    pub fn with_bank_activator(mut self, activator: Arc<dyn machine_mgr::BankActivator>) -> Self {
         self.bank_activator = Some(activator);
         self
     }
@@ -526,9 +530,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// the bank it points to, or `None` if missing / unreadable.
     fn read_current_symlink(&self) -> Option<Bank> {
         let images_dir = self.images_dir.as_ref()?;
-        let symlink_path = images_dir
-            .join(&self.bank_spec.dir_name)
-            .join("current");
+        let symlink_path = images_dir.join(&self.bank_spec.dir_name).join("current");
         let target = std::fs::read_link(&symlink_path).ok()?;
         let name = target.file_name()?.to_str()?;
         match name {
@@ -540,7 +542,9 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
     /// Atomically flip the `current` symlink to point at `bank`.
     fn flip_current_symlink(&self, bank: Bank) {
-        let Some(images_dir) = self.images_dir.as_ref() else { return };
+        let Some(images_dir) = self.images_dir.as_ref() else {
+            return;
+        };
         let dir = images_dir.join(&self.bank_spec.dir_name);
         let symlink_path = dir.join("current");
         let target = Path::new(bank_dir_name(bank));
@@ -2336,10 +2340,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             if let (Some(ref activator), Some(ref images_dir)) =
                 (&self.bank_activator, &self.images_dir)
             {
-                let wrote_to = installed_bank
-                    .ok_or_else(|| BackendError::Internal(
-                        "installed_bank unset — unreachable for !is_crl".into()
-                    ))?;
+                let wrote_to = installed_bank.ok_or_else(|| {
+                    BackendError::Internal("installed_bank unset — unreachable for !is_crl".into())
+                })?;
                 let bank_dir = images_dir
                     .join(self.bank_spec.dir_name.as_str())
                     .join(bank_dir_name(wrote_to));
@@ -2840,7 +2843,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
     async fn get_activation_state(&self) -> BackendResult<ActivationState> {
         // Check upload phase first (streaming firmware download in progress)
-        let upload_state = self.upload_phase.lock().unwrap().clone();
+        let upload_state = *self.upload_phase.lock().unwrap();
 
         // If we're in Verifying, ask the component's health source whether
         // it's now ready. Promote to Activated lazily on poll so the
@@ -2848,17 +2851,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // no out-of-band signal.
         if matches!(*self.flash_transfer.lock().unwrap(),
             Some(ref t) if t.state == FlashState::Verifying)
+            && self.guest_is_running().await
         {
-            if self.guest_is_running().await {
-                let mut ft = self.flash_transfer.lock().unwrap();
-                if let Some(ref mut t) = *ft {
-                    if t.state == FlashState::Verifying {
-                        t.state = FlashState::Activated;
-                        tracing::info!(
-                            component = %self.entity_info.id,
-                            "verifying → activated (guest health ok)"
-                        );
-                    }
+            let mut ft = self.flash_transfer.lock().unwrap();
+            if let Some(ref mut t) = *ft {
+                if t.state == FlashState::Verifying {
+                    t.state = FlashState::Activated;
+                    tracing::info!(
+                        component = %self.entity_info.id,
+                        "verifying → activated (guest health ok)"
+                    );
                 }
             }
         }

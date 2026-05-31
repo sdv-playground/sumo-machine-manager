@@ -52,7 +52,10 @@ struct HeartbeatLiveness {
 
 impl HeartbeatLiveness {
     fn new() -> Self {
-        Self { last_seq: None, last_seq_change: None }
+        Self {
+            last_seq: None,
+            last_seq_change: None,
+        }
     }
 
     /// Update tracker with a freshly read seq. Returns `true` if the
@@ -122,8 +125,7 @@ pub struct VmManager {
 /// `Err(message)` to refuse it. The closure is expected to log its own
 /// outcome (timing, sig status, gen) — `start_vm` only adds a thin
 /// failure breadcrumb on its end.
-pub type PreLaunchVerify =
-    Arc<dyn Fn(&str, &std::path::Path) -> Result<(), String> + Send + Sync>;
+pub type PreLaunchVerify = Arc<dyn Fn(&str, &std::path::Path) -> Result<(), String> + Send + Sync>;
 
 /// Returned by `initiate_stop` — carries enough info to wait for exit
 /// without holding the manager lock.
@@ -207,12 +209,11 @@ impl VmManager {
                 BackendType::Qemu => {
                     let mut r = QemuRunner::new();
                     if let Some(ref sim_dir) = def.sim_dir {
-                        r = r.ivshmem_bin(
+                        r = r.ivshmem_bin(if sim_dir.join("ivshmem-server").exists() {
                             sim_dir.join("ivshmem-server")
-                                .exists()
-                                .then(|| sim_dir.join("ivshmem-server"))
-                                .unwrap_or_else(|| "ivshmem-server".into()),
-                        );
+                        } else {
+                            "ivshmem-server".into()
+                        });
                     }
                     Box::new(r)
                 }
@@ -227,15 +228,18 @@ impl VmManager {
 
             // Channels are opened lazily in `start_vm` so their lifetime
             // matches the VM process — see module docs.
-            vms.insert(name, ManagedVm {
-                def,
-                runner,
-                handle: None,
-                heartbeat: None,
-                power: None,
-                time: None,
-                liveness: HeartbeatLiveness::new(),
-            });
+            vms.insert(
+                name,
+                ManagedVm {
+                    def,
+                    runner,
+                    handle: None,
+                    heartbeat: None,
+                    power: None,
+                    time: None,
+                    liveness: HeartbeatLiveness::new(),
+                },
+            );
         }
 
         Self {
@@ -264,7 +268,9 @@ impl VmManager {
     }
 
     pub fn start_vm(&mut self, name: &str) -> Result<(), ManagerError> {
-        let vm = self.vms.get_mut(name)
+        let vm = self
+            .vms
+            .get_mut(name)
             .ok_or_else(|| ManagerError::NotFound(name.to_string()))?;
 
         if vm.handle.is_some() {
@@ -296,8 +302,10 @@ impl VmManager {
         // Read per-bank config if available (image_dir resolves through current symlink)
         let effective_def = match VmBankConfig::from_dir(&vm.def.image_dir) {
             Some(bank_config) => {
-                tracing::info!("loaded per-bank config for {name} from {}/vm-config.yaml",
-                    vm.def.image_dir.display());
+                tracing::info!(
+                    "loaded per-bank config for {name} from {}/vm-config.yaml",
+                    vm.def.image_dir.display()
+                );
                 vm.def.with_bank_overrides(&bank_config)
             }
             None => vm.def.clone(),
@@ -349,10 +357,13 @@ impl VmManager {
         // Don't start if boot images are missing (e.g. first boot before provisioning)
         if let Some(kernel) = effective_def.kernel_path() {
             if !kernel.exists() {
-                tracing::warn!("VM {name}: kernel not found: {} — deferring start", kernel.display());
-                return Err(ManagerError::Runner(
-                    crate::runner::RunnerError::Config(format!("kernel not found: {}", kernel.display()))
-                ));
+                tracing::warn!(
+                    "VM {name}: kernel not found: {} — deferring start",
+                    kernel.display()
+                );
+                return Err(ManagerError::Runner(crate::runner::RunnerError::Config(
+                    format!("kernel not found: {}", kernel.display()),
+                )));
             }
         }
 
@@ -362,7 +373,9 @@ impl VmManager {
         // existing region by name. For ivshmem-file transports the file
         // must exist before QEMU mmaps it. Both are satisfied by opening
         // here.
-        let has_health = effective_def.devices.iter()
+        let has_health = effective_def
+            .devices
+            .iter()
             .any(|d| matches!(d, crate::config::DeviceConfig::Health { .. }));
         if has_health {
             if let Some(ref tx) = self.device_transport {
@@ -375,8 +388,12 @@ impl VmManager {
                         vm.power = Some(PowerCommandDevice::new(pw_ch));
                     }
                     (hb_res, pw_res) => {
-                        if let Err(e) = hb_res { tracing::warn!("VM {name}: heartbeat channel open failed: {e}"); }
-                        if let Err(e) = pw_res { tracing::warn!("VM {name}: power channel open failed: {e}"); }
+                        if let Err(e) = hb_res {
+                            tracing::warn!("VM {name}: heartbeat channel open failed: {e}");
+                        }
+                        if let Err(e) = pw_res {
+                            tracing::warn!("VM {name}: power channel open failed: {e}");
+                        }
                     }
                 }
             } else {
@@ -401,7 +418,9 @@ impl VmManager {
         // case and emits a single combined write. For HTTP the two
         // triples resolve to two distinct endpoints under
         // /vm/{vm}/dev/time/{ch}.
-        let has_time = effective_def.devices.iter()
+        let has_time = effective_def
+            .devices
+            .iter()
             .any(|d| matches!(d, crate::config::DeviceConfig::Time { .. }));
         if has_time {
             if let Some(ref tx) = self.device_transport {
@@ -438,16 +457,24 @@ impl VmManager {
     /// Signal a VM to stop. Returns the PID and timeout for the caller to
     /// wait on *without* holding the manager lock. Call `finalize_stop` after.
     pub fn initiate_stop(&mut self, name: &str) -> Result<StopHandle, ManagerError> {
-        let vm = self.vms.get_mut(name)
+        let vm = self
+            .vms
+            .get_mut(name)
             .ok_or_else(|| ManagerError::NotFound(name.to_string()))?;
 
-        let handle = vm.handle.as_ref()
+        let handle = vm
+            .handle
+            .as_ref()
             .ok_or_else(|| ManagerError::NotRunning(name.to_string()))?;
 
         if !vm.runner.is_running(handle) {
             vm.runner.cleanup();
             vm.handle = None;
-            return Ok(StopHandle { name: name.to_string(), pid: None, timeout_secs: 0 });
+            return Ok(StopHandle {
+                name: name.to_string(),
+                pid: None,
+                timeout_secs: 0,
+            });
         }
 
         // Send PowerCommand::Shutdown via the host→guest power channel.
@@ -477,7 +504,11 @@ impl VmManager {
         let pid = handle.pid;
         tracing::info!("signalled shutdown for VM {name} (pid: {pid:?}, timeout: {timeout_secs}s)");
 
-        Ok(StopHandle { name: name.to_string(), pid, timeout_secs })
+        Ok(StopHandle {
+            name: name.to_string(),
+            pid,
+            timeout_secs,
+        })
     }
 
     /// Finalize stop: force-kill if still running, clean up resources.
@@ -538,23 +569,32 @@ impl VmManager {
 
     /// Compute current health from process state + most-recent heartbeat.
     pub fn health_detail(&mut self, name: &str) -> Result<HealthDetail, ManagerError> {
-        let vm = self.vms.get_mut(name)
+        let vm = self
+            .vms
+            .get_mut(name)
             .ok_or_else(|| ManagerError::NotFound(name.to_string()))?;
 
         Ok(read_health(vm))
     }
 
     pub fn list(&mut self) -> Vec<VmInfo> {
-        self.vms.iter_mut().map(|(name, vm)| {
-            let detail = read_health(vm);
-            let pid = vm.handle.as_ref().and_then(|h| h.pid);
-            VmInfo {
-                name: name.clone(),
-                status: detail.status,
-                pid: if matches!(detail.status, HealthStatus::Stopped) { None } else { pid },
-                backend: vm.def.backend,
-            }
-        }).collect()
+        self.vms
+            .iter_mut()
+            .map(|(name, vm)| {
+                let detail = read_health(vm);
+                let pid = vm.handle.as_ref().and_then(|h| h.pid);
+                VmInfo {
+                    name: name.clone(),
+                    status: detail.status,
+                    pid: if matches!(detail.status, HealthStatus::Stopped) {
+                        None
+                    } else {
+                        pid
+                    },
+                    backend: vm.def.backend,
+                }
+            })
+            .collect()
     }
 
     /// Stop all running VMs (for graceful daemon shutdown).
@@ -571,7 +611,12 @@ impl VmManager {
 /// Compute current `HealthDetail`. Pulled out so `health_detail` and `list`
 /// share one mapping and the same liveness-tracker mutation rules.
 fn read_health(vm: &mut ManagedVm) -> HealthDetail {
-    let empty = HealthDetail { status: HealthStatus::Stopped, guest_state: None, hb_seq: None, boot_id: None };
+    let empty = HealthDetail {
+        status: HealthStatus::Stopped,
+        guest_state: None,
+        hb_seq: None,
+        boot_id: None,
+    };
 
     // Process state takes precedence — a Stopped VM has no live heartbeat.
     let handle = match &vm.handle {
@@ -584,12 +629,18 @@ fn read_health(vm: &mut ManagedVm) -> HealthDetail {
 
     // No heartbeat device wired up — process is up, can't say more.
     let Some(ref hb_dev) = vm.heartbeat else {
-        return HealthDetail { status: HealthStatus::Running, ..empty };
+        return HealthDetail {
+            status: HealthStatus::Running,
+            ..empty
+        };
     };
 
     // Read heartbeat. None = guest hasn't written yet, or wire is bad.
     let Some(hb) = hb_dev.read() else {
-        return HealthDetail { status: HealthStatus::Starting, ..empty };
+        return HealthDetail {
+            status: HealthStatus::Starting,
+            ..empty
+        };
     };
 
     let stale = vm.liveness.observe(hb.seq, Instant::now());

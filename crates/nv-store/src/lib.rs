@@ -17,9 +17,9 @@
 //! - FW meta   — SW identity, hash, sequence, min_security_ver (per bank set × bank)
 //! - Runtime   — writable DIDs and DTCs (per bank set × bank; copy-on-update)
 
-pub mod types;
-pub mod store;
 pub mod block;
+pub mod store;
+pub mod types;
 
 #[cfg(test)]
 mod tests;

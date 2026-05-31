@@ -217,9 +217,8 @@ impl BootstrapState {
             pending: self.pending.clone(),
             enrolled: self.enrolled.clone(),
         };
-        let yaml = serde_yaml::to_string(&doc).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("bootstrap.yaml serialise: {e}"))
-        })?;
+        let yaml = serde_yaml::to_string(&doc)
+            .map_err(|e| io::Error::other(format!("bootstrap.yaml serialise: {e}")))?;
         let parent = self.path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "bootstrap path has no parent")
         })?;
@@ -305,10 +304,8 @@ impl BootstrapState {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.pending.insert(
-            vm_id.into(),
-            PendingEnrollment { armed_at, ttl_secs },
-        );
+        self.pending
+            .insert(vm_id.into(), PendingEnrollment { armed_at, ttl_secs });
     }
 
     /// Attempt to consume a pending enrolment. On `Accepted`, the
@@ -539,6 +536,10 @@ mod tests {
         assert!(path.exists());
         // The tmp file is renamed away.
         let tmp_path = path.with_extension("yaml.tmp");
-        assert!(!tmp_path.exists(), "stale tmp file at {}", tmp_path.display());
+        assert!(
+            !tmp_path.exists(),
+            "stale tmp file at {}",
+            tmp_path.display()
+        );
     }
 }

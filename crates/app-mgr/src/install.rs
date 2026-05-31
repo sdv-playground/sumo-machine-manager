@@ -64,9 +64,9 @@ impl InstallSession {
         // Extract tar payload
         let cursor = std::io::Cursor::new(&payload);
         let mut archive = tar::Archive::new(cursor);
-        archive.unpack(&self.target_dir).map_err(|e| {
-            MachineError::ManifestInvalid(format!("tar extraction failed: {e}"))
-        })?;
+        archive
+            .unpack(&self.target_dir)
+            .map_err(|e| MachineError::ManifestInvalid(format!("tar extraction failed: {e}")))?;
 
         // Verify required file exists: the binary
         let has_binary = fs::read_dir(&self.target_dir)

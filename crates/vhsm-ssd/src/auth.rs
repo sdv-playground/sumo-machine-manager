@@ -571,8 +571,12 @@ fn parse_auth_payload(payload: &[u8]) -> Option<(&[u8], &[u8])> {
 /// - `nonce`: the 16-byte server-chosen nonce from HELLO.
 /// - `sig_bytes`: raw 64-byte ECDSA-P256 signature (r[32] || s[32]).
 fn verify_proof_sig(cnf_pubkey: &[u8], nonce: &[u8; NONCE_LEN], sig_bytes: &[u8]) -> bool {
-    let Some(verifying_key) = parse_p256_pub(cnf_pubkey) else { return false; };
-    let Ok(signature) = Signature::from_slice(sig_bytes) else { return false; };
+    let Some(verifying_key) = parse_p256_pub(cnf_pubkey) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(sig_bytes) else {
+        return false;
+    };
     let mut msg = Vec::with_capacity(NONCE_LEN + PROOF_DOMAIN_TAG.len());
     msg.extend_from_slice(nonce);
     msg.extend_from_slice(PROOF_DOMAIN_TAG);
@@ -724,8 +728,13 @@ statements:
         let (signer, signer_pub, principal, principal_pub) = fixture();
         let policy = sample_policy();
         let (state, hello_resp, auth_resp) = run_handshake(
-            &signer, &signer_pub, &principal, &principal_pub,
-            "vm2", &policy, fixed_time(1_500_000),
+            &signer,
+            &signer_pub,
+            &principal,
+            &principal_pub,
+            "vm2",
+            &policy,
+            fixed_time(1_500_000),
         );
 
         assert_eq!(hello_resp.status, StatusCode::Ok as u32);
@@ -756,9 +765,8 @@ statements:
         let resp = step(&mut state, &req, &signer_pub, &policy, None, fixed_time(1));
         assert_eq!(resp.status, StatusCode::PolicyReject as u32);
         assert_eq!(resp.payload.len(), 2);
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::InvalidParam));
         assert!(matches!(state, HandshakeState::Failed(_)));
     }
@@ -804,8 +812,15 @@ statements:
         // HELLO
         let _ = step(
             &mut state,
-            &Request { op: Op::Hello as u32, session_id: 1, payload: vec![] },
-            &signer_pub, &policy, None, fixed_time(1_500_000),
+            &Request {
+                op: Op::Hello as u32,
+                session_id: 1,
+                payload: vec![],
+            },
+            &signer_pub,
+            &policy,
+            None,
+            fixed_time(1_500_000),
         );
 
         // AUTH with a signature over the WRONG nonce.
@@ -822,11 +837,13 @@ statements:
                 session_id: 1,
                 payload: encode_auth_payload(&cwt, &sig_bytes),
             },
-            &signer_pub, &policy, None, fixed_time(1_500_000),
+            &signer_pub,
+            &policy,
+            None,
+            fixed_time(1_500_000),
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::BadProofSignature));
         assert!(matches!(state, HandshakeState::Failed(_)));
     }
@@ -844,8 +861,15 @@ statements:
         let mut state = HandshakeState::new();
         let hello_resp = step(
             &mut state,
-            &Request { op: Op::Hello as u32, session_id: 1, payload: vec![] },
-            &signer_pub, &policy, None, fixed_time(1_500_000),
+            &Request {
+                op: Op::Hello as u32,
+                session_id: 1,
+                payload: vec![],
+            },
+            &signer_pub,
+            &policy,
+            None,
+            fixed_time(1_500_000),
         );
         let nonce: [u8; NONCE_LEN] = hello_resp.payload.try_into().unwrap();
 
@@ -864,11 +888,13 @@ statements:
                 session_id: 1,
                 payload: encode_auth_payload(&cwt, &sig_bytes),
             },
-            &signer_pub, &policy, None, fixed_time(1_500_000),
+            &signer_pub,
+            &policy,
+            None,
+            fixed_time(1_500_000),
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::BadProofSignature));
     }
 
@@ -883,8 +909,15 @@ statements:
         let mut state = HandshakeState::new();
         let hello_resp = step(
             &mut state,
-            &Request { op: Op::Hello as u32, session_id: 1, payload: vec![] },
-            &signer_pub, &policy, None, fixed_time(1_500_000),
+            &Request {
+                op: Op::Hello as u32,
+                session_id: 1,
+                payload: vec![],
+            },
+            &signer_pub,
+            &policy,
+            None,
+            fixed_time(1_500_000),
         );
         let nonce: [u8; NONCE_LEN] = hello_resp.payload.try_into().unwrap();
         let mut msg = Vec::new();
@@ -900,11 +933,13 @@ statements:
                 session_id: 1,
                 payload: encode_auth_payload(&cwt, &sig_bytes),
             },
-            &signer_pub, &policy, None, fixed_time(1_500_000),
+            &signer_pub,
+            &policy,
+            None,
+            fixed_time(1_500_000),
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::CertExpired));
     }
 
@@ -914,8 +949,15 @@ statements:
         let mut state = HandshakeState::new();
         let _ = step(
             &mut state,
-            &Request { op: Op::Hello as u32, session_id: 1, payload: vec![] },
-            &[0u8; 65], &policy, None, fixed_time(1),
+            &Request {
+                op: Op::Hello as u32,
+                session_id: 1,
+                payload: vec![],
+            },
+            &[0u8; 65],
+            &policy,
+            None,
+            fixed_time(1),
         );
         // Length prefix says 5000 bytes but we only ship 3.
         let mut buf = vec![];
@@ -923,12 +965,18 @@ statements:
         buf.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
         let resp = step(
             &mut state,
-            &Request { op: Op::Auth as u32, session_id: 1, payload: buf },
-            &[0u8; 65], &policy, None, fixed_time(1),
+            &Request {
+                op: Op::Auth as u32,
+                session_id: 1,
+                payload: buf,
+            },
+            &[0u8; 65],
+            &policy,
+            None,
+            fixed_time(1),
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::InvalidParam));
     }
 
@@ -936,7 +984,9 @@ statements:
     fn handshake_done_marker_set_correctly() {
         let s = HandshakeState::AwaitHello;
         assert!(!s.is_done());
-        let s = HandshakeState::NonceSent { nonce: [0u8; NONCE_LEN] };
+        let s = HandshakeState::NonceSent {
+            nonce: [0u8; NONCE_LEN],
+        };
         assert!(!s.is_done());
         let s = HandshakeState::Authenticated(Principal {
             vm_id: "x".into(),
@@ -963,16 +1013,15 @@ statements:
         };
         let resp = step(&mut state, &req, &[0u8; 65], &policy, None, fixed_time(1));
         assert_eq!(resp.status, StatusCode::PolicyReject as u32);
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::InvalidParam));
     }
 
     // ---- ENROLL tests ---------------------------------------------
 
     use crate::bootstrap::BootstrapState;
-    use crate::cert::{LocalEcuSigner, validate as validate_cert};
+    use crate::cert::{validate as validate_cert, LocalEcuSigner};
 
     /// Pair of `(BootstrapState, tempdir)` — the tempdir must outlive
     /// the state so `save()` doesn't write into a deleted directory.
@@ -1006,8 +1055,15 @@ statements:
     ) {
         let resp = step(
             state,
-            &Request { op: Op::Hello as u32, session_id: 1, payload: vec![] },
-            signer_pub, policy, None, now,
+            &Request {
+                op: Op::Hello as u32,
+                session_id: 1,
+                payload: vec![],
+            },
+            signer_pub,
+            policy,
+            None,
+            now,
         );
         assert_eq!(resp.status, StatusCode::Ok as u32);
     }
@@ -1037,8 +1093,15 @@ statements:
         let payload = encode_enroll_payload("vm9", &token, &principal_pub);
         let resp = step(
             &mut state,
-            &Request { op: Op::Enroll as u32, session_id: 1, payload },
-            &signer_pub, &policy, Some(&mut ctx), now,
+            &Request {
+                op: Op::Enroll as u32,
+                session_id: 1,
+                payload,
+            },
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            now,
         );
 
         assert_eq!(resp.status, StatusCode::Ok as u32);
@@ -1093,7 +1156,10 @@ statements:
                     session_id: 1,
                     payload: encode_enroll_payload("vm9", &token, &principal_pub),
                 },
-                &signer_pub, &policy, Some(&mut ctx), now,
+                &signer_pub,
+                &policy,
+                Some(&mut ctx),
+                now,
             );
             assert_eq!(resp.status, StatusCode::Ok as u32);
         }
@@ -1116,11 +1182,13 @@ statements:
                 session_id: 2,
                 payload: encode_enroll_payload("vm9", &token, &principal_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), now,
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            now,
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::TokenAlreadyConsumed));
         assert!(matches!(state2, HandshakeState::Failed(_)));
     }
@@ -1152,11 +1220,13 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_payload("nonexistent-vm", &[0u8; 32], &principal_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), fixed_time(1_500_000),
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            fixed_time(1_500_000),
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::BadBootstrapToken));
     }
 
@@ -1186,11 +1256,13 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_payload("vm9", &[0xBBu8; 32], &principal_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), fixed_time(1_500_000),
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            fixed_time(1_500_000),
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::BadBootstrapToken));
     }
 
@@ -1219,11 +1291,13 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_payload("vm9", &[0xAAu8; 32], &principal_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), fixed_time(1_500_000),
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            fixed_time(1_500_000),
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::InvalidParam));
         assert!(matches!(state, HandshakeState::Failed(_)));
     }
@@ -1255,11 +1329,13 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_payload("vm9", &[0xAAu8; 32], &bogus_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), fixed_time(1_500_000),
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            fixed_time(1_500_000),
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::InvalidParam));
 
         // The bootstrap token must NOT be marked consumed when the
@@ -1289,12 +1365,18 @@ statements:
         // Length prefix says 50-byte vm_id but the slice is only 2 bytes.
         let resp = step(
             &mut state,
-            &Request { op: Op::Enroll as u32, session_id: 1, payload: vec![50, 0x61, 0x62] },
-            &signer_pub, &policy, Some(&mut ctx), fixed_time(1_500_000),
+            &Request {
+                op: Op::Enroll as u32,
+                session_id: 1,
+                payload: vec![50, 0x61, 0x62],
+            },
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            fixed_time(1_500_000),
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::InvalidParam));
     }
 
@@ -1314,11 +1396,13 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_payload("vm9", &[0xAAu8; 32], &principal_pub),
             },
-            &signer_pub, &policy, None, fixed_time(1_500_000),
+            &signer_pub,
+            &policy,
+            None,
+            fixed_time(1_500_000),
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::InvalidParam));
     }
 
@@ -1356,7 +1440,10 @@ statements:
                     session_id: 1,
                     payload: encode_enroll_payload("vm2", &token, &principal_pub),
                 },
-                &signer_pub, &policy, Some(&mut ctx), now,
+                &signer_pub,
+                &policy,
+                Some(&mut ctx),
+                now,
             );
             assert_eq!(resp.status, StatusCode::Ok as u32);
             resp.payload
@@ -1366,8 +1453,15 @@ statements:
         let mut state = HandshakeState::new();
         let hello_resp = step(
             &mut state,
-            &Request { op: Op::Hello as u32, session_id: 2, payload: vec![] },
-            &signer_pub, &policy, None, now,
+            &Request {
+                op: Op::Hello as u32,
+                session_id: 2,
+                payload: vec![],
+            },
+            &signer_pub,
+            &policy,
+            None,
+            now,
         );
         let nonce: [u8; NONCE_LEN] = hello_resp.payload.try_into().unwrap();
         let mut msg = Vec::new();
@@ -1381,9 +1475,16 @@ statements:
                 session_id: 2,
                 payload: encode_auth_payload(&cwt, &sig.to_bytes()),
             },
-            &signer_pub, &policy, None, now,
+            &signer_pub,
+            &policy,
+            None,
+            now,
         );
-        assert_eq!(auth_resp.status, StatusCode::Ok as u32, "AUTH should accept enrolled cert");
+        assert_eq!(
+            auth_resp.status,
+            StatusCode::Ok as u32,
+            "AUTH should accept enrolled cert"
+        );
         assert_eq!(auth_resp.op, Op::AuthOk as u32);
         let p = state.principal().expect("principal bound after AUTH");
         assert_eq!(p.vm_id, "vm2");
@@ -1443,7 +1544,10 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_assisted_payload(&principal_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), now,
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            now,
         );
         assert_eq!(resp.status, StatusCode::Ok as u32);
         assert_eq!(resp.op, Op::EnrollAssisted as u32);
@@ -1490,11 +1594,13 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_assisted_payload(&principal_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), now,
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            now,
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::BadBootstrapToken));
 
         // Pending flag MUST remain — failed lookup doesn't consume.
@@ -1534,11 +1640,13 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_assisted_payload(&principal_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), now,
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            now,
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::BadBootstrapToken));
     }
 
@@ -1589,11 +1697,13 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_assisted_payload(&principal_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), now,
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            now,
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::TokenAlreadyConsumed));
     }
 
@@ -1624,11 +1734,13 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_assisted_payload(&principal_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), now,
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            now,
         );
-        let reason = AuthFailReason::from_u16(u16::from_le_bytes([
-            resp.payload[0], resp.payload[1],
-        ]));
+        let reason =
+            AuthFailReason::from_u16(u16::from_le_bytes([resp.payload[0], resp.payload[1]]));
         assert_eq!(reason, Some(AuthFailReason::BadBootstrapToken));
     }
 
@@ -1672,8 +1784,15 @@ statements:
                 session_id: 1,
                 payload: encode_enroll_assisted_payload(&principal_pub),
             },
-            &signer_pub, &policy, Some(&mut ctx), now,
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            now,
         );
-        assert_eq!(resp.status, StatusCode::Ok as u32, "reload should have surfaced the entry");
+        assert_eq!(
+            resp.status,
+            StatusCode::Ok as u32,
+            "reload should have surfaced the entry"
+        );
     }
 }

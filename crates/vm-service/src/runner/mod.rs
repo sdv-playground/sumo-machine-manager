@@ -1,17 +1,18 @@
-/// VM runner trait — platform abstraction for starting/stopping VMs.
-///
-/// Implementations:
-/// - QemuRunner: builds QEMU command line, manages ivshmem-server + simulators
-/// - DummyRunner: instant no-ops for components without a real VM
-/// - QnxRunner: stub for QNX qvm integration (future)
+//! VM runner trait — platform abstraction for starting/stopping VMs.
+//!
+//! Implementations:
+//!
+//! - `QemuRunner`: builds QEMU command line, manages ivshmem-server + simulators
+//! - `DummyRunner`: instant no-ops for components without a real VM
+//! - `QnxRunner`: stub for QNX qvm integration (future)
 
+pub mod dummy;
 #[cfg(target_os = "linux")]
 pub mod qemu;
 pub mod qnx;
-pub mod dummy;
 
-use std::time::Duration;
 use crate::config::VmDefinition;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub enum RunnerError {
@@ -83,7 +84,11 @@ pub trait VmRunner: Send {
     /// Attempt graceful shutdown, then force-kill if still running after timeout.
     /// Default: calls stop() immediately.
     #[allow(dead_code)]
-    fn graceful_shutdown(&mut self, handle: &VmHandle, _timeout: Duration) -> Result<(), RunnerError> {
+    fn graceful_shutdown(
+        &mut self,
+        handle: &VmHandle,
+        _timeout: Duration,
+    ) -> Result<(), RunnerError> {
         self.stop(handle)
     }
 }
@@ -104,7 +109,8 @@ mod tests {
 
     #[test]
     fn runner_error_from_io_error() {
-        let e: RunnerError = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope").into();
+        let e: RunnerError =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope").into();
         assert!(matches!(e, RunnerError::Io(_)));
     }
 

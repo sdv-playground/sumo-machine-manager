@@ -2,7 +2,6 @@
 ///
 /// OTA manifests use SUIT envelopes via [`SuitProvider`](crate::suit_provider).
 /// These YAML types are only used for factory-init (offline provisioning).
-
 use crate::ota::ImageMeta;
 use nv_store::types::BankSet;
 use serde::{Deserialize, Serialize};
@@ -235,5 +234,4 @@ device_type: 1
         assert_eq!(&nv.serial_number[..6], b"SN-001");
         assert_eq!(&nv.vin[..17], b"WBALI00000TEST001");
     }
-
 }

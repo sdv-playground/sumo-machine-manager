@@ -308,10 +308,7 @@ fn capabilities_json_roundtrip() {
     let json = serde_json::to_string(&c).unwrap();
     let back: Capabilities = serde_json::from_str(&json).unwrap();
     assert_eq!(back.did_store, c.did_store);
-    assert_eq!(
-        back.flash.as_ref().map(|f| f.dual_bank),
-        Some(true)
-    );
+    assert_eq!(back.flash.as_ref().map(|f| f.dual_bank), Some(true));
     assert_eq!(back.hsm.as_ref().map(|h| h.supports_csr), Some(true));
 }
 
@@ -329,7 +326,10 @@ fn reset_kind_defaults_to_local() {
 
     struct DefaultActivator;
     impl crate::bank_activator::BankActivator for DefaultActivator {
-        fn activate(&self, _: &std::path::Path) -> Result<(), crate::bank_activator::BankActivatorError> {
+        fn activate(
+            &self,
+            _: &std::path::Path,
+        ) -> Result<(), crate::bank_activator::BankActivatorError> {
             Ok(())
         }
         // No reset_kind override — should fall back to Local.
@@ -342,7 +342,10 @@ fn reset_kind_defaults_to_local() {
 fn reset_kind_override_is_honoured() {
     struct EcuResetActivator;
     impl crate::bank_activator::BankActivator for EcuResetActivator {
-        fn activate(&self, _: &std::path::Path) -> Result<(), crate::bank_activator::BankActivatorError> {
+        fn activate(
+            &self,
+            _: &std::path::Path,
+        ) -> Result<(), crate::bank_activator::BankActivatorError> {
             Ok(())
         }
         fn reset_kind(&self) -> ResetKind {
@@ -357,7 +360,10 @@ fn reset_kind_override_is_honoured() {
 fn reset_kind_serializes_snake_case() {
     // Wire-visible names — orchestrator parses these. Lock them down.
     assert_eq!(serde_json::to_string(&ResetKind::None).unwrap(), "\"none\"");
-    assert_eq!(serde_json::to_string(&ResetKind::Local).unwrap(), "\"local\"");
+    assert_eq!(
+        serde_json::to_string(&ResetKind::Local).unwrap(),
+        "\"local\""
+    );
     assert_eq!(
         serde_json::to_string(&ResetKind::RequiresEcuReset).unwrap(),
         "\"requires_ecu_reset\""
@@ -487,7 +493,10 @@ fn machine_error_display_covers_all_variants() {
         (MachineError::InvalidArgument("arg".into()), "invalid"),
         (MachineError::PolicyRejected("pol".into()), "policy"),
         (MachineError::ManifestInvalid("m".into()), "manifest"),
-        (MachineError::UnknownFlashSession("s".into()), "flash session"),
+        (
+            MachineError::UnknownFlashSession("s".into()),
+            "flash session",
+        ),
         (MachineError::Storage("disk".into()), "storage"),
         (MachineError::Internal("boom".into()), "internal"),
     ];

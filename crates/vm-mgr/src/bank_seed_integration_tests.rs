@@ -47,7 +47,9 @@ fn make_backend(
     let trust_anchor = vec![0u8; 32];
     let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(trust_anchor));
     let sp = Arc::new(TestSecurityProvider);
-    Arc::new(VmBackend::with_options(set, nv, mp, sp, config, None, images_dir))
+    Arc::new(VmBackend::with_options(
+        set, nv, mp, sp, config, None, images_dir,
+    ))
 }
 
 fn write_file(p: &std::path::Path, content: &[u8]) {
@@ -97,7 +99,10 @@ fn partial_flash_seeds_unstreamed_components_from_active() {
         b"NEW policy image",
     );
     // Unstreamed files seeded from active.
-    assert_eq!(std::fs::read(target_dir.join("kernel")).unwrap(), b"old kernel");
+    assert_eq!(
+        std::fs::read(target_dir.join("kernel")).unwrap(),
+        b"old kernel"
+    );
     assert_eq!(
         std::fs::read(target_dir.join("rootfs.img")).unwrap(),
         b"old rootfs"
@@ -170,7 +175,10 @@ fn missing_active_bank_dir_is_noop() {
     );
 
     backend.seed_target_from_active(Bank::B).expect("seed runs");
-    assert_eq!(std::fs::read(target_dir.join("policy.sqfs")).unwrap(), b"new");
+    assert_eq!(
+        std::fs::read(target_dir.join("policy.sqfs")).unwrap(),
+        b"new"
+    );
 }
 
 /// HSM-style single-bank components have no peer bank. seed must

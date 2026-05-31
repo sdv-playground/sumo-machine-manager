@@ -1,15 +1,17 @@
-/// SUIT manifest provider — validates RFC 9124 SUIT envelopes via sumo-rs.
-///
-/// Uses sumo-onboard's orchestrator for the payload pipeline:
-/// fetch → decrypt → decompress → verify → write
-///
-/// Two trust stores:
-/// - **Provisioning authority** (fixed at startup): validates HSM key envelopes.
-///   This is the authority *over* the HSM — cannot live inside the HSM.
-/// - **Software authority** (loaded from HSM after provisioning): validates
-///   firmware SUIT envelopes. None until HSM is provisioned.
-///
-/// No file-based fallbacks for software authority or device key.
+//! SUIT manifest provider — validates RFC 9124 SUIT envelopes via sumo-rs.
+//!
+//! Uses sumo-onboard's orchestrator for the payload pipeline:
+//! fetch → decrypt → decompress → verify → write
+//!
+//! Two trust stores:
+//!
+//! - **Provisioning authority** (fixed at startup): validates HSM key envelopes.
+//!   This is the authority *over* the HSM — cannot live inside the HSM.
+//! - **Software authority** (loaded from HSM after provisioning): validates
+//!   firmware SUIT envelopes. None until HSM is provisioned.
+//!
+//! No file-based fallbacks for software authority or device key.
+#![allow(clippy::field_reassign_with_default)]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,9 +21,9 @@ use coset::{iana, CborSerializable, CoseKeyBuilder};
 use nv_store::types::BankSet;
 use sumo_crypto::{CryptoBackend, RustCryptoBackend};
 use sumo_onboard::error::Sum2Error;
+use sumo_onboard::orchestrator;
 use sumo_onboard::platform::PlatformOps;
 use sumo_onboard::Validator;
-use sumo_onboard::orchestrator;
 
 use crate::manifest_provider::{ManifestError, ManifestProvider, ManifestType, ValidatedFirmware};
 use crate::ota::ImageMeta;
@@ -34,7 +36,11 @@ use crate::ota::ImageMeta;
 /// the right user-facing message, we decode the envelope and re-check the
 /// digest manually: if the digest fails, the error is digest-mismatch;
 /// otherwise the signature is the cause.
-fn map_sum2_error(err: Sum2Error, envelope_bytes: &[u8], crypto: &RustCryptoBackend) -> ManifestError {
+fn map_sum2_error(
+    err: Sum2Error,
+    envelope_bytes: &[u8],
+    crypto: &RustCryptoBackend,
+) -> ManifestError {
     match err {
         Sum2Error::AuthFailed => {
             // Decompose AuthFailed into digest-mismatch vs signature-invalid
@@ -144,18 +150,22 @@ impl SuitProvider {
     /// Select the trust anchor based on manifest type.
     fn trust_anchor_for(&self, manifest_type: ManifestType) -> Result<Vec<u8>, ManifestError> {
         match manifest_type {
-            ManifestType::HsmKeys => {
-                Ok(self.key_authority.read().unwrap().clone()
-                    .unwrap_or_else(|| self.factory_authority.clone()))
-            }
+            ManifestType::HsmKeys => Ok(self
+                .key_authority
+                .read()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| self.factory_authority.clone())),
             ManifestType::Firmware => {
                 self.software_authority
                     .read()
                     .unwrap()
                     .clone()
-                    .ok_or_else(|| ManifestError::ParseError(
-                        "no software authority key — HSM not yet provisioned".into(),
-                    ))
+                    .ok_or_else(|| {
+                        ManifestError::ParseError(
+                            "no software authority key — HSM not yet provisioned".into(),
+                        )
+                    })
             }
         }
     }
@@ -220,9 +230,9 @@ impl SuitProvider {
         manifest: &sumo_onboard::manifest::Manifest,
         secver: u64,
     ) -> Result<ValidatedFirmware, ManifestError> {
-        let segments = manifest.component_id(0).ok_or_else(|| {
-            ManifestError::ComponentUnknown("missing component_id".into())
-        })?;
+        let segments = manifest
+            .component_id(0)
+            .ok_or_else(|| ManifestError::ComponentUnknown("missing component_id".into()))?;
 
         // Resolve bank_set from the first segment that matches a BankSet,
         // falling back to deployment-registered component aliases.
@@ -255,11 +265,19 @@ impl SuitProvider {
         };
 
         let seq = manifest.sequence_number();
-        let seq_u32 = if seq > u32::MAX as u64 { u32::MAX } else { seq as u32 };
+        let seq_u32 = if seq > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            seq as u32
+        };
 
         let mut meta = ImageMeta::default();
         meta.fw_seq = seq_u32;
-        meta.fw_secver = if secver > u32::MAX as u64 { u32::MAX } else { secver as u32 };
+        meta.fw_secver = if secver > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            secver as u32
+        };
 
         let version_display = manifest
             .text_version(0)
@@ -358,11 +376,12 @@ impl ManifestProvider for SuitProvider {
 
             // Run the SUIT orchestrator — handles fetch, decrypt, decompress, verify
             let ops = VmPlatformOps::new(raw_payload);
-            orchestrator::process_image(&validator, &manifest, &ops, &crypto)
-                .map_err(|e| match e {
+            orchestrator::process_image(&validator, &manifest, &ops, &crypto).map_err(
+                |e| match e {
                     Sum2Error::DigestMismatch => ManifestError::DigestMismatch,
                     other => ManifestError::ParseError(format!("orchestrator: {other:?}")),
-                })?;
+                },
+            )?;
 
             ops.take_written()
         } else {

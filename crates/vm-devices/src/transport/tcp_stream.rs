@@ -90,11 +90,17 @@ struct Registry {
 impl Registry {
     fn open(&self, key: ChannelKey) -> Arc<ChannelState> {
         let mut map = self.channels.lock().expect("registry poisoned");
-        map.entry(key).or_insert_with(|| Arc::new(ChannelState::new())).clone()
+        map.entry(key)
+            .or_insert_with(|| Arc::new(ChannelState::new()))
+            .clone()
     }
 
     fn lookup(&self, key: &ChannelKey) -> Option<Arc<ChannelState>> {
-        self.channels.lock().expect("registry poisoned").get(key).cloned()
+        self.channels
+            .lock()
+            .expect("registry poisoned")
+            .get(key)
+            .cloned()
     }
 }
 
@@ -108,7 +114,9 @@ impl TcpStreamTransport {
     /// Construct an empty transport. No socket is opened until `bind` is
     /// called or the registry is otherwise served.
     pub fn new() -> Self {
-        Self { registry: Arc::new(Registry::default()) }
+        Self {
+            registry: Arc::new(Registry::default()),
+        }
     }
 
     /// Bind a TCP listener on `addr` and spawn the accept loop. Returns the
@@ -179,13 +187,17 @@ impl StreamChannel for TcpStreamChannelHandle {
         let queue = self.state.rx_queue.lock().expect("rx_queue poisoned");
         match timeout {
             None => {
-                let mut q = self.state.rx_cv
+                let mut q = self
+                    .state
+                    .rx_cv
                     .wait_while(queue, |q| q.is_empty())
                     .expect("rx_cv poisoned");
                 Ok(q.pop_front())
             }
             Some(dur) => {
-                let (mut q, result) = self.state.rx_cv
+                let (mut q, result) = self
+                    .state
+                    .rx_cv
                     .wait_timeout_while(queue, dur, |q| q.is_empty())
                     .expect("rx_cv poisoned");
                 if result.timed_out() {
@@ -344,7 +356,11 @@ fn parse_handshake(line: &str) -> Option<ChannelKey> {
     if segments[0] != "vm" || segments[2] != "dev" || segments[4] != "ch" {
         return None;
     }
-    Some((segments[1].to_string(), segments[3].to_string(), segments[5].to_string()))
+    Some((
+        segments[1].to_string(),
+        segments[3].to_string(),
+        segments[5].to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -352,7 +368,12 @@ mod tests {
     use super::*;
     use std::io::Read;
 
-    fn open_handle(t: &TcpStreamTransport, vm: &str, dev: &str, ch: &str) -> Arc<dyn StreamChannel> {
+    fn open_handle(
+        t: &TcpStreamTransport,
+        vm: &str,
+        dev: &str,
+        ch: &str,
+    ) -> Arc<dyn StreamChannel> {
         t.open_stream(vm, dev, ch).expect("open_stream")
     }
 
@@ -363,10 +384,10 @@ mod tests {
         let mut response = String::new();
         reader.read_line(&mut response)?;
         if !response.starts_with("OK") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("handshake rejected: {}", response.trim()),
-            ));
+            return Err(std::io::Error::other(format!(
+                "handshake rejected: {}",
+                response.trim()
+            )));
         }
         Ok(s)
     }
@@ -443,7 +464,8 @@ mod tests {
         let addr = t.bind("127.0.0.1:0").unwrap();
         // Don't open the channel — server should reply ERR.
         let mut s = TcpStream::connect(addr).unwrap();
-        s.write_all(b"STREAM /vm/vm2/dev/nothing/ch/here\n").unwrap();
+        s.write_all(b"STREAM /vm/vm2/dev/nothing/ch/here\n")
+            .unwrap();
         let mut response = String::new();
         BufReader::new(s).read_to_string(&mut response).unwrap();
         assert!(response.starts_with("ERR"), "got: {response:?}");

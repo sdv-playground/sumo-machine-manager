@@ -163,7 +163,9 @@ fn deserialize_metadata(data: &[u8]) -> Option<KeyMetadata> {
     let mut take_str = || -> Option<String> {
         let len = u16::from_le_bytes(data.get(pos..pos + 2)?.try_into().ok()?) as usize;
         pos += 2;
-        let s = std::str::from_utf8(data.get(pos..pos + len)?).ok()?.to_string();
+        let s = std::str::from_utf8(data.get(pos..pos + len)?)
+            .ok()?
+            .to_string();
         pos += len;
         Some(s)
     };
@@ -213,10 +215,7 @@ mod tests {
         let dir = std::env::temp_dir().join("secstore-test");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let store = Secstore::new(
-            LinuxSimEncryptor::new([0xAB; 16]),
-            FileBackend::new(&dir),
-        );
+        let store = Secstore::new(LinuxSimEncryptor::new([0xAB; 16]), FileBackend::new(&dir));
 
         let meta = KeyMetadata {
             vhsm_handle: 0x0100,

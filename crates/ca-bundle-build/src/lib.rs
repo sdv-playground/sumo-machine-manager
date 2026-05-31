@@ -190,9 +190,8 @@ impl CaBundleImageBuilder {
 
         let num_sectors = self.qnx6_num_sectors.unwrap_or(8192);
         let build_file = output.with_extension("qnx6.buildfile");
-        let buildfile_contents = format!(
-            "[num_sectors={num_sectors}]\n[num_inodes=512]\n[blksize=4096]\n"
-        );
+        let buildfile_contents =
+            format!("[num_sectors={num_sectors}]\n[num_inodes=512]\n[blksize=4096]\n");
         std::fs::write(&build_file, &buildfile_contents).map_err(|e| BuildError::Io {
             op: "write qnx6 build-file",
             path: build_file.clone(),
@@ -321,7 +320,10 @@ mod tests {
         let err = CaBundleImageBuilder::new(&not_a_dir, ImageFormat::Squashfs)
             .build(tmp.path().join("out.sqfs"))
             .unwrap_err();
-        assert!(matches!(err, BuildError::SourceNotDirectory(_)), "got {err:?}");
+        assert!(
+            matches!(err, BuildError::SourceNotDirectory(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]

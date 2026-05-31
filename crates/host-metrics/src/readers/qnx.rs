@@ -66,7 +66,11 @@ impl SensorReader for QnxSensorReader {
 
 fn read_cpu_count() -> Option<i64> {
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if n > 0 { Some(n) } else { None }
+    if n > 0 {
+        Some(n)
+    } else {
+        None
+    }
 }
 
 /// Parse `/proc/vm/stats` for memory metrics. Format is `key=value` or
@@ -82,7 +86,11 @@ fn read_vm_stats() -> Vec<Sensor> {
 fn parse_vm_stats(content: &str) -> Vec<Sensor> {
     let mut out = Vec::new();
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
-    let page_bytes: f64 = if page_size > 0 { page_size as f64 } else { 4096.0 };
+    let page_bytes: f64 = if page_size > 0 {
+        page_size as f64
+    } else {
+        4096.0
+    };
 
     let mut page_count: Option<u64> = None;
     let mut pages_free: Option<u64> = None;
@@ -91,7 +99,9 @@ fn parse_vm_stats(content: &str) -> Vec<Sensor> {
     let mut anon_count: Option<u64> = None;
 
     for line in content.lines() {
-        let Some((key, val_str)) = line.split_once('=') else { continue };
+        let Some((key, val_str)) = line.split_once('=') else {
+            continue;
+        };
         let pages = parse_hex_or_dec(val_str);
 
         match key {
@@ -200,10 +210,13 @@ pages_wired=0x4c35 (76.207MB)
 pages_kernel=0x4c39 (76.222MB)
 ";
         let sensors = parse_vm_stats(input);
-        let names: Vec<_> = sensors.iter().map(|s| {
-            let label = s.labels.first().map(|l| l.1.as_str()).unwrap_or("");
-            (s.name, label)
-        }).collect();
+        let names: Vec<_> = sensors
+            .iter()
+            .map(|s| {
+                let label = s.labels.first().map(|l| l.1.as_str()).unwrap_or("");
+                (s.name, label)
+            })
+            .collect();
         assert!(names.contains(&("host_memory_bytes", "total")));
         assert!(names.contains(&("host_memory_bytes", "free")));
         assert!(names.contains(&("host_memory_bytes", "used")));
@@ -211,7 +224,10 @@ pages_kernel=0x4c39 (76.222MB)
         assert!(names.contains(&("host_memory_bytes", "kernel")));
         assert!(names.contains(&("host_memory_bytes", "anonymous")));
 
-        let total = sensors.iter().find(|s| s.labels.first().map(|l| l.1.as_str()) == Some("total")).unwrap();
+        let total = sensors
+            .iter()
+            .find(|s| s.labels.first().map(|l| l.1.as_str()) == Some("total"))
+            .unwrap();
         // 0xe0000 pages * 4096 bytes = 3.5 GB
         assert_eq!(total.value, 0xe0000_u64 as f64 * 4096.0);
     }

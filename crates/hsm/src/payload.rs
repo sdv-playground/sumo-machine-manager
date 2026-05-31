@@ -243,8 +243,7 @@ impl KeySlot {
 /// Serialize an `HsmKeystore` to CBOR bytes.
 pub fn encode(keystore: &HsmKeystore) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
-    ciborium::into_writer(keystore, &mut buf)
-        .map_err(|e| format!("CBOR encode: {e}"))?;
+    ciborium::into_writer(keystore, &mut buf).map_err(|e| format!("CBOR encode: {e}"))?;
     Ok(buf)
 }
 
@@ -252,8 +251,7 @@ pub fn encode(keystore: &HsmKeystore) -> Result<Vec<u8>, String> {
 /// `schema_version != SCHEMA_VERSION` (v1 envelopes are dead) and
 /// runs `KeySlot::validate` on each slot.
 pub fn decode(data: &[u8]) -> Result<HsmKeystore, String> {
-    let ks: HsmKeystore = ciborium::from_reader(data)
-        .map_err(|e| format!("CBOR decode: {e}"))?;
+    let ks: HsmKeystore = ciborium::from_reader(data).map_err(|e| format!("CBOR decode: {e}"))?;
     if ks.schema_version != SCHEMA_VERSION {
         return Err(format!(
             "unsupported schema version {} (this build only accepts {SCHEMA_VERSION}; \

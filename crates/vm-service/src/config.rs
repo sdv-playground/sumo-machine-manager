@@ -1,13 +1,12 @@
+use serde::Deserialize;
 /// Static YAML configuration for vm-service.
 ///
 /// Loaded once at startup. Declares which VMs can exist and their hardware
 /// setup. Lifecycle control (start/stop/restart) comes via the HTTP API.
 /// Bank selection is invisible — `image_dir` is typically a symlink that
 /// the diagnostic stack flips before calling restart.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use serde::Deserialize;
 
 /// Top-level service configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -114,12 +113,19 @@ impl Default for VmSlots {
         // creator/factory). Empirically the guest's first attach lands
         // on slot 2 every time, on both fresh boot and after deploys.
         // Override per VM only if you actually know better.
-        Self { host_slot: 0, peer_slot: 2 }
+        Self {
+            host_slot: 0,
+            peer_slot: 2,
+        }
     }
 }
 
-fn default_host_slot() -> u32 { 0 }
-fn default_peer_slot() -> u32 { 2 }
+fn default_host_slot() -> u32 {
+    0
+}
+fn default_peer_slot() -> u32 {
+    2
+}
 
 fn default_ivshmem_dir() -> PathBuf {
     PathBuf::from("/dev/shm")
@@ -190,8 +196,12 @@ pub struct VmDefinition {
     pub auto_start: bool,
 }
 
-fn default_cpus() -> u32 { 4 }
-fn default_ram() -> u32 { 2048 }
+fn default_cpus() -> u32 {
+    4
+}
+fn default_ram() -> u32 {
+    2048
+}
 
 /// Guest OS type — affects boot method, disk layout, and device setup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -259,7 +269,9 @@ pub struct HealthConfig {
     pub timeout_secs: u64,
 }
 
-fn default_health_timeout() -> u64 { 10 }
+fn default_health_timeout() -> u64 {
+    10
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShutdownConfig {
@@ -272,7 +284,9 @@ pub struct ShutdownConfig {
 // managed-cvc; QNX is faster but the orchestrator amortises the
 // extra ceiling. Was 10s, which always force-killed before linux
 // finished, leaving fsck-on-next-mount as the cleanup path.
-fn default_shutdown_timeout() -> u64 { 60 }
+fn default_shutdown_timeout() -> u64 {
+    60
+}
 
 impl VmServiceConfig {
     pub fn from_file(path: &Path) -> Result<Self, String> {
@@ -286,14 +300,16 @@ impl VmServiceConfig {
 impl VmDefinition {
     /// Resolve target architecture (defaults to Aarch64).
     pub fn arch(&self) -> Arch {
-        self.arch.as_deref()
+        self.arch
+            .as_deref()
             .and_then(Arch::from_str)
             .unwrap_or(Arch::Aarch64)
     }
 
     /// Count CAN interfaces.
     pub fn can_count(&self) -> u8 {
-        self.devices.iter()
+        self.devices
+            .iter()
             .filter(|d| matches!(d, DeviceConfig::Can { .. }))
             .count() as u8
     }
@@ -412,6 +428,11 @@ pub enum Arch {
 }
 
 impl Arch {
+    /// Parse an architecture token from config strings.  Not the
+    /// `std::str::FromStr` trait method — returns `Option`, not
+    /// `Result`, because unknown tokens are legitimately absent
+    /// rather than malformed.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "aarch64" | "arm64" => Some(Arch::Aarch64),
@@ -489,20 +510,22 @@ pub enum DeviceConfig {
         interface: Option<String>,
     },
     #[serde(rename = "health")]
-    Health {
-        transport: String,
-    },
+    Health { transport: String },
     #[serde(rename = "time")]
-    Time {
-        transport: String,
-    },
+    Time { transport: String },
     #[serde(rename = "hsm")]
     Hsm {
+        // Deserialized from config for compatibility but not consumed
+        // by the bin path today — keep the fields in the enum so config
+        // files don't fail to parse, and silence the unused warning.
         #[serde(default)]
+        #[allow(dead_code)]
         keystore: Option<String>,
         #[serde(default)]
+        #[allow(dead_code)]
         keygen_bin: Option<String>,
         #[serde(default = "default_hsm_port")]
+        #[allow(dead_code)]
         port: u16,
     },
     #[serde(rename = "network")]
@@ -513,15 +536,14 @@ pub enum DeviceConfig {
         ssh_port: Option<u16>,
     },
     #[serde(rename = "bridge")]
-    Bridge {
-        bridge: String,
-        mac: String,
-    },
+    Bridge { bridge: String, mac: String },
     #[serde(rename = "console")]
     Console,
 }
 
-fn default_hsm_port() -> u16 { 5100 }
+fn default_hsm_port() -> u16 {
+    5100
+}
 
 impl DeviceConfig {
     pub fn needs_ivshmem(&self) -> bool {
@@ -588,7 +610,12 @@ mod tests {
             ram_mb: 2048,
             cpu_model: None,
             image_dir: PathBuf::from("/tmp/test"),
-            images: ImagePaths { kernel: Some("bzImage".into()), rootfs: Some("rootfs.img".into()), policy: None, ca_bundle: None },
+            images: ImagePaths {
+                kernel: Some("bzImage".into()),
+                rootfs: Some("rootfs.img".into()),
+                policy: None,
+                ca_bundle: None,
+            },
             devices: vec![],
             disks: vec![],
             health: None,

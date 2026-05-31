@@ -3,7 +3,6 @@
 /// These test the full HTTP flow through sovd-api's router, ensuring
 /// our DiagnosticBackend implementation works correctly with the
 /// standard SOVD REST API.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +17,7 @@ use nv_store::types::*;
 
 use sovd_core::DiagnosticBackend;
 
-use crate::backend::{VmBackend, ComponentConfig};
+use crate::backend::{ComponentConfig, VmBackend};
 use crate::manifest_provider::ManifestProvider;
 use crate::ota;
 use crate::sovd::security::TestSecurityProvider;
@@ -38,7 +37,10 @@ struct TestKeys {
 fn generate_test_keys() -> TestKeys {
     let signing_key = keygen::generate_signing_key(keygen::ES256).unwrap();
     let trust_anchor = signing_key.public_key_bytes();
-    TestKeys { signing_key, trust_anchor }
+    TestKeys {
+        signing_key,
+        trust_anchor,
+    }
 }
 
 fn make_test_suit_envelope(keys: &TestKeys, component: &str, seq: u64, image: &[u8]) -> Vec<u8> {
@@ -70,15 +72,36 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
-        ("host-os", BankSet::HostOs, ComponentConfig { entity_type: "host_os".into(), ..ComponentConfig::default() }),
+        (
+            "host-os",
+            BankSet::HostOs,
+            ComponentConfig {
+                entity_type: "host_os".into(),
+                ..ComponentConfig::default()
+            },
+        ),
         ("vm1", BankSet::Vm1, ComponentConfig::default()),
         ("vm2", BankSet::Vm2, ComponentConfig::default()),
-        ("hsm", BankSet::Hsm, ComponentConfig { supports_rollback: false, single_bank: true, entity_type: "hsm".into(), ..ComponentConfig::default() }),
+        (
+            "hsm",
+            BankSet::Hsm,
+            ComponentConfig {
+                supports_rollback: false,
+                single_bank: true,
+                entity_type: "hsm".into(),
+            },
+        ),
     ];
     for (id, set, config) in components {
         backends.insert(
             id.to_string(),
-            Arc::new(VmBackend::new(set, nv.clone(), manifest_provider.clone(), security_provider.clone(), config)),
+            Arc::new(VmBackend::new(
+                set,
+                nv.clone(),
+                manifest_provider.clone(),
+                security_provider.clone(),
+                config,
+            )),
         );
     }
 
@@ -99,7 +122,11 @@ async fn get(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value
     (status, json)
 }
 
-async fn put_json(router: &axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+async fn put_json(
+    router: &axum::Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     let resp = router
         .clone()
         .oneshot(
@@ -116,7 +143,11 @@ async fn put_json(router: &axum::Router, uri: &str, body: serde_json::Value) -> 
     (status, json)
 }
 
-async fn post_bytes(router: &axum::Router, uri: &str, data: Vec<u8>) -> (StatusCode, serde_json::Value) {
+async fn post_bytes(
+    router: &axum::Router,
+    uri: &str,
+    data: Vec<u8>,
+) -> (StatusCode, serde_json::Value) {
     let resp = router
         .clone()
         .oneshot(
@@ -133,7 +164,11 @@ async fn post_bytes(router: &axum::Router, uri: &str, data: Vec<u8>) -> (StatusC
     (status, json)
 }
 
-async fn post_json(router: &axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+async fn post_json(
+    router: &axum::Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     let resp = router
         .clone()
         .oneshot(
@@ -176,23 +211,35 @@ async fn delete(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Va
 
 /// Unlock a component: switch to programming + seed/key flow.
 async fn unlock_for_flash(router: &axum::Router, component: &str) {
-    put_json(router, &format!("/vehicle/v1/components/{component}/modes/session"),
-        serde_json::json!({"value": "programming"})).await;
+    put_json(
+        router,
+        &format!("/vehicle/v1/components/{component}/modes/session"),
+        serde_json::json!({"value": "programming"}),
+    )
+    .await;
 
-    let (_, seed_resp) = put_json(router,
+    let (_, seed_resp) = put_json(
+        router,
         &format!("/vehicle/v1/components/{component}/modes/security"),
-        serde_json::json!({"value": "level1_requestseed"})).await;
+        serde_json::json!({"value": "level1_requestseed"}),
+    )
+    .await;
 
-    // Parse "0xf4 0x7b 0x82 0x92" format from Request_Seed
-    let seed_str = seed_resp["seed"]["Request_Seed"].as_str().unwrap();
-    let seed_bytes: Vec<u8> = seed_str
-        .split_whitespace()
-        .map(|s| u8::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
+    // Seed is a concatenated lowercase hex string per ISO 17978-3
+    // `string:hex` primitive (sovd_iso17978_spec.yaml line 192).
+    let seed_str = seed_resp["seed"].as_str().unwrap();
+    let seed_bytes = hex::decode(seed_str).unwrap();
+    let key_hex: String = seed_bytes
+        .iter()
+        .map(|b| format!("{:02x}", b ^ 0xFF))
         .collect();
-    let key_hex: String = seed_bytes.iter().map(|b| format!("{:02x}", b ^ 0xFF)).collect();
 
-    put_json(router, &format!("/vehicle/v1/components/{component}/modes/security"),
-        serde_json::json!({"value": "level1", "key": key_hex})).await;
+    put_json(
+        router,
+        &format!("/vehicle/v1/components/{component}/modes/security"),
+        serde_json::json!({"value": "level1", "key": key_hex}),
+    )
+    .await;
 }
 
 // ============================================================
@@ -274,8 +321,12 @@ async fn session_default_initially() {
 #[tokio::test]
 async fn session_switch_to_programming() {
     let (router, _, _) = make_router();
-    let (status, json) = put_json(&router, "/vehicle/v1/components/vm1/modes/session",
-        serde_json::json!({"value": "programming"})).await;
+    let (status, json) = put_json(
+        &router,
+        "/vehicle/v1/components/vm1/modes/session",
+        serde_json::json!({"value": "programming"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["value"], "programming");
 }
@@ -292,26 +343,38 @@ async fn security_locked_initially() {
 async fn security_seed_key_unlock() {
     let (router, _, _) = make_router();
     // Programming session first
-    put_json(&router, "/vehicle/v1/components/vm1/modes/session",
-        serde_json::json!({"value": "programming"})).await;
+    put_json(
+        &router,
+        "/vehicle/v1/components/vm1/modes/session",
+        serde_json::json!({"value": "programming"}),
+    )
+    .await;
 
     // Request seed
-    let (status, json) = put_json(&router, "/vehicle/v1/components/vm1/modes/security",
-        serde_json::json!({"value": "level1_requestseed"})).await;
+    let (status, json) = put_json(
+        &router,
+        "/vehicle/v1/components/vm1/modes/security",
+        serde_json::json!({"value": "level1_requestseed"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(json["seed"].is_object());
-
-    // Parse "0xf4 0x7b 0x82 0x92" format
-    let seed_str = json["seed"]["Request_Seed"].as_str().unwrap();
-    let seed_bytes: Vec<u8> = seed_str
-        .split_whitespace()
-        .map(|s| u8::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
+    // Seed is a concatenated lowercase hex string per ISO 17978-3
+    // `string:hex` primitive (sovd_iso17978_spec.yaml line 192).
+    assert!(json["seed"].is_string());
+    let seed_str = json["seed"].as_str().unwrap();
+    let seed_bytes = hex::decode(seed_str).unwrap();
+    let key_hex: String = seed_bytes
+        .iter()
+        .map(|b| format!("{:02x}", b ^ 0xFF))
         .collect();
-    let key_hex: String = seed_bytes.iter().map(|b| format!("{:02x}", b ^ 0xFF)).collect();
 
     // Send key
-    let (status, json) = put_json(&router, "/vehicle/v1/components/vm1/modes/security",
-        serde_json::json!({"value": "level1", "key": key_hex})).await;
+    let (status, json) = put_json(
+        &router,
+        "/vehicle/v1/components/vm1/modes/security",
+        serde_json::json!({"value": "level1", "key": key_hex}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     // Unlocked — value should be "level1"
     assert!(json["value"].as_str().unwrap().contains("level"));
@@ -323,8 +386,12 @@ async fn session_change_resets_security() {
     unlock_for_flash(&router, "vm1").await;
 
     // Switch back to default
-    put_json(&router, "/vehicle/v1/components/vm1/modes/session",
-        serde_json::json!({"value": "default"})).await;
+    put_json(
+        &router,
+        "/vehicle/v1/components/vm1/modes/session",
+        serde_json::json!({"value": "default"}),
+    )
+    .await;
 
     // Security should be locked
     let (_, json) = get(&router, "/vehicle/v1/components/vm1/modes/security").await;
@@ -348,8 +415,12 @@ async fn flash_rejected_in_default_session() {
 async fn flash_rejected_when_locked() {
     let (router, _, keys) = make_router();
     // Programming but no security unlock
-    put_json(&router, "/vehicle/v1/components/vm1/modes/session",
-        serde_json::json!({"value": "programming"})).await;
+    put_json(
+        &router,
+        "/vehicle/v1/components/vm1/modes/session",
+        serde_json::json!({"value": "programming"}),
+    )
+    .await;
 
     let envelope = make_test_suit_envelope(&keys, "vm1", 1, &[0xAA; 256]);
     let (status, _) = post_bytes(&router, "/vehicle/v1/components/vm1/files", envelope).await;
@@ -374,14 +445,21 @@ async fn flash_full_suit_flow() {
     let file_id = json["file_id"].as_str().unwrap().to_string();
 
     // 2. Verify
-    let (status, json) = post_empty(&router,
-        &format!("/vehicle/v1/components/vm1/files/{file_id}/verify")).await;
+    let (status, json) = post_empty(
+        &router,
+        &format!("/vehicle/v1/components/vm1/files/{file_id}/verify"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(json["valid"].as_bool().unwrap());
 
     // 3. Start transfer
-    let (status, _json) = post_json(&router, "/vehicle/v1/components/vm1/flash/transfer",
-        serde_json::json!({"file_id": file_id})).await;
+    let (status, _json) = post_json(
+        &router,
+        "/vehicle/v1/components/vm1/flash/transfer",
+        serde_json::json!({"file_id": file_id}),
+    )
+    .await;
     assert!(status == StatusCode::OK || status == StatusCode::ACCEPTED);
 
     // 4. Check activation — should be trial (activated)
@@ -424,8 +502,12 @@ async fn faults_and_clear() {
         let active = bs.banks[BankSet::Vm1.as_index()].active_bank;
         let mut runtime = nv.read_runtime(BankSet::Vm1, active).unwrap_or_default();
         runtime.dtc_count = 1;
-        runtime.dtcs[0] = DtcEntry { dtc_number: 0x00A301, status: 0x01 };
-        nv.write_runtime(BankSet::Vm1, active, &mut runtime).unwrap();
+        runtime.dtcs[0] = DtcEntry {
+            dtc_number: 0x00A301,
+            status: 0x01,
+        };
+        nv.write_runtime(BankSet::Vm1, active, &mut runtime)
+            .unwrap();
     }
 
     let (status, json) = get(&router, "/vehicle/v1/components/vm1/faults").await;
@@ -433,10 +515,10 @@ async fn faults_and_clear() {
     let items = json["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
 
-    // Clear
-    let (status, json) = delete(&router, "/vehicle/v1/components/vm1/faults").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["cleared_count"], 1);
+    // Clear — ISO 17978-3 §7.8 fault.delete returns 204 No Content
+    // (Phase E quick-win 1 in SOVDd; the JSON body was non-spec).
+    let (status, _) = delete(&router, "/vehicle/v1/components/vm1/faults").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 // ============================================================

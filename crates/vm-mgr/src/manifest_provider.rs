@@ -2,7 +2,6 @@
 ///
 /// Default implementation: [`SuitProvider`](crate::suit_provider::SuitProvider)
 /// using sumo-rs for RFC 9124 SUIT envelope validation.
-
 use std::sync::Arc;
 
 use hsm::ivd::IvdFile;
@@ -119,7 +118,8 @@ pub trait ManifestProvider: Send + Sync {
         _sw_authority: Vec<u8>,
         _key_unwrap: Option<Arc<dyn KeyUnwrap + Send + Sync>>,
         _key_authority: Option<Vec<u8>>,
-    ) {}
+    ) {
+    }
 }
 
 #[cfg(test)]
@@ -152,7 +152,10 @@ mod tests {
 
     #[test]
     fn manifest_error_display_size_mismatch() {
-        let e = ManifestError::SizeMismatch { expected: 100, actual: 50 };
+        let e = ManifestError::SizeMismatch {
+            expected: 100,
+            actual: 50,
+        };
         assert_eq!(format!("{e}"), "image size mismatch: expected 100, got 50");
     }
 
@@ -176,11 +179,7 @@ mod tests {
     /// software/device key snapshots default to None, update_keys is a no-op).
     struct StubProvider;
     impl ManifestProvider for StubProvider {
-        fn validate(
-            &self,
-            _data: &[u8],
-            _min: u32,
-        ) -> Result<ValidatedFirmware, ManifestError> {
+        fn validate(&self, _data: &[u8], _min: u32) -> Result<ValidatedFirmware, ManifestError> {
             Ok(ValidatedFirmware {
                 bank_set: BankSet::Vm1,
                 manifest_type: ManifestType::Firmware,

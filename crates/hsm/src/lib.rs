@@ -1,3 +1,5 @@
+pub mod payload;
+pub mod sim;
 /// HSM provider trait and implementations.
 ///
 /// Defines the management interface for Hardware Security Modules.
@@ -8,24 +10,21 @@
 /// Implementations:
 /// - SimHsm: manages vhsm-ssd + file-based keystore (dev/test + QNX host)
 /// - QnxHsm: stub for real HSM hardware via QNX resource manager
-
 pub mod types;
-pub mod payload;
-pub mod sim;
 pub mod linux {
     //! Backward-compatible re-export. Prefer `hsm::sim::SimHsm`.
     pub use crate::sim::*;
 }
-pub mod qnx;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+pub mod ivd;
 #[cfg(feature = "suit")]
 pub mod key_unwrap;
-pub mod ivd;
+pub mod qnx;
 
-pub use types::*;
 #[cfg(feature = "suit")]
 pub use key_unwrap::HsmKeyUnwrap;
+pub use types::*;
 
 /// HSM management provider.
 ///
@@ -79,11 +78,10 @@ pub trait HsmProvider: Send {
     /// Retrieve a public key by role, as COSE_Key CBOR bytes.
     fn get_public_key(&self, role: KeyRole) -> Result<Vec<u8>, HsmError>;
 
-    /// Retrieve a private key by role, as COSE_Key CBOR bytes.
     // get_private_key intentionally removed — private keys never leave
-    // the HSM. Decrypt via unwrap_cek_a128kw / unwrap_cek_ecdh_es;
+    // the HSM.  Decrypt via unwrap_cek_a128kw / unwrap_cek_ecdh_es;
     // sign via HsmCryptoProvider::sign; CSR-gen via generate_csr (key
-    // stays in-HSM). If you reach for "give me the bytes" you're
+    // stays in-HSM).  If you reach for "give me the bytes" you're
     // designing against the HSE model.
 
     /// Get the current provisioning lifecycle state.
@@ -98,7 +96,9 @@ pub trait HsmProvider: Send {
     /// Default impl returns `NotSupported`; concrete providers override.
     fn unwrap_cek_a128kw(&self, key_id: &str, wrapped_cek: &[u8]) -> Result<Vec<u8>, HsmError> {
         let _ = (key_id, wrapped_cek);
-        Err(HsmError::NotSupported("HsmProvider::unwrap_cek_a128kw".into()))
+        Err(HsmError::NotSupported(
+            "HsmProvider::unwrap_cek_a128kw".into(),
+        ))
     }
 
     /// ECDH-ES+A128KW unwrap delegated to the HSM. See
@@ -111,7 +111,9 @@ pub trait HsmProvider: Send {
         recipient_protected: &[u8],
     ) -> Result<Vec<u8>, HsmError> {
         let _ = (key_id, ephem_pub, wrapped_cek, recipient_protected);
-        Err(HsmError::NotSupported("HsmProvider::unwrap_cek_ecdh_es".into()))
+        Err(HsmError::NotSupported(
+            "HsmProvider::unwrap_cek_ecdh_es".into(),
+        ))
     }
 
     /// ECDSA-SHA256 sign delegated to the HSM. Same semantics as

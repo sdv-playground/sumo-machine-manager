@@ -243,9 +243,8 @@ impl PolicyImageBuilder {
         // when the build runs.
         let num_sectors = self.qnx6_num_sectors.unwrap_or(8192);
         let build_file = output.with_extension("qnx6.buildfile");
-        let buildfile_contents = format!(
-            "[num_sectors={num_sectors}]\n[num_inodes=512]\n[blksize=4096]\n"
-        );
+        let buildfile_contents =
+            format!("[num_sectors={num_sectors}]\n[num_inodes=512]\n[blksize=4096]\n");
         std::fs::write(&build_file, &buildfile_contents).map_err(|e| BuildError::Io {
             op: "write qnx6 build-file",
             path: build_file.clone(),
@@ -342,22 +341,14 @@ mod tests {
 
     /// Build a well-formed policy directory in `dir`. Returns dir.
     fn populate_policy_dir(dir: &Path) -> &Path {
-        fs::write(
-            dir.join("policy.yaml"),
-            "version: 1\nstatements: []\n",
-        )
-        .unwrap();
+        fs::write(dir.join("policy.yaml"), "version: 1\nstatements: []\n").unwrap();
         fs::create_dir(dir.join("roots")).unwrap();
         fs::write(
             dir.join("roots/sumo-sign.pem"),
             b"-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
         )
         .unwrap();
-        fs::write(
-            dir.join("crl.yaml"),
-            "cert_thumbprints: []\njwt_jti: []\n",
-        )
-        .unwrap();
+        fs::write(dir.join("crl.yaml"), "cert_thumbprints: []\njwt_jti: []\n").unwrap();
         dir
     }
 
@@ -384,7 +375,10 @@ mod tests {
         fs::write(&not_a_dir, b"content").unwrap();
         let builder = PolicyImageBuilder::new(&not_a_dir, ImageFormat::Squashfs);
         let err = builder.build(tmp.path().join("out.sqfs")).unwrap_err();
-        assert!(matches!(err, BuildError::SourceNotDirectory(_)), "got {err:?}");
+        assert!(
+            matches!(err, BuildError::SourceNotDirectory(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -417,7 +411,10 @@ mod tests {
 
         let builder = PolicyImageBuilder::new(tmp.path(), ImageFormat::Squashfs);
         let err = builder.build(tmp.path().join("out.sqfs")).unwrap_err();
-        assert!(matches!(err, BuildError::ValidationFailed(_)), "got {err:?}");
+        assert!(
+            matches!(err, BuildError::ValidationFailed(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -434,8 +431,7 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let img = out.path().join("garbage.sqfs");
 
-        let builder = PolicyImageBuilder::new(tmp.path(), ImageFormat::Squashfs)
-            .skip_validation();
+        let builder = PolicyImageBuilder::new(tmp.path(), ImageFormat::Squashfs).skip_validation();
         builder.build(&img).expect("builds despite garbage input");
         assert!(img.exists());
     }
@@ -469,9 +465,7 @@ mod tests {
     #[test]
     fn squashfs_round_trip_through_unsquashfs_loads_via_partition() {
         if !mksquashfs_available() || !unsquashfs_available() {
-            eprintln!(
-                "(skipping — mksquashfs/unsquashfs not on $PATH; install squashfs-tools)"
-            );
+            eprintln!("(skipping — mksquashfs/unsquashfs not on $PATH; install squashfs-tools)");
             return;
         }
 

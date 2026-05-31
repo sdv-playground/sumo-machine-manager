@@ -1,3 +1,8 @@
+// Tests construct records via `Default::default()` then mutate fields
+// — the struct-init form would mean spelling out every default field
+// at every call site for negligible benefit.  Allow at module scope.
+#![allow(clippy::field_reassign_with_default)]
+
 use crate::block::{BlockDevice, MemBlockDevice};
 use crate::store::*;
 use crate::types::*;
@@ -14,9 +19,21 @@ fn boot_state_roundtrip() {
     let mut state = NvBootState {
         write_seq: 0,
         banks: std::array::from_fn(|i| match i {
-            0 => BankBootState { active_bank: Bank::A, committed: true, boot_count: 0 },
-            1 => BankBootState { active_bank: Bank::B, committed: false, boot_count: 7 },
-            2 => BankBootState { active_bank: Bank::A, committed: true, boot_count: 0 },
+            0 => BankBootState {
+                active_bank: Bank::A,
+                committed: true,
+                boot_count: 0,
+            },
+            1 => BankBootState {
+                active_bank: Bank::B,
+                committed: false,
+                boot_count: 7,
+            },
+            2 => BankBootState {
+                active_bank: Bank::A,
+                committed: true,
+                boot_count: 0,
+            },
             _ => BankBootState::default(),
         }),
     };
@@ -64,7 +81,9 @@ fn fw_meta_roundtrip() {
     meta.spare_part_number[..4].copy_from_slice(b"SP01");
     meta.min_security_ver = 2;
 
-    store.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+    store
+        .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta)
+        .unwrap();
     let read = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
 
     assert_eq!(&read.fw_version[..5], b"1.2.3");
@@ -84,16 +103,33 @@ fn runtime_roundtrip() {
     let mut store = make_store();
     let mut runtime = NvRuntime::default();
     runtime.did_count = 2;
-    runtime.dids[0] = DidEntry { did: 0xFD10, len: 4, data: {
-        let mut d = [0u8; 32]; d[..4].copy_from_slice(b"test"); d
-    }};
-    runtime.dids[1] = DidEntry { did: 0xFD11, len: 1, data: {
-        let mut d = [0u8; 32]; d[0] = 0xFF; d
-    }};
+    runtime.dids[0] = DidEntry {
+        did: 0xFD10,
+        len: 4,
+        data: {
+            let mut d = [0u8; 32];
+            d[..4].copy_from_slice(b"test");
+            d
+        },
+    };
+    runtime.dids[1] = DidEntry {
+        did: 0xFD11,
+        len: 1,
+        data: {
+            let mut d = [0u8; 32];
+            d[0] = 0xFF;
+            d
+        },
+    };
     runtime.dtc_count = 1;
-    runtime.dtcs[0] = DtcEntry { dtc_number: 0x00112233, status: 0x09 };
+    runtime.dtcs[0] = DtcEntry {
+        dtc_number: 0x00112233,
+        status: 0x09,
+    };
 
-    store.write_runtime(BankSet::Vm2, Bank::B, &mut runtime).unwrap();
+    store
+        .write_runtime(BankSet::Vm2, Bank::B, &mut runtime)
+        .unwrap();
     let read = store.read_runtime(BankSet::Vm2, Bank::B).unwrap();
 
     assert_eq!(read.did_count, 2);
@@ -170,7 +206,9 @@ fn fw_meta_rotation_with_4_sectors() {
     for i in 0..10u32 {
         let mut meta = NvFwMeta::default();
         meta.fw_seq = i;
-        store.write_fw_meta(BankSet::HostOs, Bank::A, &mut meta).unwrap();
+        store
+            .write_fw_meta(BankSet::HostOs, Bank::A, &mut meta)
+            .unwrap();
     }
 
     let read = store.read_fw_meta(BankSet::HostOs, Bank::A).unwrap();
@@ -219,7 +257,8 @@ fn corrupted_sector_falls_back_to_older() {
     let mut dev = store.into_inner();
     let mut buf = [0u8; 1];
     dev.read(SECTOR_SIZE as u64 + 10, &mut buf).unwrap();
-    dev.write(SECTOR_SIZE as u64 + 10, &[buf[0] ^ 0xFF]).unwrap();
+    dev.write(SECTOR_SIZE as u64 + 10, &[buf[0] ^ 0xFF])
+        .unwrap();
 
     let store = NvStore::new(dev);
     // Should fall back to sector 0 (seq=1, boot_count=10)
@@ -249,17 +288,23 @@ fn bank_sets_are_isolated() {
     // Write to VM1 Bank A
     let mut meta1 = NvFwMeta::default();
     meta1.fw_version[..3].copy_from_slice(b"1.0");
-    store.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta1).unwrap();
+    store
+        .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta1)
+        .unwrap();
 
     // Write to VM2 Bank A
     let mut meta2 = NvFwMeta::default();
     meta2.fw_version[..3].copy_from_slice(b"2.0");
-    store.write_fw_meta(BankSet::Vm2, Bank::A, &mut meta2).unwrap();
+    store
+        .write_fw_meta(BankSet::Vm2, Bank::A, &mut meta2)
+        .unwrap();
 
     // Write to VM1 Bank B
     let mut meta3 = NvFwMeta::default();
     meta3.fw_version[..3].copy_from_slice(b"1.1");
-    store.write_fw_meta(BankSet::Vm1, Bank::B, &mut meta3).unwrap();
+    store
+        .write_fw_meta(BankSet::Vm1, Bank::B, &mut meta3)
+        .unwrap();
 
     // Verify isolation
     let r1a = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
@@ -294,8 +339,13 @@ fn copy_runtime_clones_dids() {
         },
     };
     runtime.dtc_count = 1;
-    runtime.dtcs[0] = DtcEntry { dtc_number: 0x001122, status: 0x01 };
-    store.write_runtime(BankSet::Vm1, Bank::A, &mut runtime).unwrap();
+    runtime.dtcs[0] = DtcEntry {
+        dtc_number: 0x001122,
+        status: 0x01,
+    };
+    store
+        .write_runtime(BankSet::Vm1, Bank::A, &mut runtime)
+        .unwrap();
 
     // Copy A → B
     store.copy_runtime(BankSet::Vm1, Bank::A, Bank::B).unwrap();
@@ -310,7 +360,9 @@ fn copy_runtime_clones_dids() {
 
     // Modify A — B should be unaffected
     runtime.dids[0].data[0] = b'X';
-    store.write_runtime(BankSet::Vm1, Bank::A, &mut runtime).unwrap();
+    store
+        .write_runtime(BankSet::Vm1, Bank::A, &mut runtime)
+        .unwrap();
 
     let b_again = store.read_runtime(BankSet::Vm1, Bank::B).unwrap();
     assert_eq!(b_again.dids[0].data[0], b'a'); // still 'a', not 'X'
@@ -411,14 +463,18 @@ fn anti_rollback_floor_raised_on_commit() {
     let mut meta = NvFwMeta::default();
     meta.fw_secver = 5;
     meta.min_security_ver = 2;
-    store.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+    store
+        .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta)
+        .unwrap();
 
     // On commit: raise floor if secver > min
     let mut read = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
     if read.fw_secver > read.min_security_ver {
         read.min_security_ver = read.fw_secver;
     }
-    store.write_fw_meta(BankSet::Vm1, Bank::A, &mut read).unwrap();
+    store
+        .write_fw_meta(BankSet::Vm1, Bank::A, &mut read)
+        .unwrap();
 
     let final_read = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
     assert_eq!(final_read.min_security_ver, 5);
@@ -430,7 +486,9 @@ fn anti_rollback_rejects_old_version() {
 
     let mut meta = NvFwMeta::default();
     meta.min_security_ver = 5;
-    store.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+    store
+        .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta)
+        .unwrap();
 
     let current = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
 

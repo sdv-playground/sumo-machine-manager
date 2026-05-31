@@ -58,7 +58,11 @@ impl ShmemChannel {
                 size: region.len(),
             });
         }
-        Ok(Self { region, doorbell, size })
+        Ok(Self {
+            region,
+            doorbell,
+            size,
+        })
     }
 
     pub fn payload_size(&self) -> usize {
@@ -165,9 +169,15 @@ mod tests {
     fn write_rejects_wrong_length() {
         let ch = make_channel(8);
         // Too short.
-        assert!(matches!(ch.write(&[1, 2, 3]), Err(TransportError::OutOfBounds { .. })));
+        assert!(matches!(
+            ch.write(&[1, 2, 3]),
+            Err(TransportError::OutOfBounds { .. })
+        ));
         // Too long.
-        assert!(matches!(ch.write(&[0; 16]), Err(TransportError::OutOfBounds { .. })));
+        assert!(matches!(
+            ch.write(&[0; 16]),
+            Err(TransportError::OutOfBounds { .. })
+        ));
     }
 
     #[test]
@@ -195,9 +205,8 @@ mod tests {
 
         let region: Arc<dyn SharedMemory> = Arc::new(MemSharedMemory::new(4096));
         let doorbell: Arc<dyn Doorbell> = Arc::new(MemDoorbell);
-        let channel: Arc<dyn DeviceChannel> = Arc::new(
-            ShmemChannel::new(region, doorbell, HEARTBEAT_WIRE_SIZE).unwrap(),
-        );
+        let channel: Arc<dyn DeviceChannel> =
+            Arc::new(ShmemChannel::new(region, doorbell, HEARTBEAT_WIRE_SIZE).unwrap());
 
         let host = HeartbeatDevice::new(channel.clone());
         let guest = HeartbeatDevice::new(channel);
@@ -221,9 +230,8 @@ mod tests {
 
         let region: Arc<dyn SharedMemory> = Arc::new(MemSharedMemory::new(4096));
         let doorbell: Arc<dyn Doorbell> = Arc::new(MemDoorbell);
-        let channel: Arc<dyn DeviceChannel> = Arc::new(
-            ShmemChannel::new(region, doorbell, POWER_WIRE_SIZE).unwrap(),
-        );
+        let channel: Arc<dyn DeviceChannel> =
+            Arc::new(ShmemChannel::new(region, doorbell, POWER_WIRE_SIZE).unwrap());
 
         let host = PowerCommandDevice::new(channel.clone());
         let guest = PowerCommandDevice::new(channel);

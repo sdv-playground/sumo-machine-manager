@@ -131,24 +131,42 @@ mod tests {
     #[test]
     fn payload_uri_mapping_vm() {
         assert_eq!(payload_target_name(BankLayout::Vm, "#kernel"), "kernel");
-        assert_eq!(payload_target_name(BankLayout::Vm, "#firmware"), "rootfs.img");
-        assert_eq!(payload_target_name(BankLayout::Vm, "#config"), "vm-config.yaml");
-        assert_eq!(payload_target_name(BankLayout::Vm, "#qvm-config"), "qvm.conf");
+        assert_eq!(
+            payload_target_name(BankLayout::Vm, "#firmware"),
+            "rootfs.img"
+        );
+        assert_eq!(
+            payload_target_name(BankLayout::Vm, "#config"),
+            "vm-config.yaml"
+        );
+        assert_eq!(
+            payload_target_name(BankLayout::Vm, "#qvm-config"),
+            "qvm.conf"
+        );
         // Anything else strips the leading '#'.
         assert_eq!(payload_target_name(BankLayout::Vm, "#extra"), "extra");
     }
 
     #[test]
     fn payload_uri_mapping_boot_ifs() {
-        assert_eq!(payload_target_name(BankLayout::BootIfs, "#kernel"), "boot.ifs");
-        assert_eq!(payload_target_name(BankLayout::BootIfs, "#qvm-config"), "qvm.conf");
+        assert_eq!(
+            payload_target_name(BankLayout::BootIfs, "#kernel"),
+            "boot.ifs"
+        );
+        assert_eq!(
+            payload_target_name(BankLayout::BootIfs, "#qvm-config"),
+            "qvm.conf"
+        );
     }
 
     #[test]
     fn payload_uri_mapping_generic_passes_through() {
         // No special URI mappings — `#kernel` becomes `kernel` via the
         // trim_start_matches fallback, NOT the layout-specific table.
-        assert_eq!(payload_target_name(BankLayout::Generic, "#kernel"), "kernel");
+        assert_eq!(
+            payload_target_name(BankLayout::Generic, "#kernel"),
+            "kernel"
+        );
         assert_eq!(
             payload_target_name(BankLayout::Generic, "#rt-firmware"),
             "rt-firmware",

@@ -10,10 +10,7 @@ use crate::state::{self, AppConfig};
 ///
 /// If in trial mode: increments boot_count, triggers auto-rollback if exceeded.
 /// Returns the bank that the app should run from.
-pub fn process_app_boot<D: BlockDevice>(
-    config: &AppConfig,
-    nv: &Arc<Mutex<NvStore<D>>>,
-) -> Bank {
+pub fn process_app_boot<D: BlockDevice>(config: &AppConfig, nv: &Arc<Mutex<NvStore<D>>>) -> Bank {
     let mut nv_guard = nv.lock().unwrap();
 
     let mut boot_state = match nv_guard.read_boot_state() {

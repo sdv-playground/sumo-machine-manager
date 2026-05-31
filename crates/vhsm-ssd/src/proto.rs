@@ -1,6 +1,6 @@
-/// vHSM wire protocol types (v2) — matches vhsm_proto.h exactly.
-///
-/// See specs/vhsm/protocol.md (VHSM-PROTO-002) for the full specification.
+//! vHSM wire protocol types (v2) — matches `vhsm_proto.h` exactly.
+//!
+//! See `specs/vhsm/protocol.md` (VHSM-PROTO-002) for the full specification.
 
 // ---- Magic and version --------------------------------------------------
 
@@ -259,13 +259,13 @@ pub const HANDLE_DYNAMIC_BASE: u32 = 0x0100;
 /// Used by `HandleTable::register_well_known` to reject dynamic-range
 /// inputs.
 pub fn handle_is_well_known(h: u32) -> bool {
-    h >= 0x0001 && h < HANDLE_DYNAMIC_BASE
+    (0x0001..HANDLE_DYNAMIC_BASE).contains(&h)
 }
 
 /// True if `h` is a sumo-owned well-known handle (strictly below the
 /// project extension range).
 pub fn handle_is_sumo_core(h: u32) -> bool {
-    h >= 0x0001 && h < HANDLE_PROJECT_BASE
+    (0x0001..HANDLE_PROJECT_BASE).contains(&h)
 }
 
 /// True if `h` is in the project-extension range. Sumo does not know
@@ -273,7 +273,7 @@ pub fn handle_is_sumo_core(h: u32) -> bool {
 /// (e.g. guest-vm-spec's `vhsm-handles-ext`) and registered via the
 /// same `register_well_known` API as the core set.
 pub fn handle_is_project(h: u32) -> bool {
-    h >= HANDLE_PROJECT_BASE && h < HANDLE_DYNAMIC_BASE
+    (HANDLE_PROJECT_BASE..HANDLE_DYNAMIC_BASE).contains(&h)
 }
 
 // ---- Wire format structures ---------------------------------------------
@@ -355,8 +355,13 @@ mod tests {
         }
         // None of the regular ops are handshake.
         for op in [
-            Op::GetRandom, Op::KeyGenerate, Op::Encrypt, Op::Decrypt,
-            Op::Sign, Op::Verify, Op::GetCert,
+            Op::GetRandom,
+            Op::KeyGenerate,
+            Op::Encrypt,
+            Op::Decrypt,
+            Op::Sign,
+            Op::Verify,
+            Op::GetCert,
         ] {
             assert!(!op.is_handshake(), "{op:?} is not a handshake op");
         }
@@ -482,7 +487,10 @@ mod tests {
             HANDLE_STORAGE,
         ] {
             assert!(handle_is_sumo_core(h), "0x{h:04x} should be sumo-core");
-            assert!(!handle_is_project(h), "0x{h:04x} must not be in project range");
+            assert!(
+                !handle_is_project(h),
+                "0x{h:04x} must not be in project range"
+            );
         }
     }
 

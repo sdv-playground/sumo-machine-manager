@@ -112,7 +112,9 @@ pub fn default_reader() -> Arc<dyn SensorReader> {
                 Vec::new()
             }
         }
-        tracing::warn!("host-metrics: no platform-default reader for this target — /metrics will be empty");
+        tracing::warn!(
+            "host-metrics: no platform-default reader for this target — /metrics will be empty"
+        );
         Arc::new(Empty)
     }
 }
@@ -230,7 +232,10 @@ mod tests {
         ];
         let out = encode_prometheus(&sensors);
         assert_eq!(out.matches("# HELP host_temperature_celsius").count(), 1);
-        assert_eq!(out.matches("# TYPE host_temperature_celsius gauge").count(), 1);
+        assert_eq!(
+            out.matches("# TYPE host_temperature_celsius gauge").count(),
+            1
+        );
         assert!(out.contains("host_temperature_celsius{zone=\"soc\"} 45"));
         assert!(out.contains("host_temperature_celsius{zone=\"board\"} 38.5"));
     }
@@ -251,13 +256,32 @@ mod tests {
     #[test]
     fn encode_skips_non_finite_values() {
         let sensors = vec![
-            Sensor { name: "x", help: "h", kind: SensorKind::Gauge, value: f64::NAN, labels: vec![] },
-            Sensor { name: "x", help: "h", kind: SensorKind::Gauge, value: f64::INFINITY, labels: vec![] },
-            Sensor { name: "x", help: "h", kind: SensorKind::Gauge, value: 1.0, labels: vec![] },
+            Sensor {
+                name: "x",
+                help: "h",
+                kind: SensorKind::Gauge,
+                value: f64::NAN,
+                labels: vec![],
+            },
+            Sensor {
+                name: "x",
+                help: "h",
+                kind: SensorKind::Gauge,
+                value: f64::INFINITY,
+                labels: vec![],
+            },
+            Sensor {
+                name: "x",
+                help: "h",
+                kind: SensorKind::Gauge,
+                value: 1.0,
+                labels: vec![],
+            },
         ];
         let out = encode_prometheus(&sensors);
         // Only the finite sample produces a metric line.
-        let metric_lines: Vec<_> = out.lines()
+        let metric_lines: Vec<_> = out
+            .lines()
             .filter(|l| l.starts_with("x"))
             .filter(|l| !l.starts_with("# "))
             .collect();
@@ -268,8 +292,20 @@ mod tests {
     #[test]
     fn encode_groups_sort_alphabetically_by_name() {
         let sensors = vec![
-            Sensor { name: "z_metric", help: "z", kind: SensorKind::Gauge, value: 1.0, labels: vec![] },
-            Sensor { name: "a_metric", help: "a", kind: SensorKind::Gauge, value: 2.0, labels: vec![] },
+            Sensor {
+                name: "z_metric",
+                help: "z",
+                kind: SensorKind::Gauge,
+                value: 1.0,
+                labels: vec![],
+            },
+            Sensor {
+                name: "a_metric",
+                help: "a",
+                kind: SensorKind::Gauge,
+                value: 2.0,
+                labels: vec![],
+            },
         ];
         let out = encode_prometheus(&sensors);
         let a_pos = out.find("# HELP a_metric").unwrap();
@@ -288,8 +324,10 @@ mod tests {
         }];
         let out = encode_prometheus(&sensors);
         // \ → \\, " → \", \n → \n (literal backslash-n)
-        assert!(out.contains(r#"k="back\\slash \"quote\" line\nbreak""#),
-            "got: {out:?}");
+        assert!(
+            out.contains(r#"k="back\\slash \"quote\" line\nbreak""#),
+            "got: {out:?}"
+        );
     }
 
     #[test]

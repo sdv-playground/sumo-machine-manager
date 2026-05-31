@@ -163,7 +163,11 @@ impl std::fmt::Display for PartitionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PartitionError::NotADirectory(p) => {
-                write!(f, "policy partition path is not a directory: {}", p.display())
+                write!(
+                    f,
+                    "policy partition path is not a directory: {}",
+                    p.display()
+                )
             }
             PartitionError::MissingRequiredFile(p) => {
                 write!(f, "policy partition missing required file: {}", p.display())
@@ -257,7 +261,8 @@ fn load_optional_crl(root: &Path) -> Result<Option<Crl>, PartitionError> {
         path: path.clone(),
         error: e.to_string(),
     })?;
-    let crl: Crl = serde_yaml::from_str(&text).map_err(|e| PartitionError::CrlParse(e.to_string()))?;
+    let crl: Crl =
+        serde_yaml::from_str(&text).map_err(|e| PartitionError::CrlParse(e.to_string()))?;
     Ok(Some(crl))
 }
 
@@ -403,7 +408,11 @@ rules:
     #[test]
     fn malformed_policy_yaml_surfaces_policy_eval_error() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("policy.yaml"), "this is not valid yaml: : :").unwrap();
+        fs::write(
+            tmp.path().join("policy.yaml"),
+            "this is not valid yaml: : :",
+        )
+        .unwrap();
         fs::create_dir(tmp.path().join("roots")).unwrap();
         let err = PolicyPartition::load_from_dir(tmp.path(), normalize_test).unwrap_err();
         assert!(matches!(err, PartitionError::AuthorisationPolicyParse(_)));

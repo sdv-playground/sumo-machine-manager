@@ -201,18 +201,13 @@ fn run() -> ExitCode {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    if args.quiet { "warn" } else { "info" }.parse().unwrap()
-                }),
+                .unwrap_or_else(|_| if args.quiet { "warn" } else { "info" }.parse().unwrap()),
         )
         .with_writer(std::io::stderr)
         .try_init();
 
     if !args.bank.exists() {
-        eprintln!(
-            "sumo-verify: bank dir missing: {}",
-            args.bank.display(),
-        );
+        eprintln!("sumo-verify: bank dir missing: {}", args.bank.display(),);
         return ExitCode::from(EXIT_USAGE);
     }
 

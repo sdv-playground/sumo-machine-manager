@@ -41,11 +41,7 @@ fn provisioned_keystore(scratch: &Scratch) -> PathBuf {
     let keystore = scratch.path("keystore");
     std::fs::create_dir_all(&keystore).unwrap();
 
-    let hsm = SimHsm::new(
-        PathBuf::from("/dev/null"),
-        keystore.clone(),
-        0,
-    );
+    let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
 
     let ks = payload::HsmKeystore {
         schema_version: payload::SCHEMA_VERSION,
@@ -56,7 +52,11 @@ fn provisioned_keystore(scratch: &Scratch) -> PathBuf {
             key_kind: payload::KEY_TYPE_EC_P256,
             anchor_public_key: None,
             allowed_guests: None,
-            allowed_ops: Some(vec![payload::OP_SIGN, payload::OP_VERIFY, payload::OP_GET_PUBKEY]),
+            allowed_ops: Some(vec![
+                payload::OP_SIGN,
+                payload::OP_VERIFY,
+                payload::OP_GET_PUBKEY,
+            ]),
         }],
     };
     hsm.write_keystore(&ks).unwrap();
@@ -79,7 +79,7 @@ fn verifies_a_signed_bank() {
     let bank = s.path("vm2/bank_a");
     std::fs::create_dir_all(&bank).unwrap();
     std::fs::write(bank.join("kernel"), b"kernel bytes").unwrap();
-    std::fs::write(bank.join("rootfs.img"), &vec![0xAB; 4096]).unwrap();
+    std::fs::write(bank.join("rootfs.img"), vec![0xAB; 4096]).unwrap();
 
     // Sign with the HSM the CLI will use. `gen=7` here is the
     // per-install generation counter the NV layer would assign; the
@@ -88,9 +88,12 @@ fn verifies_a_signed_bank() {
     ivd::sign_bank(&hsm, &bank, 7).unwrap();
 
     let out = Command::new(binary())
-        .arg("--bank").arg(&bank)
-        .arg("--keystore").arg(&keystore)
-        .arg("--expect-install-gen").arg("7")
+        .arg("--bank")
+        .arg(&bank)
+        .arg("--keystore")
+        .arg(&keystore)
+        .arg("--expect-install-gen")
+        .arg("7")
         .output()
         .expect("run sumo-verify");
 
@@ -115,7 +118,7 @@ fn rejects_tampered_file() {
     // 12-byte original; tamper to a different 12-byte content so
     // we exercise hash mismatch (not size mismatch).
     std::fs::write(bank.join("kernel"), b"original\0\0\0\0").unwrap();
-    std::fs::write(bank.join("rootfs.img"), &vec![0u8; 2048]).unwrap();
+    std::fs::write(bank.join("rootfs.img"), vec![0u8; 2048]).unwrap();
 
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
     ivd::sign_bank(&hsm, &bank, 11).unwrap();
@@ -124,8 +127,10 @@ fn rejects_tampered_file() {
     std::fs::write(bank.join("kernel"), b"tampered\0\0\0\0").unwrap();
 
     let out = Command::new(binary())
-        .arg("--bank").arg(&bank)
-        .arg("--keystore").arg(&keystore)
+        .arg("--bank")
+        .arg(&bank)
+        .arg("--keystore")
+        .arg(&keystore)
         .output()
         .expect("run sumo-verify");
 
@@ -150,8 +155,10 @@ fn rejects_unexpected_extra_file() {
     std::fs::write(bank.join("evil-payload"), b"sneaky").unwrap();
 
     let out = Command::new(binary())
-        .arg("--bank").arg(&bank)
-        .arg("--keystore").arg(&keystore)
+        .arg("--bank")
+        .arg(&bank)
+        .arg("--keystore")
+        .arg(&keystore)
         .output()
         .expect("run sumo-verify");
 
@@ -179,9 +186,12 @@ fn rejects_install_gen_mismatch() {
     ivd::sign_bank(&hsm, &bank, 5).unwrap();
 
     let out = Command::new(binary())
-        .arg("--bank").arg(&bank)
-        .arg("--keystore").arg(&keystore)
-        .arg("--expect-install-gen").arg("6")
+        .arg("--bank")
+        .arg(&bank)
+        .arg("--keystore")
+        .arg(&keystore)
+        .arg("--expect-install-gen")
+        .arg("6")
         .output()
         .expect("run sumo-verify");
 
@@ -199,8 +209,10 @@ fn rejects_missing_bank_dir() {
     let keystore = provisioned_keystore(&s);
 
     let out = Command::new(binary())
-        .arg("--bank").arg(s.path("does/not/exist"))
-        .arg("--keystore").arg(&keystore)
+        .arg("--bank")
+        .arg(s.path("does/not/exist"))
+        .arg("--keystore")
+        .arg(&keystore)
         .output()
         .expect("run sumo-verify");
 
@@ -216,8 +228,10 @@ fn rejects_missing_keystore() {
     std::fs::create_dir_all(&bank).unwrap();
 
     let out = Command::new(binary())
-        .arg("--bank").arg(&bank)
-        .arg("--keystore").arg(s.path("nonexistent-keystore"))
+        .arg("--bank")
+        .arg(&bank)
+        .arg("--keystore")
+        .arg(s.path("nonexistent-keystore"))
         .output()
         .expect("run sumo-verify");
 
@@ -249,8 +263,10 @@ fn quiet_suppresses_stdout_on_success() {
     ivd::sign_bank(&hsm, &bank, 3).unwrap();
 
     let out = Command::new(binary())
-        .arg("--bank").arg(&bank)
-        .arg("--keystore").arg(&keystore)
+        .arg("--bank")
+        .arg(&bank)
+        .arg("--keystore")
+        .arg(&keystore)
         .arg("--quiet")
         .output()
         .expect("run sumo-verify");

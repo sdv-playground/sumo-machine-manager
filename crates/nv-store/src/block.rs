@@ -1,7 +1,7 @@
-/// Block device abstraction for platform-independent NV storage.
-///
-/// On Linux/QEMU: file-backed I/O for testing
-/// On QNX: raw partition I/O for production
+//! Block device abstraction for platform-independent NV storage.
+//!
+//! On Linux/QEMU: file-backed I/O for testing.  On QNX: raw partition
+//! I/O for production.
 
 pub trait BlockDevice {
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, BlockError>;

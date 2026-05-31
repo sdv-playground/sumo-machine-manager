@@ -1,8 +1,13 @@
 /// Dummy runner — no-op backend for components without a real VM process.
-
 use super::*;
 
 pub struct DummyRunner;
+
+impl Default for DummyRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl DummyRunner {
     pub fn new() -> Self {
@@ -12,7 +17,10 @@ impl DummyRunner {
 
 impl VmRunner for DummyRunner {
     fn start(&mut self, name: &str, _def: &VmDefinition) -> Result<VmHandle, RunnerError> {
-        Ok(VmHandle { name: name.to_string(), pid: None })
+        Ok(VmHandle {
+            name: name.to_string(),
+            pid: None,
+        })
     }
 
     fn stop(&mut self, _handle: &VmHandle) -> Result<(), RunnerError> {
@@ -56,7 +64,10 @@ image_dir: /nonexistent
     #[test]
     fn is_running_always_false() {
         let r = DummyRunner::new();
-        let h = VmHandle { name: "x".into(), pid: None };
+        let h = VmHandle {
+            name: "x".into(),
+            pid: None,
+        };
         assert!(!r.is_running(&h));
     }
 

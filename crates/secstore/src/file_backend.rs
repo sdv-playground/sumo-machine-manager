@@ -14,7 +14,9 @@ pub struct FileBackend {
 
 impl FileBackend {
     pub fn new(dir: &Path) -> Self {
-        Self { dir: dir.to_path_buf() }
+        Self {
+            dir: dir.to_path_buf(),
+        }
     }
 }
 

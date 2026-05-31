@@ -63,10 +63,12 @@ pub enum Principal {
     /// authoritatively by the launcher (e.g. jwt-mgr) based on the
     /// image's signing chain — not requested by the container itself.
     /// Conventional namespace roots:
-    ///   * `system/...`   — OEM platform components, highest trust
-    ///   * `vendor/<supplier>/...` — tier-1 supplier components
-    ///   * `app/<publisher>/...`   — third-party apps
-    ///   * `dev/...`              — unsigned / dev builds, lowest trust
+    ///
+    /// - `system/...`            — OEM platform components, highest trust
+    /// - `vendor/<supplier>/...` — tier-1 supplier components
+    /// - `app/<publisher>/...`   — third-party apps
+    /// - `dev/...`               — unsigned / dev builds, lowest trust
+    ///
     /// See AUTH-ARCH-001 §7.4 (launcher policy) for the assignment flow.
     Container {
         vm_id: String,
@@ -95,7 +97,12 @@ impl Principal {
     pub fn display_id(&self) -> String {
         match self {
             Principal::Vm { vm_id, .. } => format!("vm:{vm_id}"),
-            Principal::Container { vm_id, namespace, container, .. } => {
+            Principal::Container {
+                vm_id,
+                namespace,
+                container,
+                ..
+            } => {
                 format!("vm:{vm_id}/ns:{namespace}/container:{container}")
             }
             Principal::Tester { idp, sub, .. } => format!("tester:{idp}/{sub}"),
@@ -254,9 +261,8 @@ impl PrincipalSelector {
                 }
                 if let Some(vm) = &t.vm {
                     // Container if ANY container-shaped field is set.
-                    let is_container = t.namespace.is_some()
-                        || t.container.is_some()
-                        || t.image_digest.is_some();
+                    let is_container =
+                        t.namespace.is_some() || t.container.is_some() || t.image_digest.is_some();
                     if is_container {
                         Ok(PrincipalSelector::Container {
                             vm_id: vm.clone(),
@@ -303,11 +309,9 @@ impl PrincipalSelector {
                 },
             ) => {
                 (w_vm == g_vm || w_vm == "*")
-                    && w_ns.as_ref().map_or(true, |w| w.matches(g_ns))
-                    && w_c.as_ref().map_or(true, |w| w == g_c)
-                    && w_img
-                        .as_ref()
-                        .map_or(true, |w| g_img.as_ref().map_or(false, |g| w == g))
+                    && w_ns.as_ref().is_none_or(|w| w.matches(g_ns))
+                    && w_c.as_ref().is_none_or(|w| w == g_c)
+                    && w_img.as_ref().is_none_or(|w| g_img.as_ref() == Some(w))
             }
             (
                 PrincipalSelector::Tester {
@@ -322,11 +326,9 @@ impl PrincipalSelector {
                     ..
                 },
             ) => {
-                w_idp.as_ref().map_or(true, |w| w == g_idp)
-                    && w_sub.as_ref().map_or(true, |w| w == g_sub)
-                    && w_role
-                        .as_ref()
-                        .map_or(true, |w| g_role.as_ref().map_or(false, |g| w == g))
+                w_idp.as_ref().is_none_or(|w| w == g_idp)
+                    && w_sub.as_ref().is_none_or(|w| w == g_sub)
+                    && w_role.as_ref().is_none_or(|w| g_role.as_ref() == Some(w))
             }
             (PrincipalSelector::Device { serial: w }, Principal::Device { serial: g }) => {
                 w == g || w == "*"
@@ -609,9 +611,7 @@ impl Policy {
                 let mut set = HashSet::with_capacity(raw.ops.len());
                 for s in &raw.ops {
                     let canonical = normalize_op(s).ok_or_else(|| {
-                        LoadError::Malformed(format!(
-                            "statement {i}: unknown op name {s:?}"
-                        ))
+                        LoadError::Malformed(format!("statement {i}: unknown op name {s:?}"))
                     })?;
                     set.insert(canonical);
                 }
@@ -658,7 +658,7 @@ mod tests {
             stmt.get("test")
                 .and_then(|t| t.get("value"))
                 .and_then(|v| v.as_str())
-                .map_or(false, |s| s == "*" || s == req)
+                .is_some_and(|s| s == "*" || s == req)
         }
     }
 
@@ -691,7 +691,12 @@ statements:
         )
         .expect("parses");
         let d = evaluate(&p, &vm("vm1"), &"foo".to_string(), "sign", &TestMatcher);
-        assert_eq!(d, Decision::Allow { matched_statement: 0 });
+        assert_eq!(
+            d,
+            Decision::Allow {
+                matched_statement: 0
+            }
+        );
 
         // vm2 doesn't match.
         let d = evaluate(&p, &vm("vm2"), &"foo".to_string(), "sign", &TestMatcher);
@@ -713,7 +718,12 @@ statements:
         )
         .expect("parses");
         let d = evaluate(&p, &vm("vm99"), &"foo".to_string(), "sign", &TestMatcher);
-        assert_eq!(d, Decision::Allow { matched_statement: 0 });
+        assert_eq!(
+            d,
+            Decision::Allow {
+                matched_statement: 0
+            }
+        );
     }
 
     #[test]
@@ -732,7 +742,12 @@ statements:
         )
         .expect("parses");
         let d = evaluate(&p, &vm("vm1"), &"foo".to_string(), "sign", &TestMatcher);
-        assert_eq!(d, Decision::Allow { matched_statement: 0 });
+        assert_eq!(
+            d,
+            Decision::Allow {
+                matched_statement: 0
+            }
+        );
 
         // A Container principal on vm1 does NOT match a `vm:` selector
         // (selector requires exact variant).
@@ -769,7 +784,12 @@ statements:
             image_digest: None,
         };
         let d = evaluate(&p, &container, &"foo".to_string(), "sign", &TestMatcher);
-        assert_eq!(d, Decision::Allow { matched_statement: 0 });
+        assert_eq!(
+            d,
+            Decision::Allow {
+                matched_statement: 0
+            }
+        );
 
         // Different container — denied.
         let other = Principal::Container {
@@ -806,7 +826,12 @@ statements:
             scope: vec![],
         };
         let d = evaluate(&p, &tester, &"x".to_string(), "read", &TestMatcher);
-        assert_eq!(d, Decision::Allow { matched_statement: 0 });
+        assert_eq!(
+            d,
+            Decision::Allow {
+                matched_statement: 0
+            }
+        );
 
         // Wrong role — denied.
         let tester2 = Principal::Tester {
@@ -840,11 +865,21 @@ statements:
 
         // vm1 hits statement 0.
         let d = evaluate(&p, &vm("vm1"), &"foo".to_string(), "sign", &TestMatcher);
-        assert_eq!(d, Decision::Allow { matched_statement: 0 });
+        assert_eq!(
+            d,
+            Decision::Allow {
+                matched_statement: 0
+            }
+        );
 
         // vm2 falls through to statement 1.
         let d = evaluate(&p, &vm("vm2"), &"bar".to_string(), "verify", &TestMatcher);
-        assert_eq!(d, Decision::Allow { matched_statement: 1 });
+        assert_eq!(
+            d,
+            Decision::Allow {
+                matched_statement: 1
+            }
+        );
     }
 
     #[test]
@@ -865,7 +900,9 @@ statements:
             let d = evaluate(&p, &vm("vm1"), &"x".to_string(), op, &TestMatcher);
             assert_eq!(
                 d,
-                Decision::Allow { matched_statement: 0 },
+                Decision::Allow {
+                    matched_statement: 0
+                },
                 "op {op}"
             );
         }
@@ -1057,11 +1094,15 @@ statements:
 
         assert_eq!(
             evaluate(&p, &sys_a, &"x".into(), "sign", &TestMatcher),
-            Decision::Allow { matched_statement: 0 }
+            Decision::Allow {
+                matched_statement: 0
+            }
         );
         assert_eq!(
             evaluate(&p, &sys_b, &"x".into(), "sign", &TestMatcher),
-            Decision::Allow { matched_statement: 0 }
+            Decision::Allow {
+                matched_statement: 0
+            }
         );
         assert_eq!(
             evaluate(&p, &vendor, &"x".into(), "sign", &TestMatcher),
@@ -1094,7 +1135,9 @@ statements:
         let sub = container("vm1", "system/foo", "x");
         assert_eq!(
             evaluate(&p, &exact, &"x".into(), "sign", &TestMatcher),
-            Decision::Allow { matched_statement: 0 }
+            Decision::Allow {
+                matched_statement: 0
+            }
         );
         assert_eq!(
             evaluate(&p, &sub, &"x".into(), "sign", &TestMatcher),
@@ -1119,11 +1162,18 @@ statements:
         )
         .expect("parses");
 
-        for ns in ["system/telemetry", "vendor/bosch/x", "app/foo/bar", "dev/scratch"] {
+        for ns in [
+            "system/telemetry",
+            "vendor/bosch/x",
+            "app/foo/bar",
+            "dev/scratch",
+        ] {
             let c = container("vm1", ns, "x");
             assert_eq!(
                 evaluate(&p, &c, &"x".into(), "sign", &TestMatcher),
-                Decision::Allow { matched_statement: 0 },
+                Decision::Allow {
+                    matched_statement: 0
+                },
                 "ns={ns}"
             );
         }
@@ -1153,11 +1203,15 @@ statements:
         let c2 = container("vm1", "vendor/bosch", "telemetry");
         assert_eq!(
             evaluate(&p, &c1, &"x".into(), "sign", &TestMatcher),
-            Decision::Allow { matched_statement: 0 }
+            Decision::Allow {
+                matched_statement: 0
+            }
         );
         assert_eq!(
             evaluate(&p, &c2, &"x".into(), "sign", &TestMatcher),
-            Decision::Allow { matched_statement: 0 }
+            Decision::Allow {
+                matched_statement: 0
+            }
         );
     }
 
@@ -1196,8 +1250,10 @@ statements:
                 stmt.get("hsm")
                     .and_then(|h| h.get("handles"))
                     .and_then(|v| v.as_sequence())
-                    .map_or(false, |seq| {
-                        seq.iter().filter_map(|v| v.as_str()).any(|h| h == "*" || h == req)
+                    .is_some_and(|seq| {
+                        seq.iter()
+                            .filter_map(|v| v.as_str())
+                            .any(|h| h == "*" || h == req)
                     })
             }
         }
@@ -1209,18 +1265,34 @@ statements:
         // System can sign with jwt-signing.
         assert_eq!(
             evaluate(&p, &sys, &"jwt-signing".into(), "sign", &HsmMatcher),
-            Decision::Allow { matched_statement: 0 }
+            Decision::Allow {
+                matched_statement: 0
+            }
         );
         // System CANNOT use bosch-vendor-signing (statement 1 is for
         // bosch principals).
         assert_eq!(
-            evaluate(&p, &sys, &"bosch-vendor-signing".into(), "sign", &HsmMatcher),
+            evaluate(
+                &p,
+                &sys,
+                &"bosch-vendor-signing".into(),
+                "sign",
+                &HsmMatcher
+            ),
             Decision::Deny
         );
         // Bosch CAN use its own vendor key.
         assert_eq!(
-            evaluate(&p, &bosch, &"bosch-vendor-signing".into(), "sign", &HsmMatcher),
-            Decision::Allow { matched_statement: 1 }
+            evaluate(
+                &p,
+                &bosch,
+                &"bosch-vendor-signing".into(),
+                "sign",
+                &HsmMatcher
+            ),
+            Decision::Allow {
+                matched_statement: 1
+            }
         );
         // Bosch CANNOT use jwt-signing (would let bosch impersonate
         // the system).
@@ -1234,7 +1306,13 @@ statements:
             Decision::Deny
         );
         assert_eq!(
-            evaluate(&p, &app, &"bosch-vendor-signing".into(), "sign", &HsmMatcher),
+            evaluate(
+                &p,
+                &app,
+                &"bosch-vendor-signing".into(),
+                "sign",
+                &HsmMatcher
+            ),
             Decision::Deny
         );
     }

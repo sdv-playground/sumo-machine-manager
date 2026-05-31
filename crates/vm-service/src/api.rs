@@ -1,3 +1,11 @@
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Json},
+    routing::{get, post},
+    Router,
+};
+use serde::Serialize;
 /// HTTP API for VM lifecycle control.
 ///
 /// Routes:
@@ -7,16 +15,7 @@
 ///   POST /vms/{name}/stop    → stop a VM
 ///   POST /vms/{name}/restart → alias for /start (kept for API back-compat)
 ///   GET  /vms/{name}/health  → health status
-
 use std::sync::Arc;
-use axum::{
-    Router,
-    extract::{Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Json},
-    routing::{get, post},
-};
-use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::health_status::HealthStatus;
@@ -62,19 +61,20 @@ struct VmInfoResponse {
 
 async fn list_vms(State(mgr): State<SharedManager>) -> Json<Vec<VmInfoResponse>> {
     let mut mgr = mgr.lock().await;
-    let vms = mgr.list().into_iter().map(|v| VmInfoResponse {
-        name: v.name,
-        status: v.status,
-        pid: v.pid,
-        backend: format!("{:?}", v.backend).to_lowercase(),
-    }).collect();
+    let vms = mgr
+        .list()
+        .into_iter()
+        .map(|v| VmInfoResponse {
+            name: v.name,
+            status: v.status,
+            pid: v.pid,
+            backend: format!("{:?}", v.backend).to_lowercase(),
+        })
+        .collect();
     Json(vms)
 }
 
-async fn stop_vm(
-    State(mgr): State<SharedManager>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
+async fn stop_vm(State(mgr): State<SharedManager>, Path(name): Path<String>) -> impl IntoResponse {
     // Phase 1: signal shutdown (fast, under lock)
     let stop_handle = {
         let mut mgr = mgr.lock().await;
@@ -93,7 +93,8 @@ async fn stop_vm(
             // on false, so the result is informational here. Caller logs
             // its own elapsed metric.
             manager::wait_for_exit(pid, timeout)
-        }).await;
+        })
+        .await;
     }
 
     // Phase 3: force-kill if needed + cleanup (fast, under lock)
@@ -142,11 +143,10 @@ async fn ensure_vm_running(
             if let Some(pid) = sh.pid {
                 let timeout = sh.timeout_secs;
                 let phase_started = std::time::Instant::now();
-                let exited = tokio::task::spawn_blocking(move || {
-                    manager::wait_for_exit(pid, timeout)
-                })
-                .await
-                .unwrap_or(false);
+                let exited =
+                    tokio::task::spawn_blocking(move || manager::wait_for_exit(pid, timeout))
+                        .await
+                        .unwrap_or(false);
                 let elapsed_secs = phase_started.elapsed().as_secs();
                 if exited {
                     tracing::info!(
@@ -171,7 +171,8 @@ async fn ensure_vm_running(
             let rt = tokio::runtime::Handle::current();
             let mut mgr = rt.block_on(start_mgr.lock());
             mgr.start_vm(&start_name)
-        }).await;
+        })
+        .await;
         let start_elapsed_secs = phase_started.elapsed().as_secs();
 
         let total_elapsed_secs = total_started.elapsed().as_secs();
@@ -191,7 +192,10 @@ async fn ensure_vm_running(
         }
     });
 
-    (StatusCode::OK, Json(serde_json::json!({"ok": true, "queued": true})))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"ok": true, "queued": true})),
+    )
 }
 
 async fn health_vm(
@@ -200,12 +204,15 @@ async fn health_vm(
 ) -> impl IntoResponse {
     let mut mgr = mgr.lock().await;
     match mgr.health_detail(&name) {
-        Ok(detail) => (StatusCode::OK, Json(serde_json::json!({
-            "status": detail.status,
-            "guest_state": detail.guest_state,
-            "hb_seq": detail.hb_seq,
-            "boot_id": detail.boot_id,
-        }))),
+        Ok(detail) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": detail.status,
+                "guest_state": detail.guest_state,
+                "hb_seq": detail.hb_seq,
+                "boot_id": detail.boot_id,
+            })),
+        ),
         Err(e) => error_response(e),
     }
 }

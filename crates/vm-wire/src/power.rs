@@ -77,8 +77,7 @@ mod tests {
         };
         let expected: [u8; POWER_WIRE_SIZE] = [
             // seq = 0x11223344 LE
-            0x44, 0x33, 0x22, 0x11,
-            // cmd = Reboot (2)
+            0x44, 0x33, 0x22, 0x11, // cmd = Reboot (2)
             0x02, 0x00, 0x00, 0x00,
         ];
         assert_eq!(frame.to_bytes(), expected);
@@ -110,7 +109,10 @@ mod tests {
             PowerCommand::Freeze,
         ] {
             let frame = PowerCommandFrame { seq: 7, cmd };
-            assert_eq!(PowerCommandFrame::from_bytes(&frame.to_bytes()), Some(frame));
+            assert_eq!(
+                PowerCommandFrame::from_bytes(&frame.to_bytes()),
+                Some(frame)
+            );
         }
     }
 }

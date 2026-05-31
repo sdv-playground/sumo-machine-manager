@@ -2,7 +2,6 @@
 ///
 /// CRC-32 covers the entire 4 KB sector (minus the last 4 bytes which hold the CRC).
 /// Records are serialized into the sector, zero-padded, then CRC'd.
-
 use crate::block::{BlockDevice, BlockError};
 use crate::types::*;
 
@@ -93,7 +92,7 @@ pub fn read_record<T: NvRecord>(
         };
 
         let seq = record.write_seq();
-        if best.as_ref().map_or(true, |(best_seq, _)| seq > *best_seq) {
+        if best.as_ref().is_none_or(|(best_seq, _)| seq > *best_seq) {
             best = Some((seq, record));
         }
     }
@@ -185,7 +184,12 @@ impl<D: BlockDevice> NvStore<D> {
     }
 
     pub fn write_boot_state(&mut self, state: &mut NvBootState) -> Result<(), BlockError> {
-        write_record(&mut self.dev, layout::BOOT_OFFSET, layout::BOOT_SECTORS, state)
+        write_record(
+            &mut self.dev,
+            layout::BOOT_OFFSET,
+            layout::BOOT_SECTORS,
+            state,
+        )
     }
 
     // --- Factory ---
@@ -195,7 +199,12 @@ impl<D: BlockDevice> NvStore<D> {
     }
 
     pub fn write_factory(&mut self, factory: &mut NvFactory) -> Result<(), BlockError> {
-        write_record(&mut self.dev, layout::FACTORY_OFFSET, layout::FACTORY_SECTORS, factory)
+        write_record(
+            &mut self.dev,
+            layout::FACTORY_OFFSET,
+            layout::FACTORY_SECTORS,
+            factory,
+        )
     }
 
     // --- App ---
@@ -243,12 +252,7 @@ impl<D: BlockDevice> NvStore<D> {
     }
 
     /// Copy runtime data from one bank to another (copy-on-update for OTA).
-    pub fn copy_runtime(
-        &mut self,
-        set: BankSet,
-        from: Bank,
-        to: Bank,
-    ) -> Result<(), BlockError> {
+    pub fn copy_runtime(&mut self, set: BankSet, from: Bank, to: Bank) -> Result<(), BlockError> {
         let Some(mut runtime) = self.read_runtime(set, from) else {
             // Source has no runtime data — write empty default to target
             let mut empty = NvRuntime::default();

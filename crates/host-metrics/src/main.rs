@@ -32,15 +32,14 @@ async fn main() -> ExitCode {
     tracing::info!("host-metrics listening on {bind_addr}, GET /metrics");
 
     let shutdown = async {
-        let mut sigterm = match tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("failed to register SIGTERM: {e}");
-                return;
-            }
-        };
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("failed to register SIGTERM: {e}");
+                    return;
+                }
+            };
         tokio::select! {
             _ = sigterm.recv() => tracing::info!("SIGTERM"),
             _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT"),

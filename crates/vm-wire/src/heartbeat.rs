@@ -90,7 +90,13 @@ impl Heartbeat {
         let mono_ns = u64::from_le_bytes(data[16..24].try_into().ok()?);
         let flags = u32::from_le_bytes(data[24..28].try_into().ok()?);
         let boot_id = u32::from_le_bytes(data[28..32].try_into().ok()?);
-        Some(Self { seq, state, mono_ns, flags, boot_id })
+        Some(Self {
+            seq,
+            state,
+            mono_ns,
+            flags,
+            boot_id,
+        })
     }
 }
 
@@ -113,18 +119,12 @@ mod tests {
         };
         let expected: [u8; HEARTBEAT_WIRE_SIZE] = [
             // magic "HBTH"
-            0x48, 0x54, 0x42, 0x48,
-            // version = 1
-            0x01, 0x00, 0x00, 0x00,
-            // seq = 0x11223344 LE
-            0x44, 0x33, 0x22, 0x11,
-            // state = Running (1)
-            0x01, 0x00, 0x00, 0x00,
-            // mono_ns = 0x5566_7788_99AA_BBCC LE
-            0xCC, 0xBB, 0xAA, 0x99, 0x88, 0x77, 0x66, 0x55,
-            // flags = 1
-            0x01, 0x00, 0x00, 0x00,
-            // boot_id = 0xCAFE_BABE LE
+            0x48, 0x54, 0x42, 0x48, // version = 1
+            0x01, 0x00, 0x00, 0x00, // seq = 0x11223344 LE
+            0x44, 0x33, 0x22, 0x11, // state = Running (1)
+            0x01, 0x00, 0x00, 0x00, // mono_ns = 0x5566_7788_99AA_BBCC LE
+            0xCC, 0xBB, 0xAA, 0x99, 0x88, 0x77, 0x66, 0x55, // flags = 1
+            0x01, 0x00, 0x00, 0x00, // boot_id = 0xCAFE_BABE LE
             0xBE, 0xBA, 0xFE, 0xCA,
         ];
         assert_eq!(hb.to_bytes(), expected);

@@ -248,9 +248,10 @@ impl ResourceMatcher for HsmResourceMatcher {
         let Some(handles) = hsm.get("handles").and_then(|v| v.as_sequence()) else {
             return false;
         };
-        handles.iter().filter_map(|v| v.as_str()).any(|h| {
-            h == "*" || h == request.handle_key_id
-        })
+        handles
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|h| h == "*" || h == request.handle_key_id)
     }
 }
 
@@ -352,7 +353,10 @@ statements:
     #[test]
     fn empty_policy_denies_everything() {
         let p = IamPolicy::empty();
-        assert_eq!(p.evaluate("vm1", "sw-authority", Op::Verify), IamDecision::Deny);
+        assert_eq!(
+            p.evaluate("vm1", "sw-authority", Op::Verify),
+            IamDecision::Deny
+        );
     }
 
     #[test]
@@ -360,7 +364,12 @@ statements:
         let p = IamPolicy::parse(sample()).unwrap();
         // vm1 + sw-authority + verify → statement 0
         let d = p.evaluate("vm1", "sw-authority", Op::Verify);
-        assert_eq!(d, IamDecision::Allow { matched_statement: 0 });
+        assert_eq!(
+            d,
+            IamDecision::Allow {
+                matched_statement: 0
+            }
+        );
     }
 
     #[test]
@@ -369,7 +378,12 @@ statements:
         // any vm + device-decrypt + decrypt → statement 2 (wildcard
         // principal)
         let d = p.evaluate("vm99", "device-decrypt", Op::Decrypt);
-        assert_eq!(d, IamDecision::Allow { matched_statement: 2 });
+        assert_eq!(
+            d,
+            IamDecision::Allow {
+                matched_statement: 2
+            }
+        );
     }
 
     #[test]
@@ -393,7 +407,12 @@ statements:
     fn project_extension_handle_in_policy() {
         let p = IamPolicy::parse(sample()).unwrap();
         let d = p.evaluate("vm2", "mqtt-client-cert", Op::Sign);
-        assert_eq!(d, IamDecision::Allow { matched_statement: 3 });
+        assert_eq!(
+            d,
+            IamDecision::Allow {
+                matched_statement: 3
+            }
+        );
         let d = p.evaluate("vm1", "mqtt-client-cert", Op::Sign);
         assert_eq!(d, IamDecision::Deny); // only vm2 may use it
     }
@@ -417,7 +436,10 @@ statements:
     #[test]
     fn rejects_unknown_version() {
         let bad = "version: 99\nstatements: []\n";
-        assert_eq!(IamPolicy::parse(bad).unwrap_err(), LoadError::UnknownVersion(99));
+        assert_eq!(
+            IamPolicy::parse(bad).unwrap_err(),
+            LoadError::UnknownVersion(99)
+        );
     }
 
     #[test]
@@ -456,7 +478,10 @@ statements:
         // Tests that exercised the parse-time rejection are kept as
         // documentation of the new semantics.
         let p = IamPolicy::parse(bad).expect("empty handles list parses as a no-op statement");
-        assert_eq!(p.evaluate("vm1", "sw-authority", Op::Verify), IamDecision::Deny);
+        assert_eq!(
+            p.evaluate("vm1", "sw-authority", Op::Verify),
+            IamDecision::Deny
+        );
     }
 
     #[test]
@@ -484,11 +509,15 @@ statements:
         assert_eq!(p.num_statements(), 1);
         assert_eq!(
             p.evaluate("vm1", "sw-authority", Op::Verify),
-            IamDecision::Allow { matched_statement: 0 }
+            IamDecision::Allow {
+                matched_statement: 0
+            }
         );
         assert_eq!(
             p.evaluate("vm1", "sw-authority", Op::GetPubkey),
-            IamDecision::Allow { matched_statement: 0 }
+            IamDecision::Allow {
+                matched_statement: 0
+            }
         );
     }
 
@@ -506,7 +535,9 @@ statements:
         .unwrap();
         assert_eq!(
             p.evaluate("vm1", "anything-goes", Op::Sign),
-            IamDecision::Allow { matched_statement: 0 }
+            IamDecision::Allow {
+                matched_statement: 0
+            }
         );
     }
 
@@ -525,7 +556,9 @@ statements:
         for op in &[Op::Verify, Op::Sign, Op::Encrypt, Op::Decrypt] {
             assert_eq!(
                 p.evaluate("vm1", "sw-authority", *op),
-                IamDecision::Allow { matched_statement: 0 }
+                IamDecision::Allow {
+                    matched_statement: 0
+                }
             );
         }
     }
@@ -572,12 +605,26 @@ statements:
         .unwrap();
 
         for (handle, op, expected) in [
-            ("jwt-signing", Op::Sign, IamDecision::Allow { matched_statement: 0 }),
+            (
+                "jwt-signing",
+                Op::Sign,
+                IamDecision::Allow {
+                    matched_statement: 0,
+                },
+            ),
             ("jwt-signing", Op::Verify, IamDecision::Deny),
             ("other-handle", Op::Sign, IamDecision::Deny),
         ] {
-            assert_eq!(v1.evaluate("vm1", handle, op), expected, "v1: handle={handle} op={op:?}");
-            assert_eq!(v2.evaluate("vm1", handle, op), expected, "v2: handle={handle} op={op:?}");
+            assert_eq!(
+                v1.evaluate("vm1", handle, op),
+                expected,
+                "v1: handle={handle} op={op:?}"
+            );
+            assert_eq!(
+                v2.evaluate("vm1", handle, op),
+                expected,
+                "v2: handle={handle} op={op:?}"
+            );
         }
     }
 
@@ -619,8 +666,22 @@ statements:
 
         // Identical decisions across a sample of cases.
         for (vm, handle, op, expected) in [
-            ("vm1", "jwt-signing", Op::Sign, IamDecision::Allow { matched_statement: 0 }),
-            ("vm1", "jwt-signing", Op::Verify, IamDecision::Allow { matched_statement: 0 }),
+            (
+                "vm1",
+                "jwt-signing",
+                Op::Sign,
+                IamDecision::Allow {
+                    matched_statement: 0,
+                },
+            ),
+            (
+                "vm1",
+                "jwt-signing",
+                Op::Verify,
+                IamDecision::Allow {
+                    matched_statement: 0,
+                },
+            ),
             ("vm1", "jwt-signing", Op::Encrypt, IamDecision::Deny),
             ("vm2", "jwt-signing", Op::Sign, IamDecision::Deny),
             ("vm1", "sw-authority", Op::Sign, IamDecision::Deny),

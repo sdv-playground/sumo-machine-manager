@@ -1,10 +1,12 @@
-/// DID resolution — reads from the correct NV source based on DID number.
-///
-/// Resolution order:
-/// 1. Runtime DIDs (writable, per-bank) — active bank's NV Runtime
-/// 2. FW Meta DIDs (SW identity, per-bank) — active bank's NV FW Meta
-/// 3. Factory DIDs (hardware identity, shared) — NV Factory
-/// 4. Dynamic DIDs (computed at runtime)
+//! DID resolution — reads from the correct NV source based on DID number.
+//!
+//! Resolution order:
+//!
+//! 1. Runtime DIDs (writable, per-bank) — active bank's NV Runtime
+//! 2. FW Meta DIDs (SW identity, per-bank) — active bank's NV FW Meta
+//! 3. Factory DIDs (hardware identity, shared) — NV Factory
+//! 4. Dynamic DIDs (computed at runtime)
+#![allow(clippy::field_reassign_with_default)]
 
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
@@ -127,12 +129,8 @@ pub fn read_did<D: BlockDevice>(
             // Report the bank we're actually running on, not the staged next-boot bank
             DidValue::Bytes(vec![if active == Bank::A { b'A' } else { b'B' }])
         }
-        DID_COMMITTED => {
-            DidValue::Bytes(vec![bs.committed as u8])
-        }
-        DID_BOOT_COUNT => {
-            DidValue::Bytes(vec![bs.boot_count])
-        }
+        DID_COMMITTED => DidValue::Bytes(vec![bs.committed as u8]),
+        DID_BOOT_COUNT => DidValue::Bytes(vec![bs.boot_count]),
         DID_MIN_SECURITY_VER | DID_CURRENT_SECURITY_VER => {
             if let Some(meta) = nv.read_fw_meta(set, active) {
                 let val = if did == DID_MIN_SECURITY_VER {

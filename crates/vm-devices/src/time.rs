@@ -128,7 +128,8 @@ impl<S: SharedMemory, D: Doorbell, C: Clock> TimeSim<S, D, C> {
 
         // Authorization check
         if self.sync_guest_id != 0 && guest_id != self.sync_guest_id {
-            self.shm.write_u32(r::CMD_OFF_STATUS, r::STATUS_UNAUTHORIZED);
+            self.shm
+                .write_u32(r::CMD_OFF_STATUS, r::STATUS_UNAUTHORIZED);
             let _ = self.doorbell.notify();
             return;
         }
@@ -136,7 +137,8 @@ impl<S: SharedMemory, D: Doorbell, C: Clock> TimeSim<S, D, C> {
         // Rate limit check
         if let Some(last) = self.last_adjust {
             if last.elapsed() < self.min_adjust_interval {
-                self.shm.write_u32(r::CMD_OFF_STATUS, r::STATUS_RATE_LIMITED);
+                self.shm
+                    .write_u32(r::CMD_OFF_STATUS, r::STATUS_RATE_LIMITED);
                 let _ = self.doorbell.notify();
                 return;
             }
@@ -170,7 +172,8 @@ impl<S: SharedMemory, D: Doorbell, C: Clock> TimeSim<S, D, C> {
         let quality = self.shm.read_u32(r::CMD_OFF_SYNC_QUALITY);
         self.shm.write_u32(r::OFF_SYNC_SOURCE, source);
         self.shm.write_u32(r::OFF_SYNC_QUALITY, quality);
-        self.shm.write_u64(r::OFF_LAST_SYNC_MONO_NS, self.clock.now_mono_ns());
+        self.shm
+            .write_u64(r::OFF_LAST_SYNC_MONO_NS, self.clock.now_mono_ns());
         self.shm.write_u32(r::OFF_FLAGS, r::FLAG_SYNC_VALID);
 
         self.last_adjust = Some(Instant::now());
@@ -229,11 +232,7 @@ impl TimeDevice {
     /// Single-channel constructor — bidirectional vtime over ONE channel
     /// using offset-based directional split (regs at 0x00-0x3F, cmd at
     /// 0x40-0x7F). Suits qvm-shmem where each peer writes its own slot.
-    pub fn new(
-        channel: Arc<dyn DeviceChannel>,
-        clock: Arc<dyn Clock>,
-        interval: Duration,
-    ) -> Self {
+    pub fn new(channel: Arc<dyn DeviceChannel>, clock: Arc<dyn Clock>, interval: Duration) -> Self {
         // Pass same Arc twice; writer_loop_inner uses Arc::ptr_eq to
         // detect aliasing and emits a single combined write.
         Self::with_split_channels(channel.clone(), channel, clock, interval)
@@ -563,10 +562,17 @@ mod tests {
     use super::*;
     use crate::transport::mem::{MemDoorbell, MemSharedMemory};
 
-    struct FixedClock { mono: u64, wall_off: i64 }
+    struct FixedClock {
+        mono: u64,
+        wall_off: i64,
+    }
     impl Clock for FixedClock {
-        fn now_mono_ns(&self) -> u64 { self.mono }
-        fn wall_offset_ns(&self) -> i64 { self.wall_off }
+        fn now_mono_ns(&self) -> u64 {
+            self.mono
+        }
+        fn wall_offset_ns(&self) -> i64 {
+            self.wall_off
+        }
     }
 
     fn make_sim() -> TimeSim<MemSharedMemory, MemDoorbell, FixedClock> {
@@ -575,8 +581,7 @@ mod tests {
             mono: 5_000_000_000,
             wall_off: 1_700_000_000_000_000_000, // ~2023 epoch offset
         });
-        TimeSim::new(shm, MemDoorbell, clock)
-            .with_min_adjust_interval(Duration::ZERO)
+        TimeSim::new(shm, MemDoorbell, clock).with_min_adjust_interval(Duration::ZERO)
     }
 
     #[test]
@@ -623,7 +628,8 @@ mod tests {
         sim.shm.write_u32(r::CMD_OFF_OP, r::CMD_ADJUST as u32);
         sim.shm.write_i64(r::CMD_OFF_CORRECTION_NS, 1_000_000); // +1ms
         sim.shm.write_u32(r::CMD_OFF_SYNC_SOURCE, r::SRC_NTP);
-        sim.shm.write_u32(r::CMD_OFF_SYNC_QUALITY, r::QUALITY_MEDIUM);
+        sim.shm
+            .write_u32(r::CMD_OFF_SYNC_QUALITY, r::QUALITY_MEDIUM);
         sim.shm.write_u32(r::CMD_OFF_GUEST_ID, 1);
 
         sim.check_adjust();
@@ -660,7 +666,8 @@ mod tests {
         // More than 1 hour correction
         sim.shm.write_u32(r::CMD_OFF_SEQ, 1);
         sim.shm.write_u32(r::CMD_OFF_OP, r::CMD_ADJUST as u32);
-        sim.shm.write_i64(r::CMD_OFF_CORRECTION_NS, 4_000_000_000_000); // 4 hours
+        sim.shm
+            .write_i64(r::CMD_OFF_CORRECTION_NS, 4_000_000_000_000); // 4 hours
         sim.shm.write_u32(r::CMD_OFF_GUEST_ID, 1);
 
         sim.check_adjust();

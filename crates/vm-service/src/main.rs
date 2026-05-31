@@ -5,7 +5,6 @@
 ///
 /// Usage:
 ///   vm-service --config /etc/vm-service/config.yaml
-
 mod api;
 mod config;
 mod health_status;
@@ -77,11 +76,7 @@ async fn main() {
         .map(|(name, _)| name.clone())
         .collect();
 
-    tracing::info!(
-        "loaded config: {} VMs, bind: {}",
-        vm_count,
-        bind_addr,
-    );
+    tracing::info!("loaded config: {} VMs, bind: {}", vm_count, bind_addr,);
 
     // VmManager builds the device-transport from `config.device_transport`
     // internally. supernova-machine-manager (which embeds VmManager
@@ -116,9 +111,8 @@ async fn main() {
 
     // Graceful shutdown on SIGTERM/SIGINT
     let shutdown = async move {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        ).expect("failed to register SIGTERM");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM");
 
         tokio::select! {
             _ = sigterm.recv() => {

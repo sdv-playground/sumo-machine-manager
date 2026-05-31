@@ -1,8 +1,8 @@
 //! Clock abstractions for device simulators.
 
-pub mod system;
-pub mod simulation;
 pub mod gptp;
+pub mod simulation;
+pub mod system;
 
 /// Clock source for device simulators.
 ///

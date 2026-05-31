@@ -48,18 +48,16 @@ pub fn flip_current_symlink(base_path: &Path, bank: Bank) -> MachineResult<()> {
     // Create new symlink at temp path, then atomically rename
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(target, &tmp_path).map_err(|e| {
-            MachineError::Storage(format!("symlink create failed: {e}"))
-        })?;
+        std::os::unix::fs::symlink(target, &tmp_path)
+            .map_err(|e| MachineError::Storage(format!("symlink create failed: {e}")))?;
     }
     #[cfg(not(unix))]
     {
         return Err(MachineError::Internal("symlink flip requires unix".into()));
     }
 
-    fs::rename(&tmp_path, &link_path).map_err(|e| {
-        MachineError::Storage(format!("symlink rename failed: {e}"))
-    })?;
+    fs::rename(&tmp_path, &link_path)
+        .map_err(|e| MachineError::Storage(format!("symlink rename failed: {e}")))?;
 
     Ok(())
 }

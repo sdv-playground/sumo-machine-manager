@@ -31,7 +31,10 @@ impl std::fmt::Display for HsmError {
             HsmError::PayloadInvalid(s) => write!(f, "invalid key material payload: {s}"),
             HsmError::DecryptionFailed(s) => write!(f, "decryption failed: {s}"),
             HsmError::RollbackRejected { current, attempted } => {
-                write!(f, "rollback rejected: security_version {attempted} <= current {current}")
+                write!(
+                    f,
+                    "rollback rejected: security_version {attempted} <= current {current}"
+                )
             }
             HsmError::NotSupported(s) => write!(f, "not supported: {s}"),
             HsmError::CryptoError(s) => write!(f, "crypto error: {s}"),
@@ -216,10 +219,22 @@ mod tests {
     #[test]
     fn hsm_error_display_covers_every_variant() {
         // One case per variant — catches accidental duplicate/wrong arm additions.
-        assert_eq!(format!("{}", HsmError::NotProvisioned), "HSM not provisioned");
-        assert_eq!(format!("{}", HsmError::AlreadyProvisioned), "HSM already provisioned");
-        assert_eq!(format!("{}", HsmError::NotRunning), "HSM service not running");
-        assert_eq!(format!("{}", HsmError::AlreadyRunning), "HSM service already running");
+        assert_eq!(
+            format!("{}", HsmError::NotProvisioned),
+            "HSM not provisioned"
+        );
+        assert_eq!(
+            format!("{}", HsmError::AlreadyProvisioned),
+            "HSM already provisioned"
+        );
+        assert_eq!(
+            format!("{}", HsmError::NotRunning),
+            "HSM service not running"
+        );
+        assert_eq!(
+            format!("{}", HsmError::AlreadyRunning),
+            "HSM service already running"
+        );
         assert_eq!(
             format!("{}", HsmError::KeystoreError("disk full".into())),
             "keystore error: disk full"
@@ -245,7 +260,13 @@ mod tests {
             "decryption failed: tag mismatch"
         );
         assert_eq!(
-            format!("{}", HsmError::RollbackRejected { current: 7, attempted: 3 }),
+            format!(
+                "{}",
+                HsmError::RollbackRejected {
+                    current: 7,
+                    attempted: 3
+                }
+            ),
             "rollback rejected: security_version 3 <= current 7"
         );
         assert_eq!(
@@ -289,7 +310,10 @@ mod tests {
         assert_eq!(KeyRole::KeyAuthority.key_id(), "key-authority");
         assert_eq!(KeyRole::SoftwareAuthority.key_id(), "sw-authority");
         assert_eq!(KeyRole::PlatformAuthority.key_id(), "platform-authority");
-        assert_eq!(KeyRole::ApplicationAuthority.key_id(), "application-authority");
+        assert_eq!(
+            KeyRole::ApplicationAuthority.key_id(),
+            "application-authority"
+        );
         assert_eq!(KeyRole::DeviceDecryption.key_id(), "device-decrypt");
         assert_eq!(KeyRole::IamSigning.key_id(), "iam-signing");
         assert_eq!(KeyRole::IvdSigning.key_id(), "ivd-signing");
@@ -354,9 +378,18 @@ mod tests {
 
     #[test]
     fn provisioning_state_equality_and_debug() {
-        assert_eq!(ProvisioningState::Unprovisioned, ProvisioningState::Unprovisioned);
-        assert_ne!(ProvisioningState::Unprovisioned, ProvisioningState::Provisioned);
+        assert_eq!(
+            ProvisioningState::Unprovisioned,
+            ProvisioningState::Unprovisioned
+        );
+        assert_ne!(
+            ProvisioningState::Unprovisioned,
+            ProvisioningState::Provisioned
+        );
         // Debug format is used in logs — make sure it doesn't accidentally silently change.
-        assert_eq!(format!("{:?}", ProvisioningState::Provisioned), "Provisioned");
+        assert_eq!(
+            format!("{:?}", ProvisioningState::Provisioned),
+            "Provisioned"
+        );
     }
 }

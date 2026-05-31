@@ -1,6 +1,5 @@
 /// ivshmem-server management — launches and cleans up ivshmem shared memory
 /// servers for host-guest communication (CAN, health, time).
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -65,10 +64,14 @@ pub(crate) fn start_ivshmem(
     let _ = std::fs::remove_file(shm_path(vm_name, label));
 
     let child = Command::new(ivshmem_bin)
-        .arg("-S").arg(&sock)
-        .arg("-l").arg(size)
-        .arg("-n").arg("2")
-        .arg("-M").arg(&mem_name)
+        .arg("-S")
+        .arg(&sock)
+        .arg("-l")
+        .arg(size)
+        .arg("-n")
+        .arg("2")
+        .arg("-M")
+        .arg(&mem_name)
         .arg("-F")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

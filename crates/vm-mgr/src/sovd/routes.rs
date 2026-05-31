@@ -35,13 +35,19 @@ pub fn csr_router(machine: Arc<dyn Machine>) -> Router {
             let machine = machine.clone();
             async move {
                 let Some(comp) = machine.component("hsm") else {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "no hsm component".to_string())
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "no hsm component".to_string(),
+                    )
                         .into_response();
                 };
                 match comp.get_csr().await {
                     Ok(csr) => {
                         tracing::info!("CSR generated ({} bytes)", csr.0.len());
-                        ([(header::CONTENT_TYPE, "application/pkcs10")], csr.0.to_vec())
+                        (
+                            [(header::CONTENT_TYPE, "application/pkcs10")],
+                            csr.0.to_vec(),
+                        )
                             .into_response()
                     }
                     Err(MachineError::PolicyRejected(s)) => {
@@ -54,10 +60,7 @@ pub fn csr_router(machine: Arc<dyn Machine>) -> Router {
                         .into_response(),
                     Err(e) => {
                         tracing::error!(error = %e, "CSR generation failed");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("CSR error: {e}"),
-                        )
+                        (StatusCode::INTERNAL_SERVER_ERROR, format!("CSR error: {e}"))
                             .into_response()
                     }
                 }

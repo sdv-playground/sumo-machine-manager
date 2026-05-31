@@ -51,10 +51,7 @@ impl TcpListener {
 
         tracing::info!(peer = %peer_ip, port = self.addr.port(), "vhsm connection accepted");
 
-        Ok(Connection {
-            stream,
-            peer_ip,
-        })
+        Ok(Connection { stream, peer_ip })
     }
 
     pub fn local_addr(&self) -> SocketAddr {

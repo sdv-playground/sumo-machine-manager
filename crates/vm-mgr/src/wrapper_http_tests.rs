@@ -117,7 +117,9 @@ async fn list_parameters_through_wrapper() {
     // Routes through Component::list_dids → ParameterInfo translation in adapter.
     let items = body.get("items").and_then(|v| v.as_array()).expect("items");
     assert!(
-        items.iter().any(|p| p.get("id").and_then(|v| v.as_str()) == Some("serial_number")),
+        items
+            .iter()
+            .any(|p| p.get("id").and_then(|v| v.as_str()) == Some("serial_number")),
         "serial_number not in list_parameters"
     );
 }
@@ -125,8 +127,7 @@ async fn list_parameters_through_wrapper() {
 #[tokio::test]
 async fn read_did_through_wrapper() {
     let router = make_wrapper_router();
-    let (status, body) =
-        get_json(&router, "/vehicle/v1/components/vm1/data/serial_number").await;
+    let (status, body) = get_json(&router, "/vehicle/v1/components/vm1/data/serial_number").await;
     assert_eq!(status, StatusCode::OK);
     // Routes through Component::read_did → DataValue translation in adapter.
     // Response body is the flat DataValue.
@@ -141,8 +142,7 @@ async fn read_did_through_wrapper() {
 #[tokio::test]
 async fn read_activation_state_through_wrapper() {
     let router = make_wrapper_router();
-    let (status, body) =
-        get_json(&router, "/vehicle/v1/components/vm1/flash/activation").await;
+    let (status, body) = get_json(&router, "/vehicle/v1/components/vm1/flash/activation").await;
     // Activation state goes Component → ActivationState → JSON.
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert!(

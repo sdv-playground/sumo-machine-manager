@@ -78,11 +78,7 @@ impl AuditLogger {
 
     /// Open the rotating file at `path` with the given size cap and
     /// rotated-copies count. Always uses `sync_each_line: true`.
-    pub fn open(
-        path: impl AsRef<Path>,
-        max_bytes: u64,
-        max_rotated: u32,
-    ) -> io::Result<Self> {
+    pub fn open(path: impl AsRef<Path>, max_bytes: u64, max_rotated: u32) -> io::Result<Self> {
         let cfg = RotatingFileConfig::new(path.as_ref().to_path_buf(), max_bytes)
             .with_max_rotated(max_rotated)
             .with_sync_each_line(true);
@@ -112,7 +108,7 @@ impl AuditLogger {
         };
         let rec = AuditRecord::build(caller, req, resp, authz);
         let mut line = serde_json::to_vec(&rec)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serialize audit record: {e}")))?;
+            .map_err(|e| io::Error::other(format!("serialize audit record: {e}")))?;
         line.push(b'\n');
         match w.write_all(&line) {
             Ok(()) => Ok(()),
@@ -171,10 +167,7 @@ struct AuditRecord<'a> {
 impl<'a> AuditRecord<'a> {
     fn build(caller: &'a CallerId, req: &Request, resp: &Response, authz: AuthzOutcome) -> Self {
         let op = Op::from_u32(req.op);
-        let op_name = op
-            .map(|o| op_name_for(o))
-            .unwrap_or("<unknown>")
-            .to_string();
+        let op_name = op.map(op_name_for).unwrap_or("<unknown>").to_string();
         let (iam_decision, iam_statement) = render_authz(authz);
 
         Self {
@@ -299,8 +292,8 @@ fn _coerce_unused(_: IpAddr) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
     use std::fs;
+    use std::io::Read;
     use std::net::Ipv4Addr;
     use tempfile::tempdir;
 
@@ -331,7 +324,9 @@ mod tests {
             &caller("vmX", [127, 0, 0, 1]),
             &req,
             &resp,
-            AuthzOutcome::Allow { matched_statement: 0 },
+            AuthzOutcome::Allow {
+                matched_statement: 0,
+            },
         )
         .unwrap();
         // No file to assert against — just confirm we don't panic.
@@ -355,7 +350,9 @@ mod tests {
             &caller("vm2", [10, 0, 200, 2]),
             &req,
             &resp,
-            AuthzOutcome::Allow { matched_statement: 3 },
+            AuthzOutcome::Allow {
+                matched_statement: 3,
+            },
         )
         .unwrap();
         drop(a);
@@ -395,7 +392,9 @@ mod tests {
             &caller("vm1", [10, 0, 201, 2]),
             &req,
             &resp,
-            AuthzOutcome::Allow { matched_statement: 0 },
+            AuthzOutcome::Allow {
+                matched_statement: 0,
+            },
         )
         .unwrap();
         drop(a);
@@ -424,7 +423,9 @@ mod tests {
             &caller("vm1", [10, 0, 201, 2]),
             &req,
             &resp,
-            AuthzOutcome::Allow { matched_statement: 0 },
+            AuthzOutcome::Allow {
+                matched_statement: 0,
+            },
         )
         .unwrap();
         drop(a);
@@ -457,7 +458,9 @@ mod tests {
                 &caller("vm1", [10, 0, 201, 2]),
                 &req,
                 &resp,
-                AuthzOutcome::Allow { matched_statement: 0 },
+                AuthzOutcome::Allow {
+                    matched_statement: 0,
+                },
             )
             .unwrap();
         }
@@ -480,11 +483,24 @@ mod tests {
     fn op_name_covers_every_variant() {
         // Belt-and-suspenders: every Op variant resolves to a name.
         for op in [
-            Op::GetRandom, Op::KeyGenerate, Op::KeyImport, Op::KeyDerive,
-            Op::KeyDelete, Op::Encrypt, Op::Decrypt, Op::MacGenerate,
-            Op::MacVerify, Op::Sign, Op::Verify, Op::GetHandleInfo,
-            Op::GetPubkey, Op::GetCert,
-            Op::Hello, Op::Auth, Op::AuthOk, Op::Enroll,
+            Op::GetRandom,
+            Op::KeyGenerate,
+            Op::KeyImport,
+            Op::KeyDerive,
+            Op::KeyDelete,
+            Op::Encrypt,
+            Op::Decrypt,
+            Op::MacGenerate,
+            Op::MacVerify,
+            Op::Sign,
+            Op::Verify,
+            Op::GetHandleInfo,
+            Op::GetPubkey,
+            Op::GetCert,
+            Op::Hello,
+            Op::Auth,
+            Op::AuthOk,
+            Op::Enroll,
         ] {
             assert!(!op_name_for(op).is_empty());
         }
@@ -561,9 +577,21 @@ mod tests {
         // rendering is exercised.
         let mut c = caller("vm1", [10, 0, 201, 2]);
         c.cert_thumbprint = [0xABu8; 32];
-        let req = Request { op: Op::GetRandom as u32, session_id: 1, payload: 32u32.to_le_bytes().to_vec() };
+        let req = Request {
+            op: Op::GetRandom as u32,
+            session_id: 1,
+            payload: 32u32.to_le_bytes().to_vec(),
+        };
         let resp = Response::ok(req.op, 1, vec![]);
-        a.record(&c, &req, &resp, AuthzOutcome::Allow { matched_statement: 2 }).unwrap();
+        a.record(
+            &c,
+            &req,
+            &resp,
+            AuthzOutcome::Allow {
+                matched_statement: 2,
+            },
+        )
+        .unwrap();
         drop(a);
 
         let v: serde_json::Value = serde_json::from_str(&read_lines(&path)[0]).unwrap();

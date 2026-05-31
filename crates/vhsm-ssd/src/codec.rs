@@ -2,7 +2,6 @@
 ///
 /// Request:  [3] magic + [1] version + [4] op + [4] session_id + [4] payload_len + [N] payload
 /// Response: [3] magic + [1] version + [4] op + [4] session_id + [4] payload_len + [4] status + [N] payload
-
 use std::io::{self, Read, Write};
 
 use crate::proto::*;
@@ -178,7 +177,7 @@ mod tests {
     #[test]
     fn read_request_rejects_truncated_header() {
         // Header is 16 bytes; give only 8.
-        let bytes = vec![0u8; 8];
+        let bytes = [0u8; 8];
         let err = match read_request(&mut &bytes[..]) {
             Ok(_) => panic!("expected error, got Ok"),
             Err(e) => e,

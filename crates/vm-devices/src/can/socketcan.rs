@@ -27,9 +27,7 @@ pub struct SocketCanBackend {
 impl SocketCanBackend {
     /// Open a raw CAN socket bound to the named interface (e.g., "vcan1").
     pub fn open(ifname: &str) -> Result<Self, CanError> {
-        let fd = unsafe {
-            libc::socket(PF_CAN, libc::SOCK_RAW | libc::SOCK_NONBLOCK, CAN_RAW)
-        };
+        let fd = unsafe { libc::socket(PF_CAN, libc::SOCK_RAW | libc::SOCK_NONBLOCK, CAN_RAW) };
         if fd < 0 {
             return Err(CanError::Io(std::io::Error::last_os_error()));
         }
@@ -51,11 +49,12 @@ impl SocketCanBackend {
         }
 
         // Get interface index
-        let ifindex = if_nametoindex(ifname)
-            .ok_or_else(|| CanError::Io(std::io::Error::new(
+        let ifindex = if_nametoindex(ifname).ok_or_else(|| {
+            CanError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("CAN interface not found: {ifname}"),
-            )))?;
+            ))
+        })?;
 
         // Bind to the interface
         let addr = SockaddrCan {
@@ -98,9 +97,7 @@ impl CanBackend for SocketCanBackend {
         let dlen = frame.len.min(64) as usize;
         raw[8..8 + dlen].copy_from_slice(&frame.data[..dlen]);
 
-        let n = unsafe {
-            libc::write(self.fd, raw.as_ptr() as *const libc::c_void, 72)
-        };
+        let n = unsafe { libc::write(self.fd, raw.as_ptr() as *const libc::c_void, 72) };
         if n < 0 {
             return Err(CanError::Io(std::io::Error::last_os_error()));
         }
@@ -109,9 +106,7 @@ impl CanBackend for SocketCanBackend {
 
     fn try_recv(&mut self, frame: &mut CanFrame) -> Result<bool, CanError> {
         let mut raw = [0u8; 72];
-        let n = unsafe {
-            libc::read(self.fd, raw.as_mut_ptr() as *mut libc::c_void, 72)
-        };
+        let n = unsafe { libc::read(self.fd, raw.as_mut_ptr() as *mut libc::c_void, 72) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -137,5 +132,9 @@ impl CanBackend for SocketCanBackend {
 fn if_nametoindex(name: &str) -> Option<u32> {
     let c_name = std::ffi::CString::new(name).ok()?;
     let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-    if idx == 0 { None } else { Some(idx) }
+    if idx == 0 {
+        None
+    } else {
+        Some(idx)
+    }
 }

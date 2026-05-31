@@ -96,11 +96,7 @@ fn main() -> ExitCode {
 
     let format = match format {
         Some(f) => f,
-        None => match output
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-        {
+        None => match output.extension().and_then(|s| s.to_str()).unwrap_or("") {
             "sqfs" | "squashfs" => ImageFormat::Squashfs,
             "qnx6" => ImageFormat::Qnx6,
             other => {
@@ -120,19 +116,13 @@ fn main() -> ExitCode {
 
     match builder.build(&output) {
         Ok(()) => {
-            eprintln!(
-                "ca-bundle-build: wrote {} ({:?})",
-                output.display(),
-                format
-            );
+            eprintln!("ca-bundle-build: wrote {} ({:?})", output.display(), format);
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("ca-bundle-build: {e}");
             match e {
-                BuildError::ToolSpawn { .. } | BuildError::ToolFailed { .. } => {
-                    ExitCode::from(3)
-                }
+                BuildError::ToolSpawn { .. } | BuildError::ToolFailed { .. } => ExitCode::from(3),
                 _ => ExitCode::from(1),
             }
         }

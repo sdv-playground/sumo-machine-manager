@@ -9,8 +9,8 @@
 /// Health device registers (vhealth_regs.h).
 pub mod health {
     // Magic numbers
-    pub const MAGIC: u32 = 0x48544C48;     // "HLTH"
-    pub const HB_MAGIC: u32 = 0x48425448;  // "HBTH"
+    pub const MAGIC: u32 = 0x48544C48; // "HLTH"
+    pub const HB_MAGIC: u32 = 0x48425448; // "HBTH"
     pub const VERSION: u32 = 1;
     pub const HB_VERSION: u32 = 1;
 
@@ -30,14 +30,14 @@ pub mod health {
     pub const SENSOR_MAX: usize = 63;
 
     // Sensor entry field offsets (relative to entry start)
-    pub const SENSOR_OFF_TYPE: usize = 0x00;       // u16
-    pub const SENSOR_OFF_ID: usize = 0x02;          // u16
-    pub const SENSOR_OFF_VALUE: usize = 0x04;        // i32
-    pub const SENSOR_OFF_VALUE_MIN: usize = 0x08;    // i32
-    pub const SENSOR_OFF_VALUE_MAX: usize = 0x0C;    // i32
-    pub const SENSOR_OFF_THRESH_WARN: usize = 0x10;  // i32
-    pub const SENSOR_OFF_THRESH_CRIT: usize = 0x14;  // i32
-    pub const SENSOR_OFF_FLAGS: usize = 0x18;         // u32
+    pub const SENSOR_OFF_TYPE: usize = 0x00; // u16
+    pub const SENSOR_OFF_ID: usize = 0x02; // u16
+    pub const SENSOR_OFF_VALUE: usize = 0x04; // i32
+    pub const SENSOR_OFF_VALUE_MIN: usize = 0x08; // i32
+    pub const SENSOR_OFF_VALUE_MAX: usize = 0x0C; // i32
+    pub const SENSOR_OFF_THRESH_WARN: usize = 0x10; // i32
+    pub const SENSOR_OFF_THRESH_CRIT: usize = 0x14; // i32
+    pub const SENSOR_OFF_FLAGS: usize = 0x18; // u32
 
     // Guest heartbeat (64 bytes @ 0x800)
     pub const HB_BASE: usize = 0x800;
@@ -55,8 +55,8 @@ pub mod health {
     pub const CMD_OFF_CMD: usize = CMD_BASE + 0x04;
 
     // Minimum shm sizes
-    pub const MIN_SIZE_HEARTBEAT: usize = 0x840;  // header + sensors + heartbeat
-    pub const MIN_SIZE_FULL: usize = 0x860;        // + command region
+    pub const MIN_SIZE_HEARTBEAT: usize = 0x840; // header + sensors + heartbeat
+    pub const MIN_SIZE_FULL: usize = 0x860; // + command region
 
     // Flags
     pub const FLAG_ACTIVE: u32 = 1 << 0;
@@ -104,13 +104,11 @@ pub mod time {
     // that did `use crate::regs::time as r;` continue working.
     pub use vm_wire::{
         SyncQuality, SyncSource, VtimeCmd, VtimeRegs, VTIME_CMD_ADJUST as CMD_ADJUST,
-        VTIME_FLAG_RTC_PRESENT as FLAG_RTC_PRESENT,
-        VTIME_FLAG_SYNC_VALID as FLAG_SYNC_VALID, VTIME_MAGIC as MAGIC,
-        VTIME_STATUS_APPLIED as STATUS_APPLIED, VTIME_STATUS_PENDING as STATUS_PENDING,
-        VTIME_STATUS_RATE_LIMITED as STATUS_RATE_LIMITED,
-        VTIME_STATUS_REJECTED as STATUS_REJECTED,
-        VTIME_STATUS_UNAUTHORIZED as STATUS_UNAUTHORIZED, VTIME_VERSION as VERSION,
-        VTIME_WIRE_SIZE as REGION_SIZE,
+        VTIME_FLAG_RTC_PRESENT as FLAG_RTC_PRESENT, VTIME_FLAG_SYNC_VALID as FLAG_SYNC_VALID,
+        VTIME_MAGIC as MAGIC, VTIME_STATUS_APPLIED as STATUS_APPLIED,
+        VTIME_STATUS_PENDING as STATUS_PENDING, VTIME_STATUS_RATE_LIMITED as STATUS_RATE_LIMITED,
+        VTIME_STATUS_REJECTED as STATUS_REJECTED, VTIME_STATUS_UNAUTHORIZED as STATUS_UNAUTHORIZED,
+        VTIME_VERSION as VERSION, VTIME_WIRE_SIZE as REGION_SIZE,
     };
 
     // Sync source codes — kept as u32 aliases for SharedMemory write_u32
@@ -155,7 +153,7 @@ pub mod time {
 
 /// CAN SPSC ring buffer protocol.
 pub mod can {
-    pub const MAGIC: u32 = 0x4E414356;  // "VCAN"
+    pub const MAGIC: u32 = 0x4E414356; // "VCAN"
     pub const VERSION: u32 = 1;
 
     // Ring header (32 bytes at start of each ring)
@@ -168,10 +166,10 @@ pub mod can {
     pub const RING_HEADER_SIZE: usize = 32;
 
     // Frame slot (72 bytes each)
-    pub const FRAME_OFF_ID: usize = 0x00;        // u32 (with flags in upper bits)
-    pub const FRAME_OFF_LEN: usize = 0x04;        // u8
-    pub const FRAME_OFF_FLAGS: usize = 0x05;       // u8
-    pub const FRAME_OFF_DATA: usize = 0x08;        // [u8; 64]
+    pub const FRAME_OFF_ID: usize = 0x00; // u32 (with flags in upper bits)
+    pub const FRAME_OFF_LEN: usize = 0x04; // u8
+    pub const FRAME_OFF_FLAGS: usize = 0x05; // u8
+    pub const FRAME_OFF_DATA: usize = 0x08; // [u8; 64]
     pub const FRAME_SIZE: usize = 72;
 
     // CAN ID flags (upper bits of can_id)
@@ -180,10 +178,10 @@ pub mod can {
     pub const ID_FLAG_EFF: u32 = 1 << 31;
 
     // Frame flags
-    pub const FRAME_FLAG_BRS: u8 = 1 << 0;  // CAN FD bit rate switch
-    pub const FRAME_FLAG_ESI: u8 = 1 << 1;  // error state indicator
-    pub const FRAME_FLAG_FDF: u8 = 1 << 2;  // FD format indicator
+    pub const FRAME_FLAG_BRS: u8 = 1 << 0; // CAN FD bit rate switch
+    pub const FRAME_FLAG_ESI: u8 = 1 << 1; // error state indicator
+    pub const FRAME_FLAG_FDF: u8 = 1 << 2; // FD format indicator
 
     // Ring flags
-    pub const RING_FLAG_FD: u32 = 1 << 0;   // CAN FD capable
+    pub const RING_FLAG_FD: u32 = 1 << 0; // CAN FD capable
 }

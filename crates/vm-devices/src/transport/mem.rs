@@ -416,14 +416,16 @@ mod tests {
         let b = t.open_channel("vm2", "power", "cmd", 64).unwrap();
 
         let b_clone = b.clone();
-        let waiter = std::thread::spawn(move || {
-            b_clone.wait(Some(Duration::from_millis(50))).unwrap()
-        });
+        let waiter =
+            std::thread::spawn(move || b_clone.wait(Some(Duration::from_millis(50))).unwrap());
 
         std::thread::sleep(Duration::from_millis(10));
         a.notify().unwrap(); // wrong channel — must not wake b's waiter
 
         let woken = waiter.join().expect("waiter panicked");
-        assert!(!woken, "notify on a different channel must not wake this waiter");
+        assert!(
+            !woken,
+            "notify on a different channel must not wake this waiter"
+        );
     }
 }

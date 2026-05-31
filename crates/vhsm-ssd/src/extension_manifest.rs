@@ -93,10 +93,14 @@ impl std::fmt::Display for LoadError {
 impl std::error::Error for LoadError {}
 
 impl From<std::io::Error> for LoadError {
-    fn from(e: std::io::Error) -> Self { LoadError::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        LoadError::Io(e)
+    }
 }
 impl From<serde_yaml::Error> for LoadError {
-    fn from(e: serde_yaml::Error) -> Self { LoadError::Parse(e) }
+    fn from(e: serde_yaml::Error) -> Self {
+        LoadError::Parse(e)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,7 +156,9 @@ pub fn parse(text: &str) -> Result<Vec<Extension>, LoadError> {
     for i in 0..out.len() {
         for j in (i + 1)..out.len() {
             if out[i].handle == out[j].handle {
-                return Err(LoadError::DuplicateHandle { handle: out[i].handle });
+                return Err(LoadError::DuplicateHandle {
+                    handle: out[i].handle,
+                });
             }
         }
     }
@@ -282,7 +288,10 @@ extensions:
     permitted_ops: [sign]
 "#;
         let err = parse(yaml).unwrap_err();
-        assert!(matches!(err, LoadError::HandleOutOfRange { handle: 0x0007 }));
+        assert!(matches!(
+            err,
+            LoadError::HandleOutOfRange { handle: 0x0007 }
+        ));
     }
 
     #[test]
@@ -295,7 +304,10 @@ extensions:
     permitted_ops: [sign]
 "#;
         let err = parse(yaml).unwrap_err();
-        assert!(matches!(err, LoadError::HandleOutOfRange { handle: 0x0100 }));
+        assert!(matches!(
+            err,
+            LoadError::HandleOutOfRange { handle: 0x0100 }
+        ));
     }
 
     #[test]

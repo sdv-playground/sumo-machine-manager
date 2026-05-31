@@ -1,5 +1,6 @@
 //! Integration tests: exercise the `machine-mgr::Component` trait against a
 //! real `VmBackend`. Validates the trait surface, not the diagserver wiring.
+#![allow(clippy::field_reassign_with_default)]
 
 use std::sync::{Arc, Mutex};
 

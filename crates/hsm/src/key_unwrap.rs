@@ -26,7 +26,10 @@ pub struct HsmKeyUnwrap {
 
 impl HsmKeyUnwrap {
     pub fn new(provider: Arc<Mutex<dyn HsmProvider>>, key_id: impl Into<String>) -> Self {
-        Self { provider, key_id: key_id.into() }
+        Self {
+            provider,
+            key_id: key_id.into(),
+        }
     }
 }
 

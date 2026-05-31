@@ -97,12 +97,10 @@ impl<D: BlockDevice + Send + 'static> Component for HostOsComponent<D> {
         })
     }
 
-    async fn commit_install(
-        &self,
-        _id: &machine_mgr::types::FlashId,
-    ) -> MachineResult<()> {
+    async fn commit_install(&self, _id: &machine_mgr::types::FlashId) -> MachineResult<()> {
         let mut nv = self.nv.lock().unwrap();
-        let mut state = nv.read_boot_state()
+        let mut state = nv
+            .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
 
         let idx = BankSet::HostOs.as_index();
@@ -119,12 +117,10 @@ impl<D: BlockDevice + Send + 'static> Component for HostOsComponent<D> {
         Ok(())
     }
 
-    async fn rollback_install(
-        &self,
-        _id: &machine_mgr::types::FlashId,
-    ) -> MachineResult<()> {
+    async fn rollback_install(&self, _id: &machine_mgr::types::FlashId) -> MachineResult<()> {
         let mut nv = self.nv.lock().unwrap();
-        let mut state = nv.read_boot_state()
+        let mut state = nv
+            .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
 
         let idx = BankSet::HostOs.as_index();

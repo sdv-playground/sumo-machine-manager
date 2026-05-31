@@ -32,6 +32,12 @@ pub struct QnxRunner {
     qvm_child: Option<Child>,
 }
 
+impl Default for QnxRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl QnxRunner {
     pub fn new() -> Self {
         Self {
@@ -104,10 +110,16 @@ impl QnxRunner {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let Ok(pid) = name.parse::<u32>() else { continue };
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
             let cmdline_path = format!("/proc/{pid}/cmdline");
-            let Ok(bytes) = std::fs::read(&cmdline_path) else { continue };
-            if bytes.is_empty() { continue; }
+            let Ok(bytes) = std::fs::read(&cmdline_path) else {
+                continue;
+            };
+            if bytes.is_empty() {
+                continue;
+            }
             let argv = String::from_utf8_lossy(&bytes).replace('\0', " ");
             out.push((pid, argv));
         }
@@ -135,9 +147,13 @@ impl QnxRunner {
     fn slay_loopbacks_for_vm(vm_name: &str) {
         for pid in Self::find_loopback_pids(vm_name) {
             tracing::info!(vm = %vm_name, pid, "killing stale devb-loopback");
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
             std::thread::sleep(Duration::from_millis(100));
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
         }
     }
 
@@ -181,11 +197,15 @@ impl QnxRunner {
         Self::enumerate_pids_with_cmdline()
             .into_iter()
             .filter(|(_, argv)| {
-                if !argv.contains(&needle) { return false; }
+                if !argv.contains(&needle) {
+                    return false;
+                }
                 // Confirm argv[0] is `qvm` (not some other process that
                 // happens to reference the config path in its argv).
                 let mut tokens = argv.split_whitespace();
-                let Some(cmd) = tokens.next() else { return false };
+                let Some(cmd) = tokens.next() else {
+                    return false;
+                };
                 cmd == "qvm" || cmd.rsplit('/').next() == Some("qvm")
             })
             .map(|(pid, _)| pid)
@@ -207,9 +227,13 @@ impl QnxRunner {
     fn slay_qvm_for_vm(qvm_config: &Path) {
         for pid in Self::find_qvm_pids(qvm_config) {
             tracing::info!(qvm_config = %qvm_config.display(), pid, "killing stale qvm");
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
             std::thread::sleep(Duration::from_millis(100));
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
         }
     }
 }
@@ -254,9 +278,10 @@ impl VmRunner for QnxRunner {
     }
 
     fn start(&mut self, name: &str, def: &VmDefinition) -> Result<VmHandle, RunnerError> {
-        let raw_path = def.qvm_config.as_ref().ok_or_else(|| {
-            RunnerError::Config(format!("VM {name}: qvm_config not set"))
-        })?;
+        let raw_path = def
+            .qvm_config
+            .as_ref()
+            .ok_or_else(|| RunnerError::Config(format!("VM {name}: qvm_config not set")))?;
 
         // Relative paths resolve against image_dir (follows active bank symlink)
         let qvm_config = if raw_path.is_relative() {
@@ -288,7 +313,10 @@ impl VmRunner for QnxRunner {
                 let prefix = Self::rootfs_prefix(name);
                 self.spawn_loopback(&prefix, &rootfs)?;
             } else {
-                tracing::warn!("VM {name}: rootfs not found: {} — skipping loopback", rootfs.display());
+                tracing::warn!(
+                    "VM {name}: rootfs not found: {} — skipping loopback",
+                    rootfs.display()
+                );
             }
         }
 
@@ -349,8 +377,11 @@ impl VmRunner for QnxRunner {
         // collisions with the rootfs's `qvmdisk-{vm}` namespace.
         for disk in &def.disks {
             if !disk.path.exists() {
-                tracing::warn!("VM {name}: extra disk {role} not found: {path} — skipping",
-                    role = disk.role, path = disk.path.display());
+                tracing::warn!(
+                    "VM {name}: extra disk {role} not found: {path} — skipping",
+                    role = disk.role,
+                    path = disk.path.display()
+                );
                 continue;
             }
             let prefix = Self::extra_prefix(name, &disk.role);
@@ -430,9 +461,13 @@ impl VmRunner for QnxRunner {
         }
         for pid in pids {
             tracing::info!(vm = ?self.vm_name, pid, "killing devb-loopback daemon");
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
             std::thread::sleep(Duration::from_millis(100));
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
         }
         self.vm_name = None;
     }

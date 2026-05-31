@@ -35,7 +35,9 @@ pub struct LinuxSensorReader {
 
 impl LinuxSensorReader {
     pub fn new() -> Self {
-        Self { cpu_state: Mutex::new(None) }
+        Self {
+            cpu_state: Mutex::new(None),
+        }
     }
 }
 
@@ -120,8 +122,14 @@ struct CpuTicks {
 
 impl CpuTicks {
     fn total(&self) -> u64 {
-        self.user + self.nice + self.system + self.idle
-            + self.iowait + self.irq + self.softirq + self.steal
+        self.user
+            + self.nice
+            + self.system
+            + self.idle
+            + self.iowait
+            + self.irq
+            + self.softirq
+            + self.steal
     }
 
     fn busy(&self) -> u64 {
@@ -154,19 +162,30 @@ fn parse_proc_stat(content: &str) -> CpuTickSnapshot {
     for line in content.lines() {
         // Skip the aggregate "cpu " line (no digit after "cpu"); pick up
         // "cpu0", "cpu1", ... which have a digit after the prefix.
-        let Some(rest) = line.strip_prefix("cpu") else { continue };
-        if !rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        let Some(rest) = line.strip_prefix("cpu") else {
+            continue;
+        };
+        if !rest
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             continue;
         }
         let mut parts = rest.split_ascii_whitespace();
         let _idx = parts.next(); // cpu0, cpu1, ...
-        let nums: Vec<u64> = parts
-            .filter_map(|s| s.parse::<u64>().ok())
-            .collect();
+        let nums: Vec<u64> = parts.filter_map(|s| s.parse::<u64>().ok()).collect();
         if nums.len() >= 8 {
             cpus.push(CpuTicks {
-                user: nums[0], nice: nums[1], system: nums[2], idle: nums[3],
-                iowait: nums[4], irq: nums[5], softirq: nums[6], steal: nums[7],
+                user: nums[0],
+                nice: nums[1],
+                system: nums[2],
+                idle: nums[3],
+                iowait: nums[4],
+                irq: nums[5],
+                softirq: nums[6],
+                steal: nums[7],
             });
         }
     }
@@ -246,7 +265,8 @@ fn read_loadavg() -> Vec<Sensor> {
 fn parse_loadavg(content: &str) -> Vec<Sensor> {
     let parts: Vec<&str> = content.split_ascii_whitespace().take(3).collect();
     let labels = ["1m", "5m", "15m"];
-    parts.iter()
+    parts
+        .iter()
         .zip(labels.iter())
         .filter_map(|(s, &period)| {
             s.parse::<f64>().ok().map(|v| Sensor {
@@ -274,8 +294,7 @@ fn read_hwmon() -> Vec<Sensor> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let chip_name = read_label_file(&path.join("name"))
-            .unwrap_or_else(|| "unknown".into());
+        let chip_name = read_label_file(&path.join("name")).unwrap_or_else(|| "unknown".into());
         out.extend(scrape_hwmon_dir(&path, &chip_name));
     }
     out
@@ -292,7 +311,9 @@ fn scrape_hwmon_dir(dir: &Path, chip: &str) -> Vec<Sensor> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(name_str) = name.to_str() else { continue };
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
 
         if let Some((kind, idx)) = parse_hwmon_input(name_str) {
             let path = entry.path();
@@ -406,22 +427,67 @@ intr 0
 
     #[test]
     fn cpu_ticks_usage_ratio_basic() {
-        let prev = CpuTicks { user: 0, nice: 0, system: 0, idle: 100, iowait: 0, irq: 0, softirq: 0, steal: 0 };
-        let cur  = CpuTicks { user: 50, nice: 0, system: 0, idle: 150, iowait: 0, irq: 0, softirq: 0, steal: 0 };
+        let prev = CpuTicks {
+            user: 0,
+            nice: 0,
+            system: 0,
+            idle: 100,
+            iowait: 0,
+            irq: 0,
+            softirq: 0,
+            steal: 0,
+        };
+        let cur = CpuTicks {
+            user: 50,
+            nice: 0,
+            system: 0,
+            idle: 150,
+            iowait: 0,
+            irq: 0,
+            softirq: 0,
+            steal: 0,
+        };
         // total diff = 100, busy diff = 50 → 50%.
         assert!((cur.usage_ratio_since(&prev).unwrap() - 0.5).abs() < 1e-9);
     }
 
     #[test]
     fn cpu_ticks_usage_ratio_returns_none_on_no_progress() {
-        let snap = CpuTicks { user: 1, nice: 1, system: 1, idle: 1, iowait: 0, irq: 0, softirq: 0, steal: 0 };
+        let snap = CpuTicks {
+            user: 1,
+            nice: 1,
+            system: 1,
+            idle: 1,
+            iowait: 0,
+            irq: 0,
+            softirq: 0,
+            steal: 0,
+        };
         assert_eq!(snap.usage_ratio_since(&snap), None);
     }
 
     #[test]
     fn cpu_ticks_usage_ratio_returns_none_on_counter_regression() {
-        let prev = CpuTicks { user: 100, nice: 0, system: 0, idle: 0, iowait: 0, irq: 0, softirq: 0, steal: 0 };
-        let cur  = CpuTicks { user: 50, nice: 0, system: 0, idle: 0, iowait: 0, irq: 0, softirq: 0, steal: 0 };
+        let prev = CpuTicks {
+            user: 100,
+            nice: 0,
+            system: 0,
+            idle: 0,
+            iowait: 0,
+            irq: 0,
+            softirq: 0,
+            steal: 0,
+        };
+        let cur = CpuTicks {
+            user: 50,
+            nice: 0,
+            system: 0,
+            idle: 0,
+            iowait: 0,
+            irq: 0,
+            softirq: 0,
+            steal: 0,
+        };
         // checked_sub returns None on regression.
         assert_eq!(cur.usage_ratio_since(&prev), None);
     }
@@ -498,7 +564,7 @@ Buffers:           50000 kB
         assert_eq!(parse_hwmon_input("temp1_label"), None);
         assert_eq!(parse_hwmon_input("temp1_max"), None);
         assert_eq!(parse_hwmon_input("curr1_input"), None); // current — not handled yet
-        assert_eq!(parse_hwmon_input("temp_input"), None);  // missing index
+        assert_eq!(parse_hwmon_input("temp_input"), None); // missing index
     }
 
     // ---- end-to-end ----

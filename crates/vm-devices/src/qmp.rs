@@ -44,7 +44,9 @@ impl std::fmt::Display for QmpError {
 impl std::error::Error for QmpError {}
 
 impl From<std::io::Error> for QmpError {
-    fn from(e: std::io::Error) -> Self { QmpError::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        QmpError::Io(e)
+    }
 }
 
 impl QmpClient {
@@ -59,7 +61,9 @@ impl QmpClient {
         // Read greeting
         let greeting = client.read_line()?;
         if !greeting.contains("\"QMP\"") {
-            return Err(QmpError::Protocol(format!("expected QMP greeting, got: {greeting}")));
+            return Err(QmpError::Protocol(format!(
+                "expected QMP greeting, got: {greeting}"
+            )));
         }
 
         // Send capabilities negotiation

@@ -19,7 +19,11 @@ use std::time::Duration;
 #[derive(Debug)]
 pub enum TransportError {
     Io(std::io::Error),
-    OutOfBounds { offset: usize, len: usize, size: usize },
+    OutOfBounds {
+        offset: usize,
+        len: usize,
+        size: usize,
+    },
     /// The transport doesn't support the requested channel shape — typically
     /// returned by `DeviceTransport::open_stream` on register-only transports
     /// (HTTP, plain ivshmem) and by `open_channel` on stream-only transports.
@@ -168,6 +172,7 @@ pub trait DeviceTransport: Send + Sync {
 /// - Tests: heap-allocated buffer
 ///
 /// All reads/writes use volatile semantics to prevent compiler reordering.
+#[allow(clippy::len_without_is_empty)]
 pub trait SharedMemory: Send + Sync {
     /// Size of the shared region in bytes.
     fn len(&self) -> usize;
@@ -244,13 +249,17 @@ mod tests {
 
     #[test]
     fn transport_error_display_io_variant() {
-        let e = TransportError::Io(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        let e = TransportError::Io(std::io::Error::other("boom"));
         assert!(format!("{e}").contains("boom"));
     }
 
     #[test]
     fn transport_error_display_out_of_bounds() {
-        let e = TransportError::OutOfBounds { offset: 10, len: 4, size: 8 };
+        let e = TransportError::OutOfBounds {
+            offset: 10,
+            len: 4,
+            size: 8,
+        };
         let s = format!("{e}");
         assert!(s.contains("offset=10"));
         assert!(s.contains("len=4"));
@@ -260,7 +269,11 @@ mod tests {
     #[test]
     fn transport_error_is_std_error() {
         fn as_error(_e: &dyn std::error::Error) {}
-        let e = TransportError::OutOfBounds { offset: 0, len: 0, size: 0 };
+        let e = TransportError::OutOfBounds {
+            offset: 0,
+            len: 0,
+            size: 0,
+        };
         as_error(&e);
     }
 

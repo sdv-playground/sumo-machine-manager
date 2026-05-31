@@ -206,7 +206,10 @@ mod tests {
         let copied = seed_missing_files(&source, &target).unwrap();
         assert_eq!(copied.len(), 3);
         assert_eq!(read_file(&target.join("kernel")), b"kernel bytes");
-        assert_eq!(read_file(&target.join("policy.sqfs")), b"squashfs goes here");
+        assert_eq!(
+            read_file(&target.join("policy.sqfs")),
+            b"squashfs goes here"
+        );
     }
 
     #[test]
@@ -350,6 +353,9 @@ mod tests {
 
         seed_missing_files(&source, &target).unwrap();
 
-        assert_eq!(fs::read_link(target.join("link")).unwrap(), Path::new("new"));
+        assert_eq!(
+            fs::read_link(target.join("link")).unwrap(),
+            Path::new("new")
+        );
     }
 }

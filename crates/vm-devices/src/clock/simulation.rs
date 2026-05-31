@@ -7,7 +7,7 @@
 //! Also supports fast-forward (step 1000x) for soak testing and
 //! freeze/inspect at a known time point.
 
-use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use super::Clock;
@@ -125,7 +125,11 @@ impl SimController {
         step_ns: u64,
         qmp: crate::qmp::QmpClient,
     ) -> Self {
-        Self { clock, step_ns, qmp: Some(Mutex::new(qmp)) }
+        Self {
+            clock,
+            step_ns,
+            qmp: Some(Mutex::new(qmp)),
+        }
     }
 
     /// Advance by one step. Resumes vCPUs if paused.
@@ -156,7 +160,10 @@ impl SimController {
         if let Some(ref qmp) = self.qmp {
             let mut q = qmp.lock().unwrap();
             q.stop().map_err(|e| format!("QMP stop: {e}"))?;
-            tracing::info!(mono_ns = self.clock.now_mono_ns(), "simulation paused (vCPUs halted)");
+            tracing::info!(
+                mono_ns = self.clock.now_mono_ns(),
+                "simulation paused (vCPUs halted)"
+            );
             return Ok(());
         }
         // No QMP — just stop stepping (vtime freezes, but CLOCK_MONOTONIC still runs)
@@ -225,9 +232,7 @@ mod tests {
         let clock = Arc::new(SimulationClock::new(0, 0));
         let clock2 = clock.clone();
 
-        let handle = std::thread::spawn(move || {
-            clock2.wait_tick()
-        });
+        let handle = std::thread::spawn(move || clock2.wait_tick());
 
         // Small sleep to ensure thread is waiting
         std::thread::sleep(std::time::Duration::from_millis(10));

@@ -5,7 +5,6 @@
 ///
 /// Dynamic handles (>= 0x0100) are allocated by KEY_GENERATE and owned by
 /// the creating guest's `vm_id`.
-
 use crate::proto::*;
 
 /// A single entry in the handle table.
@@ -26,6 +25,12 @@ pub struct HandleEntry {
 pub struct HandleTable {
     entries: Vec<HandleEntry>,
     next_dynamic: u32,
+}
+
+impl Default for HandleTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HandleTable {
@@ -137,16 +142,18 @@ impl HandleTable {
     /// The handle table itself is in-memory only, so persistent here
     /// means "survives reconnect", not "survives reboot".
     pub fn remove_by_vm_id(&mut self, vm_id: &str) {
-        self.entries.retain(|e| {
-            e.owner_vm_id.is_empty()
-                || e.owner_vm_id != vm_id
-                || e.persistent
-        });
+        self.entries
+            .retain(|e| e.owner_vm_id.is_empty() || e.owner_vm_id != vm_id || e.persistent);
     }
 
     /// Number of handles currently in use.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// True if no handles are currently allocated.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Get the most recently added entry.
@@ -188,7 +195,14 @@ mod tests {
         let label = [0u8; LABEL_LEN];
 
         let h = table
-            .allocate("temp-key", ALG_AES_256, PERM_ENCRYPT | PERM_DECRYPT, "vm1", false, &label)
+            .allocate(
+                "temp-key",
+                ALG_AES_256,
+                PERM_ENCRYPT | PERM_DECRYPT,
+                "vm1",
+                false,
+                &label,
+            )
             .unwrap();
         assert!(h >= HANDLE_DYNAMIC_BASE);
 

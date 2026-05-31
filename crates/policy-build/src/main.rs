@@ -107,11 +107,7 @@ fn main() -> ExitCode {
     // Infer format from extension if not explicit.
     let format = match format {
         Some(f) => f,
-        None => match output
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-        {
+        None => match output.extension().and_then(|s| s.to_str()).unwrap_or("") {
             "sqfs" | "squashfs" => ImageFormat::Squashfs,
             "qnx6" => ImageFormat::Qnx6,
             other => {
@@ -134,11 +130,7 @@ fn main() -> ExitCode {
 
     match builder.build(&output) {
         Ok(()) => {
-            eprintln!(
-                "policy-build: wrote {} ({:?})",
-                output.display(),
-                format
-            );
+            eprintln!("policy-build: wrote {} ({:?})", output.display(), format);
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -148,9 +140,7 @@ fn main() -> ExitCode {
             // exit non-zero; an operator-facing distinction may be useful
             // for CI scripts.
             match e {
-                BuildError::ToolSpawn { .. } | BuildError::ToolFailed { .. } => {
-                    ExitCode::from(3)
-                }
+                BuildError::ToolSpawn { .. } | BuildError::ToolFailed { .. } => ExitCode::from(3),
                 _ => ExitCode::from(1),
             }
         }

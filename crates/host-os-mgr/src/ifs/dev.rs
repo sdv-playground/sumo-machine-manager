@@ -30,7 +30,7 @@ impl BankActivator for DevBankActivator {
 
         let mount_check = std::process::Command::new("mount")
             .output()
-            .map_err(|e| BankActivatorError::Io(e))?;
+            .map_err(BankActivatorError::Io)?;
         let mount_output = String::from_utf8_lossy(&mount_check.stdout);
         let mp_str = self.mount_point.to_string_lossy();
 
@@ -39,7 +39,7 @@ impl BankActivator for DevBankActivator {
             let status = std::process::Command::new("mount")
                 .args(["-t", "qnx6", &self.boot_device, &mp_str])
                 .status()
-                .map_err(|e| BankActivatorError::Io(e))?;
+                .map_err(BankActivatorError::Io)?;
             if !status.success() {
                 return Err(BankActivatorError::Failed(format!(
                     "mount {} failed (exit {})",

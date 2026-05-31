@@ -1,5 +1,4 @@
 /// Request dispatch (v3) — routes opcodes via handle table + IAM policy.
-
 use std::net::IpAddr;
 
 use hsm::{HsmCryptoProvider, HsmError};
@@ -75,7 +74,10 @@ pub fn handle_request(
     // here with a handshake op the dispatcher upstream has a bug —
     // reject with InvalidParam rather than panic so the daemon stays
     // alive.
-    if matches!(op, Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll | Op::EnrollAssisted) {
+    if matches!(
+        op,
+        Op::Hello | Op::Auth | Op::AuthOk | Op::Enroll | Op::EnrollAssisted
+    ) {
         tracing::warn!(
             op = ?op,
             vm = %caller.vm_id,
@@ -169,9 +171,12 @@ fn handle_get_random(req: &Request, crypto: &dyn HsmCryptoProvider) -> Response 
     if req.payload.len() < 4 {
         return Response::err(req.op, req.session_id, StatusCode::InvalidParam);
     }
-    let count =
-        u32::from_le_bytes([req.payload[0], req.payload[1], req.payload[2], req.payload[3]])
-            as usize;
+    let count = u32::from_le_bytes([
+        req.payload[0],
+        req.payload[1],
+        req.payload[2],
+        req.payload[3],
+    ]) as usize;
     if count == 0 || count > MAX_RANDOM {
         return Response::err(req.op, req.session_id, StatusCode::InvalidParam);
     }
@@ -322,7 +327,7 @@ fn handle_crypto_with_handle(
                     Response::err(req.op, req.session_id, StatusCode::CryptoError)
                 }
             }
-        },
+        }
         Op::MacVerify => {
             // payload: mac_len(4) + mac + data
             if data.len() < 4 {
@@ -342,7 +347,7 @@ fn handle_crypto_with_handle(
                     Response::err(req.op, req.session_id, StatusCode::CryptoError)
                 }
             }
-        },
+        }
         _ => Response::err(req.op, req.session_id, StatusCode::InvalidParam),
     }
 }
@@ -390,9 +395,12 @@ fn handle_verify(
     }
     let signature = &rest[4..4 + sig_len];
     let hash_start = 4 + sig_len;
-    let hash_len =
-        u32::from_le_bytes([rest[hash_start], rest[hash_start + 1], rest[hash_start + 2], rest[hash_start + 3]])
-            as usize;
+    let hash_len = u32::from_le_bytes([
+        rest[hash_start],
+        rest[hash_start + 1],
+        rest[hash_start + 2],
+        rest[hash_start + 3],
+    ]) as usize;
     if rest.len() < hash_start + 4 + hash_len {
         return Response::err(req.op, req.session_id, StatusCode::InvalidParam);
     }
@@ -663,11 +671,21 @@ mod tests {
         let resp = handle_key_generate(&req, &caller("vm1"), &mut table, &hsm);
         assert_eq!(resp.status, StatusCode::Ok as u32);
         // result layout: handle(4) + pubkey_len(4) + pubkey
-        assert!(resp.payload.len() > 8, "expected pubkey DER, got len={}", resp.payload.len());
+        assert!(
+            resp.payload.len() > 8,
+            "expected pubkey DER, got len={}",
+            resp.payload.len()
+        );
         let pubkey_len = u32::from_le_bytes([
-            resp.payload[4], resp.payload[5], resp.payload[6], resp.payload[7],
+            resp.payload[4],
+            resp.payload[5],
+            resp.payload[6],
+            resp.payload[7],
         ]) as usize;
-        assert!(pubkey_len > 32, "Ed25519 SPKI is ~44 bytes, got {pubkey_len}");
+        assert!(
+            pubkey_len > 32,
+            "Ed25519 SPKI is ~44 bytes, got {pubkey_len}"
+        );
     }
 
     #[test]
@@ -833,7 +851,12 @@ statements:
         // vm1 hits statement 0 — outcome is Allow.
         let (resp, outcome) = handle_request(&req, &caller("vm1"), &mut table, &iam, &hsm);
         assert!(
-            matches!(outcome, AuthzOutcome::Allow { matched_statement: 0 }),
+            matches!(
+                outcome,
+                AuthzOutcome::Allow {
+                    matched_statement: 0
+                }
+            ),
             "vm1 should be allowed by statement 0, got {outcome:?}"
         );
         assert_ne!(
@@ -951,13 +974,23 @@ statements:
         };
         let (_resp, outcome) = handle_request(&req, &caller("vm1"), &mut table, &iam, &hsm);
         assert!(
-            matches!(outcome, AuthzOutcome::Allow { matched_statement: 0 }),
+            matches!(
+                outcome,
+                AuthzOutcome::Allow {
+                    matched_statement: 0
+                }
+            ),
             "vm1 should hit specific statement 0, got {outcome:?}"
         );
 
         let (_resp, outcome) = handle_request(&req, &caller("vm2"), &mut table, &iam, &hsm);
         assert!(
-            matches!(outcome, AuthzOutcome::Allow { matched_statement: 1 }),
+            matches!(
+                outcome,
+                AuthzOutcome::Allow {
+                    matched_statement: 1
+                }
+            ),
             "vm2 should fall through to wildcard statement 1, got {outcome:?}"
         );
     }

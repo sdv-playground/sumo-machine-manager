@@ -16,8 +16,8 @@
 //! 4. Trial: boot manager counts boots, auto-rolls back if unhealthy
 //! 5. Commit: mark new bank as committed (raises anti-rollback floor)
 
-pub mod ifs;
 pub mod component;
+pub mod ifs;
 
 pub use component::HostOsComponent;
 pub use ifs::{BankActivator, BankActivatorError};

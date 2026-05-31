@@ -199,7 +199,6 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 entity_type: "app".into(),
                 supports_rollback: spec.rollback,
                 single_bank: false,
-                ..ComponentConfig::default()
             };
             let backend = VmBackend::with_options(
                 bank_set,
@@ -224,10 +223,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             };
 
             let fallback: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
-            let diag = vm_mgr::diag_backend::ComponentDiagBackend::new(
-                component.clone(),
-                fallback,
-            );
+            let diag = vm_mgr::diag_backend::ComponentDiagBackend::new(component.clone(), fallback);
 
             Some(BuiltComponent {
                 component,
@@ -248,7 +244,6 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 entity_type: spec.component_type.clone(),
                 supports_rollback: spec.rollback,
                 single_bank: spec.single_bank,
-                ..ComponentConfig::default()
             };
 
             let images_dir = spec.storage_path.clone();
@@ -291,7 +286,8 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
 
             if bank_set == BankSet::Hsm {
                 if let Some(ref keystore) = deps.hsm_keystore {
-                    component_inner = component_inner.with_csr_keystore(keystore.clone(), deps.hsm_port);
+                    component_inner =
+                        component_inner.with_csr_keystore(keystore.clone(), deps.hsm_port);
                 }
             }
 
@@ -307,10 +303,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             };
 
             let fallback: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
-            let diag = vm_mgr::diag_backend::ComponentDiagBackend::new(
-                component.clone(),
-                fallback,
-            );
+            let diag = vm_mgr::diag_backend::ComponentDiagBackend::new(component.clone(), fallback);
 
             Some(BuiltComponent {
                 component,

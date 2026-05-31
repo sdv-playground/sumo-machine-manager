@@ -4,11 +4,11 @@
 //! vs simulation stepping vs gPTP) so the same device code runs on both
 //! Linux/QEMU development and QNX production hosts.
 
-pub mod transport;
 pub mod clock;
-pub mod regs;
 #[cfg(target_os = "linux")]
 pub mod qmp;
+pub mod regs;
+pub mod transport;
 
 // Heartbeat (guest → host liveness signal) and power-command (host → guest
 // shutdown/reboot/suspend) devices, both built on top of `DeviceChannel`.

@@ -1,3 +1,5 @@
+#[cfg(feature = "crypto")]
+use crate::HsmCryptoProvider;
 /// QNX HSM provider — stub for real hardware.
 ///
 /// On QNX, the HSM is real hardware accessed via a resource manager
@@ -21,12 +23,15 @@
 ///   firmware runs independently. May manage a TCP proxy if needed.
 ///
 /// - `status`: query HSM firmware health, key slot count, etc.
-
 use crate::{HsmError, HsmProvider, HsmStatus, KeyInfo, KeyRole, ProvisioningState};
-#[cfg(feature = "crypto")]
-use crate::HsmCryptoProvider;
 
 pub struct QnxHsm;
+
+impl Default for QnxHsm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl QnxHsm {
     pub fn new() -> Self {
@@ -71,36 +76,58 @@ impl HsmProvider for QnxHsm {
 #[cfg(feature = "crypto")]
 impl HsmCryptoProvider for QnxHsm {
     fn sign(&self, _key_id: &str, _data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
     fn verify(&self, _key_id: &str, _data: &[u8], _sig: &[u8]) -> Result<bool, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
     fn encrypt(&self, _key_id: &str, _plaintext: &[u8]) -> Result<Vec<u8>, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
     fn decrypt(&self, _key_id: &str, _ciphertext: &[u8]) -> Result<Vec<u8>, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
     fn mac_generate(&self, _key_id: &str, _data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
     fn mac_verify(&self, _key_id: &str, _data: &[u8], _mac: &[u8]) -> Result<bool, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
     fn derive(&self, _key_id: &str, _context: &[u8], _len: usize) -> Result<Vec<u8>, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
     fn random(&self, _len: usize) -> Result<Vec<u8>, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
     fn get_certificate_der(&self, _key_id: &str) -> Result<Vec<u8>, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
     fn get_public_key_der(&self, _key_id: &str) -> Result<Vec<u8>, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
     fn get_key_info(&self, _key_id: &str) -> Result<KeyInfo, HsmError> {
-        Err(HsmError::NotSupported("QNX HSM crypto not implemented".into()))
+        Err(HsmError::NotSupported(
+            "QNX HSM crypto not implemented".into(),
+        ))
     }
 }
