@@ -19,6 +19,11 @@ pub enum MachineError {
     Busy(String),
     /// Manifest validation failed (signature, hash, sequence number, ...).
     ManifestInvalid(String),
+    /// Manifest is well-formed but addressed at a different target than
+    /// the Component receiving it (e.g. a vm2 envelope handed to vm1's
+    /// install pipeline).  The SOVD adapter maps this to HTTP 415
+    /// Unsupported Media Type (BackendError::UnsupportedMediaType).
+    WrongTarget(String),
     /// A flash session id is unknown or has expired.
     UnknownFlashSession(String),
     /// Backing storage / hardware error.
@@ -36,6 +41,7 @@ impl fmt::Display for MachineError {
             Self::PolicyRejected(m) => write!(f, "policy rejected: {m}"),
             Self::Busy(m) => write!(f, "busy: {m}"),
             Self::ManifestInvalid(m) => write!(f, "manifest invalid: {m}"),
+            Self::WrongTarget(m) => write!(f, "wrong target: {m}"),
             Self::UnknownFlashSession(id) => write!(f, "unknown flash session: {id}"),
             Self::Storage(m) => write!(f, "storage error: {m}"),
             Self::Internal(m) => write!(f, "internal error: {m}"),

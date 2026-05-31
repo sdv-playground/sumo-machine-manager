@@ -43,6 +43,7 @@ pub mod bank_spec;
 pub mod component_adapter;
 pub mod diag_backend;
 pub mod did;
+pub mod dispatcher;
 pub mod manifest;
 pub mod manifest_provider;
 pub mod ota;

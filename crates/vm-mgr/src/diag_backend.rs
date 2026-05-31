@@ -402,6 +402,8 @@ fn map_machine_error(e: MachineError) -> BackendError {
         MachineError::PolicyRejected(s) => BackendError::InvalidRequest(s),
         MachineError::Busy(s) => BackendError::Busy(s),
         MachineError::ManifestInvalid(s) => BackendError::InvalidRequest(s),
+        // F.D3 dispatcher: target mismatch maps to HTTP 415.
+        MachineError::WrongTarget(s) => BackendError::UnsupportedMediaType(s),
         MachineError::UnknownFlashSession(s) => BackendError::InvalidRequest(s),
         MachineError::Storage(s) => BackendError::Internal(s),
         MachineError::Internal(s) => BackendError::Internal(s),

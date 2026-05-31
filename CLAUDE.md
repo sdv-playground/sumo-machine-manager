@@ -11,6 +11,26 @@ trait layer + per-crate `BlockDevice` / `SharedMemory` / `HsmCryptoProvider`
 traits let the same business logic run on QNX (qvm hypervisor) once the
 concrete impls exist.
 
+### The Upgradable abstraction (lead with this)
+
+The conceptual base is **"a thing that can be updated"**, modelled by
+`machine_mgr::Component`. There are two structural shapes (today
+discriminated at runtime via `Capabilities`):
+
+| Shape | Lifecycle | Implementations |
+|---|---|---|
+| **Banked** — A/B + trial + commit/rollback | `start_install` → `upload_envelope` → `finalize_install` (flip pointer, reboot needed) → trial boot → `commit_install` OR auto-rollback | `VmBackendComponent` (vm-mgr), `HostOsComponent` (host-os-mgr), future RT-core component, A/B-style slave-ECU component |
+| **Singleshot** — write-through, no rollback | `start_install` → `upload_envelope` → `finalize_install` (write live) → `commit_install` (raise floor + audit) | HSM keystore (hsm crate), `ContainerImageComponent` (app-mgr) |
+
+`vm-mgr` is **the VM impl of `Component`**, not the base. Same for
+`host-os-mgr`, `app-mgr`, and `hsm`. They're siblings under the same
+trait; `MachineRegistry` (`crates/machine-mgr/src/machine.rs`) holds
+them as `dyn Component` and routes by `component_id`.
+
+The compile-time `Banked: Upgradable` / `Singleshot: Upgradable`
+trait split is a deferred refactor (see `tasks/sw-update-architecture.md`
+open question #1) — capability-only discrimination works today.
+
 ### Architecture
 
 Cargo workspace with 10 crates. Bottom-up:
@@ -46,6 +66,8 @@ Cargo workspace with 10 crates. Bottom-up:
   streaming pipeline, OTA engine (install/commit/rollback), DID resolution,
   and the SOVD wire adapter. `VmBackend` per-component state machine;
   `ComponentDiagBackend` routes SOVD calls through `Component` trait.
+  `dispatcher.rs` resolves a SUIT envelope's target `BankSet` (used by the
+  /updates wire to reject mismatches with HTTP 415 before opening a session).
 
 ### Separation of Concerns
 
@@ -88,6 +110,7 @@ crates/vm-mgr/src/
   backend.rs              — VmBackend: per-component state machine
   component_adapter.rs    — VmBackendComponent: exposes VmBackend via Component
   diag_backend.rs         — ComponentDiagBackend: routes SOVD -> Component
+  dispatcher.rs           — F.D3 SUIT-aware target resolver (peek_target_bank_set / check_target)
   suit_provider.rs        — SUIT envelope validation
   manifest_provider.rs    — ManifestProvider trait
   ota.rs                  — OTA engine: install, commit, rollback

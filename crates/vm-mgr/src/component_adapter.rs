@@ -369,5 +369,7 @@ fn map_backend_error(e: BackendError) -> MachineError {
         BackendError::EcuError { message, nrc, sid } => MachineError::Internal(format!(
             "ECU error NRC=0x{nrc:02X} SID=0x{sid:02X}: {message}"
         )),
+        BackendError::UpdateInProgress(s) => MachineError::Busy(s),
+        BackendError::UnsupportedMediaType(s) => MachineError::WrongTarget(s),
     }
 }
