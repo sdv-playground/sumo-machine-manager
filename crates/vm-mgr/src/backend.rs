@@ -1648,6 +1648,19 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         &self.capabilities
     }
 
+    /// F.D5: report the lifecycle shape so SOVDd's /campaigns
+    /// coordinator orders Banked-vs-Singleshot finalize correctly
+    /// (sw-update-architecture.md §5).  HSM and other single-bank
+    /// targets are singleshot; everything else (host-os, VMs, RT
+    /// core, slave-ECU components) is banked.
+    fn update_shape(&self) -> &'static str {
+        if self.config.single_bank {
+            "singleshot"
+        } else {
+            "banked"
+        }
+    }
+
     // --- Data ---
 
     async fn list_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {

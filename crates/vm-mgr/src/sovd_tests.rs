@@ -610,3 +610,49 @@ fn suit_provider_rejects_rollback() {
     let envelope = make_test_suit_envelope(&keys, "vm1", 3, &image);
     assert!(provider.validate(&envelope, 5).is_err());
 }
+
+// =============================================================================
+// F.D5 — VmBackend reports the lifecycle shape used by SOVDd's /campaigns
+// =============================================================================
+
+#[tokio::test]
+async fn update_shape_reports_banked_for_ab_components() {
+    let (_router, _, _) = make_router();
+    let keys = generate_test_keys();
+    let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
+    suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
+    let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
+    let security_provider = Arc::new(TestSecurityProvider);
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let nv = Arc::new(Mutex::new(NvStore::new(dev)));
+
+    let banked = VmBackend::new(
+        BankSet::Vm1,
+        nv.clone(),
+        manifest_provider.clone(),
+        security_provider.clone(),
+        ComponentConfig::default(),
+    );
+    assert_eq!(
+        DiagnosticBackend::update_shape(&banked),
+        "banked",
+        "VM bank-set with single_bank=false must report banked"
+    );
+
+    let singleshot = VmBackend::new(
+        BankSet::Hsm,
+        nv,
+        manifest_provider,
+        security_provider,
+        ComponentConfig {
+            supports_rollback: false,
+            single_bank: true,
+            entity_type: "hsm".into(),
+        },
+    );
+    assert_eq!(
+        DiagnosticBackend::update_shape(&singleshot),
+        "singleshot",
+        "single_bank=true must report singleshot (HSM keystore semantics)"
+    );
+}

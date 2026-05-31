@@ -78,6 +78,13 @@ impl DiagnosticBackend for ComponentDiagBackend {
         self.fallback.capabilities()
     }
 
+    /// F.D5: delegate to the underlying VmBackend so the campaign
+    /// coordinator on the SOVD wire sees the right shape regardless of
+    /// whether it reaches the Component-trait path or the fallback.
+    fn update_shape(&self) -> &'static str {
+        self.fallback.update_shape()
+    }
+
     // -----------------------------------------------------------------
     // Faults — wired through Component
     // -----------------------------------------------------------------
