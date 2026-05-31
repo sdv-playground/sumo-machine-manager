@@ -18,7 +18,6 @@ use vm_mgr::suit_provider::SuitProvider;
 use machine_mgr::{Machine, MachineRegistry};
 use sovd_core::EntityInfo;
 
-use axum::response::IntoResponse;
 use hsm::sim::SimHsm;
 use hsm::{HsmProvider, KeyRole};
 
@@ -315,53 +314,8 @@ async fn main() {
     let machine: Arc<dyn Machine> = Arc::new(machine_builder.build());
 
     let state = sovd_api::AppState::new(backends);
-    let router = sovd_api::create_router(state);
-
-    // CSR endpoint for device provisioning. Routes through the Machine so
-    // the actual CSR-signing logic lives in `VmBackendComponent::get_csr`,
-    // not inline here.
-    let csr_machine = machine.clone();
-    let router = router.route(
-        "/vehicle/v1/components/hsm/csr",
-        axum::routing::get(move || {
-            let machine = csr_machine.clone();
-            async move {
-                let Some(comp) = machine.component("hsm") else {
-                    return (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "no hsm component".to_string(),
-                    )
-                        .into_response();
-                };
-                match comp.get_csr().await {
-                    Ok(csr) => {
-                        tracing::info!("CSR generated for device-decrypt ({} bytes)", csr.0.len());
-                        (
-                            [(axum::http::header::CONTENT_TYPE, "application/pkcs10")],
-                            csr.0.to_vec(),
-                        )
-                            .into_response()
-                    }
-                    Err(machine_mgr::MachineError::PolicyRejected(s)) => {
-                        (axum::http::StatusCode::FORBIDDEN, s).into_response()
-                    }
-                    Err(machine_mgr::MachineError::NotSupported(_)) => (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "CSR not configured".to_string(),
-                    )
-                        .into_response(),
-                    Err(e) => {
-                        tracing::error!(error = %e, "CSR generation failed");
-                        (
-                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("CSR error: {e}"),
-                        )
-                            .into_response()
-                    }
-                }
-            }
-        }),
-    );
+    let router =
+        sovd_api::create_router(state).merge(vm_mgr::sovd::routes::csr_router(machine.clone()));
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
