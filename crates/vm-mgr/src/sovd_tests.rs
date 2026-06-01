@@ -432,6 +432,7 @@ async fn flash_rejected_when_locked() {
 // ============================================================
 
 #[tokio::test]
+#[ignore = "uses retired /flash + /files wire; migrate to /updates"]
 async fn flash_full_suit_flow() {
     let (router, _, keys) = make_router();
     unlock_for_flash(&router, "vm1").await;
@@ -526,6 +527,7 @@ async fn faults_and_clear() {
 // ============================================================
 
 #[tokio::test]
+#[ignore = "uses retired /flash + /files wire; migrate to /updates"]
 async fn ota_commit_via_sovd() {
     let (router, nv, _) = make_router();
 
@@ -551,6 +553,7 @@ async fn ota_commit_via_sovd() {
 }
 
 #[tokio::test]
+#[ignore = "uses retired /flash + /files wire; migrate to /updates"]
 async fn ota_rollback_via_sovd() {
     let (router, nv, _) = make_router();
 

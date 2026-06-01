@@ -112,6 +112,18 @@ enum FlashSessionState {
     Complete,
 }
 
+/// Where an uploaded file_id was placed, so `verify_part` can re-read
+/// and re-hash for SOVDd `/executions{verify}`.  Manifest uploads go
+/// to the in-memory `packages` map; detached payload uploads stream
+/// through to a file under the staged bank dir.
+enum UploadedPartLocation {
+    /// Manifest part — `packages[file_id].validated.image_data` is
+    /// the canonical bytes to re-hash.
+    Manifest,
+    /// Detached payload — file on disk.
+    OnDisk(PathBuf),
+}
+
 // ---------------------------------------------------------------------------
 // Flash transfer tracking
 // ---------------------------------------------------------------------------
@@ -185,6 +197,11 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     packages: Mutex<HashMap<String, StoredPackage>>,
     manifests: Mutex<HashMap<String, StoredManifest>>,
     payloads: Mutex<HashMap<String, StoredPayload>>,
+    /// Records every uploaded file_id's storage location for later
+    /// per-part re-verification (SOVDd `/executions{verify}`). Manifest
+    /// uploads point at the in-memory `packages` entry; detached
+    /// payloads point at the on-disk bank-dir file.
+    uploaded_parts: Mutex<HashMap<String, UploadedPartLocation>>,
     flash_session: Mutex<Option<FlashSessionState>>,
     flash_transfer: Mutex<Option<FlashTransferState>>,
     /// The bank the ECU is actually running on. Only changes on ecu_reset().
@@ -331,6 +348,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             manifest_provider,
             security_provider,
             packages: Mutex::new(HashMap::new()),
+            uploaded_parts: Mutex::new(HashMap::new()),
             manifests: Mutex::new(HashMap::new()),
             payloads: Mutex::new(HashMap::new()),
             flash_session: Mutex::new(None),
@@ -1250,6 +1268,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                     },
                 );
             }
+            self.uploaded_parts
+                .lock()
+                .unwrap()
+                .insert(id.clone(), UploadedPartLocation::Manifest);
 
             // Session complete — no payload uploads needed
             {
@@ -1299,6 +1321,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                     },
                 );
             }
+            self.uploaded_parts
+                .lock()
+                .unwrap()
+                .insert(id.clone(), UploadedPartLocation::Manifest);
 
             // Set package_id on flash transfer
             {
@@ -1467,6 +1493,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         }
 
         let id = self.next_id();
+        self.uploaded_parts.lock().unwrap().insert(
+            id.clone(),
+            UploadedPartLocation::OnDisk(output_path.clone()),
+        );
         Ok(id)
     }
 
@@ -2108,6 +2138,48 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         })
     }
 
+    async fn verify_part(&self, file_id: &str, expected_sha256: &str) -> BackendResult<()> {
+        use sha2::{Digest, Sha256};
+        let location = {
+            let parts = self.uploaded_parts.lock().unwrap();
+            parts
+                .get(file_id)
+                .ok_or_else(|| {
+                    BackendError::EntityNotFound(format!("no uploaded part with file_id {file_id}"))
+                })
+                .map(|loc| match loc {
+                    UploadedPartLocation::Manifest => UploadedPartLocation::Manifest,
+                    UploadedPartLocation::OnDisk(p) => UploadedPartLocation::OnDisk(p.clone()),
+                })?
+        };
+        let computed: String = match location {
+            UploadedPartLocation::Manifest => {
+                let packages = self.packages.lock().unwrap();
+                let p = packages.get(file_id).ok_or_else(|| {
+                    BackendError::Internal(format!(
+                        "uploaded_parts records manifest {file_id} but packages map is empty",
+                    ))
+                })?;
+                let h: [u8; 32] = Sha256::digest(&p.validated.image_data).into();
+                hex::encode(h)
+            }
+            UploadedPartLocation::OnDisk(path) => {
+                let bytes = std::fs::read(&path).map_err(|e| {
+                    BackendError::Internal(format!("verify_part read {}: {e}", path.display()))
+                })?;
+                let h: [u8; 32] = Sha256::digest(&bytes).into();
+                hex::encode(h)
+            }
+        };
+        if computed.eq_ignore_ascii_case(expected_sha256) {
+            Ok(())
+        } else {
+            Err(BackendError::InvalidRequest(format!(
+                "verify_part {file_id}: sha256 mismatch — computed {computed}, expected {expected_sha256}",
+            )))
+        }
+    }
+
     async fn delete_package(&self, package_id: &str) -> BackendResult<()> {
         let mut packages = self.packages.lock().unwrap();
         packages
@@ -2139,6 +2211,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             let mut packages = self.packages.lock().unwrap();
             packages.clear();
         }
+        // Drop the previous cycle's part-location records; new uploads
+        // re-populate as they arrive.
+        self.uploaded_parts.lock().unwrap().clear();
 
         let transfer_id = self.next_id();
         tracing::info!(transfer_id = %transfer_id, "flash session started — awaiting manifest upload");

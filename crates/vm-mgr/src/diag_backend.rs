@@ -253,6 +253,10 @@ impl DiagnosticBackend for ComponentDiagBackend {
         self.fallback.verify_package(package_id).await
     }
 
+    async fn verify_part(&self, file_id: &str, expected_sha256: &str) -> BackendResult<()> {
+        self.fallback.verify_part(file_id, expected_sha256).await
+    }
+
     async fn delete_package(&self, package_id: &str) -> BackendResult<()> {
         self.fallback.delete_package(package_id).await
     }

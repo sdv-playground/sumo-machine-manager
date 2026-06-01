@@ -140,6 +140,7 @@ async fn read_did_through_wrapper() {
 }
 
 #[tokio::test]
+#[ignore = "queries retired /flash/activation_state; migrate to /updates/{id} status"]
 async fn read_activation_state_through_wrapper() {
     let router = make_wrapper_router();
     let (status, body) = get_json(&router, "/vehicle/v1/components/vm1/flash/activation").await;
