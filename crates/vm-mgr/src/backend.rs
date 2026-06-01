@@ -112,22 +112,33 @@ enum FlashSessionState {
     Complete,
 }
 
-/// Where an uploaded file_id was placed, so `verify_part` can confirm
-/// it against the SHA-256 the SOVD layer recorded at upload time.
+/// Where an uploaded file_id was placed, so `verify_part` can re-confirm
+/// the part's integrity post-upload.
 ///
-/// Manifests are extracted (decrypted + decompressed) before
-/// `packages[file_id].validated.image_data` is populated, so re-hashing
-/// the in-memory image would not match the wire-recorded hash of the
-/// raw envelope.  We keep the upload-time hash here directly.
+/// Two flavours:
 ///
-/// Detached payloads are written through to disk; verify_part re-reads
-/// the file to catch on-disk corruption.
+/// * `Manifest` — the SUIT envelope as it arrived on the wire.  Small
+///   (≤100 KB), kept whole in `packages[file_id]`.  We record the
+///   upload-time outer SHA-256 so verify_part can compare directly
+///   against what the SOVD wire recorded during `PUT /bulk-data`.
+///
+/// * `OnDisk` — a detached payload.  We can't keep the raw wire bytes
+///   (multi-MB; the streaming pipeline writes the decrypted +
+///   decompressed *inner* content straight to disk to avoid doubling
+///   flash I/O).  So re-verification compares the file on disk against
+///   the inner SHA-256 the streaming pipeline captured at write time
+///   — which is itself the manifest's declared `image_digest`, already
+///   verified against ciphertext during upload.  Catches on-disk
+///   corruption between upload and finalize; doesn't and can't
+///   re-verify the outer-on-the-wire hash post-stream.
 enum UploadedPartLocation {
-    /// Manifest part — upload-time SHA-256 of the raw bytes streamed
-    /// in via `receive_package_stream`.  Compared as-is.
-    Manifest { upload_sha256: [u8; 32] },
-    /// Detached payload — file on disk; verify_part re-reads + hashes.
-    OnDisk(PathBuf),
+    Manifest {
+        upload_sha256: [u8; 32],
+    },
+    OnDisk {
+        path: PathBuf,
+        inner_sha256: [u8; 32],
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1508,7 +1519,10 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let id = self.next_id();
         self.uploaded_parts.lock().unwrap().insert(
             id.clone(),
-            UploadedPartLocation::OnDisk(output_path.clone()),
+            UploadedPartLocation::OnDisk {
+                path: output_path.clone(),
+                inner_sha256: image_hash,
+            },
         );
         Ok(id)
     }
@@ -2153,6 +2167,21 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
     async fn verify_part(&self, file_id: &str, expected_sha256: &str) -> BackendResult<()> {
         use sha2::{Digest, Sha256};
+        // Re-verification semantics:
+        //
+        // * Manifest part — the SOVD layer's `expected_sha256` is the
+        //   outer (wire-bytes) hash recorded during PUT /bulk-data.
+        //   We stored the same value at upload time; compare directly.
+        //
+        // * Detached payload — we cannot re-verify the outer hash
+        //   without keeping the raw ciphertext bytes around (multi-MB
+        //   per payload — flash I/O cost doubles).  Outer integrity
+        //   was already validated during streaming.  Re-verify the
+        //   inner hash instead: re-read the on-disk decrypted content
+        //   and compare to the inner SHA-256 the streaming pipeline
+        //   captured at write time (already cross-checked against the
+        //   manifest's image_digest).  The SOVD-passed
+        //   `expected_sha256` (outer) is informational only here.
         let location = {
             let parts = self.uploaded_parts.lock().unwrap();
             parts
@@ -2166,25 +2195,42 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                             upload_sha256: *upload_sha256,
                         }
                     }
-                    UploadedPartLocation::OnDisk(p) => UploadedPartLocation::OnDisk(p.clone()),
+                    UploadedPartLocation::OnDisk { path, inner_sha256 } => {
+                        UploadedPartLocation::OnDisk {
+                            path: path.clone(),
+                            inner_sha256: *inner_sha256,
+                        }
+                    }
                 })?
         };
-        let computed: String = match location {
-            UploadedPartLocation::Manifest { upload_sha256 } => hex::encode(upload_sha256),
-            UploadedPartLocation::OnDisk(path) => {
+        match location {
+            UploadedPartLocation::Manifest { upload_sha256 } => {
+                let stored = hex::encode(upload_sha256);
+                if stored.eq_ignore_ascii_case(expected_sha256) {
+                    Ok(())
+                } else {
+                    Err(BackendError::InvalidRequest(format!(
+                        "verify_part {file_id}: outer sha256 mismatch — \
+                         stored {stored}, expected {expected_sha256}",
+                    )))
+                }
+            }
+            UploadedPartLocation::OnDisk { path, inner_sha256 } => {
                 let bytes = std::fs::read(&path).map_err(|e| {
                     BackendError::Internal(format!("verify_part read {}: {e}", path.display()))
                 })?;
-                let h: [u8; 32] = Sha256::digest(&bytes).into();
-                hex::encode(h)
+                let recomputed: [u8; 32] = Sha256::digest(&bytes).into();
+                if recomputed == inner_sha256 {
+                    Ok(())
+                } else {
+                    Err(BackendError::InvalidRequest(format!(
+                        "verify_part {file_id}: inner sha256 mismatch on disk — \
+                         recomputed {} vs captured {}",
+                        hex::encode(recomputed),
+                        hex::encode(inner_sha256)
+                    )))
+                }
             }
-        };
-        if computed.eq_ignore_ascii_case(expected_sha256) {
-            Ok(())
-        } else {
-            Err(BackendError::InvalidRequest(format!(
-                "verify_part {file_id}: sha256 mismatch — computed {computed}, expected {expected_sha256}",
-            )))
         }
     }
 
