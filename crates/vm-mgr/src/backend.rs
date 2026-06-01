@@ -112,15 +112,21 @@ enum FlashSessionState {
     Complete,
 }
 
-/// Where an uploaded file_id was placed, so `verify_part` can re-read
-/// and re-hash for SOVDd `/executions{verify}`.  Manifest uploads go
-/// to the in-memory `packages` map; detached payload uploads stream
-/// through to a file under the staged bank dir.
+/// Where an uploaded file_id was placed, so `verify_part` can confirm
+/// it against the SHA-256 the SOVD layer recorded at upload time.
+///
+/// Manifests are extracted (decrypted + decompressed) before
+/// `packages[file_id].validated.image_data` is populated, so re-hashing
+/// the in-memory image would not match the wire-recorded hash of the
+/// raw envelope.  We keep the upload-time hash here directly.
+///
+/// Detached payloads are written through to disk; verify_part re-reads
+/// the file to catch on-disk corruption.
 enum UploadedPartLocation {
-    /// Manifest part — `packages[file_id].validated.image_data` is
-    /// the canonical bytes to re-hash.
-    Manifest,
-    /// Detached payload — file on disk.
+    /// Manifest part — upload-time SHA-256 of the raw bytes streamed
+    /// in via `receive_package_stream`.  Compared as-is.
+    Manifest { upload_sha256: [u8; 32] },
+    /// Detached payload — file on disk; verify_part re-reads + hashes.
     OnDisk(PathBuf),
 }
 
@@ -1204,11 +1210,16 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     ) -> BackendResult<String> {
         use futures::StreamExt;
 
-        // Buffer the manifest entirely (it's small, <100KB)
+        // Buffer the manifest entirely (it's small, <100KB).  Hash
+        // as we go so `verify_part` can compare against the SOVD
+        // layer's upload-time SHA-256.
+        use sha2::Digest;
         let mut data = Vec::new();
+        let mut hasher = sha2::Sha256::new();
         let mut stream = stream;
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| BackendError::Internal(format!("stream: {e}")))?;
+            hasher.update(&bytes);
             data.extend_from_slice(&bytes);
             if data.len() > 100 * 1024 {
                 return Err(BackendError::InvalidRequest(
@@ -1268,10 +1279,11 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                     },
                 );
             }
+            let upload_sha256: [u8; 32] = hasher.clone().finalize().into();
             self.uploaded_parts
                 .lock()
                 .unwrap()
-                .insert(id.clone(), UploadedPartLocation::Manifest);
+                .insert(id.clone(), UploadedPartLocation::Manifest { upload_sha256 });
 
             // Session complete — no payload uploads needed
             {
@@ -1321,10 +1333,11 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                     },
                 );
             }
+            let upload_sha256: [u8; 32] = hasher.clone().finalize().into();
             self.uploaded_parts
                 .lock()
                 .unwrap()
-                .insert(id.clone(), UploadedPartLocation::Manifest);
+                .insert(id.clone(), UploadedPartLocation::Manifest { upload_sha256 });
 
             // Set package_id on flash transfer
             {
@@ -2148,21 +2161,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     BackendError::EntityNotFound(format!("no uploaded part with file_id {file_id}"))
                 })
                 .map(|loc| match loc {
-                    UploadedPartLocation::Manifest => UploadedPartLocation::Manifest,
+                    UploadedPartLocation::Manifest { upload_sha256 } => {
+                        UploadedPartLocation::Manifest {
+                            upload_sha256: *upload_sha256,
+                        }
+                    }
                     UploadedPartLocation::OnDisk(p) => UploadedPartLocation::OnDisk(p.clone()),
                 })?
         };
         let computed: String = match location {
-            UploadedPartLocation::Manifest => {
-                let packages = self.packages.lock().unwrap();
-                let p = packages.get(file_id).ok_or_else(|| {
-                    BackendError::Internal(format!(
-                        "uploaded_parts records manifest {file_id} but packages map is empty",
-                    ))
-                })?;
-                let h: [u8; 32] = Sha256::digest(&p.validated.image_data).into();
-                hex::encode(h)
-            }
+            UploadedPartLocation::Manifest { upload_sha256 } => hex::encode(upload_sha256),
             UploadedPartLocation::OnDisk(path) => {
                 let bytes = std::fs::read(&path).map_err(|e| {
                     BackendError::Internal(format!("verify_part read {}: {e}", path.display()))

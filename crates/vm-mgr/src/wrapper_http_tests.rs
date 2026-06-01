@@ -140,16 +140,41 @@ async fn read_did_through_wrapper() {
 }
 
 #[tokio::test]
-#[ignore = "queries retired /flash/activation_state; migrate to /updates/{id} status"]
-async fn read_activation_state_through_wrapper() {
+async fn read_spec_status_through_wrapper() {
+    // ISO 17978-3 §7.18.7 — GET /updates/{id}/status returns the
+    // Table 270 UpdateStatusBody.  Confirms ComponentDiagBackend
+    // routes the /updates collection through to the wrapped
+    // VmBackend correctly.
     let router = make_wrapper_router();
-    let (status, body) = get_json(&router, "/vehicle/v1/components/vm1/flash/activation").await;
-    // Activation state goes Component → ActivationState → JSON.
+
+    // Register an update so /status has an entry to read.
+    let post = router
+        .clone()
+        .oneshot(
+            Request::post("/vehicle/v1/components/vm1/updates")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post.status(), StatusCode::CREATED);
+    let body = post.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let update_id = json["update_id"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(
+        &router,
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/status"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert!(
-        body.get("supports_rollback").is_some(),
-        "missing supports_rollback: {body}"
-    );
+    // Table 270: phase + status are MANDATORY.
+    assert!(body.get("phase").is_some(), "missing phase: {body}");
+    assert!(body.get("status").is_some(), "missing status: {body}");
+    // Default state of a freshly-registered update.
+    assert_eq!(body["phase"], "prepare");
+    assert_eq!(body["status"], "pending");
 }
 
 #[tokio::test]

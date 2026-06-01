@@ -209,6 +209,86 @@ async fn delete(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Va
     (status, json)
 }
 
+async fn put_bytes(
+    router: &axum::Router,
+    uri: &str,
+    data: Vec<u8>,
+) -> (StatusCode, serde_json::Value) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::put(uri)
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(data))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+async fn put_empty(router: &axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap) {
+    let resp = router
+        .clone()
+        .oneshot(Request::put(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let _ = resp.into_body().collect().await;
+    (status, headers)
+}
+
+/// Poll `GET /updates/{id}/status` until `(phase, status)` matches a
+/// terminal state for the in-process spec wire (PUT prepare / execute /
+/// commit return 202; the actual backend work runs in a tokio task).
+/// Returns the final body.
+async fn poll_status_until_terminal(
+    router: &axum::Router,
+    component: &str,
+    update_id: &str,
+) -> serde_json::Value {
+    for _ in 0..400 {
+        let (status, body) = get(
+            router,
+            &format!("/vehicle/v1/components/{component}/updates/{update_id}/status"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        if matches!(body["status"].as_str(), Some("completed") | Some("failed")) {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("status never reached terminal")
+}
+
+/// Poll until the orchestrated execute task pauses at substate=awaiting-verdict.
+async fn poll_status_until_awaiting_verdict(
+    router: &axum::Router,
+    component: &str,
+    update_id: &str,
+) -> serde_json::Value {
+    for _ in 0..400 {
+        let (status, body) = get(
+            router,
+            &format!("/vehicle/v1/components/{component}/updates/{update_id}/status"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        if body["x-sumo-substate"].as_str() == Some("awaiting-verdict")
+            || matches!(body["status"].as_str(), Some("completed") | Some("failed"))
+        {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("status never reached awaiting-verdict")
+}
+
 /// Unlock a component: switch to programming + seed/key flow.
 async fn unlock_for_flash(router: &axum::Router, component: &str) {
     put_json(
@@ -432,53 +512,86 @@ async fn flash_rejected_when_locked() {
 // ============================================================
 
 #[tokio::test]
-#[ignore = "uses retired /flash + /files wire; migrate to /updates"]
 async fn flash_full_suit_flow() {
+    // Spec-wire round trip — register the update, upload the SUIT
+    // envelope as the `manifest` part, drive prepare + execute(orchestrated),
+    // then commit via the Phase B vendor verb.  Asserts every transition.
     let (router, _, keys) = make_router();
     unlock_for_flash(&router, "vm1").await;
 
     let image = vec![0xBB; 2048];
     let envelope = make_test_suit_envelope(&keys, "vm1", 2, &image);
 
-    // 1. Upload
-    let (status, json) = post_bytes(&router, "/vehicle/v1/components/vm1/files", envelope).await;
+    // 1. POST /updates — server allocates update_id and calls
+    //    backend.start_flash up-front (puts VmBackend in
+    //    AwaitingManifest so the upload goes through the staging
+    //    pipeline, not the legacy integrated-envelope path).
+    let (status, body) = post_json(
+        &router,
+        "/vehicle/v1/components/vm1/updates",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
+    let update_id = body["update_id"].as_str().unwrap().to_string();
+
+    // 2. PUT /bulk-data/manifest — uploads the SUIT envelope.  By
+    //    convention the manifest is named "manifest" so the server's
+    //    verify path can find it.
+    let (status, _) = put_bytes(
+        &router,
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/bulk-data/manifest"),
+        envelope,
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
-    let file_id = json["file_id"].as_str().unwrap().to_string();
 
-    // 2. Verify
-    let (status, json) = post_empty(
+    // 3. PUT /prepare — async 202; poll /status to terminal.
+    let (status, _) = put_empty(
         &router,
-        &format!("/vehicle/v1/components/vm1/files/{file_id}/verify"),
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/prepare"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(json["valid"].as_bool().unwrap());
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let prepared = poll_status_until_terminal(&router, "vm1", &update_id).await;
+    assert_eq!(
+        prepared["phase"], "prepare",
+        "after PUT /prepare: {prepared}"
+    );
+    assert_eq!(
+        prepared["status"], "completed",
+        "after PUT /prepare: {prepared}"
+    );
 
-    // 3. Start transfer
-    let (status, _json) = post_json(
+    // 4. PUT /execute?x-sumo-control=orchestrated — banked VmBackend
+    //    runs finalize+validate+activate then pauses at
+    //    substate=awaiting-verdict.
+    let (status, _) = put_empty(
         &router,
-        "/vehicle/v1/components/vm1/flash/transfer",
-        serde_json::json!({"file_id": file_id}),
+        &format!(
+            "/vehicle/v1/components/vm1/updates/{update_id}/execute?x-sumo-control=orchestrated"
+        ),
     )
     .await;
-    assert!(status == StatusCode::OK || status == StatusCode::ACCEPTED);
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let paused = poll_status_until_awaiting_verdict(&router, "vm1", &update_id).await;
+    assert_eq!(paused["phase"], "execute");
+    assert_eq!(paused["status"], "inProgress");
+    assert_eq!(paused["x-sumo-substate"], "awaiting-verdict");
 
-    // 4. Check activation — should be trial (activated)
-    let (status, json) = get(&router, "/vehicle/v1/components/vm1/flash/activation").await;
-    assert_eq!(status, StatusCode::OK);
-    // Trial state — sovd-api serializes FlashState::Activated
-    assert!(json["state"].as_str().unwrap() != "committed");
-
-    // 5. Commit
-    let (status, _) = post_empty(&router, "/vehicle/v1/components/vm1/flash/commit").await;
-    assert_eq!(status, StatusCode::OK);
-
-    // 6. Verify idle after commit. start_flash clears the packages map, so
-    // this contrived flow never reaches install(); fw_meta stays empty on
-    // both banks → "initial" (never-OTA'd) is the truthful end state.
-    let (status, json) = get(&router, "/vehicle/v1/components/vm1/flash/activation").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["state"], "initial");
+    // 5. PUT /x-sumo-commit — Phase B vendor verb.  Wakes the paused
+    //    execute task; calls backend.commit_flash; transitions to
+    //    execute/completed.
+    let (status, _) = put_empty(
+        &router,
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/x-sumo-commit"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let final_body = poll_status_until_terminal(&router, "vm1", &update_id).await;
+    assert_eq!(final_body["phase"], "execute");
+    assert_eq!(final_body["status"], "completed");
+    assert!(final_body.get("x-sumo-substate").is_none());
 }
 
 // ============================================================
@@ -526,51 +639,84 @@ async fn faults_and_clear() {
 // OTA via direct API (commit/rollback without flash upload)
 // ============================================================
 
-#[tokio::test]
-#[ignore = "uses retired /flash + /files wire; migrate to /updates"]
-async fn ota_commit_via_sovd() {
-    let (router, nv, _) = make_router();
+/// Drive a full prepare+execute+verdict cycle and return the
+/// post-verdict `UpdateStatusBody`.  `verdict_verb` is one of
+/// `x-sumo-commit` / `x-sumo-rollback`.
+async fn run_spec_cycle(
+    router: &axum::Router,
+    component: &str,
+    envelope: Vec<u8>,
+    verdict_verb: &str,
+) -> serde_json::Value {
+    let (status, body) = post_json(
+        router,
+        &format!("/vehicle/v1/components/{component}/updates"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
+    let update_id = body["update_id"].as_str().unwrap().to_string();
 
-    // Install OTA directly via library
-    {
-        let mut nv = nv.lock().unwrap();
-        let mut meta = ota::ImageMeta::default();
-        meta.fw_version[..5].copy_from_slice(b"2.0.0");
-        meta.fw_secver = 1;
-        meta.fw_seq = 1;
-        ota::install(&mut *nv, BankSet::Vm1, b"test", &meta, false).unwrap();
-    }
+    let (status, _) = put_bytes(
+        router,
+        &format!("/vehicle/v1/components/{component}/updates/{update_id}/bulk-data/manifest"),
+        envelope,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
 
-    let (_, json) = get(&router, "/vehicle/v1/components/vm1/flash/activation").await;
-    // Trial state — sovd-api serializes FlashState::Activated
-    assert!(json["state"].as_str().unwrap() != "committed");
+    let (status, _) = put_empty(
+        router,
+        &format!("/vehicle/v1/components/{component}/updates/{update_id}/prepare"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let prepared = poll_status_until_terminal(router, component, &update_id).await;
+    assert_eq!(prepared["status"], "completed", "prepare: {prepared}");
 
-    let (status, _) = post_empty(&router, "/vehicle/v1/components/vm1/flash/commit").await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, _) = put_empty(
+        router,
+        &format!(
+            "/vehicle/v1/components/{component}/updates/{update_id}\
+             /execute?x-sumo-control=orchestrated"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    poll_status_until_awaiting_verdict(router, component, &update_id).await;
 
-    let (_, json) = get(&router, "/vehicle/v1/components/vm1/flash/activation").await;
-    assert_eq!(json["state"], "complete"); // idle after commit
+    let (status, _) = put_empty(
+        router,
+        &format!("/vehicle/v1/components/{component}/updates/{update_id}/{verdict_verb}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    poll_status_until_terminal(router, component, &update_id).await
 }
 
 #[tokio::test]
-#[ignore = "uses retired /flash + /files wire; migrate to /updates"]
+async fn ota_commit_via_sovd() {
+    let (router, _, keys) = make_router();
+    unlock_for_flash(&router, "vm1").await;
+    let envelope = make_test_suit_envelope(&keys, "vm1", 3, &vec![0xCC; 1024]);
+    let final_body = run_spec_cycle(&router, "vm1", envelope, "x-sumo-commit").await;
+    assert_eq!(final_body["phase"], "execute");
+    assert_eq!(final_body["status"], "completed");
+    assert!(final_body.get("error").is_none());
+}
+
+#[tokio::test]
 async fn ota_rollback_via_sovd() {
-    let (router, nv, _) = make_router();
-
-    {
-        let mut nv = nv.lock().unwrap();
-        let mut meta = ota::ImageMeta::default();
-        meta.fw_version[..5].copy_from_slice(b"2.0.0");
-        meta.fw_secver = 1;
-        meta.fw_seq = 1;
-        ota::install(&mut *nv, BankSet::Vm1, b"test", &meta, false).unwrap();
-    }
-
-    let (status, _) = post_empty(&router, "/vehicle/v1/components/vm1/flash/rollback").await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (_, json) = get(&router, "/vehicle/v1/components/vm1/data/active_bank").await;
-    assert_eq!(json["value"], "A");
+    let (router, _, keys) = make_router();
+    unlock_for_flash(&router, "vm1").await;
+    let envelope = make_test_suit_envelope(&keys, "vm1", 4, &vec![0xDD; 1024]);
+    let final_body = run_spec_cycle(&router, "vm1", envelope, "x-sumo-rollback").await;
+    assert_eq!(final_body["phase"], "execute");
+    assert_eq!(final_body["status"], "failed");
+    assert_eq!(
+        final_body["error"]["error_code"], "x-sumo-verdict-rollback",
+        "rollback attribution: {final_body}"
+    );
 }
 
 // ============================================================
