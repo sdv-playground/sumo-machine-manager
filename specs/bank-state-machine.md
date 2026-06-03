@@ -187,3 +187,102 @@ Rules:
 - On COMMIT: if `fw_secver > min_security_ver`, raise the floor
 - The floor is **never lowered** — prevents installing old vulnerable images
 - Both banks share the same floor (copied from active to target during OTA)
+
+## VM Bank Composition with App/Dependency Images
+
+A VM bank set may contain not only the VM image (kernel + rootfs) but also
+zero or more application and dependency images. All images in the target bank
+composition are treated atomically: when a bank is swapped to active on boot,
+all images in that bank become available to the guest.
+
+### Inventory Model
+
+Each bank's inventory contains explicit entries:
+
+```
+vm1-bank-a:
+  - vm-rootfs
+      version: 3.0.0
+      security_version: 2
+      digest: sha256:vm1-abc123...
+  - app.example
+      version: 2.1.0
+      security_version: 2
+      digest: sha256:app-def456...
+      dependencies: [runtime.base]
+  - runtime.base
+      version: 1.5.0
+      security_version: 1
+      digest: sha256:runtime-ghi789...
+```
+
+Reused images are explicit inventory entries, not invisible missing payloads.
+If an app image in the target bank references a reused dependency from the
+active bank, the inventory records that reference by digest.
+
+### Commit Semantics
+
+When a bank set commits from TRIAL to COMMITTED:
+
+1. All entries in the bank's inventory are considered part of the final,
+   immutable committed state.
+2. Anti-rollback policy is applied according to the chosen architecture:
+   either one floor for the composed VM bank or separate floors for selected
+   images. The policy choice remains an architecture/product decision.
+3. Rollback restores the complete previous inventory, including reused images.
+
+### Rollback Semantics
+
+On explicit rollback or auto-rollback:
+
+1. The previous bank becomes active again.
+2. The entire previous inventory is restored (all images, including reused ones).
+3. Trial boot restarts from the previous bank with previous image composition.
+
+Partial rollback (rolling back just one app while keeping the OS) is not
+supported in the initial architecture. All images in a bank roll back together.
+
+### Trial Success Criteria
+
+A bank set transitions from TRIAL to COMMITTED when:
+
+1. The VM's base OS image boots successfully.
+2. All app/dependency images in the bank inventory are accessible to the guest.
+3. Health signals indicate the guest and its services are operational
+   (e.g., vHealth heartbeat steady, services ready flags set).
+
+Health monitoring includes both OS-level metrics and app availability.
+The exact health criteria are a product/platform decision, but the architecture
+assumes that trial success includes verifying that required app images are
+present and accessible.
+
+### Anti-Rollback Policy for App Images
+
+App/dependency images may require anti-rollback protection in addition to the
+VM bank's base image floor. The exact policy is not fixed by this state machine
+specification. Valid architecture choices include:
+
+- one security floor for the whole composed VM bank;
+- separate floors for selected app/dependency images;
+- separate floors for every image in the inventory.
+
+Whichever policy is chosen, OTA validation must be explicit and consistent for
+all entries in the target inventory. The architecture question is whether the
+floor is tracked per composed bank, per selected image, or per image. This is
+preserved as an open product/security decision in
+[`sovd-vm-app-installation.md`](sovd-vm-app-installation.md).
+
+### Reuse and Source-Lock
+
+When an OTA updates a bank set and one or more images are unchanged:
+
+- The manifest declares the unchanged image as "reuse from active bank"
+- The source digest (digest of the image in the active bank) is recorded
+- During install, the unchanged image is copied from active to target bank
+- The target digest must match the source digest (verify copy integrity)
+- If source digest in active bank does not match the manifest's declared
+  source digest, the update is rejected or falls back to fetching the full
+  image (source-lock enforcement)
+
+Source-lock prevents subtle errors where an image is silently replaced
+between OTA planning and execution.
