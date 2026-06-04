@@ -25,10 +25,11 @@
 //!
 //! ```text
 //! IvdManifest = {
-//!   0: uint,           ; ivd_version (currently 1)
-//!   1: tstr,           ; bank_id    (component-defined, e.g. "vm2/bank_a")
+//!   0: uint,           ; ivd_version (currently 3)
 //!   2: uint,           ; signed_at_unix
 //!   3: [* FileEntry],
+//!   4: uint,           ; gen (install-time generation counter)
+//!   5: Identity,       ; firmware SW identity (v3+) — see Identity below
 //! }
 //!
 //! FileEntry = {
@@ -36,7 +37,27 @@
 //!   1: bstr,           ; sha256 of file contents (32 bytes)
 //!   2: uint,           ; size in bytes
 //! }
+//!
+//! Identity = {         ; the single source of firmware SW identity.
+//!   0: tstr,           ; name             (UDS F197 system_name)
+//!   1: tstr,           ; version          (UDS F189 fw_version)
+//!   2: tstr,           ; ecu_sw_number    (UDS F188)
+//!   3: tstr,           ; supplier_sw_number  (UDS F194)
+//!   4: tstr,           ; supplier_sw_version (UDS F195)
+//!   5: tstr,           ; spare_part_number   (UDS F187)
+//!   6: tstr,           ; odx_file_id      (UDS F19E)
+//!   7: tstr,           ; system_name      (UDS F197 — kept distinct from name)
+//!   8: tstr,           ; programming_date (UDS F199)
+//!   9: tstr,           ; tester_serial    (UDS F198)
+//! }
 //! ```
+//!
+//! The identity is stored as readable CBOR text strings. `read_did` (in
+//! vm-mgr) converts each field to the fixed-width UDS DID byte form on
+//! read (UTF-8, NUL-padded / truncated to the historical field width).
+//! Because the identity lives inside the signed manifest bytes, the HSM
+//! signature authenticates it for free — there is no second NV copy to
+//! drift out of sync.
 //!
 //! `ivd-signature.bin` is the raw DER-encoded ECDSA-SHA256 signature
 //! produced by the HSM's `HsmCryptoProvider::sign` over the CBOR
@@ -62,7 +83,11 @@ pub const IVD_KEY_ID: &str = "ivd-signing";
 /// - v2: adds `gen` (install-time generation counter) for run-time
 ///   anti-rollback. v1 manifests on existing banks will fail to
 ///   deserialize after this bump — devices must be re-flashed.
-pub const IVD_MANIFEST_VERSION: u64 = 2;
+/// - v3: adds `identity` (firmware SW identity — the single source for
+///   the UDS identification DIDs F187-F19E, retired from the FW Meta NV
+///   blob). v2 manifests on existing banks fail to deserialize after
+///   this bump — devices must be re-flashed (same contract as v1→v2).
+pub const IVD_MANIFEST_VERSION: u64 = 3;
 
 /// Filenames the IVD machinery owns inside a bank dir.
 pub const IVD_MANIFEST_FILE: &str = "ivd-manifest.cbor";
@@ -97,6 +122,55 @@ pub struct IvdManifest {
     ///    can't manufacture a matching HSM signature.
     #[serde(rename = "4")]
     pub gen: u64,
+
+    /// Firmware SW identity — the single authoritative source for the
+    /// UDS identification DIDs (F187-F19E). Inside the signed bytes, so
+    /// the HSM signature authenticates it; vm-mgr's `read_did` derives
+    /// the per-DID byte form from these strings on read. Retires the
+    /// duplicate identity copy that used to live in the FW Meta NV blob.
+    #[serde(rename = "5")]
+    pub identity: IvdIdentity,
+}
+
+/// Firmware SW identity carried inside the signed IVD manifest.
+///
+/// Readable CBOR text strings; the consumer (`vm-mgr::did`) pads /
+/// truncates each to the historical UDS DID field width on read. Every
+/// field is `String` (CBOR `tstr`) — empty string means "not provided"
+/// and reads back as an all-NUL DID value, matching the prior
+/// zero-initialised NV behaviour.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IvdIdentity {
+    /// Human/product name (was sourced from SUIT model/vendor text).
+    #[serde(rename = "0")]
+    pub name: String,
+    /// Firmware version string — UDS F189 (`fw_version`).
+    #[serde(rename = "1")]
+    pub version: String,
+    /// ECU software number — UDS F188 (`ecu_sw_number`).
+    #[serde(rename = "2")]
+    pub ecu_sw_number: String,
+    /// Supplier software number — UDS F194 (`supplier_sw_number`).
+    #[serde(rename = "3")]
+    pub supplier_sw_number: String,
+    /// Supplier software version — UDS F195 (`supplier_sw_version`).
+    #[serde(rename = "4")]
+    pub supplier_sw_version: String,
+    /// Spare part number — UDS F187 (`spare_part_number`).
+    #[serde(rename = "5")]
+    pub spare_part_number: String,
+    /// ODX file id — UDS F19E (`odx_file_id`).
+    #[serde(rename = "6")]
+    pub odx_file_id: String,
+    /// System name — UDS F197 (`system_name`).
+    #[serde(rename = "7")]
+    pub system_name: String,
+    /// Programming date — UDS F199 (`programming_date`, e.g. "20260604").
+    #[serde(rename = "8")]
+    pub programming_date: String,
+    /// Tester serial — UDS F198 (`tester_serial`).
+    #[serde(rename = "9")]
+    pub tester_serial: String,
 }
 
 /// One file in the bank inventory.
@@ -207,10 +281,14 @@ impl From<HsmError> for IvdError {
 /// Walk `bank_dir` and produce a sorted file inventory. Skips the
 /// IVD-owned files themselves (manifest + signature) so they don't
 /// shadow themselves. Does not recurse into symlinks.
-pub fn build_manifest(bank_dir: &Path, gen: u64) -> Result<IvdManifest, IvdError> {
+pub fn build_manifest(
+    bank_dir: &Path,
+    gen: u64,
+    identity: IvdIdentity,
+) -> Result<IvdManifest, IvdError> {
     let mut files = Vec::new();
     collect_files(bank_dir, bank_dir, &mut files)?;
-    Ok(build_manifest_from_files(files, gen))
+    Ok(build_manifest_from_files(files, gen, identity))
 }
 
 /// Construct a manifest from a pre-computed file inventory.
@@ -223,7 +301,11 @@ pub fn build_manifest(bank_dir: &Path, gen: u64) -> Result<IvdManifest, IvdError
 ///
 /// The function sorts the input by `relative_path` so the signed CBOR
 /// is deterministic regardless of payload-arrival order.
-pub fn build_manifest_from_files(mut files: Vec<IvdFile>, gen: u64) -> IvdManifest {
+pub fn build_manifest_from_files(
+    mut files: Vec<IvdFile>,
+    gen: u64,
+    identity: IvdIdentity,
+) -> IvdManifest {
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
     let signed_at_unix = SystemTime::now()
@@ -236,6 +318,7 @@ pub fn build_manifest_from_files(mut files: Vec<IvdFile>, gen: u64) -> IvdManife
         signed_at_unix,
         files,
         gen,
+        identity,
     }
 }
 
@@ -328,12 +411,13 @@ pub fn sign_bank(
     hsm: &dyn HsmProvider,
     bank_dir: &Path,
     gen: u64,
+    identity: IvdIdentity,
 ) -> Result<IvdManifest, IvdError> {
     let hash_start = std::time::Instant::now();
     let mut files = Vec::new();
     collect_files(bank_dir, bank_dir, &mut files)?;
     let hash_ms = hash_start.elapsed().as_millis() as u64;
-    sign_bank_with_files(hsm, bank_dir, gen, files, Some(hash_ms))
+    sign_bank_with_files(hsm, bank_dir, gen, identity, files, Some(hash_ms))
 }
 
 /// Sign a bank using a pre-computed file inventory.
@@ -362,12 +446,13 @@ pub fn sign_bank_with_files(
     hsm: &dyn HsmProvider,
     bank_dir: &Path,
     gen: u64,
+    identity: IvdIdentity,
     files: Vec<IvdFile>,
     walk_hash_ms: Option<u64>,
 ) -> Result<IvdManifest, IvdError> {
     let started = std::time::Instant::now();
 
-    let manifest = build_manifest_from_files(files, gen);
+    let manifest = build_manifest_from_files(files, gen, identity);
     let manifest_bytes = encode_manifest(&manifest)?;
     let hash_ms = walk_hash_ms.unwrap_or(0);
 
@@ -566,6 +651,44 @@ fn verify_bank_inner(
     Ok(manifest)
 }
 
+/// Read the bank's IVD manifest, **signature-verify** it against the
+/// HSM's IVD public key, and return the firmware [`IvdIdentity`] it
+/// carries.
+///
+/// This is the single source for the UDS identification DIDs (F187-F19E)
+/// now that the FW Meta NV blob no longer copies them. It is a
+/// diagnostics-only read path (never on the boot hot path), so verifying
+/// the signature on every read is acceptable; callers cache the result
+/// per running bank and invalidate on install/commit.
+///
+/// Unlike [`verify_bank`], this does NOT re-hash the bank's payload files
+/// or enforce the gen pins — those are launch-time secure-boot concerns.
+/// It only proves the identity bytes are the ones the device signed, then
+/// returns them. A tampered manifest (any flipped byte) fails the
+/// signature check and surfaces [`IvdError::SignatureInvalid`].
+#[cfg(feature = "crypto")]
+pub fn read_identity(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<IvdIdentity, IvdError> {
+    let manifest_path = bank_dir.join(IVD_MANIFEST_FILE);
+    let signature_path = bank_dir.join(IVD_SIGNATURE_FILE);
+
+    let manifest_bytes =
+        fs::read(&manifest_path).map_err(|e| IvdError::Io(e, manifest_path.clone()))?;
+    let sig = fs::read(&signature_path).map_err(|e| IvdError::Io(e, signature_path.clone()))?;
+
+    // Signature verification over the exact on-disk bytes — must pass
+    // before we trust anything the manifest claims.
+    let ok = hsm
+        .verify(IVD_KEY_ID, &manifest_bytes, &sig)
+        .map_err(IvdError::Hsm)?;
+    if !ok {
+        return Err(IvdError::SignatureInvalid);
+    }
+
+    // Decode (also re-checks the version) and hand back just the identity.
+    let manifest = decode_manifest(&manifest_bytes)?;
+    Ok(manifest.identity)
+}
+
 /// SHA-256 of `bytes`. Uses `sha2` when the `crypto` feature is on;
 /// falls back to a minimal panic on non-crypto builds (no HSM op
 /// path needs hashing without crypto).
@@ -596,6 +719,23 @@ mod tests {
         p
     }
 
+    /// A non-trivial identity so round-trip tests prove every field
+    /// survives encode → sign → decode unchanged.
+    fn sample_identity() -> IvdIdentity {
+        IvdIdentity {
+            name: "Sumo VM1".into(),
+            version: "1.2.0".into(),
+            ecu_sw_number: "ECU-SW-001".into(),
+            supplier_sw_number: "SUP-SW-VM1".into(),
+            supplier_sw_version: "1.2.0".into(),
+            spare_part_number: "VM1-SPARE-001".into(),
+            odx_file_id: "ODX-VM1-V1".into(),
+            system_name: "VM1-Linux".into(),
+            programming_date: "20260604".into(),
+            tester_serial: "SOVD-OTA".into(),
+        }
+    }
+
     #[test]
     fn build_manifest_lists_files_sorted_and_skips_ivd_files() {
         let bank = temp_bank("list");
@@ -606,7 +746,7 @@ mod tests {
         write(&bank.join(IVD_MANIFEST_FILE), b"stale manifest");
         write(&bank.join(IVD_SIGNATURE_FILE), b"stale sig");
 
-        let m = build_manifest(&bank, 1).unwrap();
+        let m = build_manifest(&bank, 1, sample_identity()).unwrap();
         let paths: Vec<&str> = m.files.iter().map(|f| f.relative_path.as_str()).collect();
         assert_eq!(paths, vec!["kernel", "nested/qvm.conf", "rootfs.img"]);
         assert_eq!(m.files[0].size, b"kernel bytes".len() as u64);
@@ -620,7 +760,7 @@ mod tests {
         let bank = temp_bank("roundtrip");
         write(&bank.join("a"), b"alpha");
         write(&bank.join("b"), b"beta");
-        let m = build_manifest(&bank, 42).unwrap();
+        let m = build_manifest(&bank, 42, sample_identity()).unwrap();
         let bytes = encode_manifest(&m).unwrap();
         let back = decode_manifest(&bytes).unwrap();
         assert_eq!(back.files.len(), 2);
@@ -666,7 +806,7 @@ mod tests {
         write(&bank.join("nested/qvm.conf"), b"cmdline foo=bar");
 
         let (hsm, keystore) = provisioned_sim("sign-verify");
-        let manifest = sign_bank(&hsm, &bank, 7).unwrap();
+        let manifest = sign_bank(&hsm, &bank, 7, sample_identity()).unwrap();
         assert_eq!(manifest.files.len(), 3);
         assert_eq!(manifest.gen, 7);
         assert!(bank.join(IVD_MANIFEST_FILE).exists());
@@ -692,7 +832,7 @@ mod tests {
         write(&bank.join("kernel"), b"original kernel");
 
         let (hsm, keystore) = provisioned_sim("tamper");
-        sign_bank(&hsm, &bank, 1).unwrap();
+        sign_bank(&hsm, &bank, 1, sample_identity()).unwrap();
 
         std::fs::write(bank.join("kernel"), b"tampered kernel").unwrap();
 
@@ -711,7 +851,7 @@ mod tests {
         write(&bank.join("kernel"), b"k");
 
         let (hsm, keystore) = provisioned_sim("extra");
-        sign_bank(&hsm, &bank, 1).unwrap();
+        sign_bank(&hsm, &bank, 1, sample_identity()).unwrap();
 
         // Drop an extra file AFTER signing — bank shouldn't have
         // anything the manifest didn't authorize.
@@ -732,7 +872,7 @@ mod tests {
         write(&bank.join("f"), b"x");
 
         let (hsm, keystore) = provisioned_sim("genmm");
-        sign_bank(&hsm, &bank, 5).unwrap();
+        sign_bank(&hsm, &bank, 5, sample_identity()).unwrap();
 
         // NV says this slot should have gen=6 (e.g. someone swapped
         // a gen=5 manifest into a slot the device installed gen=6 to)
@@ -759,7 +899,7 @@ mod tests {
 
         let (hsm, keystore) = provisioned_sim("genfloor");
         // Sign at gen=3
-        sign_bank(&hsm, &bank, 3).unwrap();
+        sign_bank(&hsm, &bank, 3, sample_identity()).unwrap();
 
         // Run-floor says we've committed gen=5 elsewhere — refuse.
         let pins = VerifyPins {
@@ -786,7 +926,7 @@ mod tests {
         write(&bank.join("f"), b"trial-bank");
 
         let (hsm, keystore) = provisioned_sim("trial");
-        sign_bank(&hsm, &bank, 6).unwrap();
+        sign_bank(&hsm, &bank, 6, sample_identity()).unwrap();
 
         let pins = VerifyPins {
             expected_install_gen: Some(6),
@@ -832,7 +972,8 @@ mod tests {
         ];
 
         let (hsm, keystore) = provisioned_sim("sign-with-files");
-        let manifest = sign_bank_with_files(&hsm, &bank, 42, files, None).unwrap();
+        let manifest =
+            sign_bank_with_files(&hsm, &bank, 42, sample_identity(), files, None).unwrap();
         assert_eq!(manifest.gen, 42);
         assert_eq!(manifest.files.len(), 2);
         // Sorted result.
@@ -850,6 +991,60 @@ mod tests {
         };
         let back = verify_bank(&hsm, &bank, pins).unwrap();
         assert_eq!(back.gen, 42);
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn identity_survives_encode_decode_roundtrip() {
+        let bank = temp_bank("identity-roundtrip");
+        write(&bank.join("kernel"), b"k");
+        let m = build_manifest(&bank, 9, sample_identity()).unwrap();
+        let bytes = encode_manifest(&m).unwrap();
+        let back = decode_manifest(&bytes).unwrap();
+        assert_eq!(back.ivd_version, IVD_MANIFEST_VERSION);
+        assert_eq!(back.identity, sample_identity());
+        let _ = std::fs::remove_dir_all(&bank);
+    }
+
+    #[test]
+    fn read_identity_returns_signed_identity() {
+        let bank = temp_bank("read-identity");
+        write(&bank.join("kernel"), b"kernel bytes");
+
+        let (hsm, keystore) = provisioned_sim("read-identity");
+        sign_bank(&hsm, &bank, 3, sample_identity()).unwrap();
+
+        let id = read_identity(&hsm, &bank).unwrap();
+        assert_eq!(id, sample_identity());
+        assert_eq!(id.version, "1.2.0");
+        assert_eq!(id.ecu_sw_number, "ECU-SW-001");
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn read_identity_rejects_tampered_manifest() {
+        let bank = temp_bank("read-identity-tamper");
+        write(&bank.join("kernel"), b"kernel bytes");
+
+        let (hsm, keystore) = provisioned_sim("read-identity-tamper");
+        sign_bank(&hsm, &bank, 3, sample_identity()).unwrap();
+
+        // Flip one byte of the signed manifest CBOR — the signature no
+        // longer matches, so read_identity must refuse it.
+        let mpath = bank.join(IVD_MANIFEST_FILE);
+        let mut bytes = std::fs::read(&mpath).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&mpath, &bytes).unwrap();
+
+        match read_identity(&hsm, &bank) {
+            Err(IvdError::SignatureInvalid) => {}
+            other => panic!("expected SignatureInvalid, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&bank);
         let _ = std::fs::remove_dir_all(&keystore);

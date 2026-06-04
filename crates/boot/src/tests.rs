@@ -416,9 +416,9 @@ fn ota_trial_commit_cycle() {
     let image = b"new firmware image v2";
     let hash: [u8; 32] = Sha256::digest(image).into();
 
-    // Write FW Meta for target bank
+    // Write FW Meta for target bank. (Identity like fw_version lives in
+    // the signed IVD manifest now; boot only reads image_sha256 + state.)
     let mut meta = NvFwMeta::default();
-    meta.fw_version[..2].copy_from_slice(b"v2");
     meta.fw_secver = 2;
     meta.min_security_ver = 1;
     meta.image_sha256 = hash;

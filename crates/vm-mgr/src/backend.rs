@@ -569,6 +569,19 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             }
         }
 
+        // Overlay the SW-identity DIDs (F187-F19E) from the running
+        // bank's signature-verified IVD manifest — the single source for
+        // these now that they're out of NvFwMeta. `read_did` returns
+        // NotFound for them above, so this is the only insert. Verifying
+        // the signature here (once per NV write / boot, not per SOVD read)
+        // keeps `read_data` on the cheap in-RAM path while still proving
+        // the served identity is the one the device signed. Invalidation
+        // is automatic: every install/commit/ecu_reset refreshes through
+        // this function via `NvWriteGuard::drop`.
+        for (did, bytes) in self.identity_did_bytes(rb) {
+            new_cache.insert(did, bytes);
+        }
+
         // Atomic swap — lock held for a single move, microseconds.
         *self.did_cache.write().expect("did_cache poisoned") = new_cache;
     }
@@ -956,11 +969,17 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 .unwrap_or_default()
         };
 
+        // The firmware SW identity (SUIT-extracted at validate time) is
+        // sealed into the signed manifest here — this is now the single
+        // source for the F187-F19E identification DIDs. Resolved from the
+        // package the current flash transfer points at.
+        let identity = self.current_install_identity();
+
         let _manifest = if streamed_files.is_empty() {
-            hsm::ivd::sign_bank(&*hsm, &bank_dir, gen)
+            hsm::ivd::sign_bank(&*hsm, &bank_dir, gen, identity)
                 .map_err(|e| BackendError::Internal(format!("ivd sign {bank_id}: {e}")))?
         } else {
-            hsm::ivd::sign_bank_with_files(&*hsm, &bank_dir, gen, streamed_files, None)
+            hsm::ivd::sign_bank_with_files(&*hsm, &bank_dir, gen, identity, streamed_files, None)
                 .map_err(|e| BackendError::Internal(format!("ivd sign {bank_id}: {e}")))?
         };
         tracing::info!(
@@ -970,6 +989,77 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             "ivd sign OK",
         );
         Ok(())
+    }
+
+    /// The firmware SW identity to seal into the IVD manifest being
+    /// signed: derived from the SUIT-extracted `ImageMeta` of the package
+    /// the current flash transfer points at. Empty (all-default) when no
+    /// package is in scope (e.g. a re-sign with no active transfer) — the
+    /// manifest then carries a blank identity, which reads back as
+    /// all-NUL DIDs, matching the prior zero-initialised behaviour.
+    fn current_install_identity(&self) -> hsm::ivd::IvdIdentity {
+        let package_id = {
+            let ft = self.flash_transfer.lock().ok();
+            ft.and_then(|g| g.as_ref().map(|t| t.package_id.clone()))
+                .unwrap_or_default()
+        };
+        if package_id.is_empty() {
+            return hsm::ivd::IvdIdentity::default();
+        }
+        let packages = match self.packages.lock() {
+            Ok(p) => p,
+            Err(_) => return hsm::ivd::IvdIdentity::default(),
+        };
+        packages
+            .get(&package_id)
+            .map(|p| p.validated.image_meta.to_ivd_identity())
+            .unwrap_or_default()
+    }
+
+    /// Read + signature-verify a bank's IVD manifest and return the
+    /// firmware [`IvdIdentity`] it carries — the single source for the
+    /// SW-identity DIDs (F187-F19E) and version labels now that they're
+    /// out of NvFwMeta.
+    ///
+    /// Returns `None` when the bank has no verifiable manifest (no
+    /// images_dir, no HSM, not provisioned, no manifest yet, or a bad
+    /// signature). A bad signature is logged at warn; absent/unsigned is
+    /// debug (normal for factory-fresh / unprovisioned banks).
+    fn verified_bank_identity(&self, bank: Bank) -> Option<hsm::ivd::IvdIdentity> {
+        let bank_dir = self.target_bank_dir(bank)?;
+        let hsm_arc = self.hsm_provider.as_ref()?;
+        let hsm = hsm_arc.lock().ok()?;
+        match hsm::ivd::read_identity(&*hsm, &bank_dir) {
+            Ok(id) => Some(id),
+            Err(hsm::ivd::IvdError::SignatureInvalid) => {
+                tracing::warn!(
+                    bank_set = ?self.bank_set,
+                    bank = ?bank,
+                    "identity: IVD manifest signature INVALID; refusing to serve its identity",
+                );
+                None
+            }
+            Err(e) => {
+                tracing::debug!(
+                    bank_set = ?self.bank_set,
+                    bank = ?bank,
+                    error = %e,
+                    "identity: no verifiable IVD manifest; identity DIDs unavailable",
+                );
+                None
+            }
+        }
+    }
+
+    /// The `(did, bytes)` pairs for the 9 SW-identity DIDs of `bank`,
+    /// each converted to its historical fixed-width UDS byte form. Empty
+    /// when the bank has no verifiable identity (see
+    /// [`Self::verified_bank_identity`]).
+    fn identity_did_bytes(&self, bank: Bank) -> Vec<(u16, Vec<u8>)> {
+        match self.verified_bank_identity(bank) {
+            Some(id) => identity_to_did_bytes(&id),
+            None => Vec::new(),
+        }
     }
 
     /// Wipe the target bank dir (frees ~1 image worth of space) and remove any
@@ -3247,12 +3337,17 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             },
         };
 
-        let active_version = active_meta
-            .as_ref()
-            .map(|m| Self::nv_bytes_to_string(&m.fw_version));
-        let previous_version = previous_meta
-            .as_ref()
-            .map(|m| Self::nv_bytes_to_string(&m.fw_version));
+        // Version strings now come from each bank's signed IVD manifest
+        // identity (F189), not NvFwMeta. Present a version only when the
+        // bank both has FW meta (has been written) AND a verifiable
+        // manifest carrying a non-empty version.
+        let version_of = |bank: Bank| -> Option<String> {
+            self.verified_bank_identity(bank)
+                .map(|id| id.version)
+                .filter(|v| !v.is_empty())
+        };
+        let active_version = active_meta.as_ref().and_then(|_| version_of(rb));
+        let previous_version = previous_meta.as_ref().and_then(|_| version_of(rb.other()));
 
         Ok(ActivationState {
             supports_rollback: self.config.supports_rollback,
@@ -3683,6 +3778,49 @@ pub(crate) fn bank_dir_name(bank: Bank) -> &'static str {
     }
 }
 
+/// Convert a manifest [`IvdIdentity`] into the `(did, bytes)` pairs for
+/// the 9 SW-identity DIDs, each rendered in the historical fixed-width
+/// UDS byte form (UTF-8, NUL-padded / truncated to the width that DID
+/// used when it lived in NvFwMeta — 32 bytes, except programming_date's
+/// 8). Empty identity strings are skipped (DID stays not-found), so a
+/// blank manifest identity behaves like an unprovisioned field.
+fn identity_to_did_bytes(identity: &hsm::ivd::IvdIdentity) -> Vec<(u16, Vec<u8>)> {
+    /// Pad/truncate a UTF-8 string to `width` bytes, NUL-padded — the
+    /// same fixed-width form `read_did` used to return from NvFwMeta.
+    fn fixed(s: &str, width: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; width];
+        let n = s.len().min(width);
+        buf[..n].copy_from_slice(&s.as_bytes()[..n]);
+        buf
+    }
+
+    // (did, value, field-width). `version` → F189, `system_name` → F197.
+    let fields: [(u16, &str, usize); 9] = [
+        (did::DID_FW_VERSION, &identity.version, 32),
+        (did::DID_ECU_SW_NUMBER, &identity.ecu_sw_number, 32),
+        (
+            did::DID_SUPPLIER_SW_NUMBER,
+            &identity.supplier_sw_number,
+            32,
+        ),
+        (
+            did::DID_SUPPLIER_SW_VERSION,
+            &identity.supplier_sw_version,
+            32,
+        ),
+        (did::DID_SPARE_PART_NUMBER, &identity.spare_part_number, 32),
+        (did::DID_ODX_FILE_ID, &identity.odx_file_id, 32),
+        (did::DID_SYSTEM_NAME, &identity.system_name, 32),
+        (did::DID_PROGRAMMING_DATE, &identity.programming_date, 8),
+        (did::DID_TESTER_SERIAL, &identity.tester_serial, 32),
+    ];
+    fields
+        .iter()
+        .filter(|(_, s, _)| !s.is_empty())
+        .map(|&(did, s, width)| (did, fixed(s, width)))
+        .collect()
+}
+
 /// `true` if `bank_dir` has no files that IVD signing would attest to.
 /// Skips IVD's own outputs (manifest + signature) so a re-sign doesn't
 /// trip on a previous run's artefacts.
@@ -3834,4 +3972,312 @@ fn parse_security_level(s: &str) -> BackendResult<u8> {
     digits
         .parse::<u8>()
         .map_err(|_| BackendError::InvalidRequest(format!("invalid security level: {s}")))
+}
+
+// ---------------------------------------------------------------------------
+// Single-source SW identity: end-to-end tests proving the F187-F19E
+// identification DIDs are served from the signed IVD manifest (not NV),
+// the cache invalidates, and a tampered manifest is refused.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::manifest_provider::ManifestError;
+    use crate::ota::ImageMeta;
+    use hsm::sim::SimHsm;
+    use hsm::HsmProvider;
+    use nv_store::block::MemBlockDevice;
+    use nv_store::store::MIN_NV_DEVICE_SIZE;
+
+    /// Manifest provider stub — the identity path never validates a SUIT
+    /// envelope (the package is injected directly), so this can be inert.
+    struct NoopManifest;
+    impl ManifestProvider for NoopManifest {
+        fn validate(&self, _d: &[u8], _m: u32) -> Result<ValidatedFirmware, ManifestError> {
+            Err(ManifestError::ParseError("unused in identity tests".into()))
+        }
+    }
+    struct NoopSecurity;
+    impl SecurityProvider for NoopSecurity {
+        fn generate_seed(&self, _component: BankSet, _level: u8) -> Vec<u8> {
+            Vec::new()
+        }
+        fn validate_key(&self, _component: BankSet, _level: u8, _seed: &[u8], _key: &[u8]) -> bool {
+            true
+        }
+    }
+
+    /// Build a fully-provisioned SimHsm: keystore manifest present (so
+    /// `is_provisioned()` is true) plus the device `ivd-signing` keypair
+    /// (so `sign`/`verify` work). Mirrors `hsm::ivd` test setup.
+    fn provisioned_hsm(tag: &str) -> (Arc<Mutex<dyn hsm::HsmProvider>>, PathBuf) {
+        use hsm::payload::*;
+        let keystore = std::env::temp_dir().join(format!("vm-mgr-identity-ks-{tag}"));
+        let _ = std::fs::remove_dir_all(&keystore);
+        std::fs::create_dir_all(&keystore).unwrap();
+
+        let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 5400);
+        let ks = HsmKeystore {
+            schema_version: SCHEMA_VERSION,
+            security_version: 1,
+            identities: vec![],
+            slots: vec![KeySlot {
+                key_id: hsm::ivd::IVD_KEY_ID.to_string(),
+                key_kind: KEY_TYPE_EC_P256,
+                anchor_public_key: None,
+                allowed_guests: None,
+                allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
+            }],
+        };
+        hsm.write_keystore(&ks).unwrap();
+        hsm.ensure_device_keys().unwrap();
+        std::fs::write(keystore.join("provision_state"), b"1\n").unwrap();
+        assert!(hsm.is_provisioned().unwrap());
+
+        (Arc::new(Mutex::new(hsm)), keystore)
+    }
+
+    fn sample_image_meta() -> ImageMeta {
+        let mut m = ImageMeta::default();
+        let set = |dst: &mut [u8], s: &[u8]| dst[..s.len()].copy_from_slice(s);
+        set(&mut m.fw_version, b"1.2.0");
+        set(&mut m.spare_part_number, b"VM1-SPARE-001");
+        set(&mut m.ecu_sw_number, b"VM1-SW-001");
+        set(&mut m.supplier_sw_number, b"SUP-SW-VM1-001");
+        set(&mut m.supplier_sw_version, b"1.2.0");
+        set(&mut m.odx_file_id, b"ODX-VM1-V1");
+        set(&mut m.system_name, b"VM1-Linux");
+        set(&mut m.programming_date, b"20260604");
+        set(&mut m.tester_serial, b"SOVD-OTA");
+        m
+    }
+
+    /// Construct a VmBackend (vm1) with images_dir + provisioned HSM,
+    /// inject a Verified package carrying `meta`, and point the flash
+    /// transfer at it so `ivd_sign_staged_bank` picks up its identity.
+    fn backend_with_package(
+        tag: &str,
+        meta: ImageMeta,
+    ) -> (VmBackend<MemBlockDevice>, PathBuf, PathBuf) {
+        let images_dir = std::env::temp_dir().join(format!("vm-mgr-identity-img-{tag}"));
+        let _ = std::fs::remove_dir_all(&images_dir);
+        std::fs::create_dir_all(&images_dir).unwrap();
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        let nv = Arc::new(Mutex::new(nv));
+
+        let (hsm, keystore) = provisioned_hsm(tag);
+
+        let backend = VmBackend::with_options(
+            BankSet::Vm1,
+            nv,
+            Arc::new(NoopManifest),
+            Arc::new(NoopSecurity),
+            ComponentConfig::default(),
+            None,
+            Some(images_dir.clone()),
+        )
+        .with_hsm_provider(hsm);
+
+        // Stage a payload file in the target (bank_b) so the bank isn't
+        // payload-empty and signing actually runs.
+        let bank_dir = images_dir.join("vm1").join("bank_b");
+        std::fs::create_dir_all(&bank_dir).unwrap();
+        std::fs::write(bank_dir.join("rootfs.img"), b"vm1 rootfs bytes").unwrap();
+
+        // Inject a Verified package + a flash transfer pointing at it.
+        let pkg_id = "pkg-1".to_string();
+        backend.packages.lock().unwrap().insert(
+            pkg_id.clone(),
+            StoredPackage {
+                id: pkg_id.clone(),
+                validated: ValidatedFirmware {
+                    bank_set: BankSet::Vm1,
+                    manifest_type: ManifestType::Firmware,
+                    image_meta: meta,
+                    image_data: Vec::new(),
+                    version_display: "1.2.0".into(),
+                    image_sha256: Some([0xAB; 32]),
+                    image_size: Some(16),
+                    raw_envelope: None,
+                    streamed_files: Vec::new(),
+                },
+                status: PackageStatus::Verified,
+            },
+        );
+        *backend.flash_transfer.lock().unwrap() = Some(FlashTransferState {
+            transfer_id: "t1".into(),
+            package_id: pkg_id,
+            state: FlashState::AwaitingActivation,
+            image_size: 16,
+            verify_baseline_boot_id: None,
+            streamed_files: Vec::new(),
+        });
+
+        (backend, images_dir, keystore)
+    }
+
+    fn cleanup(images_dir: &Path, keystore: &Path) {
+        let _ = std::fs::remove_dir_all(images_dir);
+        let _ = std::fs::remove_dir_all(keystore);
+    }
+
+    #[test]
+    fn install_sign_then_read_identity_roundtrips_image_meta() {
+        let (backend, images_dir, keystore) =
+            backend_with_package("roundtrip", sample_image_meta());
+
+        // Sign bank_b (the inactive/target bank) with the package identity.
+        backend.ivd_sign_staged_bank(Bank::B).unwrap();
+
+        // read_identity must return exactly what ImageMeta projected.
+        let id = backend.verified_bank_identity(Bank::B).unwrap();
+        assert_eq!(id, sample_image_meta().to_ivd_identity());
+        assert_eq!(id.version, "1.2.0");
+        assert_eq!(id.ecu_sw_number, "VM1-SW-001");
+        assert_eq!(id.system_name, "VM1-Linux");
+
+        cleanup(&images_dir, &keystore);
+    }
+
+    #[tokio::test]
+    async fn read_data_serves_identity_dids_from_manifest_not_nv() {
+        let (backend, images_dir, keystore) = backend_with_package("readdata", sample_image_meta());
+
+        // Bank_b is the target; make the backend RUN on bank_b so the
+        // identity overlay reads the bank we just signed.
+        *backend.running_bank.lock().unwrap() = Bank::B;
+        backend.ivd_sign_staged_bank(Bank::B).unwrap();
+
+        // NvFwMeta has NO identity fields, so this proves the values come
+        // from the signed manifest. Refresh the cache for the running bank.
+        {
+            let nv = backend.nv.lock().unwrap();
+            backend.refresh_did_cache_locked(&nv);
+        }
+
+        let want = [
+            ("fw_version", "1.2.0"),
+            ("ecu_sw_number", "VM1-SW-001"),
+            ("supplier_sw_number", "SUP-SW-VM1-001"),
+            ("supplier_sw_version", "1.2.0"),
+            ("system_name", "VM1-Linux"),
+            ("tester_serial", "SOVD-OTA"),
+            ("programming_date", "20260604"),
+            ("spare_part_number", "VM1-SPARE-001"),
+            ("odx_file_id", "ODX-VM1-V1"),
+        ];
+        for (param, expected) in want {
+            let vals = backend.read_data(&[param.to_string()]).await.unwrap();
+            assert_eq!(vals.len(), 1, "{param}");
+            assert_eq!(
+                vals[0].value,
+                serde_json::Value::String(expected.to_string()),
+                "DID {param} should be served from the signed IVD manifest"
+            );
+        }
+
+        cleanup(&images_dir, &keystore);
+    }
+
+    #[tokio::test]
+    async fn read_data_identity_did_unavailable_before_sign() {
+        // Before any manifest is signed, the identity DIDs are not in the
+        // cache → read_data reports parameter-not-found (they no longer
+        // come from NV).
+        let (backend, images_dir, keystore) = backend_with_package("presign", sample_image_meta());
+        *backend.running_bank.lock().unwrap() = Bank::B;
+        // No ivd_sign_staged_bank call; bank_b has a payload file but no
+        // manifest yet.
+        {
+            let nv = backend.nv.lock().unwrap();
+            backend.refresh_did_cache_locked(&nv);
+        }
+        let err = backend
+            .read_data(&["fw_version".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BackendError::ParameterNotFound(_)));
+
+        cleanup(&images_dir, &keystore);
+    }
+
+    #[test]
+    fn tampered_manifest_identity_is_refused() {
+        let (backend, images_dir, keystore) = backend_with_package("tamper", sample_image_meta());
+        backend.ivd_sign_staged_bank(Bank::B).unwrap();
+
+        // Flip a byte of the signed manifest — signature no longer matches.
+        let mpath = images_dir
+            .join("vm1")
+            .join("bank_b")
+            .join(hsm::ivd::IVD_MANIFEST_FILE);
+        let mut bytes = std::fs::read(&mpath).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&mpath, &bytes).unwrap();
+
+        // The signature check rejects it → no identity served.
+        assert!(backend.verified_bank_identity(Bank::B).is_none());
+        assert!(backend.identity_did_bytes(Bank::B).is_empty());
+
+        cleanup(&images_dir, &keystore);
+    }
+
+    #[tokio::test]
+    async fn identity_cache_invalidates_on_nv_write() {
+        // Cache invalidation rides on NvWriteGuard::drop. Sign with one
+        // identity, populate cache, then re-sign the SAME bank with a new
+        // identity and trigger an NV write — the cache must reflect the new
+        // version, proving install/commit invalidate it.
+        let (backend, images_dir, keystore) =
+            backend_with_package("invalidate", sample_image_meta());
+        *backend.running_bank.lock().unwrap() = Bank::B;
+        backend.ivd_sign_staged_bank(Bank::B).unwrap();
+        {
+            let nv = backend.nv.lock().unwrap();
+            backend.refresh_did_cache_locked(&nv);
+        }
+        let vals = backend
+            .read_data(&["fw_version".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(vals[0].value, serde_json::json!("1.2.0"));
+
+        // Re-sign bank_b with a bumped version (simulating a new install
+        // landing on this bank), by swapping the package identity.
+        let mut bumped = sample_image_meta();
+        bumped.fw_version = [0u8; 32];
+        bumped.fw_version[..5].copy_from_slice(b"2.0.0");
+        backend
+            .packages
+            .lock()
+            .unwrap()
+            .get_mut("pkg-1")
+            .unwrap()
+            .validated
+            .image_meta = bumped;
+        backend.ivd_sign_staged_bank(Bank::B).unwrap();
+
+        // Any NV write refreshes the cache via NvWriteGuard::drop.
+        {
+            let mut guard = backend.nv_write().unwrap();
+            let mut boot = guard.read_boot_state().unwrap();
+            let _ = guard.write_boot_state(&mut boot);
+        }
+
+        let vals = backend
+            .read_data(&["fw_version".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            vals[0].value,
+            serde_json::json!("2.0.0"),
+            "cache must reflect the re-signed manifest identity after an NV write"
+        );
+
+        cleanup(&images_dir, &keystore);
+    }
 }

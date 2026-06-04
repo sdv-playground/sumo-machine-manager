@@ -50,55 +50,59 @@ fn did_factory_vin() {
 }
 
 #[test]
-fn did_fw_meta_version() {
+fn did_fw_version_not_served_from_nv() {
+    // F189 (fw_version) and the other SW-identity DIDs moved to the
+    // signed IVD manifest. The NV-only `read_did` path no longer serves
+    // them (it can't authenticate the manifest); the VmBackend layer
+    // does, from a verified IvdIdentity (covered in backend.rs tests).
     let mut nv = make_nv();
     let mut meta = NvFwMeta::default();
-    meta.fw_version = str_arr("2.1.0");
+    meta.fw_seq = 21;
     nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
-    let val = read_did(&nv, BankSet::Vm1, DID_FW_VERSION, None);
-    assert_eq!(val.as_str(), Some("2.1.0"));
+    assert_eq!(
+        read_did(&nv, BankSet::Vm1, DID_FW_VERSION, None),
+        DidValue::NotFound
+    );
 }
 
 #[test]
-fn did_fw_meta_reads_active_bank() {
+fn did_fw_meta_security_ver_reads_active_bank() {
+    // fw_secver (a KEPT NvFwMeta field, surfaced via DID_CURRENT_SECURITY_VER)
+    // resolves against the active bank — proving per-bank NV resolution
+    // still works for the fields that stayed in NvFwMeta.
     let mut nv = make_nv();
 
-    // Bank A has version 1.0
     let mut meta_a = NvFwMeta::default();
-    meta_a.fw_version = str_arr("1.0");
+    meta_a.fw_secver = 1;
     nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta_a)
         .unwrap();
 
-    // Bank B has version 2.0
     let mut meta_b = NvFwMeta::default();
-    meta_b.fw_version = str_arr("2.0");
+    meta_b.fw_secver = 2;
     nv.write_fw_meta(BankSet::Vm1, Bank::B, &mut meta_b)
         .unwrap();
 
-    // Active bank is A — should read 1.0
-    let val = read_did(&nv, BankSet::Vm1, DID_FW_VERSION, None);
-    assert_eq!(val.as_str(), Some("1.0"));
+    // Active bank is A → secver 1.
+    let val = read_did(&nv, BankSet::Vm1, DID_CURRENT_SECURITY_VER, None);
+    assert_eq!(val, DidValue::Bytes(1u32.to_le_bytes().to_vec()));
 
-    // Switch to B
+    // Switch to B → secver 2.
     let mut state = nv.read_boot_state().unwrap();
     state.banks[1].active_bank = Bank::B;
     nv.write_boot_state(&mut state).unwrap();
 
-    let val = read_did(&nv, BankSet::Vm1, DID_FW_VERSION, None);
-    assert_eq!(val.as_str(), Some("2.0"));
+    let val = read_did(&nv, BankSet::Vm1, DID_CURRENT_SECURITY_VER, None);
+    assert_eq!(val, DidValue::Bytes(2u32.to_le_bytes().to_vec()));
 }
 
 #[test]
-fn did_runtime_overrides_fw_meta() {
+fn did_runtime_serves_identity_did() {
+    // A runtime-written value for an identity DID (source 1) is served
+    // directly — the NV-only path otherwise returns NotFound for these
+    // now that they live in the signed manifest.
     let mut nv = make_nv();
 
-    // FW Meta has tester_serial "TOOL-A"
-    let mut meta = NvFwMeta::default();
-    meta.tester_serial = str_arr("TOOL-A");
-    nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
-
-    // Runtime DID with same number overrides it
     write_did(&mut nv, BankSet::Vm1, DID_TESTER_SERIAL, b"TOOL-B").unwrap();
 
     let val = read_did(&nv, BankSet::Vm1, DID_TESTER_SERIAL, None);
@@ -235,9 +239,10 @@ fn ota_install_basic() {
     assert!(!state.banks[1].committed);
     assert_eq!(state.banks[1].boot_count, 0);
 
-    // FW Meta written for B
+    // FW Meta written for B. Identity (version "2.0") lives in the IVD
+    // manifest now; NvFwMeta carries fw_seq/secver/hash.
     let fw = nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
-    assert_eq!(&fw.fw_version[..3], b"2.0");
+    assert_eq!(fw.fw_seq, 2);
     assert_eq!(fw.fw_secver, 2);
     assert_eq!(fw.image_sha256, result.image_sha256);
 }
@@ -417,7 +422,7 @@ fn rollback_rejects_if_committed() {
 fn status_committed() {
     let mut nv = make_nv();
     let mut meta = NvFwMeta::default();
-    meta.fw_version = str_arr("1.0");
+    meta.fw_seq = 1;
     meta.fw_secver = 1;
     meta.min_security_ver = 1;
     nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
@@ -458,7 +463,7 @@ fn full_ota_install_commit_then_new_update() {
 
     // v1 on bank A (initial)
     let mut meta_a = NvFwMeta::default();
-    meta_a.fw_version = str_arr("1.0");
+    meta_a.fw_seq = 1;
     meta_a.fw_secver = 1;
     meta_a.min_security_ver = 0;
     nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta_a)
@@ -496,7 +501,7 @@ fn full_ota_install_commit_then_new_update() {
 
     commit(&mut nv, BankSet::Vm1).unwrap();
     let fw = nv.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
-    assert_eq!(&fw.fw_version[..3], b"3.0");
+    assert_eq!(fw.fw_seq, 3); // version "3.0" now lives in the IVD manifest
     assert_eq!(fw.min_security_ver, 3); // floor raised
 }
 
@@ -663,7 +668,7 @@ fn hsm_install_overwrites_bank_a() {
     assert_eq!(result.target_bank, Bank::A);
 
     let fw = nv.read_fw_meta(BankSet::Hsm, Bank::A).unwrap();
-    assert_eq!(&fw.fw_version[..3], b"2.0");
+    assert_eq!(fw.fw_seq, 2); // version "2.0" now lives in the IVD manifest
     assert_eq!(fw.min_security_ver, 2);
 }
 

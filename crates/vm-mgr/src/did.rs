@@ -3,34 +3,27 @@
 //! Resolution order:
 //!
 //! 1. Runtime DIDs (writable, per-bank) — active bank's NV Runtime
-//! 2. FW Meta DIDs (SW identity, per-bank) — active bank's NV FW Meta
+//! 2. SW-identity DIDs (F187-F19E) — NOT here; sourced from the bank's
+//!    signed IVD manifest at the VmBackend layer (see below).
 //! 3. Factory DIDs (hardware identity, shared) — NV Factory
 //! 4. Dynamic DIDs (computed at runtime)
 //!
-//! FUTURE — single-source SW identity (design note, not yet implemented):
-//! Source 2 (FW Meta — the SW-identity DIDs F188/F189/F194/F195/…) already
-//! DUPLICATES the bank's signed IVD manifest (see `nv_store::types`: "embeds
-//! the same value in the bank's signed IVD manifest"). That hand-synced copy
-//! is a drift risk and a second thing to update on every install. Collapse it
-//! to one source: extend the signed installed manifest to mirror the SUIT
-//! *update* manifest's identity fields (human name, semantic version, sw/part
-//! numbers, component list) — author-once-in-the-manifest, report-everywhere —
-//! derive these identification DIDs from it on read, and RETIRE the FW Meta NV
-//! struct. One signed source then feeds BOTH wires: classic UDS
-//! ReadDataByIdentifier (this `read_did`) AND SOVD `data`/`identData` via the
-//! CDA DID→data mapping (§8) — same field→DID map, two transports. The
-//! manifest is already parsed + signature-verified at boot, so the identity is
-//! free there — but confirm vm-boot sources `gen`/security-version from the
-//! manifest (not this blob) before retiring it; that's the one real migration
-//! risk. Scope = SOURCE 2 ONLY (FW Meta — firmware SW identity). Source 3
-//! (Factory — HW identity: HW number/serial/VIN) is also the spec's `identData`
-//! *category*, but keeps its own factory-provisioning NV truth (it is NOT
-//! carried in the firmware manifest) — do not retire or re-source it. Sources 1
-//! (writable/runtime) and 4 (computed) stay too — the spec's currentData/config,
-//! not identData. NB the signed IVD manifest itself is the source of truth and
-//! is never retired; this only removes the redundant FW Meta *copy* of it.
-//! SOVDd side must also add the `identData` category machinery (data-categories,
-//! `?categories`, `x-sovd-data-category`) to surface it — all currently absent.
+//! Single-source SW identity (implemented): the firmware SW-identity DIDs
+//! (F187 spare-part, F188 ecu-sw, F189 fw-version, F194/F195 supplier sw
+//! number/version, F197 system-name, F198 tester-serial, F199 programming-date,
+//! F19E odx-file-id) used to be copied into the FW Meta NV blob — a hand-synced
+//! duplicate of the bank's signed IVD manifest and a drift risk. They now live
+//! ONLY in the signed manifest (`hsm::ivd::IvdIdentity`), authored once at sign
+//! time and authenticated by the HSM signature. `read_did` no longer serves
+//! them; the VmBackend intercepts them from a cached, signature-verified
+//! `IvdIdentity` for the running bank (`backend.rs::identity_did_bytes`),
+//! invalidated on install/commit. One signed source feeds both wires: classic
+//! UDS ReadDataByIdentifier AND SOVD `data`/`identData`. Boot is untouched —
+//! vm-boot reads only `image_sha256` + boot-state from this blob, never the
+//! identity. Scope was SW identity (former FW Meta source 2) ONLY. Source 3
+//! (Factory — HW identity: HW number/serial/VIN) keeps its own
+//! factory-provisioning NV truth (NOT carried in the firmware manifest) and is
+//! unchanged. Sources 1 (writable/runtime) and 4 (computed) stay too.
 #![allow(clippy::field_reassign_with_default)]
 
 use nv_store::block::BlockDevice;
@@ -111,24 +104,16 @@ pub fn read_did<D: BlockDevice>(
         }
     }
 
-    // 2. Check FW Meta DIDs (SW identity, per-bank)
-    if let Some(meta) = nv.read_fw_meta(set, active) {
-        let val = match did {
-            DID_SPARE_PART_NUMBER => Some(meta.spare_part_number.to_vec()),
-            DID_ECU_SW_NUMBER => Some(meta.ecu_sw_number.to_vec()),
-            DID_FW_VERSION => Some(meta.fw_version.to_vec()),
-            DID_SUPPLIER_SW_NUMBER => Some(meta.supplier_sw_number.to_vec()),
-            DID_SUPPLIER_SW_VERSION => Some(meta.supplier_sw_version.to_vec()),
-            DID_SYSTEM_NAME => Some(meta.system_name.to_vec()),
-            DID_TESTER_SERIAL => Some(meta.tester_serial.to_vec()),
-            DID_PROGRAMMING_DATE => Some(meta.programming_date.to_vec()),
-            DID_ODX_FILE_ID => Some(meta.odx_file_id.to_vec()),
-            _ => None,
-        };
-        if let Some(v) = val {
-            return DidValue::Bytes(v);
-        }
-    }
+    // 2. SW-identity DIDs (F187-F19E) are NO LONGER sourced from FW Meta.
+    //    They now live in the bank's signed IVD manifest
+    //    (`hsm::ivd::IvdIdentity`) — the single signed source. Because
+    //    that read needs the bank dir + HSM (which this NV-only path
+    //    doesn't have), the VmBackend layer intercepts these DIDs from a
+    //    cached, signature-verified identity before consulting `read_did`
+    //    (see `backend.rs::identity_did_bytes`). If `read_did` is reached
+    //    for one of them (e.g. the standalone `vm-diagserver read-did`
+    //    CLI with no HSM), it falls through to NotFound below — correct,
+    //    since this path can't authenticate the manifest.
 
     // 3. Check Factory DIDs (hardware identity, shared)
     if let Some(factory) = nv.read_factory() {
@@ -272,17 +257,35 @@ mod tests {
     }
 
     #[test]
-    fn read_did_fw_meta_returns_spare_part_number() {
+    fn read_did_does_not_source_sw_identity_from_fw_meta() {
+        // SW-identity DIDs (F187-F19E) moved to the signed IVD manifest.
+        // The NV-only `read_did` path no longer serves them — it can't
+        // authenticate the manifest. The VmBackend layer intercepts
+        // these from a verified IvdIdentity instead (see backend.rs).
         let mut nv = make_nv();
         init_boot_state(&mut nv);
 
+        // Even with FW Meta present, the identity DIDs are NotFound here.
         let mut meta = NvFwMeta::default();
-        meta.spare_part_number[..5].copy_from_slice(b"SP-42");
+        meta.fw_seq = 5;
         nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
 
-        match read_did(&nv, BankSet::Vm1, DID_SPARE_PART_NUMBER, None) {
-            DidValue::Bytes(b) => assert_eq!(&b[..5], b"SP-42"),
-            DidValue::NotFound => panic!("expected bytes"),
+        for did in [
+            DID_SPARE_PART_NUMBER,
+            DID_ECU_SW_NUMBER,
+            DID_FW_VERSION,
+            DID_SUPPLIER_SW_NUMBER,
+            DID_SUPPLIER_SW_VERSION,
+            DID_SYSTEM_NAME,
+            DID_TESTER_SERIAL,
+            DID_PROGRAMMING_DATE,
+            DID_ODX_FILE_ID,
+        ] {
+            assert_eq!(
+                read_did(&nv, BankSet::Vm1, did, None),
+                DidValue::NotFound,
+                "DID {did:#06X} must not be served from NvFwMeta anymore"
+            );
         }
     }
 

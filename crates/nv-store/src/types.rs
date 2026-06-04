@@ -109,7 +109,7 @@ pub const MAX_TRIAL_BOOTS: u8 = 10;
 // NV partition magic numbers (sector validation)
 pub const MAGIC_BOOT: u32 = 0x4E564231; // "NVB1"
 pub const MAGIC_FACTORY: u32 = 0x4E564631; // "NVF1"
-pub const MAGIC_FW_META: u32 = 0x4E564D31; // "NVM1"
+pub const MAGIC_FW_META: u32 = 0x4E564D32; // "NVM2" (v2: SW identity moved to signed IVD manifest)
 pub const MAGIC_RUNTIME: u32 = 0x4E565231; // "NVR1"
 pub const MAGIC_APP: u32 = 0x4E564131; // "NVA1"
 
@@ -366,29 +366,33 @@ impl NvRecord for NvFactory {
     }
 }
 
-/// Per-bank firmware metadata — SW identity DIDs.
+/// Per-bank firmware metadata — boot/install state only.
 ///
-/// Wire format (324 bytes):
+/// SW-identity DIDs (F187-F19E: fw_version, spare/ecu/supplier sw
+/// numbers + versions, odx file id, system name, programming date,
+/// tester serial) used to live here too. They were a hand-synced
+/// duplicate of the bank's signed IVD manifest and a drift risk, so
+/// they now live ONLY in the manifest (`hsm::ivd::IvdIdentity`) — the
+/// single signed source. `vm-mgr::did` derives the identification DIDs
+/// from there on read. This record keeps only the fields the boot /
+/// OTA-install path needs.
+///
+/// Wire format (64 bytes):
 /// ```text
-/// [0..4]     magic (NVM1)
+/// [0..4]     magic (NVM2)
 /// [4..8]     write_seq
-/// [8..40]    fw_version (32)           F189
-/// [40..44]   fw_seq
-/// [44..48]   fw_secver
-/// [48..52]   fw_crc
-/// [52..84]   image_sha256 (32)
-/// [84..116]  spare_part_number (32)    F187
-/// [116..148] ecu_sw_number (32)        F188
-/// [148..180] supplier_sw_number (32)   F194
-/// [180..212] supplier_sw_version (32)  F195
-/// [212..244] odx_file_id (32)          F19E
-/// [244..276] system_name (32)          F197
-/// [276..284] programming_date (8)      F199
-/// [284..316] tester_serial (32)        F198
-/// [316..320] min_security_ver
-/// [320..328] gen (u64, install-time generation counter)
-/// [328..332] padding
+/// [8..12]    fw_seq
+/// [12..16]   fw_secver
+/// [16..20]   fw_crc
+/// [20..52]   image_sha256 (32)
+/// [52..56]   min_security_ver
+/// [56..64]   gen (u64, install-time generation counter)
 /// ```
+///
+/// The MAGIC bumped (NVM1 → NVM2) with this layout change, so any v1
+/// blob on an existing device is rejected on read and forces a
+/// re-flash — the same contract as the v2→v3 IVD manifest bump that
+/// carries the identity now.
 ///
 /// `gen` is the IVD anti-rollback counter:
 /// - At install time the caller writes `nv.committed_gen + 1` here
@@ -403,19 +407,10 @@ impl NvRecord for NvFactory {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NvFwMeta {
     pub write_seq: u32,
-    pub fw_version: [u8; 32],
     pub fw_seq: u32,
     pub fw_secver: u32,
     pub fw_crc: u32,
     pub image_sha256: [u8; 32],
-    pub spare_part_number: [u8; 32],
-    pub ecu_sw_number: [u8; 32],
-    pub supplier_sw_number: [u8; 32],
-    pub supplier_sw_version: [u8; 32],
-    pub odx_file_id: [u8; 32],
-    pub system_name: [u8; 32],
-    pub programming_date: [u8; 8],
-    pub tester_serial: [u8; 32],
     pub min_security_ver: u32,
     pub gen: u64,
 }
@@ -424,7 +419,7 @@ impl NvRecord for NvFwMeta {
     const MAGIC: u32 = MAGIC_FW_META;
 
     fn size() -> usize {
-        332
+        64
     }
 
     fn write_seq(&self) -> u32 {
@@ -438,21 +433,12 @@ impl NvRecord for NvFwMeta {
     fn serialize(&self, buf: &mut [u8]) {
         put_u32_le(buf, 0, Self::MAGIC);
         put_u32_le(buf, 4, self.write_seq);
-        put_bytes(buf, 8, &self.fw_version);
-        put_u32_le(buf, 40, self.fw_seq);
-        put_u32_le(buf, 44, self.fw_secver);
-        put_u32_le(buf, 48, self.fw_crc);
-        put_bytes(buf, 52, &self.image_sha256);
-        put_bytes(buf, 84, &self.spare_part_number);
-        put_bytes(buf, 116, &self.ecu_sw_number);
-        put_bytes(buf, 148, &self.supplier_sw_number);
-        put_bytes(buf, 180, &self.supplier_sw_version);
-        put_bytes(buf, 212, &self.odx_file_id);
-        put_bytes(buf, 244, &self.system_name);
-        put_bytes(buf, 276, &self.programming_date);
-        put_bytes(buf, 284, &self.tester_serial);
-        put_u32_le(buf, 316, self.min_security_ver);
-        put_u64_le(buf, 320, self.gen);
+        put_u32_le(buf, 8, self.fw_seq);
+        put_u32_le(buf, 12, self.fw_secver);
+        put_u32_le(buf, 16, self.fw_crc);
+        put_bytes(buf, 20, &self.image_sha256);
+        put_u32_le(buf, 52, self.min_security_ver);
+        put_u64_le(buf, 56, self.gen);
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
@@ -461,21 +447,12 @@ impl NvRecord for NvFwMeta {
         }
         Some(Self {
             write_seq: get_u32_le(buf, 4),
-            fw_version: get_bytes(buf, 8),
-            fw_seq: get_u32_le(buf, 40),
-            fw_secver: get_u32_le(buf, 44),
-            fw_crc: get_u32_le(buf, 48),
-            image_sha256: get_bytes(buf, 52),
-            spare_part_number: get_bytes(buf, 84),
-            ecu_sw_number: get_bytes(buf, 116),
-            supplier_sw_number: get_bytes(buf, 148),
-            supplier_sw_version: get_bytes(buf, 180),
-            odx_file_id: get_bytes(buf, 212),
-            system_name: get_bytes(buf, 244),
-            programming_date: get_bytes(buf, 276),
-            tester_serial: get_bytes(buf, 284),
-            min_security_ver: get_u32_le(buf, 316),
-            gen: get_u64_le(buf, 320),
+            fw_seq: get_u32_le(buf, 8),
+            fw_secver: get_u32_le(buf, 12),
+            fw_crc: get_u32_le(buf, 16),
+            image_sha256: get_bytes(buf, 20),
+            min_security_ver: get_u32_le(buf, 52),
+            gen: get_u64_le(buf, 56),
         })
     }
 }

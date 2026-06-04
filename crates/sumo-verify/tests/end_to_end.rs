@@ -85,7 +85,7 @@ fn verifies_a_signed_bank() {
     // per-install generation counter the NV layer would assign; the
     // CLI's `--expect-install-gen` pins it on read.
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
-    ivd::sign_bank(&hsm, &bank, 7).unwrap();
+    ivd::sign_bank(&hsm, &bank, 7, ivd::IvdIdentity::default()).unwrap();
 
     let out = Command::new(binary())
         .arg("--bank")
@@ -121,7 +121,7 @@ fn rejects_tampered_file() {
     std::fs::write(bank.join("rootfs.img"), vec![0u8; 2048]).unwrap();
 
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
-    ivd::sign_bank(&hsm, &bank, 11).unwrap();
+    ivd::sign_bank(&hsm, &bank, 11, ivd::IvdIdentity::default()).unwrap();
 
     // Tamper post-sign.
     std::fs::write(bank.join("kernel"), b"tampered\0\0\0\0").unwrap();
@@ -149,7 +149,7 @@ fn rejects_unexpected_extra_file() {
     std::fs::write(bank.join("kernel"), b"k").unwrap();
 
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
-    ivd::sign_bank(&hsm, &bank, 1).unwrap();
+    ivd::sign_bank(&hsm, &bank, 1, ivd::IvdIdentity::default()).unwrap();
 
     // Drop an extra file the manifest never authorised.
     std::fs::write(bank.join("evil-payload"), b"sneaky").unwrap();
@@ -183,7 +183,7 @@ fn rejects_install_gen_mismatch() {
     // between-slot swap detection case that motivated the v2
     // manifest format).
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
-    ivd::sign_bank(&hsm, &bank, 5).unwrap();
+    ivd::sign_bank(&hsm, &bank, 5, ivd::IvdIdentity::default()).unwrap();
 
     let out = Command::new(binary())
         .arg("--bank")
@@ -260,7 +260,7 @@ fn quiet_suppresses_stdout_on_success() {
     std::fs::write(bank.join("kernel"), b"k").unwrap();
 
     let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
-    ivd::sign_bank(&hsm, &bank, 3).unwrap();
+    ivd::sign_bank(&hsm, &bank, 3, ivd::IvdIdentity::default()).unwrap();
 
     let out = Command::new(binary())
         .arg("--bank")

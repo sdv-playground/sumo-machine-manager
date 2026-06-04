@@ -72,27 +72,27 @@ fn factory_roundtrip() {
 #[test]
 fn fw_meta_roundtrip() {
     let mut store = make_store();
+    // NvFwMeta carries boot/install state only — SW identity moved to
+    // the signed IVD manifest (hsm::ivd::IvdIdentity).
     let mut meta = NvFwMeta::default();
-    meta.fw_version[..5].copy_from_slice(b"1.2.3");
     meta.fw_seq = 10;
     meta.fw_secver = 3;
     meta.fw_crc = 0xDEADBEEF;
     meta.image_sha256 = [0xAA; 32];
-    meta.spare_part_number[..4].copy_from_slice(b"SP01");
     meta.min_security_ver = 2;
+    meta.gen = 7;
 
     store
         .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta)
         .unwrap();
     let read = store.read_fw_meta(BankSet::Vm1, Bank::A).unwrap();
 
-    assert_eq!(&read.fw_version[..5], b"1.2.3");
     assert_eq!(read.fw_seq, 10);
     assert_eq!(read.fw_secver, 3);
     assert_eq!(read.fw_crc, 0xDEADBEEF);
     assert_eq!(read.image_sha256, [0xAA; 32]);
-    assert_eq!(&read.spare_part_number[..4], b"SP01");
     assert_eq!(read.min_security_ver, 2);
+    assert_eq!(read.gen, 7);
 
     // Bank B should be empty
     assert!(store.read_fw_meta(BankSet::Vm1, Bank::B).is_none());
@@ -285,23 +285,24 @@ fn empty_device_returns_none() {
 fn bank_sets_are_isolated() {
     let mut store = make_store();
 
-    // Write to VM1 Bank A
+    // Write to VM1 Bank A. fw_seq distinguishes the records now that
+    // the version string lives in the IVD manifest, not this blob.
     let mut meta1 = NvFwMeta::default();
-    meta1.fw_version[..3].copy_from_slice(b"1.0");
+    meta1.fw_seq = 10;
     store
         .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta1)
         .unwrap();
 
     // Write to VM2 Bank A
     let mut meta2 = NvFwMeta::default();
-    meta2.fw_version[..3].copy_from_slice(b"2.0");
+    meta2.fw_seq = 20;
     store
         .write_fw_meta(BankSet::Vm2, Bank::A, &mut meta2)
         .unwrap();
 
     // Write to VM1 Bank B
     let mut meta3 = NvFwMeta::default();
-    meta3.fw_version[..3].copy_from_slice(b"1.1");
+    meta3.fw_seq = 11;
     store
         .write_fw_meta(BankSet::Vm1, Bank::B, &mut meta3)
         .unwrap();
@@ -311,9 +312,9 @@ fn bank_sets_are_isolated() {
     let r2a = store.read_fw_meta(BankSet::Vm2, Bank::A).unwrap();
     let r1b = store.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
 
-    assert_eq!(&r1a.fw_version[..3], b"1.0");
-    assert_eq!(&r2a.fw_version[..3], b"2.0");
-    assert_eq!(&r1b.fw_version[..3], b"1.1");
+    assert_eq!(r1a.fw_seq, 10);
+    assert_eq!(r2a.fw_seq, 20);
+    assert_eq!(r1b.fw_seq, 11);
 
     // Hyp should be untouched
     assert!(store.read_fw_meta(BankSet::HostOs, Bank::A).is_none());

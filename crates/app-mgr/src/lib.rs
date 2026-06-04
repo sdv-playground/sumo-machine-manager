@@ -269,15 +269,11 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             .map(|s| s.banks[BankSet::App.as_index()].committed)
             .unwrap_or(true);
 
-        let version = active_meta
-            .as_ref()
-            .map(|m| {
-                String::from_utf8_lossy(&m.fw_version)
-                    .trim_end_matches('\0')
-                    .to_string()
-            })
-            .unwrap_or_default();
-
+        // The firmware version string moved out of NvFwMeta into the
+        // bank's signed IVD manifest (single-source SW identity). This
+        // component has no HSM to verify that signature, so it no longer
+        // surfaces a version label here. NvFwMeta still works as the
+        // "has this bank ever been flashed" sentinel below.
         // No fw_meta on either bank → never OTA'd → factory-fresh.
         let flash_state = if active_meta.is_none() && previous_meta.is_none() {
             FlashState::Initial
@@ -294,11 +290,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             // Matches VmBackend's pattern of reporting config.supports_rollback.
             supports_rollback: true,
             state: flash_state,
-            active_version: if version.is_empty() {
-                None
-            } else {
-                Some(version)
-            },
+            active_version: None,
             previous_version: None,
             // Container image import + service restart — local-only.
             reset_kind: ResetKind::Local,

@@ -60,6 +60,12 @@ impl std::fmt::Display for OtaError {
 }
 
 /// Metadata for an incoming OTA image (parsed from image header).
+///
+/// The identity fields here (fw_version, part/sw numbers, …) are the
+/// SUIT-extracted firmware identity. They are NOT written to NV — at
+/// sign time `ImageMeta::to_ivd_identity` converts them to the readable
+/// `IvdIdentity` carried inside the bank's signed IVD manifest, which is
+/// the single source the UDS identification DIDs read from.
 #[derive(Debug, Clone, Default)]
 pub struct ImageMeta {
     pub fw_version: [u8; 32],
@@ -73,6 +79,35 @@ pub struct ImageMeta {
     pub system_name: [u8; 32],
     pub programming_date: [u8; 8],
     pub tester_serial: [u8; 32],
+}
+
+/// Trim trailing NULs from a fixed-width NV/identity field and return
+/// the UTF-8 prefix as an owned `String` (lossy on invalid UTF-8).
+fn fixed_field_to_string(field: &[u8]) -> String {
+    let end = field.iter().position(|&c| c == 0).unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end]).into_owned()
+}
+
+impl ImageMeta {
+    /// Project the SUIT-extracted identity into the readable
+    /// [`hsm::ivd::IvdIdentity`] stored inside the signed IVD manifest.
+    /// `name` mirrors `system_name` (the SUIT model/system name) — the
+    /// manifest's human label.
+    pub fn to_ivd_identity(&self) -> hsm::ivd::IvdIdentity {
+        let system_name = fixed_field_to_string(&self.system_name);
+        hsm::ivd::IvdIdentity {
+            name: system_name.clone(),
+            version: fixed_field_to_string(&self.fw_version),
+            ecu_sw_number: fixed_field_to_string(&self.ecu_sw_number),
+            supplier_sw_number: fixed_field_to_string(&self.supplier_sw_number),
+            supplier_sw_version: fixed_field_to_string(&self.supplier_sw_version),
+            spare_part_number: fixed_field_to_string(&self.spare_part_number),
+            odx_file_id: fixed_field_to_string(&self.odx_file_id),
+            system_name,
+            programming_date: fixed_field_to_string(&self.programming_date),
+            tester_serial: fixed_field_to_string(&self.tester_serial),
+        }
+    }
 }
 
 /// Result of a successful install.
@@ -205,21 +240,16 @@ fn install_inner<D: BlockDevice>(
         let prev_gen = nv.read_fw_meta(set, Bank::A).map(|m| m.gen).unwrap_or(0);
         let next_gen = prev_gen + 1;
 
+        // SW identity (fw_version, part/sw numbers, …) is NOT written
+        // here — it lives in the bank's signed IVD manifest, sealed by
+        // `ivd_sign_staged_bank`. This record carries boot/install
+        // state only.
         let mut fw_meta = NvFwMeta {
             write_seq: 0,
-            fw_version: meta.fw_version,
             fw_seq: meta.fw_seq,
             fw_secver: meta.fw_secver,
             fw_crc,
             image_sha256,
-            spare_part_number: meta.spare_part_number,
-            ecu_sw_number: meta.ecu_sw_number,
-            supplier_sw_number: meta.supplier_sw_number,
-            supplier_sw_version: meta.supplier_sw_version,
-            odx_file_id: meta.odx_file_id,
-            system_name: meta.system_name,
-            programming_date: meta.programming_date,
-            tester_serial: meta.tester_serial,
             min_security_ver,
             gen: next_gen,
         };
@@ -257,21 +287,14 @@ fn install_inner<D: BlockDevice>(
         let committed_gen = nv.read_fw_meta(set, active).map(|m| m.gen).unwrap_or(0);
         let next_gen = committed_gen + 1;
 
+        // SW identity is sealed into the target bank's signed IVD
+        // manifest by `ivd_sign_staged_bank`, not duplicated here.
         let mut fw_meta = NvFwMeta {
             write_seq: 0,
-            fw_version: meta.fw_version,
             fw_seq: meta.fw_seq,
             fw_secver: meta.fw_secver,
             fw_crc,
             image_sha256,
-            spare_part_number: meta.spare_part_number,
-            ecu_sw_number: meta.ecu_sw_number,
-            supplier_sw_number: meta.supplier_sw_number,
-            supplier_sw_version: meta.supplier_sw_version,
-            odx_file_id: meta.odx_file_id,
-            system_name: meta.system_name,
-            programming_date: meta.programming_date,
-            tester_serial: meta.tester_serial,
             min_security_ver,
             gen: next_gen,
         };
@@ -341,12 +364,16 @@ pub fn rollback<D: BlockDevice>(nv: &mut NvStore<D>, set: BankSet) -> Result<Ban
 }
 
 /// Query the status of a bank set.
+///
+/// Note: the firmware version string is no longer here — it lives in
+/// the bank's signed IVD manifest (`hsm::ivd::IvdIdentity`). Callers
+/// that need a version label read it from there (the VmBackend caches
+/// the verified identity per running bank).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BankStatus {
     pub active_bank: Bank,
     pub committed: bool,
     pub boot_count: u8,
-    pub fw_version: Option<[u8; 32]>,
     pub fw_secver: Option<u32>,
     pub min_security_ver: Option<u32>,
 }
@@ -360,7 +387,6 @@ pub fn status<D: BlockDevice>(nv: &NvStore<D>, set: BankSet) -> Option<BankStatu
         active_bank: bs.active_bank,
         committed: bs.committed,
         boot_count: bs.boot_count,
-        fw_version: meta.as_ref().map(|m| m.fw_version),
         fw_secver: meta.as_ref().map(|m| m.fw_secver),
         min_security_ver: meta.as_ref().map(|m| m.min_security_ver),
     })

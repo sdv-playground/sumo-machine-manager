@@ -87,13 +87,9 @@ fn main() {
                     println!("Active bank: {}", bank_letter(s.active_bank));
                     println!("Committed: {}", s.committed);
                     println!("Boot count: {}", s.boot_count);
-                    if let Some(v) = s.fw_version {
-                        let end = v.iter().position(|&c| c == 0).unwrap_or(v.len());
-                        println!(
-                            "FW version: {}",
-                            std::str::from_utf8(&v[..end]).unwrap_or("?")
-                        );
-                    }
+                    // FW version string lives in the bank's signed IVD
+                    // manifest now, not NvFwMeta — not shown by this
+                    // NV-only status command.
                     if let Some(v) = s.fw_secver {
                         println!("Security version: {v}");
                     }
@@ -241,20 +237,56 @@ fn main() {
 
         "factory-init" => {
             if args.len() < 4 {
-                eprintln!("Usage: factory-init <manifest-dir> [--runner-path <path>]");
+                eprintln!(
+                    "Usage: factory-init <manifest-dir> [--runner-path <path>] \
+                     [--images-dir <dir>] [--hsm-keystore <dir>] [--hsm-port <port>]"
+                );
                 std::process::exit(1);
             }
             let dir = PathBuf::from(&args[3]);
             let mut runner_path: Option<PathBuf> = None;
+            let mut images_dir: Option<PathBuf> = None;
+            let mut hsm_keystore: Option<PathBuf> = None;
+            let mut hsm_port: u16 = 5100;
             let mut i = 4;
             while i < args.len() {
                 if args[i] == "--runner-path" && i + 1 < args.len() {
                     runner_path = Some(PathBuf::from(&args[i + 1]));
                     i += 2;
+                } else if args[i] == "--images-dir" && i + 1 < args.len() {
+                    images_dir = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else if args[i] == "--hsm-keystore" && i + 1 < args.len() {
+                    hsm_keystore = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else if args[i] == "--hsm-port" && i + 1 < args.len() {
+                    hsm_port = args[i + 1].parse().unwrap_or(5100);
+                    i += 2;
                 } else {
                     i += 1;
                 }
             }
+
+            // When both an images dir (for bank dirs) and an HSM keystore
+            // are supplied, factory-init seals the factory SW identity into
+            // each bank's signed IVD manifest — the single source for the
+            // F187-F19E identification DIDs (they no longer live in NV).
+            // Mirror the server's HSM bring-up: a SimHsm with device keys
+            // ensured (creates the `ivd-signing` slot). Without these
+            // flags, identity isn't sealed anywhere (the bank gets its
+            // signed manifest at the first OTA flash instead).
+            let factory_hsm = match (&images_dir, &hsm_keystore) {
+                (Some(_), Some(ks)) => {
+                    let hsm =
+                        hsm::sim::SimHsm::new(PathBuf::from("vhsm-test-ssd"), ks.clone(), hsm_port);
+                    if let Err(e) = hsm.ensure_device_keys() {
+                        eprintln!("[factory] failed to ensure HSM device keys: {e}");
+                        std::process::exit(1);
+                    }
+                    Some(hsm)
+                }
+                _ => None,
+            };
 
             // Provision factory data
             let factory_yaml = dir.join("factory.yaml");
@@ -333,21 +365,14 @@ fn main() {
                 }
 
                 let meta = manifest.to_image_meta();
+                // NvFwMeta carries boot/install state only — SW identity
+                // goes into the signed IVD manifest below.
                 let mut fw_meta = NvFwMeta {
                     write_seq: 0,
-                    fw_version: meta.fw_version,
                     fw_seq: meta.fw_seq,
                     fw_secver: meta.fw_secver,
                     fw_crc,
                     image_sha256,
-                    spare_part_number: meta.spare_part_number,
-                    ecu_sw_number: meta.ecu_sw_number,
-                    supplier_sw_number: meta.supplier_sw_number,
-                    supplier_sw_version: meta.supplier_sw_version,
-                    odx_file_id: meta.odx_file_id,
-                    system_name: meta.system_name,
-                    programming_date: meta.programming_date,
-                    tester_serial: meta.tester_serial,
                     min_security_ver: 0,
                     // Factory baseline; first OTA install ratchets to 1.
                     gen: 0,
@@ -358,6 +383,31 @@ fn main() {
                     "[factory] {name}: wrote FW meta bank A (version: {})",
                     manifest.version
                 );
+
+                // Seal the factory SW identity into bank A's signed IVD
+                // manifest — the single source for the identification DIDs.
+                // gen=0 matches the factory NvFwMeta baseline above.
+                if let (Some(ref hsm), Some(ref images)) = (&factory_hsm, &images_dir) {
+                    let bank_dir = images.join(name).join("bank_a");
+                    if let Err(e) = std::fs::create_dir_all(&bank_dir) {
+                        eprintln!(
+                            "[factory] {name}: create bank dir {}: {e}",
+                            bank_dir.display()
+                        );
+                        std::process::exit(1);
+                    }
+                    let identity = meta.to_ivd_identity();
+                    match hsm::ivd::sign_bank(hsm, &bank_dir, 0, identity) {
+                        Ok(_) => println!(
+                            "[factory] {name}: signed IVD identity manifest in {}",
+                            bank_dir.display()
+                        ),
+                        Err(e) => {
+                            eprintln!("[factory] {name}: IVD identity sign failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
             }
 
             println!("[factory] initialization complete");
