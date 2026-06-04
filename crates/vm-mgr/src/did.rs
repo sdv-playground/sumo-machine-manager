@@ -6,6 +6,27 @@
 //! 2. FW Meta DIDs (SW identity, per-bank) — active bank's NV FW Meta
 //! 3. Factory DIDs (hardware identity, shared) — NV Factory
 //! 4. Dynamic DIDs (computed at runtime)
+//!
+//! FUTURE — single-source SW identity (design note, not yet implemented):
+//! Source 2 (FW Meta — the SW-identity DIDs F188/F189/F194/F195/…) already
+//! DUPLICATES the bank's signed IVD manifest (see `nv_store::types`: "embeds
+//! the same value in the bank's signed IVD manifest"). That hand-synced copy
+//! is a drift risk and a second thing to update on every install. Collapse it
+//! to one source: extend the signed installed manifest to mirror the SUIT
+//! *update* manifest's identity fields (human name, semantic version, sw/part
+//! numbers, component list) — author-once-in-the-manifest, report-everywhere —
+//! derive these identification DIDs from it on read, and RETIRE the FW Meta NV
+//! struct. One signed source then feeds BOTH wires: classic UDS
+//! ReadDataByIdentifier (this `read_did`) AND SOVD `data`/`identData` via the
+//! CDA DID→data mapping (§8) — same field→DID map, two transports. The
+//! manifest is already parsed + signature-verified at boot, so the identity is
+//! free there — but confirm vm-boot sources `gen`/security-version from the
+//! manifest (not this blob) before retiring it; that's the one real migration
+//! risk. Scope = fixed-identity DIDs (sources 2+3 = the spec's `identData`);
+//! writable/runtime DIDs (source 1) and computed ones (source 4) stay — they
+//! are the spec's currentData/config, not identData. SOVDd side must also add
+//! the `identData` category machinery (data-categories, `?categories`,
+//! `x-sovd-data-category`) to surface it — all currently absent there.
 #![allow(clippy::field_reassign_with_default)]
 
 use nv_store::block::BlockDevice;
