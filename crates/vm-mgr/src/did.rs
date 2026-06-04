@@ -22,11 +22,15 @@
 //! manifest is already parsed + signature-verified at boot, so the identity is
 //! free there — but confirm vm-boot sources `gen`/security-version from the
 //! manifest (not this blob) before retiring it; that's the one real migration
-//! risk. Scope = fixed-identity DIDs (sources 2+3 = the spec's `identData`);
-//! writable/runtime DIDs (source 1) and computed ones (source 4) stay — they
-//! are the spec's currentData/config, not identData. SOVDd side must also add
-//! the `identData` category machinery (data-categories, `?categories`,
-//! `x-sovd-data-category`) to surface it — all currently absent there.
+//! risk. Scope = SOURCE 2 ONLY (FW Meta — firmware SW identity). Source 3
+//! (Factory — HW identity: HW number/serial/VIN) is also the spec's `identData`
+//! *category*, but keeps its own factory-provisioning NV truth (it is NOT
+//! carried in the firmware manifest) — do not retire or re-source it. Sources 1
+//! (writable/runtime) and 4 (computed) stay too — the spec's currentData/config,
+//! not identData. NB the signed IVD manifest itself is the source of truth and
+//! is never retired; this only removes the redundant FW Meta *copy* of it.
+//! SOVDd side must also add the `identData` category machinery (data-categories,
+//! `?categories`, `x-sovd-data-category`) to surface it — all currently absent.
 #![allow(clippy::field_reassign_with_default)]
 
 use nv_store::block::BlockDevice;
