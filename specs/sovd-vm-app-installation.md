@@ -59,10 +59,11 @@ From current vm-mgr anchors:
 
 ### SOVD and Routing
 
-From current SOVD anchors:
+From current SOVDd repo implementation:
 
-- Sub-entity app routes were retired; `/apps/{app_id}/updates` is not plumbed.
-- Current update route: `/vehicle/v1/components/{id}/updates` → host VM bank authority.
+- Current update route: `/vehicle/v1/components/{id}/updates` → host VM bank authority (component-scoped).
+- App-scoped updates at `/vehicle/v1/components/{id}/apps/{app_id}/updates` are not currently plumbed in this repo, though they are compatible with the SOVD standard model (see SOVD Standard Alignment section below).
+- App image delivery through the hypervisor-managed update route (component-scoped) is the current implementation.
 
 From `supernova-host-qnx/examples/gateway.toml`:
 
@@ -87,7 +88,7 @@ SOVD client
   → VM sees read-only app image attachments after boot
 ```
 
-Do not use `/apps/{app_id}/updates` as the initial architecture. Current SOVD code explicitly declares that route not plumbed.
+The current repo implementation uses `/vehicle/v1/components/{id}/updates` (component-scoped) for app image delivery. This is a current implementation mapping, not a SOVD standard limitation. The ISO/SOVD model supports app-scoped updates at `/vehicle/v1/components/{id}/apps/{app_id}/updates` when an app entity exposes the standardized `updates` resource collection. App-scoped updates are deferred to a future repo iteration.
 
 ### 4.2 Trust Boundary
 
@@ -217,7 +218,58 @@ The architecture does not mandate the mechanism — only that the host validates
 
 ---
 
-## 5. Alternatives
+## 5. SOVD Standard Alignment
+
+This section clarifies how the architecture maps to the ISO 17978 (SOVD) standard model as described in `docs/sovd_iso17978_spec.yaml`.
+
+### SOVD Entity and Resource Model
+
+According to the standard:
+
+- **Entity types**: `component` (HW/SW that can be updated) and `app` (application running on a component) are both valid entity types.
+- **Resource collections**: Each entity type may expose standardized resource collections, including `updates`.
+- **Update resource**: The `updates` collection provides endpoints to query, register, prepare, execute, and track software update packages.
+
+The entity path for updates follows the pattern:
+
+```
+/{entity-path}/updates         # Query available packages
+/{entity-path}/updates/{id}    # Read package details
+/{entity-path}/updates/{id}/automated
+/{entity-path}/updates/{id}/prepare
+/{entity-path}/updates/{id}/execute
+/{entity-path}/updates/{id}/status
+/{entity-path}/updates/{id}/delete
+POST /{entity-path}/updates    # Register/upload a package
+```
+
+Both `component` and `app` entities are allowed to expose `updates` and all 13 standardized resource collections per Table 8 of ISO 17978-3.
+
+### Current Repo Implementation
+
+The current SOVDd repo maps software updates as follows:
+
+- **Component-scoped**: `/vehicle/v1/components/{id}/updates` is implemented and plumbed. This is the current delivery route for VM bank updates (including app images composed with the OS).
+- **App-scoped**: `/vehicle/v1/components/{id}/apps/{app_id}/updates` is not currently implemented. This is a repo implementation choice, not a SOVD standard limitation.
+
+### App-Scoped Update Behavior (Future)
+
+When app-scoped updates are plumbed in a future repo iteration:
+
+- An app entity would expose the `updates` resource collection.
+- Clients could register and execute update packages targeting individual applications.
+- The update lifecycle (query, prepare, execute, status, delete, automated) would follow the standard SOVD semantics.
+- The update package content, bank composition, SUIT payload structure, and delta/reuse strategy would remain manufacturer decisions (ExVe/hypervisor architecture behind the SOVD API).
+- An app-scoped update would need to satisfy the same validation rules as component-scoped updates: SUIT envelope authenticity, payload digest verification, anti-rollback checks, source-lock constraints.
+- Commit and rollback semantics would follow the same trial/commit model as component updates (or an app-specific trial model, depending on implementation).
+
+### Campaigns Extension
+
+The endpoint `/vehicle/v1/campaigns` (and related campaign orchestration) is a repository/orchestrator extension not present in the ISO 17978 standard. This allows the repo to stage multi-ECU update campaigns and track their progress. Clients and servers that require strict ISO 17978 conformance should treat campaigns as optional/vendor-specific.
+
+---
+
+## 6. Alternatives
 
 ### Alternative A: VM-bank composition artifacts (RECOMMENDED)
 
@@ -242,10 +294,11 @@ Apps become independently updateable SOVD sub-entities.
 
 **Pros:**
 - Natural app-level targeting for large fleets
+- Aligned with ISO 17978 standard model (app entities can expose `updates` resource collection)
 - Could enable independent app lifecycle management
 
 **Cons:**
-- Current API says this route is not plumbed
+- Not plumbed in current SOVDd repo code
 - More complex routing and security validation
 - Harder to preserve VM-bank atomicity and rollback semantics
 - Requires parallel update orchestration logic
@@ -285,9 +338,9 @@ Current app-mgr handles container image import/runtime.
 
 ---
 
-## 6. SOVD Routing Model
+## 7. SOVDd Repo Routing Model
 
-### Initial: VM Update Route
+### Initial: VM Update Route (Component-Scoped)
 
 ```
 POST /vehicle/v1/components/vm1/updates
@@ -301,20 +354,20 @@ POST /vehicle/v1/components/vm1/updates
   → swaps on next boot
 ```
 
-This route is already defined in `sovd-api` and `vm-mgr`. No new endpoints.
+This route is already defined in `sovd-api` and `vm-mgr`. No new endpoints. This is the current SOVDd repo implementation mapping.
 
 ### Future: App Sub-entity Route (Deferred)
 
-When `/apps/{app_id}/updates` is plumbed (phase 2+), it would enable:
+When `/vehicle/v1/components/{id}/apps/{app_id}/updates` is plumbed (phase 2+), it would enable:
 - Direct app targeting without VM involvement
-- Independent app lifecycle
+- Independent app lifecycle (though still subject to VM bank trial/commit if composed atomically)
 - But adds complexity that's not required for phase 1
 
 **Open question:** Should all app updates remain VM-bank composition updates, or transition to per-app routes in phase 2?
 
 ---
 
-## 7. VM Bank Composition Model
+## 8. VM Bank Composition Model
 
 ### Inventory Entry Schema (Conceptual)
 
@@ -367,7 +420,7 @@ Binary/chunk deltas optimize unchanged images:
 
 ---
 
-## 8. Manifest and Delta Semantics
+## 9. Manifest and Delta Semantics
 
 ### Phase 1: Final-State Manifest with Reuse
 
@@ -439,7 +492,7 @@ Delta failure → full fetch or reject.
 
 ---
 
-## 9. Validation-Before-Mount Contract
+## 10. Validation-Before-Mount Contract
 
 ### Host Validation Steps
 
@@ -482,7 +535,7 @@ If host validation failed, guest never boots the bank.
 
 ---
 
-## 10. VM-OS-Neutral Exposure Contract
+## 11. VM-OS-Neutral Exposure Contract
 
 ### What the Host Provides
 
@@ -524,7 +577,7 @@ The host/hypervisor validates all images before guest exposure. Guest-side valid
 
 ---
 
-## 11. Storage Options for App Images
+## 12. Storage Options for App Images
 
 The following storage models are all valid; the choice is a BSP/factory/product decision:
 
@@ -609,7 +662,7 @@ Per-bank inventory (in NV):
 
 ---
 
-## 12. Open Questions
+## 13. Open Questions
 
 1. **Storage allocation strategy** — Should app images live in expanded VM bank partitions (Option 1), dedicated app banks (Option 2), or a factory-provisioned shared region (Option 3)?
 
@@ -633,7 +686,7 @@ Per-bank inventory (in NV):
 
 ---
 
-## 13. Reference Architecture Diagram
+## 14. Reference Architecture Diagram
 
 ```
 OEM/Backend
@@ -699,7 +752,7 @@ Result: COMMITTED (images remain) OR auto-rollback (previous bank activated)
 
 ---
 
-## 14. Architecture and Specification Boundaries
+## 15. Architecture and Specification Boundaries
 
 This document defines the architecture and specification for SOVD VM application installation — the concepts, trust models, routing, manifest semantics, and validation contracts. It establishes the semantic boundaries and trust relationships needed for design review and product iteration.
 
@@ -707,7 +760,7 @@ Future work includes concrete system design, platform-specific protocol mappings
 
 ---
 
-## 15. Summary
+## 16. Summary
 
 SOVD VM application installation delivers read-only app/dependency filesystem images to guests through the host's trusted OTA path. The recommended architecture:
 
