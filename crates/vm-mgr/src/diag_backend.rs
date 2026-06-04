@@ -241,6 +241,19 @@ impl DiagnosticBackend for ComponentDiagBackend {
         self.upload_via_install_pipeline(stream).await
     }
 
+    // GET /updates/{id} catalog detail (ISO 17978-3 §7.18.3 Table 261).
+    // SUIT-aware enrichment lives on the wrapped VmBackend (it owns the
+    // manifest describe-cache + the SOVD entity_info); forward there so the
+    // wire sees the enriched descriptor regardless of which path served the
+    // upload. Falls back to the format-agnostic default inside VmBackend
+    // when the manifest can't be located/parsed.
+    async fn describe_update_package(
+        &self,
+        ctx: &UpdatePackageContext<'_>,
+    ) -> BackendResult<UpdatePackageDescriptor> {
+        self.fallback.describe_update_package(ctx).await
+    }
+
     async fn list_packages(&self) -> BackendResult<Vec<PackageInfo>> {
         self.fallback.list_packages().await
     }

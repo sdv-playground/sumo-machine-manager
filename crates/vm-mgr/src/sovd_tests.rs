@@ -19,7 +19,6 @@ use sovd_core::DiagnosticBackend;
 
 use crate::backend::{ComponentConfig, VmBackend};
 use crate::manifest_provider::ManifestProvider;
-use crate::ota;
 use crate::sovd::security::TestSecurityProvider;
 use crate::suit_provider::SuitProvider;
 
@@ -52,6 +51,33 @@ fn make_test_suit_envelope(keys: &TestKeys, component: &str, seq: u64, image: &[
         .payload_digest(&digest, image.len() as u64)
         .payload_uri("#firmware".to_string())
         .integrated_payload("#firmware".to_string(), image.to_vec())
+        .build(&keys.signing_key)
+        .unwrap()
+}
+
+/// Like `make_test_suit_envelope`, but sets the SUIT text fields
+/// (model name, version, description) so the `/updates` catalog detail
+/// (`describe_update_package`) has something to enrich from.
+fn make_test_suit_envelope_with_text(
+    keys: &TestKeys,
+    component: &str,
+    seq: u64,
+    image: &[u8],
+    model_name: &str,
+    version: &str,
+    description: &str,
+) -> Vec<u8> {
+    let crypto = RustCryptoBackend::new();
+    let digest = crypto.sha256(image);
+    ImageManifestBuilder::new()
+        .component_id(vec![component.to_string()])
+        .sequence_number(seq)
+        .payload_digest(&digest, image.len() as u64)
+        .payload_uri("#firmware".to_string())
+        .integrated_payload("#firmware".to_string(), image.to_vec())
+        .text_model_name(model_name)
+        .text_version(version)
+        .text_description(description)
         .build(&keys.signing_key)
         .unwrap()
 }
@@ -177,18 +203,6 @@ async fn post_json(
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    (status, json)
-}
-
-async fn post_empty(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
-    let resp = router
-        .clone()
-        .oneshot(Request::post(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = resp.status();
@@ -592,6 +606,79 @@ async fn flash_full_suit_flow() {
     assert_eq!(final_body["phase"], "execute");
     assert_eq!(final_body["status"], "completed");
     assert!(final_body.get("x-sumo-substate").is_none());
+}
+
+// ============================================================
+// Update catalog detail (ISO 17978-3 §7.18.3 Table 261)
+// ============================================================
+
+#[tokio::test]
+async fn get_update_detail_enriched_from_suit_manifest() {
+    // Phase 4: GET /updates/{id} is enriched from the uploaded SUIT
+    // manifest (update_name + updated/affected components) instead of the
+    // SUIT-agnostic default (update_name == the register-time id).
+    let (router, _, keys) = make_router();
+    unlock_for_flash(&router, "vm1").await;
+
+    let image = vec![0xCC; 2048];
+    let envelope = make_test_suit_envelope_with_text(
+        &keys,
+        "vm1",
+        3,
+        &image,
+        "Sumo VM1 Firmware",
+        "4.2.0",
+        "Quarterly security rollup",
+    );
+
+    // Register the update (server allocates the id + opens a flash session).
+    let (status, body) = post_json(
+        &router,
+        "/vehicle/v1/components/vm1/updates",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
+    let update_id = body["update_id"].as_str().unwrap().to_string();
+
+    // Upload the SUIT envelope as the `manifest` part — this is where the
+    // backend parses + caches the Table-261 facts keyed by the part file_id.
+    let (status, _) = put_bytes(
+        &router,
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/bulk-data/manifest"),
+        envelope,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // GET /updates/{id} → describe_update_package → enriched descriptor.
+    let (status, detail) = get(
+        &router,
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GET /updates/{{id}}: {detail}");
+
+    // id is unchanged (still the register-time URL key).
+    assert_eq!(detail["id"], update_id);
+
+    // update_name is enriched from SUIT text (model name + version) — and
+    // is NOT the bare id default.
+    assert_eq!(detail["update_name"], "Sumo VM1 Firmware 4.2.0");
+    assert_ne!(detail["update_name"], serde_json::json!(update_id));
+
+    // notes carries the SUIT text description.
+    assert_eq!(detail["notes"], "Quarterly security rollup");
+
+    // The SUIT-named component shows up as updated + affected (entity-path).
+    assert_eq!(
+        detail["updated_components"],
+        serde_json::json!(["/vehicle/v1/components/vm1"])
+    );
+    assert_eq!(
+        detail["affected_components"],
+        serde_json::json!(["/vehicle/v1/components/vm1"])
+    );
 }
 
 // ============================================================

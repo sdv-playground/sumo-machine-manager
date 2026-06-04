@@ -87,6 +87,95 @@ struct StoredPayload {
     path: std::path::PathBuf,
 }
 
+/// SUIT-derived facts for one uploaded manifest, cached so the
+/// `GET /updates/{id}` detail body (ISO 17978-3 §7.18.3 Table 261) can be
+/// enriched without re-reading / re-parsing the envelope at describe time.
+///
+/// Populated when the `"manifest"` bulk-data part arrives (the envelope is
+/// already CBOR-decoded there for validation, so extraction is free), keyed
+/// by the `file_id` the upload returned on the wire. The streaming pipeline
+/// writes the *inner* payload straight to flash and drops the raw envelope
+/// bytes, so a describe-time re-read isn't possible — caching at parse time
+/// is the only honest source for these fields.
+#[derive(Clone, Default)]
+struct ManifestDescribeMeta {
+    /// Human-readable name: SUIT model/vendor text + version, or the
+    /// component path + version when no text name is present.
+    update_name: Option<String>,
+    /// SUIT text description (`suit-text-manifest-description`), if any.
+    notes: Option<String>,
+    /// Component identifiers named by the manifest, rendered as slash-joined
+    /// segment paths (e.g. `vm1`, `rt/firmware`). One entry per SUIT component.
+    component_paths: Vec<String>,
+}
+
+/// Extract the Table-261-relevant facts from an already-decoded SUIT manifest.
+///
+/// Pure / allocation-light; only reads the metadata the SUIT envelope
+/// genuinely carries. `version_display` is the `ValidatedFirmware` version
+/// string (text-version or the `seq-N` fallback) — used to qualify the name
+/// when the manifest has a human model/vendor name.
+fn extract_describe_meta(
+    manifest: &sumo_onboard::manifest::Manifest,
+    version_display: &str,
+) -> ManifestDescribeMeta {
+    // Prefer a human product/model name; fall back to the supplier/vendor
+    // name. Qualify either with the version so the catalog entry is
+    // self-describing (e.g. "Sumo VM1 1.2.0").
+    let human_name = manifest
+        .text_model_name(0)
+        .or_else(|| manifest.text_vendor_name(0))
+        .map(str::to_string);
+
+    let version = manifest
+        .text_version(0)
+        .map(str::to_string)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| version_display.to_string());
+
+    // Render every component id the manifest names as a slash-joined
+    // segment path (component ids are arrays of bstr segments).
+    let component_paths: Vec<String> = (0..manifest.component_count())
+        .filter_map(|i| manifest.component_id(i))
+        .map(render_component_path)
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    let update_name = match human_name {
+        Some(name) if !version.is_empty() => Some(format!("{name} {version}")),
+        Some(name) => Some(name),
+        // No SUIT text name: name from the first component path + version,
+        // which is still strictly better than the bare register-time id.
+        None => component_paths.first().map(|p| {
+            if version.is_empty() {
+                p.clone()
+            } else {
+                format!("{p} {version}")
+            }
+        }),
+    };
+
+    ManifestDescribeMeta {
+        update_name,
+        notes: manifest.text_description().map(str::to_string),
+        component_paths,
+    }
+}
+
+/// Render a SUIT component id (array of byte-string segments) as a
+/// slash-joined UTF-8 path. Non-UTF-8 segments are hex-encoded so the
+/// result is always printable. Empty input yields an empty string.
+fn render_component_path(segments: &[Vec<u8>]) -> String {
+    segments
+        .iter()
+        .map(|seg| match std::str::from_utf8(seg) {
+            Ok(s) => s.to_string(),
+            Err(_) => hex::encode(seg),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 // ---------------------------------------------------------------------------
 // Flash session: sequential upload state machine
 // ---------------------------------------------------------------------------
@@ -262,6 +351,12 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// the campaign viewer's parallel-poll-of-many-DIDs runs concurrent.
     /// Keyed by raw 16-bit DID number.
     did_cache: std::sync::RwLock<std::collections::HashMap<u16, Vec<u8>>>,
+    /// SUIT-derived Table-261 facts for uploaded manifests, keyed by the
+    /// `file_id` the upload returned. Populated when the `"manifest"` part
+    /// arrives; read by `describe_update_package` (via the diag adapter) to
+    /// enrich `GET /updates/{id}`. Cleared with the rest of the flash
+    /// session in `clear_flash_session` / `start_flash`.
+    manifest_describe: Mutex<HashMap<String, ManifestDescribeMeta>>,
 }
 
 impl<D: BlockDevice + Send + 'static> VmBackend<D> {
@@ -381,6 +476,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             bank_activator: None,
             health_probe: None,
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
+            manifest_describe: Mutex::new(HashMap::new()),
         };
         // Populate DID cache from NV once at construction time. After this,
         // SOVD reads of NV-backed DIDs hit RAM only — see refresh_did_cache.
@@ -509,6 +605,31 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 
     pub fn entity_info(&self) -> &EntityInfo {
         &self.entity_info
+    }
+
+    /// SUIT-derived Table-261 facts cached for the manifest uploaded under
+    /// `file_id`, if any. Returns `(update_name, notes, component_paths)`:
+    ///
+    /// * `update_name` — human name + version (or component-path + version).
+    /// * `notes` — SUIT text description.
+    /// * `component_paths` — slash-joined SUIT component-id segment paths.
+    ///
+    /// `None` when no manifest was cached for that `file_id` (e.g. the part
+    /// was a detached payload, or the envelope failed to parse) — the
+    /// describe path then keeps the format-agnostic default. Owned clones so
+    /// the caller never holds the cache lock across `.await`.
+    pub fn manifest_describe_facts(
+        &self,
+        file_id: &str,
+    ) -> Option<(Option<String>, Option<String>, Vec<String>)> {
+        let cache = self.manifest_describe.lock().ok()?;
+        cache.get(file_id).map(|m| {
+            (
+                m.update_name.clone(),
+                m.notes.clone(),
+                m.component_paths.clone(),
+            )
+        })
     }
 
     pub fn component_config(&self) -> &ComponentConfig {
@@ -996,6 +1117,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         self.packages.lock().unwrap().clear();
         self.manifests.lock().unwrap().clear();
         self.payloads.lock().unwrap().clear();
+        self.manifest_describe.lock().unwrap().clear();
     }
 
     /// Whether a flash session is currently in flight.
@@ -1267,6 +1389,19 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let total_components = manifest.component_count();
 
         let id = self.next_id();
+
+        // Cache the SUIT-derived Table-261 facts keyed by this upload's
+        // file_id, so `describe_update_package` can enrich GET /updates/{id}
+        // later (the raw envelope is dropped after this; describe-time
+        // re-parsing isn't possible). `id` is exactly the file_id the SOVD
+        // wire records for the `"manifest"` part.
+        {
+            let meta = extract_describe_meta(&manifest, &validated.version_display);
+            self.manifest_describe
+                .lock()
+                .unwrap()
+                .insert(id.clone(), meta);
+        }
 
         if has_integrated {
             // Integrated envelope (HSM keys, small packages) — all data present.
@@ -1957,6 +2092,62 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         Err(BackendError::OperationNotFound(operation_id.to_string()))
     }
 
+    // --- Update package catalog (ISO 17978-3 §7.18.3 Table 261) ---
+
+    /// Enrich `GET /updates/{id}` from the uploaded SUIT manifest.
+    ///
+    /// Starts from the format-agnostic [`default_descriptor_from_context`]
+    /// base, then overrides the fields the SUIT envelope genuinely provides:
+    /// a meaningful `update_name`, optional release `notes`, and the
+    /// `updated`/`affected` component entity-paths.
+    ///
+    /// The manifest's SUIT facts were cached when the `"manifest"` bulk-data
+    /// part arrived, keyed by that part's `file_id`. We locate the
+    /// `part_id == "manifest"` part in the context, look the facts up by its
+    /// `file_id`, and enrich. Absent/garbled manifest → the default base is
+    /// returned unchanged (the GET never errors). No locks are held across an
+    /// `.await` (the lookup returns owned clones; there is no `.await` here).
+    async fn describe_update_package(
+        &self,
+        ctx: &UpdatePackageContext<'_>,
+    ) -> BackendResult<UpdatePackageDescriptor> {
+        let mut desc = default_descriptor_from_context(ctx);
+
+        // The orchestrator uploads the SUIT envelope as the part whose
+        // part_id is exactly "manifest"; its file_id is the cache key.
+        let Some(manifest_part) = ctx.parts.iter().find(|p| p.part_id == "manifest") else {
+            return Ok(desc);
+        };
+        let Some((update_name, notes, component_paths)) =
+            self.manifest_describe_facts(manifest_part.file_id)
+        else {
+            // No cached facts (parse failed, or this file_id isn't a
+            // manifest) — keep the honest default.
+            return Ok(desc);
+        };
+
+        if let Some(name) = update_name {
+            desc.update_name = name;
+        }
+        if let Some(n) = notes {
+            desc.notes = Some(n);
+        }
+
+        // The manifest names this component; the SOVD-addressable entity it
+        // maps to is this backend's own component id (the bank set this
+        // VmBackend serves). Report it as both updated (version changed) and
+        // affected. `default_descriptor_from_context` already seeded
+        // `affected_components` with this same path; set `updated_components`
+        // only when the manifest actually carried component identifiers.
+        if !component_paths.is_empty() {
+            let entity_path = format!("/vehicle/v1/components/{}", self.entity_info.id);
+            desc.updated_components = vec![entity_path.clone()];
+            desc.affected_components = vec![entity_path];
+        }
+
+        Ok(desc)
+    }
+
     // --- Package management ---
 
     async fn receive_package(&self, data: &[u8]) -> BackendResult<String> {
@@ -1986,6 +2177,18 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         }
 
         let id = self.next_id();
+
+        // Single-shot upload still carries the raw envelope here, so cache
+        // the SUIT describe facts keyed by this file_id for GET /updates/{id}.
+        if let Ok(envelope) = sumo_codec::decode::decode_envelope(data) {
+            let manifest = sumo_onboard::manifest::Manifest { envelope };
+            let meta = extract_describe_meta(&manifest, &validated.version_display);
+            self.manifest_describe
+                .lock()
+                .unwrap()
+                .insert(id.clone(), meta);
+        }
+
         let mut packages = self.packages.lock().unwrap();
         packages.insert(
             id.clone(),
@@ -2268,6 +2471,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // Drop the previous cycle's part-location records; new uploads
         // re-populate as they arrive.
         self.uploaded_parts.lock().unwrap().clear();
+        // Same for the manifest describe-cache — stale SUIT facts from a
+        // prior flash must not leak into this session's catalog entry.
+        self.manifest_describe.lock().unwrap().clear();
 
         let transfer_id = self.next_id();
         tracing::info!(transfer_id = %transfer_id, "flash session started — awaiting manifest upload");
