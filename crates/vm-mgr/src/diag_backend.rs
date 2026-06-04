@@ -140,6 +140,7 @@ impl DiagnosticBackend for ComponentDiagBackend {
                     read_only: !d.writable,
                     href: format!("/vehicle/v1/components/{entity_id}/data/{}", d.id),
                     did: Some(format!("{:04X}", d.key)),
+                    category: Some(DataCategory::from_did(d.key)),
                 }
             })
             .collect();

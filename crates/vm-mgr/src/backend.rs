@@ -1877,6 +1877,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 read_only: !d.writable,
                 href: format!("/vehicle/v1/components/{comp_id}/data/{}", d.id),
                 did: Some(format!("{:04X}", d.did)),
+                category: Some(DataCategory::from_did(d.did)),
             })
             .collect();
 
@@ -1899,6 +1900,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                         read_only: false,
                         href: format!("/vehicle/v1/components/{comp_id}/data/{id}"),
                         did: Some(format!("{:04X}", did_num)),
+                        category: Some(DataCategory::from_did(did_num)),
                     });
                 }
             }
