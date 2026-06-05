@@ -28,6 +28,9 @@ use sovd_core::error::{BackendError, BackendResult};
 use sovd_core::models::*;
 use sovd_core::PackageStream;
 
+use machine_mgr::bank_provider::{BankProvider, FirmwareIdentity, InstalledFirmware};
+
+use crate::bank_provider::IvdBankProvider;
 use crate::did;
 use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware};
 use crate::ota;
@@ -369,13 +372,27 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// `x-sumo-installed-manifest` data parameter — share a single verify
     /// pass rather than re-reading + re-verifying CBOR on every SOVD call.
     ///
-    /// `(bank, manifest)`: the bank the cached manifest was read for, so a
+    /// `(bank, installed)`: the bank the cached firmware was read for, so a
     /// running-bank flip (ecu_reset) is detected and re-verified. `Arc` so
     /// readers clone cheaply without holding the lock across the JSON
     /// build. Invalidated to `None` on every NV write via
     /// `NvWriteGuard::drop` (same trigger as `did_cache`); the next reader
     /// re-populates lazily.
-    verified_manifest_cache: Mutex<Option<(Bank, Arc<hsm::ivd::VerifiedManifest>)>>,
+    verified_manifest_cache: Mutex<Option<(Bank, Arc<InstalledFirmware>)>>,
+    /// The per-kind A/B storage + lifecycle seam. Owns every bank touch —
+    /// target selection, prepare/seed, payload sinks, IVD seal, installed-
+    /// firmware read-back, symlink-flip activation, commit/rollback. Built
+    /// inline as an `IvdBankProvider` in `with_options` (and rebuilt by the
+    /// `with_bank_spec` / `with_bank_activator` builders, which change its
+    /// inputs); a later phase moves construction to component-factory.
+    bank_provider: Arc<dyn BankProvider>,
+    /// The same object as `bank_provider`, kept at its concrete type so the
+    /// engine can reach the `IvdBankProvider` inherent helpers (`target_bank_dir`,
+    /// `seed_target_from_active`, `flip_current_symlink`) that aren't part of the
+    /// kind-agnostic trait. `dyn BankProvider` isn't `Any`, so a downcast isn't
+    /// available; holding both handles to one `Arc` is the cost-free
+    /// alternative until the generic engine no longer needs the inherent calls.
+    ivd_bank: Arc<IvdBankProvider<D>>,
 }
 
 impl<D: BlockDevice + Send + 'static> VmBackend<D> {
@@ -452,6 +469,24 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 .unwrap_or(Bank::A)
         };
 
+        // Build the initial bank provider from the same nv/bank_set/images_dir/
+        // hsm it holds (activator still None here; `with_bank_activator` rebuilds
+        // it, as does `with_bank_spec` for the dir name). Clones the Arcs — the
+        // struct literal below moves the originals into the backend's fields.
+        // Both `bank_provider` (dyn, for trait calls) and `ivd_bank` (concrete,
+        // for inherent helpers) point at this one object.
+        let bank_spec = crate::bank_spec::BankSetSpec::for_well_known(bank_set);
+        let ivd_bank = Arc::new(IvdBankProvider::new(
+            nv.clone(),
+            bank_set,
+            config.single_bank,
+            images_dir.clone(),
+            bank_spec.dir_name.clone(),
+            hsm_provider.clone(),
+            None,
+        ));
+        let bank_provider: Arc<dyn BankProvider> = ivd_bank.clone();
+
         let backend = Self {
             entity_info: EntityInfo {
                 id: id.to_string(),
@@ -476,7 +511,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 operations: false,
             },
             bank_set,
-            bank_spec: crate::bank_spec::BankSetSpec::for_well_known(bank_set),
+            bank_spec,
             config,
             nv,
             manifest_provider,
@@ -500,6 +535,8 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             manifest_describe: Mutex::new(HashMap::new()),
             verified_manifest_cache: Mutex::new(None),
+            bank_provider,
+            ivd_bank,
         };
         // Populate DID cache from NV once at construction time. After this,
         // SOVD reads of NV-backed DIDs hit RAM only — see refresh_did_cache.
@@ -522,13 +559,39 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// values once Phase 3 wires the ComponentSpec → BankSetSpec path.
     pub fn with_bank_spec(mut self, spec: crate::bank_spec::BankSetSpec) -> Self {
         self.bank_spec = spec;
+        // The provider keys its on-disk layout off `bank_spec.dir_name`; rebuild
+        // it so a deployment-supplied dir name takes effect.
+        self.rebuild_bank_provider();
         self
     }
 
     /// Set a bank activator for post-install bank activation.
     pub fn with_bank_activator(mut self, activator: Arc<dyn machine_mgr::BankActivator>) -> Self {
         self.bank_activator = Some(activator);
+        // The provider holds the activator (used by `activate` + `reset_kind`);
+        // rebuild it so the just-set activator is the one it invokes.
+        self.rebuild_bank_provider();
         self
+    }
+
+    /// Rebuild the bank provider from the backend's current bank-relevant state
+    /// and re-point both the `dyn` and concrete handles at the new object.
+    /// Called by the `with_bank_spec` / `with_bank_activator` builders that
+    /// change its inputs. `running_bank` is re-seeded from NV inside the
+    /// provider — same rule as the backend's own copy, idempotent at
+    /// construction.
+    fn rebuild_bank_provider(&mut self) {
+        let ivd_bank = Arc::new(IvdBankProvider::new(
+            self.nv.clone(),
+            self.bank_set,
+            self.config.single_bank,
+            self.images_dir.clone(),
+            self.bank_spec.dir_name.clone(),
+            self.hsm_provider.clone(),
+            self.bank_activator.clone(),
+        ));
+        self.bank_provider = ivd_bank.clone();
+        self.ivd_bank = ivd_bank;
     }
 
     /// Set a synthetic health probe used by `read_data` for `guest_state`
@@ -696,165 +759,38 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             .unwrap_or(machine_mgr::ResetKind::Local)
     }
 
-    /// The bank an OTA upload should write to: the *inactive* bank for dual-bank
-    /// components, or `Bank::A` for single-bank ones (HSM).
-    ///
-    /// For activator-backed components the `current` symlink under
-    /// `images_dir/<dir_name>/` is the source of truth — it survives
-    /// factory resets and doesn't depend on NV flip timing. Falls back
-    /// to NV when no symlink exists (first-ever flash).
+    /// The bank an OTA upload should write to — delegated to the bank
+    /// provider (the *inactive* bank for dual-bank, `Bank::A` for single-bank,
+    /// `current`-symlink-aware for activator-backed kinds).
     fn determine_target_bank(&self) -> BackendResult<Bank> {
-        if self.config.single_bank {
-            return Ok(Bank::A);
-        }
-        if self.bank_activator.is_some() {
-            if let Some(active) = self.read_current_symlink() {
-                return Ok(active.other());
-            }
-        }
-        let nv = self
-            .nv
-            .lock()
-            .map_err(|_| BackendError::Internal("nv lock".into()))?;
-        let state = nv
-            .read_boot_state()
-            .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-        let idx = self.bank_set.as_index();
-        Ok(state.banks[idx].active_bank.other())
+        Ok(self.bank_provider.target_bank())
     }
 
-    /// Read the `current` symlink under `images_dir/<dir_name>/` and return
-    /// the bank it points to, or `None` if missing / unreadable.
-    fn read_current_symlink(&self) -> Option<Bank> {
-        let images_dir = self.images_dir.as_ref()?;
-        let symlink_path = images_dir.join(&self.bank_spec.dir_name).join("current");
-        let target = std::fs::read_link(&symlink_path).ok()?;
-        let name = target.file_name()?.to_str()?;
-        match name {
-            "bank_a" => Some(Bank::A),
-            "bank_b" => Some(Bank::B),
-            _ => None,
-        }
-    }
-
-    /// Atomically flip the `current` symlink to point at `bank`.
+    /// Atomically flip the `current` symlink to point at `bank` — delegated to
+    /// the provider's symlink-only flip. The engine keeps orchestrating the
+    /// activator + NV-rollback-on-failure itself (see `finalize_flash`), so
+    /// this stays a bare flip, not the trait's flip-plus-activator `activate`.
     fn flip_current_symlink(&self, bank: Bank) {
-        let Some(images_dir) = self.images_dir.as_ref() else {
-            return;
-        };
-        let dir = images_dir.join(&self.bank_spec.dir_name);
-        let symlink_path = dir.join("current");
-        let target = Path::new(bank_dir_name(bank));
-        let tmp_link = symlink_path.with_extension("tmp");
-        let _ = std::fs::remove_file(&tmp_link);
-        if let Err(e) = std::os::unix::fs::symlink(target, &tmp_link)
-            .and_then(|()| std::fs::rename(&tmp_link, &symlink_path))
-        {
-            tracing::warn!(
-                bank_set = ?self.bank_set,
-                "failed to flip current symlink: {e}"
-            );
-        } else {
-            tracing::info!(
-                bank_set = ?self.bank_set,
-                bank = ?bank,
-                "flipped current -> {}",
-                bank_dir_name(bank),
-            );
-        }
+        self.ivd_bank.flip_current_symlink(bank);
     }
 
     /// Path of the target bank directory under `images_dir`. `None` if no
-    /// images_dir is configured (tests / in-memory only).
+    /// images_dir is configured (tests / in-memory only). Delegated to the
+    /// provider, which owns the bank-dir layout.
     fn target_bank_dir(&self, target: Bank) -> Option<PathBuf> {
-        self.images_dir.as_ref().map(|images_dir| {
-            images_dir
-                .join(&self.bank_spec.dir_name)
-                .join(bank_dir_name(target))
-        })
+        self.ivd_bank.target_bank_dir(target)
     }
 
-    /// Copy any files in the active bank that don't already exist in
-    /// the target bank. This makes every OTA implicitly partial: a
-    /// SUIT envelope that carried only some components ends with a
-    /// complete target bank, with unstreamed files seeded from active.
-    /// A full envelope that streamed every file is a no-op for this
-    /// step (every file already exists in target).
-    ///
-    /// Must run AFTER all streaming finishes and BEFORE IVD signing,
-    /// so the signature covers the final bank contents.
-    ///
-    /// No-op cases (returns Ok without doing anything):
-    ///   - single-bank bank-sets (HSM) — no "other" bank to seed from
-    ///   - no images_dir configured (in-memory test backends)
-    ///   - active bank dir doesn't exist (factory first-flash)
+    /// Test entry point into the provider's bank-seed primitive (copy the
+    /// active bank's files that are missing from the target). The production
+    /// flow seeds inside the provider's `seal` right before signing, so this
+    /// thin delegator exists only for `bank_seed_integration_tests`, which
+    /// exercise the seed step in isolation through the backend.
+    #[cfg(test)]
     pub(crate) fn seed_target_from_active(&self, target: Bank) -> BackendResult<()> {
-        if self.config.single_bank {
-            // HSM-style single-bank — no peer to seed from.
-            return Ok(());
-        }
-
-        let Some(images_dir) = self.images_dir.as_ref() else {
-            // In-memory test backends — no on-disk bank to seed.
-            return Ok(());
-        };
-
-        let nv = self
-            .nv
-            .lock()
-            .map_err(|_| BackendError::Internal("nv lock".into()))?;
-        let state = nv
-            .read_boot_state()
-            .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-        let idx = self.bank_set.as_index();
-        let active = state.banks[idx].active_bank;
-        drop(nv);
-
-        if active == target {
-            // Defensive — `determine_target_bank` always returns the
-            // .other() of active, but a future refactor that breaks
-            // this invariant shouldn't silently corrupt the active
-            // bank by self-seeding.
-            return Ok(());
-        }
-
-        let set_name = &self.bank_spec.dir_name;
-        let source_dir = images_dir.join(set_name).join(bank_dir_name(active));
-        let target_dir = images_dir.join(set_name).join(bank_dir_name(target));
-
-        match crate::bank_seed::seed_missing_files(&source_dir, &target_dir) {
-            Ok(seeded) if seeded.is_empty() => {
-                tracing::debug!(
-                    target = %target_dir.display(),
-                    source = %source_dir.display(),
-                    "bank seed: no files copied (full update or empty active)"
-                );
-                Ok(())
-            }
-            Ok(seeded) => {
-                tracing::info!(
-                    target = %target_dir.display(),
-                    source = %source_dir.display(),
-                    count = seeded.len(),
-                    paths = ?seeded,
-                    "bank seed: copied unstreamed files from active bank"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!(
-                    target = %target_dir.display(),
-                    source = %source_dir.display(),
-                    error = %e,
-                    "bank seed failed — refusing to sign/activate a partial bank"
-                );
-                Err(BackendError::Internal(format!(
-                    "bank seed from {} to {}: {e}",
-                    source_dir.display(),
-                    target_dir.display()
-                )))
-            }
-        }
+        self.ivd_bank
+            .seed_target_from_active(target)
+            .map_err(|e| BackendError::Internal(e.to_string()))
     }
 
     /// Self-sign the staged bank with the HSM's `ivd-signing` key so
@@ -887,318 +823,164 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// present, signing failure, mutex poisoned) returns an error
     /// rather than silently shipping an unsigned bank.
     fn ivd_sign_staged_bank(&self, target: Bank) -> BackendResult<()> {
-        // (1) Test-mode and legitimate no-op skips first — these are
-        //     independent of HSM state.
-        let Some(bank_dir) = self.target_bank_dir(target) else {
-            tracing::debug!("ivd sign: no images_dir; skipping (in-memory test mode)");
-            return Ok(());
-        };
-        if !bank_dir.exists() {
-            tracing::debug!(
-                bank_dir = %bank_dir.display(),
-                "ivd sign: bank dir absent; skipping (pre-streaming path)",
-            );
-            return Ok(());
-        }
-        if bank_dir_is_payload_empty(&bank_dir) {
-            tracing::debug!(
-                bank_dir = %bank_dir.display(),
-                "ivd sign: bank dir has no payload files; skipping (HSM bank / out-of-band attestation)",
-            );
-            return Ok(());
-        }
-
-        let bank_id = format!("{}/{}", &self.bank_spec.dir_name, bank_dir_name(target),);
-
-        // (2) Past here we have a real bank with real payloads → HSM
-        //     attachment is required. A missing provider means the
-        //     wiring is broken (component-factory / sovd_main should
-        //     have attached one); fail loud rather than ship unsigned.
-        let hsm_arc = self.hsm_provider.as_ref().ok_or_else(|| {
-            BackendError::Internal(format!(
-                "ivd sign {bank_id}: no HSM provider attached — wiring bug"
-            ))
-        })?;
-        let hsm = hsm_arc
-            .lock()
-            .map_err(|_| BackendError::Internal("ivd sign: hsm mutex poisoned".into()))?;
-
-        // (3) Pre-provisioning exception: the HSM is reachable but the
-        //     `ivd-signing` key doesn't exist yet. Skip with a warning;
-        //     the bank is intentionally un-sealed until the next flash
-        //     after HSM provisioning.
-        match hsm.is_provisioned() {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!(
-                    bank_id = %bank_id,
-                    "ivd sign: HSM not yet provisioned — skipping (bank is not boot-eligible until re-flashed post-provision)",
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(BackendError::Internal(format!(
-                    "ivd sign {bank_id}: hsm provisioning probe failed: {e}"
-                )));
-            }
-        }
-
-        // Compute the install-time generation counter (gen) directly
-        // from NV state. This must agree with what ota::install_inner
-        // will write into target's NvFwMeta — they both derive it as
-        // `committed_bank.gen + 1`. Two reasons it has to be computed
-        // here independently (not read back from NvFwMeta):
-        //
-        // - In the multi-POST upload path this function runs at
-        //   "all payloads received" but install_precomputed doesn't
-        //   run until transferexit. NvFwMeta for the target hasn't
-        //   been written yet.
-        // - The OTA flow is serialized (start_flash rejects
-        //   concurrent flashes via InTrial), so both call sites read
-        //   the same NV state and arrive at the same gen.
-        //
-        // The committed bank is whichever of {active, active.other()}
-        // currently has committed=true. If active is committed, that's
-        // the committed bank. If we're already in trial mode (active=
-        // target, committed=false), the OTHER bank is the
-        // previously-committed one.
-        let gen = {
-            let nv = self
-                .nv
-                .lock()
-                .map_err(|_| BackendError::Internal("ivd sign: nv mutex poisoned".into()))?;
-            let state = nv.read_boot_state().ok_or_else(|| {
-                BackendError::Internal(format!("ivd sign {bank_id}: NV boot state missing"))
-            })?;
-            let idx = self.bank_set.as_index();
-            let committed_bank = if state.banks[idx].committed {
-                state.banks[idx].active_bank
-            } else {
-                state.banks[idx].active_bank.other()
-            };
-            let committed_gen = nv
-                .read_fw_meta(self.bank_set, committed_bank)
-                .map(|m| m.gen)
-                .unwrap_or(0);
-            committed_gen + 1
-        };
-
-        // Reuse the per-file hashes captured by the streaming pipeline
-        // when available — the OEM SUIT manifest already authenticated
-        // each payload's digest at write time, so re-hashing the bank
-        // from disk here is duplicate work (~2.5 s on the CVC's 80 MB
-        // rootfs). Empty stash → fall back to walk + hash.
-        let streamed_files = {
-            let ft = self.flash_transfer.lock().map_err(|_| {
-                BackendError::Internal("ivd sign: flash_transfer mutex poisoned".into())
-            })?;
-            ft.as_ref()
-                .map(|t| t.streamed_files.clone())
-                .unwrap_or_default()
-        };
-
-        // The firmware SW identity (SUIT-extracted at validate time) is
-        // sealed into the signed manifest here — this is now the single
-        // source for the F187-F19E identification DIDs. Resolved from the
-        // package the current flash transfer points at.
+        // Bank mechanics (seed → skip-checks → HSM-provisioned gate → sign)
+        // moved to `IvdBankProvider::seal`. The engine still owns the two
+        // inputs that come from its OTA state: the install-time `gen` (from NV)
+        // and the firmware SW identity (from the package the flash transfer
+        // points at, mapped to the kind-agnostic `FirmwareIdentity`).
+        let gen = self.install_gen_for(target)?;
         let identity = self.current_install_identity();
-
-        let _manifest = if streamed_files.is_empty() {
-            hsm::ivd::sign_bank(&*hsm, &bank_dir, gen, identity)
-                .map_err(|e| BackendError::Internal(format!("ivd sign {bank_id}: {e}")))?
-        } else {
-            hsm::ivd::sign_bank_with_files(&*hsm, &bank_dir, gen, identity, streamed_files, None)
-                .map_err(|e| BackendError::Internal(format!("ivd sign {bank_id}: {e}")))?
-        };
-        tracing::info!(
-            bank_id = %bank_id,
-            bank_dir = %bank_dir.display(),
-            gen,
-            "ivd sign OK",
-        );
-        Ok(())
+        self.bank_provider
+            .seal(target, identity, gen)
+            .map_err(|e| BackendError::Internal(e.to_string()))
     }
 
-    /// The firmware SW identity to seal into the IVD manifest being
-    /// signed: derived from the SUIT-extracted `ImageMeta` of the package
-    /// the current flash transfer points at. Empty (all-default) when no
-    /// package is in scope (e.g. a re-sign with no active transfer) — the
-    /// manifest then carries a blank identity, which reads back as
-    /// all-NUL DIDs, matching the prior zero-initialised behaviour.
-    fn current_install_identity(&self) -> hsm::ivd::IvdIdentity {
+    /// Compute the install-time generation counter (`gen`) directly from NV
+    /// state. Must agree with what `ota::install_inner` writes into target's
+    /// NvFwMeta — both derive it as `committed_bank.gen + 1`. Computed here
+    /// (not read back from NvFwMeta) because in the multi-POST upload path the
+    /// sign happens at "all payloads received", before `install_precomputed`
+    /// writes the target's NvFwMeta at transferexit. The OTA flow is serialized
+    /// (start_flash rejects concurrent flashes), so both arrive at the same
+    /// gen. The committed bank is whichever of {active, active.other()} has
+    /// committed=true.
+    fn install_gen_for(&self, _target: Bank) -> BackendResult<u64> {
+        let nv = self
+            .nv
+            .lock()
+            .map_err(|_| BackendError::Internal("ivd sign: nv mutex poisoned".into()))?;
+        let state = nv
+            .read_boot_state()
+            .ok_or_else(|| BackendError::Internal("ivd sign: NV boot state missing".into()))?;
+        let idx = self.bank_set.as_index();
+        let committed_bank = if state.banks[idx].committed {
+            state.banks[idx].active_bank
+        } else {
+            state.banks[idx].active_bank.other()
+        };
+        let committed_gen = nv
+            .read_fw_meta(self.bank_set, committed_bank)
+            .map(|m| m.gen)
+            .unwrap_or(0);
+        Ok(committed_gen + 1)
+    }
+
+    /// The firmware SW identity to seal into the IVD manifest being signed:
+    /// derived from the SUIT-extracted `ImageMeta` of the package the current
+    /// flash transfer points at, mapped to the kind-agnostic
+    /// [`FirmwareIdentity`]. All-`None` when no package is in scope (e.g. a
+    /// re-sign with no active transfer) — the manifest then carries a blank
+    /// identity, which reads back as all-NUL DIDs (prior behaviour preserved).
+    fn current_install_identity(&self) -> FirmwareIdentity {
         let package_id = {
             let ft = self.flash_transfer.lock().ok();
             ft.and_then(|g| g.as_ref().map(|t| t.package_id.clone()))
                 .unwrap_or_default()
         };
         if package_id.is_empty() {
-            return hsm::ivd::IvdIdentity::default();
+            return FirmwareIdentity::default();
         }
         let packages = match self.packages.lock() {
             Ok(p) => p,
-            Err(_) => return hsm::ivd::IvdIdentity::default(),
+            Err(_) => return FirmwareIdentity::default(),
         };
         packages
             .get(&package_id)
-            .map(|p| p.validated.image_meta.to_ivd_identity())
+            .map(|p| p.validated.image_meta.to_firmware_identity())
             .unwrap_or_default()
     }
 
-    /// Read + signature-verify a bank's IVD manifest and return the whole
-    /// [`VerifiedManifest`] (decoded manifest + raw bytes + signature),
-    /// caching it per-bank so repeated diagnostics reads share one verify
-    /// pass. The cache is invalidated on every NV write (see
-    /// `refresh_did_cache_locked`), so the served manifest always reflects
-    /// the latest install/commit/ecu_reset.
+    /// Read + signature-verify a bank's installed firmware via the bank
+    /// provider and return it as [`InstalledFirmware`], caching it per-bank so
+    /// repeated diagnostics reads share one verify pass. The cache is
+    /// invalidated on every NV write (see `refresh_did_cache_locked`), so the
+    /// served firmware always reflects the latest install/commit/ecu_reset.
     ///
-    /// Returns `None` when the bank has no verifiable manifest (no
-    /// images_dir, no HSM, not provisioned, no manifest yet, or a bad
-    /// signature). A bad signature is logged at warn; absent/unsigned is
-    /// debug (normal for factory-fresh / unprovisioned banks).
+    /// Returns `None` when the bank has no verifiable firmware (no images_dir,
+    /// no HSM, not provisioned, no manifest yet, or a bad signature). A bad
+    /// signature is logged at warn; absent/unsigned is debug (normal for
+    /// factory-fresh / unprovisioned banks).
     ///
-    /// Used for the RUNNING/committed bank: `read_data` of the identity
-    /// DIDs and the vendor `x-sumo-installed-manifest` parameter both pass
-    /// `*self.running_bank`, the same bank whose identity overlay is built
-    /// in `refresh_did_cache_locked`.
-    fn verified_bank_manifest(&self, bank: Bank) -> Option<Arc<hsm::ivd::VerifiedManifest>> {
-        // Fast path: return the cached manifest if it's for this bank.
+    /// Used for the RUNNING/committed bank: `read_data` of the identity DIDs
+    /// and the vendor `x-sumo-installed-manifest` parameter both pass
+    /// `*self.running_bank`, the same bank whose identity overlay is built in
+    /// `refresh_did_cache_locked`.
+    fn verified_bank_manifest(&self, bank: Bank) -> Option<Arc<InstalledFirmware>> {
+        // Fast path: return the cached firmware if it's for this bank.
         {
             let cache = self
                 .verified_manifest_cache
                 .lock()
                 .expect("verified_manifest_cache poisoned");
-            if let Some((cached_bank, vm)) = cache.as_ref() {
+            if let Some((cached_bank, fw)) = cache.as_ref() {
                 if *cached_bank == bank {
                     tracing::info!(component = %self.entity_info.id, bank = ?bank, "ivd-route: cache hit -> serving");
-                    return Some(Arc::clone(vm));
+                    return Some(Arc::clone(fw));
                 }
             }
         }
 
-        // Slow path: read + verify, then memoise for this bank.
-        // ROUTING TRACE (temporary): log every decision so the installed-manifest
-        // read path is visible on-device. Strip once the path is confirmed.
-        let Some(bank_dir) = self.target_bank_dir(bank) else {
-            tracing::warn!(component = %self.entity_info.id, bank = ?bank, "ivd-route: NO images_dir (target_bank_dir None) -> None");
-            return None;
-        };
-        let Some(hsm_arc) = self.hsm_provider.as_ref() else {
-            tracing::warn!(component = %self.entity_info.id, bank = ?bank, bank_dir = ?bank_dir, "ivd-route: NO hsm_provider on backend -> None");
-            return None;
-        };
-        let Ok(hsm) = hsm_arc.lock() else {
-            tracing::warn!(component = %self.entity_info.id, bank = ?bank, "ivd-route: hsm lock poisoned -> None");
-            return None;
-        };
-        tracing::info!(component = %self.entity_info.id, bank = ?bank, bank_dir = ?bank_dir, "ivd-route: reading + signature-verifying manifest");
-        match hsm::ivd::read_manifest(&*hsm, &bank_dir) {
-            Ok(vm) => {
-                tracing::info!(component = %self.entity_info.id, bank = ?bank, "ivd-route: manifest OK -> serving + caching");
-                let vm = Arc::new(vm);
+        // Slow path: read + verify via the provider, then memoise for this bank.
+        match self.bank_provider.read_installed(bank) {
+            Ok(fw) => {
+                tracing::info!(component = %self.entity_info.id, bank = ?bank, "ivd-route: installed firmware OK -> serving + caching");
+                let fw = Arc::new(fw);
                 *self
                     .verified_manifest_cache
                     .lock()
-                    .expect("verified_manifest_cache poisoned") = Some((bank, Arc::clone(&vm)));
-                Some(vm)
+                    .expect("verified_manifest_cache poisoned") = Some((bank, Arc::clone(&fw)));
+                Some(fw)
             }
-            Err(hsm::ivd::IvdError::SignatureInvalid) => {
+            Err(machine_mgr::bank_provider::BankError::Unverifiable(msg)) => {
                 tracing::warn!(
                     component = %self.entity_info.id,
                     bank_set = ?self.bank_set,
                     bank = ?bank,
-                    "ivd-route: IVD manifest signature INVALID; refusing to serve it",
+                    "ivd-route: installed firmware unverifiable ({msg}); refusing to serve it",
                 );
                 None
             }
             Err(e) => {
-                tracing::warn!(
+                // NotInstalled / no images_dir / no HSM etc. — normal absence.
+                tracing::debug!(
                     component = %self.entity_info.id,
                     bank_set = ?self.bank_set,
                     bank = ?bank,
                     error = %e,
-                    "ivd-route: read_manifest FAILED -> None",
+                    "ivd-route: no installed firmware -> None",
                 );
                 None
             }
         }
     }
 
-    /// Read + signature-verify a bank's IVD manifest and return the
-    /// firmware [`IvdIdentity`] it carries — the single source for the
-    /// SW-identity DIDs (F187-F19E) and version labels now that they're
-    /// out of NvFwMeta. Thin projection over [`Self::verified_bank_manifest`].
-    fn verified_bank_identity(&self, bank: Bank) -> Option<hsm::ivd::IvdIdentity> {
+    /// The installed firmware's SW [`FirmwareIdentity`] for `bank` — the single
+    /// source for the SW-identity DIDs (F187-F19E) and version labels now that
+    /// they're out of NvFwMeta. Thin projection over
+    /// [`Self::verified_bank_manifest`].
+    fn verified_bank_identity(&self, bank: Bank) -> Option<FirmwareIdentity> {
         self.verified_bank_manifest(bank)
-            .map(|vm| vm.manifest.identity.clone())
+            .map(|fw| fw.identity.clone())
     }
 
-    /// The `(did, bytes)` pairs for the 9 SW-identity DIDs of `bank`,
-    /// each converted to its historical fixed-width UDS byte form. Empty
-    /// when the bank has no verifiable identity (see
-    /// [`Self::verified_bank_identity`]).
+    /// The `(did, bytes)` pairs for the 9 SW-identity DIDs of `bank`, each
+    /// converted to its historical fixed-width UDS byte form. Empty when the
+    /// bank has no verifiable identity (see [`Self::verified_bank_identity`]).
     fn identity_did_bytes(&self, bank: Bank) -> Vec<(u16, Vec<u8>)> {
-        match self.verified_bank_identity(bank) {
-            Some(id) => identity_to_did_bytes(&id),
+        match self.verified_bank_manifest(bank) {
+            Some(fw) => identity_to_did_bytes(&fw.identity),
             None => Vec::new(),
         }
     }
 
-    /// Wipe the target bank dir (frees ~1 image worth of space) and remove any
-    /// orphaned staged files left in `images_dir` root by previous flashes.
-    /// Called at flash-session start so the incoming payload lands in a clean,
-    /// space-reclaimed location on the same filesystem as its final home.
+    /// Wipe the target bank dir + reclaim space — delegated to the provider's
+    /// `prepare_target`. Called at flash-session start so the incoming payload
+    /// lands in a clean, space-reclaimed location on the same filesystem as its
+    /// final home.
     fn prepare_target_bank_dir(&self, target: Bank) -> BackendResult<()> {
-        let Some(images_dir) = self.images_dir.as_ref() else {
-            return Ok(());
-        };
-        let set_name = &self.bank_spec.dir_name;
-        let bank_dir = images_dir.join(set_name).join(bank_dir_name(target));
-        std::fs::create_dir_all(&bank_dir).map_err(|e| {
-            BackendError::Internal(format!("create bank dir {}: {e}", bank_dir.display()))
-        })?;
-        let mut cleared = 0usize;
-        if let Ok(entries) = std::fs::read_dir(&bank_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        tracing::warn!("failed to clear {}: {e}", path.display());
-                    } else {
-                        cleared += 1;
-                    }
-                }
-            }
-        }
-        tracing::info!(
-            target = %bank_dir.display(),
-            cleared,
-            "prepared target bank dir for {set_name}"
-        );
-
-        // Wipe legacy staged files in images_dir root (pre-refactor layout).
-        // Free standing here so an upgrade path doesn't leave them squatting
-        // on space the new upload needs.
-        for suffix in &[
-            "staged.img",
-            "kernel-staged.img",
-            "config-staged.yaml",
-            "qvm-config-staged.conf",
-        ] {
-            let p = images_dir.join(format!("{set_name}-{suffix}"));
-            if p.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-        // And any pre-refactor compressed-input scratch tmps. The component
-        // index is bounded by the SUIT envelope's payload count (currently
-        // <= 4 for VMs); 16 covers any reasonable manifest.
-        for n in 0..16 {
-            let p = images_dir.join(format!("{set_name}-upload-{n}.tmp"));
-            if p.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-        Ok(())
+        self.bank_provider
+            .prepare_target(target)
+            .map_err(|e| BackendError::Internal(e.to_string()))
     }
 
     pub fn has_hsm_provider(&self) -> bool {
@@ -1618,14 +1400,11 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             }
 
             // Self-sign the staged bank so external secure boot can
-            // validate it before launch. See `ivd_sign_staged_bank`
-            // for soft-skip policy (no-op when HSM has no
-            // ivd-signing slot yet).
+            // validate it before launch. `ivd_sign_staged_bank` (via the
+            // provider's `seal`) first seeds unstreamed files from the active
+            // bank so the signature covers a complete bank, then signs;
+            // soft-skips when the HSM has no ivd-signing slot yet.
             let target_bank = self.determine_target_bank()?;
-            // Seed unstreamed files from the active bank so the IVD
-            // signature below covers a complete bank, not a partial
-            // one. No-op for full updates / single-bank / factory.
-            self.seed_target_from_active(target_bank)?;
             self.ivd_sign_staged_bank(target_bank)?;
 
             return Ok(id);
@@ -1812,13 +1591,11 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         };
 
         if all_done {
-            // Bank dir is content-final; IVD-sign before the caller
-            // proceeds to finalize_flash. See `ivd_sign_staged_bank`.
+            // Bank dir is content-final; IVD-sign before the caller proceeds
+            // to finalize_flash. `ivd_sign_staged_bank` (via the provider's
+            // `seal`) seeds unstreamed files from the active bank first so the
+            // signature covers a complete bank.
             let target_bank = self.determine_target_bank()?;
-            // Seed unstreamed files from the active bank so the IVD
-            // signature below covers a complete bank, not a partial
-            // one. No-op for full updates / single-bank / factory.
-            self.seed_target_from_active(target_bank)?;
             self.ivd_sign_staged_bank(target_bank)?;
         }
 
@@ -2807,15 +2584,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     streamed_files: Vec::new(),
                 });
             }
-            // No-op for HSM single-bank (no bank dir under
-            // images_dir; the keystore lives separately) but kept
-            // for uniformity — any future component with content
-            // here gets signed automatically.
+            // No-op for HSM single-bank (no bank dir under images_dir; the
+            // keystore lives separately) but kept for uniformity — any future
+            // component with content here gets signed automatically.
+            // `ivd_sign_staged_bank` (provider `seal`) seeds then signs.
             let target_bank = self.determine_target_bank()?;
-            // Seed unstreamed files from the active bank so the IVD
-            // signature below covers a complete bank, not a partial
-            // one. No-op for full updates / single-bank / factory.
-            self.seed_target_from_active(target_bank)?;
             self.ivd_sign_staged_bank(target_bank)?;
             return Ok(transfer_id);
         }
@@ -2967,13 +2740,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     (id, tb)
                 }
             };
-            // Self-sign before returning. `ivd_sign_staged_bank`
-            // no-ops when the bank dir is absent (e.g. HSM
-            // single-bank components).
-            // Seed unstreamed files from the active bank so the IVD
-            // signature below covers a complete bank, not a partial
-            // one. No-op for full updates / single-bank / factory.
-            self.seed_target_from_active(target_bank)?;
+            // Self-sign before returning. `ivd_sign_staged_bank` (provider
+            // `seal`) seeds unstreamed files from the active bank first so the
+            // signature covers a complete bank, then signs; no-ops when the
+            // bank dir is absent (e.g. HSM single-bank components).
             self.ivd_sign_staged_bank(target_bank)?;
             return Ok(transfer_id);
         }
@@ -3478,7 +3248,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // manifest carrying a non-empty version.
         let version_of = |bank: Bank| -> Option<String> {
             self.verified_bank_identity(bank)
-                .map(|id| id.version)
+                .and_then(|id| id.version)
                 .filter(|v| !v.is_empty())
         };
         let active_version = active_meta.as_ref().and_then(|_| version_of(rb));
@@ -3498,15 +3268,21 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn commit_flash(&self) -> BackendResult<()> {
-        let mut nv = self.nv_write()?;
-        match ota::commit(&mut *nv, self.bank_set) {
-            Ok(()) => {}
-            Err(ota::OtaError::AlreadyCommitted) => {} // CRL or idempotent commit — OK
-            Err(e) => return Err(map_ota_error(e)),
+        // NV commit routed through the bank provider (it folds AlreadyCommitted
+        // into Ok for CRL / idempotent commits). The provider writes NV with a
+        // plain lock, so refresh the DID cache afterwards — the `nv_write()`
+        // guard used to do this on drop, and the served identity/manifest must
+        // reflect the just-committed bank.
+        self.bank_provider
+            .commit()
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        {
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("nv lock poisoned".into()))?;
+            self.refresh_did_cache_locked(&nv);
         }
-        // Drop the NV write lock before acquiring the HSM mutex —
-        // arm_enrollment may itself touch on-disk state.
-        drop(nv);
 
         // Arm in-band enrolment for this VM's principal. The guest
         // will boot the just-promoted bank, connect to vhsm-ssd,
@@ -3551,8 +3327,19 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                 "rollback not supported for this component".into(),
             ));
         }
-        let mut nv = self.nv_write()?;
-        ota::rollback(&mut *nv, self.bank_set).map_err(map_ota_error)?;
+        // NV rollback routed through the bank provider. Refresh the DID cache
+        // afterwards (the provider writes NV with a plain lock; the old
+        // `nv_write()` guard refreshed on drop).
+        self.bank_provider
+            .rollback()
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        {
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("nv lock poisoned".into()))?;
+            self.refresh_did_cache_locked(&nv);
+        }
         // Clear flash transfer state after rollback
         *self.flash_transfer.lock().unwrap() = None;
         Ok(())
@@ -3913,13 +3700,13 @@ pub(crate) fn bank_dir_name(bank: Bank) -> &'static str {
     }
 }
 
-/// Convert a manifest [`IvdIdentity`] into the `(did, bytes)` pairs for
-/// the 9 SW-identity DIDs, each rendered in the historical fixed-width
-/// UDS byte form (UTF-8, NUL-padded / truncated to the width that DID
-/// used when it lived in NvFwMeta — 32 bytes, except programming_date's
-/// 8). Empty identity strings are skipped (DID stays not-found), so a
+/// Convert a [`FirmwareIdentity`] into the `(did, bytes)` pairs for the 9
+/// SW-identity DIDs, each rendered in the historical fixed-width UDS byte
+/// form (UTF-8, NUL-padded / truncated to the width that DID used when it
+/// lived in NvFwMeta — 32 bytes, except programming_date's 8). Absent
+/// (`None` / empty) identity fields are skipped (DID stays not-found), so a
 /// blank manifest identity behaves like an unprovisioned field.
-fn identity_to_did_bytes(identity: &hsm::ivd::IvdIdentity) -> Vec<(u16, Vec<u8>)> {
+fn identity_to_did_bytes(identity: &FirmwareIdentity) -> Vec<(u16, Vec<u8>)> {
     /// Pad/truncate a UTF-8 string to `width` bytes, NUL-padded — the
     /// same fixed-width form `read_did` used to return from NvFwMeta.
     fn fixed(s: &str, width: usize) -> Vec<u8> {
@@ -3930,7 +3717,7 @@ fn identity_to_did_bytes(identity: &hsm::ivd::IvdIdentity) -> Vec<(u16, Vec<u8>)
     }
 
     // (did, value, field-width). `version` → F189, `system_name` → F197.
-    let fields: [(u16, &str, usize); 9] = [
+    let fields: [(u16, &Option<String>, usize); 9] = [
         (did::DID_FW_VERSION, &identity.version, 32),
         (did::DID_ECU_SW_NUMBER, &identity.ecu_sw_number, 32),
         (
@@ -3951,77 +3738,77 @@ fn identity_to_did_bytes(identity: &hsm::ivd::IvdIdentity) -> Vec<(u16, Vec<u8>)
     ];
     fields
         .iter()
-        .filter(|(_, s, _)| !s.is_empty())
-        .map(|&(did, s, width)| (did, fixed(s, width)))
+        .filter_map(|(did, s, width)| {
+            s.as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| (*did, fixed(v, *width)))
+        })
         .collect()
 }
 
-/// Render a verified IVD manifest as the `x-sumo-installed-manifest`
-/// JSON body: the signed identity + per-file `(path, sha256-hex)`
-/// inventory + the base64 of the raw signature and manifest bytes (so a
-/// SW-mapping tool can re-verify the device signature independently).
-fn installed_manifest_json(vm: &hsm::ivd::VerifiedManifest) -> serde_json::Value {
+/// Render the installed firmware as the `x-sumo-installed-manifest` JSON
+/// body: the signed identity + per-file `(path, sha256-hex)` inventory + the
+/// base64 of the raw signature and manifest bytes (so a SW-mapping tool can
+/// re-verify the device signature independently).
+///
+/// IVD-specific scalar fields (`ivd_version`, `signed_at_unix`) aren't part
+/// of the kind-agnostic [`InstalledFirmware`], so they're decoded back out of
+/// the raw signed CBOR here — this is vm-mgr's IVD serving path, which is
+/// allowed to know the IVD wire (`fw.raw` is exactly those CBOR bytes).
+fn installed_manifest_json(fw: &InstalledFirmware) -> serde_json::Value {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
-    let m = &vm.manifest;
-    let id = &m.identity;
 
-    let files: Vec<serde_json::Value> = m
+    // Render an identity field exactly as before — the IVD manifest stored
+    // readable strings (empty for absent), so map `None` back to "".
+    fn s(o: &Option<String>) -> &str {
+        o.as_deref().unwrap_or("")
+    }
+
+    let files: Vec<serde_json::Value> = fw
         .files
         .iter()
         .map(|f| {
             serde_json::json!({
-                "path": f.relative_path,
-                "sha256": hex::encode(&f.sha256),
+                "path": f.name,
+                "sha256": hex::encode(f.sha256),
             })
         })
         .collect();
 
+    // Recover the two IVD-only scalars from the signed CBOR. Absent / undecodable
+    // raw (non-IVD kinds) falls back to the manifest version + 0.
+    let (ivd_version, signed_at_unix) = fw
+        .raw
+        .as_deref()
+        .and_then(|b| hsm::ivd::decode_manifest(b).ok())
+        .map(|m| (m.ivd_version, m.signed_at_unix))
+        .unwrap_or((hsm::ivd::IVD_MANIFEST_VERSION, 0));
+
     serde_json::json!({
-        "ivd_version": m.ivd_version,
-        "gen": m.gen,
-        "signed_at_unix": m.signed_at_unix,
+        "ivd_version": ivd_version,
+        "gen": fw.gen,
+        "signed_at_unix": signed_at_unix,
         "identity": {
-            "name": id.name,
-            "version": id.version,
-            "ecu_sw_number": id.ecu_sw_number,
-            "supplier_sw_number": id.supplier_sw_number,
-            "supplier_sw_version": id.supplier_sw_version,
-            "spare_part_number": id.spare_part_number,
-            "odx_file_id": id.odx_file_id,
-            "system_name": id.system_name,
-            "programming_date": id.programming_date,
-            "tester_serial": id.tester_serial,
+            "name": s(&fw.identity.name),
+            "version": s(&fw.identity.version),
+            "ecu_sw_number": s(&fw.identity.ecu_sw_number),
+            "supplier_sw_number": s(&fw.identity.supplier_sw_number),
+            "supplier_sw_version": s(&fw.identity.supplier_sw_version),
+            "spare_part_number": s(&fw.identity.spare_part_number),
+            "odx_file_id": s(&fw.identity.odx_file_id),
+            "system_name": s(&fw.identity.system_name),
+            "programming_date": s(&fw.identity.programming_date),
+            "tester_serial": s(&fw.identity.tester_serial),
         },
         "files": files,
-        "signature_b64": b64.encode(&vm.signature),
-        "manifest_b64": b64.encode(&vm.manifest_bytes),
+        "signature_b64": b64.encode(fw.signature.as_deref().unwrap_or(&[])),
+        "manifest_b64": b64.encode(fw.raw.as_deref().unwrap_or(&[])),
     })
 }
 
-/// `true` if `bank_dir` has no files that IVD signing would attest to.
-/// Skips IVD's own outputs (manifest + signature) so a re-sign doesn't
-/// trip on a previous run's artefacts.
-fn bank_dir_is_payload_empty(bank_dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(bank_dir) else {
-        return true;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = match path.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        if name == hsm::ivd::IVD_MANIFEST_FILE || name == hsm::ivd::IVD_SIGNATURE_FILE {
-            continue;
-        }
-        return false;
-    }
-    true
-}
+// `bank_dir_is_payload_empty` moved to `crate::bank_provider` alongside the
+// IVD seal logic that uses it.
 // `bank_set_dir_name` / `bank_file_names` / `payload_target_name`
 // retired in Phase 2 — per-slot behavior lives on `BankSetSpec` in
 // `crate::bank_spec` now and is read off `self.bank_spec` for the
@@ -4310,12 +4097,15 @@ mod identity_tests {
         // Sign bank_b (the inactive/target bank) with the package identity.
         backend.ivd_sign_staged_bank(Bank::B).unwrap();
 
-        // read_identity must return exactly what ImageMeta projected.
+        // read_installed's identity must round-trip exactly what ImageMeta
+        // projected (now mapped to the kind-agnostic FirmwareIdentity).
         let id = backend.verified_bank_identity(Bank::B).unwrap();
-        assert_eq!(id, sample_image_meta().to_ivd_identity());
-        assert_eq!(id.version, "1.2.0");
-        assert_eq!(id.ecu_sw_number, "VM1-SW-001");
-        assert_eq!(id.system_name, "VM1-Linux");
+        assert_eq!(id.version.as_deref(), Some("1.2.0"));
+        assert_eq!(id.ecu_sw_number.as_deref(), Some("VM1-SW-001"));
+        assert_eq!(id.system_name.as_deref(), Some("VM1-Linux"));
+        assert_eq!(id.spare_part_number.as_deref(), Some("VM1-SPARE-001"));
+        assert_eq!(id.supplier_sw_number.as_deref(), Some("SUP-SW-VM1-001"));
+        assert_eq!(id.odx_file_id.as_deref(), Some("ODX-VM1-V1"));
 
         cleanup(&images_dir, &keystore);
     }

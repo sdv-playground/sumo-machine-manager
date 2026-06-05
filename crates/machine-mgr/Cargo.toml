@@ -11,6 +11,7 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+nv-store = { path = "../nv-store" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

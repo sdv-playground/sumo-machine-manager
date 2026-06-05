@@ -38,6 +38,7 @@
 
 pub mod app_install_router;
 pub mod backend;
+pub mod bank_provider;
 pub mod bank_seed;
 pub mod bank_spec;
 pub mod component_adapter;

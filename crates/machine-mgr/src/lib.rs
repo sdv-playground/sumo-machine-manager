@@ -65,6 +65,7 @@
 //!   isn't written yet, real CAN adapter pending.
 
 pub mod bank_activator;
+pub mod bank_provider;
 pub mod component;
 pub mod error;
 pub mod machine;
@@ -74,6 +75,9 @@ pub mod types;
 mod tests;
 
 pub use bank_activator::{BankActivator, BankActivatorError};
+pub use bank_provider::{
+    BankError, BankProvider, FirmwareIdentity, InstalledFile, InstalledFirmware,
+};
 pub use component::Component;
 pub use error::{MachineError, MachineResult};
 pub use machine::{Machine, MachineRegistry};

@@ -89,6 +89,31 @@ fn fixed_field_to_string(field: &[u8]) -> String {
 }
 
 impl ImageMeta {
+    /// Project the SUIT-extracted identity into the kind-agnostic
+    /// [`machine_mgr::bank_provider::FirmwareIdentity`] the engine hands the
+    /// bank provider's `seal`. Empty fixed-width fields become `None` (the
+    /// "not provided" encoding); `name` mirrors `system_name`, matching
+    /// [`Self::to_ivd_identity`].
+    pub fn to_firmware_identity(&self) -> machine_mgr::bank_provider::FirmwareIdentity {
+        let opt = |b: &[u8]| {
+            let s = fixed_field_to_string(b);
+            (!s.is_empty()).then_some(s)
+        };
+        let system_name = opt(&self.system_name);
+        machine_mgr::bank_provider::FirmwareIdentity {
+            name: system_name.clone(),
+            version: opt(&self.fw_version),
+            ecu_sw_number: opt(&self.ecu_sw_number),
+            supplier_sw_number: opt(&self.supplier_sw_number),
+            supplier_sw_version: opt(&self.supplier_sw_version),
+            spare_part_number: opt(&self.spare_part_number),
+            odx_file_id: opt(&self.odx_file_id),
+            system_name,
+            programming_date: opt(&self.programming_date),
+            tester_serial: opt(&self.tester_serial),
+        }
+    }
+
     /// Project the SUIT-extracted identity into the readable
     /// [`hsm::ivd::IvdIdentity`] stored inside the signed IVD manifest.
     /// `name` mirrors `system_name` (the SUIT model/system name) — the
