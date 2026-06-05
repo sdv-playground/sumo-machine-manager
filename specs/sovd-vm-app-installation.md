@@ -773,3 +773,52 @@ SOVD VM application installation delivers read-only app/dependency filesystem im
 7. Preserves future flexibility for per-app update routes (phase 2+)
 
 This design balances simplicity (reuses existing bank model), safety (host authority, validation-before-mount), and efficiency (reuse, deltas), while remaining open to refinement based on phase 1 experience.
+
+---
+
+## 17. Reading the installed inventory — `x-sumo-installed-manifest` (implemented)
+
+The sections above describe *what* is composed into a bank. A SW-mapping / update
+tool also needs to read *what is actually installed right now*, per VM, file by
+file. That inventory already exists on the device as the committed bank's **signed
+IVD manifest** (`ivd-manifest.cbor` + `ivd-signature.bin`, see §4.4). vm-mgr
+exposes it, signature-verified, as a single vendor SOVD data read — no new route,
+no SOVDd change (SOVDd routes `/data` generically and stays spec-pure).
+
+**`GET /vehicle/v1/components/{vm}/data/x-sumo-installed-manifest`** →
+
+```json
+{
+  "ivd_version": 3, "gen": 5, "signed_at_unix": 1733000000,
+  "identity": { "name", "version", "ecu_sw_number", "supplier_sw_number",
+                "supplier_sw_version", "spare_part_number", "odx_file_id",
+                "system_name", "programming_date", "tester_serial" },
+  "files": [ { "path": "kernel",     "sha256": "<64-hex>" },
+             { "path": "rootfs.img", "sha256": "<64-hex>" } ],
+  "signature_b64": "<DER ECDSA-SHA256 over manifest_b64>",
+  "manifest_b64":  "<exact ivd-manifest.cbor bytes the signature covers>"
+}
+```
+
+**Semantics**
+
+- Served from the **running / committed bank** — the same source as the F187–F19E
+  identData DIDs, so the manifest and the DIDs can never disagree.
+- **Signature-verified server-side** before return; **404** when the bank has no
+  signed manifest (never flashed / no-HSM smoke path) — never fabricated.
+- **Vendor (`x-sumo-`)**: lives entirely in vm-mgr; SOVDd carries no vendor name.
+- **Independent verification**: a consumer re-verifies `signature_b64` over
+  `manifest_b64` with the **`ivd-signing` public key** (the key the device signs
+  banks with at provision/flash time). `files[]` then proves the exact installed
+  bits; `identity.version` is the release tag to diff against available updates.
+
+**Implementation**
+
+- `hsm::ivd::read_manifest(hsm, bank_dir) -> VerifiedManifest` — verifies the
+  signature, decodes, and returns the full manifest + the raw signed bytes + the
+  signature. `read_identity` is now a thin projection over it.
+- `VmBackend::verified_bank_manifest(bank)` — the running bank, memoised and
+  invalidated on every NV write (the same funnel as the identity-DID cache).
+- Advertised in `list_parameters` (only when a committed manifest exists) and
+  served in `read_data`; id const `INSTALLED_MANIFEST_PARAM_ID =
+  "x-sumo-installed-manifest"`, category `identData`.

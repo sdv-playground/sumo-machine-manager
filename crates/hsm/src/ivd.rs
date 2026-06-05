@@ -651,23 +651,37 @@ fn verify_bank_inner(
     Ok(manifest)
 }
 
+/// A bank's IVD manifest after a successful signature verification, with
+/// the raw artefacts kept alongside so a downstream consumer can
+/// re-verify independently (e.g. a SW-mapping tool that reads the manifest
+/// over SOVD and wants to check the device signature itself).
+#[derive(Debug, Clone)]
+pub struct VerifiedManifest {
+    /// The decoded manifest (`ivd_version`, `signed_at_unix`, `files`,
+    /// `gen`, `identity`).
+    pub manifest: IvdManifest,
+    /// The exact `ivd-manifest.cbor` bytes the signature covers — the
+    /// message a downstream re-verify must pass to `verify`.
+    pub manifest_bytes: Vec<u8>,
+    /// The `ivd-signature.bin` contents (raw DER ECDSA-SHA256).
+    pub signature: Vec<u8>,
+}
+
 /// Read the bank's IVD manifest, **signature-verify** it against the
-/// HSM's IVD public key, and return the firmware [`IvdIdentity`] it
-/// carries.
+/// HSM's IVD public key, and return the FULL verified manifest plus the
+/// raw bytes + signature for downstream re-verification.
 ///
-/// This is the single source for the UDS identification DIDs (F187-F19E)
-/// now that the FW Meta NV blob no longer copies them. It is a
-/// diagnostics-only read path (never on the boot hot path), so verifying
-/// the signature on every read is acceptable; callers cache the result
-/// per running bank and invalidate on install/commit.
-///
-/// Unlike [`verify_bank`], this does NOT re-hash the bank's payload files
-/// or enforce the gen pins — those are launch-time secure-boot concerns.
-/// It only proves the identity bytes are the ones the device signed, then
-/// returns them. A tampered manifest (any flipped byte) fails the
-/// signature check and surfaces [`IvdError::SignatureInvalid`].
+/// This is the diagnostics read path that backs the vendor
+/// `x-sumo-installed-manifest` SOVD parameter — it surfaces the committed
+/// bank's signed per-file inventory + identity in one go. Like
+/// [`read_identity`] (which is now a thin wrapper over this), it verifies
+/// the signature over the exact on-disk bytes but does NOT re-hash the
+/// payload files or enforce the gen pins — those are launch-time
+/// secure-boot concerns handled by [`verify_bank`]. A tampered manifest
+/// (any flipped byte) fails the signature check and surfaces
+/// [`IvdError::SignatureInvalid`].
 #[cfg(feature = "crypto")]
-pub fn read_identity(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<IvdIdentity, IvdError> {
+pub fn read_manifest(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<VerifiedManifest, IvdError> {
     let manifest_path = bank_dir.join(IVD_MANIFEST_FILE);
     let signature_path = bank_dir.join(IVD_SIGNATURE_FILE);
 
@@ -684,9 +698,31 @@ pub fn read_identity(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<IvdIdenti
         return Err(IvdError::SignatureInvalid);
     }
 
-    // Decode (also re-checks the version) and hand back just the identity.
+    // Decode (also re-checks the version) and hand back the whole manifest
+    // together with the bytes/signature the caller may want to re-verify.
     let manifest = decode_manifest(&manifest_bytes)?;
-    Ok(manifest.identity)
+    Ok(VerifiedManifest {
+        manifest,
+        manifest_bytes,
+        signature: sig,
+    })
+}
+
+/// Read the bank's IVD manifest, **signature-verify** it against the
+/// HSM's IVD public key, and return the firmware [`IvdIdentity`] it
+/// carries.
+///
+/// This is the single source for the UDS identification DIDs (F187-F19E)
+/// now that the FW Meta NV blob no longer copies them. It is a
+/// diagnostics-only read path (never on the boot hot path), so verifying
+/// the signature on every read is acceptable; callers cache the result
+/// per running bank and invalidate on install/commit.
+///
+/// A thin wrapper over [`read_manifest`] — same signature verification,
+/// returns only `.manifest.identity`.
+#[cfg(feature = "crypto")]
+pub fn read_identity(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<IvdIdentity, IvdError> {
+    Ok(read_manifest(hsm, bank_dir)?.manifest.identity)
 }
 
 /// SHA-256 of `bytes`. Uses `sha2` when the `crypto` feature is on;
@@ -1042,6 +1078,76 @@ mod tests {
         std::fs::write(&mpath, &bytes).unwrap();
 
         match read_identity(&hsm, &bank) {
+            Err(IvdError::SignatureInvalid) => {}
+            other => panic!("expected SignatureInvalid, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn read_manifest_returns_full_verified_manifest() {
+        let bank = temp_bank("read-manifest");
+        write(&bank.join("kernel"), b"kernel bytes");
+        write(&bank.join("rootfs.img"), &[0xCD; 64]);
+        write(&bank.join("nested/qvm.conf"), b"cmdline foo=bar");
+
+        let (hsm, keystore) = provisioned_sim("read-manifest");
+        sign_bank(&hsm, &bank, 4, sample_identity()).unwrap();
+
+        let vm = read_manifest(&hsm, &bank).unwrap();
+
+        // Identity + gen survive.
+        assert_eq!(vm.manifest.identity, sample_identity());
+        assert_eq!(vm.manifest.gen, 4);
+        assert_eq!(vm.manifest.ivd_version, IVD_MANIFEST_VERSION);
+
+        // The full sorted file inventory is present with name + 32-byte sha.
+        let paths: Vec<&str> = vm
+            .manifest
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["kernel", "nested/qvm.conf", "rootfs.img"]);
+        for f in &vm.manifest.files {
+            assert_eq!(f.sha256.len(), 32, "{}", f.relative_path);
+        }
+
+        // The raw bytes are exactly what the signature covers — re-verify
+        // them directly to prove the artefacts are usable downstream.
+        let on_disk = std::fs::read(bank.join(IVD_MANIFEST_FILE)).unwrap();
+        assert_eq!(vm.manifest_bytes, on_disk);
+        assert_eq!(
+            vm.signature,
+            std::fs::read(bank.join(IVD_SIGNATURE_FILE)).unwrap()
+        );
+        assert!(hsm
+            .verify(IVD_KEY_ID, &vm.manifest_bytes, &vm.signature)
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn read_manifest_rejects_tampered_manifest() {
+        let bank = temp_bank("read-manifest-tamper");
+        write(&bank.join("kernel"), b"kernel bytes");
+
+        let (hsm, keystore) = provisioned_sim("read-manifest-tamper");
+        sign_bank(&hsm, &bank, 3, sample_identity()).unwrap();
+
+        // Flip one byte of the signed manifest CBOR — the signature no
+        // longer matches, so read_manifest must refuse it.
+        let mpath = bank.join(IVD_MANIFEST_FILE);
+        let mut bytes = std::fs::read(&mpath).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&mpath, &bytes).unwrap();
+
+        match read_manifest(&hsm, &bank) {
             Err(IvdError::SignatureInvalid) => {}
             other => panic!("expected SignatureInvalid, got {other:?}"),
         }

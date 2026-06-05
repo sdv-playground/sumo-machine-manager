@@ -33,6 +33,7 @@ hsm = { path = "../hsm", features = ["crypto"] }
 host-os-mgr = { path = "../host-os-mgr" }
 app-mgr = { path = "../app-mgr" }
 hex = "0.4.3"
+base64 = "0.22"
 
 [dev-dependencies]
 http-body-util = "0.1"

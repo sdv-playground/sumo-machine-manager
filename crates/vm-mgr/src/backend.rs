@@ -33,6 +33,12 @@ use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware
 use crate::ota;
 use crate::sovd::security::SecurityProvider;
 
+/// Vendor SOVD data-parameter id for the committed bank's signed IVD
+/// manifest. `x-sumo-` prefix per ISO 17978-3 Table 70 vendor-extension
+/// namespacing — the route is plain `/data/{id}` (SOVDd stays spec-pure /
+/// format-agnostic); the vendor semantics live entirely here in vm-mgr.
+pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-sumo-installed-manifest";
+
 // ---------------------------------------------------------------------------
 // Session / security state (per backend instance)
 // ---------------------------------------------------------------------------
@@ -357,6 +363,19 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// enrich `GET /updates/{id}`. Cleared with the rest of the flash
     /// session in `clear_flash_session` / `start_flash`.
     manifest_describe: Mutex<HashMap<String, ManifestDescribeMeta>>,
+    /// Signature-verified IVD manifest of the RUNNING/committed bank,
+    /// cached so the diagnostics reads that need it — the identity-DID
+    /// overlay (`verified_bank_identity`) and the vendor
+    /// `x-sumo-installed-manifest` data parameter — share a single verify
+    /// pass rather than re-reading + re-verifying CBOR on every SOVD call.
+    ///
+    /// `(bank, manifest)`: the bank the cached manifest was read for, so a
+    /// running-bank flip (ecu_reset) is detected and re-verified. `Arc` so
+    /// readers clone cheaply without holding the lock across the JSON
+    /// build. Invalidated to `None` on every NV write via
+    /// `NvWriteGuard::drop` (same trigger as `did_cache`); the next reader
+    /// re-populates lazily.
+    verified_manifest_cache: Mutex<Option<(Bank, Arc<hsm::ivd::VerifiedManifest>)>>,
 }
 
 impl<D: BlockDevice + Send + 'static> VmBackend<D> {
@@ -477,6 +496,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             health_probe: None,
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             manifest_describe: Mutex::new(HashMap::new()),
+            verified_manifest_cache: Mutex::new(None),
         };
         // Populate DID cache from NV once at construction time. After this,
         // SOVD reads of NV-backed DIDs hit RAM only — see refresh_did_cache.
@@ -552,6 +572,17 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// - factory_reset (full re-population)
     fn refresh_did_cache_locked(&self, nv: &NvStore<D>) {
         let rb = *self.running_bank.lock().unwrap();
+
+        // Invalidate the verified-manifest cache in lock-step with the DID
+        // cache. This is the single funnel for both startup and every NV
+        // write (`NvWriteGuard::drop`), so dropping it here covers
+        // install/commit/ecu_reset. The identity overlay below re-populates
+        // it via `verified_bank_identity`; the vendor
+        // `x-sumo-installed-manifest` reader re-populates lazily on demand.
+        *self
+            .verified_manifest_cache
+            .lock()
+            .expect("verified_manifest_cache poisoned") = None;
 
         // Build the new map outside any cache lock — readers proceed
         // against the old map throughout this loop.
@@ -1016,26 +1047,54 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             .unwrap_or_default()
     }
 
-    /// Read + signature-verify a bank's IVD manifest and return the
-    /// firmware [`IvdIdentity`] it carries — the single source for the
-    /// SW-identity DIDs (F187-F19E) and version labels now that they're
-    /// out of NvFwMeta.
+    /// Read + signature-verify a bank's IVD manifest and return the whole
+    /// [`VerifiedManifest`] (decoded manifest + raw bytes + signature),
+    /// caching it per-bank so repeated diagnostics reads share one verify
+    /// pass. The cache is invalidated on every NV write (see
+    /// `refresh_did_cache_locked`), so the served manifest always reflects
+    /// the latest install/commit/ecu_reset.
     ///
     /// Returns `None` when the bank has no verifiable manifest (no
     /// images_dir, no HSM, not provisioned, no manifest yet, or a bad
     /// signature). A bad signature is logged at warn; absent/unsigned is
     /// debug (normal for factory-fresh / unprovisioned banks).
-    fn verified_bank_identity(&self, bank: Bank) -> Option<hsm::ivd::IvdIdentity> {
+    ///
+    /// Used for the RUNNING/committed bank: `read_data` of the identity
+    /// DIDs and the vendor `x-sumo-installed-manifest` parameter both pass
+    /// `*self.running_bank`, the same bank whose identity overlay is built
+    /// in `refresh_did_cache_locked`.
+    fn verified_bank_manifest(&self, bank: Bank) -> Option<Arc<hsm::ivd::VerifiedManifest>> {
+        // Fast path: return the cached manifest if it's for this bank.
+        {
+            let cache = self
+                .verified_manifest_cache
+                .lock()
+                .expect("verified_manifest_cache poisoned");
+            if let Some((cached_bank, vm)) = cache.as_ref() {
+                if *cached_bank == bank {
+                    return Some(Arc::clone(vm));
+                }
+            }
+        }
+
+        // Slow path: read + verify, then memoise for this bank.
         let bank_dir = self.target_bank_dir(bank)?;
         let hsm_arc = self.hsm_provider.as_ref()?;
         let hsm = hsm_arc.lock().ok()?;
-        match hsm::ivd::read_identity(&*hsm, &bank_dir) {
-            Ok(id) => Some(id),
+        match hsm::ivd::read_manifest(&*hsm, &bank_dir) {
+            Ok(vm) => {
+                let vm = Arc::new(vm);
+                *self
+                    .verified_manifest_cache
+                    .lock()
+                    .expect("verified_manifest_cache poisoned") = Some((bank, Arc::clone(&vm)));
+                Some(vm)
+            }
             Err(hsm::ivd::IvdError::SignatureInvalid) => {
                 tracing::warn!(
                     bank_set = ?self.bank_set,
                     bank = ?bank,
-                    "identity: IVD manifest signature INVALID; refusing to serve its identity",
+                    "identity: IVD manifest signature INVALID; refusing to serve it",
                 );
                 None
             }
@@ -1049,6 +1108,15 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 None
             }
         }
+    }
+
+    /// Read + signature-verify a bank's IVD manifest and return the
+    /// firmware [`IvdIdentity`] it carries — the single source for the
+    /// SW-identity DIDs (F187-F19E) and version labels now that they're
+    /// out of NvFwMeta. Thin projection over [`Self::verified_bank_manifest`].
+    fn verified_bank_identity(&self, bank: Bank) -> Option<hsm::ivd::IvdIdentity> {
+        self.verified_bank_manifest(bank)
+            .map(|vm| vm.manifest.identity.clone())
     }
 
     /// The `(did, bytes)` pairs for the 9 SW-identity DIDs of `bank`,
@@ -1996,6 +2064,34 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             }
         }
 
+        // Vendor data parameter: the running/committed bank's signed IVD
+        // manifest (per-file inventory + identity + signature). Advertised
+        // only when a verifiable manifest actually exists — absent on the
+        // no-HSM smoke path or a never-flashed bank, so we don't fabricate
+        // a parameter that would 404 on read.
+        let running = *self.running_bank.lock().unwrap();
+        if self.verified_bank_manifest(running).is_some() {
+            params.push(ParameterInfo {
+                id: INSTALLED_MANIFEST_PARAM_ID.to_string(),
+                name: "Installed firmware manifest (signed IVD)".to_string(),
+                description: Some(
+                    "Committed bank's signature-verified IVD manifest: \
+                     per-file name + sha256 inventory, firmware SW identity, \
+                     and the device signature + manifest bytes (base64) for \
+                     downstream re-verification."
+                        .to_string(),
+                ),
+                unit: None,
+                data_type: Some("object".to_string()),
+                read_only: true,
+                href: format!(
+                    "/vehicle/v1/components/{comp_id}/data/{INSTALLED_MANIFEST_PARAM_ID}"
+                ),
+                did: None,
+                category: Some(DataCategory::IdentData),
+            });
+        }
+
         Ok(params)
     }
 
@@ -2009,6 +2105,31 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         let mut values = Vec::new();
 
         for param_id in param_ids {
+            // Vendor parameter: the running/committed bank's signed IVD
+            // manifest. Intercepted before `resolve_param` (which only
+            // knows DID-registry / hex ids). 404 when no committed manifest
+            // exists — never fabricated.
+            if param_id == INSTALLED_MANIFEST_PARAM_ID {
+                let running = *self.running_bank.lock().unwrap();
+                let vm = self.verified_bank_manifest(running).ok_or_else(|| {
+                    BackendError::EntityNotFound(format!(
+                        "{INSTALLED_MANIFEST_PARAM_ID}: no committed IVD manifest for {} bank {:?}",
+                        self.entity_info.id, running
+                    ))
+                })?;
+                values.push(DataValue {
+                    id: param_id.clone(),
+                    name: "Installed firmware manifest (signed IVD)".to_string(),
+                    value: installed_manifest_json(&vm),
+                    unit: None,
+                    timestamp: Utc::now(),
+                    raw: None,
+                    did: None,
+                    length: None,
+                });
+                continue;
+            }
+
             let (did_num, reg) = resolve_param(param_id)
                 .ok_or_else(|| BackendError::ParameterNotFound(param_id.clone()))?;
 
@@ -3821,6 +3942,49 @@ fn identity_to_did_bytes(identity: &hsm::ivd::IvdIdentity) -> Vec<(u16, Vec<u8>)
         .collect()
 }
 
+/// Render a verified IVD manifest as the `x-sumo-installed-manifest`
+/// JSON body: the signed identity + per-file `(path, sha256-hex)`
+/// inventory + the base64 of the raw signature and manifest bytes (so a
+/// SW-mapping tool can re-verify the device signature independently).
+fn installed_manifest_json(vm: &hsm::ivd::VerifiedManifest) -> serde_json::Value {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let m = &vm.manifest;
+    let id = &m.identity;
+
+    let files: Vec<serde_json::Value> = m
+        .files
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "path": f.relative_path,
+                "sha256": hex::encode(&f.sha256),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "ivd_version": m.ivd_version,
+        "gen": m.gen,
+        "signed_at_unix": m.signed_at_unix,
+        "identity": {
+            "name": id.name,
+            "version": id.version,
+            "ecu_sw_number": id.ecu_sw_number,
+            "supplier_sw_number": id.supplier_sw_number,
+            "supplier_sw_version": id.supplier_sw_version,
+            "spare_part_number": id.spare_part_number,
+            "odx_file_id": id.odx_file_id,
+            "system_name": id.system_name,
+            "programming_date": id.programming_date,
+            "tester_serial": id.tester_serial,
+        },
+        "files": files,
+        "signature_b64": b64.encode(&vm.signature),
+        "manifest_b64": b64.encode(&vm.manifest_bytes),
+    })
+}
+
 /// `true` if `bank_dir` has no files that IVD signing would attest to.
 /// Skips IVD's own outputs (manifest + signature) so a re-sign doesn't
 /// trip on a previous run's artefacts.
@@ -4277,6 +4441,150 @@ mod identity_tests {
             serde_json::json!("2.0.0"),
             "cache must reflect the re-signed manifest identity after an NV write"
         );
+
+        cleanup(&images_dir, &keystore);
+    }
+
+    // -----------------------------------------------------------------
+    // Vendor data parameter: x-sumo-installed-manifest
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn installed_manifest_param_listed_and_read_when_committed() {
+        let (backend, images_dir, keystore) = backend_with_package("ivdread", sample_image_meta());
+        // Run on bank_b (the bank we sign) so the committed manifest is the
+        // running one the vendor param serves.
+        *backend.running_bank.lock().unwrap() = Bank::B;
+        backend.ivd_sign_staged_bank(Bank::B).unwrap();
+
+        // list_parameters advertises the vendor param (IdentData, read-only).
+        let params = backend.list_parameters().await.unwrap();
+        let p = params
+            .iter()
+            .find(|p| p.id == INSTALLED_MANIFEST_PARAM_ID)
+            .expect("x-sumo-installed-manifest must be listed when a manifest exists");
+        assert!(p.read_only);
+        assert_eq!(p.category, Some(DataCategory::IdentData));
+        assert!(p.did.is_none());
+
+        // read_data returns the structured JSON in `value`.
+        let vals = backend
+            .read_data(&[INSTALLED_MANIFEST_PARAM_ID.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(vals.len(), 1);
+        let v = &vals[0].value;
+
+        // gen + identity come straight from the signed manifest.
+        assert_eq!(v["ivd_version"], serde_json::json!(3));
+        assert_eq!(v["identity"]["version"], serde_json::json!("1.2.0"));
+        assert_eq!(
+            v["identity"]["ecu_sw_number"],
+            serde_json::json!("VM1-SW-001")
+        );
+        assert_eq!(v["identity"]["system_name"], serde_json::json!("VM1-Linux"));
+
+        // files[]: each entry has path + lowercase-hex sha256 (64 chars).
+        let files = v["files"].as_array().expect("files array");
+        assert!(files
+            .iter()
+            .any(|f| f["path"] == serde_json::json!("rootfs.img")));
+        for f in files {
+            let sha = f["sha256"].as_str().expect("sha256 hex string");
+            assert_eq!(sha.len(), 64, "sha256 must be 32-byte lowercase hex");
+            assert!(sha
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        }
+
+        // The two base64 fields decode and re-verify against the HSM,
+        // proving they're the exact signed artefacts (downstream re-verify).
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let sig = b64
+            .decode(v["signature_b64"].as_str().unwrap())
+            .expect("signature_b64 decodes");
+        let mbytes = b64
+            .decode(v["manifest_b64"].as_str().unwrap())
+            .expect("manifest_b64 decodes");
+        // manifest_b64 must equal the on-disk signed bytes.
+        let on_disk = std::fs::read(
+            images_dir
+                .join("vm1")
+                .join("bank_b")
+                .join(hsm::ivd::IVD_MANIFEST_FILE),
+        )
+        .unwrap();
+        assert_eq!(mbytes, on_disk);
+        // Re-verify the signature over the manifest bytes via the HSM.
+        let ok = {
+            let hsm = backend.hsm_provider.as_ref().unwrap().lock().unwrap();
+            hsm.verify(hsm::ivd::IVD_KEY_ID, &mbytes, &sig).unwrap()
+        };
+        assert!(
+            ok,
+            "decoded signature must verify over decoded manifest bytes"
+        );
+
+        cleanup(&images_dir, &keystore);
+    }
+
+    #[tokio::test]
+    async fn installed_manifest_param_absent_and_404_without_manifest() {
+        // No ivd_sign_staged_bank call → the running bank has a payload file
+        // but no signed manifest yet (mirrors no-HSM smoke / never-flashed).
+        let (backend, images_dir, keystore) = backend_with_package("ivdnone", sample_image_meta());
+        *backend.running_bank.lock().unwrap() = Bank::B;
+
+        // Not advertised.
+        let params = backend.list_parameters().await.unwrap();
+        assert!(
+            !params.iter().any(|p| p.id == INSTALLED_MANIFEST_PARAM_ID),
+            "vendor param must be absent when no committed manifest exists"
+        );
+
+        // Read 404s (EntityNotFound → HTTP 404).
+        let err = backend
+            .read_data(&[INSTALLED_MANIFEST_PARAM_ID.to_string()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BackendError::EntityNotFound(_)),
+            "expected EntityNotFound (404), got {err:?}"
+        );
+        assert_eq!(err.status_code(), 404);
+
+        cleanup(&images_dir, &keystore);
+    }
+
+    #[tokio::test]
+    async fn installed_manifest_param_refused_when_tampered() {
+        let (backend, images_dir, keystore) =
+            backend_with_package("ivdtamper", sample_image_meta());
+        *backend.running_bank.lock().unwrap() = Bank::B;
+        backend.ivd_sign_staged_bank(Bank::B).unwrap();
+
+        // Flip a byte of the signed manifest — signature no longer matches.
+        let mpath = images_dir
+            .join("vm1")
+            .join("bank_b")
+            .join(hsm::ivd::IVD_MANIFEST_FILE);
+        let mut bytes = std::fs::read(&mpath).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&mpath, &bytes).unwrap();
+
+        // A tampered manifest must not be served — invalidate the cache
+        // (an NV write would normally do this) so the re-read hits disk.
+        {
+            let nv = backend.nv.lock().unwrap();
+            backend.refresh_did_cache_locked(&nv);
+        }
+        let err = backend
+            .read_data(&[INSTALLED_MANIFEST_PARAM_ID.to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BackendError::EntityNotFound(_)));
 
         cleanup(&images_dir, &keystore);
     }
