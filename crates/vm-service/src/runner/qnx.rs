@@ -71,29 +71,12 @@ impl QnxRunner {
         format!("/dev/{}0", Self::extra_prefix(vm_name, role))
     }
 
-    /// Dedicated prefix for the policy partition's devb-loopback.
-    /// 4-char role token (`pols`) mirrors `qvmdisk-{vm}`'s structure
-    /// (4-char role + dash + vm_name); 6-char tokens like the natural
-    /// `qvmpolicy-{vm}` tripped a silent io-blk registration drop on
-    /// managed-cvc QNX 7.1 hosts. Pattern proven empirically.
-    fn policy_prefix(vm_name: &str) -> String {
-        format!("qvmpols-{vm_name}")
-    }
-
-    fn policy_device(vm_name: &str) -> String {
-        format!("/dev/{}0", Self::policy_prefix(vm_name))
-    }
-
-    /// Dedicated prefix for the CA-bundle partition's devb-loopback.
-    /// 3-char role token (`cab`) stays inside the same io-blk-friendly
-    /// prefix-length envelope as `qvmpols-{vm}` (see `policy_prefix`).
-    fn ca_bundle_prefix(vm_name: &str) -> String {
-        format!("qvmcab-{vm_name}")
-    }
-
-    fn ca_bundle_device(vm_name: &str) -> String {
-        format!("/dev/{}0", Self::ca_bundle_prefix(vm_name))
-    }
+    // Policy, ca-bundle, sumo-config, and any future partition share the
+    // generic `extra_prefix` naming (`qvm{role}-{vm}`) — see the partition
+    // loop in `start`. No per-type prefix fns: the role token comes from
+    // the OTA-delivered vm-config.yaml, so a new partition is config, not
+    // code. (Keep role tokens ≤4 chars — io-blk on QNX 7.1 silently drops
+    // longer prefixes; that's why the tokens are `pols`/`cab`/`cfg`.)
 
     /// Walk `/proc/<pid>/cmdline` for every live process and return
     /// `(pid, argv_string)` pairs. argv tokens are NUL-separated on
@@ -320,54 +303,30 @@ impl VmRunner for QnxRunner {
             }
         }
 
-        // Policy partition (AUTH-ARCH-001 §4): a small read-only image
-        // shipped in the bank alongside the rootfs. The on-host
-        // devb-loopback registers as `/dev/qvmpols-{vm}0` — short
-        // 4-char role token matching the rootfs's `qvmdisk-{vm}`
-        // structure (the `qvm{role}-{vm}` pattern with 6-char role
-        // "policy" was tried first and tripped a silent io-blk
-        // registration drop on managed-cvc QNX 7.1; shorter prefix
-        // fixed it). The qvm.conf wires a virtio-blk pointing at
-        // /dev/qvmpols-{vm}0; the guest's IFS mounts it at
-        // /etc/sumo/policy/ before any policy-reading service starts.
-        // Optional — banks without policy.qnx6 just don't get a
-        // mount on the guest.
-        if let Some(policy) = def.policy_path() {
-            if policy.exists() {
-                let prefix = Self::policy_prefix(name);
-                self.spawn_loopback(&prefix, &policy)?;
-                let device = Self::policy_device(name);
+        // Per-bank read-only partitions (policy, ca-bundle, sumo-config,
+        // future app images …) — declared in the OTA-delivered
+        // vm-config.yaml, NOT hardcoded here, so a new partition needs no
+        // host-binary change. Each backs a devb-loopback at
+        // `/dev/qvm{role}-{vm}0` (short role token — io-blk on QNX 7.1
+        // silently drops prefixes >~4 chars); the bank's qvm.conf wires a
+        // matching virtio-blk hostdev and the guest IFS mounts it. A
+        // missing source is skipped (the guest just doesn't see it).
+        for part in &def.partitions {
+            let path = def.partition_path(part);
+            if path.exists() {
+                let prefix = Self::extra_prefix(name, &part.role);
+                self.spawn_loopback(&prefix, &path)?;
                 tracing::info!(
-                    vm = %name, device, path = %policy.display(),
-                    "policy partition attached"
+                    vm = %name, role = %part.role,
+                    device = %Self::extra_device(name, &part.role),
+                    path = %path.display(),
+                    "partition attached"
                 );
             } else {
                 tracing::warn!(
-                    "VM {name}: policy image not found: {} — guest will boot without /etc/sumo/policy",
-                    policy.display()
-                );
-            }
-        }
-
-        // CA-bundle partition — a small read-only image carrying the
-        // TLS trust anchors. Mounted by the guest at `/etc/ssl/certs`
-        // (QNX) or `/etc/pki/ca-trust/extracted` (Linux). Ships in the
-        // bank alongside the policy partition. Same short-prefix
-        // pattern as policy (`qvmcab-{vm}`) to dodge the io-blk
-        // silent-drop trap on long prefixes.
-        if let Some(bundle) = def.ca_bundle_path() {
-            if bundle.exists() {
-                let prefix = Self::ca_bundle_prefix(name);
-                self.spawn_loopback(&prefix, &bundle)?;
-                let device = Self::ca_bundle_device(name);
-                tracing::info!(
-                    vm = %name, device, path = %bundle.display(),
-                    "ca-bundle partition attached"
-                );
-            } else {
-                tracing::warn!(
-                    "VM {name}: ca-bundle image not found: {} — guest TLS clients will fail",
-                    bundle.display()
+                    "VM {name}: partition '{}' source not found: {} — skipping",
+                    part.role,
+                    path.display()
                 );
             }
         }

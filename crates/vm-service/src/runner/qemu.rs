@@ -208,24 +208,18 @@ impl QemuRunner {
                 ]);
             }
 
-            // Policy partition (AUTH-ARCH-001 §4) — read-only image
-            // mounted at /etc/sumo/policy by the guest's startup.
-            // No readonly=on: QNX uses bare -drive (IDE interface) which
-            // doesn't support read-only on q35. The guest mounts ro.
-            if let Some(policy) = def.policy_path() {
-                args.extend_from_slice(&[
-                    "-drive".into(),
-                    format!("file={},format=raw", policy.display()),
-                ]);
-            }
-
-            // CA-bundle partition — read-only image, single concatenated
-            // PEM mounted at /etc/ssl/certs/ by the guest's IFS startup.
-            if let Some(bundle) = def.ca_bundle_path() {
-                args.extend_from_slice(&[
-                    "-drive".into(),
-                    format!("file={},format=raw", bundle.display()),
-                ]);
+            // Per-bank read-only partitions (policy, ca-bundle, sumo-config,
+            // app images …) from the OTA-delivered vm-config.yaml. QNX uses
+            // bare -drive (IDE interface — no readonly=on on q35); the guest
+            // mounts each ro. A missing source is skipped.
+            for part in &def.partitions {
+                let path = def.partition_path(part);
+                if path.exists() {
+                    args.extend_from_slice(&[
+                        "-drive".into(),
+                        format!("file={},format=raw", path.display()),
+                    ]);
+                }
             }
 
             // Extra disks (data partition, etc.)
@@ -285,36 +279,26 @@ impl QemuRunner {
                 }
             }
 
-            // Policy partition (AUTH-ARCH-001 §4) — read-only image.
-            // Appended to disk_args so it shares the same ordering
-            // logic as data/swap disks. The guest's init mounts it
-            // at /etc/sumo/policy/ from whichever virtio-blk node it
-            // enumerates as.
-            if let Some(policy) = def.policy_path() {
+            // Per-bank read-only partitions (policy, ca-bundle, sumo-config,
+            // app images …) from the OTA-delivered vm-config.yaml. Appended
+            // to disk_args so they share the data/swap ordering logic; the
+            // guest mounts each from whichever virtio-blk node it enumerates
+            // as. A missing source is skipped.
+            for part in &def.partitions {
+                let path = def.partition_path(part);
+                if !path.exists() {
+                    continue;
+                }
+                let drive_id = format!("hd_{}", part.role);
+                let ro = if part.readonly { ",readonly=on" } else { "" };
                 disk_args.push(vec![
                     "-drive".into(),
                     format!(
-                        "file={},format=raw,if=none,id=hd_policy,readonly=on",
-                        policy.display()
+                        "file={},format=raw,if=none,id={drive_id}{ro}",
+                        path.display()
                     ),
                     "-device".into(),
-                    format!("{blk_device},drive=hd_policy"),
-                ]);
-            }
-
-            // CA-bundle partition — full /etc/pki/ca-trust/extracted/
-            // tree as squashfs; mounted by a systemd .mount unit in
-            // the guest. Same disk_args ordering as policy so the
-            // virtio-blk enumeration order stays stable across rebuilds.
-            if let Some(bundle) = def.ca_bundle_path() {
-                disk_args.push(vec![
-                    "-drive".into(),
-                    format!(
-                        "file={},format=raw,if=none,id=hd_cabundle,readonly=on",
-                        bundle.display()
-                    ),
-                    "-device".into(),
-                    format!("{blk_device},drive=hd_cabundle"),
+                    format!("{blk_device},drive={drive_id}"),
                 ]);
             }
 

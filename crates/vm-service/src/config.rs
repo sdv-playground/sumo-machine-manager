@@ -175,6 +175,11 @@ pub struct VmDefinition {
     /// Extra disks (data, swap) — not part of the banked image set.
     #[serde(default)]
     pub disks: Vec<DiskConfig>,
+    /// Per-bank read-only partitions (policy, ca-bundle, sumo-config,
+    /// app images …) the host loopbacks for the guest. Sourced from the
+    /// OTA-delivered `vm-config.yaml`; see [`Partition`].
+    #[serde(default)]
+    pub partitions: Vec<Partition>,
     /// Health monitoring configuration.
     #[serde(default)]
     #[allow(dead_code)]
@@ -233,20 +238,27 @@ pub struct ImagePaths {
     /// Root filesystem filename (e.g., "rootfs.qcow2").
     #[serde(default)]
     pub rootfs: Option<String>,
-    /// Policy partition filename (e.g., "policy") — a read-only image
-    /// (qnx6 / squashfs) the guest mounts at `/etc/sumo/policy`.
-    /// Ships in the bank alongside kernel + rootfs; absent on banks
-    /// that haven't migrated yet. See AUTH-ARCH-001 §4.
-    #[serde(default)]
-    pub policy: Option<String>,
-    /// CA-bundle partition filename (e.g., "ca-bundle") — a read-only
-    /// image (qnx6 / squashfs) the guest mounts at `/etc/ssl/certs`
-    /// (QNX) or `/etc/pki/ca-trust/extracted` (Linux). Ships in the
-    /// bank alongside kernel + rootfs. No backward-compat fallback:
-    /// guests without this component will not have TLS until the
-    /// bank is reflashed with one.
-    #[serde(default)]
-    pub ca_bundle: Option<String>,
+}
+
+/// One extra read-only image the host exposes to the guest as a block
+/// device (devb-loopback → `/dev/qvm{role}-{vm}0`, wired to the guest's
+/// `qvm.conf` hostdev). Declared per-bank in the OTA-delivered
+/// `vm-config.yaml`, so adding a partition — policy, ca-bundle,
+/// sumo-config, an app image — never needs a host-binary change; only a
+/// genuinely new *kind* of host operation would. `role` is the short
+/// device token (keep ≤4 chars — io-blk on QNX 7.1 silently drops longer
+/// prefixes); `source` is the bank-relative filename backing the loopback.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Partition {
+    pub role: String,
+    pub source: String,
+    /// Attach read-only (default true — these are RO partitions).
+    #[serde(default = "default_true")]
+    pub readonly: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Extra disk not managed by the banking system.
@@ -345,32 +357,15 @@ impl VmDefinition {
         })
     }
 
-    /// Resolve the policy partition path (image_dir + images.policy).
-    /// Returns None on banks that don't carry a policy image yet —
-    /// the runner falls back to no-policy-attached, and the guest
-    /// services see no /etc/sumo/policy mount.
-    pub fn policy_path(&self) -> Option<PathBuf> {
-        self.images.policy.as_ref().map(|p| {
-            if Path::new(p).is_absolute() {
-                PathBuf::from(p)
-            } else {
-                self.image_dir.join(p)
-            }
-        })
-    }
-
-    /// Resolve the CA-bundle partition path (image_dir + images.ca_bundle).
-    /// Returns None when the bank doesn't carry a CA bundle. The runner
-    /// then doesn't attach the device and the guest can't mount it —
-    /// TLS clients in that guest will fail to validate certificates.
-    pub fn ca_bundle_path(&self) -> Option<PathBuf> {
-        self.images.ca_bundle.as_ref().map(|p| {
-            if Path::new(p).is_absolute() {
-                PathBuf::from(p)
-            } else {
-                self.image_dir.join(p)
-            }
-        })
+    /// Resolve a partition's backing path: bank-relative `source` against
+    /// `image_dir`, or an absolute `source` verbatim. Used by the runners
+    /// to back each partition's devb-loopback / -drive.
+    pub fn partition_path(&self, p: &Partition) -> PathBuf {
+        if Path::new(&p.source).is_absolute() {
+            PathBuf::from(&p.source)
+        } else {
+            self.image_dir.join(&p.source)
+        }
     }
 
     /// Shutdown timeout in seconds (default 10).
@@ -404,12 +399,11 @@ impl VmDefinition {
             if imgs.rootfs.is_some() {
                 merged.images.rootfs = imgs.rootfs.clone();
             }
-            if imgs.policy.is_some() {
-                merged.images.policy = imgs.policy.clone();
-            }
-            if imgs.ca_bundle.is_some() {
-                merged.images.ca_bundle = imgs.ca_bundle.clone();
-            }
+        }
+        // Partitions are declared wholesale per-bank (vm-config.yaml),
+        // not field-merged: a present list replaces the base entirely.
+        if let Some(ref parts) = overrides.partitions {
+            merged.partitions = parts.clone();
         }
         merged
     }
@@ -577,6 +571,8 @@ pub struct VmBankConfig {
     pub extra_cmdline: Option<String>,
     #[serde(default)]
     pub images: Option<ImagePaths>,
+    #[serde(default)]
+    pub partitions: Option<Vec<Partition>>,
 }
 
 impl VmBankConfig {
@@ -613,11 +609,10 @@ mod tests {
             images: ImagePaths {
                 kernel: Some("bzImage".into()),
                 rootfs: Some("rootfs.img".into()),
-                policy: None,
-                ca_bundle: None,
             },
             devices: vec![],
             disks: vec![],
+            partitions: vec![],
             health: None,
             shutdown: None,
             extra_cmdline: Some("console=ttyS0".into()),
@@ -657,9 +652,8 @@ mod tests {
             images: Some(ImagePaths {
                 kernel: Some("vmlinuz".into()),
                 rootfs: Some("root.ext4".into()),
-                policy: None,
-                ca_bundle: None,
             }),
+            partitions: None,
         };
 
         let merged = base.with_bank_overrides(&overrides);
@@ -731,8 +725,6 @@ extra_cmdline: "debug"
             images: Some(ImagePaths {
                 kernel: Some("vmlinuz-new".into()),
                 rootfs: None,
-                policy: None,
-                ca_bundle: None,
             }),
             ..Default::default()
         };
@@ -740,6 +732,47 @@ extra_cmdline: "debug"
         let merged = base.with_bank_overrides(&overrides);
         assert_eq!(merged.images.kernel.as_deref(), Some("vmlinuz-new"));
         assert_eq!(merged.images.rootfs.as_deref(), Some("rootfs.img")); // unchanged
+    }
+
+    #[test]
+    fn bank_config_partitions_override() {
+        let base = base_def();
+        assert!(base.partitions.is_empty());
+        let overrides = VmBankConfig {
+            partitions: Some(vec![
+                Partition {
+                    role: "cfg".into(),
+                    source: "sumo-config".into(),
+                    readonly: true,
+                },
+                Partition {
+                    role: "cab".into(),
+                    source: "ca-bundle".into(),
+                    readonly: true,
+                },
+            ]),
+            ..Default::default()
+        };
+        let merged = base.with_bank_overrides(&overrides);
+        assert_eq!(merged.partitions.len(), 2);
+        assert_eq!(merged.partitions[0].role, "cfg");
+        assert_eq!(merged.partitions[0].source, "sumo-config");
+    }
+
+    #[test]
+    fn bank_config_deserialize_partitions() {
+        let yaml = r#"
+cpus: 2
+partitions:
+  - { role: pols, source: policy }
+  - { role: cfg, source: sumo-config }
+"#;
+        let config: VmBankConfig = serde_yaml::from_str(yaml).unwrap();
+        let parts = config.partitions.expect("partitions present");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].role, "pols");
+        assert_eq!(parts[1].source, "sumo-config");
+        assert!(parts[0].readonly); // defaults true
     }
 
     // -----------------------------------------------------------------
