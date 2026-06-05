@@ -48,7 +48,7 @@ fn make_backend(
     let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(trust_anchor));
     let sp = Arc::new(TestSecurityProvider);
     Arc::new(VmBackend::with_options(
-        set, nv, mp, sp, config, None, images_dir,
+        set, nv, mp, sp, config, None, images_dir, None,
     ))
 }
 

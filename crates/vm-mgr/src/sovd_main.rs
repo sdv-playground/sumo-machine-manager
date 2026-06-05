@@ -244,6 +244,7 @@ async fn main() {
             config,
             vm_service_addr.clone(),
             images_dir.clone(),
+            hsm_provider.clone(),
         );
         // Read display_name from per-bank vm-config.yaml if available
         if let Some(ref dir) = images_dir {
@@ -256,12 +257,6 @@ async fn main() {
                     }
                 }
             }
-        }
-        // Every bank set needs the HSM provider, not just HSM —
-        // ivd_sign_staged_bank seals each staged bank with the
-        // `ivd-signing` key for verified launch.
-        if let Some(ref provider) = hsm_provider {
-            backend = backend.with_hsm_provider(provider.clone());
         }
         // Wire bank activator into the boot backend
         if set == BankSet::HostOs {

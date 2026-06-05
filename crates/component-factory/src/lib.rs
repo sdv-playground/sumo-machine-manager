@@ -208,6 +208,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 comp_config,
                 deps.vm_service_addr.clone(),
                 spec.storage_path.clone().or_else(|| spec.base_path.clone()),
+                deps.hsm_provider.clone(),
             )
             .with_bank_spec(bank_spec.clone());
             let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);
@@ -264,15 +265,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 comp_config,
                 vm_service,
                 images_dir,
+                deps.hsm_provider.clone(),
             )
             .with_bank_spec(bank_spec.clone());
-
-            // Every bank set needs the HSM provider, not just HSM —
-            // ivd_sign_staged_bank uses the `ivd-signing` key to seal
-            // each staged bank dir for verified launch.
-            if let Some(ref provider) = deps.hsm_provider {
-                backend = backend.with_hsm_provider(provider.clone());
-            }
 
             if let Some(activator) = deps.bank_activators.get(&spec.id) {
                 backend = backend.with_bank_activator(activator.clone());

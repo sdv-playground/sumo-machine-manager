@@ -394,6 +394,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             config,
             None,
             None,
+            None,
         )
     }
 
@@ -413,6 +414,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             config,
             vm_service_addr,
             None,
+            None,
         )
     }
 
@@ -424,6 +426,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         config: ComponentConfig,
         vm_service_addr: Option<String>,
         images_dir: Option<PathBuf>,
+        hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
     ) -> Self {
         let (id, name, desc) = match bank_set {
             BankSet::HostOs => ("host-os", "Host OS", "Host OS (IFS + rootfs) A/B bank set"),
@@ -491,7 +494,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             vm_service_addr,
             images_dir,
             upload_phase: Mutex::new(None),
-            hsm_provider: None,
+            hsm_provider,
             bank_activator: None,
             health_probe: None,
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
@@ -519,12 +522,6 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// values once Phase 3 wires the ComponentSpec → BankSetSpec path.
     pub fn with_bank_spec(mut self, spec: crate::bank_spec::BankSetSpec) -> Self {
         self.bank_spec = spec;
-        self
-    }
-
-    /// Set an HSM provider for routing key material manifests.
-    pub fn with_hsm_provider(mut self, provider: Arc<Mutex<dyn hsm::HsmProvider>>) -> Self {
-        self.hsm_provider = Some(provider);
         self
     }
 
@@ -1072,17 +1069,31 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 .expect("verified_manifest_cache poisoned");
             if let Some((cached_bank, vm)) = cache.as_ref() {
                 if *cached_bank == bank {
+                    tracing::info!(component = %self.entity_info.id, bank = ?bank, "ivd-route: cache hit -> serving");
                     return Some(Arc::clone(vm));
                 }
             }
         }
 
         // Slow path: read + verify, then memoise for this bank.
-        let bank_dir = self.target_bank_dir(bank)?;
-        let hsm_arc = self.hsm_provider.as_ref()?;
-        let hsm = hsm_arc.lock().ok()?;
+        // ROUTING TRACE (temporary): log every decision so the installed-manifest
+        // read path is visible on-device. Strip once the path is confirmed.
+        let Some(bank_dir) = self.target_bank_dir(bank) else {
+            tracing::warn!(component = %self.entity_info.id, bank = ?bank, "ivd-route: NO images_dir (target_bank_dir None) -> None");
+            return None;
+        };
+        let Some(hsm_arc) = self.hsm_provider.as_ref() else {
+            tracing::warn!(component = %self.entity_info.id, bank = ?bank, bank_dir = ?bank_dir, "ivd-route: NO hsm_provider on backend -> None");
+            return None;
+        };
+        let Ok(hsm) = hsm_arc.lock() else {
+            tracing::warn!(component = %self.entity_info.id, bank = ?bank, "ivd-route: hsm lock poisoned -> None");
+            return None;
+        };
+        tracing::info!(component = %self.entity_info.id, bank = ?bank, bank_dir = ?bank_dir, "ivd-route: reading + signature-verifying manifest");
         match hsm::ivd::read_manifest(&*hsm, &bank_dir) {
             Ok(vm) => {
+                tracing::info!(component = %self.entity_info.id, bank = ?bank, "ivd-route: manifest OK -> serving + caching");
                 let vm = Arc::new(vm);
                 *self
                     .verified_manifest_cache
@@ -1092,18 +1103,20 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             }
             Err(hsm::ivd::IvdError::SignatureInvalid) => {
                 tracing::warn!(
+                    component = %self.entity_info.id,
                     bank_set = ?self.bank_set,
                     bank = ?bank,
-                    "identity: IVD manifest signature INVALID; refusing to serve it",
+                    "ivd-route: IVD manifest signature INVALID; refusing to serve it",
                 );
                 None
             }
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
+                    component = %self.entity_info.id,
                     bank_set = ?self.bank_set,
                     bank = ?bank,
                     error = %e,
-                    "identity: no verifiable IVD manifest; identity DIDs unavailable",
+                    "ivd-route: read_manifest FAILED -> None",
                 );
                 None
             }
@@ -2111,6 +2124,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             // exists — never fabricated.
             if param_id == INSTALLED_MANIFEST_PARAM_ID {
                 let running = *self.running_bank.lock().unwrap();
+                tracing::info!(component = %self.entity_info.id, running_bank = ?running, "ivd-route: read_data x-sumo-installed-manifest requested");
                 let vm = self.verified_bank_manifest(running).ok_or_else(|| {
                     BackendError::EntityNotFound(format!(
                         "{INSTALLED_MANIFEST_PARAM_ID}: no committed IVD manifest for {} bank {:?}",
@@ -4242,8 +4256,8 @@ mod identity_tests {
             ComponentConfig::default(),
             None,
             Some(images_dir.clone()),
-        )
-        .with_hsm_provider(hsm);
+            Some(hsm),
+        );
 
         // Stage a payload file in the target (bank_b) so the bank isn't
         // payload-empty and signing actually runs.
