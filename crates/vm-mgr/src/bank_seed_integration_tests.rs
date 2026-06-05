@@ -1,5 +1,5 @@
-//! Backend-level integration tests for `bank_seed::seed_missing_files`
-//! wired through `VmBackend::seed_target_from_active`.
+//! Provider-level integration tests for `bank_seed::seed_missing_files`
+//! wired through `IvdBankProvider::seed_target_from_active`.
 //!
 //! These complement the pure-function tests in `bank_seed::tests`
 //! (file-by-file semantics) by validating that:
@@ -10,6 +10,10 @@
 //!   - the "seed before IVD sign" ordering invariant is encoded in
 //!     a way a future refactor can't silently break (we assert the
 //!     visible file system state after the seed runs)
+//!
+//! The production seed runs inside `IvdBankProvider::seal`; these tests
+//! exercise the same primitive directly on the provider (the engine no
+//! longer holds a concrete `IvdBankProvider`, only `Arc<dyn BankProvider>`).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -18,10 +22,9 @@ use nv_store::block::MemBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
-use crate::backend::{ComponentConfig, VmBackend};
-use crate::manifest_provider::ManifestProvider;
-use crate::sovd::security::TestSecurityProvider;
-use crate::suit_provider::SuitProvider;
+use crate::backend::ComponentConfig;
+use crate::bank_provider::IvdBankProvider;
+use crate::bank_spec::BankSetSpec;
 
 fn make_nv() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
@@ -38,18 +41,25 @@ fn set_active_bank(nv: &Arc<Mutex<NvStore<MemBlockDevice>>>, set: BankSet, activ
     nv_guard.write_boot_state(&mut state).unwrap();
 }
 
+/// Build an `IvdBankProvider` with the same nv / bank_set / images_dir /
+/// dir_name the backend would, so `seed_target_from_active` resolves the
+/// active bank from NV and composes identical on-disk paths.
 fn make_backend(
     nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
     set: BankSet,
     config: ComponentConfig,
     images_dir: Option<PathBuf>,
-) -> Arc<VmBackend<MemBlockDevice>> {
-    let trust_anchor = vec![0u8; 32];
-    let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(trust_anchor));
-    let sp = Arc::new(TestSecurityProvider);
-    Arc::new(VmBackend::with_options(
-        set, nv, mp, sp, config, None, images_dir, None,
-    ))
+) -> IvdBankProvider<MemBlockDevice> {
+    let dir_name = BankSetSpec::for_well_known(set).dir_name;
+    IvdBankProvider::new(
+        nv,
+        set,
+        config.single_bank,
+        images_dir,
+        dir_name,
+        None,
+        None,
+    )
 }
 
 fn write_file(p: &std::path::Path, content: &[u8]) {

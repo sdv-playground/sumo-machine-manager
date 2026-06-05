@@ -48,9 +48,10 @@ pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     dir_name: String,
     /// HSM provider used to sign / signature-verify the IVD manifest.
     hsm: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
-    /// Activator invoked on `activate()` after the symlink flip (RT launcher,
-    /// IFS write, ...). `None` for VMs whose qvm/process cycle is the
-    /// activation.
+    /// Activator invoked by `activate()` BEFORE the symlink flip (RT launcher,
+    /// IFS write, ...) — on failure the flip is skipped so the engine can roll
+    /// NV back without a stale `current` pointer. `None` for VMs whose
+    /// qvm/process cycle is the activation (they never flip here).
     bank_activator: Option<Arc<dyn machine_mgr::BankActivator>>,
     /// The bank the ECU is actually running on. Seeded from NV at construction
     /// (NV `active_bank` may differ after install — that's the *next-boot*
@@ -118,13 +119,12 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         }
     }
 
-    /// Atomically flip the `current` symlink to point at `bank`. `pub` so the
-    /// engine can route its symlink-only flips (ecu_reset, post-activator
-    /// finalize) through the provider without also re-running the activator —
-    /// the trait's `activate` bundles flip + activator for the generic engine,
-    /// but the VM engine still orchestrates the activator + NV-rollback-on-fail
-    /// itself, so it needs the bare flip.
-    pub fn flip_current_symlink(&self, bank: Bank) {
+    /// Atomically flip the `current` symlink to point at `bank`. Internal to
+    /// the provider: `activate` calls it AFTER the activator succeeds (the
+    /// activator-then-flip order). The engine no longer flips directly — its
+    /// install/finalize path routes entirely through `activate`, and
+    /// `ecu_reset` does its own running-bank flip.
+    fn flip_current_symlink(&self, bank: Bank) {
         let Some(images_dir) = self.images_dir.as_ref() else {
             return;
         };
@@ -482,8 +482,43 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         }
     }
 
+    fn verify_payload(
+        &self,
+        bank: Bank,
+        name: &str,
+        expected_sha256: &[u8; 32],
+    ) -> Result<(), BankError> {
+        use sha2::{Digest, Sha256};
+        let bank_dir = self
+            .target_bank_dir(bank)
+            .ok_or_else(|| BankError::Failed("no images_dir configured".into()))?;
+        let path = bank_dir.join(name);
+        let bytes = std::fs::read(&path).map_err(|e| {
+            BankError::Failed(format!("verify_payload read {}: {e}", path.display()))
+        })?;
+        let recomputed: [u8; 32] = Sha256::digest(&bytes).into();
+        if &recomputed == expected_sha256 {
+            Ok(())
+        } else {
+            Err(BankError::Unverifiable(format!(
+                "{name}: inner sha256 mismatch on disk — recomputed {} vs captured {}",
+                hex::encode(recomputed),
+                hex::encode(expected_sha256)
+            )))
+        }
+    }
+
     fn activate(&self, bank: Bank) -> Result<ResetKind, BankError> {
-        self.flip_current_symlink(bank);
+        // Activator-then-flip (the live finalize order, NOT the old dead-code
+        // flip-then-activator): run the activator FIRST so a failure leaves the
+        // `current` symlink pointing at the previously-active bank, and the
+        // engine can roll NV back without a stale pointer to the half-activated
+        // bank. Only flip once the activator has succeeded.
+        //
+        // For VMs (`bank_activator == None`) the whole block is skipped — VMs
+        // never flip here; their qvm/process cycle is the activation, and
+        // `ecu_reset` flips the `current` symlink at reset time. This matches
+        // the finalize block that is skipped when no activator is configured.
         if let (Some(activator), Some(images_dir)) =
             (self.bank_activator.as_ref(), self.images_dir.as_ref())
         {
@@ -491,6 +526,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             activator
                 .activate(&bank_dir)
                 .map_err(|e| BankError::Failed(format!("bank activation failed: {e}")))?;
+            self.flip_current_symlink(bank);
         }
         Ok(self.reset_kind())
     }

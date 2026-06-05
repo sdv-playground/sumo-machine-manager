@@ -222,19 +222,22 @@ enum FlashSessionState {
 ///
 /// * `OnDisk` — a detached payload.  We can't keep the raw wire bytes
 ///   (multi-MB; the streaming pipeline writes the decrypted +
-///   decompressed *inner* content straight to disk to avoid doubling
-///   flash I/O).  So re-verification compares the file on disk against
-///   the inner SHA-256 the streaming pipeline captured at write time
-///   — which is itself the manifest's declared `image_digest`, already
-///   verified against ciphertext during upload.  Catches on-disk
-///   corruption between upload and finalize; doesn't and can't
-///   re-verify the outer-on-the-wire hash post-stream.
+///   decompressed *inner* content straight through the bank provider to
+///   avoid doubling flash I/O).  So re-verification asks the provider to
+///   re-read the staged `(bank, name)` and compare against the inner
+///   SHA-256 the streaming pipeline captured at write time — which is
+///   itself the manifest's declared `image_digest`, already verified
+///   against ciphertext during upload.  Catches on-disk corruption
+///   between upload and finalize; doesn't and can't re-verify the
+///   outer-on-the-wire hash post-stream.  Stored as `(bank, name)` (not
+///   a path) so the provider owns the on-medium layout.
 enum UploadedPartLocation {
     Manifest {
         upload_sha256: [u8; 32],
     },
     OnDisk {
-        path: PathBuf,
+        bank: Bank,
+        name: String,
         inner_sha256: [u8; 32],
     },
 }
@@ -343,9 +346,6 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// (component_id `["hsm", "keys"]`) are routed to this provider
     /// instead of being written as a disk image.
     hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
-    /// Optional bank activator — when set, ecu_reset() invokes activate()
-    /// on the target bank directory instead of (or in addition to) symlink switching.
-    bank_activator: Option<Arc<dyn machine_mgr::BankActivator>>,
     /// Synthetic health source — consulted by `read_data` for
     /// `guest_state` / `heartbeat_seq` when `vm_service_addr` is None.
     /// Set via `with_health_probe` (typically by supernova-mm for the
@@ -379,20 +379,16 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     /// `NvWriteGuard::drop` (same trigger as `did_cache`); the next reader
     /// re-populates lazily.
     verified_manifest_cache: Mutex<Option<(Bank, Arc<InstalledFirmware>)>>,
-    /// The per-kind A/B storage + lifecycle seam. Owns every bank touch —
-    /// target selection, prepare/seed, payload sinks, IVD seal, installed-
-    /// firmware read-back, symlink-flip activation, commit/rollback. Built
-    /// inline as an `IvdBankProvider` in `with_options` (and rebuilt by the
-    /// `with_bank_spec` / `with_bank_activator` builders, which change its
-    /// inputs); a later phase moves construction to component-factory.
+    /// The per-kind A/B storage + lifecycle seam — the engine's ONLY bank
+    /// handle. Owns every bank touch: target selection, prepare/seed, payload
+    /// sinks, IVD seal, installed-firmware read-back, activator-then-flip
+    /// activation, commit/rollback, reset-kind. Built as an `IvdBankProvider`
+    /// in `with_options` (and rebuilt by the `with_bank_spec` /
+    /// `with_bank_activator` builders, which change its inputs); a later phase
+    /// moves construction to component-factory. The concrete type is no longer
+    /// retained — a non-IVD provider (e.g. RT raw-partition) drops in here
+    /// without touching the engine.
     bank_provider: Arc<dyn BankProvider>,
-    /// The same object as `bank_provider`, kept at its concrete type so the
-    /// engine can reach the `IvdBankProvider` inherent helpers (`target_bank_dir`,
-    /// `seed_target_from_active`, `flip_current_symlink`) that aren't part of the
-    /// kind-agnostic trait. `dyn BankProvider` isn't `Any`, so a downcast isn't
-    /// available; holding both handles to one `Arc` is the cost-free
-    /// alternative until the generic engine no longer needs the inherent calls.
-    ivd_bank: Arc<IvdBankProvider<D>>,
 }
 
 impl<D: BlockDevice + Send + 'static> VmBackend<D> {
@@ -473,10 +469,8 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         // hsm it holds (activator still None here; `with_bank_activator` rebuilds
         // it, as does `with_bank_spec` for the dir name). Clones the Arcs — the
         // struct literal below moves the originals into the backend's fields.
-        // Both `bank_provider` (dyn, for trait calls) and `ivd_bank` (concrete,
-        // for inherent helpers) point at this one object.
         let bank_spec = crate::bank_spec::BankSetSpec::for_well_known(bank_set);
-        let ivd_bank = Arc::new(IvdBankProvider::new(
+        let bank_provider: Arc<dyn BankProvider> = Arc::new(IvdBankProvider::new(
             nv.clone(),
             bank_set,
             config.single_bank,
@@ -485,7 +479,6 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             hsm_provider.clone(),
             None,
         ));
-        let bank_provider: Arc<dyn BankProvider> = ivd_bank.clone();
 
         let backend = Self {
             entity_info: EntityInfo {
@@ -530,13 +523,11 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             images_dir,
             upload_phase: Mutex::new(None),
             hsm_provider,
-            bank_activator: None,
             health_probe: None,
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             manifest_describe: Mutex::new(HashMap::new()),
             verified_manifest_cache: Mutex::new(None),
             bank_provider,
-            ivd_bank,
         };
         // Populate DID cache from NV once at construction time. After this,
         // SOVD reads of NV-backed DIDs hit RAM only — see refresh_did_cache.
@@ -560,38 +551,39 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     pub fn with_bank_spec(mut self, spec: crate::bank_spec::BankSetSpec) -> Self {
         self.bank_spec = spec;
         // The provider keys its on-disk layout off `bank_spec.dir_name`; rebuild
-        // it so a deployment-supplied dir name takes effect.
-        self.rebuild_bank_provider();
+        // it so a deployment-supplied dir name takes effect. No activator yet —
+        // `with_bank_spec` always precedes `with_bank_activator` (the
+        // component-factory / sovd_main builder order), so passing `None` here
+        // never drops an activator.
+        self.rebuild_bank_provider(None);
         self
     }
 
     /// Set a bank activator for post-install bank activation.
     pub fn with_bank_activator(mut self, activator: Arc<dyn machine_mgr::BankActivator>) -> Self {
-        self.bank_activator = Some(activator);
-        // The provider holds the activator (used by `activate` + `reset_kind`);
-        // rebuild it so the just-set activator is the one it invokes.
-        self.rebuild_bank_provider();
+        // The provider owns the activator (used by `activate` + `reset_kind`);
+        // rebuild it so the just-set activator is the one it invokes. Must be
+        // called AFTER `with_bank_spec` (which rebuilds with `None`).
+        self.rebuild_bank_provider(Some(activator));
         self
     }
 
     /// Rebuild the bank provider from the backend's current bank-relevant state
-    /// and re-point both the `dyn` and concrete handles at the new object.
-    /// Called by the `with_bank_spec` / `with_bank_activator` builders that
-    /// change its inputs. `running_bank` is re-seeded from NV inside the
-    /// provider — same rule as the backend's own copy, idempotent at
-    /// construction.
-    fn rebuild_bank_provider(&mut self) {
-        let ivd_bank = Arc::new(IvdBankProvider::new(
+    /// (plus the optional `activator`, which the provider now owns) and re-point
+    /// the `dyn` handle at the new object. Called by the `with_bank_spec` /
+    /// `with_bank_activator` builders that change its inputs. `running_bank` is
+    /// re-seeded from NV inside the provider — same rule as the backend's own
+    /// copy, idempotent at construction.
+    fn rebuild_bank_provider(&mut self, activator: Option<Arc<dyn machine_mgr::BankActivator>>) {
+        self.bank_provider = Arc::new(IvdBankProvider::new(
             self.nv.clone(),
             self.bank_set,
             self.config.single_bank,
             self.images_dir.clone(),
             self.bank_spec.dir_name.clone(),
             self.hsm_provider.clone(),
-            self.bank_activator.clone(),
+            activator,
         ));
-        self.bank_provider = ivd_bank.clone();
-        self.ivd_bank = ivd_bank;
     }
 
     /// Set a synthetic health probe used by `read_data` for `guest_state`
@@ -748,15 +740,13 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         self.vm_service_addr.is_some()
     }
 
-    /// Reset kind declared by this component's bank activator, or
-    /// [`ResetKind::Local`] when no activator is configured (e.g. VM
-    /// components without a custom activator: qvm/process cycle is local).
-    /// `derive_capabilities` reads this to populate `FlashCaps.reset_kind`.
+    /// Reset kind declared by this component's bank provider (folds in the
+    /// activator's `reset_kind`, or [`ResetKind::Local`] when no activator is
+    /// configured — e.g. VM components without a custom activator, whose
+    /// qvm/process cycle is local). `derive_capabilities` reads this to
+    /// populate `FlashCaps.reset_kind`.
     pub fn reset_kind(&self) -> machine_mgr::ResetKind {
-        self.bank_activator
-            .as_ref()
-            .map(|a| a.reset_kind())
-            .unwrap_or(machine_mgr::ResetKind::Local)
+        self.bank_provider.reset_kind()
     }
 
     /// The bank an OTA upload should write to — delegated to the bank
@@ -764,33 +754,6 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     /// `current`-symlink-aware for activator-backed kinds).
     fn determine_target_bank(&self) -> BackendResult<Bank> {
         Ok(self.bank_provider.target_bank())
-    }
-
-    /// Atomically flip the `current` symlink to point at `bank` — delegated to
-    /// the provider's symlink-only flip. The engine keeps orchestrating the
-    /// activator + NV-rollback-on-failure itself (see `finalize_flash`), so
-    /// this stays a bare flip, not the trait's flip-plus-activator `activate`.
-    fn flip_current_symlink(&self, bank: Bank) {
-        self.ivd_bank.flip_current_symlink(bank);
-    }
-
-    /// Path of the target bank directory under `images_dir`. `None` if no
-    /// images_dir is configured (tests / in-memory only). Delegated to the
-    /// provider, which owns the bank-dir layout.
-    fn target_bank_dir(&self, target: Bank) -> Option<PathBuf> {
-        self.ivd_bank.target_bank_dir(target)
-    }
-
-    /// Test entry point into the provider's bank-seed primitive (copy the
-    /// active bank's files that are missing from the target). The production
-    /// flow seeds inside the provider's `seal` right before signing, so this
-    /// thin delegator exists only for `bank_seed_integration_tests`, which
-    /// exercise the seed step in isolation through the backend.
-    #[cfg(test)]
-    pub(crate) fn seed_target_from_active(&self, target: Bank) -> BackendResult<()> {
-        self.ivd_bank
-            .seed_target_from_active(target)
-            .map_err(|e| BackendError::Internal(e.to_string()))
     }
 
     /// Self-sign the staged bank with the HSM's `ivd-signing` key so
@@ -1204,11 +1167,6 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let key_unwrap = self.manifest_provider.key_unwrap_for_decryption();
 
         let target_bank = self.determine_target_bank()?;
-        let bank_dir = self
-            .target_bank_dir(target_bank)
-            .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
-        std::fs::create_dir_all(&bank_dir)
-            .map_err(|e| BackendError::Internal(format!("create {}: {e}", bank_dir.display())))?;
 
         // Process each payload
         for (uri, payload_id) in payload_ids {
@@ -1236,16 +1194,21 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                     BackendError::Internal(format!("no digest for component {comp_idx}"))
                 })?;
 
-            let output_path = bank_dir.join(crate::bank_spec::payload_target_name(
-                self.bank_spec.layout,
-                uri.as_str(),
-            ));
+            let target_name =
+                crate::bank_spec::payload_target_name(self.bank_spec.layout, uri.as_str());
+
+            // Open the payload sink through the bank provider — it owns where
+            // the bytes land and creates the bank dir as needed.
+            let writer = self
+                .bank_provider
+                .open_payload_writer(target_bank, &target_name)
+                .map_err(|e| BackendError::Internal(e.to_string()))?;
 
             tracing::info!(
                 uri = %uri,
                 component = comp_idx,
                 payload = %stored_payload.path.display(),
-                output = %output_path.display(),
+                output = %target_name,
                 "processing payload"
             );
 
@@ -1261,7 +1224,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 comp_idx,
                 key_unwrap.as_deref(),
                 &expected_digest,
-                &output_path,
+                writer,
             )
             .map_err(|e| BackendError::Internal(format!("payload processing ({uri}): {e}")))?;
             let process_elapsed = process_started.elapsed();
@@ -1278,7 +1241,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
                 uri = %uri,
                 elapsed_ms = process_elapsed.as_millis() as u64,
                 "payload written: {} ({:.2} MB compressed → {:.2} MB at {:.2} MB/s)",
-                output_path.display(),
+                target_name,
                 compressed_mb, uncompressed_mb, mb_per_sec,
             );
         }
@@ -1495,19 +1458,19 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         let uri = manifest.uri(comp_idx).unwrap_or("#firmware").to_string();
 
         let target_bank = self.determine_target_bank()?;
-        let bank_dir = self
-            .target_bank_dir(target_bank)
-            .ok_or_else(|| BackendError::Internal("no images_dir configured".into()))?;
-        std::fs::create_dir_all(&bank_dir)
-            .map_err(|e| BackendError::Internal(format!("create {}: {e}", bank_dir.display())))?;
-
         let target_name = crate::bank_spec::payload_target_name(self.bank_spec.layout, &uri);
-        let output_path = bank_dir.join(&target_name);
+
+        // Open the payload sink through the bank provider — it owns where the
+        // bytes land and creates the bank dir as needed.
+        let writer = self
+            .bank_provider
+            .open_payload_writer(target_bank, &target_name)
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
 
         tracing::info!(
             component = comp_idx,
             uri = %uri,
-            output = %output_path.display(),
+            target = %target_name,
             "processing payload {}/{}",
             comp_idx + 1, total,
         );
@@ -1523,7 +1486,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             comp_idx,
             key_unwrap.clone(),
             expected_digest.clone(),
-            output_path.clone(),
+            writer,
         )
         .await?;
         let process_elapsed = process_started.elapsed();
@@ -1557,7 +1520,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
             uri = %uri,
             elapsed_ms = process_elapsed.as_millis() as u64,
             "payload written: {} ({:.2} MB compressed → {:.2} MB at {:.2} MB/s)",
-            output_path.display(),
+            target_name,
             compressed_mb, uncompressed_mb, mb_per_sec,
         );
 
@@ -1603,7 +1566,8 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
         self.uploaded_parts.lock().unwrap().insert(
             id.clone(),
             UploadedPartLocation::OnDisk {
-                path: output_path.clone(),
+                bank: target_bank,
+                name: target_name.clone(),
                 inner_sha256: image_hash,
             },
         );
@@ -2279,7 +2243,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             stream,
             self.manifest_provider.as_ref(),
             min_security_ver,
-            self.images_dir.as_deref(),
+            Some(self.bank_provider.as_ref()),
             self.bank_set,
             &self.bank_spec,
             target_bank,
@@ -2373,7 +2337,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
     }
 
     async fn verify_part(&self, file_id: &str, expected_sha256: &str) -> BackendResult<()> {
-        use sha2::{Digest, Sha256};
         // Re-verification semantics:
         //
         // * Manifest part — the SOVD layer's `expected_sha256` is the
@@ -2402,12 +2365,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                             upload_sha256: *upload_sha256,
                         }
                     }
-                    UploadedPartLocation::OnDisk { path, inner_sha256 } => {
-                        UploadedPartLocation::OnDisk {
-                            path: path.clone(),
-                            inner_sha256: *inner_sha256,
-                        }
-                    }
+                    UploadedPartLocation::OnDisk {
+                        bank,
+                        name,
+                        inner_sha256,
+                    } => UploadedPartLocation::OnDisk {
+                        bank: *bank,
+                        name: name.clone(),
+                        inner_sha256: *inner_sha256,
+                    },
                 })?
         };
         match location {
@@ -2422,21 +2388,24 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     )))
                 }
             }
-            UploadedPartLocation::OnDisk { path, inner_sha256 } => {
-                let bytes = std::fs::read(&path).map_err(|e| {
-                    BackendError::Internal(format!("verify_part read {}: {e}", path.display()))
-                })?;
-                let recomputed: [u8; 32] = Sha256::digest(&bytes).into();
-                if recomputed == inner_sha256 {
-                    Ok(())
-                } else {
-                    Err(BackendError::InvalidRequest(format!(
-                        "verify_part {file_id}: inner sha256 mismatch on disk — \
-                         recomputed {} vs captured {}",
-                        hex::encode(recomputed),
-                        hex::encode(inner_sha256)
-                    )))
-                }
+            UploadedPartLocation::OnDisk {
+                bank,
+                name,
+                inner_sha256,
+            } => {
+                // Re-read the staged part through the provider (it owns the
+                // on-medium layout) and confirm the captured inner hash. Map
+                // the provider error back to the wire variants the inline
+                // version used: a hash mismatch is a bad request (the data on
+                // disk is wrong), a read failure is our-fault internal.
+                self.bank_provider
+                    .verify_payload(bank, &name, &inner_sha256)
+                    .map_err(|e| match e {
+                        machine_mgr::bank_provider::BankError::Unverifiable(_) => {
+                            BackendError::InvalidRequest(format!("verify_part {file_id}: {e}"))
+                        }
+                        _ => BackendError::Internal(format!("verify_part {file_id}: {e}")),
+                    })
             }
         }
     }
@@ -2676,43 +2645,33 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             installed_bank = Some(result.target_bank);
         }
 
-        // Bank activation: if a bank_activator is configured, invoke it now.
+        // Bank activation: route through the provider's `activate`, which runs
+        // the activator (if any) then flips the `current` symlink on success.
         // Use installed_bank captured from install_precomputed / install
         // above — that's the authoritative answer. Re-deriving via
         // determine_target_bank() here would return the OLD (now-inactive)
         // bank on first-ever flash because NV has been flipped but the
-        // `current` symlink doesn't exist yet to override. Activator runs
+        // `current` symlink doesn't exist yet to override. `activate` runs
         // on the bank we just wrote payloads to; success flips the symlink
-        // so the next flash's determine_target_bank() reads correctly.
+        // so the next flash's determine_target_bank() reads correctly. For
+        // VMs (no activator) `activate` is a no-op — matching the old
+        // activator-gated block that was skipped without an activator.
         if !is_crl {
-            if let (Some(ref activator), Some(ref images_dir)) =
-                (&self.bank_activator, &self.images_dir)
-            {
-                let wrote_to = installed_bank.ok_or_else(|| {
-                    BackendError::Internal("installed_bank unset — unreachable for !is_crl".into())
-                })?;
-                let bank_dir = images_dir
-                    .join(self.bank_spec.dir_name.as_str())
-                    .join(bank_dir_name(wrote_to));
-                if let Err(e) = activator.activate(&bank_dir) {
-                    tracing::error!(
-                        bank_set = ?self.bank_set,
-                        bank_dir = %bank_dir.display(),
-                        error = %e,
-                        "bank activation failed during install finalize — rolling back"
-                    );
-                    let mut nv = self.nv_write()?;
-                    let _ = ota::rollback(&mut *nv, self.bank_set);
-                    return Err(BackendError::Internal(format!(
-                        "bank activation failed: {e}"
-                    )));
-                }
-                self.flip_current_symlink(wrote_to);
-                tracing::info!(
+            let wrote_to = installed_bank.ok_or_else(|| {
+                BackendError::Internal("installed_bank unset — unreachable for !is_crl".into())
+            })?;
+            if let Err(e) = self.bank_provider.activate(wrote_to) {
+                tracing::error!(
                     bank_set = ?self.bank_set,
-                    bank_dir = %bank_dir.display(),
-                    "bank activated during install finalize"
+                    bank = ?wrote_to,
+                    error = %e,
+                    "bank activation failed during install finalize — rolling back"
                 );
+                let mut nv = self.nv_write()?;
+                let _ = ota::rollback(&mut *nv, self.bank_set);
+                return Err(BackendError::Internal(format!(
+                    "bank activation failed: {e}"
+                )));
             }
         }
 
@@ -2880,7 +2839,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
             }
         }
 
-        // Bank activation: if a bank_activator is configured, invoke it now.
+        // Bank activation: route through the provider's `activate`, which runs
+        // the activator (if any) then flips the `current` symlink on success.
         // Read NV.active_bank directly — install_precomputed (above, when
         // it ran) just flipped it to the just-installed bank, which is
         // exactly the bank that has the payloads the activator needs.
@@ -2889,9 +2849,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
         // empty and would make the activator fail with "firmware not found".
         // See 2c9d2d8 for the original fix to this race; d25d967 re-introduced
         // the determine_target_bank() call and reopened the bug for
-        // first-ever-flash on activator-backed components.
-        if let (Some(ref activator), Some(ref images_dir)) =
-            (&self.bank_activator, &self.images_dir)
+        // first-ever-flash on activator-backed components. For VMs (no
+        // activator) `activate` is a no-op, so this runs unconditionally.
         {
             let wrote_to = {
                 let nv = self
@@ -2903,13 +2862,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
                 state.banks[self.bank_set.as_index()].active_bank
             };
-            let bank_dir = images_dir
-                .join(self.bank_spec.dir_name.as_str())
-                .join(bank_dir_name(wrote_to));
-            if let Err(e) = activator.activate(&bank_dir) {
+            if let Err(e) = self.bank_provider.activate(wrote_to) {
                 tracing::error!(
                     bank_set = ?self.bank_set,
-                    bank_dir = %bank_dir.display(),
+                    bank = ?wrote_to,
                     error = %e,
                     "bank activation failed during finalize — rolling back"
                 );
@@ -2919,12 +2875,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
                     "bank activation failed: {e}"
                 )));
             }
-            self.flip_current_symlink(wrote_to);
-            tracing::info!(
-                bank_set = ?self.bank_set,
-                bank_dir = %bank_dir.display(),
-                "bank activated during finalize"
-            );
         }
 
         let mut ft = self.flash_transfer.lock().unwrap();
@@ -3693,13 +3643,6 @@ pub(crate) fn did_value_to_json(
     }
 }
 
-pub(crate) fn bank_dir_name(bank: Bank) -> &'static str {
-    match bank {
-        Bank::A => "bank_a",
-        Bank::B => "bank_b",
-    }
-}
-
 /// Convert a [`FirmwareIdentity`] into the `(did, bytes)` pairs for the 9
 /// SW-identity DIDs, each rendered in the historical fixed-width UDS byte
 /// form (UTF-8, NUL-padded / truncated to the width that DID used when it
@@ -3807,10 +3750,12 @@ fn installed_manifest_json(fw: &InstalledFirmware) -> serde_json::Value {
     })
 }
 
-// `bank_dir_is_payload_empty` moved to `crate::bank_provider` alongside the
-// IVD seal logic that uses it.
+// `bank_dir_is_payload_empty` + `bank_dir_name` moved to
+// `crate::bank_provider` alongside the IVD bank-layout logic that uses
+// them — the engine no longer touches bank dirs directly, it routes
+// every write through `BankProvider::open_payload_writer`.
 // `bank_set_dir_name` / `bank_file_names` / `payload_target_name`
-// retired in Phase 2 — per-slot behavior lives on `BankSetSpec` in
+// retired earlier — per-slot behavior lives on `BankSetSpec` in
 // `crate::bank_spec` now and is read off `self.bank_spec` for the
 // backend or passed as `&BankSetSpec` to free functions in
 // `streaming::process_envelope_stream`.
@@ -4391,5 +4336,94 @@ mod identity_tests {
         assert!(matches!(err, BackendError::EntityNotFound(_)));
 
         cleanup(&images_dir, &keystore);
+    }
+
+    /// A `BankActivator` that always fails — drives the finalize rollback path.
+    struct FailingActivator;
+    impl machine_mgr::BankActivator for FailingActivator {
+        fn activate(
+            &self,
+            _bank_dir: &Path,
+        ) -> Result<(), machine_mgr::bank_activator::BankActivatorError> {
+            Err(machine_mgr::bank_activator::BankActivatorError::Failed(
+                "synthetic activation failure".into(),
+            ))
+        }
+    }
+
+    /// When the bank provider's `activate` fails during finalize (the activator
+    /// errors), the engine must (a) surface the error, (b) roll NV back to the
+    /// previously-committed bank, and (c) leave the `current` symlink pointing
+    /// at the OLD bank — never flip it to the half-activated new bank. This
+    /// pins the activator-then-flip order: a failed activate must not flip.
+    #[tokio::test]
+    async fn finalize_activation_failure_rolls_back_and_does_not_flip() {
+        let images_dir = std::env::temp_dir().join("vm-mgr-activate-fail-img");
+        let _ = std::fs::remove_dir_all(&images_dir);
+        std::fs::create_dir_all(&images_dir).unwrap();
+
+        // NV in the post-install trial state: active_bank flipped to B,
+        // committed=false (exactly what `install_precomputed` leaves behind).
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        let idx = BankSet::Vm1.as_index();
+        boot.banks[idx].active_bank = Bank::B;
+        boot.banks[idx].committed = false;
+        nv.write_boot_state(&mut boot).unwrap();
+        let nv = Arc::new(Mutex::new(nv));
+
+        // Stage payloads in bank_b (the just-installed bank) and pre-create the
+        // `current` symlink pointing at bank_a (the still-committed bank).
+        let set_dir = images_dir.join("vm1");
+        let bank_b = set_dir.join("bank_b");
+        std::fs::create_dir_all(&bank_b).unwrap();
+        std::fs::write(bank_b.join("rootfs.img"), b"new bank bytes").unwrap();
+        let current = set_dir.join("current");
+        let _ = std::fs::remove_file(&current);
+        std::os::unix::fs::symlink(Path::new("bank_a"), &current).unwrap();
+
+        let backend = VmBackend::with_options(
+            BankSet::Vm1,
+            nv.clone(),
+            Arc::new(NoopManifest),
+            Arc::new(NoopSecurity),
+            ComponentConfig::default(),
+            None,
+            Some(images_dir.clone()),
+            None,
+        )
+        .with_bank_activator(Arc::new(FailingActivator));
+
+        // (a) finalize must surface the activation failure.
+        let err = backend.finalize_flash().await.unwrap_err();
+        assert!(
+            err.to_string().contains("bank activation failed"),
+            "expected activation-failure error, got: {err}"
+        );
+
+        // (b) NV rolled back to the previously-committed bank (A), committed.
+        {
+            let nv_guard = nv.lock().unwrap();
+            let state = nv_guard.read_boot_state().unwrap();
+            assert_eq!(
+                state.banks[idx].active_bank,
+                Bank::A,
+                "NV active_bank must roll back to A after failed activation"
+            );
+            assert!(
+                state.banks[idx].committed,
+                "rollback must leave the bank committed"
+            );
+        }
+
+        // (c) `current` symlink must NOT have been flipped to bank_b.
+        let target = std::fs::read_link(&current).unwrap();
+        assert_eq!(
+            target.file_name().and_then(|s| s.to_str()),
+            Some("bank_a"),
+            "current symlink must still point at bank_a — a failed activate must not flip"
+        );
+
+        let _ = std::fs::remove_dir_all(&images_dir);
     }
 }

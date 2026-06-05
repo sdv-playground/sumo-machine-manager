@@ -135,6 +135,19 @@ pub trait BankProvider: Send + Sync {
     /// the bank was never flashed.
     fn read_installed(&self, bank: Bank) -> Result<InstalledFirmware, BankError>;
 
+    /// Re-read a single staged payload `name` in `bank` and confirm its content
+    /// hashes to `expected_sha256` — catches on-disk corruption between the
+    /// `open_payload_writer` write and finalize (the SOVD per-part verify). The
+    /// provider knows where the bytes landed (a file in the bank dir for IVD, a
+    /// region of a raw partition for other kinds); the engine only holds the
+    /// `(bank, name)` it streamed and the digest the pipeline captured.
+    fn verify_payload(
+        &self,
+        bank: Bank,
+        name: &str,
+        expected_sha256: &[u8; 32],
+    ) -> Result<(), BankError>;
+
     /// Make `bank` the active image (symlink flip / partition-selector write /
     /// loader exec). Returns the reset needed to bring it up.
     fn activate(&self, bank: Bank) -> Result<ResetKind, BankError>;

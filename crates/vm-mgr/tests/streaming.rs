@@ -9,11 +9,16 @@
 //! - Truncated transfer (stream ends early)
 //! - Wrong encryption key (device key mismatch)
 
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::stream;
-use nv_store::types::{Bank, BankSet};
+use nv_store::block::MemBlockDevice;
+use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
+use nv_store::types::{Bank, BankSet, NvBootState};
 use sumo_crypto::{CryptoBackend, RustCryptoBackend};
 use sumo_offboard::cose_key::CoseKey;
 use sumo_offboard::encryptor;
@@ -21,12 +26,44 @@ use sumo_offboard::image_builder::{ComponentSpec, ImageManifestBuilder, MultiCom
 use sumo_offboard::keygen;
 use sumo_offboard::recipient::Recipient;
 
+use vm_mgr::bank_provider::IvdBankProvider;
+use vm_mgr::bank_spec::BankSetSpec;
 use vm_mgr::streaming::process_envelope_stream;
 use vm_mgr::suit_provider::SuitProvider;
 
 type PackageStream = Pin<
     Box<dyn futures::Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>,
 >;
+
+/// Build an `IvdBankProvider` rooted at `images_dir` for `set` so
+/// `process_envelope_stream` writes payloads to `images_dir/<set>/bank_x/`.
+/// NV is a throwaway MemBlockDevice — `open_payload_writer` only consults
+/// the images_dir + dir_name, not NV.
+fn provider_for(images_dir: &Path, set: BankSet) -> IvdBankProvider<MemBlockDevice> {
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    let mut state = NvBootState::default();
+    nv.write_boot_state(&mut state).unwrap();
+    let dir_name = BankSetSpec::for_well_known(set).dir_name;
+    IvdBankProvider::new(
+        Arc::new(Mutex::new(nv)),
+        set,
+        false,
+        Some(images_dir.to_path_buf()),
+        dir_name,
+        None,
+        None,
+    )
+}
+
+/// A `Box<dyn Write + Send>` sink at `path` (parent dirs created) — the
+/// writer shape `process_raw_payload` now takes instead of a path.
+fn file_writer(path: &Path) -> Box<dyn Write + Send> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    Box::new(BufWriter::new(std::fs::File::create(path).unwrap()))
+}
 
 /// Helper: generate test keys.
 fn test_keys() -> (CoseKey, CoseKey) {
@@ -148,11 +185,12 @@ async fn single_component_unencrypted() {
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
+    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
     let result = process_envelope_stream(
         stream_from_bytes(envelope),
         &provider,
         0,
-        Some(tmp.path()),
+        Some(&bank_provider),
         BankSet::Vm1,
         &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
@@ -191,11 +229,12 @@ async fn single_component_encrypted() {
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
+    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
     let result = process_envelope_stream(
         stream_from_bytes(envelope),
         &provider,
         0,
-        Some(tmp.path()),
+        Some(&bank_provider),
         BankSet::Vm1,
         &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
@@ -269,7 +308,7 @@ fn multi_component_separate_uploads() {
         0,
         None,
         &kernel_digest,
-        &kernel_out,
+        file_writer(&kernel_out),
     )
     .unwrap();
     assert_eq!(ksize, 2048);
@@ -282,7 +321,7 @@ fn multi_component_separate_uploads() {
         1,
         None,
         &rootfs_digest,
-        &rootfs_out,
+        file_writer(&rootfs_out),
     )
     .unwrap();
     assert_eq!(rsize, 16384);
@@ -352,7 +391,7 @@ fn multi_component_encrypted_separate() {
         0,
         Some(&dk_unwrap as &(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)),
         &kernel_digest,
-        &kernel_out,
+        file_writer(&kernel_out),
     )
     .unwrap();
     assert_eq!(ksize, 2048);
@@ -365,7 +404,7 @@ fn multi_component_encrypted_separate() {
         1,
         Some(&dk_unwrap as &(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)),
         &rootfs_digest,
-        &rootfs_out,
+        file_writer(&rootfs_out),
     )
     .unwrap();
     assert_eq!(rsize, 8192);
@@ -400,7 +439,14 @@ fn raw_payload_corrupt_fails() {
     std::fs::write(&payload_path, &corrupted).unwrap();
 
     let out = tmp.path().join("staged.img");
-    let result = process_raw_payload(&payload_path, &manifest, 0, None, &digest, &out);
+    let result = process_raw_payload(
+        &payload_path,
+        &manifest,
+        0,
+        None,
+        &digest,
+        file_writer(&out),
+    );
     assert!(result.is_err());
 }
 
@@ -425,11 +471,12 @@ async fn chunked_delivery() {
 
     let tmp = tempfile::tempdir().unwrap();
     // Split into 512-byte chunks
+    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
     let result = process_envelope_stream(
         stream_chunked(envelope, 512),
         &provider,
         0,
-        Some(tmp.path()),
+        Some(&bank_provider),
         BankSet::Vm1,
         &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
@@ -471,11 +518,12 @@ async fn corrupted_payload_digest_mismatch() {
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
+    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
     let result = process_envelope_stream(
         stream_from_bytes(envelope),
         &provider,
         0,
-        Some(tmp.path()),
+        Some(&bank_provider),
         BankSet::Vm1,
         &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
@@ -513,11 +561,12 @@ async fn truncated_transfer() {
     let truncated = envelope[..envelope.len() * 80 / 100].to_vec();
 
     let tmp = tempfile::tempdir().unwrap();
+    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
     let result = process_envelope_stream(
         stream_from_bytes(truncated),
         &provider,
         0,
-        Some(tmp.path()),
+        Some(&bank_provider),
         BankSet::Vm1,
         &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
@@ -552,11 +601,12 @@ async fn wrong_device_key() {
     let provider = test_provider(&signing_key, Some(&wrong_key));
 
     let tmp = tempfile::tempdir().unwrap();
+    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
     let result = process_envelope_stream(
         stream_from_bytes(envelope),
         &provider,
         0,
-        Some(tmp.path()),
+        Some(&bank_provider),
         BankSet::Vm1,
         &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
@@ -591,11 +641,12 @@ async fn anti_rollback_rejects_old_security_version() {
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
+    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
     let result = process_envelope_stream(
         stream_from_bytes(envelope),
         &provider,
         5, // min_security_ver = 5 — higher than manifest's 1
-        Some(tmp.path()),
+        Some(&bank_provider),
         BankSet::Vm1,
         &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
@@ -641,11 +692,12 @@ async fn stream_error_mid_transfer() {
     let stream: PackageStream = Box::pin(stream::iter(chunks));
 
     let tmp = tempfile::tempdir().unwrap();
+    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
     let result = process_envelope_stream(
         stream,
         &provider,
         0,
-        Some(tmp.path()),
+        Some(&bank_provider),
         BankSet::Vm1,
         &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,

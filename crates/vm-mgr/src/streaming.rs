@@ -5,7 +5,7 @@
 //! decrypt → decompress → hash → write-to-disk without buffering the full payload.
 
 use std::io::{self, Read, Write as IoWrite};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,9 +18,10 @@ use sumo_onboard::decryptor::StreamingDecryptor;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
-use crate::backend::bank_dir_name;
 use crate::bank_spec::{payload_target_name, BankSetSpec};
 use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware};
+
+use machine_mgr::bank_provider::BankProvider;
 
 use sovd_core::{BackendError, PackageStream};
 
@@ -45,7 +46,7 @@ pub async fn process_envelope_stream(
     stream: PackageStream,
     manifest_provider: &dyn ManifestProvider,
     min_security_ver: u32,
-    images_dir: Option<&Path>,
+    bank_provider: Option<&dyn BankProvider>,
     bank_set: BankSet,
     bank_spec: &BankSetSpec,
     target_bank: Bank,
@@ -105,15 +106,6 @@ pub async fn process_envelope_stream(
     // no raw device-key bytes flow through this pipeline anymore.
     let suit_key_unwrap = manifest_provider.key_unwrap_for_decryption();
 
-    let bank_dir = images_dir.map(|dir| {
-        dir.join(&bank_spec.dir_name)
-            .join(bank_dir_name(target_bank))
-    });
-    if let Some(ref bd) = bank_dir {
-        std::fs::create_dir_all(bd)
-            .map_err(|e| BackendError::Internal(format!("create {}: {e}", bd.display())))?;
-    }
-
     // Map payload keys to component indices by matching URIs in the manifest
     let component_count = manifest.component_count();
 
@@ -142,15 +134,24 @@ pub async fn process_envelope_stream(
 
         let target_name = payload_target_name(bank_spec.layout, pp.key.as_str());
 
-        // Land payload directly inside the target bank dir under its
-        // canonical filename — no rename pass needed downstream.
-        let image_path = bank_dir.as_ref().map(|bd| bd.join(&target_name));
+        // Open the payload sink through the bank provider — it owns where the
+        // bytes land (a file in the target bank dir for IVD, a raw-partition
+        // region for other kinds). `None` provider = in-memory / no-images-dir
+        // path: hash-only, no write. The writer is a sync `BufWriter`; it's
+        // moved into the blocking pipeline below and flushed there.
+        let writer =
+            match bank_provider {
+                Some(bp) => Some(bp.open_payload_writer(target_bank, &target_name).map_err(
+                    |e| BackendError::Internal(format!("open payload sink {target_name}: {e}")),
+                )?),
+                None => None,
+            };
 
         tracing::info!(
             payload_key = %pp.key,
             component = comp_idx,
             size = pp.len,
-            path = ?image_path,
+            target = %target_name,
             "streaming component payload"
         );
 
@@ -158,7 +159,6 @@ pub async fn process_envelope_stream(
         let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
 
         let header_for_decrypt = header_bytes.clone();
-        let image_path_clone = image_path.clone();
         let trust_anchor = suit_trust_anchor.clone();
         let key_unwrap = suit_key_unwrap.clone();
         let expected_digest_clone = expected_digest.clone();
@@ -173,7 +173,7 @@ pub async fn process_envelope_stream(
                     &trust_anchor,
                     key_unwrap.as_deref(),
                     &expected_digest_clone,
-                    image_path_clone.as_deref(),
+                    writer,
                 )
             }))
             .unwrap_or_else(|panic| {
@@ -545,9 +545,13 @@ fn rebuild_envelope_with_payload(
 // Sync payload processing pipeline
 // ---------------------------------------------------------------------------
 
-/// Process the firmware payload synchronously: decrypt → decompress → hash → write.
+/// Process the firmware payload synchronously: decrypt → decompress → hash →
+/// write to the bank-provider-opened `writer`.
 ///
-/// Runs in a blocking thread. Returns (total_image_size, image_sha256).
+/// Runs in a blocking thread. `writer` is the provider's payload sink (already
+/// opened by the caller, e.g. via `open_payload_writer`), or `None` for
+/// in-memory / no-images-dir paths that still verify the hash. Returns
+/// (total_image_size, image_sha256).
 #[allow(clippy::too_many_arguments)]
 fn process_payload_sync(
     rx: tokio::sync::mpsc::Receiver<Bytes>,
@@ -557,7 +561,7 @@ fn process_payload_sync(
     _trust_anchor: &[u8],
     key_unwrap: Option<&(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)>,
     expected_digest: &[u8],
-    image_path: Option<&Path>,
+    writer: Option<Box<dyn IoWrite + Send>>,
 ) -> Result<(usize, [u8; 32]), String> {
     let crypto = RustCryptoBackend::new();
 
@@ -587,11 +591,11 @@ fn process_payload_sync(
         if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
             // Encrypted + compressed: chain through ruzstd
             let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
-            process_decompressed(prefixed, expected_digest, image_path)
+            process_decompressed(prefixed, expected_digest, writer)
         } else {
             // Encrypted, not compressed: hash + write directly
             let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
-            process_plain(prefixed, expected_digest, image_path)
+            process_plain(prefixed, expected_digest, writer)
         }
     } else {
         // Unencrypted — read first bytes to check for zstd
@@ -600,27 +604,27 @@ fn process_payload_sync(
 
         if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
             let prefixed = PrefixReader::new(&first_buf[..first_n], channel_reader);
-            process_decompressed(prefixed, expected_digest, image_path)
+            process_decompressed(prefixed, expected_digest, writer)
         } else {
             let prefixed = PrefixReader::new(&first_buf[..first_n], channel_reader);
-            process_plain(prefixed, expected_digest, image_path)
+            process_plain(prefixed, expected_digest, writer)
         }
     }
 }
 
-/// Process a plain (uncompressed) stream: hash + write.
+/// Process a plain (uncompressed) stream: hash + write to the provider's sink.
+///
+/// `writer` is the bank-provider-opened payload sink (a `BufWriter`); `None`
+/// for in-memory / no-images-dir paths that still verify the hash. Flushed
+/// before returning so the BufWriter's tail reaches the sink.
 fn process_plain<R: Read>(
     mut reader: R,
     expected_digest: &[u8],
-    image_path: Option<&Path>,
+    mut writer: Option<Box<dyn IoWrite + Send>>,
 ) -> Result<(usize, [u8; 32]), String> {
     let mut hasher = Sha256::new();
     let mut total = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
-
-    let mut file = image_path
-        .map(|p| std::fs::File::create(p).map_err(|e| format!("create {}: {e}", p.display())))
-        .transpose()?;
 
     loop {
         let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
@@ -628,21 +632,26 @@ fn process_plain<R: Read>(
             break;
         }
         hasher.update(&buf[..n]);
-        if let Some(ref mut f) = file {
-            f.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
+        if let Some(ref mut w) = writer {
+            w.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
         }
         total += n;
+    }
+
+    if let Some(ref mut w) = writer {
+        w.flush().map_err(|e| format!("flush: {e}"))?;
     }
 
     let hash = verify_digest(hasher, expected_digest)?;
     Ok((total, hash))
 }
 
-/// Process a compressed stream: decompress → hash → write.
+/// Process a compressed stream: decompress → hash → write to the provider's
+/// sink. Same `writer` contract as [`process_plain`] (flushed before return).
 fn process_decompressed<R: Read>(
     reader: R,
     expected_digest: &[u8],
-    image_path: Option<&Path>,
+    mut writer: Option<Box<dyn IoWrite + Send>>,
 ) -> Result<(usize, [u8; 32]), String> {
     let mut decoder =
         ruzstd::StreamingDecoder::new(reader).map_err(|e| format!("zstd init: {e}"))?;
@@ -650,10 +659,6 @@ fn process_decompressed<R: Read>(
     let mut hasher = Sha256::new();
     let mut total = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
-
-    let mut file = image_path
-        .map(|p| std::fs::File::create(p).map_err(|e| format!("create {}: {e}", p.display())))
-        .transpose()?;
 
     loop {
         let n = decoder
@@ -663,10 +668,14 @@ fn process_decompressed<R: Read>(
             break;
         }
         hasher.update(&buf[..n]);
-        if let Some(ref mut f) = file {
-            f.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
+        if let Some(ref mut w) = writer {
+            w.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
         }
         total += n;
+    }
+
+    if let Some(ref mut w) = writer {
+        w.flush().map_err(|e| format!("flush: {e}"))?;
     }
 
     let hash = verify_digest(hasher, expected_digest)?;
@@ -971,7 +980,7 @@ pub fn process_raw_payload(
     component_index: usize,
     key_unwrap: Option<&(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)>,
     expected_digest: &[u8],
-    output_path: &Path,
+    writer: Box<dyn IoWrite + Send>,
 ) -> Result<(usize, [u8; 32]), String> {
     let crypto = RustCryptoBackend::new();
 
@@ -1000,10 +1009,10 @@ pub fn process_raw_payload(
 
         if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
             let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
-            process_decompressed(prefixed, expected_digest, Some(output_path))
+            process_decompressed(prefixed, expected_digest, Some(writer))
         } else {
             let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
-            process_plain(prefixed, expected_digest, Some(output_path))
+            process_plain(prefixed, expected_digest, Some(writer))
         }
     } else {
         // Unencrypted — detect zstd
@@ -1012,10 +1021,10 @@ pub fn process_raw_payload(
 
         if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
             let prefixed = PrefixReader::new(&first_buf[..first_n], reader);
-            process_decompressed(prefixed, expected_digest, Some(output_path))
+            process_decompressed(prefixed, expected_digest, Some(writer))
         } else {
             let prefixed = PrefixReader::new(&first_buf[..first_n], reader);
-            process_plain(prefixed, expected_digest, Some(output_path))
+            process_plain(prefixed, expected_digest, Some(writer))
         }
     }
 }
@@ -1042,7 +1051,7 @@ pub async fn process_payload_stream(
     component_index: usize,
     key_unwrap: Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>,
     expected_digest: Vec<u8>,
-    output_path: PathBuf,
+    writer: Box<dyn IoWrite + Send>,
 ) -> Result<(u64, usize, [u8; 32]), BackendError> {
     let envelope = sumo_codec::decode::decode_envelope(&manifest_bytes)
         .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
@@ -1065,7 +1074,7 @@ pub async fn process_payload_stream(
                 &[],
                 key_unwrap.as_deref(),
                 &expected_digest,
-                Some(&output_path),
+                Some(writer),
             )
         }))
         .unwrap_or_else(|panic| {
