@@ -459,7 +459,13 @@ fn writer_loop_inner(
             guest_id: 0,
         };
 
-        if single_channel_mode {
+        // notify() pokes the guest's vdev slot to wake it for a re-read.
+        // Its success also serves as a liveness signal: when the guest
+        // isn't attached, the qvm vdev layer logs "remote side not ready"
+        // on every poke. We use the result to drive an adaptive cadence
+        // (see the sleep below) rather than poking an absent peer at the
+        // full rate.
+        let peer_reachable = if single_channel_mode {
             // qvm-shmem path: regs + reply combined in one 128-byte
             // buffer, written to the single channel (host's own slot).
             let mut buf = [0u8; VTIME_WIRE_SIZE];
@@ -468,7 +474,7 @@ fn writer_loop_inner(
             if let Err(e) = regs_channel.write(&buf) {
                 tracing::warn!("vtime write failed: {e}");
             }
-            let _ = regs_channel.notify();
+            regs_channel.notify().is_ok()
         } else {
             // HTTP path: regs to regs channel (cmd half zero), reply
             // to adjust channel (regs half zero). The adjust write is
@@ -480,17 +486,32 @@ fn writer_loop_inner(
             if let Err(e) = regs_channel.write(&regs_buf) {
                 tracing::warn!("vtime regs write failed: {e}");
             }
-            let _ = regs_channel.notify();
+            let regs_ok = regs_channel.notify().is_ok();
 
             let mut adj_buf = [0u8; VTIME_WIRE_SIZE];
             adj_buf[VTIME_REGS_SIZE..].copy_from_slice(&reply.to_cmd_bytes());
             if let Err(e) = adjust_channel.write(&adj_buf) {
                 tracing::warn!("vtime adjust write failed: {e}");
             }
-            let _ = adjust_channel.notify();
-        }
+            let adj_ok = adjust_channel.notify().is_ok();
+            // HTTP notify has no peer-attach concept — treat success as
+            // reachable so HTTP transports keep the base cadence.
+            regs_ok && adj_ok
+        };
 
-        thread::sleep(interval);
+        // Adaptive cadence: run at the base `interval` while the guest is
+        // reachable; back off while it isn't, so an unattached guest (vm1
+        // still booting, or a VM that never came up) isn't poked at the
+        // base rate — every such poke makes qvm log "remote side not
+        // ready". Snaps straight back to the base rate the moment the
+        // guest attaches and the poke succeeds again.
+        const PEER_ABSENT_BACKOFF: Duration = Duration::from_secs(2);
+        let sleep_for = if peer_reachable {
+            interval
+        } else {
+            interval.max(PEER_ABSENT_BACKOFF)
+        };
+        thread::sleep(sleep_for);
     }
 }
 
