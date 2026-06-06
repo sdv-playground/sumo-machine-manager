@@ -17,8 +17,8 @@ use nv_store::block::MemBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
-use crate::backend::{ComponentConfig, VmBackend};
-use crate::component_adapter::VmBackendComponent;
+use crate::backend::{ComponentBackend, ComponentConfig};
+use crate::component_adapter::ComponentAdapter;
 use crate::diag_backend::ComponentDiagBackend;
 use crate::manifest_provider::ManifestProvider;
 use crate::sovd::security::TestSecurityProvider;
@@ -26,7 +26,7 @@ use crate::suit_provider::SuitProvider;
 
 const CONTAINER_IMAGE_REF: &str = "localhost/sumo-container-image-test:1.0.0";
 
-fn make_vm_backend() -> Arc<VmBackend<MemBlockDevice>> {
+fn make_vm_backend() -> Arc<ComponentBackend<MemBlockDevice>> {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
     let mut nv = NvStore::new(dev);
     nv.write_boot_state(&mut NvBootState::default()).unwrap();
@@ -35,7 +35,7 @@ fn make_vm_backend() -> Arc<VmBackend<MemBlockDevice>> {
     let trust_anchor = vec![0u8; 32];
     let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(trust_anchor));
     let sp = Arc::new(TestSecurityProvider);
-    Arc::new(VmBackend::new(
+    Arc::new(ComponentBackend::new(
         BankSet::Vm1,
         nv,
         mp,
@@ -44,8 +44,8 @@ fn make_vm_backend() -> Arc<VmBackend<MemBlockDevice>> {
     ))
 }
 
-fn diag_for(backend: Arc<VmBackend<MemBlockDevice>>) -> ComponentDiagBackend {
-    let component: Arc<dyn Component> = Arc::new(VmBackendComponent::new(backend.clone()));
+fn diag_for(backend: Arc<ComponentBackend<MemBlockDevice>>) -> ComponentDiagBackend {
+    let component: Arc<dyn Component> = Arc::new(ComponentAdapter::new(backend.clone()));
     ComponentDiagBackend::new(component, backend)
 }
 
@@ -54,7 +54,7 @@ async fn entity_info_and_capabilities_delegate_to_fallback() {
     let backend = make_vm_backend();
     let diag = diag_for(backend);
 
-    // VmBackend's id is "vm1" for BankSet::Vm1 — see backend.rs:218.
+    // ComponentBackend's id is "vm1" for BankSet::Vm1 — see backend.rs:218.
     assert_eq!(diag.entity_info().id, "vm1");
     assert!(diag.capabilities().software_update);
 }
@@ -78,14 +78,14 @@ async fn clear_faults_routes_through_component() {
     let diag = diag_for(backend);
 
     let res = diag.clear_faults(None).await.unwrap();
-    // VmBackend's clear_faults returns success even on empty.
+    // ComponentBackend's clear_faults returns success even on empty.
     assert!(res.success);
 }
 
 #[tokio::test]
 async fn fallback_used_when_component_returns_not_supported() {
     // Use a Component that returns NotSupported for read_dtcs to prove the
-    // fallback path runs — the underlying VmBackend should answer instead.
+    // fallback path runs — the underlying ComponentBackend should answer instead.
     struct AlwaysUnsupported {
         id: String,
         caps: Capabilities,
@@ -109,7 +109,7 @@ async fn fallback_used_when_component_returns_not_supported() {
     let diag = ComponentDiagBackend::new(component, backend.clone());
 
     // Even though Component returns NotSupported, get_faults still works
-    // because ComponentDiagBackend falls back to the underlying VmBackend.
+    // because ComponentDiagBackend falls back to the underlying ComponentBackend.
     let res = diag.get_faults(None).await.unwrap();
     assert!(res.faults.is_empty());
 }
@@ -177,7 +177,7 @@ async fn other_ops_still_pass_through() {
 // PR 3b — read_data / write_data routing tests
 // -------------------------------------------------------------------------
 
-fn make_vm_backend_with_factory(serial: &str, vin: &str) -> Arc<VmBackend<MemBlockDevice>> {
+fn make_vm_backend_with_factory(serial: &str, vin: &str) -> Arc<ComponentBackend<MemBlockDevice>> {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
     let mut nv = NvStore::new(dev);
     nv.write_boot_state(&mut NvBootState::default()).unwrap();
@@ -197,7 +197,7 @@ fn make_vm_backend_with_factory(serial: &str, vin: &str) -> Arc<VmBackend<MemBlo
     let mp: Arc<dyn crate::manifest_provider::ManifestProvider> =
         Arc::new(SuitProvider::new(trust_anchor));
     let sp = Arc::new(TestSecurityProvider);
-    Arc::new(VmBackend::new(
+    Arc::new(ComponentBackend::new(
         BankSet::Vm1,
         nv,
         mp,
@@ -253,7 +253,7 @@ async fn read_data_health_did_falls_back_to_vm_service() {
 
     let values = diag.read_data(&["guest_state".to_string()]).await.unwrap();
     assert_eq!(values[0].id, "guest_state");
-    // VmBackend returns "offline" when no vm-service socket is configured.
+    // ComponentBackend returns "offline" when no vm-service socket is configured.
     assert_eq!(values[0].value, serde_json::Value::String("offline".into()));
 }
 
@@ -332,7 +332,7 @@ async fn commit_flash_routes_through_component() {
     });
     let diag = ComponentDiagBackend::new(component, backend);
 
-    // VmBackend::commit_flash treats AlreadyCommitted as Ok, so a fresh
+    // ComponentBackend::commit_flash treats AlreadyCommitted as Ok, so a fresh
     // component with no in-flight install commits cleanly.
     diag.commit_flash().await.unwrap();
     assert!(
@@ -344,7 +344,7 @@ async fn commit_flash_routes_through_component() {
 #[tokio::test]
 async fn commit_flash_falls_back_when_component_unsupported() {
     // Default Capabilities, default Component — commit_flash returns NotSupported
-    // by default, so the adapter falls through to VmBackend's commit_flash.
+    // by default, so the adapter falls through to ComponentBackend's commit_flash.
     struct Bare {
         id: String,
         caps: Capabilities,
@@ -375,7 +375,7 @@ async fn rollback_flash_routes_through_component() {
     let backend = make_vm_backend();
     let diag = diag_for(backend);
 
-    // VmBackendComponent's rollback_install delegates to VmBackend, which
+    // ComponentAdapter's rollback_install delegates to ComponentBackend, which
     // since the trial-mode-state-machine refactor returns Busy("not in
     // trial mode") when there's nothing to roll back. We're proving the
     // route, not the semantics — any error from the lower layer is fine
@@ -388,7 +388,7 @@ async fn rollback_flash_routes_through_component() {
                 | sovd_core::error::BackendError::Busy(_)
                 | sovd_core::error::BackendError::Internal(_)
         ),
-        "expected InvalidRequest/Busy/Internal error from VmBackend, got {err:?}"
+        "expected InvalidRequest/Busy/Internal error from ComponentBackend, got {err:?}"
     );
 }
 
@@ -490,7 +490,7 @@ async fn list_parameters_routes_through_component() {
     assert!(serial.read_only);
     assert_eq!(serial.data_type.as_deref(), Some("string"));
     assert_eq!(serial.did.as_deref(), Some("F18C"));
-    // VmBackend's id is "vm1" for BankSet::Vm1 — see backend.rs:218.
+    // ComponentBackend's id is "vm1" for BankSet::Vm1 — see backend.rs:218.
     assert_eq!(serial.href, "/vehicle/v1/components/vm1/data/serial_number");
 }
 
@@ -499,7 +499,7 @@ async fn abort_flash_routes_through_component() {
     let backend = make_vm_backend();
     let diag = diag_for(backend);
 
-    // Pre-finalize abort: VmBackendComponent clears session state and returns Ok.
+    // Pre-finalize abort: ComponentAdapter clears session state and returns Ok.
     diag.abort_flash("any-id").await.unwrap();
 }
 
@@ -601,7 +601,7 @@ async fn capabilities_carry_abortable_after_finalize() {
     use machine_mgr::{Component, MachineRegistry};
     let nv = make_vm_backend();
     let comp_arc: Arc<dyn Component> =
-        Arc::new(crate::component_adapter::VmBackendComponent::new(nv));
+        Arc::new(crate::component_adapter::ComponentAdapter::new(nv));
 
     let entity = sovd_core::EntityInfo {
         id: "vehicle".into(),
@@ -620,7 +620,7 @@ async fn capabilities_carry_abortable_after_finalize() {
         .flash
         .as_ref()
         .expect("vm has flash caps");
-    // Honest about current impl: VmBackendComponent doesn't yet wire abort.
+    // Honest about current impl: ComponentAdapter doesn't yet wire abort.
     assert!(!flash.abortable_after_finalize);
 }
 

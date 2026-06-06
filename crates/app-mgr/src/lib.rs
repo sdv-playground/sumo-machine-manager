@@ -287,7 +287,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             // Static capability — A/B banks always exist and rollback_install
             // can flip the symlink back. Whether rollback is meaningful right
             // now is a state-machine concern caught by rollback_install itself.
-            // Matches VmBackend's pattern of reporting config.supports_rollback.
+            // Matches ComponentBackend's pattern of reporting config.supports_rollback.
             supports_rollback: true,
             state: flash_state,
             active_version: None,

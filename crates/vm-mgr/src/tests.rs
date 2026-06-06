@@ -53,7 +53,7 @@ fn did_factory_vin() {
 fn did_fw_version_not_served_from_nv() {
     // F189 (fw_version) and the other SW-identity DIDs moved to the
     // signed IVD manifest. The NV-only `read_did` path no longer serves
-    // them (it can't authenticate the manifest); the VmBackend layer
+    // them (it can't authenticate the manifest); the ComponentBackend layer
     // does, from a verified IvdIdentity (covered in backend.rs tests).
     let mut nv = make_nv();
     let mut meta = NvFwMeta::default();

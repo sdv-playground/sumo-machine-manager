@@ -1,5 +1,5 @@
 //! Integration tests: exercise the `machine-mgr::Component` trait against a
-//! real `VmBackend`. Validates the trait surface, not the diagserver wiring.
+//! real `ComponentBackend`. Validates the trait surface, not the diagserver wiring.
 #![allow(clippy::field_reassign_with_default)]
 
 use std::sync::{Arc, Mutex};
@@ -14,8 +14,8 @@ use nv_store::block::MemBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
-use crate::backend::{ComponentConfig, VmBackend};
-use crate::component_adapter::VmBackendComponent;
+use crate::backend::{ComponentBackend, ComponentConfig};
+use crate::component_adapter::ComponentAdapter;
 use crate::did::{DID_SERIAL_NUMBER, DID_VIN};
 use crate::manifest_provider::ManifestProvider;
 use crate::sovd::security::TestSecurityProvider;
@@ -40,12 +40,12 @@ fn vm_backend(
     nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
     set: BankSet,
     config: ComponentConfig,
-) -> Arc<VmBackend<MemBlockDevice>> {
+) -> Arc<ComponentBackend<MemBlockDevice>> {
     let trust_anchor = vec![0u8; 32];
     let suit_provider = SuitProvider::new(trust_anchor);
     let mp: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
     let sp = Arc::new(TestSecurityProvider);
-    Arc::new(VmBackend::new(set, nv, mp, sp, config))
+    Arc::new(ComponentBackend::new(set, nv, mp, sp, config))
 }
 
 fn entity() -> EntityInfo {
@@ -63,7 +63,7 @@ fn entity() -> EntityInfo {
 async fn component_id_and_capabilities() {
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     assert_eq!(comp.id(), "vm1");
     let caps = comp.capabilities();
@@ -91,7 +91,7 @@ async fn hsm_component_capabilities_are_single_bank() {
         entity_type: "hsm".into(),
     };
     let hsm = vm_backend(nv, BankSet::Hsm, cfg);
-    let comp = VmBackendComponent::new(hsm);
+    let comp = ComponentAdapter::new(hsm);
 
     assert_eq!(comp.id(), "hsm");
     let flash = comp.capabilities().flash.as_ref().unwrap();
@@ -112,7 +112,7 @@ async fn read_factory_did_via_component() {
     }
 
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     let serial = comp
         .read_did(DID_SERIAL_NUMBER, DidKind::Factory)
@@ -128,7 +128,7 @@ async fn read_factory_did_via_component() {
 async fn read_did_not_found() {
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     let err = comp.read_did(0xABCD, DidKind::Runtime).await.unwrap_err();
     assert!(matches!(err, MachineError::NotFound(_)), "got {err:?}");
@@ -138,7 +138,7 @@ async fn read_did_not_found() {
 async fn write_runtime_did_then_read_back() {
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     comp.write_did(0xFD10, DidKind::Runtime, b"hello")
         .await
@@ -151,7 +151,7 @@ async fn write_runtime_did_then_read_back() {
 async fn write_factory_did_rejected() {
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     let err = comp
         .write_did(DID_SERIAL_NUMBER, DidKind::Factory, b"X")
@@ -167,7 +167,7 @@ async fn write_factory_did_rejected() {
 async fn activation_state_returns_some() {
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     let st = comp.activation_state().await.unwrap().expect("Some(state)");
     assert!(st.supports_rollback);
@@ -177,7 +177,7 @@ async fn activation_state_returns_some() {
 async fn read_dtcs_empty() {
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     let dtcs = comp.read_dtcs(&DtcFilter::default()).await.unwrap();
     assert!(dtcs.is_empty());
@@ -192,7 +192,7 @@ async fn rollback_unsupported_for_hsm() {
         entity_type: "hsm".into(),
     };
     let hsm = vm_backend(nv, BankSet::Hsm, cfg);
-    let comp = VmBackendComponent::new(hsm);
+    let comp = ComponentAdapter::new(hsm);
 
     let err = comp
         .rollback_install(&FlashId::new("dummy"))
@@ -208,7 +208,7 @@ async fn rollback_unsupported_for_hsm() {
 async fn defaults_return_not_supported() {
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     // Methods not yet wired must still return NotSupported.
     // (CSR requires explicit with_csr_keystore; install_keys has no use case yet.)
@@ -223,7 +223,7 @@ async fn defaults_return_not_supported() {
 async fn get_csr_not_supported_without_keystore() {
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     // No with_csr_keystore call → NotSupported.
     let err = comp.get_csr().await.unwrap_err();
@@ -255,7 +255,7 @@ async fn get_csr_generates_csr_when_keystore_configured() {
     let setup = hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), 5100);
     setup.ensure_device_keys().expect("device keys created");
 
-    let comp = VmBackendComponent::new(vm).with_csr_keystore(keystore, 5100);
+    let comp = ComponentAdapter::new(vm).with_csr_keystore(keystore, 5100);
 
     // Capability should reflect CSR support.
     assert!(comp.capabilities().hsm.as_ref().unwrap().supports_csr);
@@ -272,7 +272,7 @@ async fn abort_install_clears_session_pre_finalize() {
 
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     // No session in flight — abort is a no-op success.
     comp.abort_install(&FlashId::new("nope")).await.unwrap();
@@ -285,7 +285,7 @@ async fn defaults_return_not_supported_after_abort_wired() {
     // still surface NotSupported. install_keys is the remaining one.
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     let err = comp.install_keys(&[]).await.unwrap_err();
     assert!(matches!(err, MachineError::NotSupported(_)), "got {err:?}");
@@ -297,7 +297,7 @@ async fn list_dids_returns_registry_minus_health_when_no_vm_service() {
 
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     let dids = comp.list_dids(&DidFilter::default()).await.unwrap();
 
@@ -320,7 +320,7 @@ async fn list_dids_includes_runtime_dids_from_nv() {
 
     let nv = make_nv();
     let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
-    let comp = VmBackendComponent::new(vm1);
+    let comp = ComponentAdapter::new(vm1);
 
     // Write a custom runtime DID — should appear in list_dids.
     comp.write_did(0xFD42, DidKind::Runtime, b"abc")
@@ -339,17 +339,17 @@ async fn list_dids_includes_runtime_dids_from_nv() {
 #[tokio::test]
 async fn machine_registry_holds_multiple_components() {
     let nv = make_nv();
-    let vm1 = VmBackendComponent::new(vm_backend(
+    let vm1 = ComponentAdapter::new(vm_backend(
         nv.clone(),
         BankSet::Vm1,
         ComponentConfig::default(),
     ));
-    let vm2 = VmBackendComponent::new(vm_backend(
+    let vm2 = ComponentAdapter::new(vm_backend(
         nv.clone(),
         BankSet::Vm2,
         ComponentConfig::default(),
     ));
-    let hsm = VmBackendComponent::new(vm_backend(
+    let hsm = ComponentAdapter::new(vm_backend(
         nv,
         BankSet::Hsm,
         ComponentConfig {

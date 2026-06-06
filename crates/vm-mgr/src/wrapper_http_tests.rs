@@ -1,9 +1,9 @@
 //! End-to-end HTTP smoke tests through the *wrapper* path that `vm-sovd`
 //! actually uses in production: SOVD HTTP → `sovd-api` router →
-//! `ComponentDiagBackend` → `Component` → `VmBackend`.
+//! `ComponentDiagBackend` → `Component` → `ComponentBackend`.
 //!
 //! `sovd_tests.rs` exercises the same SOVD HTTP layer but registers raw
-//! `VmBackend` instances directly. These tests prove the wrapper doesn't
+//! `ComponentBackend` instances directly. These tests prove the wrapper doesn't
 //! break the wire format. Add a test here whenever a bug is found that the
 //! unit tests didn't catch — the wrapper layer is where translation
 //! mismatches live.
@@ -26,8 +26,8 @@ use nv_store::types::*;
 
 use sovd_core::DiagnosticBackend;
 
-use crate::backend::{ComponentConfig, VmBackend};
-use crate::component_adapter::VmBackendComponent;
+use crate::backend::{ComponentBackend, ComponentConfig};
+use crate::component_adapter::ComponentAdapter;
 use crate::diag_backend::ComponentDiagBackend;
 use crate::manifest_provider::ManifestProvider;
 use crate::sovd::security::TestSecurityProvider;
@@ -72,9 +72,15 @@ fn make_wrapper_router() -> axum::Router {
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     for (id, set, cfg) in components {
-        let backend = Arc::new(VmBackend::new(set, nv.clone(), mp.clone(), sp.clone(), cfg));
+        let backend = Arc::new(ComponentBackend::new(
+            set,
+            nv.clone(),
+            mp.clone(),
+            sp.clone(),
+            cfg,
+        ));
         let component: Arc<dyn machine_mgr::Component> =
-            Arc::new(VmBackendComponent::new(backend.clone()));
+            Arc::new(ComponentAdapter::new(backend.clone()));
         let diag = ComponentDiagBackend::new(component, backend);
         backends.insert(id.to_string(), Arc::new(diag) as Arc<dyn DiagnosticBackend>);
     }
@@ -144,7 +150,7 @@ async fn read_spec_status_through_wrapper() {
     // ISO 17978-3 §7.18.7 — GET /updates/{id}/status returns the
     // Table 270 UpdateStatusBody.  Confirms ComponentDiagBackend
     // routes the /updates collection through to the wrapped
-    // VmBackend correctly.
+    // ComponentBackend correctly.
     let router = make_wrapper_router();
 
     // Register an update so /status has an entry to read.

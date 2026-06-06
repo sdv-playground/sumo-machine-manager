@@ -2,7 +2,7 @@
 //! `sovd-core::DiagnosticBackend`.
 //!
 //! Migration adapter: it wraps both a `Component` (the new path) and a
-//! fallback `DiagnosticBackend` (today's `VmBackend`). Method bodies that have
+//! fallback `DiagnosticBackend` (today's `ComponentBackend`). Method bodies that have
 //! been wired through `Component` route there; the rest fall through to the
 //! fallback. As more `Component` methods are wired across subsequent PRs, the
 //! fallback becomes vestigial and can eventually be dropped.
@@ -28,7 +28,7 @@ use crate::did;
 /// Wraps a `Component` as a `DiagnosticBackend`.
 ///
 /// `entity_info` and `capabilities` are delegated to the fallback because
-/// those are SOVD-wire shapes and today live on `VmBackend`. Once `Component`
+/// those are SOVD-wire shapes and today live on `ComponentBackend`. Once `Component`
 /// owns the SOVD-side `EntityInfo`/`Capabilities` (PR 4 work), the fallback
 /// can be retired.
 pub struct ComponentDiagBackend {
@@ -46,7 +46,7 @@ impl ComponentDiagBackend {
 
     /// Wire-side upload (`receive_package*`). Session lifecycle is owned by
     /// the `Component` impl — the adapter is stateless. The `id` we pass is
-    /// a sentinel that today's `VmBackendComponent` ignores (it tracks one
+    /// a sentinel that today's `ComponentAdapter` ignores (it tracks one
     /// in-flight session per component internally). The returned String is
     /// the per-upload identifier the impl chose to expose on the wire.
     async fn upload_via_install_pipeline(
@@ -78,7 +78,7 @@ impl DiagnosticBackend for ComponentDiagBackend {
         self.fallback.capabilities()
     }
 
-    /// F.D5: delegate to the underlying VmBackend so the campaign
+    /// F.D5: delegate to the underlying ComponentBackend so the campaign
     /// coordinator on the SOVD wire sees the right shape regardless of
     /// whether it reaches the Component-trait path or the fallback.
     fn update_shape(&self) -> &'static str {
@@ -243,10 +243,10 @@ impl DiagnosticBackend for ComponentDiagBackend {
     }
 
     // GET /updates/{id} catalog detail (ISO 17978-3 §7.18.3 Table 261).
-    // SUIT-aware enrichment lives on the wrapped VmBackend (it owns the
+    // SUIT-aware enrichment lives on the wrapped ComponentBackend (it owns the
     // manifest describe-cache + the SOVD entity_info); forward there so the
     // wire sees the enriched descriptor regardless of which path served the
-    // upload. Falls back to the format-agnostic default inside VmBackend
+    // upload. Falls back to the format-agnostic default inside ComponentBackend
     // when the manifest can't be located/parsed.
     async fn describe_update_package(
         &self,
@@ -303,7 +303,7 @@ impl DiagnosticBackend for ComponentDiagBackend {
 
     // validate / invalidate / activate are not (yet) routed through the
     // Component trait — machine-mgr has no equivalent ops. Delegate
-    // directly to the legacy VmBackend implementation.
+    // directly to the legacy ComponentBackend implementation.
     async fn validate(&self) -> BackendResult<()> {
         self.fallback.validate().await
     }
@@ -333,7 +333,7 @@ impl DiagnosticBackend for ComponentDiagBackend {
 
     // SOVD's commit_flash / rollback_flash take no transfer_id (one in-flight
     // session per component on the wire). Component's API takes a `&FlashId`
-    // for future multi-session support; today's VmBackendComponent ignores
+    // for future multi-session support; today's ComponentAdapter ignores
     // the id, so the sentinel is harmless.
     async fn commit_flash(&self) -> BackendResult<()> {
         let id = machine_mgr::FlashId::new("");
@@ -362,7 +362,7 @@ impl DiagnosticBackend for ComponentDiagBackend {
         }
     }
 
-    // NOTE: ecu_reset is intentionally still on the fallback. `VmBackend`
+    // NOTE: ecu_reset is intentionally still on the fallback. `ComponentBackend`
     // returns `Ok(None)` for the boot component (meaning "reset deferred,
     // requires manual reboot") and `Ok(Some(reset_type))` for everything
     // else. `Component::restart` returns `()` so it can't carry that

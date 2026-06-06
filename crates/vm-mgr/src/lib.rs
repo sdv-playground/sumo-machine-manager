@@ -14,23 +14,23 @@
 //!         ▼
 //!   diag_backend::ComponentDiagBackend     ← migration adapter
 //!         │                                  (routes via machine-mgr where wired,
-//!         │                                   falls back to legacy VmBackend)
+//!         │                                   falls back to legacy ComponentBackend)
 //!         ▼
 //!   machine_mgr::Component
 //!         │
 //!         │ implemented by
 //!         ▼
-//!   component_adapter::VmBackendComponent
+//!   component_adapter::ComponentAdapter
 //!         │
 //!         │ delegates to
 //!         ▼
-//!   backend::VmBackend<D: BlockDevice>    ← legacy per-bank-set type,
+//!   backend::ComponentBackend<D: BlockDevice>    ← legacy per-bank-set type,
 //!                                           one instance per component
 //! ```
 //!
 //! # Key modules
 //!
-//! - [`backend`]  — `VmBackend`: OTA / session / DID impl, one per component
+//! - [`backend`]  — `ComponentBackend`: OTA / session / DID impl, one per component
 //! - [`ota`]      — install, commit, rollback, image hash verification
 //! - [`did`]      — runtime → FW meta → factory → dynamic DID resolution
 //! - [`suit_provider`] + [`manifest_provider`] — SUIT envelope validation

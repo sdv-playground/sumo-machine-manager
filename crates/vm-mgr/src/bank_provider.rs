@@ -4,7 +4,7 @@
 //! This is the default `BankProvider`: a signed CBOR IVD manifest living in
 //! a bank dir, a `current` symlink flip for activation, and NV boot-state for
 //! the A/B + trial + commit/rollback lifecycle. It owns every *bank touch*
-//! the OTA engine used to inline — `VmBackend` now delegates to it through an
+//! the OTA engine used to inline — `ComponentBackend` now delegates to it through an
 //! `Arc<dyn BankProvider>`.
 //!
 //! The bodies here were **moved** out of `backend.rs` / `ota.rs` (Phase 0
@@ -62,7 +62,7 @@ pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
 
 impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     /// Build a provider from the backend's current state. `running_bank` is
-    /// seeded the same way `VmBackend::with_options` seeds its own copy:
+    /// seeded the same way `ComponentBackend::with_options` seeds its own copy:
     /// `Bank::A` for single-bank, else NV `active_bank`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(

@@ -1,4 +1,4 @@
-/// Integration tests for VmBackend via sovd-api.
+/// Integration tests for ComponentBackend via sovd-api.
 ///
 /// These test the full HTTP flow through sovd-api's router, ensuring
 /// our DiagnosticBackend implementation works correctly with the
@@ -17,7 +17,7 @@ use nv_store::types::*;
 
 use sovd_core::DiagnosticBackend;
 
-use crate::backend::{ComponentConfig, VmBackend};
+use crate::backend::{ComponentBackend, ComponentConfig};
 use crate::manifest_provider::ManifestProvider;
 use crate::sovd::security::TestSecurityProvider;
 use crate::suit_provider::SuitProvider;
@@ -121,7 +121,7 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
     for (id, set, config) in components {
         backends.insert(
             id.to_string(),
-            Arc::new(VmBackend::new(
+            Arc::new(ComponentBackend::new(
                 set,
                 nv.clone(),
                 manifest_provider.clone(),
@@ -537,7 +537,7 @@ async fn flash_full_suit_flow() {
     let envelope = make_test_suit_envelope(&keys, "vm1", 2, &image);
 
     // 1. POST /updates — server allocates update_id and calls
-    //    backend.start_flash up-front (puts VmBackend in
+    //    backend.start_flash up-front (puts ComponentBackend in
     //    AwaitingManifest so the upload goes through the staging
     //    pipeline, not the legacy integrated-envelope path).
     let (status, body) = post_json(
@@ -577,7 +577,7 @@ async fn flash_full_suit_flow() {
         "after PUT /prepare: {prepared}"
     );
 
-    // 4. PUT /execute?x-sumo-control=orchestrated — banked VmBackend
+    // 4. PUT /execute?x-sumo-control=orchestrated — banked ComponentBackend
     //    runs finalize+validate+activate then pauses at
     //    substate=awaiting-verdict.
     let (status, _) = put_empty(
@@ -848,7 +848,7 @@ fn suit_provider_rejects_rollback() {
 }
 
 // =============================================================================
-// F.D5 — VmBackend reports the lifecycle shape used by SOVDd's /campaigns
+// F.D5 — ComponentBackend reports the lifecycle shape used by SOVDd's /campaigns
 // =============================================================================
 
 #[tokio::test]
@@ -862,7 +862,7 @@ async fn update_shape_reports_banked_for_ab_components() {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
     let nv = Arc::new(Mutex::new(NvStore::new(dev)));
 
-    let banked = VmBackend::new(
+    let banked = ComponentBackend::new(
         BankSet::Vm1,
         nv.clone(),
         manifest_provider.clone(),
@@ -875,7 +875,7 @@ async fn update_shape_reports_banked_for_ab_components() {
         "VM bank-set with single_bank=false must report banked"
     );
 
-    let singleshot = VmBackend::new(
+    let singleshot = ComponentBackend::new(
         BankSet::Hsm,
         nv,
         manifest_provider,

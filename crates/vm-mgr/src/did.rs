@@ -4,7 +4,7 @@
 //!
 //! 1. Runtime DIDs (writable, per-bank) — active bank's NV Runtime
 //! 2. SW-identity DIDs (F187-F19E) — NOT here; sourced from the bank's
-//!    signed IVD manifest at the VmBackend layer (see below).
+//!    signed IVD manifest at the ComponentBackend layer (see below).
 //! 3. Factory DIDs (hardware identity, shared) — NV Factory
 //! 4. Dynamic DIDs (computed at runtime)
 //!
@@ -15,7 +15,7 @@
 //! duplicate of the bank's signed IVD manifest and a drift risk. They now live
 //! ONLY in the signed manifest (`hsm::ivd::IvdIdentity`), authored once at sign
 //! time and authenticated by the HSM signature. `read_did` no longer serves
-//! them; the VmBackend intercepts them from a cached, signature-verified
+//! them; the ComponentBackend intercepts them from a cached, signature-verified
 //! `IvdIdentity` for the running bank (`backend.rs::identity_did_bytes`),
 //! invalidated on install/commit. One signed source feeds both wires: classic
 //! UDS ReadDataByIdentifier AND SOVD `data`/`identData`. Boot is untouched —
@@ -108,7 +108,7 @@ pub fn read_did<D: BlockDevice>(
     //    They now live in the bank's signed IVD manifest
     //    (`hsm::ivd::IvdIdentity`) — the single signed source. Because
     //    that read needs the bank dir + HSM (which this NV-only path
-    //    doesn't have), the VmBackend layer intercepts these DIDs from a
+    //    doesn't have), the ComponentBackend layer intercepts these DIDs from a
     //    cached, signature-verified identity before consulting `read_did`
     //    (see `backend.rs::identity_did_bytes`). If `read_did` is reached
     //    for one of them (e.g. the standalone `vm-diagserver read-did`
@@ -260,7 +260,7 @@ mod tests {
     fn read_did_does_not_source_sw_identity_from_fw_meta() {
         // SW-identity DIDs (F187-F19E) moved to the signed IVD manifest.
         // The NV-only `read_did` path no longer serves them — it can't
-        // authenticate the manifest. The VmBackend layer intercepts
+        // authenticate the manifest. The ComponentBackend layer intercepts
         // these from a verified IvdIdentity instead (see backend.rs).
         let mut nv = make_nv();
         init_boot_state(&mut nv);

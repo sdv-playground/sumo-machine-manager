@@ -25,14 +25,14 @@
 //!        (Component)     (Component)    (Component)    (Component)
 //!             │               │               │              │
 //!             └───────────────┴───────────────┴──────────────┘
-//!                 each a VmBackendComponent<D: BlockDevice>
+//!                 each a ComponentAdapter<D: BlockDevice>
 //!                 (see vm-mgr::component_adapter)
 //! ```
 //!
-//! Every Component today is a thin `VmBackendComponent<D>` wrapper around
-//! a `vm_mgr::VmBackend<D>` bound to a specific `BankSet`. This is
+//! Every Component today is a thin `ComponentAdapter<D>` wrapper around
+//! a `vm_mgr::ComponentBackend<D>` bound to a specific `BankSet`. This is
 //! a migration layer: as more Component methods get wired end-to-end, the
-//! legacy `VmBackend` surface shrinks; once it's vestigial the adapter will
+//! legacy `ComponentBackend` surface shrinks; once it's vestigial the adapter will
 //! implement `Component` directly.
 //!
 //! # Component State Matrix
@@ -46,7 +46,7 @@
 //! | vm2        | A/B        | ✓       | ✓                 | ✓                  | ✓    | QNX 7.1 guest                             |
 //! | hsm        | single     | ✓       | —  (no rollback)  | ✓                  | ✓    | SUIT envelope → keystore; no trial boot   |
 //!
-//! All four run through the same `VmBackend` codepath — per-component state
+//! All four run through the same `ComponentBackend` codepath — per-component state
 //! lives in the NV store (see the `nv-store` crate) keyed by `BankSet`.
 //!
 //! # Platform Maturity

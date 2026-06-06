@@ -73,7 +73,7 @@ pub trait Component: Send + Sync {
     ///
     /// Multi-file SOVD uploads (manifest, then per-payload) all hit this
     /// method; the impl owns session continuity. The `id` is informational —
-    /// today's `VmBackendComponent` ignores it because `VmBackend` tracks one
+    /// today's `ComponentAdapter` ignores it because `ComponentBackend` tracks one
     /// in-flight session per component.
     ///
     /// Returns a per-upload identifier (e.g. SOVD package_id). Callers may

@@ -9,8 +9,8 @@ use nv_store::types::{BankSet, NvBootState};
 use sovd_core::DiagnosticBackend;
 
 use vm_mgr::app_install_router::AppInstallRouterComponent;
-use vm_mgr::backend::{ComponentConfig, VmBackend};
-use vm_mgr::component_adapter::VmBackendComponent;
+use vm_mgr::backend::{ComponentBackend, ComponentConfig};
+use vm_mgr::component_adapter::ComponentAdapter;
 use vm_mgr::diag_backend::ComponentDiagBackend;
 use vm_mgr::sovd::security::TestSecurityProvider;
 use vm_mgr::suit_provider::SuitProvider;
@@ -236,7 +236,7 @@ async fn main() {
         status: None,
     });
     for (id, set, config) in components {
-        let mut backend = VmBackend::with_options(
+        let mut backend = ComponentBackend::with_options(
             set,
             nv.clone(),
             manifest_provider.clone(),
@@ -267,9 +267,9 @@ async fn main() {
             }
         }
         // Wrap as ComponentDiagBackend so wired Component methods route through
-        // machine-mgr; everything else falls through to the underlying VmBackend.
-        let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);
-        let mut component_inner = VmBackendComponent::new(backend_arc.clone());
+        // machine-mgr; everything else falls through to the underlying ComponentBackend.
+        let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
+        let mut component_inner = ComponentAdapter::new(backend_arc.clone());
         // Wire CSR signing for the HSM component so the route below can
         // call machine.component("hsm").get_csr() instead of building a
         // transient SimHsm at request time.

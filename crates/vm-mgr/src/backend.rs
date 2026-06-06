@@ -1,4 +1,4 @@
-//! VmBackend — DiagnosticBackend implementation for vm-mgr bank sets.
+//! ComponentBackend — DiagnosticBackend implementation for vm-mgr bank sets.
 //!
 //! Each instance manages one bank set (hypervisor, vm1, vm2, hsm) and provides:
 //!
@@ -275,7 +275,7 @@ struct FlashTransferState {
 // Component configuration
 // ---------------------------------------------------------------------------
 
-/// Per-component configuration for VmBackend behavior.
+/// Per-component configuration for ComponentBackend behavior.
 pub struct ComponentConfig {
     /// Whether this component supports rollback (false for HSM).
     pub supports_rollback: bool,
@@ -296,10 +296,10 @@ impl Default for ComponentConfig {
 }
 
 // ---------------------------------------------------------------------------
-// VmBackend
+// ComponentBackend
 // ---------------------------------------------------------------------------
 
-pub struct VmBackend<D: BlockDevice + Send + 'static> {
+pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     entity_info: EntityInfo,
     capabilities: Capabilities,
     bank_set: BankSet,
@@ -391,7 +391,7 @@ pub struct VmBackend<D: BlockDevice + Send + 'static> {
     bank_provider: Arc<dyn BankProvider>,
 }
 
-impl<D: BlockDevice + Send + 'static> VmBackend<D> {
+impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     pub fn new(
         bank_set: BankSet,
         nv: Arc<Mutex<NvStore<D>>>,
@@ -695,7 +695,7 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
     }
 
     // =================================================================
-    // Accessors used by component_adapter::VmBackendComponent.
+    // Accessors used by component_adapter::ComponentAdapter.
     // Kept narrow on purpose — the adapter is the only outside caller.
     // =================================================================
 
@@ -1702,13 +1702,13 @@ impl<D: BlockDevice + Send + 'static> VmBackend<D> {
 // readers that wake up after the mutex drops always see a cache
 // consistent with the just-written NV state.
 //
-// Use `VmBackend::nv_write()` to acquire. Read sites should keep using
+// Use `ComponentBackend::nv_write()` to acquire. Read sites should keep using
 // `self.nv.lock()` directly — they don't need the refresh, and going
 // through the guard would do useless work.
 // ---------------------------------------------------------------------------
 
 struct NvWriteGuard<'a, D: BlockDevice + Send + 'static> {
-    backend: &'a VmBackend<D>,
+    backend: &'a ComponentBackend<D>,
     /// `Option` so `Drop` can take it via `Option::take()` and refresh
     /// against the unwrapped guard before releasing the mutex.
     inner: Option<std::sync::MutexGuard<'a, NvStore<D>>>,
@@ -1743,7 +1743,7 @@ impl<'a, D: BlockDevice + Send + 'static> Drop for NvWriteGuard<'a, D> {
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
+impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> {
     fn entity_info(&self) -> &EntityInfo {
         &self.entity_info
     }
@@ -2103,7 +2103,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for VmBackend<D> {
 
         // The manifest names this component; the SOVD-addressable entity it
         // maps to is this backend's own component id (the bank set this
-        // VmBackend serves). Report it as both updated (version changed) and
+        // ComponentBackend serves). Report it as both updated (version changed) and
         // affected. `default_descriptor_from_context` already seeded
         // `affected_components` with this same path; set `updated_components`
         // only when the manifest actually carried component identifiers.
@@ -3627,7 +3627,7 @@ pub(crate) fn did_value_to_json(
             serde_json::json!(v)
         }
         "string" => {
-            let s = VmBackend::<nv_store::block::MemBlockDevice>::nv_bytes_to_string(value);
+            let s = ComponentBackend::<nv_store::block::MemBlockDevice>::nv_bytes_to_string(value);
             serde_json::Value::String(s)
         }
         _ => {
@@ -3786,7 +3786,7 @@ pub struct GuestHealth {
     /// (qvm-shmem regions persist across stop/start).
     pub boot_id: u32,
     /// Coarse health status string ("running" / "stopped" / "unhealthy").
-    /// VmBackend treats anything not "running" as not-yet-activated —
+    /// ComponentBackend treats anything not "running" as not-yet-activated —
     /// captures the stale-heartbeat case (vm-service flips to
     /// "unhealthy" after 5s of stuck seq) without duplicating that
     /// timeout here.
@@ -3795,7 +3795,7 @@ pub struct GuestHealth {
 
 /// Synthesise a [`GuestHealth`] snapshot for a component that has no
 /// vm-service backing (e.g. activator-backed components like RT/M7).
-/// Called from `VmBackend::read_data` when `vm_service_addr` is None.
+/// Called from `ComponentBackend::read_data` when `vm_service_addr` is None.
 ///
 /// Implementations should be cheap (the call lands on the SOVD read-data
 /// hot path served by the campaign viewer). Internal caching is fine
@@ -3962,13 +3962,13 @@ mod identity_tests {
         m
     }
 
-    /// Construct a VmBackend (vm1) with images_dir + provisioned HSM,
+    /// Construct a ComponentBackend (vm1) with images_dir + provisioned HSM,
     /// inject a Verified package carrying `meta`, and point the flash
     /// transfer at it so `ivd_sign_staged_bank` picks up its identity.
     fn backend_with_package(
         tag: &str,
         meta: ImageMeta,
-    ) -> (VmBackend<MemBlockDevice>, PathBuf, PathBuf) {
+    ) -> (ComponentBackend<MemBlockDevice>, PathBuf, PathBuf) {
         let images_dir = std::env::temp_dir().join(format!("vm-mgr-identity-img-{tag}"));
         let _ = std::fs::remove_dir_all(&images_dir);
         std::fs::create_dir_all(&images_dir).unwrap();
@@ -3980,7 +3980,7 @@ mod identity_tests {
 
         let (hsm, keystore) = provisioned_hsm(tag);
 
-        let backend = VmBackend::with_options(
+        let backend = ComponentBackend::with_options(
             BankSet::Vm1,
             nv,
             Arc::new(NoopManifest),
@@ -4382,7 +4382,7 @@ mod identity_tests {
         let _ = std::fs::remove_file(&current);
         std::os::unix::fs::symlink(Path::new("bank_a"), &current).unwrap();
 
-        let backend = VmBackend::with_options(
+        let backend = ComponentBackend::with_options(
             BankSet::Vm1,
             nv.clone(),
             Arc::new(NoopManifest),

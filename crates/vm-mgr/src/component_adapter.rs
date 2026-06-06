@@ -1,7 +1,7 @@
-//! Adapter — exposes a `VmBackend` instance through the `machine-mgr::Component`
+//! Adapter — exposes a `ComponentBackend` instance through the `machine-mgr::Component`
 //! trait. Diagserver does not yet use this; PR 3 wires it in.
 //!
-//! Each `VmBackend` is already bound to a single `BankSet` (one component), so
+//! Each `ComponentBackend` is already bound to a single `BankSet` (one component), so
 //! the wrapper is 1:1 — no per-component routing logic.
 
 use std::path::PathBuf;
@@ -21,11 +21,11 @@ use machine_mgr::{
     LifecycleCaps, MachineError, MachineResult, RuntimeState, RuntimeStatus,
 };
 
-use crate::backend::{VmBackend, DID_REGISTRY};
+use crate::backend::{ComponentBackend, DID_REGISTRY};
 use crate::did;
 
-pub struct VmBackendComponent<D: BlockDevice + Send + 'static> {
-    inner: Arc<VmBackend<D>>,
+pub struct ComponentAdapter<D: BlockDevice + Send + 'static> {
+    inner: Arc<ComponentBackend<D>>,
     capabilities: Capabilities,
     /// HSM keystore directory used by `get_csr` to spin up a transient
     /// `SimHsm` for CSR signing. `None` means CSR is not supported.
@@ -35,8 +35,8 @@ pub struct VmBackendComponent<D: BlockDevice + Send + 'static> {
     csr_hsm_port: u16,
 }
 
-impl<D: BlockDevice + Send + Sync + 'static> VmBackendComponent<D> {
-    pub fn new(inner: Arc<VmBackend<D>>) -> Self {
+impl<D: BlockDevice + Send + Sync + 'static> ComponentAdapter<D> {
+    pub fn new(inner: Arc<ComponentBackend<D>>) -> Self {
         let capabilities = derive_capabilities(&inner);
         Self {
             inner,
@@ -63,12 +63,12 @@ impl<D: BlockDevice + Send + Sync + 'static> VmBackendComponent<D> {
         self
     }
 
-    pub fn inner(&self) -> &Arc<VmBackend<D>> {
+    pub fn inner(&self) -> &Arc<ComponentBackend<D>> {
         &self.inner
     }
 }
 
-fn derive_capabilities<D: BlockDevice + Send + 'static>(b: &VmBackend<D>) -> Capabilities {
+fn derive_capabilities<D: BlockDevice + Send + 'static>(b: &ComponentBackend<D>) -> Capabilities {
     let cfg = b.component_config();
     Capabilities {
         did_store: true,
@@ -76,7 +76,7 @@ fn derive_capabilities<D: BlockDevice + Send + 'static>(b: &VmBackend<D>) -> Cap
             dual_bank: !cfg.single_bank,
             supports_rollback: cfg.supports_rollback,
             supports_trial_boot: !cfg.single_bank,
-            // Today's VmBackend has no public abort hook — wired in a follow-up.
+            // Today's ComponentBackend has no public abort hook — wired in a follow-up.
             // Keep this honest with the actual implementation: false.
             abortable_after_finalize: false,
             // Phase 1 of Issue 2: surface the activator's declared reset kind
@@ -100,7 +100,7 @@ fn derive_capabilities<D: BlockDevice + Send + 'static>(b: &VmBackend<D>) -> Cap
 }
 
 #[async_trait]
-impl<D: BlockDevice + Send + Sync + 'static> Component for VmBackendComponent<D> {
+impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
     fn id(&self) -> &str {
         &self.inner.entity_info().id
     }
@@ -202,7 +202,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for VmBackendComponent<D>
     }
 
     // ---------------------------------------------------------------
-    // Install pipeline — delegates to VmBackend's existing flash methods
+    // Install pipeline — delegates to ComponentBackend's existing flash methods
     // ---------------------------------------------------------------
 
     async fn start_install(&self) -> MachineResult<FlashSession> {
@@ -211,7 +211,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for VmBackendComponent<D>
             .map_err(map_backend_error)?;
         Ok(FlashSession {
             id: FlashId::new(transfer_id),
-            target_bank: None, // VmBackend computes target from running_bank internally.
+            target_bank: None, // ComponentBackend computes target from running_bank internally.
             max_chunk_size: 0,
         })
     }
@@ -229,10 +229,10 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for VmBackendComponent<D>
     ) -> MachineResult<String> {
         // EnvelopeStream and sovd-core's PackageStream are the same underlying
         // type (Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn Error>>> + Send>>).
-        // No conversion needed. VmBackend's receive_package_stream owns the
+        // No conversion needed. ComponentBackend's receive_package_stream owns the
         // session lifecycle (AwaitingManifest → AwaitingPayload → Complete);
         // this method just feeds the next piece into it. We return the
-        // package_id VmBackend issues, which the SOVD wire surfaces.
+        // package_id ComponentBackend issues, which the SOVD wire surfaces.
         DiagnosticBackend::receive_package_stream(&*self.inner, stream, None)
             .await
             .map_err(map_backend_error)
@@ -259,7 +259,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for VmBackendComponent<D>
     async fn abort_install(&self, _id: &FlashId) -> MachineResult<()> {
         // Pre-finalize abort is always allowed: discard the staging session.
         // Post-finalize abort needs the bank pointer to flip back, which
-        // VmBackend can't do today — reject with PolicyRejected so the
+        // ComponentBackend can't do today — reject with PolicyRejected so the
         // orchestrator sees a meaningful error rather than a silent no-op.
         if self.inner.flash_is_finalized() {
             return Err(MachineError::PolicyRejected(

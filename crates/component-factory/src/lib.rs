@@ -9,8 +9,8 @@ use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
 use nv_store::types::BankSet;
 
-use vm_mgr::backend::{ComponentConfig, VmBackend};
-use vm_mgr::component_adapter::VmBackendComponent;
+use vm_mgr::backend::{ComponentBackend, ComponentConfig};
+use vm_mgr::component_adapter::ComponentAdapter;
 use vm_mgr::manifest_provider::ManifestProvider;
 use vm_mgr::sovd::security::SecurityProvider;
 
@@ -200,7 +200,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 supports_rollback: spec.rollback,
                 single_bank: false,
             };
-            let backend = VmBackend::with_options(
+            let backend = ComponentBackend::with_options(
                 bank_set,
                 deps.nv.clone(),
                 deps.manifest_provider.clone(),
@@ -211,7 +211,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 deps.hsm_provider.clone(),
             )
             .with_bank_spec(bank_spec.clone());
-            let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);
+            let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
             let component: Arc<dyn Component> = Arc::new(comp);
 
             let flash_probe: Arc<dyn Fn() -> bool + Send + Sync> = {
@@ -237,7 +237,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
         // is the deployment's problem" — VMs (vm-service notifies via
         // `notify_vm_service` based on `vm_service_addr`, not the type
         // string), RT side, future containers, anything generic. `hpc`
-        // (host OS) and `hsm` get the same VmBackendComponent shape but
+        // (host OS) and `hsm` get the same ComponentAdapter shape but
         // with extra hooks attached below (IFS activator / HSM
         // provisioning).
         "bank" | "hpc" | "hsm" => {
@@ -257,7 +257,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 deps.vm_service_addr.clone()
             };
 
-            let mut backend = VmBackend::with_options(
+            let mut backend = ComponentBackend::with_options(
                 bank_set,
                 deps.nv.clone(),
                 deps.manifest_provider.clone(),
@@ -276,8 +276,8 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 backend = backend.with_health_probe(probe.clone());
             }
 
-            let backend_arc: Arc<VmBackend<_>> = Arc::new(backend);
-            let mut component_inner = VmBackendComponent::new(backend_arc.clone());
+            let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
+            let mut component_inner = ComponentAdapter::new(backend_arc.clone());
 
             if bank_set == BankSet::Hsm {
                 if let Some(ref keystore) = deps.hsm_keystore {

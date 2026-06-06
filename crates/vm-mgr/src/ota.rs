@@ -392,7 +392,7 @@ pub fn rollback<D: BlockDevice>(nv: &mut NvStore<D>, set: BankSet) -> Result<Ban
 ///
 /// Note: the firmware version string is no longer here — it lives in
 /// the bank's signed IVD manifest (`hsm::ivd::IvdIdentity`). Callers
-/// that need a version label read it from there (the VmBackend caches
+/// that need a version label read it from there (the ComponentBackend caches
 /// the verified identity per running bank).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BankStatus {

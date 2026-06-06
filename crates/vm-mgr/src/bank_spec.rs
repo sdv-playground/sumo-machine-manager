@@ -33,7 +33,7 @@ pub enum BankLayout {
     Generic,
 }
 
-/// Per-bank-set spec attached to each VmBackend at construction.
+/// Per-bank-set spec attached to each ComponentBackend at construction.
 #[derive(Debug, Clone)]
 pub struct BankSetSpec {
     /// On-disk subdirectory under `images_dir`. E.g. "vm1", "host-os",
@@ -47,7 +47,7 @@ pub struct BankSetSpec {
 impl BankSetSpec {
     /// Build the default spec for one of the six well-known BankSet
     /// slots. **Bridge for Phase 2** — until Phase 3 wires the spec
-    /// through component-factory, every existing VmBackend
+    /// through component-factory, every existing ComponentBackend
     /// constructor goes through here.
     pub fn for_well_known(bs: BankSet) -> Self {
         let dir_name = match bs {
