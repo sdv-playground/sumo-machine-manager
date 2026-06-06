@@ -1,24 +1,61 @@
 use nv_store::block::FileBlockDevice;
+use nv_store::selector::FileSelectorStore;
 use nv_store::store::MIN_NV_DEVICE_SIZE;
 use nv_store::types::BankSet;
 use std::path::PathBuf;
 use vm_boot::{BootAction, BootManager, HashCheck};
 
+fn usage() -> ! {
+    eprintln!("Usage: vm-boot <nv-store-path> [--selector <dir>] [--init]");
+    eprintln!();
+    eprintln!("  <nv-store-path>   Path to the NV store file/device");
+    eprintln!("  --selector <dir>  Boot-selector dir (PRIMARY/SECONDARY slot files).");
+    eprintln!("                    When present and seeded, drives the bank decision;");
+    eprintln!("                    otherwise the NV boot state is used.");
+    eprintln!("  --init            Create a new NV store file if it doesn't exist");
+    std::process::exit(1);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    let nv_path = match args.get(1) {
-        Some(p) => PathBuf::from(p),
-        None => {
-            eprintln!("Usage: vm-boot <nv-store-path> [--init]");
-            eprintln!();
-            eprintln!("  <nv-store-path>  Path to the NV store file/device");
-            eprintln!("  --init           Create a new NV store file if it doesn't exist");
-            std::process::exit(1);
+    // Parse: the NV path is the first non-flag arg; `--selector <dir>` and
+    // `--init` may appear anywhere after it.
+    let mut nv_path: Option<PathBuf> = None;
+    let mut selector_dir: Option<PathBuf> = None;
+    let mut init = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--init" => init = true,
+            "--selector" => {
+                i += 1;
+                match args.get(i) {
+                    Some(dir) => selector_dir = Some(PathBuf::from(dir)),
+                    None => {
+                        eprintln!("[bootmgr] --selector requires a directory argument");
+                        usage();
+                    }
+                }
+            }
+            "-h" | "--help" => usage(),
+            other if other.starts_with("--") => {
+                eprintln!("[bootmgr] unknown option: {other}");
+                usage();
+            }
+            _ if nv_path.is_none() => nv_path = Some(PathBuf::from(&args[i])),
+            other => {
+                eprintln!("[bootmgr] unexpected argument: {other}");
+                usage();
+            }
         }
-    };
+        i += 1;
+    }
 
-    let init = args.get(2).is_some_and(|a| a == "--init");
+    let nv_path = match nv_path {
+        Some(p) => p,
+        None => usage(),
+    };
 
     let dev = if init && !nv_path.exists() {
         eprintln!("[bootmgr] creating NV store: {}", nv_path.display());
@@ -36,6 +73,10 @@ fn main() {
     };
 
     let mut mgr = BootManager::new(dev);
+    if let Some(dir) = &selector_dir {
+        eprintln!("[bootmgr] using boot selector: {}", dir.display());
+        mgr = mgr.with_selector(Box::new(FileSelectorStore::new(dir.clone())));
+    }
 
     let actions = match mgr.process_boot() {
         Ok(a) => a,
