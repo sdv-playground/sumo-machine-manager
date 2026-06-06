@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use nv_store::types::{Bank, BankSet};
+
 use crate::component::Component;
 use crate::system_bank_state::{
     SelectorStore, Signer, StubSelectorStore, StubSigner, SystemBankManager,
@@ -71,6 +73,36 @@ impl MachineRegistry {
     /// bootloader sector contract is real.
     pub fn system_bank(&self) -> &SystemBankManager {
         &self.system_bank
+    }
+
+    /// Seed the boot selector from the node's per-bank-set boot state so the
+    /// selector's PRIMARY slot mirrors reality on startup.
+    ///
+    /// For each `(set, bank)` entry, this stages the selection **only when it
+    /// differs** from the selector's current PRIMARY view; after the loop, it
+    /// seals **once** iff anything was staged.
+    ///
+    /// **Idempotent on purpose**: when the selector already matches the
+    /// supplied entries (the steady-state case on every boot), nothing is
+    /// staged and `seal` is *not* called — so the global generation does not
+    /// inflate on every startup. It only advances when the boot state actually
+    /// changed (e.g. after an OTA bank flip) and the selector needs to catch
+    /// up.
+    ///
+    /// Additive: this is a read-only mirror of `NvBootState` into the selector
+    /// — it does not make the selector the boot authority. Nothing consults the
+    /// selector for a boot/bank decision.
+    pub fn seed_selector(&mut self, entries: impl IntoIterator<Item = (BankSet, Bank)>) {
+        let mut staged_any = false;
+        for (set, bank) in entries {
+            if self.system_bank.active_bank(set) != Some(bank) {
+                self.system_bank.stage(set, bank);
+                staged_any = true;
+            }
+        }
+        if staged_any {
+            self.system_bank.seal();
+        }
     }
 }
 

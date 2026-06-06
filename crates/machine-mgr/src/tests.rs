@@ -242,6 +242,51 @@ fn registry_with_arc_accepts_prebuilt_arcs() {
 }
 
 #[test]
+fn seed_selector_writes_on_first_seed_and_is_idempotent() {
+    use crate::system_bank_state::{InMemorySelectorStore, SelectorStore, TestSigner};
+    use nv_store::types::{Bank, BankSet};
+
+    // A real two-slot store we can inspect after seeding.
+    let store = InMemorySelectorStore::new();
+    let mut m = MachineRegistry::builder(entity("veh"))
+        .with_selector_store(Box::new(store.clone()), Box::new(TestSigner))
+        .build();
+
+    // Selector starts empty (no PRIMARY blob, generation 0).
+    assert!(store.read_primary().is_none());
+    assert_eq!(m.system_bank().generation(), 0);
+
+    // First seed of an empty selector: both entries differ from the (absent)
+    // PRIMARY view, so both are staged and a single seal promotes them.
+    let entries = vec![(BankSet::Vm1, Bank::B), (BankSet::Vm2, Bank::A)];
+    m.seed_selector(entries.clone());
+
+    // The selector now mirrors the seed and the store's PRIMARY slot was
+    // written with both entries at generation 1.
+    assert_eq!(m.system_bank().active_bank(BankSet::Vm1), Some(Bank::B));
+    assert_eq!(m.system_bank().active_bank(BankSet::Vm2), Some(Bank::A));
+    assert_eq!(m.system_bank().generation(), 1, "one seal => generation 1");
+    let primary = store.read_primary().expect("PRIMARY written by the seed");
+    assert_eq!(primary.generation, 1);
+    assert_eq!(primary.selectors.get(&BankSet::Vm1), Some(&Bank::B));
+    assert_eq!(primary.selectors.get(&BankSet::Vm2), Some(&Bank::A));
+
+    // Second identical seed: every entry already matches PRIMARY, so nothing
+    // is staged and seal is NOT called — the generation must not inflate.
+    m.seed_selector(entries);
+    assert_eq!(
+        m.system_bank().generation(),
+        1,
+        "idempotent re-seed must not bump the generation"
+    );
+    assert_eq!(
+        store.read_primary().map(|b| b.generation),
+        Some(1),
+        "no second PRIMARY write on an idempotent re-seed"
+    );
+}
+
+#[test]
 fn registry_build_accepts_zero_components() {
     let m = MachineRegistry::builder(entity("empty")).build();
     assert!(m.components().is_empty());
