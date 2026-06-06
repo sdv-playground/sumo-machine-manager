@@ -1,11 +1,11 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 /// HTTP API for VM lifecycle control.
 ///
 /// Routes:
@@ -18,6 +18,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::config::Bank;
 use crate::health_status::HealthStatus;
 use crate::manager::{self, ManagerError, VmManager};
 
@@ -106,11 +107,26 @@ async fn stop_vm(State(mgr): State<SharedManager>, Path(name): Path<String>) -> 
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
+/// Query params for [`ensure_vm_running`]. Optional `?bank=a|b` lets the
+/// caller (vm-mgr after an OTA flip) pin the A/B bank to relaunch from.
+/// Absent ⇒ leave the VM's existing `def.bank` untouched (back-compat with
+/// manual callers and supernova's startup auto-start).
+#[derive(Debug, Default, Deserialize)]
+struct EnsureParams {
+    bank: Option<String>,
+}
+
 /// Idempotent "ensure VM is running with current config". Backs both
 /// POST /vms/{name}/start and POST /vms/{name}/restart so callers don't
 /// have to probe state first — a previously-started but never-healthy
 /// instance (e.g. qvm rejected a config option and exited) gets recycled
 /// instead of returning AlreadyRunning.
+///
+/// An optional `?bank=a|b` query pins which A/B bank to relaunch from: it's
+/// pushed via `set_vm_bank` right before `start_vm`. vm-mgr sends it after
+/// flipping the `current` symlink so the relaunch boots the just-activated
+/// bank instead of the stale boot-time `def.bank`. Absent ⇒ `def.bank` is
+/// left as-is.
 ///
 /// `initiate_stop` is synchronous (signal + record pid; or, for an
 /// already-dead handle, cleanup + return no-op handle). The blocking
@@ -121,7 +137,17 @@ async fn stop_vm(State(mgr): State<SharedManager>, Path(name): Path<String>) -> 
 async fn ensure_vm_running(
     State(mgr): State<SharedManager>,
     Path(name): Path<String>,
+    Query(params): Query<EnsureParams>,
 ) -> impl IntoResponse {
+    // Parse the optional bank selector to vm-service's own `Bank`. Unknown
+    // tokens are treated as absent (no clobber) rather than erroring — the
+    // notify is best-effort and an unexpected value shouldn't block a relaunch.
+    let bank = params.bank.as_deref().and_then(|s| match s {
+        "a" | "A" => Some(Bank::A),
+        "b" | "B" => Some(Bank::B),
+        _ => None,
+    });
+
     let stop_handle = {
         let mut mgr = mgr.lock().await;
         match mgr.initiate_stop(&name) {
@@ -170,6 +196,12 @@ async fn ensure_vm_running(
         let result = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             let mut mgr = rt.block_on(start_mgr.lock());
+            // Pin the requested bank (if any) before launch so the relaunch
+            // boots the just-activated bank. Only push when provided — an
+            // absent `?bank=` must not clobber the existing `def.bank`.
+            if let Some(b) = bank {
+                let _ = mgr.set_vm_bank(&start_name, Some(b));
+            }
             mgr.start_vm(&start_name)
         })
         .await;
@@ -225,4 +257,137 @@ fn error_response(e: ManagerError) -> (StatusCode, Json<serde_json::Value>) {
         ManagerError::Runner(_) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     (code, Json(serde_json::json!({"error": msg})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::VmServiceConfig;
+    use crate::manager::VmManager;
+    use std::sync::Mutex as StdMutex;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Single dummy VM so `start_vm` runs the full launch path (verify hook +
+    /// dummy runner) without real images on disk.
+    fn dummy_config() -> VmServiceConfig {
+        let yaml = r#"
+vms:
+  vm1:
+    backend: dummy
+    image_dir: /var/lib/vms/vm1/current
+"#;
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    /// Build the router with a pre-launch verify hook that records the bank dir
+    /// `start_vm` resolves — i.e. the effect of whatever `def.bank` was at launch.
+    /// Returns (router-backing manager, last-seen bank dir cell).
+    fn manager_with_seen() -> (SharedManager, Arc<StdMutex<Option<std::path::PathBuf>>>) {
+        let seen: Arc<StdMutex<Option<std::path::PathBuf>>> = Arc::new(StdMutex::new(None));
+        let seen_for_hook = seen.clone();
+        let mgr = VmManager::with_device_transport(dummy_config(), None).with_pre_launch_verify(
+            Arc::new(move |_name, bank_dir| {
+                *seen_for_hook.lock().unwrap() = Some(bank_dir.to_path_buf());
+                Ok(())
+            }),
+        );
+        (Arc::new(Mutex::new(mgr)), seen)
+    }
+
+    /// Serve the router on an ephemeral loopback port; return its addr.
+    async fn serve(mgr: SharedManager) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(mgr);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// Fire a raw `POST {path}` and read back the status line — mirrors how
+    /// vm-mgr's `notify_vm_service` talks to this route.
+    async fn post(addr: std::net::SocketAddr, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Poll a closure until it returns true or the deadline passes. The route
+    /// returns 200 the moment the recycle is *queued*; the bank push + launch
+    /// happen in a background task, so we wait for the observable effect.
+    async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    #[tokio::test]
+    async fn restart_with_bank_query_pins_bank_before_launch() {
+        let (mgr, seen) = manager_with_seen();
+        // Seed a different bank so the test proves the query *changed* it.
+        mgr.lock().await.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        let addr = serve(mgr.clone()).await;
+
+        let status = post(addr, "/vms/vm1/restart?bank=b").await;
+        assert!(status.contains("200"), "queued 200, got: {status}");
+
+        // The background task pushes bank=B via set_vm_bank, then launches —
+        // the verify hook (sync cell) observes the resolved bank_b dir once
+        // the launch runs. Poll that observable effect.
+        let ok = wait_until(|| seen.lock().unwrap().is_some()).await;
+        assert!(ok, "verify hook should fire (background launch ran)");
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(std::path::PathBuf::from("/var/lib/vms/vm1/bank_b")),
+            "verify hook must see bank_b — proving the push landed before launch"
+        );
+        // And def.bank itself is now B.
+        assert_eq!(
+            mgr.lock().await.vm_bank("vm1"),
+            Some(Bank::B),
+            "?bank=b must flip def.bank to Some(B)"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_without_bank_query_leaves_bank_unchanged() {
+        let (mgr, seen) = manager_with_seen();
+        // Pre-set bank A; an absent ?bank= must NOT clobber it.
+        mgr.lock().await.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        let addr = serve(mgr.clone()).await;
+
+        let status = post(addr, "/vms/vm1/restart").await;
+        assert!(status.contains("200"), "queued 200, got: {status}");
+
+        // Wait for the launch to complete (verify hook fires), then confirm
+        // def.bank is still A — the old/manual-caller contract.
+        let ok = wait_until(|| seen.lock().unwrap().is_some()).await;
+        assert!(ok, "verify hook should fire (dummy launch ran)");
+        assert_eq!(
+            mgr.lock().await.vm_bank("vm1"),
+            Some(Bank::A),
+            "absent ?bank= must leave def.bank untouched"
+        );
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(std::path::PathBuf::from("/var/lib/vms/vm1/bank_a")),
+        );
+    }
 }

@@ -283,6 +283,14 @@ impl VmManager {
         Ok(())
     }
 
+    /// Test-only: read a VM's currently-selected launch bank (`def.bank`).
+    /// Lets api-level tests assert that a `?bank=` query reached `set_vm_bank`
+    /// before launch without exposing the private `ManagedVm` shape.
+    #[cfg(test)]
+    pub fn vm_bank(&self, name: &str) -> Option<Bank> {
+        self.vms.get(name).and_then(|vm| vm.def.bank)
+    }
+
     pub fn start_vm(&mut self, name: &str) -> Result<(), ManagerError> {
         let vm = self
             .vms

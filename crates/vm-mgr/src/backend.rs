@@ -1633,6 +1633,17 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         String::from_utf8_lossy(&data[..end]).to_string()
     }
 
+    /// Build the `?bank=` query suffix for the vm-service notify URL.
+    /// `Some(Bank::A)` ⇒ `"?bank=a"`, `Some(Bank::B)` ⇒ `"?bank=b"`,
+    /// `None` ⇒ `""` (vm-service then leaves its `def.bank` untouched).
+    fn bank_query(bank: Option<Bank>) -> &'static str {
+        match bank {
+            Some(Bank::A) => "?bank=a",
+            Some(Bank::B) => "?bank=b",
+            None => "",
+        }
+    }
+
     /// Send a restart request to vm-service over its Unix socket.
     ///
     /// Reads back the HTTP status line so axum gets a chance to fully
@@ -1653,15 +1664,24 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// was offline pre-reset (factory provision, post-crash) so callers
     /// don't pay for a phantom shutdown step and the GUI doesn't display
     /// a misleading "Shutting Down vm2" tile for a guest that never ran.
-    async fn notify_vm_service(addr: &str, vm_name: &str, action: &str) -> Result<(), String> {
+    async fn notify_vm_service(
+        addr: &str,
+        vm_name: &str,
+        action: &str,
+        bank: Option<Bank>,
+    ) -> Result<(), String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut stream = tokio::net::TcpStream::connect(addr)
             .await
             .map_err(|e| format!("connect to vm-service: {e}"))?;
 
+        // Carry the just-activated bank as a `?bank=` query so vm-service
+        // re-resolves the launch bank (via `set_vm_bank`) before relaunching.
+        // Absent ⇒ vm-service leaves its `def.bank` untouched (back-compat).
+        let query = Self::bank_query(bank);
         let request = format!(
-            "POST /vms/{vm_name}/{action} HTTP/1.1\r\n\
+            "POST /vms/{vm_name}/{action}{query} HTTP/1.1\r\n\
              Host: localhost\r\n\
              Content-Length: 0\r\n\
              Connection: close\r\n\
@@ -3142,14 +3162,17 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             }
 
             let id = &self.entity_info.id;
-            match Self::notify_vm_service(socket_path, id, action).await {
+            // Carry the just-activated bank so vm-service relaunches THIS bank,
+            // not the stale boot-time `def.bank` (the "kernel not found" bug).
+            match Self::notify_vm_service(socket_path, id, action, Some(target_bank)).await {
                 Ok(()) => tracing::info!("vm-service {action} requested for {id}"),
                 Err(e) => tracing::warn!("failed to notify vm-service for {id}: {e}"),
             }
         } else if let Some(ref socket_path) = self.vm_service_addr {
-            // No images_dir — just notify without symlink flip
+            // No images_dir — just notify without symlink flip. We have no
+            // resolved bank dir to point at here, so leave def.bank untouched.
             let id = &self.entity_info.id;
-            match Self::notify_vm_service(socket_path, id, action).await {
+            match Self::notify_vm_service(socket_path, id, action, None).await {
                 Ok(()) => tracing::info!("vm-service {action} requested for {id}"),
                 Err(e) => tracing::warn!("failed to notify vm-service for {id}: {e}"),
             }
@@ -4601,5 +4624,21 @@ mod bank_provider_injection_tests {
             ResetKind::RequiresEcuReset,
             "with_bank_activator after with_bank_provider must not clobber the override"
         );
+    }
+}
+
+#[cfg(test)]
+mod notify_query_tests {
+    use super::*;
+    use nv_store::block::MemBlockDevice;
+
+    /// The `?bank=` suffix carried to vm-service after an OTA flip. `notify_vm_service`
+    /// itself needs a live socket, so the URL-building is factored here and tested pure.
+    #[test]
+    fn bank_query_maps_each_bank() {
+        type Cb = ComponentBackend<MemBlockDevice>;
+        assert_eq!(Cb::bank_query(Some(Bank::A)), "?bank=a");
+        assert_eq!(Cb::bank_query(Some(Bank::B)), "?bank=b");
+        assert_eq!(Cb::bank_query(None), "");
     }
 }
