@@ -1,12 +1,14 @@
 //! Core types for the NV store bank management system.
 //!
-//! Five independent A/B bank sets:
+//! Independent A/B bank sets on a fixed semantic slot layout
+//! (low slot → high in the boot order):
 //!
-//! - HostOs (IFS + rootfs, updated atomically)
-//! - VM1 (Linux or QNX VM)
-//! - VM2 (Linux or QNX VM)
-//! - HSM (Hardware Security Module — single-banked, non-rollbackable)
-//! - App (self-updating application component, filesystem A/B banks)
+//! - Hsm (Hardware Security Module — single-banked, non-rollbackable) — slot 0
+//! - Bootloader (reserved, unused) — slot 1
+//! - Os (host OS: IFS + rootfs, updated atomically; supernova rides here) — slot 2
+//! - Rt (realtime / Cortex-M7 core) — slot 3
+//! - Vm1 (Linux or QNX VM) — slot 4
+//! - Vm2 (Linux or QNX VM) — slot 5
 
 /// Identifies which bank is active within a bank set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -34,17 +36,16 @@ impl Bank {
 }
 
 /// Identifies which bank set — a numeric slot index in the NV
-/// partition layout. The well-known names (`HostOs`, `Vm1`, etc.)
-/// are kept as associated constants for back-compat with code that
-/// still references them by name; the type itself is opaque, so any
-/// slot index in `0..NUM_BANK_SETS` is a valid `BankSet`.
+/// partition layout. The slot index is a fixed semantic layout
+/// (`Hsm=0`, `Bootloader=1`, `Os=2`, `Rt=3`, `Vm1=4`, `Vm2=5`)
+/// exposed as associated constants; the type itself is opaque, so
+/// any slot index in `0..NUM_BANK_SETS` is a valid `BankSet`.
 ///
-/// Phase 1 of the deep refactor: replace the enum with a newtype.
 /// Phase 2 moves the per-slot behavior (dir name, file-naming
 /// layout) off the type and into a deployment-config-supplied
 /// `BankSetSpec`. Phase 3 makes the slot assignment itself
 /// config-driven so deployments add components without touching
-/// this enum.
+/// these constants.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -52,15 +53,16 @@ pub struct BankSet(pub u8);
 
 #[allow(non_upper_case_globals)]
 impl BankSet {
-    // Well-known slot indices. Phase 3 will retire these and let
-    // deployment config carry the (id → slot) mapping; for now they
-    // preserve the call-site names so the refactor is incremental.
-    pub const HostOs: BankSet = BankSet(0);
-    pub const Vm1: BankSet = BankSet(1);
-    pub const Vm2: BankSet = BankSet(2);
-    pub const Hsm: BankSet = BankSet(3);
-    pub const App: BankSet = BankSet(4);
-    pub const Custom: BankSet = BankSet(5);
+    // Fixed semantic slot layout. The slot index encodes the
+    // component's role in the boot order, low to high:
+    //   Hsm (security root) → Bootloader → Os (host) → Rt
+    //   (realtime core) → the application VMs.
+    pub const Hsm: BankSet = BankSet(0);
+    pub const Bootloader: BankSet = BankSet(1);
+    pub const Os: BankSet = BankSet(2);
+    pub const Rt: BankSet = BankSet(3);
+    pub const Vm1: BankSet = BankSet(4);
+    pub const Vm2: BankSet = BankSet(5);
 
     /// Iterate every slot the NV-store can address. Replaces the
     /// old `BankSet::all() -> [BankSet; NUM_BANK_SETS]` array.
@@ -85,12 +87,12 @@ impl BankSet {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "host-os" | "host_os" => Some(BankSet::HostOs),
+            "hsm" => Some(BankSet::Hsm),
+            "bootloader" | "boot" => Some(BankSet::Bootloader),
+            "os" | "host-os" | "host_os" | "supernova" | "app" => Some(BankSet::Os),
+            "rt" | "custom" => Some(BankSet::Rt),
             "os1" | "vm1" => Some(BankSet::Vm1),
             "os2" | "vm2" => Some(BankSet::Vm2),
-            "hsm" => Some(BankSet::Hsm),
-            "app" | "supernova" => Some(BankSet::App),
-            "custom" => Some(BankSet::Custom),
             _ => None,
         }
     }
@@ -100,11 +102,12 @@ impl BankSet {
 /// store can address. Deployments use 0..N of these; slots beyond
 /// what a deployment registers are unused but still allocated.
 ///
-/// Currently 6 are named (HostOs, Vm1, Vm2, Hsm, App, Custom) and
-/// in production use (the Custom slot holds the RT/Cortex-M7
-/// component). Slots 6..9 are reserved headroom — adding a new
-/// component just picks an unused index without bumping this
-/// constant + the NV partition size + the on-device file.
+/// Currently 6 are named (Hsm, Bootloader, Os, Rt, Vm1, Vm2) and in
+/// production use (Rt holds the RT/Cortex-M7 component; Bootloader is
+/// reserved headroom with no component mapped yet). Slots 6..9 are
+/// reserved headroom — adding a new component just picks an unused
+/// index without bumping this constant + the NV partition size + the
+/// on-device file.
 pub const NUM_BANK_SETS: usize = 10;
 pub const MAX_TRIAL_BOOTS: u8 = 10;
 
@@ -212,25 +215,27 @@ impl Default for BankBootState {
 
 /// Complete boot state for all bank sets.
 ///
-/// Wire format (28 bytes):
+/// Wire format (28 bytes). Each slot is 3 bytes (active_bank,
+/// committed, boot_count) in the fixed semantic order; only the
+/// first 6 of `NUM_BANK_SETS` are named today.
 /// ```text
 /// [0..4]   magic (NVB1)
 /// [4..8]   write_seq
-/// [8]      host_os.active_bank
-/// [9]      host_os.committed
-/// [10]     host_os.boot_count
-/// [11]     vm1.active_bank
-/// [12]     vm1.committed
-/// [13]     vm1.boot_count
-/// [14]     vm2.active_bank
-/// [15]     vm2.committed
-/// [16]     vm2.boot_count
-/// [17]     hsm.active_bank
-/// [18]     hsm.committed
-/// [19]     hsm.boot_count
-/// [20]     app.active_bank
-/// [21]     app.committed
-/// [22]     app.boot_count
+/// [8]      hsm.active_bank        (slot 0)
+/// [9]      hsm.committed
+/// [10]     hsm.boot_count
+/// [11]     bootloader.active_bank (slot 1)
+/// [12]     bootloader.committed
+/// [13]     bootloader.boot_count
+/// [14]     os.active_bank         (slot 2)
+/// [15]     os.committed
+/// [16]     os.boot_count
+/// [17]     rt.active_bank         (slot 3)
+/// [18]     rt.committed
+/// [19]     rt.boot_count
+/// [20]     vm1.active_bank        (slot 4)
+/// [21]     vm1.committed
+/// [22]     vm1.boot_count
 /// [23..28] padding
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,7 +257,7 @@ impl NvRecord for NvBootState {
     const MAGIC: u32 = MAGIC_BOOT;
 
     fn size() -> usize {
-        28 // 4 magic + 4 seq + 5*3 banks + 5 padding
+        28 // 4 magic + 4 seq + 6*3 banks + 2 padding
     }
 
     fn write_seq(&self) -> u32 {

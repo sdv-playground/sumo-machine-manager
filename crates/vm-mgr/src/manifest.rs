@@ -196,7 +196,7 @@ sequence_number: 1
 version: "1.0.0"
 "#;
         let m = FirmwareManifest::from_yaml(yaml).unwrap();
-        assert_eq!(m.resolve_bank_set(), Some(BankSet::HostOs));
+        assert_eq!(m.resolve_bank_set(), Some(BankSet::Os));
         assert!(m.spare_part_number.is_none());
     }
 

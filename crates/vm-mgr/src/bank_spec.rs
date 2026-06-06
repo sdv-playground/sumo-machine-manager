@@ -51,19 +51,20 @@ impl BankSetSpec {
     /// constructor goes through here.
     pub fn for_well_known(bs: BankSet) -> Self {
         let dir_name = match bs {
-            BankSet::HostOs => "host-os",
+            BankSet::Hsm => "hsm",
+            BankSet::Bootloader => "bootloader",
+            BankSet::Os => "os",
+            BankSet::Rt => "rt",
             BankSet::Vm1 => "vm1",
             BankSet::Vm2 => "vm2",
-            BankSet::Hsm => "hsm",
-            BankSet::App => "app",
-            BankSet::Custom => "custom",
             _ => "custom",
         }
         .to_string();
 
         let layout = match bs {
             BankSet::Vm1 | BankSet::Vm2 => BankLayout::Vm,
-            BankSet::HostOs | BankSet::Hsm | BankSet::App => BankLayout::BootIfs,
+            BankSet::Os | BankSet::Hsm => BankLayout::BootIfs,
+            // Bootloader + Rt are pass-through (like the old Custom slot).
             _ => BankLayout::Generic,
         };
 
@@ -106,16 +107,16 @@ mod tests {
 
     #[test]
     fn for_well_known_boot_ifs_slots() {
-        for bs in [BankSet::HostOs, BankSet::Hsm, BankSet::App] {
+        for bs in [BankSet::Os, BankSet::Hsm] {
             let s = BankSetSpec::for_well_known(bs);
             assert_eq!(s.layout, BankLayout::BootIfs);
         }
     }
 
     #[test]
-    fn for_well_known_custom_is_generic() {
-        let s = BankSetSpec::for_well_known(BankSet::Custom);
-        assert_eq!(s.dir_name, "custom");
+    fn for_well_known_rt_is_generic() {
+        let s = BankSetSpec::for_well_known(BankSet::Rt);
+        assert_eq!(s.dir_name, "rt");
         assert_eq!(s.layout, BankLayout::Generic);
     }
 

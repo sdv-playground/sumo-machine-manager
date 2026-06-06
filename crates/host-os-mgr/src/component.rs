@@ -54,13 +54,13 @@ impl<D: BlockDevice + Send + 'static> HostOsComponent<D> {
     fn active_bank(&self) -> Option<Bank> {
         let nv = self.nv.lock().unwrap();
         nv.read_boot_state()
-            .map(|s| s.banks[BankSet::HostOs.as_index()].active_bank)
+            .map(|s| s.banks[BankSet::Os.as_index()].active_bank)
     }
 
     fn is_trial(&self) -> bool {
         let nv = self.nv.lock().unwrap();
         nv.read_boot_state()
-            .map(|s| !s.banks[BankSet::HostOs.as_index()].committed)
+            .map(|s| !s.banks[BankSet::Os.as_index()].committed)
             .unwrap_or(false)
     }
 }
@@ -103,7 +103,7 @@ impl<D: BlockDevice + Send + 'static> Component for HostOsComponent<D> {
             .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
 
-        let idx = BankSet::HostOs.as_index();
+        let idx = BankSet::Os.as_index();
         if state.banks[idx].committed {
             return Err(MachineError::InvalidArgument("already committed".into()));
         }
@@ -123,7 +123,7 @@ impl<D: BlockDevice + Send + 'static> Component for HostOsComponent<D> {
             .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
 
-        let idx = BankSet::HostOs.as_index();
+        let idx = BankSet::Os.as_index();
         if state.banks[idx].committed {
             return Err(MachineError::PolicyRejected(
                 "cannot rollback committed boot".into(),

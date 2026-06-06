@@ -86,10 +86,15 @@ fn main() {
         }
     };
 
+    // (name, NV slot index, BankSet). `idx` selects this set's entry
+    // in the `actions` array (indexed by `BankSet::as_index()`), so it
+    // tracks the fixed semantic slot layout. `name` is the boot-script
+    // contract (`ACTIVE_HOST-OS=`/`ACTIVE_VM1=`/`ACTIVE_VM2=`) and is
+    // kept stable across the slot renumber.
     let output_sets: &[(&str, usize, BankSet)] = &[
-        ("host-os", 0, BankSet::HostOs),
-        ("vm1", 1, BankSet::Vm1),
-        ("vm2", 2, BankSet::Vm2),
+        ("host-os", BankSet::Os.as_index(), BankSet::Os),
+        ("vm1", BankSet::Vm1.as_index(), BankSet::Vm1),
+        ("vm2", BankSet::Vm2.as_index(), BankSet::Vm2),
     ];
 
     for &(name, idx, set) in output_sets {

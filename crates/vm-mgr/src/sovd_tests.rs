@@ -100,7 +100,7 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
         (
             "host-os",
-            BankSet::HostOs,
+            BankSet::Os,
             ComponentConfig {
                 entity_type: "host_os".into(),
                 ..ComponentConfig::default()

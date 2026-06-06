@@ -21,7 +21,7 @@ pub fn process_app_boot<D: BlockDevice>(config: &AppConfig, nv: &Arc<Mutex<NvSto
         }
     };
 
-    let idx = BankSet::App.as_index();
+    let idx = BankSet::Os.as_index();
     let bs = &mut boot_state.banks[idx];
 
     if bs.committed {

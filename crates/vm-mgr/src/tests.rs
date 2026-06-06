@@ -89,7 +89,7 @@ fn did_fw_meta_security_ver_reads_active_bank() {
 
     // Switch to B → secver 2.
     let mut state = nv.read_boot_state().unwrap();
-    state.banks[1].active_bank = Bank::B;
+    state.banks[BankSet::Vm1.as_index()].active_bank = Bank::B;
     nv.write_boot_state(&mut state).unwrap();
 
     let val = read_did(&nv, BankSet::Vm1, DID_CURRENT_SECURITY_VER, None);
@@ -154,7 +154,7 @@ fn did_dynamic_active_bank() {
     assert_eq!(val, DidValue::Bytes(vec![b'A']));
 
     let mut state = nv.read_boot_state().unwrap();
-    state.banks[1].active_bank = Bank::B;
+    state.banks[BankSet::Vm1.as_index()].active_bank = Bank::B;
     nv.write_boot_state(&mut state).unwrap();
 
     let val = read_did(&nv, BankSet::Vm1, DID_ACTIVE_BANK, None);
@@ -169,7 +169,7 @@ fn did_dynamic_committed() {
     assert_eq!(val, DidValue::Bytes(vec![1])); // true
 
     let mut state = nv.read_boot_state().unwrap();
-    state.banks[1].committed = false;
+    state.banks[BankSet::Vm1.as_index()].committed = false;
     nv.write_boot_state(&mut state).unwrap();
 
     let val = read_did(&nv, BankSet::Vm1, DID_COMMITTED, None);
@@ -235,9 +235,9 @@ fn ota_install_basic() {
 
     // Boot state: trial on B
     let state = nv.read_boot_state().unwrap();
-    assert_eq!(state.banks[1].active_bank, Bank::B);
-    assert!(!state.banks[1].committed);
-    assert_eq!(state.banks[1].boot_count, 0);
+    assert_eq!(state.banks[BankSet::Vm1.as_index()].active_bank, Bank::B);
+    assert!(!state.banks[BankSet::Vm1.as_index()].committed);
+    assert_eq!(state.banks[BankSet::Vm1.as_index()].boot_count, 0);
 
     // FW Meta written for B. Identity (version "2.0") lives in the IVD
     // manifest now; NvFwMeta carries fw_seq/secver/hash.
@@ -253,7 +253,7 @@ fn ota_install_rejects_if_trial() {
 
     // Put VM1 in trial
     let mut state = nv.read_boot_state().unwrap();
-    state.banks[1].committed = false;
+    state.banks[BankSet::Vm1.as_index()].committed = false;
     nv.write_boot_state(&mut state).unwrap();
 
     let result = install(&mut nv, BankSet::Vm1, b"img", &ImageMeta::default(), false);
@@ -341,9 +341,9 @@ fn commit_basic() {
     commit(&mut nv, BankSet::Vm1).unwrap();
 
     let state = nv.read_boot_state().unwrap();
-    assert!(state.banks[1].committed);
-    assert_eq!(state.banks[1].active_bank, Bank::B);
-    assert_eq!(state.banks[1].boot_count, 0);
+    assert!(state.banks[BankSet::Vm1.as_index()].committed);
+    assert_eq!(state.banks[BankSet::Vm1.as_index()].active_bank, Bank::B);
+    assert_eq!(state.banks[BankSet::Vm1.as_index()].boot_count, 0);
 }
 
 #[test]
@@ -403,8 +403,8 @@ fn rollback_basic() {
     assert_eq!(previous, Bank::A); // rolled back to A
 
     let state = nv.read_boot_state().unwrap();
-    assert_eq!(state.banks[1].active_bank, Bank::A);
-    assert!(state.banks[1].committed);
+    assert_eq!(state.banks[BankSet::Vm1.as_index()].active_bank, Bank::A);
+    assert!(state.banks[BankSet::Vm1.as_index()].committed);
 }
 
 #[test]
@@ -569,7 +569,7 @@ fn full_ota_multiple_bank_sets() {
     // Both on B, independent
     assert_eq!(status(&nv, BankSet::Vm1).unwrap().active_bank, Bank::B);
     assert_eq!(status(&nv, BankSet::Vm2).unwrap().active_bank, Bank::B);
-    assert_eq!(status(&nv, BankSet::HostOs).unwrap().active_bank, Bank::A); // untouched
+    assert_eq!(status(&nv, BankSet::Os).unwrap().active_bank, Bank::A); // untouched
 }
 
 #[test]
@@ -721,7 +721,7 @@ fn boot_flash_trial_mode() {
     // Standard A/B install
     let result = install(
         &mut nv,
-        BankSet::HostOs,
+        BankSet::Os,
         b"boot-v2",
         &make_image_meta("2.0", 1),
         false,
@@ -731,14 +731,14 @@ fn boot_flash_trial_mode() {
 
     // Should be in trial mode
     let state = nv.read_boot_state().unwrap();
-    let boot = &state.banks[BankSet::HostOs.as_index()];
+    let boot = &state.banks[BankSet::Os.as_index()];
     assert!(!boot.committed);
     assert_eq!(boot.active_bank, Bank::B);
 
     // Commit works
-    commit(&mut nv, BankSet::HostOs).unwrap();
+    commit(&mut nv, BankSet::Os).unwrap();
     let state = nv.read_boot_state().unwrap();
-    assert!(state.banks[BankSet::HostOs.as_index()].committed);
+    assert!(state.banks[BankSet::Os.as_index()].committed);
 }
 
 #[test]
@@ -747,16 +747,16 @@ fn boot_rollback_works() {
 
     install(
         &mut nv,
-        BankSet::HostOs,
+        BankSet::Os,
         b"boot-v2",
         &make_image_meta("2.0", 1),
         false,
     )
     .unwrap();
-    let prev = rollback(&mut nv, BankSet::HostOs).unwrap();
+    let prev = rollback(&mut nv, BankSet::Os).unwrap();
     assert_eq!(prev, Bank::A);
 
     let state = nv.read_boot_state().unwrap();
-    assert!(state.banks[BankSet::HostOs.as_index()].committed);
-    assert_eq!(state.banks[BankSet::HostOs.as_index()].active_bank, Bank::A);
+    assert!(state.banks[BankSet::Os.as_index()].committed);
+    assert_eq!(state.banks[BankSet::Os.as_index()].active_bank, Bank::A);
 }

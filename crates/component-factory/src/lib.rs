@@ -39,7 +39,7 @@ pub struct ComponentSpec {
     /// Override the bank-set name this component plugs into.
     /// Resolved via `BankSet::from_str`; falls back to the id-based
     /// mapping in [`bank_set_for_id`]. Use for deployment-specific
-    /// component ids (e.g. `"rt"` → `bank_set: custom`).
+    /// component ids that don't match a well-known id/name.
     #[serde(default)]
     pub bank_set: Option<String>,
 
@@ -117,11 +117,12 @@ pub struct FactoryDeps<D: BlockDevice> {
 
 pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
     match id {
-        "host-os" => Some(BankSet::HostOs),
+        "hsm" => Some(BankSet::Hsm),
+        "bootloader" => Some(BankSet::Bootloader),
+        "os" | "host-os" | "supernova" | "app" => Some(BankSet::Os),
+        "rt" => Some(BankSet::Rt),
         "vm1" => Some(BankSet::Vm1),
         "vm2" => Some(BankSet::Vm2),
-        "hsm" => Some(BankSet::Hsm),
-        "app" | "supernova" => Some(BankSet::App),
         _ => None,
     }
 }

@@ -207,7 +207,7 @@ async fn main() {
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
         (
             "host-os",
-            BankSet::HostOs,
+            BankSet::Os,
             ComponentConfig {
                 entity_type: "host_os".into(),
                 ..ComponentConfig::default()
@@ -259,7 +259,7 @@ async fn main() {
             }
         }
         // Wire bank activator into the boot backend
-        if set == BankSet::HostOs {
+        if set == BankSet::Os {
             if let Some(ref dev) = boot_device {
                 let activator =
                     host_os_mgr::ifs::dev::DevBankActivator::new(dev.clone(), boot_mount.clone());

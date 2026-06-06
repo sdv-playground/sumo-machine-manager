@@ -452,12 +452,16 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
     ) -> Self {
         let (id, name, desc) = match bank_set {
-            BankSet::HostOs => ("host-os", "Host OS", "Host OS (IFS + rootfs) A/B bank set"),
+            BankSet::Hsm => ("hsm", "HSM Key Store", "Hardware Security Module"),
+            BankSet::Bootloader => ("bootloader", "Bootloader", "Reserved bootloader bank set"),
+            BankSet::Os => (
+                "host-os",
+                "Host OS",
+                "Host OS (IFS + rootfs) A/B bank set; carries the self-updating app slot",
+            ),
+            BankSet::Rt => ("rt", "Realtime", "Realtime / Cortex-M7 core bank set"),
             BankSet::Vm1 => ("vm1", "VM1", "Virtual machine slot 1"),
             BankSet::Vm2 => ("vm2", "VM2", "Virtual machine slot 2"),
-            BankSet::Hsm => ("hsm", "HSM Key Store", "Hardware Security Module"),
-            BankSet::App => ("app", "App", "Self-updating application component"),
-            BankSet::Custom => ("custom", "Custom", "Deployment-specific bank slot"),
             // Phase 2 of the deep refactor will look these up from
             // deployment config; for now any slot beyond the 6
             // well-known ones gets a generic stub.
@@ -3106,7 +3110,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         {
             let mut ft = self.flash_transfer.lock().unwrap();
             if let Some(ref mut t) = *ft {
-                if self.config.single_bank || self.bank_set == BankSet::HostOs {
+                if self.config.single_bank || self.bank_set == BankSet::Os {
                     // Single-bank (HSM) and host-os: no guest health to verify
                     t.state = FlashState::Activated;
                 } else {
