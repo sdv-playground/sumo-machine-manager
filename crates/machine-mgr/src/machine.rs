@@ -101,7 +101,12 @@ impl MachineRegistry {
             }
         }
         if staged_any {
+            // seal writes PRIMARY; commit copies it to SECONDARY so both slots
+            // exist and are equal — the not-in-trial baseline (PRIMARY ==
+            // SECONDARY). A real trial (the two diverging) only arises later
+            // from an OTA stage/seal, not from this mirror seed.
             self.system_bank.seal();
+            self.system_bank.commit();
         }
     }
 }

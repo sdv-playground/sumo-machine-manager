@@ -54,9 +54,12 @@ pub struct SelectorBlob {
     /// `BankSet -> Bank` boot selection, canonically ordered.
     pub selectors: BTreeMap<BankSet, Bank>,
     /// SHA-256 over the canonical `(generation, selectors)` bytes — the digest
-    /// the signature covers.
+    /// the signature covers. Serialized as a lowercase hex string.
+    #[serde(with = "hex_array")]
     pub sha256: [u8; 32],
     /// Detached signature over [`Self::sha256`] (HSM `Signer::sign`).
+    /// Serialized as a lowercase hex string (empty -> `""`).
+    #[serde(with = "hex_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -107,6 +110,36 @@ impl SelectorBlob {
     fn is_valid(&self, signer: &dyn Signer) -> bool {
         let recomputed = Self::compute_sha256(self.generation, &self.selectors);
         recomputed == self.sha256 && signer.verify(&self.sha256, &self.signature)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// serde helpers — hex-encode the digest + signature so the on-disk JSON blob
+// is human-readable (a hex string) rather than a JSON array of bytes. Purely
+// the on-disk container; the signed canonical bytes are unaffected.
+// ---------------------------------------------------------------------------
+
+mod hex_array {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        v.try_into()
+            .map_err(|_| serde::de::Error::custom("sha256 must be 32 bytes"))
+    }
+}
+
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        hex::decode(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -704,6 +737,12 @@ mod tests {
         // The slots are the named files, not the .tmp staging files.
         assert!(dir.join("primary").exists());
         assert!(dir.join("secondary").exists());
+
+        // Digest + signature serialize as hex strings, not JSON byte arrays.
+        let raw = std::fs::read_to_string(dir.join("primary")).unwrap();
+        assert!(raw.contains("\"sha256\": \""), "sha256 is a hex string:\n{raw}");
+        assert!(!raw.contains("\"sha256\": ["), "sha256 must not be a byte array");
+        assert!(raw.contains("\"signature\": \""), "signature is a hex string");
 
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }

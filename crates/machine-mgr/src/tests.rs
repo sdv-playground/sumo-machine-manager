@@ -254,6 +254,7 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
 
     // Selector starts empty (no PRIMARY blob, generation 0).
     assert!(store.read_primary().is_none());
+    assert!(store.read_secondary().is_none());
     assert_eq!(m.system_bank().generation(), 0);
 
     // First seed of an empty selector: both entries differ from the (absent)
@@ -270,6 +271,15 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
     assert_eq!(primary.generation, 1);
     assert_eq!(primary.selectors.get(&BankSet::Vm1), Some(&Bank::B));
     assert_eq!(primary.selectors.get(&BankSet::Vm2), Some(&Bank::A));
+
+    // The seed commits too, so SECONDARY is written equal to PRIMARY — the
+    // not-in-trial baseline (PRIMARY == SECONDARY).
+    let secondary = store
+        .read_secondary()
+        .expect("SECONDARY written by the seed's commit");
+    assert_eq!(secondary.generation, 1);
+    assert_eq!(secondary.selectors, primary.selectors);
+    assert!(!m.system_bank().is_trial(), "seed leaves the node not-in-trial");
 
     // Second identical seed: every entry already matches PRIMARY, so nothing
     // is staged and seal is NOT called — the generation must not inflate.
