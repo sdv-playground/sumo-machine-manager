@@ -516,6 +516,63 @@ impl SystemBankManager {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// Whether the node has **no** booted selection at all (PRIMARY is the
+    /// empty map). True on a fresh node whose selector has never been sealed
+    /// (the stub case, or before the first seed). A later bootstrap-if-empty
+    /// path uses this; harmless today.
+    pub fn is_empty(&self) -> bool {
+        self.current.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared handle + read-only selector view
+// ---------------------------------------------------------------------------
+
+/// A shared, interior-mutable handle to the one [`SystemBankManager`].
+///
+/// The manager is a single node-wide resource that the OTA/seed path mutates
+/// (`stage`/`seal`/`commit`/`rollback`) while many readers only need
+/// `active_bank` / `is_trial`. Wrapping it in `Arc<RwLock<…>>` lets
+/// [`MachineRegistry`](crate::machine::MachineRegistry) hand out cheap clones:
+/// a write handle ([`MachineRegistry::shared_selector`](crate::machine::MachineRegistry::shared_selector))
+/// to the seed/OTA path and a read handle
+/// ([`BootSelector`], via
+/// [`MachineRegistry::boot_selector`](crate::machine::MachineRegistry::boot_selector))
+/// to the read-mostly future consumers.
+pub type SharedSystemBankState = std::sync::Arc<std::sync::RwLock<SystemBankManager>>;
+
+/// Cheap, cloneable **read-only** view of the node's boot selector.
+///
+/// Hands future readers (vm-service, the providers) the two questions they
+/// actually ask — "which bank does this set boot from?" and "are we in a
+/// trial?" — without exposing any mutation seam. Each call takes a short-lived
+/// read lock on the shared [`SystemBankManager`]; a poisoned lock is a
+/// programming bug (a panic while a writer held the lock) and panics here too,
+/// matching the in-memory store seams.
+///
+/// Additive: holding a `BootSelector` does **not** make a reader consult the
+/// selector for a boot/bank decision — wiring readers to it is a later piece.
+#[derive(Clone)]
+pub struct BootSelector(SharedSystemBankState);
+
+impl BootSelector {
+    pub fn new(inner: SharedSystemBankState) -> Self {
+        Self(inner)
+    }
+
+    /// The booted bank for `set` (PRIMARY), or `None` if the node has no
+    /// selection for that set. See [`SystemBankManager::active_bank`].
+    pub fn active_bank(&self, set: BankSet) -> Option<Bank> {
+        self.0.read().expect("selector poisoned").active_bank(set)
+    }
+
+    /// Whether the node is in a trial (PRIMARY differs from SECONDARY). See
+    /// [`SystemBankManager::is_trial`].
+    pub fn is_trial(&self) -> bool {
+        self.0.read().expect("selector poisoned").is_trial()
+    }
 }
 
 #[cfg(test)]
@@ -740,9 +797,18 @@ mod tests {
 
         // Digest + signature serialize as hex strings, not JSON byte arrays.
         let raw = std::fs::read_to_string(dir.join("primary")).unwrap();
-        assert!(raw.contains("\"sha256\": \""), "sha256 is a hex string:\n{raw}");
-        assert!(!raw.contains("\"sha256\": ["), "sha256 must not be a byte array");
-        assert!(raw.contains("\"signature\": \""), "signature is a hex string");
+        assert!(
+            raw.contains("\"sha256\": \""),
+            "sha256 is a hex string:\n{raw}"
+        );
+        assert!(
+            !raw.contains("\"sha256\": ["),
+            "sha256 must not be a byte array"
+        );
+        assert!(
+            raw.contains("\"signature\": \""),
+            "signature is a hex string"
+        );
 
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }

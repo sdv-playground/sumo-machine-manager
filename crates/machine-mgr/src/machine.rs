@@ -1,11 +1,12 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use nv_store::types::{Bank, BankSet};
 
 use crate::component::Component;
 use crate::system_bank_state::{
-    SelectorStore, Signer, StubSelectorStore, StubSigner, SystemBankManager,
+    BootSelector, SelectorStore, SharedSystemBankState, Signer, StubSelectorStore, StubSigner,
+    SystemBankManager,
 };
 use crate::EntityInfo;
 
@@ -54,7 +55,13 @@ pub struct MachineRegistry {
     /// rollback (`BankProvider` + `NvBootState`) stays the authority; this
     /// reconstructs alongside so the state machine is exercised + correct when
     /// the selector partition layout exists.
-    system_bank: SystemBankManager,
+    ///
+    /// Held as a [`SharedSystemBankState`] (`Arc<RwLock<…>>`) so later pieces
+    /// can hand cheap clones to many readers — a read-only [`BootSelector`]
+    /// view ([`boot_selector`](Self::boot_selector)) to consumers and the raw
+    /// write handle ([`shared_selector`](Self::shared_selector)) to the
+    /// seed/OTA path — without each holding its own copy of the manager.
+    system_bank: SharedSystemBankState,
 }
 
 impl MachineRegistry {
@@ -67,12 +74,28 @@ impl MachineRegistry {
         }
     }
 
-    /// Accessor for the node-level system bank selector (see field docs).
-    /// Additive shadow — read-only handle for now; mutation seams
-    /// (stage/seal/commit/rollback) are wired in a later change once the
-    /// bootloader sector contract is real.
-    pub fn system_bank(&self) -> &SystemBankManager {
+    /// The shared boot-selector handle (see field docs). Clone of the `Arc`;
+    /// callers take a short-lived `.read()`/`.write()` lock. Prefer
+    /// [`boot_selector`](Self::boot_selector) for read-only access and
+    /// [`shared_selector`](Self::shared_selector) for the write/seed path —
+    /// this raw accessor exists for tests and call sites that need the manager
+    /// directly.
+    pub fn system_bank(&self) -> &SharedSystemBankState {
         &self.system_bank
+    }
+
+    /// A cheap, cloneable **read-only** view of the boot selector for future
+    /// readers (vm-service, the providers). Additive — holding it does not
+    /// flip any reader onto the selector for a boot/bank decision.
+    pub fn boot_selector(&self) -> BootSelector {
+        BootSelector::new(Arc::clone(&self.system_bank))
+    }
+
+    /// The shared **write** handle to the boot selector, for the OTA/seed path
+    /// that mutates it (`stage`/`seal`/`commit`/`rollback`). Clone of the
+    /// `Arc`; the caller takes a `.write()` lock.
+    pub fn shared_selector(&self) -> SharedSystemBankState {
+        Arc::clone(&self.system_bank)
     }
 
     /// Seed the boot selector from the node's per-bank-set boot state so the
@@ -93,10 +116,13 @@ impl MachineRegistry {
     /// — it does not make the selector the boot authority. Nothing consults the
     /// selector for a boot/bank decision.
     pub fn seed_selector(&mut self, entries: impl IntoIterator<Item = (BankSet, Bank)>) {
+        // One write lock for the whole seed: the read-compare-stage loop and
+        // the seal/commit must see a consistent view of the selector.
+        let mut sb = self.system_bank.write().expect("selector poisoned");
         let mut staged_any = false;
         for (set, bank) in entries {
-            if self.system_bank.active_bank(set) != Some(bank) {
-                self.system_bank.stage(set, bank);
+            if sb.active_bank(set) != Some(bank) {
+                sb.stage(set, bank);
                 staged_any = true;
             }
         }
@@ -105,8 +131,8 @@ impl MachineRegistry {
             // exist and are equal — the not-in-trial baseline (PRIMARY ==
             // SECONDARY). A real trial (the two diverging) only arises later
             // from an OTA stage/seal, not from this mirror seed.
-            self.system_bank.seal();
-            self.system_bank.commit();
+            sb.seal();
+            sb.commit();
         }
     }
 }
@@ -170,11 +196,11 @@ impl MachineRegistryBuilder {
         for (idx, c) in self.components.iter().enumerate() {
             by_id.insert(c.id().to_string(), idx);
         }
-        let system_bank = SystemBankManager::load(
+        let system_bank = Arc::new(RwLock::new(SystemBankManager::load(
             self.selector_store
                 .unwrap_or_else(|| Box::new(StubSelectorStore)),
             self.signer.unwrap_or_else(|| Box::new(StubSigner)),
-        );
+        )));
         MachineRegistry {
             entity: self.entity,
             components: self.components,
@@ -193,11 +219,11 @@ impl MachineRegistryBuilder {
             }
             by_id.insert(id, idx);
         }
-        let system_bank = SystemBankManager::load(
+        let system_bank = Arc::new(RwLock::new(SystemBankManager::load(
             self.selector_store
                 .unwrap_or_else(|| Box::new(StubSelectorStore)),
             self.signer.unwrap_or_else(|| Box::new(StubSigner)),
-        );
+        )));
         Ok(MachineRegistry {
             entity: self.entity,
             components: self.components,

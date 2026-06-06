@@ -252,10 +252,11 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
         .with_selector_store(Box::new(store.clone()), Box::new(TestSigner))
         .build();
 
-    // Selector starts empty (no PRIMARY blob, generation 0).
+    // Selector starts empty (no PRIMARY blob, generation 0). Read through a
+    // short-lived lock on the now-shared (Arc<RwLock>) manager.
     assert!(store.read_primary().is_none());
     assert!(store.read_secondary().is_none());
-    assert_eq!(m.system_bank().generation(), 0);
+    assert_eq!(m.system_bank().read().unwrap().generation(), 0);
 
     // First seed of an empty selector: both entries differ from the (absent)
     // PRIMARY view, so both are staged and a single seal promotes them.
@@ -263,10 +264,16 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
     m.seed_selector(entries.clone());
 
     // The selector now mirrors the seed and the store's PRIMARY slot was
-    // written with both entries at generation 1.
-    assert_eq!(m.system_bank().active_bank(BankSet::Vm1), Some(Bank::B));
-    assert_eq!(m.system_bank().active_bank(BankSet::Vm2), Some(Bank::A));
-    assert_eq!(m.system_bank().generation(), 1, "one seal => generation 1");
+    // written with both entries at generation 1. Active-bank reads also go via
+    // the read-only `boot_selector()` view to exercise that handle.
+    let sel = m.boot_selector();
+    assert_eq!(sel.active_bank(BankSet::Vm1), Some(Bank::B));
+    assert_eq!(sel.active_bank(BankSet::Vm2), Some(Bank::A));
+    assert_eq!(
+        m.system_bank().read().unwrap().generation(),
+        1,
+        "one seal => generation 1"
+    );
     let primary = store.read_primary().expect("PRIMARY written by the seed");
     assert_eq!(primary.generation, 1);
     assert_eq!(primary.selectors.get(&BankSet::Vm1), Some(&Bank::B));
@@ -279,13 +286,13 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
         .expect("SECONDARY written by the seed's commit");
     assert_eq!(secondary.generation, 1);
     assert_eq!(secondary.selectors, primary.selectors);
-    assert!(!m.system_bank().is_trial(), "seed leaves the node not-in-trial");
+    assert!(!sel.is_trial(), "seed leaves the node not-in-trial");
 
     // Second identical seed: every entry already matches PRIMARY, so nothing
     // is staged and seal is NOT called — the generation must not inflate.
     m.seed_selector(entries);
     assert_eq!(
-        m.system_bank().generation(),
+        m.system_bank().read().unwrap().generation(),
         1,
         "idempotent re-seed must not bump the generation"
     );
