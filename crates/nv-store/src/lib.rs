@@ -18,8 +18,14 @@
 //! - Runtime   — writable DIDs and DTCs (per bank set × bank; copy-on-update)
 
 pub mod block;
+pub mod selector;
 pub mod store;
 pub mod types;
+
+pub use selector::{
+    FileSelectorStore, InMemorySelectorStore, SelectorBlob, SelectorStore, Signer,
+    StubSelectorStore, StubSigner, TestSigner,
+};
 
 #[cfg(test)]
 mod tests;
