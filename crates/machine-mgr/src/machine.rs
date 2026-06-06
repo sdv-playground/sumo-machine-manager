@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::component::Component;
-use crate::system_bank_state::{StubSelectorStore, StubSigner, SystemBankManager};
+use crate::system_bank_state::{
+    SelectorStore, Signer, StubSelectorStore, StubSigner, SystemBankManager,
+};
 use crate::EntityInfo;
 
 /// The top-level machine: an `EntityInfo` (vehicle-level identity) plus a
@@ -37,9 +39,12 @@ pub struct MachineRegistry {
     entity: EntityInfo,
     components: Vec<Arc<dyn Component>>,
     by_id: HashMap<String, usize>,
-    /// The node's single signed, generation-counted boot selector — built on
-    /// the production stubs ([`StubSelectorStore`] / [`StubSigner`]) and
-    /// `load()`ed at construction.
+    /// The node's single signed, generation-counted boot selector. The store +
+    /// signer are chosen at construction (see
+    /// [`with_selector_store`](MachineRegistryBuilder::with_selector_store)):
+    /// the default is the loud production stubs
+    /// ([`StubSelectorStore`] / [`StubSigner`]); supernova-mm swaps in a
+    /// file-backed store on the host/sim.
     ///
     /// TODO: wire component activate()->stage() and campaign commit->seal()/
     /// commit(); additive shadow until the bootloader sector contract lands.
@@ -47,7 +52,7 @@ pub struct MachineRegistry {
     /// rollback (`BankProvider` + `NvBootState`) stays the authority; this
     /// reconstructs alongside so the state machine is exercised + correct when
     /// the selector partition layout exists.
-    system_bank: SystemBankManager<StubSelectorStore, StubSigner>,
+    system_bank: SystemBankManager,
 }
 
 impl MachineRegistry {
@@ -55,6 +60,8 @@ impl MachineRegistry {
         MachineRegistryBuilder {
             entity,
             components: Vec::new(),
+            selector_store: None,
+            signer: None,
         }
     }
 
@@ -62,7 +69,7 @@ impl MachineRegistry {
     /// Additive shadow — read-only handle for now; mutation seams
     /// (stage/seal/commit/rollback) are wired in a later change once the
     /// bootloader sector contract is real.
-    pub fn system_bank(&self) -> &SystemBankManager<StubSelectorStore, StubSigner> {
+    pub fn system_bank(&self) -> &SystemBankManager {
         &self.system_bank
     }
 }
@@ -85,6 +92,10 @@ impl Machine for MachineRegistry {
 pub struct MachineRegistryBuilder {
     entity: EntityInfo,
     components: Vec<Arc<dyn Component>>,
+    /// Optional override for the boot-selector persistence + signing seams.
+    /// `None` falls back to the loud production stubs at build time.
+    selector_store: Option<Box<dyn SelectorStore>>,
+    signer: Option<Box<dyn Signer>>,
 }
 
 impl MachineRegistryBuilder {
@@ -102,16 +113,36 @@ impl MachineRegistryBuilder {
         self
     }
 
+    /// Override the boot-selector persistence + signing seams. The host/sim
+    /// build passes a file-backed [`FileSelectorStore`](crate::system_bank_state::FileSelectorStore)
+    /// (still with [`StubSigner`] until HSM signing is wired) so the selector
+    /// vector survives restarts; when omitted, `build` falls back to the loud
+    /// stubs. Additive — the boot authority is still `NvBootState`.
+    pub fn with_selector_store(
+        mut self,
+        store: Box<dyn SelectorStore>,
+        signer: Box<dyn Signer>,
+    ) -> Self {
+        self.selector_store = Some(store);
+        self.signer = Some(signer);
+        self
+    }
+
     pub fn build(self) -> MachineRegistry {
         let mut by_id = HashMap::with_capacity(self.components.len());
         for (idx, c) in self.components.iter().enumerate() {
             by_id.insert(c.id().to_string(), idx);
         }
+        let system_bank = SystemBankManager::load(
+            self.selector_store
+                .unwrap_or_else(|| Box::new(StubSelectorStore)),
+            self.signer.unwrap_or_else(|| Box::new(StubSigner)),
+        );
         MachineRegistry {
             entity: self.entity,
             components: self.components,
             by_id,
-            system_bank: SystemBankManager::load(StubSelectorStore, StubSigner),
+            system_bank,
         }
     }
 
@@ -125,11 +156,16 @@ impl MachineRegistryBuilder {
             }
             by_id.insert(id, idx);
         }
+        let system_bank = SystemBankManager::load(
+            self.selector_store
+                .unwrap_or_else(|| Box::new(StubSelectorStore)),
+            self.signer.unwrap_or_else(|| Box::new(StubSigner)),
+        );
         Ok(MachineRegistry {
             entity: self.entity,
             components: self.components,
             by_id,
-            system_bank: SystemBankManager::load(StubSelectorStore, StubSigner),
+            system_bank,
         })
     }
 }

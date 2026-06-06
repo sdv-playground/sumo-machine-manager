@@ -83,8 +83,8 @@ pub use component::Component;
 pub use error::{MachineError, MachineResult};
 pub use machine::{Machine, MachineRegistry};
 pub use system_bank_state::{
-    InMemorySelectorStore, SelectorBlob, SelectorStore, Signer, StubSelectorStore, StubSigner,
-    SystemBankManager, TestSigner,
+    FileSelectorStore, InMemorySelectorStore, SelectorBlob, SelectorStore, Signer,
+    StubSelectorStore, StubSigner, SystemBankManager, TestSigner,
 };
 pub use types::*;
 

@@ -34,6 +34,7 @@
 //! (`BankProvider` + `NvBootState`) remains the authority; this runs alongside.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -252,6 +253,89 @@ impl Signer for TestSigner {
 }
 
 // ---------------------------------------------------------------------------
+// File-backed store — the host/sim stand-in for the eMMC selector sectors
+// ---------------------------------------------------------------------------
+
+/// File-backed [`SelectorStore`]: the PRIMARY / SECONDARY slots are two JSON
+/// files (`dir/primary`, `dir/secondary`). This is the host/sim stand-in for
+/// the eventual eMMC sector layout — JSON (not the canonical binary encoding)
+/// purely so the slots are **human-inspectable** during bring-up. The selector
+/// digest + signature still travel inside the blob, so verification on `load`
+/// is unchanged; only the on-disk container differs from the future sectors.
+///
+/// Writes are atomic per slot: serialize into `<slot>.tmp`, then `rename` over
+/// `<slot>` — a crash mid-write leaves the prior slot intact.
+#[derive(Debug, Clone)]
+pub struct FileSelectorStore {
+    dir: PathBuf,
+}
+
+impl FileSelectorStore {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    /// Read + parse a slot file, or `None` if it doesn't exist. A parse error
+    /// warns and is treated as absent (the same "garbled selector → absent"
+    /// posture `load` already applies to a failed signature).
+    fn read_slot(&self, name: &str) -> Option<SelectorBlob> {
+        let path = self.dir.join(name);
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return None,
+        };
+        match serde_json::from_reader(file) {
+            Ok(blob) => Some(blob),
+            Err(e) => {
+                tracing::warn!(?path, error = %e, "selector slot unreadable — treating as absent");
+                None
+            }
+        }
+    }
+
+    /// Atomically write a slot: serialize into `<name>.tmp`, then rename over
+    /// `<name>`. Errors warn and are swallowed (the in-memory state in
+    /// [`SystemBankManager`] is the live view; the file is the shadow).
+    fn write_slot(&self, name: &str, blob: &SelectorBlob) {
+        if let Err(e) = std::fs::create_dir_all(&self.dir) {
+            tracing::warn!(dir = ?self.dir, error = %e, "selector dir create failed");
+            return;
+        }
+        let final_path = self.dir.join(name);
+        let tmp_path = self.dir.join(format!("{name}.tmp"));
+        let file = match std::fs::File::create(&tmp_path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(path = ?tmp_path, error = %e, "selector tmp create failed");
+                return;
+            }
+        };
+        if let Err(e) = serde_json::to_writer_pretty(file, blob) {
+            tracing::warn!(path = ?tmp_path, error = %e, "selector serialize failed");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+            tracing::warn!(from = ?tmp_path, to = ?final_path, error = %e, "selector rename failed");
+        }
+    }
+}
+
+impl SelectorStore for FileSelectorStore {
+    fn read_primary(&self) -> Option<SelectorBlob> {
+        self.read_slot("primary")
+    }
+    fn write_primary(&self, blob: &SelectorBlob) {
+        self.write_slot("primary", blob);
+    }
+    fn read_secondary(&self) -> Option<SelectorBlob> {
+        self.read_slot("secondary")
+    }
+    fn write_secondary(&self, blob: &SelectorBlob) {
+        self.write_slot("secondary", blob);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The manager
 // ---------------------------------------------------------------------------
 
@@ -268,9 +352,9 @@ impl Signer for TestSigner {
 /// between `stage` and [`seal`](Self::seal) boots the **old** selection,
 /// because only `seal` touches PRIMARY. This is verified by the
 /// reboot-mid-stage unit test.
-pub struct SystemBankManager<S: SelectorStore, K: Signer> {
-    store: S,
-    signer: K,
+pub struct SystemBankManager {
+    store: Box<dyn SelectorStore>,
+    signer: Box<dyn Signer>,
     /// PRIMARY / booted selection.
     current: BTreeMap<BankSet, Bank>,
     /// Generation of `current`.
@@ -283,22 +367,27 @@ pub struct SystemBankManager<S: SelectorStore, K: Signer> {
     pending: Option<BTreeMap<BankSet, Bank>>,
 }
 
-impl<S: SelectorStore, K: Signer> SystemBankManager<S, K> {
+impl SystemBankManager {
     /// Reconstruct on startup from the store. PRIMARY → `current` (+ its
     /// generation); SECONDARY → `committed`; `pending = None`.
+    ///
+    /// The store + signer are chosen at runtime (boxed trait objects) so the
+    /// same manager type backs both the production stubs and a real file- or
+    /// sector-backed store without a generic parameter rippling through
+    /// `MachineRegistry`.
     ///
     /// A blob that fails verification (bad embedded digest or bad signature) is
     /// **rejected and treated as absent** — a forged/garbled selector must not
     /// drive boot. An absent PRIMARY (the stub case) yields empty maps at
     /// generation 0.
-    pub fn load(store: S, signer: K) -> Self {
-        let primary = store.read_primary().filter(|b| b.is_valid(&signer));
+    pub fn load(store: Box<dyn SelectorStore>, signer: Box<dyn Signer>) -> Self {
+        let primary = store.read_primary().filter(|b| b.is_valid(&*signer));
         let (current, generation) = match primary {
             Some(b) => (b.selectors, b.generation),
             None => (BTreeMap::new(), 0),
         };
 
-        let secondary = store.read_secondary().filter(|b| b.is_valid(&signer));
+        let secondary = store.read_secondary().filter(|b| b.is_valid(&*signer));
         let (committed, committed_generation) = match secondary {
             Some(b) => (b.selectors, b.generation),
             None => (BTreeMap::new(), 0),
@@ -341,7 +430,7 @@ impl<S: SelectorStore, K: Signer> SystemBankManager<S, K> {
             return false;
         };
         let gen = self.generation.max(self.committed_generation) + 1;
-        let blob = SelectorBlob::signed(gen, pending.clone(), &self.signer);
+        let blob = SelectorBlob::signed(gen, pending.clone(), &*self.signer);
         self.store.write_primary(&blob);
         self.current = pending;
         self.generation = gen;
@@ -352,7 +441,7 @@ impl<S: SelectorStore, K: Signer> SystemBankManager<S, K> {
     /// — "the trial is over, this is now the floor". Builds + signs a blob from
     /// `current` at the *current* generation and writes it to SECONDARY.
     pub fn commit(&mut self) {
-        let blob = SelectorBlob::signed(self.generation, self.current.clone(), &self.signer);
+        let blob = SelectorBlob::signed(self.generation, self.current.clone(), &*self.signer);
         self.store.write_secondary(&blob);
         self.committed = self.current.clone();
         self.committed_generation = self.generation;
@@ -370,7 +459,7 @@ impl<S: SelectorStore, K: Signer> SystemBankManager<S, K> {
         let blob = SelectorBlob::signed(
             self.committed_generation,
             self.committed.clone(),
-            &self.signer,
+            &*self.signer,
         );
         self.store.write_primary(&blob);
         self.current = self.committed.clone();
@@ -400,14 +489,14 @@ impl<S: SelectorStore, K: Signer> SystemBankManager<S, K> {
 mod tests {
     use super::*;
 
-    fn mgr() -> SystemBankManager<InMemorySelectorStore, TestSigner> {
-        SystemBankManager::load(InMemorySelectorStore::new(), TestSigner)
+    fn mgr() -> SystemBankManager {
+        SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner))
     }
 
     #[test]
     fn stage_then_seal_writes_primary_only_and_enters_trial() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(store.clone(), TestSigner);
+        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
         // Establish a committed floor at A so the staged change is observable.
         m.stage(BankSet::Vm1, Bank::A);
@@ -432,7 +521,7 @@ mod tests {
     #[test]
     fn stage_seal_commit_clears_trial_and_both_sectors_match() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(store.clone(), TestSigner);
+        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
         m.stage(BankSet::Vm1, Bank::A);
         m.seal();
@@ -452,7 +541,7 @@ mod tests {
     #[test]
     fn stage_seal_rollback_returns_to_floor() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(store.clone(), TestSigner);
+        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
         m.stage(BankSet::Vm1, Bank::A);
         m.seal();
@@ -480,7 +569,7 @@ mod tests {
         let store = InMemorySelectorStore::new();
 
         {
-            let mut m = SystemBankManager::load(store.clone(), TestSigner);
+            let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
             m.stage(BankSet::Vm1, Bank::A);
             m.seal();
             m.commit(); // committed floor = A, PRIMARY = A
@@ -496,7 +585,7 @@ mod tests {
 
         // Fresh load from the SAME store: must see the old (A) selection,
         // because the staged B was never persisted.
-        let m2 = SystemBankManager::load(store.clone(), TestSigner);
+        let m2 = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
         assert_eq!(
             m2.active_bank(BankSet::Vm1),
             Some(Bank::A),
@@ -540,7 +629,7 @@ mod tests {
         };
         store.write_primary(&bad);
 
-        let m = SystemBankManager::load(store.clone(), TestSigner);
+        let m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
         // Rejected => treated as absent => empty maps, generation 0.
         assert_eq!(m.active_bank(BankSet::Vm1), None);
         assert_eq!(m.generation(), 0);
@@ -553,7 +642,7 @@ mod tests {
             signature: TestSigner.sign(&[0u8; 32]),
         };
         store.write_primary(&tampered);
-        let m2 = SystemBankManager::load(store, TestSigner);
+        let m2 = SystemBankManager::load(Box::new(store), Box::new(TestSigner));
         assert_eq!(m2.active_bank(BankSet::Vm1), None);
     }
 
@@ -561,7 +650,7 @@ mod tests {
     fn stub_seams_are_loud_and_nonfatal() {
         // The production stubs must not panic and must behave as "empty,
         // accept-all": load yields empty/gen-0, seal no-ops to a None read.
-        let mut m = SystemBankManager::load(StubSelectorStore, StubSigner);
+        let mut m = SystemBankManager::load(Box::new(StubSelectorStore), Box::new(StubSigner));
         assert_eq!(m.generation(), 0);
         assert_eq!(m.active_bank(BankSet::Vm1), None);
         assert!(!m.seal(), "nothing staged => seal is a no-op");
@@ -570,5 +659,52 @@ mod tests {
         assert!(m.seal()); // writes are dropped by the stub, but in-mem state advances
         assert_eq!(m.active_bank(BankSet::Vm1), Some(Bank::B));
         assert_eq!(m.generation(), 1);
+    }
+
+    /// Build a self-consistent signed blob (matching digest + TestSigner
+    /// signature) for the file round-trip.
+    fn blob(generation: u64, set: BankSet, bank: Bank) -> SelectorBlob {
+        let mut selectors = BTreeMap::new();
+        selectors.insert(set, bank);
+        let sha256 = SelectorBlob::compute_sha256(generation, &selectors);
+        SelectorBlob {
+            generation,
+            selectors,
+            sha256,
+            signature: TestSigner.sign(&sha256),
+        }
+    }
+
+    #[test]
+    fn file_store_round_trips_both_slots() {
+        // Unique per-run dir under the system temp dir so concurrent test
+        // binaries don't collide.
+        let dir = std::env::temp_dir().join(format!(
+            "sumo-selector-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let primary = blob(7, BankSet::Vm1, Bank::B);
+        let secondary = blob(3, BankSet::Vm2, Bank::A);
+
+        // Write through one store...
+        let writer = FileSelectorStore::new(&dir);
+        writer.write_primary(&primary);
+        writer.write_secondary(&secondary);
+
+        // ...read back through a fresh one (no shared in-process state).
+        let reader = FileSelectorStore::new(&dir);
+        assert_eq!(reader.read_primary().as_ref(), Some(&primary));
+        assert_eq!(reader.read_secondary().as_ref(), Some(&secondary));
+
+        // The slots are the named files, not the .tmp staging files.
+        assert!(dir.join("primary").exists());
+        assert!(dir.join("secondary").exists());
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 }
