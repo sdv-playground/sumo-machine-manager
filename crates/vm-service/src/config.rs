@@ -163,9 +163,26 @@ pub struct VmDefinition {
     /// CPU model override. If unset, uses arch default.
     #[serde(default)]
     pub cpu_model: Option<String>,
-    /// Directory containing kernel + rootfs. Typically a symlink
-    /// (e.g., /var/lib/vms/vm1/current → bank_a/).
+    /// Bank-set base for this VM's kernel + rootfs (e.g.
+    /// `/var/lib/vms/vm1`). Historically this pointed at the `current`
+    /// symlink (`.../vm1/current → bank_a/`); a trailing `current`
+    /// component is still tolerated and stripped by
+    /// [`VmDefinition::bank_base_dir`] so existing configs keep working.
+    ///
+    /// The actual bank dir launched is resolved from [`Self::bank`] —
+    /// `base/bank_a` or `base/bank_b` — NOT by following `current`. The
+    /// boot selector (via supernova) is the authority for which bank;
+    /// `start_vm` rewrites `image_dir` to the resolved bank dir before
+    /// the runner spawns, so `kernel_path` / `rootfs_path` /
+    /// `partition_path` all resolve against the right bank.
     pub image_dir: PathBuf,
+    /// Which A/B bank this VM launches from. Runtime-set by supernova
+    /// (from the boot selector) via [`crate::manager::VmManager::set_vm_bank`]
+    /// right before `start_vm`; never present in YAML (`#[serde(skip)]`).
+    /// `None` means "no active bank for this VM" — `start_vm` skips the
+    /// launch (logs, doesn't crash).
+    #[serde(skip)]
+    pub bank: Option<Bank>,
     /// Image filenames relative to image_dir.
     #[serde(default)]
     pub images: ImagePaths,
@@ -227,6 +244,35 @@ pub enum BackendType {
     Qemu,
     Qnx,
     Dummy,
+}
+
+/// Which A/B bank a VM launches from. vm-service's own minimal mirror of
+/// `nv_store::types::Bank` — vm-service has no nv-store dependency (it's the
+/// platform-agnostic lifecycle layer), so supernova maps `nv_store::Bank` →
+/// this enum when it hands a launch its selector-chosen bank. `bank_a` / `bank_b`
+/// match the on-disk dir names the OTA writes and `vm_mgr::bank_provider`'s
+/// `bank_dir_name`.
+//
+// dead_code: the `A`/`B` variants are constructed by supernova-mm (which maps
+// `nv_store::Bank` into them before `set_vm_bank`), not by vm-service's own
+// `bin` path. The bin's dead-code pass doesn't see those constructions; the
+// lib tests + supernova-mm do. Same posture as `BackendType` /
+// `DeviceTransportConfig::QvmShmem` above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Bank {
+    A,
+    B,
+}
+
+impl Bank {
+    /// The bank-relative subdirectory name (`"bank_a"` / `"bank_b"`).
+    pub fn subdir(self) -> &'static str {
+        match self {
+            Bank::A => "bank_a",
+            Bank::B => "bank_b",
+        }
+    }
 }
 
 /// Paths to boot images, relative to image_dir.
@@ -333,6 +379,34 @@ impl VmDefinition {
             DeviceConfig::Network { ssh_port, .. } => *ssh_port,
             _ => None,
         })
+    }
+
+    /// The bank-set base directory — `image_dir` with a trailing
+    /// `current` component stripped. So `.../vm1/current` → `.../vm1`
+    /// and `.../vm1` → `.../vm1` (already a base). This is the parent
+    /// the `bank_a` / `bank_b` dirs live under.
+    pub fn bank_base_dir(&self) -> PathBuf {
+        if self
+            .image_dir
+            .file_name()
+            .map(|n| n == std::ffi::OsStr::new("current"))
+            .unwrap_or(false)
+        {
+            self.image_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.image_dir.clone())
+        } else {
+            self.image_dir.clone()
+        }
+    }
+
+    /// Resolve the bank directory for `bank`: `bank_base_dir()/bank_{a,b}`.
+    /// `start_vm` writes this into `image_dir` before launch so the rest of
+    /// the resolution (`kernel_path` etc.) targets the selector-chosen bank
+    /// instead of following the `current` symlink.
+    pub fn resolved_bank_dir(&self, bank: Bank) -> PathBuf {
+        self.bank_base_dir().join(bank.subdir())
     }
 
     /// Resolve the kernel path (image_dir + images.kernel).
@@ -606,6 +680,7 @@ mod tests {
             ram_mb: 2048,
             cpu_model: None,
             image_dir: PathBuf::from("/tmp/test"),
+            bank: None,
             images: ImagePaths {
                 kernel: Some("bzImage".into()),
                 rootfs: Some("rootfs.img".into()),
@@ -899,6 +974,34 @@ arch: amd64
 "#;
         let v: VmDefinition = serde_yaml::from_str(y).unwrap();
         assert_eq!(v.arch(), Arch::X86_64);
+    }
+
+    #[test]
+    fn bank_base_dir_strips_trailing_current() {
+        // Legacy `.../vm1/current` symlink path → base is the parent.
+        let v = minimal_vm("/var/lib/vms/vm1/current");
+        assert_eq!(v.bank_base_dir(), PathBuf::from("/var/lib/vms/vm1"));
+    }
+
+    #[test]
+    fn bank_base_dir_passes_through_plain_base() {
+        // A base that doesn't end in `current` is used as-is.
+        let v = minimal_vm("/var/lib/vms/vm1");
+        assert_eq!(v.bank_base_dir(), PathBuf::from("/var/lib/vms/vm1"));
+    }
+
+    #[test]
+    fn resolved_bank_dir_picks_the_enum_bank() {
+        // Selector picks Bank::B ⇒ launch resolves base/bank_b (not `current`).
+        let v = minimal_vm("/var/lib/vms/vm1/current");
+        assert_eq!(
+            v.resolved_bank_dir(Bank::B),
+            PathBuf::from("/var/lib/vms/vm1/bank_b")
+        );
+        assert_eq!(
+            v.resolved_bank_dir(Bank::A),
+            PathBuf::from("/var/lib/vms/vm1/bank_a")
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ use vm_devices::regs::time as vtime_regs;
 use vm_devices::time::{TimeDevice, TIME_DEFAULT_INTERVAL};
 use vm_devices::transport::DeviceTransport;
 
-use crate::config::{BackendType, VmBankConfig, VmDefinition, VmServiceConfig};
+use crate::config::{BackendType, Bank, VmBankConfig, VmDefinition, VmServiceConfig};
 use crate::health_status::{HealthDetail, HealthStatus};
 use crate::runner::dummy::DummyRunner;
 #[cfg(target_os = "linux")]
@@ -109,9 +109,10 @@ pub struct VmManager {
     /// Optional pre-launch verification hook. Called from `start_vm`
     /// with `(vm_name, bank_dir)` AFTER per-bank config is loaded but
     /// BEFORE the runner spawns devb-loopback / qvm. Returning `Err`
-    /// fails the start; the resolved bank dir is whatever
-    /// `image_dir/current` points at, so the gate sees the actual
-    /// content about to boot.
+    /// fails the start; the resolved bank dir is the selector-chosen
+    /// `base/bank_{a,b}` (the same dir `start_vm` is about to launch),
+    /// so the gate verifies the exact content about to boot — and verify
+    /// + launch agree on the bank by construction.
     ///
     /// Owned by supernova because the verify itself needs NV +
     /// HsmProvider, which vm-service doesn't depend on. Default is
@@ -267,6 +268,21 @@ impl VmManager {
         self
     }
 
+    /// Set which A/B bank a VM launches from. Supernova calls this with the
+    /// boot selector's `active_bank` for the VM's set right before `start_vm`,
+    /// so the launch resolves `base/bank_{a,b}` by enum instead of following
+    /// the `current` symlink. `Some(bank)` selects; `None` marks the VM as
+    /// having no active bank (`start_vm` then skips the launch). Unknown VM
+    /// names are a no-op `NotFound` — supernova logs and moves on.
+    pub fn set_vm_bank(&mut self, name: &str, bank: Option<Bank>) -> Result<(), ManagerError> {
+        let vm = self
+            .vms
+            .get_mut(name)
+            .ok_or_else(|| ManagerError::NotFound(name.to_string()))?;
+        vm.def.bank = bank;
+        Ok(())
+    }
+
     pub fn start_vm(&mut self, name: &str) -> Result<(), ManagerError> {
         let vm = self
             .vms
@@ -299,16 +315,41 @@ impl VmManager {
         // Reset liveness so a stale-from-prior-boot reading doesn't carry over.
         vm.liveness = HeartbeatLiveness::new();
 
-        // Read per-bank config if available (image_dir resolves through current symlink)
-        let effective_def = match VmBankConfig::from_dir(&vm.def.image_dir) {
+        // Resolve the bank to launch from the explicit `bank` enum supernova
+        // set from the boot selector — NOT by following the `current` symlink.
+        // `None` means this VM has no active bank (unprovisioned / nothing
+        // selected); skip the launch loudly rather than crashing or guessing.
+        let Some(bank) = vm.def.bank else {
+            tracing::warn!(
+                vm = name,
+                base_dir = %vm.def.bank_base_dir().display(),
+                "no active bank selected for VM — skipping launch (boot selector \
+                 has no selection for this set)"
+            );
+            return Ok(());
+        };
+        let bank_dir = vm.def.resolved_bank_dir(bank);
+        tracing::info!(
+            vm = name,
+            ?bank,
+            bank_dir = %bank_dir.display(),
+            "launching bank from boot selector"
+        );
+
+        // Read per-bank config if available. `image_dir` is rewritten to the
+        // selector-resolved bank dir so the per-bank `vm-config.yaml`, kernel,
+        // rootfs, and partitions all resolve against the bank we actually boot.
+        let mut base_def = vm.def.clone();
+        base_def.image_dir = bank_dir.clone();
+        let effective_def = match VmBankConfig::from_dir(&bank_dir) {
             Some(bank_config) => {
                 tracing::info!(
                     "loaded per-bank config for {name} from {}/vm-config.yaml",
-                    vm.def.image_dir.display()
+                    bank_dir.display()
                 );
-                vm.def.with_bank_overrides(&bank_config)
+                base_def.with_bank_overrides(&bank_config)
             }
-            None => vm.def.clone(),
+            None => base_def,
         };
 
         // Release any resources from a previous lifetime that would
@@ -318,9 +359,9 @@ impl VmManager {
         vm.runner.prepare_for_launch(name, &effective_def);
 
         // Pre-launch verify gate — supernova installs this to run IVD
-        // verify against the bank that `image_dir/current` points at.
-        // The hook owns its own per-call logging (timing, gen, sig
-        // status).
+        // verify against the selector-chosen bank dir (now in
+        // `effective_def.image_dir`). The hook owns its own per-call
+        // logging (timing, gen, sig status).
         //
         // CURRENT POLICY: log-only. Verify still runs and reports
         // good/bad with timing, but failure does NOT refuse to start.
@@ -666,6 +707,87 @@ fn read_health(vm: &mut ManagedVm) -> HealthDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// Build a single-VM dummy config from YAML. No kernel / devices, so
+    /// `start_vm` runs the full path (verify hook + dummy runner) without
+    /// needing real images on disk.
+    fn dummy_config(image_dir: &str) -> VmServiceConfig {
+        let yaml = format!(
+            r#"
+vms:
+  vm1:
+    backend: dummy
+    image_dir: {image_dir}
+"#
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn start_vm_resolves_selector_bank_dir_not_current_symlink() {
+        // Selector picks Bank::B ⇒ launch resolves base/bank_b. The verify
+        // hook observes the exact bank dir start_vm is about to launch, so
+        // asserting on it proves the resolution AND that verify+launch agree.
+        let mut mgr =
+            VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1/current"), None);
+
+        let seen: Arc<StdMutex<Option<std::path::PathBuf>>> = Arc::new(StdMutex::new(None));
+        let seen_for_hook = seen.clone();
+        mgr = mgr.with_pre_launch_verify(Arc::new(move |_name, bank_dir| {
+            *seen_for_hook.lock().unwrap() = Some(bank_dir.to_path_buf());
+            Ok(())
+        }));
+
+        mgr.set_vm_bank("vm1", Some(Bank::B)).unwrap();
+        mgr.start_vm("vm1").expect("dummy start_vm succeeds");
+
+        let observed = seen.lock().unwrap().clone().expect("verify hook fired");
+        assert_eq!(
+            observed,
+            std::path::PathBuf::from("/var/lib/vms/vm1/bank_b")
+        );
+
+        // And switching the selector to A resolves bank_a — proves it follows
+        // the enum, not a fixed/symlinked dir.
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        mgr.stop_vm("vm1").ok();
+        mgr.start_vm("vm1").expect("dummy start_vm succeeds");
+        let observed = seen.lock().unwrap().clone().expect("verify hook fired");
+        assert_eq!(
+            observed,
+            std::path::PathBuf::from("/var/lib/vms/vm1/bank_a")
+        );
+    }
+
+    #[test]
+    fn start_vm_skips_launch_when_no_bank_selected() {
+        // `None` (no active bank) ⇒ skip the launch: Ok, no panic, runner
+        // never starts, and the verify hook never fires.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
+
+        let fired = Arc::new(StdMutex::new(false));
+        let fired_for_hook = fired.clone();
+        mgr = mgr.with_pre_launch_verify(Arc::new(move |_name, _bank_dir| {
+            *fired_for_hook.lock().unwrap() = true;
+            Ok(())
+        }));
+
+        // bank defaults to None (serde-skipped, never set) — skip launch.
+        mgr.start_vm("vm1")
+            .expect("skipped launch is Ok, not an error");
+        assert!(
+            !*fired.lock().unwrap(),
+            "verify hook must not fire on a skipped launch"
+        );
+
+        // No VM is running (the dummy runner was never started).
+        let running = mgr
+            .list()
+            .iter()
+            .any(|v| !matches!(v.status, HealthStatus::Stopped));
+        assert!(!running, "no VM should be running after a skipped launch");
+    }
 
     #[test]
     fn liveness_marks_stale_after_window() {
