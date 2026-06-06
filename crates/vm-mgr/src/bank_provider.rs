@@ -56,14 +56,31 @@ pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     /// The bank the ECU is actually running on. Seeded from NV at construction
     /// (NV `active_bank` may differ after install — that's the *next-boot*
     /// bank). The engine keeps its own running-bank for its read paths; this
-    /// copy backs only `active_bank()` / `target_bank()`.
+    /// copy backs only `active_bank()` / `target_bank()` as the **fallback**
+    /// when no shared boot selector is injected.
     running_bank: Mutex<Bank>,
+    /// The node's shared, signed boot selector (read-only view). When present
+    /// it is the **PRIMARY** source for `active_bank()` / `target_bank()` —
+    /// `running_bank` / the `current` symlink are the fallback. `None` for
+    /// tests and the inline construction in `backend.rs` (no selector wired),
+    /// which preserves the prior NV/symlink-only behaviour.
+    ///
+    /// Behaviour-preserving by design: supernova seeds the selector from
+    /// `NvBootState`, so a populated selector yields the same bank the fallback
+    /// would. Piece 5 removes the symlink fallback once the selector is the
+    /// sole authority.
+    selector: Option<machine_mgr::BootSelector>,
 }
 
 impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     /// Build a provider from the backend's current state. `running_bank` is
     /// seeded the same way `ComponentBackend::with_options` seeds its own copy:
     /// `Bank::A` for single-bank, else NV `active_bank`.
+    ///
+    /// `selector` is the node's shared boot selector (read-only). `Some` makes
+    /// it the PRIMARY source for `active_bank()` / `target_bank()` with the NV/
+    /// symlink path as fallback; `None` keeps today's NV/symlink-only behaviour
+    /// (the inline construction in `backend.rs` and all tests pass `None`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         nv: Arc<Mutex<NvStore<D>>>,
@@ -73,6 +90,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         dir_name: String,
         hsm: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
         bank_activator: Option<Arc<dyn machine_mgr::BankActivator>>,
+        selector: Option<machine_mgr::BootSelector>,
     ) -> Self {
         let running_bank = if single_bank {
             Bank::A
@@ -92,6 +110,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
             hsm,
             bank_activator,
             running_bank: Mutex::new(running_bank),
+            selector,
         }
     }
 
@@ -117,6 +136,35 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
             "bank_b" => Some(Bank::B),
             _ => None,
         }
+    }
+
+    /// The booted bank from the **fallback** source used by `active_bank()`
+    /// when no boot selector is injected: the `running_bank` copy seeded from
+    /// NV at construction (only changes on `ecu_reset`). Unchanged from the
+    /// pre-selector behaviour.
+    fn fallback_active_bank(&self) -> Bank {
+        *self.running_bank.lock().expect("running_bank poisoned")
+    }
+
+    /// The booted bank from the **fallback** source used by `target_bank()`
+    /// when no boot selector is injected: the `current` symlink (source of
+    /// truth for activator-backed components — it survives factory resets),
+    /// falling back to NV `active_bank` when no symlink exists (first-ever
+    /// flash). Unchanged from the pre-selector behaviour. Single-bank is
+    /// handled by the caller (always targets `Bank::A`).
+    fn fallback_target_active(&self) -> Bank {
+        if self.bank_activator.is_some() {
+            if let Some(active) = self.read_current_symlink() {
+                return active;
+            }
+        }
+        let nv = match self.nv.lock() {
+            Ok(nv) => nv,
+            Err(_) => return Bank::A,
+        };
+        nv.read_boot_state()
+            .map(|s| s.banks[self.bank_set.as_index()].active_bank)
+            .unwrap_or(Bank::A)
     }
 
     /// Atomically flip the `current` symlink to point at `bank`. Internal to
@@ -315,29 +363,32 @@ fn firmware_to_ivd_identity(id: &FirmwareIdentity) -> hsm::ivd::IvdIdentity {
 
 impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
     fn active_bank(&self) -> Bank {
-        *self.running_bank.lock().expect("running_bank poisoned")
+        // PRIMARY: the node's shared boot selector, when injected. FALLBACK:
+        // the `running_bank` copy seeded from NV. The selector is seeded from
+        // `NvBootState`, so a populated selector returns the same bank the
+        // fallback would — behaviour-preserving. An absent selection for this
+        // set (e.g. selector not yet seeded for it) falls through to NV too.
+        self.selector
+            .as_ref()
+            .and_then(|s| s.active_bank(self.bank_set))
+            .unwrap_or_else(|| self.fallback_active_bank())
     }
 
     fn target_bank(&self) -> Bank {
-        // Single-bank (HSM) always targets bank A. Otherwise the `current`
-        // symlink is the source of truth for activator-backed components (it
-        // survives factory resets); fall back to NV when no symlink exists
-        // (first-ever flash).
+        // Single-bank (HSM) always targets bank A.
         if self.single_bank {
             return Bank::A;
         }
-        if self.bank_activator.is_some() {
-            if let Some(active) = self.read_current_symlink() {
-                return active.other();
-            }
-        }
-        let nv = match self.nv.lock() {
-            Ok(nv) => nv,
-            Err(_) => return Bank::A,
-        };
-        nv.read_boot_state()
-            .map(|s| s.banks[self.bank_set.as_index()].active_bank.other())
-            .unwrap_or(Bank::A)
+        // Derive the active bank selector-then-fallback (PRIMARY = shared boot
+        // selector; FALLBACK = `current` symlink, then NV `active_bank`), then
+        // target its sibling. The selector mirrors NV, so this picks the same
+        // target as the symlink/NV-only path did.
+        let active = self
+            .selector
+            .as_ref()
+            .and_then(|s| s.active_bank(self.bank_set))
+            .unwrap_or_else(|| self.fallback_target_active());
+        active.other()
     }
 
     fn prepare_target(&self, bank: Bank) -> Result<(), BankError> {
@@ -592,4 +643,101 @@ fn bank_dir_is_payload_empty(bank_dir: &Path) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use machine_mgr::system_bank_state::{
+        BootSelector, InMemorySelectorStore, SharedSystemBankState, SystemBankManager, TestSigner,
+    };
+    use nv_store::block::MemBlockDevice;
+    use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
+    use nv_store::types::NvBootState;
+    use std::sync::RwLock;
+
+    /// NV with `active_bank` set to `active` for `set`, so the
+    /// `running_bank`/symlink fallback resolves to a known bank distinct from
+    /// the selector's choice.
+    fn nv_with_active(set: BankSet, active: Bank) -> Arc<Mutex<NvStore<MemBlockDevice>>> {
+        let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+        let mut nv = NvStore::new(dev);
+        let mut state = NvBootState::default();
+        state.banks[set.as_index()].active_bank = active;
+        nv.write_boot_state(&mut state).unwrap();
+        Arc::new(Mutex::new(nv))
+    }
+
+    /// A shared boot selector seeded so `set` boots from `bank` (PRIMARY).
+    fn selector_with(set: BankSet, bank: Bank) -> SharedSystemBankState {
+        let mgr =
+            SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner));
+        let shared: SharedSystemBankState = Arc::new(RwLock::new(mgr));
+        {
+            let mut g = shared.write().unwrap();
+            g.stage(set, bank);
+            assert!(g.seal());
+            assert_eq!(g.active_bank(set), Some(bank));
+        }
+        shared
+    }
+
+    fn provider(
+        nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
+        set: BankSet,
+        selector: Option<BootSelector>,
+    ) -> IvdBankProvider<MemBlockDevice> {
+        IvdBankProvider::new(nv, set, false, None, "vm1".into(), None, None, selector)
+    }
+
+    #[test]
+    fn injected_selector_is_primary_source_for_active_and_target() {
+        let set = BankSet::Vm1;
+        // NV/fallback says A; the injected selector says B — the selector wins.
+        let nv = nv_with_active(set, Bank::A);
+        let selector = BootSelector::new(selector_with(set, Bank::B));
+        let p = provider(nv, set, Some(selector));
+
+        assert_eq!(
+            p.active_bank(),
+            Bank::B,
+            "selector (B) is primary, not NV (A)"
+        );
+        assert_eq!(
+            p.target_bank(),
+            Bank::A,
+            "target is the sibling of the selector's active bank"
+        );
+    }
+
+    #[test]
+    fn no_selector_falls_back_to_running_bank() {
+        let set = BankSet::Vm1;
+        // No selector injected → active_bank reads the NV-seeded running_bank.
+        let nv = nv_with_active(set, Bank::B);
+        let p = provider(nv, set, None);
+
+        assert_eq!(
+            p.active_bank(),
+            Bank::B,
+            "fallback: running_bank seeded from NV active_bank (B)"
+        );
+        assert_eq!(p.target_bank(), Bank::A, "fallback target is the sibling");
+    }
+
+    #[test]
+    fn selector_without_entry_for_set_falls_back_to_nv() {
+        // Selector populated for a DIFFERENT set leaves this set unselected →
+        // active_bank falls through to the NV/running_bank fallback.
+        let set = BankSet::Vm1;
+        let nv = nv_with_active(set, Bank::B);
+        let selector = BootSelector::new(selector_with(BankSet::Vm2, Bank::A));
+        let p = provider(nv, set, Some(selector));
+
+        assert_eq!(
+            p.active_bank(),
+            Bank::B,
+            "no selection for Vm1 → NV fallback (B)"
+        );
+    }
 }

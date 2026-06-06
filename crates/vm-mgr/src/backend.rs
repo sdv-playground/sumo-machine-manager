@@ -440,6 +440,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_options(
         bank_set: BankSet,
         nv: Arc<Mutex<NvStore<D>>>,
@@ -486,6 +487,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             images_dir.clone(),
             bank_spec.dir_name.clone(),
             hsm_provider.clone(),
+            None,
+            // No boot selector here: the backend's inline provider keeps the
+            // NV/symlink path. component-factory builds a selector-aware
+            // `IvdBankProvider` and injects it via `with_bank_provider`.
             None,
         ));
 
@@ -600,6 +605,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             self.bank_spec.dir_name.clone(),
             self.hsm_provider.clone(),
             activator,
+            // No boot selector on the rebuild path: a selector-aware provider
+            // is injected wholesale via `with_bank_provider` (which sets the
+            // override so this rebuild is skipped). Keeps the NV/symlink path
+            // for the default in-backend provider + tests.
+            None,
         ));
     }
 

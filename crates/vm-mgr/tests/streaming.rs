@@ -53,6 +53,7 @@ fn provider_for(images_dir: &Path, set: BankSet) -> IvdBankProvider<MemBlockDevi
         dir_name,
         None,
         None,
+        None,
     )
 }
 

@@ -104,6 +104,14 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// (e.g. RT/M7 surfaces `guest_state` via `m7loader -q`). VMs leave
     /// this empty and use vm-service over loopback HTTP instead.
     pub health_probes: HashMap<String, Arc<dyn vm_mgr::backend::HealthProbe>>,
+    /// The node's shared, signed boot selector (read-only view), created once
+    /// by the binary and shared with the registry. When `Some`, each built
+    /// component gets a selector-aware `IvdBankProvider` (the boot selector is
+    /// the PRIMARY source for `active_bank()` / `target_bank()`, with the
+    /// NV/symlink path as fallback). `None` keeps the NV/symlink-only providers
+    /// (the in-backend default) — behaviour-preserving, since the selector is
+    /// seeded from `NvBootState`.
+    pub boot_selector: Option<machine_mgr::BootSelector>,
 }
 
 pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
@@ -167,6 +175,36 @@ pub fn resolve_bank_set_spec(
     Some((bank_set, bspec))
 }
 
+/// Build a selector-aware `IvdBankProvider` mirroring the args
+/// `ComponentBackend` would feed its in-backend provider, plus the shared boot
+/// selector from `deps`. Returns `None` when no selector is configured (the
+/// backend then keeps its own NV/symlink-only provider — behaviour-preserving).
+///
+/// Injected via [`vm_mgr::backend::ComponentBackend::with_bank_provider`] LAST
+/// in the builder chain (after `with_bank_spec` / `with_bank_activator`, which
+/// otherwise rebuild the default provider), so it replaces the default wholesale
+/// and the override flag suppresses any later rebuild.
+fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
+    deps: &FactoryDeps<D>,
+    bank_set: BankSet,
+    single_bank: bool,
+    images_dir: Option<PathBuf>,
+    dir_name: String,
+    activator: Option<Arc<dyn machine_mgr::BankActivator>>,
+) -> Option<Arc<dyn machine_mgr::BankProvider>> {
+    let selector = deps.boot_selector.clone()?;
+    Some(Arc::new(vm_mgr::bank_provider::IvdBankProvider::new(
+        deps.nv.clone(),
+        bank_set,
+        single_bank,
+        images_dir,
+        dir_name,
+        deps.hsm_provider.clone(),
+        activator,
+        Some(selector),
+    )))
+}
+
 /// Build a single component from its spec and shared dependencies.
 pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
     spec: &ComponentSpec,
@@ -200,17 +238,30 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 supports_rollback: spec.rollback,
                 single_bank: false,
             };
-            let backend = ComponentBackend::with_options(
+            let app_images_dir = spec.storage_path.clone().or_else(|| spec.base_path.clone());
+            let mut backend = ComponentBackend::with_options(
                 bank_set,
                 deps.nv.clone(),
                 deps.manifest_provider.clone(),
                 deps.security_provider.clone(),
                 comp_config,
                 deps.vm_service_addr.clone(),
-                spec.storage_path.clone().or_else(|| spec.base_path.clone()),
+                app_images_dir.clone(),
                 deps.hsm_provider.clone(),
             )
             .with_bank_spec(bank_spec.clone());
+            // Inject a selector-aware provider LAST so the boot selector drives
+            // active/target bank (NV/symlink fallback). App has no activator.
+            if let Some(provider) = selector_aware_provider(
+                deps,
+                bank_set,
+                false,
+                app_images_dir,
+                bank_spec.dir_name.clone(),
+                None,
+            ) {
+                backend = backend.with_bank_provider(provider);
+            }
             let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
             let component: Arc<dyn Component> = Arc::new(comp);
 
@@ -264,16 +315,31 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 deps.security_provider.clone(),
                 comp_config,
                 vm_service,
-                images_dir,
+                images_dir.clone(),
                 deps.hsm_provider.clone(),
             )
             .with_bank_spec(bank_spec.clone());
 
-            if let Some(activator) = deps.bank_activators.get(&spec.id) {
-                backend = backend.with_bank_activator(activator.clone());
+            let activator = deps.bank_activators.get(&spec.id).cloned();
+            if let Some(ref a) = activator {
+                backend = backend.with_bank_activator(a.clone());
             }
             if let Some(probe) = deps.health_probes.get(&spec.id) {
                 backend = backend.with_health_probe(probe.clone());
+            }
+            // Inject a selector-aware provider LAST (after with_bank_spec /
+            // with_bank_activator, which would otherwise rebuild the default):
+            // the boot selector drives active/target bank, NV/symlink fallback.
+            // Mirrors the same activator the backend would use.
+            if let Some(provider) = selector_aware_provider(
+                deps,
+                bank_set,
+                spec.single_bank,
+                images_dir,
+                bank_spec.dir_name.clone(),
+                activator,
+            ) {
+                backend = backend.with_bank_provider(provider);
             }
 
             let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);

@@ -71,6 +71,7 @@ impl MachineRegistry {
             components: Vec::new(),
             selector_store: None,
             signer: None,
+            shared_selector: None,
         }
     }
 
@@ -159,6 +160,13 @@ pub struct MachineRegistryBuilder {
     /// `None` falls back to the loud production stubs at build time.
     selector_store: Option<Box<dyn SelectorStore>>,
     signer: Option<Box<dyn Signer>>,
+    /// Optional pre-built shared selector. When set (via
+    /// [`with_shared_selector`](Self::with_shared_selector)) the registry
+    /// adopts this exact `Arc<RwLock<…>>` rather than loading its own from a
+    /// store — so the binary can build the selector ONCE, inject a read view
+    /// into the providers via the factory, AND hand the same write handle to
+    /// the registry. Wins over `selector_store` / `signer` when present.
+    shared_selector: Option<SharedSystemBankState>,
 }
 
 impl MachineRegistryBuilder {
@@ -191,16 +199,49 @@ impl MachineRegistryBuilder {
         self
     }
 
+    /// Adopt an **already-built** shared boot selector instead of loading one
+    /// from a store at build time.
+    ///
+    /// The binary builds the `SharedSystemBankState` ONCE (so the factory can
+    /// inject a read-only [`BootSelector`] view of it into every
+    /// `IvdBankProvider` before the registry exists), then hands that same
+    /// `Arc<RwLock<…>>` here. The registry's seed/OTA write paths
+    /// ([`seed_selector`](MachineRegistry::seed_selector),
+    /// [`shared_selector`](MachineRegistry::shared_selector)) then operate on
+    /// the very selector the providers read — a single source of truth.
+    ///
+    /// Wins over [`with_selector_store`](Self::with_selector_store): when this
+    /// is set, the store/signer are ignored (the caller already loaded the
+    /// manager from its store). Tests / the default path keep using
+    /// `with_selector_store` (or neither, falling back to the loud stubs).
+    pub fn with_shared_selector(mut self, selector: SharedSystemBankState) -> Self {
+        self.shared_selector = Some(selector);
+        self
+    }
+
+    /// Resolve the registry's `system_bank`: prefer a pre-built shared selector
+    /// (adopted as-is), else `load` one from the configured store/signer, else
+    /// the loud production stubs.
+    fn resolve_system_bank(
+        shared_selector: Option<SharedSystemBankState>,
+        selector_store: Option<Box<dyn SelectorStore>>,
+        signer: Option<Box<dyn Signer>>,
+    ) -> SharedSystemBankState {
+        shared_selector.unwrap_or_else(|| {
+            Arc::new(RwLock::new(SystemBankManager::load(
+                selector_store.unwrap_or_else(|| Box::new(StubSelectorStore)),
+                signer.unwrap_or_else(|| Box::new(StubSigner)),
+            )))
+        })
+    }
+
     pub fn build(self) -> MachineRegistry {
         let mut by_id = HashMap::with_capacity(self.components.len());
         for (idx, c) in self.components.iter().enumerate() {
             by_id.insert(c.id().to_string(), idx);
         }
-        let system_bank = Arc::new(RwLock::new(SystemBankManager::load(
-            self.selector_store
-                .unwrap_or_else(|| Box::new(StubSelectorStore)),
-            self.signer.unwrap_or_else(|| Box::new(StubSigner)),
-        )));
+        let system_bank =
+            Self::resolve_system_bank(self.shared_selector, self.selector_store, self.signer);
         MachineRegistry {
             entity: self.entity,
             components: self.components,
@@ -219,11 +260,8 @@ impl MachineRegistryBuilder {
             }
             by_id.insert(id, idx);
         }
-        let system_bank = Arc::new(RwLock::new(SystemBankManager::load(
-            self.selector_store
-                .unwrap_or_else(|| Box::new(StubSelectorStore)),
-            self.signer.unwrap_or_else(|| Box::new(StubSigner)),
-        )));
+        let system_bank =
+            Self::resolve_system_bank(self.shared_selector, self.selector_store, self.signer);
         Ok(MachineRegistry {
             entity: self.entity,
             components: self.components,
