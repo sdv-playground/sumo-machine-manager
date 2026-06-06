@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::component::Component;
+use crate::system_bank_state::{StubSelectorStore, StubSigner, SystemBankManager};
 use crate::EntityInfo;
 
 /// The top-level machine: an `EntityInfo` (vehicle-level identity) plus a
@@ -36,6 +37,17 @@ pub struct MachineRegistry {
     entity: EntityInfo,
     components: Vec<Arc<dyn Component>>,
     by_id: HashMap<String, usize>,
+    /// The node's single signed, generation-counted boot selector — built on
+    /// the production stubs ([`StubSelectorStore`] / [`StubSigner`]) and
+    /// `load()`ed at construction.
+    ///
+    /// TODO: wire component activate()->stage() and campaign commit->seal()/
+    /// commit(); additive shadow until the bootloader sector contract lands.
+    /// Today this is NOT load-bearing — the existing per-component commit/
+    /// rollback (`BankProvider` + `NvBootState`) stays the authority; this
+    /// reconstructs alongside so the state machine is exercised + correct when
+    /// the selector partition layout exists.
+    system_bank: SystemBankManager<StubSelectorStore, StubSigner>,
 }
 
 impl MachineRegistry {
@@ -44,6 +56,14 @@ impl MachineRegistry {
             entity,
             components: Vec::new(),
         }
+    }
+
+    /// Accessor for the node-level system bank selector (see field docs).
+    /// Additive shadow — read-only handle for now; mutation seams
+    /// (stage/seal/commit/rollback) are wired in a later change once the
+    /// bootloader sector contract is real.
+    pub fn system_bank(&self) -> &SystemBankManager<StubSelectorStore, StubSigner> {
+        &self.system_bank
     }
 }
 
@@ -91,6 +111,7 @@ impl MachineRegistryBuilder {
             entity: self.entity,
             components: self.components,
             by_id,
+            system_bank: SystemBankManager::load(StubSelectorStore, StubSigner),
         }
     }
 
@@ -108,6 +129,7 @@ impl MachineRegistryBuilder {
             entity: self.entity,
             components: self.components,
             by_id,
+            system_bank: SystemBankManager::load(StubSelectorStore, StubSigner),
         })
     }
 }

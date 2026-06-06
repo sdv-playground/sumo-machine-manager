@@ -389,6 +389,15 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// retained — a non-IVD provider (e.g. RT raw-partition) drops in here
     /// without touching the engine.
     bank_provider: Arc<dyn BankProvider>,
+    /// Set by [`Self::with_bank_provider`] when an explicit provider has been
+    /// injected. While `true`, [`Self::rebuild_bank_provider`] is a no-op so a
+    /// later `with_bank_spec` / `with_bank_activator` in the builder chain does
+    /// NOT clobber the override with a fresh `IvdBankProvider`. Builder order
+    /// therefore matters: call `with_bank_spec` / `with_bank_activator` (which
+    /// feed an `IvdBankProvider`) FIRST, then `with_bank_provider` LAST to
+    /// replace the whole provider — anything after `with_bank_provider` that
+    /// would rebuild is intentionally ignored.
+    bank_provider_override: bool,
 }
 
 impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
@@ -528,6 +537,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             manifest_describe: Mutex::new(HashMap::new()),
             verified_manifest_cache: Mutex::new(None),
             bank_provider,
+            bank_provider_override: false,
         };
         // Populate DID cache from NV once at construction time. After this,
         // SOVD reads of NV-backed DIDs hit RAM only — see refresh_did_cache.
@@ -575,6 +585,13 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// re-seeded from NV inside the provider — same rule as the backend's own
     /// copy, idempotent at construction.
     fn rebuild_bank_provider(&mut self, activator: Option<Arc<dyn machine_mgr::BankActivator>>) {
+        // An explicit provider injected via `with_bank_provider` wins: never
+        // rebuild over it. `with_bank_spec` / `with_bank_activator` calls that
+        // land after the override are silently no-ops on the provider (their
+        // other side effects, e.g. setting `bank_spec`, still apply).
+        if self.bank_provider_override {
+            return;
+        }
         self.bank_provider = Arc::new(IvdBankProvider::new(
             self.nv.clone(),
             self.bank_set,
@@ -584,6 +601,21 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             self.hsm_provider.clone(),
             activator,
         ));
+    }
+
+    /// Replace the default `IvdBankProvider` with an explicit `BankProvider`
+    /// (e.g. supernova-mm's RT raw-partition provider). Sets the override flag
+    /// so a subsequent `rebuild_bank_provider` (triggered by `with_bank_spec` /
+    /// `with_bank_activator`) does NOT clobber it.
+    ///
+    /// **Builder order:** call `with_bank_spec` and `with_bank_activator` FIRST
+    /// (they rebuild the default `IvdBankProvider` and set `bank_spec`), then
+    /// `with_bank_provider` LAST to swap in the explicit provider. Any rebuild-
+    /// triggering builder placed after this is intentionally ignored.
+    pub fn with_bank_provider(mut self, provider: Arc<dyn BankProvider>) -> Self {
+        self.bank_provider = provider;
+        self.bank_provider_override = true;
+        self
     }
 
     /// Set a synthetic health probe used by `read_data` for `guest_state`
@@ -4425,5 +4457,139 @@ mod identity_tests {
         );
 
         let _ = std::fs::remove_dir_all(&images_dir);
+    }
+}
+
+#[cfg(test)]
+mod bank_provider_injection_tests {
+    use super::*;
+    use crate::manifest_provider::ManifestError;
+    use machine_mgr::bank_provider::{BankError, BankProvider};
+    use machine_mgr::ResetKind;
+    use nv_store::block::MemBlockDevice;
+    use nv_store::store::MIN_NV_DEVICE_SIZE;
+
+    struct NoopManifest;
+    impl ManifestProvider for NoopManifest {
+        fn validate(&self, _d: &[u8], _m: u32) -> Result<ValidatedFirmware, ManifestError> {
+            Err(ManifestError::ParseError("unused".into()))
+        }
+    }
+    struct NoopSecurity;
+    impl SecurityProvider for NoopSecurity {
+        fn generate_seed(&self, _component: BankSet, _level: u8) -> Vec<u8> {
+            Vec::new()
+        }
+        fn validate_key(&self, _c: BankSet, _l: u8, _s: &[u8], _k: &[u8]) -> bool {
+            true
+        }
+    }
+
+    /// A sentinel `BankProvider` whose `reset_kind()` is the distinctive
+    /// `RequiresEcuReset` — the default `IvdBankProvider` (no activator) returns
+    /// `Local`, so observing `RequiresEcuReset` through `ComponentBackend`
+    /// proves the injected provider is the one in use. Every other method is an
+    /// unreachable stub: the test only exercises the dispatch.
+    struct SentinelProvider;
+    impl BankProvider for SentinelProvider {
+        fn active_bank(&self) -> Bank {
+            Bank::B
+        }
+        fn target_bank(&self) -> Bank {
+            Bank::A
+        }
+        fn prepare_target(&self, _bank: Bank) -> Result<(), BankError> {
+            Ok(())
+        }
+        fn open_payload_writer(
+            &self,
+            _bank: Bank,
+            _name: &str,
+        ) -> Result<Box<dyn std::io::Write + Send>, BankError> {
+            Err(BankError::Failed("sentinel".into()))
+        }
+        fn seal(&self, _b: Bank, _i: FirmwareIdentity, _g: u64) -> Result<(), BankError> {
+            Ok(())
+        }
+        fn read_installed(&self, _bank: Bank) -> Result<InstalledFirmware, BankError> {
+            Err(BankError::NotInstalled)
+        }
+        fn verify_payload(&self, _b: Bank, _n: &str, _s: &[u8; 32]) -> Result<(), BankError> {
+            Ok(())
+        }
+        fn activate(&self, _bank: Bank) -> Result<ResetKind, BankError> {
+            Ok(ResetKind::RequiresEcuReset)
+        }
+        fn commit(&self) -> Result<(), BankError> {
+            Ok(())
+        }
+        fn rollback(&self) -> Result<(), BankError> {
+            Ok(())
+        }
+        fn reset_kind(&self) -> ResetKind {
+            ResetKind::RequiresEcuReset
+        }
+    }
+
+    fn backend() -> ComponentBackend<MemBlockDevice> {
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        ComponentBackend::with_options(
+            BankSet::Vm1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            Arc::new(NoopSecurity),
+            ComponentConfig::default(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn injected_provider_is_the_one_backend_uses() {
+        // Default backend: IvdBankProvider with no activator => Local.
+        let b = backend();
+        assert_eq!(b.reset_kind(), ResetKind::Local);
+
+        // After injection, the backend routes through the sentinel.
+        let b = b.with_bank_provider(Arc::new(SentinelProvider));
+        assert_eq!(
+            b.reset_kind(),
+            ResetKind::RequiresEcuReset,
+            "reset_kind() must come from the injected provider"
+        );
+    }
+
+    #[test]
+    fn override_survives_later_rebuild_triggering_builders() {
+        // with_bank_spec / with_bank_activator call rebuild_bank_provider; the
+        // override flag must make those no-op on the provider so the injected
+        // one is NOT clobbered.
+        let b = backend()
+            .with_bank_provider(Arc::new(SentinelProvider))
+            .with_bank_spec(crate::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1));
+        assert_eq!(
+            b.reset_kind(),
+            ResetKind::RequiresEcuReset,
+            "with_bank_spec after with_bank_provider must not clobber the override"
+        );
+
+        struct DummyActivator;
+        impl machine_mgr::BankActivator for DummyActivator {
+            fn activate(
+                &self,
+                _d: &std::path::Path,
+            ) -> Result<(), machine_mgr::BankActivatorError> {
+                Ok(())
+            }
+        }
+        let b = b.with_bank_activator(Arc::new(DummyActivator));
+        assert_eq!(
+            b.reset_kind(),
+            ResetKind::RequiresEcuReset,
+            "with_bank_activator after with_bank_provider must not clobber the override"
+        );
     }
 }

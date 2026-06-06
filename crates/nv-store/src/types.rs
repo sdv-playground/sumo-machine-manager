@@ -9,7 +9,7 @@
 //! - App (self-updating application component, filesystem A/B banks)
 
 /// Identifies which bank is active within a bank set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum Bank {
     A = 0,
@@ -45,7 +45,9 @@ impl Bank {
 /// `BankSetSpec`. Phase 3 makes the slot assignment itself
 /// config-driven so deployments add components without touching
 /// this enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct BankSet(pub u8);
 
 #[allow(non_upper_case_globals)]

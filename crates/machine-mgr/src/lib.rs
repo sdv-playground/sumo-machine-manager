@@ -69,6 +69,7 @@ pub mod bank_provider;
 pub mod component;
 pub mod error;
 pub mod machine;
+pub mod system_bank_state;
 pub mod types;
 
 #[cfg(test)]
@@ -81,6 +82,10 @@ pub use bank_provider::{
 pub use component::Component;
 pub use error::{MachineError, MachineResult};
 pub use machine::{Machine, MachineRegistry};
+pub use system_bank_state::{
+    InMemorySelectorStore, SelectorBlob, SelectorStore, Signer, StubSelectorStore, StubSigner,
+    SystemBankManager, TestSigner,
+};
 pub use types::*;
 
 // Re-exports of SOVD wire types that are also our domain types.
