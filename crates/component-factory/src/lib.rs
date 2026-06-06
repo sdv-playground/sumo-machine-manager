@@ -104,14 +104,15 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// (e.g. RT/M7 surfaces `guest_state` via `m7loader -q`). VMs leave
     /// this empty and use vm-service over loopback HTTP instead.
     pub health_probes: HashMap<String, Arc<dyn vm_mgr::backend::HealthProbe>>,
-    /// The node's shared, signed boot selector (read-only view), created once
-    /// by the binary and shared with the registry. When `Some`, each built
-    /// component gets a selector-aware `IvdBankProvider` (the boot selector is
-    /// the PRIMARY source for `active_bank()` / `target_bank()`, with the
-    /// NV/symlink path as fallback). `None` keeps the NV/symlink-only providers
-    /// (the in-backend default) — behaviour-preserving, since the selector is
-    /// seeded from `NvBootState`.
-    pub boot_selector: Option<machine_mgr::BootSelector>,
+    /// The node's shared, signed boot selector — the **write** handle
+    /// (`SharedSystemBankState`), created once by the binary and shared with the
+    /// registry. When `Some`, each built component gets a selector-aware
+    /// `IvdBankProvider` for which the boot selector is the PRIMARY source for
+    /// `active_bank()` / `target_bank()` (NV/symlink fallback) AND the
+    /// destination the OTA path writes (`activate`/`commit`/`rollback`). `None`
+    /// keeps the NV/symlink-only providers (the in-backend default) —
+    /// behaviour-preserving, since the selector tracks `NvBootState` (dual-write).
+    pub boot_selector: Option<machine_mgr::SharedSystemBankState>,
 }
 
 pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
@@ -176,9 +177,10 @@ pub fn resolve_bank_set_spec(
 }
 
 /// Build a selector-aware `IvdBankProvider` mirroring the args
-/// `ComponentBackend` would feed its in-backend provider, plus the shared boot
-/// selector from `deps`. Returns `None` when no selector is configured (the
-/// backend then keeps its own NV/symlink-only provider — behaviour-preserving).
+/// `ComponentBackend` would feed its in-backend provider, plus a **write** clone
+/// of the shared boot selector from `deps` (an `Arc` clone — the provider's OTA
+/// path mutates it). Returns `None` when no selector is configured (the backend
+/// then keeps its own NV/symlink-only provider — behaviour-preserving).
 ///
 /// Injected via [`vm_mgr::backend::ComponentBackend::with_bank_provider`] LAST
 /// in the builder chain (after `with_bank_spec` / `with_bank_activator`, which

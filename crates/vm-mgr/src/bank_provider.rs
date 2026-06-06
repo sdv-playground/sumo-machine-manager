@@ -59,17 +59,22 @@ pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     /// copy backs only `active_bank()` / `target_bank()` as the **fallback**
     /// when no shared boot selector is injected.
     running_bank: Mutex<Bank>,
-    /// The node's shared, signed boot selector (read-only view). When present
-    /// it is the **PRIMARY** source for `active_bank()` / `target_bank()` —
-    /// `running_bank` / the `current` symlink are the fallback. `None` for
+    /// The node's shared, signed boot selector — the **write** handle
+    /// (`Arc<RwLock<SystemBankManager>>`). When present it is the **PRIMARY**
+    /// source for `active_bank()` / `target_bank()` (`running_bank` / the
+    /// `current` symlink are the fallback) AND the OTA write path stages /
+    /// seals / commits / rolls it back so it tracks the real bank. `None` for
     /// tests and the inline construction in `backend.rs` (no selector wired),
     /// which preserves the prior NV/symlink-only behaviour.
     ///
-    /// Behaviour-preserving by design: supernova seeds the selector from
-    /// `NvBootState`, so a populated selector yields the same bank the fallback
-    /// would. Piece 5 removes the symlink fallback once the selector is the
-    /// sole authority.
-    selector: Option<machine_mgr::BootSelector>,
+    /// Held as the full `SharedSystemBankState` (not the read-only
+    /// `BootSelector` view) precisely because the OTA path now mutates it:
+    /// `activate`/`commit`/`rollback` take a short-lived `.write()` lock. Reads
+    /// take a `.read()` lock. Behaviour-preserving by design: the selector
+    /// tracks the same bank NV does (dual-write), so a populated selector
+    /// yields the same bank the fallback would. A later piece removes the
+    /// symlink fallback once the selector is the sole authority.
+    selector: Option<machine_mgr::SharedSystemBankState>,
 }
 
 impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
@@ -77,10 +82,12 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     /// seeded the same way `ComponentBackend::with_options` seeds its own copy:
     /// `Bank::A` for single-bank, else NV `active_bank`.
     ///
-    /// `selector` is the node's shared boot selector (read-only). `Some` makes
-    /// it the PRIMARY source for `active_bank()` / `target_bank()` with the NV/
-    /// symlink path as fallback; `None` keeps today's NV/symlink-only behaviour
-    /// (the inline construction in `backend.rs` and all tests pass `None`).
+    /// `selector` is the node's shared boot selector **write** handle. `Some`
+    /// makes it the PRIMARY source for `active_bank()` / `target_bank()` with
+    /// the NV/symlink path as fallback, AND the destination the OTA path writes
+    /// (`activate` seals, `commit`/`rollback` follow `ota::*`); `None` keeps
+    /// today's NV/symlink-only behaviour (the inline construction in
+    /// `backend.rs` and all tests pass `None`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         nv: Arc<Mutex<NvStore<D>>>,
@@ -90,7 +97,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         dir_name: String,
         hsm: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
         bank_activator: Option<Arc<dyn machine_mgr::BankActivator>>,
-        selector: Option<machine_mgr::BootSelector>,
+        selector: Option<machine_mgr::SharedSystemBankState>,
     ) -> Self {
         let running_bank = if single_bank {
             Bank::A
@@ -370,7 +377,11 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // set (e.g. selector not yet seeded for it) falls through to NV too.
         self.selector
             .as_ref()
-            .and_then(|s| s.active_bank(self.bank_set))
+            .and_then(|s| {
+                s.read()
+                    .expect("selector poisoned")
+                    .active_bank(self.bank_set)
+            })
             .unwrap_or_else(|| self.fallback_active_bank())
     }
 
@@ -386,7 +397,11 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         let active = self
             .selector
             .as_ref()
-            .and_then(|s| s.active_bank(self.bank_set))
+            .and_then(|s| {
+                s.read()
+                    .expect("selector poisoned")
+                    .active_bank(self.bank_set)
+            })
             .unwrap_or_else(|| self.fallback_target_active());
         active.other()
     }
@@ -579,6 +594,22 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
                 .map_err(|e| BankError::Failed(format!("bank activation failed: {e}")))?;
             self.flip_current_symlink(bank);
         }
+        // Dual-write the boot selector alongside the NV/symlink state: stage +
+        // seal so the selector's PRIMARY now reflects the just-activated bank.
+        // VMs (no activator) skip the block above but still record the new bank
+        // here — the selector must track the activation regardless of how it
+        // physically happened.
+        //
+        // TODO(campaign): the selector's seal/commit/rollback are GLOBAL (whole
+        // blob); correct only while <=1 component is mid-trial (the
+        // per-component flash-guard + one-OTA-at-a-time make that the norm —
+        // non-trial components have PRIMARY==SECONDARY so the global op no-ops
+        // them). A future campaign coordinator handles concurrent trials.
+        if let Some(sel) = &self.selector {
+            let mut g = sel.write().expect("selector poisoned");
+            g.stage(self.bank_set, bank);
+            g.seal();
+        }
         Ok(self.reset_kind())
     }
 
@@ -588,21 +619,35 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             .lock()
             .map_err(|_| BankError::Failed("nv lock poisoned".into()))?;
         match ota::commit(&mut nv, self.bank_set) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             // CRL / idempotent commit — already committed is fine.
-            Err(ota::OtaError::AlreadyCommitted) => Ok(()),
-            Err(e) => Err(BankError::Failed(e.to_string())),
+            Err(ota::OtaError::AlreadyCommitted) => {}
+            Err(e) => return Err(BankError::Failed(e.to_string())),
         }
+        // Dual-write: promote the selector's PRIMARY to SECONDARY (rollback
+        // floor) — see the GLOBAL-op caveat on `activate`.
+        if let Some(sel) = &self.selector {
+            sel.write().expect("selector poisoned").commit();
+        }
+        Ok(())
     }
 
     fn rollback(&self) -> Result<(), BankError> {
-        let mut nv = self
-            .nv
-            .lock()
-            .map_err(|_| BankError::Failed("nv lock poisoned".into()))?;
-        ota::rollback(&mut nv, self.bank_set)
-            .map(|_| ())
-            .map_err(|e| BankError::Failed(e.to_string()))
+        {
+            let mut nv = self
+                .nv
+                .lock()
+                .map_err(|_| BankError::Failed("nv lock poisoned".into()))?;
+            ota::rollback(&mut nv, self.bank_set)
+                .map(|_| ())
+                .map_err(|e| BankError::Failed(e.to_string()))?;
+        }
+        // Dual-write: roll the selector's PRIMARY back to the committed floor
+        // (SECONDARY) — see the GLOBAL-op caveat on `activate`.
+        if let Some(sel) = &self.selector {
+            sel.write().expect("selector poisoned").rollback();
+        }
+        Ok(())
     }
 
     fn reset_kind(&self) -> ResetKind {
@@ -649,7 +694,7 @@ fn bank_dir_is_payload_empty(bank_dir: &Path) -> bool {
 mod tests {
     use super::*;
     use machine_mgr::system_bank_state::{
-        BootSelector, InMemorySelectorStore, SharedSystemBankState, SystemBankManager, TestSigner,
+        InMemorySelectorStore, SharedSystemBankState, SystemBankManager, TestSigner,
     };
     use nv_store::block::MemBlockDevice;
     use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
@@ -685,7 +730,7 @@ mod tests {
     fn provider(
         nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
         set: BankSet,
-        selector: Option<BootSelector>,
+        selector: Option<SharedSystemBankState>,
     ) -> IvdBankProvider<MemBlockDevice> {
         IvdBankProvider::new(nv, set, false, None, "vm1".into(), None, None, selector)
     }
@@ -695,7 +740,7 @@ mod tests {
         let set = BankSet::Vm1;
         // NV/fallback says A; the injected selector says B — the selector wins.
         let nv = nv_with_active(set, Bank::A);
-        let selector = BootSelector::new(selector_with(set, Bank::B));
+        let selector = selector_with(set, Bank::B);
         let p = provider(nv, set, Some(selector));
 
         assert_eq!(
@@ -731,7 +776,7 @@ mod tests {
         // active_bank falls through to the NV/running_bank fallback.
         let set = BankSet::Vm1;
         let nv = nv_with_active(set, Bank::B);
-        let selector = BootSelector::new(selector_with(BankSet::Vm2, Bank::A));
+        let selector = selector_with(BankSet::Vm2, Bank::A);
         let p = provider(nv, set, Some(selector));
 
         assert_eq!(
@@ -739,5 +784,33 @@ mod tests {
             Bank::B,
             "no selection for Vm1 → NV fallback (B)"
         );
+    }
+
+    #[test]
+    fn activate_writes_selector_primary() {
+        // The OTA write path: a provider holding the shared selector (VM shape
+        // — no activator/images_dir, so `activate` only does the selector
+        // dual-write) must move the selector's PRIMARY to the activated bank.
+        let set = BankSet::Vm1;
+        // Selector + NV both start at A; activate(B) must flip PRIMARY to B.
+        let nv = nv_with_active(set, Bank::A);
+        let selector = selector_with(set, Bank::A);
+        // Keep a write-handle clone so we can read PRIMARY back after activate.
+        let p = provider(nv, set, Some(Arc::clone(&selector)));
+        assert_eq!(
+            selector.read().unwrap().active_bank(set),
+            Some(Bank::A),
+            "precondition: selector PRIMARY is A"
+        );
+
+        p.activate(Bank::B).expect("activate B");
+
+        assert_eq!(
+            selector.read().unwrap().active_bank(set),
+            Some(Bank::B),
+            "activate(B) wrote the selector PRIMARY to B (OTA dual-write)"
+        );
+        // And the provider now reads B as active through the same selector.
+        assert_eq!(p.active_bank(), Bank::B);
     }
 }
