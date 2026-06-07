@@ -2,8 +2,9 @@
 //! [`machine_mgr::BankProvider`] for vm-mgr bank sets.
 //!
 //! This is the default `BankProvider`: a signed CBOR IVD manifest living in
-//! a bank dir, a `current` symlink flip for activation, and NV boot-state for
-//! the A/B + trial + commit/rollback lifecycle. It owns every *bank touch*
+//! a bank dir, an optional activator (IFS write / partition swap) for
+//! activation, and NV boot-state + the shared boot selector for the A/B +
+//! trial + commit/rollback lifecycle. It owns every *bank touch*
 //! the OTA engine used to inline — `ComponentBackend` now delegates to it through an
 //! `Arc<dyn BankProvider>`.
 //!
@@ -33,8 +34,9 @@ use machine_mgr::ResetKind;
 
 use crate::ota;
 
-/// The IVD/A-B [`BankProvider`]: signed CBOR manifest in a bank dir, `current`
-/// symlink flip, NV boot-state. Backs VMs, host-os and hsm bank sets.
+/// The IVD/A-B [`BankProvider`]: signed CBOR manifest in a bank dir, optional
+/// activator, NV boot-state + boot selector. Backs VMs, host-os and hsm bank
+/// sets.
 pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     nv: Arc<Mutex<NvStore<D>>>,
     bank_set: BankSet,
@@ -48,10 +50,10 @@ pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     dir_name: String,
     /// HSM provider used to sign / signature-verify the IVD manifest.
     hsm: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
-    /// Activator invoked by `activate()` BEFORE the symlink flip (RT launcher,
-    /// IFS write, ...) — on failure the flip is skipped so the engine can roll
-    /// NV back without a stale `current` pointer. `None` for VMs whose
-    /// qvm/process cycle is the activation (they never flip here).
+    /// Activator invoked by `activate()` (RT launcher, IFS write, ...) — runs
+    /// before the boot selector is sealed so a failure leaves NV/selector
+    /// pointing at the previously-active bank. `None` for VMs whose qvm/process
+    /// cycle is the activation.
     bank_activator: Option<Arc<dyn machine_mgr::BankActivator>>,
     /// The bank the ECU is actually running on. Seeded from NV at construction
     /// (NV `active_bank` may differ after install — that's the *next-boot*
@@ -61,11 +63,11 @@ pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     running_bank: Mutex<Bank>,
     /// The node's shared, signed boot selector — the **write** handle
     /// (`Arc<RwLock<SystemBankManager>>`). When present it is the **PRIMARY**
-    /// source for `active_bank()` / `target_bank()` (`running_bank` / the
-    /// `current` symlink are the fallback) AND the OTA write path stages /
-    /// seals / commits / rolls it back so it tracks the real bank. `None` for
-    /// tests and the inline construction in `backend.rs` (no selector wired),
-    /// which preserves the prior NV/symlink-only behaviour.
+    /// source for `active_bank()` / `target_bank()` (`running_bank` / NV
+    /// `active_bank` are the fallback) AND the OTA write path stages / seals /
+    /// commits / rolls it back so it tracks the real bank. `None` for tests and
+    /// the inline construction in `backend.rs` (no selector wired), which
+    /// preserves the prior NV-only fallback behaviour.
     ///
     /// Held as the full `SharedSystemBankState` (not the read-only
     /// `BootSelector` view) precisely because the OTA path now mutates it:
@@ -131,20 +133,6 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
             .map(|images_dir| images_dir.join(&self.dir_name).join(bank_dir_name(target)))
     }
 
-    /// Read the `current` symlink under `images_dir/<dir_name>/` and return
-    /// the bank it points to, or `None` if missing / unreadable.
-    fn read_current_symlink(&self) -> Option<Bank> {
-        let images_dir = self.images_dir.as_ref()?;
-        let symlink_path = images_dir.join(&self.dir_name).join("current");
-        let target = std::fs::read_link(&symlink_path).ok()?;
-        let name = target.file_name()?.to_str()?;
-        match name {
-            "bank_a" => Some(Bank::A),
-            "bank_b" => Some(Bank::B),
-            _ => None,
-        }
-    }
-
     /// The booted bank from the **fallback** source used by `active_bank()`
     /// when no boot selector is injected: the `running_bank` copy seeded from
     /// NV at construction (only changes on `ecu_reset`). Unchanged from the
@@ -154,17 +142,12 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     }
 
     /// The booted bank from the **fallback** source used by `target_bank()`
-    /// when no boot selector is injected: the `current` symlink (source of
-    /// truth for activator-backed components — it survives factory resets),
-    /// falling back to NV `active_bank` when no symlink exists (first-ever
-    /// flash). Unchanged from the pre-selector behaviour. Single-bank is
-    /// handled by the caller (always targets `Bank::A`).
+    /// when no boot selector is injected: NV `active_bank` (the *next-boot*
+    /// bank), defaulting to `Bank::A` on a missing/unreadable boot state
+    /// (first-ever flash). The boot selector is the authority when injected;
+    /// this NV read is purely the un-injected fallback. Single-bank is handled
+    /// by the caller (always targets `Bank::A`).
     fn fallback_target_active(&self) -> Bank {
-        if self.bank_activator.is_some() {
-            if let Some(active) = self.read_current_symlink() {
-                return active;
-            }
-        }
         let nv = match self.nv.lock() {
             Ok(nv) => nv,
             Err(_) => return Bank::A,
@@ -172,37 +155,6 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         nv.read_boot_state()
             .map(|s| s.banks[self.bank_set.as_index()].active_bank)
             .unwrap_or(Bank::A)
-    }
-
-    /// Atomically flip the `current` symlink to point at `bank`. Internal to
-    /// the provider: `activate` calls it AFTER the activator succeeds (the
-    /// activator-then-flip order). The engine no longer flips directly — its
-    /// install/finalize path routes entirely through `activate`, and
-    /// `ecu_reset` does its own running-bank flip.
-    fn flip_current_symlink(&self, bank: Bank) {
-        let Some(images_dir) = self.images_dir.as_ref() else {
-            return;
-        };
-        let dir = images_dir.join(&self.dir_name);
-        let symlink_path = dir.join("current");
-        let target = Path::new(bank_dir_name(bank));
-        let tmp_link = symlink_path.with_extension("tmp");
-        let _ = std::fs::remove_file(&tmp_link);
-        if let Err(e) = std::os::unix::fs::symlink(target, &tmp_link)
-            .and_then(|()| std::fs::rename(&tmp_link, &symlink_path))
-        {
-            tracing::warn!(
-                bank_set = ?self.bank_set,
-                "failed to flip current symlink: {e}"
-            );
-        } else {
-            tracing::info!(
-                bank_set = ?self.bank_set,
-                bank = ?bank,
-                "flipped current -> {}",
-                bank_dir_name(bank),
-            );
-        }
     }
 
     /// Wipe the target bank dir (frees ~1 image worth of space) and remove any
@@ -398,9 +350,9 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             return Bank::A;
         }
         // Derive the active bank selector-then-fallback (PRIMARY = shared boot
-        // selector; FALLBACK = `current` symlink, then NV `active_bank`), then
-        // target its sibling. The selector mirrors NV, so this picks the same
-        // target as the symlink/NV-only path did.
+        // selector; FALLBACK = NV `active_bank`), then target its sibling. The
+        // selector mirrors NV, so this picks the same target as the NV-only
+        // fallback path did.
         let active = self
             .selector
             .as_ref()
@@ -587,16 +539,14 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
     }
 
     fn activate(&self, bank: Bank) -> Result<ResetKind, BankError> {
-        // Activator-then-flip (the live finalize order, NOT the old dead-code
-        // flip-then-activator): run the activator FIRST so a failure leaves the
-        // `current` symlink pointing at the previously-active bank, and the
-        // engine can roll NV back without a stale pointer to the half-activated
-        // bank. Only flip once the activator has succeeded.
+        // Run the activator (IFS write, partition swap, RT launcher …) FIRST so
+        // a failure short-circuits with `?` BEFORE the selector below is sealed:
+        // the engine can then roll NV back without the boot selector pointing at
+        // a half-activated bank.
         //
-        // For VMs (`bank_activator == None`) the whole block is skipped — VMs
-        // never flip here; their qvm/process cycle is the activation, and
-        // `ecu_reset` flips the `current` symlink at reset time. This matches
-        // the finalize block that is skipped when no activator is configured.
+        // For VMs (`bank_activator == None`) the block is skipped — VMs have no
+        // activator; their qvm/process cycle is the activation. This matches the
+        // finalize block that is skipped when no activator is configured.
         if let (Some(activator), Some(images_dir)) =
             (self.bank_activator.as_ref(), self.images_dir.as_ref())
         {
@@ -604,12 +554,11 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             activator
                 .activate(&bank_dir)
                 .map_err(|e| BankError::Failed(format!("bank activation failed: {e}")))?;
-            self.flip_current_symlink(bank);
         }
-        // Dual-write the boot selector alongside the NV/symlink state: stage +
-        // seal so the selector's PRIMARY now reflects the just-activated bank.
+        // Record the activation in the boot selector (the boot authority): stage
+        // + seal so the selector's PRIMARY now reflects the just-activated bank.
         // VMs (no activator) skip the block above but still record the new bank
-        // here — the selector must track the activation regardless of how it
+        // here — the selector tracks the activation regardless of how it
         // physically happened.
         //
         // TODO(campaign): the selector's seal/commit/rollback are GLOBAL (whole

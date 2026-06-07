@@ -246,15 +246,34 @@ async fn main() {
             images_dir.clone(),
             hsm_provider.clone(),
         );
-        // Read display_name from per-bank vm-config.yaml if available
+        // Read display_name from the active bank's vm-config.yaml if available.
+        // No `current` symlink any more — resolve the active bank from NV, and
+        // if that's unreadable fall back to trying bank_a then bank_b
+        // (display_name is the same in both). Best-effort: skip on any miss.
         if let Some(ref dir) = images_dir {
-            let config_path = dir.join(id).join("current").join("vm-config.yaml");
-            if let Ok(content) = std::fs::read_to_string(&config_path) {
-                // Lightweight parse — just extract display_name
-                if let Ok(map) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                    if let Some(name) = map.get("display_name").and_then(|v| v.as_str()) {
-                        backend = backend.with_display_name(name.to_string());
+            let set_dir = dir.join(id);
+            let active = nv.lock().ok().and_then(|nv| nv.read_boot_state()).map(|s| {
+                match s.banks[set.as_index()].active_bank {
+                    nv_store::types::Bank::A => "bank_a",
+                    nv_store::types::Bank::B => "bank_b",
+                }
+            });
+            // Active bank first when known; otherwise probe both (same name).
+            let candidates: &[&str] = match active {
+                Some("bank_b") => &["bank_b"],
+                Some(_) => &["bank_a"],
+                None => &["bank_a", "bank_b"],
+            };
+            for bank in candidates {
+                let config_path = set_dir.join(bank).join("vm-config.yaml");
+                if let Ok(content) = std::fs::read_to_string(&config_path) {
+                    // Lightweight parse — just extract display_name
+                    if let Ok(map) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                        if let Some(name) = map.get("display_name").and_then(|v| v.as_str()) {
+                            backend = backend.with_display_name(name.to_string());
+                        }
                     }
+                    break;
                 }
             }
         }

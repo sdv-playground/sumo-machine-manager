@@ -13,7 +13,7 @@
 /// - SUIT-based firmware flash with A/B banking
 /// - Session/security mode control
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -797,7 +797,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
     /// The bank an OTA upload should write to — delegated to the bank
     /// provider (the *inactive* bank for dual-bank, `Bank::A` for single-bank,
-    /// `current`-symlink-aware for activator-backed kinds).
+    /// resolved from the boot selector / NV `active_bank`).
     fn determine_target_bank(&self) -> BackendResult<Bank> {
         Ok(self.bank_provider.target_bank())
     }
@@ -2693,9 +2693,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // Captured here so the activator block below uses the
         // authoritative answer instead of re-deriving via
         // determine_target_bank() — which is racy on first-ever flash
-        // (no `current` symlink yet → falls back to NV, which
-        // install_precomputed has by then flipped, returning the WRONG
-        // bank). For CRL (no install), stays None and the activator
+        // (it resolves the *target* as the sibling of NV `active_bank`,
+        // which install_precomputed has by then flipped, returning the
+        // WRONG bank). For CRL (no install), stays None and the activator
         // block is skipped via `if !is_crl`.
         let mut installed_bank: Option<Bank> = None;
         if is_crl {
@@ -2769,16 +2769,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         }
 
         // Bank activation: route through the provider's `activate`, which runs
-        // the activator (if any) then flips the `current` symlink on success.
-        // Use installed_bank captured from install_precomputed / install
-        // above — that's the authoritative answer. Re-deriving via
+        // the activator (if any) then records the activation in the boot
+        // selector. Use installed_bank captured from install_precomputed /
+        // install above — that's the authoritative answer. Re-deriving via
         // determine_target_bank() here would return the OLD (now-inactive)
-        // bank on first-ever flash because NV has been flipped but the
-        // `current` symlink doesn't exist yet to override. `activate` runs
-        // on the bank we just wrote payloads to; success flips the symlink
-        // so the next flash's determine_target_bank() reads correctly. For
-        // VMs (no activator) `activate` is a no-op — matching the old
-        // activator-gated block that was skipped without an activator.
+        // bank on first-ever flash because NV has been flipped, so its sibling
+        // is the prior bank. `activate` runs on the bank we just wrote payloads
+        // to. For VMs (no activator) `activate` only seals the selector —
+        // matching the old activator-gated block that was skipped without an
+        // activator.
         if !is_crl {
             let wrote_to = installed_bank.ok_or_else(|| {
                 BackendError::Internal("installed_bank unset — unreachable for !is_crl".into())
@@ -2963,17 +2962,17 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         }
 
         // Bank activation: route through the provider's `activate`, which runs
-        // the activator (if any) then flips the `current` symlink on success.
-        // Read NV.active_bank directly — install_precomputed (above, when
-        // it ran) just flipped it to the just-installed bank, which is
+        // the activator (if any) then records the activation in the boot
+        // selector. Read NV.active_bank directly — install_precomputed (above,
+        // when it ran) just flipped it to the just-installed bank, which is
         // exactly the bank that has the payloads the activator needs.
         // determine_target_bank() would return the OTHER bank (active.other())
-        // when no `current` symlink exists yet (first flash) — that's
-        // empty and would make the activator fail with "firmware not found".
-        // See 2c9d2d8 for the original fix to this race; d25d967 re-introduced
-        // the determine_target_bank() call and reopened the bug for
-        // first-ever-flash on activator-backed components. For VMs (no
-        // activator) `activate` is a no-op, so this runs unconditionally.
+        // on first flash — that's empty and would make the activator fail with
+        // "firmware not found". See 2c9d2d8 for the original fix to this race;
+        // d25d967 re-introduced the determine_target_bank() call and reopened
+        // the bug for first-ever-flash on activator-backed components. For VMs
+        // (no activator) `activate` only seals the selector, so this runs
+        // unconditionally.
         {
             let wrote_to = {
                 let nv = self
@@ -3198,42 +3197,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             "start"
         };
 
-        // Flip the `current` symlink so vm-service boots the right bank
-        if let (Some(ref images_dir), Some(ref socket_path)) =
-            (&self.images_dir, &self.vm_service_addr)
-        {
-            let set_name = self.bank_spec.dir_name.as_str();
+        // Notify vm-service to (re)launch the guest on the just-activated bank.
+        // The boot selector is the authority for which bank actually boots; we
+        // no longer flip a per-component `current` symlink here. We still carry
+        // the running bank explicitly so vm-service relaunches THIS bank, not
+        // the stale boot-time `def.bank` (the "kernel not found" bug).
+        if let Some(ref socket_path) = self.vm_service_addr {
             let target_bank = *self.running_bank.lock().unwrap();
-            let bank_dir_name = match target_bank {
-                Bank::A => "bank_a",
-                Bank::B => "bank_b",
-            };
-            let symlink_path = images_dir.join(set_name).join("current");
-            // Relative target — symlink is a sibling of bank_a/bank_b.
-            let target = Path::new(bank_dir_name);
-            // Atomic symlink swap: create temp, rename over existing
-            let tmp_link = symlink_path.with_extension("tmp");
-            let _ = std::fs::remove_file(&tmp_link);
-            if let Err(e) = std::os::unix::fs::symlink(target, &tmp_link)
-                .and_then(|()| std::fs::rename(&tmp_link, &symlink_path))
-            {
-                tracing::warn!("failed to flip current symlink for {set_name}: {e}");
-            } else {
-                tracing::info!("flipped {set_name}/current -> {bank_dir_name}");
-            }
-
             let id = &self.entity_info.id;
-            // Carry the just-activated bank so vm-service relaunches THIS bank,
-            // not the stale boot-time `def.bank` (the "kernel not found" bug).
             match Self::notify_vm_service(socket_path, id, action, Some(target_bank)).await {
-                Ok(()) => tracing::info!("vm-service {action} requested for {id}"),
-                Err(e) => tracing::warn!("failed to notify vm-service for {id}: {e}"),
-            }
-        } else if let Some(ref socket_path) = self.vm_service_addr {
-            // No images_dir — just notify without symlink flip. We have no
-            // resolved bank dir to point at here, so leave def.bank untouched.
-            let id = &self.entity_info.id;
-            match Self::notify_vm_service(socket_path, id, action, None).await {
                 Ok(()) => tracing::info!("vm-service {action} requested for {id}"),
                 Err(e) => tracing::warn!("failed to notify vm-service for {id}: {e}"),
             }
@@ -4069,6 +4041,7 @@ mod identity_tests {
     use hsm::HsmProvider;
     use nv_store::block::MemBlockDevice;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
+    use std::path::Path;
 
     /// Manifest provider stub — the identity path never validates a SUIT
     /// envelope (the package is injected directly), so this can be inert.
@@ -4610,12 +4583,11 @@ mod identity_tests {
     }
 
     /// When the bank provider's `activate` fails during finalize (the activator
-    /// errors), the engine must (a) surface the error, (b) roll NV back to the
-    /// previously-committed bank, and (c) leave the `current` symlink pointing
-    /// at the OLD bank — never flip it to the half-activated new bank. This
-    /// pins the activator-then-flip order: a failed activate must not flip.
+    /// errors), the engine must (a) surface the error and (b) roll NV back to
+    /// the previously-committed bank. The activator runs before the boot
+    /// selector is sealed, so a failure leaves the activation un-recorded.
     #[tokio::test]
-    async fn finalize_activation_failure_rolls_back_and_does_not_flip() {
+    async fn finalize_activation_failure_rolls_back() {
         let images_dir = std::env::temp_dir().join("vm-mgr-activate-fail-img");
         let _ = std::fs::remove_dir_all(&images_dir);
         std::fs::create_dir_all(&images_dir).unwrap();
@@ -4630,15 +4602,11 @@ mod identity_tests {
         nv.write_boot_state(&mut boot).unwrap();
         let nv = Arc::new(Mutex::new(nv));
 
-        // Stage payloads in bank_b (the just-installed bank) and pre-create the
-        // `current` symlink pointing at bank_a (the still-committed bank).
+        // Stage payloads in bank_b (the just-installed bank).
         let set_dir = images_dir.join("vm1");
         let bank_b = set_dir.join("bank_b");
         std::fs::create_dir_all(&bank_b).unwrap();
         std::fs::write(bank_b.join("rootfs.img"), b"new bank bytes").unwrap();
-        let current = set_dir.join("current");
-        let _ = std::fs::remove_file(&current);
-        std::os::unix::fs::symlink(Path::new("bank_a"), &current).unwrap();
 
         let backend = ComponentBackend::with_options(
             BankSet::Vm1,
@@ -4673,14 +4641,6 @@ mod identity_tests {
                 "rollback must leave the bank committed"
             );
         }
-
-        // (c) `current` symlink must NOT have been flipped to bank_b.
-        let target = std::fs::read_link(&current).unwrap();
-        assert_eq!(
-            target.file_name().and_then(|s| s.to_str()),
-            Some("bank_a"),
-            "current symlink must still point at bank_a — a failed activate must not flip"
-        );
 
         let _ = std::fs::remove_dir_all(&images_dir);
     }

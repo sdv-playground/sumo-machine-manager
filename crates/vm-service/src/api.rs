@@ -123,9 +123,9 @@ struct EnsureParams {
 /// instead of returning AlreadyRunning.
 ///
 /// An optional `?bank=a|b` query pins which A/B bank to relaunch from: it's
-/// pushed via `set_vm_bank` right before `start_vm`. vm-mgr sends it after
-/// flipping the `current` symlink so the relaunch boots the just-activated
-/// bank instead of the stale boot-time `def.bank`. Absent ⇒ `def.bank` is
+/// pushed via `set_vm_bank` right before `start_vm`. vm-mgr sends it with
+/// the just-activated bank so the relaunch boots that bank instead of the
+/// stale boot-time `def.bank`. Absent ⇒ `def.bank` is
 /// left as-is.
 ///
 /// `initiate_stop` is synchronous (signal + record pid; or, for an

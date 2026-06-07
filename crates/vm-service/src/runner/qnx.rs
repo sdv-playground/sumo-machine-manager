@@ -266,7 +266,8 @@ impl VmRunner for QnxRunner {
             .as_ref()
             .ok_or_else(|| RunnerError::Config(format!("VM {name}: qvm_config not set")))?;
 
-        // Relative paths resolve against image_dir (follows active bank symlink)
+        // Relative paths resolve against image_dir, which `start_vm` has
+        // already rewritten to the selector-resolved bank dir (`base/bank_{a,b}`).
         let qvm_config = if raw_path.is_relative() {
             def.image_dir.join(raw_path)
         } else {
