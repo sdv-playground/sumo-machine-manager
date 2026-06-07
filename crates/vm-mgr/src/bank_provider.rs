@@ -375,14 +375,21 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // `NvBootState`, so a populated selector returns the same bank the
         // fallback would — behaviour-preserving. An absent selection for this
         // set (e.g. selector not yet seeded for it) falls through to NV too.
-        self.selector
-            .as_ref()
-            .and_then(|s| {
-                s.read()
-                    .expect("selector poisoned")
-                    .active_bank(self.bank_set)
-            })
+        self.selected_bank()
             .unwrap_or_else(|| self.fallback_active_bank())
+    }
+
+    fn selected_bank(&self) -> Option<Bank> {
+        // ONLY the shared boot selector's selection for this set — no NV /
+        // symlink / `running_bank` fallback. `None` when no selector is wired
+        // or it has no selection for this set, letting the caller pick its own
+        // fallback. This is the live boot authority the diagnostics serve path
+        // (`ComponentBackend::serving_bank`) prefers.
+        self.selector.as_ref().and_then(|s| {
+            s.read()
+                .expect("selector poisoned")
+                .active_bank(self.bank_set)
+        })
     }
 
     fn target_bank(&self) -> Bank {

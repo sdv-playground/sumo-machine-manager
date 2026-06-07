@@ -899,6 +899,23 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .unwrap_or_default()
     }
 
+    /// Bank to serve installed-manifest / identity from: the boot selector's
+    /// active bank (the authority the VM boots), falling back to the
+    /// `running_bank` cache only when the selector has no selection.
+    ///
+    /// `selected_bank()` is the selector's selection ALONE (`None` when no
+    /// selector is wired — tests / the no-HSM smoke path / RT-without-config);
+    /// it deliberately does NOT use the provider's own NV-seeded fallback, so
+    /// we fall back to THIS backend's live `running_bank` (updated on
+    /// `ecu_reset`), not the provider's frozen construction-time copy. The
+    /// previous serve path read `*self.running_bank.lock()` directly and so
+    /// missed the just-flashed bank the selector had already switched to.
+    fn serving_bank(&self) -> Bank {
+        self.bank_provider
+            .selected_bank()
+            .unwrap_or_else(|| *self.running_bank.lock().unwrap())
+    }
+
     /// Read + signature-verify a bank's installed firmware via the bank
     /// provider and return it as [`InstalledFirmware`], caching it per-bank so
     /// repeated diagnostics reads share one verify pass. The cache is
@@ -951,12 +968,13 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             }
             Err(e) => {
                 // NotInstalled / no images_dir / no HSM etc. — normal absence.
-                tracing::debug!(
+                // INFO (not debug) so a fresh-device 404 on the manifest shows
+                // exactly which bank had no installed firmware and why.
+                tracing::info!(
                     component = %self.entity_info.id,
-                    bank_set = ?self.bank_set,
                     bank = ?bank,
                     error = %e,
-                    "ivd-route: no installed firmware -> None",
+                    "ivd-route: no installed manifest for serving bank -> None",
                 );
                 None
             }
@@ -1884,13 +1902,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             }
         }
 
-        // Vendor data parameter: the running/committed bank's signed IVD
-        // manifest (per-file inventory + identity + signature). Advertised
-        // only when a verifiable manifest actually exists — absent on the
-        // no-HSM smoke path or a never-flashed bank, so we don't fabricate
-        // a parameter that would 404 on read.
-        let running = *self.running_bank.lock().unwrap();
-        if self.verified_bank_manifest(running).is_some() {
+        // Vendor data parameter: the booted bank's signed IVD manifest
+        // (per-file inventory + identity + signature). Advertised only when a
+        // verifiable manifest actually exists — absent on the no-HSM smoke path
+        // or a never-flashed bank, so we don't fabricate a parameter that would
+        // 404 on read. Bank comes from the boot selector (the authority the VM
+        // boots from), not the stale `running_bank` cache.
+        let serving = self.serving_bank();
+        tracing::info!(component = %self.entity_info.id, serving_bank = ?serving, running_bank = ?*self.running_bank.lock().unwrap(), "ivd-route: list_data picking bank for installed-manifest advertisement");
+        if self.verified_bank_manifest(serving).is_some() {
             params.push(ParameterInfo {
                 id: INSTALLED_MANIFEST_PARAM_ID.to_string(),
                 name: "Installed firmware manifest (signed IVD)".to_string(),
@@ -1925,17 +1945,18 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         let mut values = Vec::new();
 
         for param_id in param_ids {
-            // Vendor parameter: the running/committed bank's signed IVD
-            // manifest. Intercepted before `resolve_param` (which only
-            // knows DID-registry / hex ids). 404 when no committed manifest
-            // exists — never fabricated.
+            // Vendor parameter: the booted bank's signed IVD manifest.
+            // Intercepted before `resolve_param` (which only knows
+            // DID-registry / hex ids). 404 when no committed manifest exists —
+            // never fabricated. Bank comes from the boot selector (the
+            // authority the VM boots from), not the stale `running_bank` cache.
             if param_id == INSTALLED_MANIFEST_PARAM_ID {
-                let running = *self.running_bank.lock().unwrap();
-                tracing::info!(component = %self.entity_info.id, running_bank = ?running, "ivd-route: read_data x-sumo-installed-manifest requested");
-                let vm = self.verified_bank_manifest(running).ok_or_else(|| {
+                let serving = self.serving_bank();
+                tracing::info!(component = %self.entity_info.id, serving_bank = ?serving, running_bank = ?*self.running_bank.lock().unwrap(), "ivd-route: read_data x-sumo-installed-manifest requested");
+                let vm = self.verified_bank_manifest(serving).ok_or_else(|| {
                     BackendError::EntityNotFound(format!(
                         "{INSTALLED_MANIFEST_PARAM_ID}: no committed IVD manifest for {} bank {:?}",
-                        self.entity_info.id, running
+                        self.entity_info.id, serving
                     ))
                 })?;
                 values.push(DataValue {

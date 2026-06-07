@@ -110,6 +110,17 @@ pub trait BankProvider: Send + Sync {
     /// The bank currently booted / active.
     fn active_bank(&self) -> Bank;
 
+    /// The bank the node's shared boot selector says to boot — the live boot
+    /// authority — or `None` when no selector is wired (or it has no selection
+    /// for this set). Unlike [`Self::active_bank`], this never falls back to the
+    /// provider's own NV-seeded copy, so the caller can choose its OWN fallback
+    /// (e.g. a fresher `running_bank` held elsewhere). Diagnostics serve the
+    /// installed-manifest / identity from this when present. Default `None`
+    /// (providers without a selector concept).
+    fn selected_bank(&self) -> Option<Bank> {
+        None
+    }
+
     /// The bank the next install should target (A/B alternation off `active_bank`).
     fn target_bank(&self) -> Bank;
 
