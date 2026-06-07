@@ -277,8 +277,14 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 Arc::new(move || b.clear_flash_session())
             };
 
-            let fallback: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
-            let diag = vm_mgr::diag_backend::ComponentDiagBackend::new(component.clone(), fallback);
+            // The `app` component has its OWN install/flash lifecycle
+            // (`AppComponent`: app-mgr A/B symlink flip) that is NOT the VM
+            // bank flow `ComponentBackend` implements — so it's the
+            // install-router case: route install/flash through the `Component`
+            // and delegate data/faults/modes to the engine (`backend_arc`).
+            let engine: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
+            let diag =
+                vm_mgr::install_router_diag::InstallRouterDiag::new(component.clone(), engine);
 
             Some(BuiltComponent {
                 component,
@@ -366,12 +372,17 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 Arc::new(move || b.clear_flash_session())
             };
 
-            let fallback: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
-            let diag = vm_mgr::diag_backend::ComponentDiagBackend::new(component.clone(), fallback);
+            // `bank`/`hpc`/`hsm` install/flash lives natively on
+            // `ComponentBackend` (the `ComponentAdapter` above delegates its
+            // install methods 1:1 back to this same backend), so wire the
+            // engine directly as the SOVD `DiagnosticBackend`. The
+            // `ComponentAdapter` still goes into the registry as the
+            // `Component` view (orthogonal to SOVD).
+            let diag_backend: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
 
             Some(BuiltComponent {
                 component,
-                diag_backend: Some(Arc::new(diag)),
+                diag_backend: Some(diag_backend),
                 flash_probe: Some(flash_probe),
                 flash_clear: Some(flash_clear),
             })

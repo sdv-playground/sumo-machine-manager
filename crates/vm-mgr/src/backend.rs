@@ -1863,11 +1863,27 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         let comp_id = &self.entity_info.id;
 
         let has_health = self.vm_service_addr.is_some();
+
+        // Bank + manifest presence are resolved ONCE here and reused for both
+        // the identity-DID list gate (below) and the vendor
+        // `x-sumo-installed-manifest` advertisement (further down) — same
+        // authority `read_data` / the cache overlay use. `verified_bank_manifest`
+        // memoises per-bank, so the later x-sumo check is a cache hit.
+        let serving = self.serving_bank();
+        let manifest_present = self.verified_bank_manifest(serving).is_some();
+
         let mut params: Vec<ParameterInfo> = DID_REGISTRY
             .iter()
             .filter(|d| {
                 has_health || (d.did != did::DID_GUEST_STATE && d.did != did::DID_HEARTBEAT_SEQ)
             })
+            // Advertise the F187–F19E SW-identity DIDs ONLY when the serving
+            // bank has a committed signed manifest — they read from `did_cache`
+            // via the manifest overlay, so on a manifest-less bank they would
+            // be LISTED but 404 on read (list/read disagreement, spec C-031).
+            // Hardware-identity + factory + runtime + dynamic DIDs read from NV
+            // regardless and stay listed unconditionally.
+            .filter(|d| manifest_present || !is_identity_did(d.did))
             .map(|d| ParameterInfo {
                 id: d.id.to_string(),
                 name: d.name.to_string(),
@@ -1910,11 +1926,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // (per-file inventory + identity + signature). Advertised only when a
         // verifiable manifest actually exists — absent on the no-HSM smoke path
         // or a never-flashed bank, so we don't fabricate a parameter that would
-        // 404 on read. Bank comes from the boot selector (the authority the VM
-        // boots from), not the stale `running_bank` cache.
-        let serving = self.serving_bank();
+        // 404 on read. Reuses the `serving` bank + `manifest_present` resolved
+        // at the top (same authority gating the identity DIDs above), so this
+        // and the identity-DID gate can never disagree.
         tracing::info!(component = %self.entity_info.id, serving_bank = ?serving, running_bank = ?*self.running_bank.lock().unwrap(), "ivd-route: list_data picking bank for installed-manifest advertisement");
-        if self.verified_bank_manifest(serving).is_some() {
+        if manifest_present {
             params.push(ParameterInfo {
                 id: INSTALLED_MANIFEST_PARAM_ID.to_string(),
                 name: "Installed firmware manifest (signed IVD)".to_string(),
@@ -3405,6 +3421,25 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         Ok(())
     }
 
+    async fn abort_flash(&self, _transfer_id: &str) -> BackendResult<()> {
+        // Mirror `ComponentAdapter::abort_install` exactly — the round-trip the
+        // directly-wired bank/hsm engine no longer goes through. Pre-finalize
+        // abort is always allowed: drop the staging session (the same shared
+        // `clear_flash_session` the adapter calls). Post-finalize the bank
+        // pointer has already flipped to the next-boot bank and the engine
+        // can't unflip it, so refuse rather than silently no-op — surfaced as
+        // `InvalidRequest`, the exact wire mapping `map_machine_error` produces
+        // from the adapter's `PolicyRejected`, so the direct (bank/hsm) and
+        // routed (vm2/app) abort paths return identical HTTP.
+        if self.flash_is_finalized() {
+            return Err(BackendError::InvalidRequest(
+                "cannot abort: install already finalized".into(),
+            ));
+        }
+        self.clear_flash_session();
+        Ok(())
+    }
+
     // --- Session ---
 
     async fn get_session_mode(&self) -> BackendResult<SessionMode> {
@@ -3751,6 +3786,32 @@ pub(crate) fn did_value_to_json(
             serde_json::Value::String(format!("0x{hex}"))
         }
     }
+}
+
+/// The SW-identity DIDs (subset of the F187–F19E range) sourced ONLY from the
+/// running bank's signed IVD manifest — never from NV. These are exactly the
+/// DIDs `identity_to_did_bytes` overlays into `did_cache`, so they read back
+/// (and may be listed) only when `verified_bank_manifest` finds a committed
+/// manifest. The other F18x/F19x DIDs in `DID_REGISTRY` (supplier_id F18A,
+/// manufacturing_date F18B, serial_number F18C, vin F190, ecu_hw_number F191,
+/// supplier_hw_number F192, supplier_hw_version F193) are HARDWARE identity
+/// read from the NV Factory blob regardless of any manifest — they are NOT
+/// here and stay listed unconditionally.
+pub(crate) const IDENTITY_DIDS: [u16; 9] = [
+    did::DID_SPARE_PART_NUMBER,
+    did::DID_ECU_SW_NUMBER,
+    did::DID_FW_VERSION,
+    did::DID_SUPPLIER_SW_NUMBER,
+    did::DID_SUPPLIER_SW_VERSION,
+    did::DID_SYSTEM_NAME,
+    did::DID_TESTER_SERIAL,
+    did::DID_PROGRAMMING_DATE,
+    did::DID_ODX_FILE_ID,
+];
+
+/// Whether `did` is a manifest-sourced SW-identity DID (see [`IDENTITY_DIDS`]).
+pub(crate) fn is_identity_did(did: u16) -> bool {
+    IDENTITY_DIDS.contains(&did)
 }
 
 /// Convert a [`FirmwareIdentity`] into the `(did, bytes)` pairs for the 9
@@ -4335,6 +4396,27 @@ mod identity_tests {
         assert_eq!(p.category, Some(DataCategory::IdentData));
         assert!(p.did.is_none());
 
+        // C-031: with a committed manifest the F187–F19E SW-identity DIDs are
+        // listed (they read back from the manifest overlay) AND read 200 — so
+        // list and read agree on a flashed bank. fw_version (F189) stands in.
+        // Refresh the cache the way the real flash flow does (every
+        // finalize/commit/ecu_reset NV write triggers `NvWriteGuard::drop`),
+        // since this test signs the bank directly without an NV write.
+        {
+            let nv = backend.nv.lock().unwrap();
+            backend.refresh_did_cache_locked(&nv);
+        }
+        let fw = params
+            .iter()
+            .find(|p| p.id == "fw_version")
+            .expect("fw_version must be listed when a manifest exists");
+        assert_eq!(fw.did.as_deref(), Some("F189"));
+        let read = backend
+            .read_data(&["fw_version".to_string()])
+            .await
+            .expect("listed identity DID must read back");
+        assert_eq!(read[0].value, serde_json::json!("1.2.0"));
+
         // read_data returns the structured JSON in `value`.
         let vals = backend
             .read_data(&[INSTALLED_MANIFEST_PARAM_ID.to_string()])
@@ -4409,6 +4491,19 @@ mod identity_tests {
         assert!(
             !params.iter().any(|p| p.id == INSTALLED_MANIFEST_PARAM_ID),
             "vendor param must be absent when no committed manifest exists"
+        );
+
+        // C-031: the manifest-sourced SW-identity DIDs are likewise absent
+        // (they'd 404 on read), while a hardware/factory DID stays listed.
+        assert!(
+            !params.iter().any(|p| is_identity_did(
+                u16::from_str_radix(p.did.as_deref().unwrap_or(""), 16).unwrap_or(0)
+            )),
+            "no manifest-gated identity DID may be listed without a committed manifest"
+        );
+        assert!(
+            params.iter().any(|p| p.id == "serial_number"),
+            "hardware/factory serial_number must remain listed without a manifest"
         );
 
         // Read 404s (EntityNotFound → HTTP 404).
@@ -4738,5 +4833,113 @@ mod notify_query_tests {
         assert_eq!(Cb::bank_query(Some(Bank::A)), "?bank=a");
         assert_eq!(Cb::bank_query(Some(Bank::B)), "?bank=b");
         assert_eq!(Cb::bank_query(None), "");
+    }
+}
+
+#[cfg(test)]
+mod abort_flash_tests {
+    //! `DiagnosticBackend::abort_flash` on the directly-wired engine
+    //! (bank/hsm). Restores the pre-convergence semantics the round-trip
+    //! `ComponentAdapter::abort_install` used to provide: Ok pre-finalize,
+    //! refusal post-finalize. The routed (vm2/app) abort path is covered in
+    //! `install_router_diag_tests`.
+    use super::*;
+    use crate::manifest_provider::ManifestError;
+    use nv_store::block::MemBlockDevice;
+    use nv_store::store::MIN_NV_DEVICE_SIZE;
+
+    struct NoopManifest;
+    impl ManifestProvider for NoopManifest {
+        fn validate(&self, _d: &[u8], _m: u32) -> Result<ValidatedFirmware, ManifestError> {
+            Err(ManifestError::ParseError("unused".into()))
+        }
+    }
+    struct NoopSecurity;
+    impl SecurityProvider for NoopSecurity {
+        fn generate_seed(&self, _component: BankSet, _level: u8) -> Vec<u8> {
+            Vec::new()
+        }
+        fn validate_key(&self, _c: BankSet, _l: u8, _s: &[u8], _k: &[u8]) -> bool {
+            true
+        }
+    }
+
+    fn backend() -> ComponentBackend<MemBlockDevice> {
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        ComponentBackend::with_options(
+            BankSet::Vm1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            Arc::new(NoopSecurity),
+            ComponentConfig::default(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Seed a flash transfer in `state` so `flash_is_finalized()` reflects it.
+    fn set_transfer_state(b: &ComponentBackend<MemBlockDevice>, state: FlashState) {
+        *b.flash_transfer.lock().unwrap() = Some(FlashTransferState {
+            transfer_id: "t1".into(),
+            package_id: "pkg-1".into(),
+            state,
+            image_size: 0,
+            verify_baseline_boot_id: None,
+            streamed_files: Vec::new(),
+        });
+    }
+
+    #[tokio::test]
+    async fn abort_flash_ok_when_no_session() {
+        // No session in flight — abort is an idempotent success (mirrors
+        // ComponentAdapter::abort_install on a fresh backend).
+        let b = backend();
+        assert!(!b.flash_is_finalized());
+        b.abort_flash("nope").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_flash_ok_pre_finalize_clears_session() {
+        // A staged-but-not-finalized session (AwaitingActivation) aborts Ok and
+        // the staging state is dropped.
+        let b = backend();
+        *b.flash_session.lock().unwrap() = Some(FlashSessionState::Complete);
+        set_transfer_state(&b, FlashState::AwaitingActivation);
+        assert!(!b.flash_is_finalized());
+
+        b.abort_flash("t1").await.unwrap();
+
+        assert!(b.flash_session.lock().unwrap().is_none());
+        assert!(b.flash_transfer.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn abort_flash_rejected_post_finalize() {
+        // Post-finalize (bank pointer already flipped) abort must refuse — the
+        // engine can't unflip it. Surfaced as InvalidRequest (HTTP 400), the
+        // exact wire mapping `map_machine_error` produces from the adapter's
+        // PolicyRejected, so direct and routed abort paths agree.
+        for st in [
+            FlashState::AwaitingReboot,
+            FlashState::Activated,
+            FlashState::Committed,
+            FlashState::RolledBack,
+        ] {
+            let b = backend();
+            set_transfer_state(&b, st);
+            assert!(b.flash_is_finalized(), "{st:?} should be finalized");
+
+            let err = b.abort_flash("t1").await.unwrap_err();
+            assert!(
+                matches!(err, BackendError::InvalidRequest(_)),
+                "{st:?}: expected InvalidRequest, got {err:?}"
+            );
+            assert_eq!(err.status_code(), 400, "{st:?}");
+            // Refused → the finalized transfer is left intact, not cleared.
+            assert!(b.flash_transfer.lock().unwrap().is_some(), "{st:?}");
+        }
     }
 }

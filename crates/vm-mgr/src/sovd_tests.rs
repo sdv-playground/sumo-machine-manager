@@ -381,7 +381,11 @@ async fn list_parameters() {
     let (status, json) = get(&router, "/vehicle/v1/components/vm1/data").await;
     assert_eq!(status, StatusCode::OK);
     let items = json["items"].as_array().unwrap();
-    assert!(items.len() >= 21);
+    // vm1 here has no vm-service (health DIDs filtered) and no committed
+    // manifest, so the 9 manifest-sourced SW-identity DIDs (F187–F19E) are NOT
+    // listed (C-031: they'd 404 on read). What remains is the 7 hardware/factory
+    // DIDs + 5 dynamic DIDs that read from NV regardless.
+    assert!(items.len() >= 12, "got {} params", items.len());
 }
 
 #[tokio::test]

@@ -7,26 +7,38 @@
 //!
 //! # Layering
 //!
+//! `ComponentBackend` IS the per-component `DiagnosticBackend` and is wired
+//! straight into SOVD for every component:
+//!
 //! ```text
 //!   sovd-core::DiagnosticBackend (wire-shape layer)
 //!         │
 //!         │ implemented by
 //!         ▼
-//!   diag_backend::ComponentDiagBackend     ← migration adapter
-//!         │                                  (routes via machine-mgr where wired,
-//!         │                                   falls back to legacy ComponentBackend)
-//!         ▼
-//!   machine_mgr::Component
-//!         │
-//!         │ implemented by
-//!         ▼
-//!   component_adapter::ComponentAdapter
-//!         │
-//!         │ delegates to
-//!         ▼
-//!   backend::ComponentBackend<D: BlockDevice>    ← legacy per-bank-set type,
+//!   backend::ComponentBackend<D: BlockDevice>    ← the complete engine:
+//!                                           data + DIDs + identity overlay +
+//!                                           faults + OTA lifecycle + modes,
 //!                                           one instance per component
 //! ```
+//!
+//! vm2 is the one exception. A SUIT envelope on its `/updates` wire may target
+//! the VM bank set OR the in-VM container image, and that routing decision
+//! lives in `app_install_router::AppInstallRouterComponent`. There,
+//! `install_router_diag::InstallRouterDiag` wraps the engine: it intercepts
+//! ONLY the install/flash methods (routing them through the router) and
+//! delegates everything else (data, faults, modes, …) to the engine.
+//!
+//! ```text
+//!   sovd-core::DiagnosticBackend
+//!         │ implemented by
+//!         ▼
+//!   install_router_diag::InstallRouterDiag   ← vm2 only
+//!     ├─ install/flash ─▶ machine_mgr::Component (AppInstallRouterComponent)
+//!     └─ everything else ─▶ backend::ComponentBackend (the engine)
+//! ```
+//!
+//! `component_adapter::ComponentAdapter` still exposes `ComponentBackend` as a
+//! `machine_mgr::Component` for the `MachineRegistry` (orthogonal to SOVD).
 //!
 //! # Key modules
 //!
@@ -42,9 +54,9 @@ pub mod bank_provider;
 pub mod bank_seed;
 pub mod bank_spec;
 pub mod component_adapter;
-pub mod diag_backend;
 pub mod did;
 pub mod dispatcher;
+pub mod install_router_diag;
 pub mod manifest;
 pub mod manifest_provider;
 pub mod ota;
@@ -66,7 +78,7 @@ mod sovd_tests;
 mod component_adapter_tests;
 
 #[cfg(test)]
-mod diag_backend_tests;
+mod install_router_diag_tests;
 
 #[cfg(test)]
 mod wrapper_http_tests;

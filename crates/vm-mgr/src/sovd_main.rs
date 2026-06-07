@@ -11,7 +11,7 @@ use sovd_core::DiagnosticBackend;
 use vm_mgr::app_install_router::AppInstallRouterComponent;
 use vm_mgr::backend::{ComponentBackend, ComponentConfig};
 use vm_mgr::component_adapter::ComponentAdapter;
-use vm_mgr::diag_backend::ComponentDiagBackend;
+use vm_mgr::install_router_diag::InstallRouterDiag;
 use vm_mgr::sovd::security::TestSecurityProvider;
 use vm_mgr::suit_provider::SuitProvider;
 
@@ -266,8 +266,6 @@ async fn main() {
                 backend = backend.with_bank_activator(Arc::new(activator));
             }
         }
-        // Wrap as ComponentDiagBackend so wired Component methods route through
-        // machine-mgr; everything else falls through to the underlying ComponentBackend.
         let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
         let mut component_inner = ComponentAdapter::new(backend_arc.clone());
         // Wire CSR signing for the HSM component so the route below can
@@ -278,6 +276,11 @@ async fn main() {
                 component_inner.with_csr_keystore(hsm_keystore_path.clone(), hsm_port);
         }
         let vm_component: Arc<dyn machine_mgr::Component> = Arc::new(component_inner);
+
+        // vm2 routes installs container-vs-VM through AppInstallRouterComponent;
+        // every other component's install/flash lives natively on
+        // ComponentBackend. The registry gets `component` either way; only the
+        // SOVD diag backend differs.
         let component: Arc<dyn machine_mgr::Component> = if id == "vm2" {
             let container_images_dir = images_dir
                 .clone()
@@ -300,9 +303,15 @@ async fn main() {
 
         machine_builder = machine_builder.with_arc(component.clone());
 
-        let fallback: Arc<dyn DiagnosticBackend> = backend_arc.clone();
-        let diag = ComponentDiagBackend::new(component, fallback);
-        backends.insert(id.to_string(), Arc::new(diag) as Arc<dyn DiagnosticBackend>);
+        // vm2: wrap the install router so install/flash route through it and
+        // everything else (data, faults, modes) delegates to the engine.
+        // All others: the engine IS the DiagnosticBackend — wire it directly.
+        let diag: Arc<dyn DiagnosticBackend> = if id == "vm2" {
+            Arc::new(InstallRouterDiag::new(component, backend_arc.clone()))
+        } else {
+            backend_arc.clone() as Arc<dyn DiagnosticBackend>
+        };
+        backends.insert(id.to_string(), diag);
     }
 
     let machine: Arc<dyn Machine> = Arc::new(machine_builder.build());
