@@ -42,6 +42,14 @@ use crate::sovd::security::SecurityProvider;
 /// format-agnostic); the vendor semantics live entirely here in vm-mgr.
 pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-sumo-installed-manifest";
 
+/// Vendor SOVD data-parameter id for this component's **update-mode** — how it
+/// updates: A/B-banked + trial + rollback, vs single-bank write-through &
+/// irreversible (the HSM keystore). A STABLE per-component config property,
+/// readable any time (even pre-flash), so an offboard twin can sync
+/// rollback-capability the same way it syncs firmware identity. Same `x-sumo-`
+/// vendor namespace (SOVDd stays spec-pure; the semantics live here in vm-mgr).
+pub const UPDATE_MODE_PARAM_ID: &str = "x-sumo-update-mode";
+
 // ---------------------------------------------------------------------------
 // Session / security state (per backend instance)
 // ---------------------------------------------------------------------------
@@ -793,6 +801,25 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// populate `FlashCaps.reset_kind`.
     pub fn reset_kind(&self) -> machine_mgr::ResetKind {
         self.bank_provider.reset_kind()
+    }
+
+    /// Render this component's update-mode as the `x-sumo-update-mode` JSON
+    /// value: `banked` (A/B + trial + rollback) vs `singleshot` (single-bank,
+    /// write-through, irreversible — the HSM keystore), plus the flash-cap
+    /// fields an offboard twin keys its composition guard on. Stable config —
+    /// no NV / manifest dependency, so it serves even pre-flash.
+    fn update_mode_json(&self) -> serde_json::Value {
+        let update_mode = if self.config.single_bank {
+            "singleshot"
+        } else {
+            "banked"
+        };
+        serde_json::json!({
+            "update_mode": update_mode,
+            "supports_rollback": self.config.supports_rollback,
+            "dual_bank": !self.config.single_bank,
+            "reset_kind": self.reset_kind(),
+        })
     }
 
     /// The bank an OTA upload should write to — delegated to the bank
@@ -1952,6 +1979,30 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             });
         }
 
+        // Vendor data parameter: this component's update-mode (banked &
+        // rollbackable vs single-bank & irreversible). A STABLE config property —
+        // advertised + readable unconditionally (even pre-flash), unlike the
+        // installed manifest, so an offboard twin can sync rollback-capability the
+        // same way it syncs firmware identity.
+        params.push(ParameterInfo {
+            id: UPDATE_MODE_PARAM_ID.to_string(),
+            name: "Component update-mode".to_string(),
+            description: Some(
+                "How this component updates: banked (A/B + trial + rollback) or \
+                 singleshot (single-bank, write-through, irreversible — e.g. the \
+                 HSM keystore). Carries update_mode / supports_rollback / \
+                 dual_bank / reset_kind. Stable per-component config; readable any \
+                 time, even before first flash."
+                    .to_string(),
+            ),
+            unit: None,
+            data_type: Some("object".to_string()),
+            read_only: true,
+            href: format!("/vehicle/v1/components/{comp_id}/data/{UPDATE_MODE_PARAM_ID}"),
+            did: None,
+            category: Some(DataCategory::IdentData),
+        });
+
         Ok(params)
     }
 
@@ -1999,6 +2050,23 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     id: param_id.clone(),
                     name: "Installed firmware manifest (signed IVD)".to_string(),
                     value: installed_manifest_json(&vm),
+                    unit: None,
+                    timestamp: Utc::now(),
+                    raw: None,
+                    did: None,
+                    length: None,
+                });
+                continue;
+            }
+
+            // Vendor parameter: this component's update-mode. Stable config —
+            // always served (no 404), even pre-flash, so the offboard twin can
+            // classify rollback-capability for the composition guard.
+            if param_id == UPDATE_MODE_PARAM_ID {
+                values.push(DataValue {
+                    id: param_id.clone(),
+                    name: "Component update-mode".to_string(),
+                    value: self.update_mode_json(),
                     unit: None,
                     timestamp: Utc::now(),
                     raw: None,
@@ -4731,6 +4799,72 @@ mod bank_provider_injection_tests {
             None,
             None,
         )
+    }
+
+    /// Single-bank (HSM-style), irreversible backend for update-mode tests.
+    fn singleshot_backend() -> ComponentBackend<MemBlockDevice> {
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        ComponentBackend::with_options(
+            BankSet::Hsm,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            Arc::new(NoopSecurity),
+            ComponentConfig {
+                supports_rollback: false,
+                single_bank: true,
+                entity_type: "hsm".to_string(),
+            },
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn update_mode_param_banked_for_default_component() {
+        // Default backend: dual-bank VM, NO firmware flashed. The vendor param
+        // is advertised + readable unconditionally (stable config), proving it
+        // works pre-flash — unlike x-sumo-installed-manifest which 404s.
+        let b = backend();
+        let params = b.list_parameters().await.unwrap();
+        let p = params
+            .iter()
+            .find(|p| p.id == UPDATE_MODE_PARAM_ID)
+            .expect("x-sumo-update-mode must be listed even with no committed manifest");
+        assert!(p.read_only);
+        assert!(p.did.is_none());
+
+        let vals = b
+            .read_data(&[UPDATE_MODE_PARAM_ID.to_string()])
+            .await
+            .expect("update-mode reads 200 pre-flash");
+        let v = &vals[0].value;
+        assert_eq!(v["update_mode"], serde_json::json!("banked"));
+        assert_eq!(v["supports_rollback"], serde_json::json!(true));
+        assert_eq!(v["dual_bank"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn update_mode_param_singleshot_for_hsm_component() {
+        // The HSM keystore is single-bank + irreversible — it must report
+        // singleshot / supports_rollback=false so the offboard guard can keep it
+        // out of a rollbackable campaign.
+        let b = singleshot_backend();
+        let params = b.list_parameters().await.unwrap();
+        assert!(
+            params.iter().any(|p| p.id == UPDATE_MODE_PARAM_ID),
+            "x-sumo-update-mode must be listed for the HSM component too"
+        );
+        let vals = b
+            .read_data(&[UPDATE_MODE_PARAM_ID.to_string()])
+            .await
+            .unwrap();
+        let v = &vals[0].value;
+        assert_eq!(v["update_mode"], serde_json::json!("singleshot"));
+        assert_eq!(v["supports_rollback"], serde_json::json!(false));
+        assert_eq!(v["dual_bank"], serde_json::json!(false));
     }
 
     #[test]
