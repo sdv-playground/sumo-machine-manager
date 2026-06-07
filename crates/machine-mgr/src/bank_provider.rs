@@ -12,7 +12,7 @@
 //! firmware on a raw partition) is then one impl, not a hardcode:
 //!
 //! - **`IvdBankProvider`** (vm-mgr, the default): signed CBOR manifest in a bank
-//!   dir, `current` symlink flip, NV boot-state. VMs / host-os / hsm.
+//!   dir + NV boot-state; the boot selector is the bank authority. VMs / host-os / hsm.
 //! - **`RtBankProvider`** (supernova-mm): a raw partition — one sector for the
 //!   bank selector, one for the SHA, `m7loader` to activate.
 //!

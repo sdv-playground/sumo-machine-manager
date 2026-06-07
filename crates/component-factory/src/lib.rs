@@ -32,7 +32,7 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub storage_path: Option<PathBuf>,
 
-    /// Base path for app-type components (A/B bank root with `current` symlink).
+    /// Base path for app-type components (A/B bank root; bank_a/bank_b live under it).
     #[serde(default)]
     pub base_path: Option<PathBuf>,
 

@@ -164,17 +164,15 @@ pub struct VmDefinition {
     #[serde(default)]
     pub cpu_model: Option<String>,
     /// Bank-set base for this VM's kernel + rootfs (e.g.
-    /// `/var/lib/vms/vm1`). Historically this pointed at the `current`
-    /// symlink (`.../vm1/current → bank_a/`); a trailing `current`
-    /// component is still tolerated and stripped by
-    /// [`VmDefinition::bank_base_dir`] so existing configs keep working.
+    /// `/var/lib/vms/vm1`) — the parent the `bank_a` / `bank_b` dirs
+    /// live under.
     ///
     /// The actual bank dir launched is resolved from [`Self::bank`] —
-    /// `base/bank_a` or `base/bank_b` — NOT by following `current`. The
-    /// boot selector (via supernova) is the authority for which bank;
-    /// `start_vm` rewrites `image_dir` to the resolved bank dir before
-    /// the runner spawns, so `kernel_path` / `rootfs_path` /
-    /// `partition_path` all resolve against the right bank.
+    /// `base/bank_a` or `base/bank_b`. The boot selector (via supernova)
+    /// is the authority for which bank; `start_vm` rewrites `image_dir`
+    /// to the resolved bank dir before the runner spawns, so
+    /// `kernel_path` / `rootfs_path` / `partition_path` all resolve
+    /// against the right bank.
     pub image_dir: PathBuf,
     /// Which A/B bank this VM launches from. Runtime-set by supernova
     /// (from the boot selector) via [`crate::manager::VmManager::set_vm_bank`]
@@ -381,30 +379,17 @@ impl VmDefinition {
         })
     }
 
-    /// The bank-set base directory — `image_dir` with a trailing
-    /// `current` component stripped. So `.../vm1/current` → `.../vm1`
-    /// and `.../vm1` → `.../vm1` (already a base). This is the parent
-    /// the `bank_a` / `bank_b` dirs live under.
+    /// The bank-set base directory — the parent the `bank_a` / `bank_b`
+    /// dirs live under. `image_dir` is that base (e.g. `.../vm1`); the
+    /// launched bank is `base/bank_{a,b}`, resolved from [`Self::bank`]
+    /// (the boot selector's choice), never a `current` symlink.
     pub fn bank_base_dir(&self) -> PathBuf {
-        if self
-            .image_dir
-            .file_name()
-            .map(|n| n == std::ffi::OsStr::new("current"))
-            .unwrap_or(false)
-        {
-            self.image_dir
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.image_dir.clone())
-        } else {
-            self.image_dir.clone()
-        }
+        self.image_dir.clone()
     }
 
     /// Resolve the bank directory for `bank`: `bank_base_dir()/bank_{a,b}`.
     /// `start_vm` writes this into `image_dir` before launch so the rest of
-    /// the resolution (`kernel_path` etc.) targets the selector-chosen bank
-    /// instead of following the `current` symlink.
+    /// the resolution (`kernel_path` etc.) targets the selector-chosen bank.
     pub fn resolved_bank_dir(&self, bank: Bank) -> PathBuf {
         self.bank_base_dir().join(bank.subdir())
     }
@@ -977,23 +962,16 @@ arch: amd64
     }
 
     #[test]
-    fn bank_base_dir_strips_trailing_current() {
-        // Legacy `.../vm1/current` symlink path → base is the parent.
-        let v = minimal_vm("/var/lib/vms/vm1/current");
-        assert_eq!(v.bank_base_dir(), PathBuf::from("/var/lib/vms/vm1"));
-    }
-
-    #[test]
-    fn bank_base_dir_passes_through_plain_base() {
-        // A base that doesn't end in `current` is used as-is.
+    fn bank_base_dir_is_the_image_dir() {
+        // image_dir IS the bank-set base; bank_a/bank_b live under it.
         let v = minimal_vm("/var/lib/vms/vm1");
         assert_eq!(v.bank_base_dir(), PathBuf::from("/var/lib/vms/vm1"));
     }
 
     #[test]
     fn resolved_bank_dir_picks_the_enum_bank() {
-        // Selector picks Bank::B ⇒ launch resolves base/bank_b (not `current`).
-        let v = minimal_vm("/var/lib/vms/vm1/current");
+        // Selector picks Bank::B ⇒ launch resolves base/bank_b.
+        let v = minimal_vm("/var/lib/vms/vm1");
         assert_eq!(
             v.resolved_bank_dir(Bank::B),
             PathBuf::from("/var/lib/vms/vm1/bank_b")

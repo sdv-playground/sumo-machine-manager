@@ -737,8 +737,7 @@ vms:
         // Selector picks Bank::B ⇒ launch resolves base/bank_b. The verify
         // hook observes the exact bank dir start_vm is about to launch, so
         // asserting on it proves the resolution AND that verify+launch agree.
-        let mut mgr =
-            VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1/current"), None);
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
 
         let seen: Arc<StdMutex<Option<std::path::PathBuf>>> = Arc::new(StdMutex::new(None));
         let seen_for_hook = seen.clone();

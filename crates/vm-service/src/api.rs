@@ -275,7 +275,7 @@ mod tests {
 vms:
   vm1:
     backend: dummy
-    image_dir: /var/lib/vms/vm1/current
+    image_dir: /var/lib/vms/vm1
 "#;
         serde_yaml::from_str(yaml).unwrap()
     }
