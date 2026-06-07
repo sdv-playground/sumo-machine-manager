@@ -355,8 +355,19 @@ impl VmRunner for QnxRunner {
         // mechanism we can use to pass vm_id — the guest's IFS reads
         // its own vm_name from /etc/sumo/vm-host.toml, which is
         // baked per-VM at mkifs time.)
-        tracing::info!("starting qvm for {name}: @{}", qvm_config.display());
+        // Run qvm FROM the bank dir (the dir holding this qvm.conf, which also
+        // holds the kernel) so the conf's relative `load kernel` resolves to the
+        // selector-chosen bank's kernel — bank-agnostic, no `current` symlink
+        // (retired). Everything else in the conf is an absolute /dev/... node the
+        // setup above created, so cwd affects only the kernel load.
+        let bank_dir = qvm_config.parent().unwrap_or_else(|| Path::new("."));
+        tracing::info!(
+            "starting qvm for {name}: @{} (cwd {})",
+            qvm_config.display(),
+            bank_dir.display()
+        );
         let child = Command::new("qvm")
+            .current_dir(bank_dir)
             .arg(format!("@{}", qvm_config.display()))
             .spawn()
             .map_err(|e| RunnerError::ProcessFailed(format!("qvm: {e}")))?;
