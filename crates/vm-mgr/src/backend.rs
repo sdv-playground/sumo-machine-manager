@@ -916,16 +916,20 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .unwrap_or_else(|| *self.running_bank.lock().unwrap())
     }
 
-    /// Read + signature-verify a bank's installed firmware via the bank
-    /// provider and return it as [`InstalledFirmware`], caching it per-bank so
-    /// repeated diagnostics reads share one verify pass. The cache is
-    /// invalidated on every NV write (see `refresh_did_cache_locked`), so the
-    /// served firmware always reflects the latest install/commit/ecu_reset.
+    /// Read a bank's installed firmware **report-only** via the bank provider
+    /// (decode the on-disk signed manifest; NO HSM verify) and return it as
+    /// [`InstalledFirmware`], caching it per-bank so repeated diagnostics reads
+    /// share one decode. The cache is invalidated on every NV write (see
+    /// `refresh_did_cache_locked`), so the served firmware always reflects the
+    /// latest install/commit/ecu_reset.
     ///
-    /// Returns `None` when the bank has no verifiable firmware (no images_dir,
-    /// no HSM, not provisioned, no manifest yet, or a bad signature). A bad
-    /// signature is logged at warn; absent/unsigned is debug (normal for
-    /// factory-fresh / unprovisioned banks).
+    /// Returns `Some` whenever the manifest file is present + decodable, `None`
+    /// only on `NotInstalled` (no images_dir, no manifest yet) or a corrupt
+    /// manifest. The served object carries the raw manifest bytes + signature
+    /// so a client verifies independently; the on-device gate stays in
+    /// `verify_bank` (install/boot/launch), unchanged. The `Unverifiable` warn
+    /// arm below is therefore unreachable on this report-only path — it is left
+    /// in place but never fires.
     ///
     /// Used for the RUNNING/committed bank: `read_data` of the identity DIDs
     /// and the vendor `x-sumo-installed-manifest` parameter both pass
@@ -1953,12 +1957,28 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             if param_id == INSTALLED_MANIFEST_PARAM_ID {
                 let serving = self.serving_bank();
                 tracing::info!(component = %self.entity_info.id, serving_bank = ?serving, running_bank = ?*self.running_bank.lock().unwrap(), "ivd-route: read_data x-sumo-installed-manifest requested");
-                let vm = self.verified_bank_manifest(serving).ok_or_else(|| {
-                    BackendError::EntityNotFound(format!(
-                        "{INSTALLED_MANIFEST_PARAM_ID}: no committed IVD manifest for {} bank {:?}",
-                        self.entity_info.id, serving
-                    ))
-                })?;
+                let vm = match self.verified_bank_manifest(serving) {
+                    Some(vm) => {
+                        tracing::info!(
+                            component = %self.entity_info.id,
+                            bank = ?serving,
+                            gen = vm.gen,
+                            "ivd-route: read_data x-sumo-installed-manifest served",
+                        );
+                        vm
+                    }
+                    None => {
+                        tracing::info!(
+                            component = %self.entity_info.id,
+                            bank = ?serving,
+                            "ivd-route: read_data x-sumo-installed-manifest 404 (NotInstalled)",
+                        );
+                        return Err(BackendError::EntityNotFound(format!(
+                            "{INSTALLED_MANIFEST_PARAM_ID}: no committed IVD manifest for {} bank {:?}",
+                            self.entity_info.id, serving
+                        )));
+                    }
+                };
                 values.push(DataValue {
                     id: param_id.clone(),
                     name: "Installed firmware manifest (signed IVD)".to_string(),
@@ -4208,11 +4228,17 @@ mod identity_tests {
     }
 
     #[test]
-    fn tampered_manifest_identity_is_refused() {
+    fn tampered_manifest_identity_is_reported_report_only() {
+        // Report-only diagnostic read: the identity DIDs come from the on-disk
+        // signed manifest WITHOUT an HSM verify, so a tampered-but-decodable
+        // manifest is still reported. The served object carries the signature +
+        // bytes for the client to verify; the real gate is `verify_bank`.
         let (backend, images_dir, keystore) = backend_with_package("tamper", sample_image_meta());
         backend.ivd_sign_staged_bank(Bank::B).unwrap();
 
-        // Flip a byte of the signed manifest — signature no longer matches.
+        // Flip a byte INSIDE a string value (the manifest's last field is the
+        // identity map; the final byte is string content, so it stays
+        // structurally decodable) — the signature no longer matches.
         let mpath = images_dir
             .join("vm1")
             .join("bank_b")
@@ -4222,9 +4248,12 @@ mod identity_tests {
         bytes[last] ^= 0x01;
         std::fs::write(&mpath, &bytes).unwrap();
 
-        // The signature check rejects it → no identity served.
-        assert!(backend.verified_bank_identity(Bank::B).is_none());
-        assert!(backend.identity_did_bytes(Bank::B).is_empty());
+        // Report-only: the identity is still served (it decodes).
+        assert!(
+            backend.verified_bank_identity(Bank::B).is_some(),
+            "report-only path serves a decodable manifest's identity"
+        );
+        assert!(!backend.identity_did_bytes(Bank::B).is_empty());
 
         cleanup(&images_dir, &keystore);
     }
@@ -4397,13 +4426,21 @@ mod identity_tests {
     }
 
     #[tokio::test]
-    async fn installed_manifest_param_refused_when_tampered() {
+    async fn installed_manifest_param_reports_even_when_signature_would_not_verify() {
+        // Report-only path: the diagnostic read surfaces what the bank is
+        // supposed to have installed and hands the client the raw bytes +
+        // signature to verify independently. It does NOT call into the HSM, so
+        // a manifest whose signature would FAIL an HSM verify (here: a flipped
+        // byte) is still served — the served `manifest_b64` carries the exact
+        // tampered on-disk bytes so a `--pubkey` client catches the mismatch
+        // itself. The real on-device gate stays in `verify_bank`.
         let (backend, images_dir, keystore) =
             backend_with_package("ivdtamper", sample_image_meta());
         *backend.running_bank.lock().unwrap() = Bank::B;
         backend.ivd_sign_staged_bank(Bank::B).unwrap();
 
-        // Flip a byte of the signed manifest — signature no longer matches.
+        // Flip a byte inside the signed manifest CBOR — still structurally
+        // decodable, but the signature no longer matches it.
         let mpath = images_dir
             .join("vm1")
             .join("bank_b")
@@ -4413,17 +4450,53 @@ mod identity_tests {
         bytes[last] ^= 0x01;
         std::fs::write(&mpath, &bytes).unwrap();
 
-        // A tampered manifest must not be served — invalidate the cache
-        // (an NV write would normally do this) so the re-read hits disk.
+        // Invalidate the cache (an NV write would normally do this) so the
+        // re-read hits disk and sees the tampered bytes.
         {
             let nv = backend.nv.lock().unwrap();
             backend.refresh_did_cache_locked(&nv);
         }
-        let err = backend
+
+        // It is still listed (report-only — present + decodable).
+        let params = backend.list_parameters().await.unwrap();
+        assert!(
+            params.iter().any(|p| p.id == INSTALLED_MANIFEST_PARAM_ID),
+            "report-only: param advertised whenever the manifest decodes"
+        );
+
+        // And it is served — NOT 404'd.
+        let vals = backend
             .read_data(&[INSTALLED_MANIFEST_PARAM_ID.to_string()])
             .await
-            .unwrap_err();
-        assert!(matches!(err, BackendError::EntityNotFound(_)));
+            .expect("report-only read must succeed even with a bad signature");
+        assert_eq!(vals.len(), 1);
+        let v = &vals[0].value;
+
+        // The served manifest_b64 is exactly the tampered on-disk bytes — the
+        // client re-verifies these against `--pubkey` and detects the tamper.
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mbytes = b64
+            .decode(v["manifest_b64"].as_str().unwrap())
+            .expect("manifest_b64 decodes");
+        let on_disk = std::fs::read(&mpath).unwrap();
+        assert_eq!(
+            mbytes, on_disk,
+            "served bytes are the raw on-disk (tampered) manifest"
+        );
+        // Prove the HSM verify over the served artefacts now FAILS — i.e. the
+        // client's independent check would reject it.
+        let sig = b64
+            .decode(v["signature_b64"].as_str().unwrap())
+            .expect("signature_b64 decodes");
+        let ok = {
+            let hsm = backend.hsm_provider.as_ref().unwrap().lock().unwrap();
+            hsm.verify(hsm::ivd::IVD_KEY_ID, &mbytes, &sig).unwrap()
+        };
+        assert!(
+            !ok,
+            "served (tampered) bytes must NOT verify — the client gate catches it"
+        );
 
         cleanup(&images_dir, &keystore);
     }

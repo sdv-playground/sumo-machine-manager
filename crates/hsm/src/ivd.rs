@@ -708,6 +708,44 @@ pub fn read_manifest(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<VerifiedM
     })
 }
 
+/// Read + CBOR-decode the bank's IVD manifest **without** any HSM
+/// signature check, returning the manifest plus the raw bytes + signature
+/// for the *caller/client* to verify independently.
+///
+/// This is the **report-only** read backing the diagnostic
+/// `x-sumo-installed-manifest` SOVD parameter. By design it answers "what
+/// is this bank supposed to have installed?" — it surfaces the on-disk
+/// signed inventory + identity and the device signature, but it is **never
+/// a gate**: it deliberately does NOT call `hsm.verify`, so a diagnostic
+/// read keeps working even when the live HSM verify is unavailable (e.g.
+/// the IVD public key changed after a guest re-enroll while the manifest
+/// bytes on disk are still intact). The returned `signature` +
+/// `manifest_bytes` let a downstream consumer (a SW-mapping tool reading
+/// over SOVD with `--pubkey`) check the device signature itself.
+///
+/// Takes no [`HsmProvider`] and needs no `crypto` feature — decode is pure
+/// CBOR. Use the strict [`read_manifest`] for any path that must enforce
+/// the HSM gate; the real install/boot/launch gate is [`verify_bank`],
+/// which is unchanged.
+pub fn read_manifest_unverified(bank_dir: &Path) -> Result<VerifiedManifest, IvdError> {
+    let manifest_path = bank_dir.join(IVD_MANIFEST_FILE);
+    let signature_path = bank_dir.join(IVD_SIGNATURE_FILE);
+
+    let manifest_bytes =
+        fs::read(&manifest_path).map_err(|e| IvdError::Io(e, manifest_path.clone()))?;
+    let sig = fs::read(&signature_path).map_err(|e| IvdError::Io(e, signature_path.clone()))?;
+
+    // No `hsm.verify` here — report-only. Decode (re-checks the version)
+    // and hand back the manifest together with the bytes + signature so the
+    // caller/client can re-verify on its own.
+    let manifest = decode_manifest(&manifest_bytes)?;
+    Ok(VerifiedManifest {
+        manifest,
+        manifest_bytes,
+        signature: sig,
+    })
+}
+
 /// Read the bank's IVD manifest, **signature-verify** it against the
 /// HSM's IVD public key, and return the firmware [`IvdIdentity`] it
 /// carries.
@@ -1154,5 +1192,62 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&bank);
         let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn read_manifest_unverified_reports_without_hsm_even_with_bad_signature() {
+        let bank = temp_bank("read-manifest-unverified");
+        write(&bank.join("kernel"), b"kernel bytes");
+        write(&bank.join("rootfs.img"), &[0xCD; 64]);
+
+        let (hsm, keystore) = provisioned_sim("read-manifest-unverified");
+        sign_bank(&hsm, &bank, 9, sample_identity()).unwrap();
+
+        // Baseline: report-only read decodes the manifest + hands back the
+        // exact on-disk bytes + signature. Takes NO HsmProvider.
+        let vm = read_manifest_unverified(&bank).unwrap();
+        assert_eq!(vm.manifest.gen, 9);
+        assert_eq!(vm.manifest.identity, sample_identity());
+        assert_eq!(
+            vm.manifest_bytes,
+            std::fs::read(bank.join(IVD_MANIFEST_FILE)).unwrap()
+        );
+        assert_eq!(
+            vm.signature,
+            std::fs::read(bank.join(IVD_SIGNATURE_FILE)).unwrap()
+        );
+
+        // Tamper a byte: still structurally decodable, but the signature no
+        // longer matches. The strict HSM-gated read rejects it...
+        let mpath = bank.join(IVD_MANIFEST_FILE);
+        let mut bytes = std::fs::read(&mpath).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&mpath, &bytes).unwrap();
+        match read_manifest(&hsm, &bank) {
+            Err(IvdError::SignatureInvalid) => {}
+            other => panic!("strict read must still reject tamper, got {other:?}"),
+        }
+        // ...but the report-only read still reports it, surfacing the raw
+        // (tampered) bytes for the caller/client to verify independently.
+        let vm = read_manifest_unverified(&bank).unwrap();
+        assert_eq!(
+            vm.manifest_bytes, bytes,
+            "served bytes are the on-disk bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn read_manifest_unverified_absent_is_io_not_found() {
+        let bank = temp_bank("read-manifest-unverified-absent");
+        // No sign_bank → no manifest/signature files on disk.
+        match read_manifest_unverified(&bank) {
+            Err(IvdError::Io(e, _)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            other => panic!("expected Io(NotFound), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&bank);
     }
 }

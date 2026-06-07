@@ -514,12 +514,17 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
 
     fn read_installed(&self, bank: Bank) -> Result<InstalledFirmware, BankError> {
         let bank_dir = self.target_bank_dir(bank).ok_or(BankError::NotInstalled)?;
-        let hsm_arc = self.hsm.as_ref().ok_or(BankError::NotInstalled)?;
-        let hsm = hsm_arc
-            .lock()
-            .map_err(|_| BankError::Failed("read_installed: hsm mutex poisoned".into()))?;
 
-        match hsm::ivd::read_manifest(&*hsm, &bank_dir) {
+        // Report-only read: decode + return the on-disk signed manifest
+        // WITHOUT an HSM signature check. We report what the bank is
+        // supposed to have installed; the served object carries the raw
+        // bytes + signature so the client verifies independently. The real
+        // gate (install/boot/launch) stays in `verify_bank`. This path
+        // deliberately never touches the HSM, so a diagnostic read keeps
+        // working even when the live HSM verify is unavailable (e.g. the
+        // IVD public key changed after a guest re-enroll) — the manifest
+        // bytes on disk are still intact.
+        match hsm::ivd::read_manifest_unverified(&bank_dir) {
             Ok(vm) => {
                 let m = &vm.manifest;
                 let files = m
@@ -548,9 +553,9 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             Err(hsm::ivd::IvdError::Io(e, _)) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(BankError::NotInstalled)
             }
-            Err(hsm::ivd::IvdError::SignatureInvalid) => {
-                Err(BankError::Unverifiable("ivd signature invalid".into()))
-            }
+            // Any other failure (corrupt/undecodable CBOR, unsupported
+            // version, non-NotFound I/O) — there is no `SignatureInvalid`
+            // outcome on the report-only path.
             Err(e) => Err(BankError::Failed(format!("read_installed: {e}"))),
         }
     }
@@ -819,5 +824,113 @@ mod tests {
         );
         // And the provider now reads B as active through the same selector.
         assert_eq!(p.active_bank(), Bank::B);
+    }
+
+    // ---------------------------------------------------------------------
+    // read_installed is REPORT-ONLY: decode the on-disk signed manifest with
+    // no HSM verify. It must report even when the signature would not verify,
+    // and never call into the HSM.
+    // ---------------------------------------------------------------------
+
+    /// Provision a `SimHsm`, sign `gen` into `bank_dir`, and return the HSM +
+    /// keystore path (to clean up). Mirrors hsm's own `provisioned_sim`.
+    fn sign_bank_dir(name: &str, bank_dir: &Path, gen: u64) -> (hsm::sim::SimHsm, PathBuf) {
+        use hsm::payload::*;
+        let keystore = std::env::temp_dir().join(format!("vm-mgr-readinstalled-ks-{name}"));
+        let _ = std::fs::remove_dir_all(&keystore);
+        std::fs::create_dir_all(&keystore).unwrap();
+
+        let hsm = hsm::sim::SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 5300);
+        let ks = HsmKeystore {
+            schema_version: SCHEMA_VERSION,
+            security_version: 1,
+            identities: vec![],
+            slots: vec![KeySlot {
+                key_id: hsm::ivd::IVD_KEY_ID.to_string(),
+                key_kind: KEY_TYPE_EC_P256,
+                anchor_public_key: None,
+                allowed_guests: None,
+                allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
+            }],
+        };
+        hsm.write_keystore(&ks).unwrap();
+        std::fs::write(keystore.join("provision_state"), b"1\n").unwrap();
+
+        std::fs::create_dir_all(bank_dir).unwrap();
+        std::fs::write(bank_dir.join("kernel"), b"kernel bytes").unwrap();
+        // Non-empty identity so the manifest's final CBOR byte is string
+        // content — flipping it in the tamper test keeps the CBOR decodable.
+        let identity = hsm::ivd::IvdIdentity {
+            version: "1.2.0".into(),
+            ecu_sw_number: "VM1-SW-001".into(),
+            tester_serial: "SOVD-OTA".into(),
+            ..Default::default()
+        };
+        hsm::ivd::sign_bank(&hsm, bank_dir, gen, identity).unwrap();
+        (hsm, keystore)
+    }
+
+    /// An `images_dir`-backed provider with NO HSM wired — proves the
+    /// report-only read needs none.
+    fn disk_provider_no_hsm(images_dir: PathBuf) -> IvdBankProvider<MemBlockDevice> {
+        let nv = nv_with_active(BankSet::Vm1, Bank::A);
+        IvdBankProvider::new(
+            nv,
+            BankSet::Vm1,
+            false,
+            Some(images_dir),
+            "vm1".into(),
+            None, // <- no HSM
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn read_installed_reports_even_when_signature_would_not_verify_and_without_hsm() {
+        let images_dir = std::env::temp_dir().join("vm-mgr-readinstalled-tamper");
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let bank_dir = images_dir.join("vm1").join("bank_b");
+        let (_hsm, keystore) = sign_bank_dir("tamper", &bank_dir, 7);
+
+        // Tamper a byte: still decodable, but the signature no longer matches.
+        let mpath = bank_dir.join(hsm::ivd::IVD_MANIFEST_FILE);
+        let mut bytes = std::fs::read(&mpath).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&mpath, &bytes).unwrap();
+
+        // Provider has NO HSM — read_installed still reports the bank.
+        let p = disk_provider_no_hsm(images_dir.clone());
+        let fw = p
+            .read_installed(Bank::B)
+            .expect("report-only read_installed must succeed with a bad signature and no HSM");
+        assert_eq!(fw.bank, Bank::B);
+        assert_eq!(fw.gen, 7);
+        // The raw artefacts are handed up for the client to verify itself, and
+        // they are the exact tampered on-disk bytes.
+        assert_eq!(fw.raw.as_deref(), Some(bytes.as_slice()));
+        assert!(fw.signature.is_some());
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn read_installed_not_installed_when_manifest_absent() {
+        let images_dir = std::env::temp_dir().join("vm-mgr-readinstalled-absent");
+        let _ = std::fs::remove_dir_all(&images_dir);
+        // Create the bank dir + a payload file but NO signed manifest.
+        let bank_dir = images_dir.join("vm1").join("bank_b");
+        std::fs::create_dir_all(&bank_dir).unwrap();
+        std::fs::write(bank_dir.join("kernel"), b"kernel bytes").unwrap();
+
+        let p = disk_provider_no_hsm(images_dir.clone());
+        match p.read_installed(Bank::B) {
+            Err(BankError::NotInstalled) => {}
+            other => panic!("expected NotInstalled, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&images_dir);
     }
 }
