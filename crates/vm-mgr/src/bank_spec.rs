@@ -81,10 +81,15 @@ pub fn payload_target_name(layout: BankLayout, uri: &str) -> String {
         BankLayout::BootIfs => ("boot.ifs", "qvm.conf"),
         BankLayout::Generic => ("", ""),
     };
+    // Generic banks (e.g. the M7/RT slot) are verbatim — NO VM-style URI
+    // remapping. Without this gate, `#firmware`/`#config` would be force-renamed
+    // to rootfs.img / vm-config.yaml even for rt, so `rt-firmware.s19` lands as
+    // rootfs.img and the m7loader can't find it. Only VM/BootIfs layouts remap.
+    let vm_style = !matches!(layout, BankLayout::Generic);
     match uri {
         "#kernel" if !kernel_name.is_empty() => kernel_name.to_string(),
-        "#firmware" => "rootfs.img".to_string(),
-        "#config" => "vm-config.yaml".to_string(),
+        "#firmware" if vm_style => "rootfs.img".to_string(),
+        "#config" if vm_style => "vm-config.yaml".to_string(),
         "#qvm-config" if !qvm_config_name.is_empty() => qvm_config_name.to_string(),
         other => other.trim_start_matches('#').to_string(),
     }
@@ -171,6 +176,21 @@ mod tests {
         assert_eq!(
             payload_target_name(BankLayout::Generic, "#rt-firmware"),
             "rt-firmware",
+        );
+        // #firmware / #config are VM/BootIfs-isms — Generic must NOT remap them
+        // (the regression that wrote rt's firmware as rootfs.img). Verbatim.
+        assert_eq!(
+            payload_target_name(BankLayout::Generic, "#firmware"),
+            "firmware"
+        );
+        assert_eq!(
+            payload_target_name(BankLayout::Generic, "#config"),
+            "config"
+        );
+        // The real rt payload URI lands verbatim — what the m7loader expects.
+        assert_eq!(
+            payload_target_name(BankLayout::Generic, "#rt-firmware.s19"),
+            "rt-firmware.s19"
         );
     }
 }
