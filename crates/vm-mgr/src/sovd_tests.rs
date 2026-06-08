@@ -169,27 +169,6 @@ async fn put_json(
     (status, json)
 }
 
-async fn post_bytes(
-    router: &axum::Router,
-    uri: &str,
-    data: Vec<u8>,
-) -> (StatusCode, serde_json::Value) {
-    let resp = router
-        .clone()
-        .oneshot(
-            Request::post(uri)
-                .header("content-type", "application/octet-stream")
-                .body(Body::from(data))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    (status, json)
-}
-
 async fn post_json(
     router: &axum::Router,
     uri: &str,
@@ -497,32 +476,50 @@ async fn session_change_resets_security() {
 }
 
 // ============================================================
-// Flash gating
+// Flash authorization (native SOVD: bearer token, not a UDS session)
 // ============================================================
 
 #[tokio::test]
-async fn flash_rejected_in_default_session() {
+async fn flash_accepted_without_uds_session() {
+    // supernova is a native SOVD server: privileged /updates is authorized by
+    // the bearer token (ISO 17978-3 §5.4.4), NOT a UDS programming session. With
+    // the legacy UDS session/security gate dropped (and auth not yet enforced), a
+    // flash in the default, locked session is accepted — no programming/unlock
+    // dance. This is the path rig + provision drive.
     let (router, _, keys) = make_router();
-    let envelope = make_test_suit_envelope(&keys, "vm1", 1, &[0xAA; 256]);
-    let (status, _) = post_bytes(&router, "/vehicle/v1/components/vm1/files", envelope).await;
-    // Should be rejected — not in programming session
-    assert_ne!(status, StatusCode::CREATED);
-}
+    // Deliberately NO unlock_for_flash — default session, security locked.
 
-#[tokio::test]
-async fn flash_rejected_when_locked() {
-    let (router, _, keys) = make_router();
-    // Programming but no security unlock
-    put_json(
+    let image = vec![0xBB; 2048];
+    let envelope = make_test_suit_envelope(&keys, "vm1", 2, &image);
+
+    // POST /updates calls backend.start_flash (require_flash_access) — previously
+    // rejected 409 "Session change required: programming" without a session.
+    let (status, body) = post_json(
         &router,
-        "/vehicle/v1/components/vm1/modes/session",
-        serde_json::json!({"value": "programming"}),
+        "/vehicle/v1/components/vm1/updates",
+        serde_json::json!({}),
     )
     .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "register_update without unlock: {body}"
+    );
+    let update_id = body["update_id"].as_str().unwrap().to_string();
 
-    let envelope = make_test_suit_envelope(&keys, "vm1", 1, &[0xAA; 256]);
-    let (status, _) = post_bytes(&router, "/vehicle/v1/components/vm1/files", envelope).await;
-    assert_ne!(status, StatusCode::CREATED);
+    // PUT /bulk-data/manifest — the exact upload that hit the 409 gate in the
+    // provision flow; now accepted unauthenticated (server warns).
+    let (status, _) = put_bytes(
+        &router,
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/bulk-data/manifest"),
+        envelope,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "manifest upload without unlock"
+    );
 }
 
 // ============================================================

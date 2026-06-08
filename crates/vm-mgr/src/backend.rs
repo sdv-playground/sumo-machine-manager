@@ -1669,14 +1669,28 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         Ok(id)
     }
 
+    /// Authorization gate for privileged flash operations.
+    ///
+    /// supernova is a **native SOVD server**, not a UDS ECU front, so privileged
+    /// `/updates` is authorized by the **bearer token** (ISO 17978-3 §5.4.4), not
+    /// a UDS programming session. The legacy UDS session/security dance has been
+    /// dropped from this path — it leaked the UDS model into a native server, and
+    /// the native-SOVD drivers (rig, provision) never run it. `modes/session` +
+    /// `modes/security` stay for clients that still set them (classic campaign
+    /// unlock), but are no longer *required* to flash.
+    ///
+    /// Until the SOVDd TLS+JWT auth slice lands the bearer token isn't visible to
+    /// the backend, so privileged flash is accepted and we warn. Flip this to a
+    /// 401 token check (absent/invalid token) once auth enforces.
     fn require_flash_access(&self) -> BackendResult<()> {
-        let session = self.session.lock().unwrap();
-        if *session != SessionState::Programming {
-            return Err(BackendError::SessionRequired("programming".to_string()));
-        }
-        let security = self.security.lock().unwrap();
-        if security.phase != SecurityPhase::Unlocked {
-            return Err(BackendError::SecurityRequired(1));
+        let in_programming = *self.session.lock().unwrap() == SessionState::Programming;
+        let unlocked = self.security.lock().unwrap().phase == SecurityPhase::Unlocked;
+        if !(in_programming && unlocked) {
+            tracing::warn!(
+                bank_set = ?self.bank_set,
+                "privileged flash operation accepted unauthenticated — authorize with a \
+                 bearer token (ISO 17978-3 §5.4.4) once the SOVD auth slice enforces it"
+            );
         }
         Ok(())
     }
