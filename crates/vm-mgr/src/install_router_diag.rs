@@ -130,6 +130,12 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.ecu_reset(reset_type).await
     }
 
+    // Entity status (§7.19.2: ready/notReady + x-sumo-runtime boot_count) —
+    // delegated to the engine, which owns the heartbeat + NV boot counter.
+    async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {
+        self.engine.read_entity_status().await
+    }
+
     // -----------------------------------------------------------------
     // Faults — delegated to the engine (NV-backed DTC store).
     // -----------------------------------------------------------------

@@ -3175,6 +3175,52 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         }
     }
 
+    /// Read the entity's runtime status — ISO 17978-3 §7.19.2. Liveness comes
+    /// from the guest heartbeat (`ready` = running + a fresh heartbeat; otherwise
+    /// `notReady`); non-guest components (no vm-service addr) are present-by-
+    /// definition → `ready` (mirrors `guest_is_running`). The vendor
+    /// `x-sumo-runtime` block (§5.4.5) carries the per-component `boot_count` (the
+    /// NV trial counter, bumped on each (re)boot — see `ecu_reset`/`process_boot`)
+    /// that an orchestrator reads to verify a reset took effect, plus the
+    /// heartbeat seq as a liveness signal.
+    async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {
+        let health = match &self.vm_service_addr {
+            Some(socket) => query_vm_health(socket, &self.entity_info.id).await,
+            None => None,
+        };
+        let status = if self.vm_service_addr.is_none()
+            || health
+                .as_ref()
+                .is_some_and(|h| h.status == "running" && h.guest_state == 1)
+        {
+            EntityStatus::Ready
+        } else {
+            EntityStatus::NotReady
+        };
+
+        let boot_count: u64 = self
+            .nv
+            .lock()
+            .unwrap()
+            .read_boot_state()
+            .map(|s| s.banks[self.bank_set.as_index()].boot_count as u64)
+            .unwrap_or(0);
+
+        let mut runtime = serde_json::Map::new();
+        runtime.insert("boot_count".into(), serde_json::json!(boot_count));
+        if let Some(h) = &health {
+            runtime.insert("hb_seq".into(), serde_json::json!(h.hb_seq));
+        }
+        let mut extensions = serde_json::Map::new();
+        extensions.insert("x-sumo-runtime".into(), serde_json::Value::Object(runtime));
+
+        Ok(EntityStatusBody {
+            status,
+            extensions,
+            ..Default::default()
+        })
+    }
+
     async fn ecu_reset(&self, _reset_type: u8) -> BackendResult<Option<u8>> {
         // VM "reset" — simulate reboot:
         // 1. Switch running_bank to NV active_bank (the bank install() staged)
