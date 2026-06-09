@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::Router;
-use machine_mgr::{Machine, MachineError};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use machine_mgr::{Component, FlashId, FlashState, Machine, MachineError};
+use sovd_core::{OperationExecution, OperationStatus};
 
 /// Build the `x-sumo-csr` route.
 ///
@@ -67,4 +68,302 @@ pub fn csr_router(machine: Arc<dyn Machine>) -> Router {
             }
         }),
     )
+}
+
+/// Which way a node-level verdict resolves the node's in-trial components.
+#[derive(Clone, Copy)]
+enum Verdict {
+    Commit,
+    Rollback,
+}
+
+impl Verdict {
+    /// Vendor operation id (also the synthetic execution id — the op is
+    /// synchronous, so there is no execution resource to GET).
+    fn op_id(self) -> &'static str {
+        match self {
+            Verdict::Commit => "x-sumo-commit-trials",
+            Verdict::Rollback => "x-sumo-rollback-trials",
+        }
+    }
+
+    /// Result key under which the acted-on component ids are reported.
+    fn acted_key(self) -> &'static str {
+        match self {
+            Verdict::Commit => "committed",
+            Verdict::Rollback => "rolled_back",
+        }
+    }
+}
+
+/// Outcome of fanning a verdict out across a node's components.
+struct VerdictOutcome {
+    /// Components the verdict acted on (committed / rolled back).
+    acted: Vec<String>,
+    /// Components skipped — no activation concept, singleshot, or already
+    /// committed. Reported for visibility, not an error.
+    skipped: Vec<String>,
+    /// Per-component failures, `"{id}: {err}"`.
+    errors: Vec<String>,
+}
+
+/// Fan a commit/rollback verdict out across a node's components.
+///
+/// A component is part of the node's update *session* iff it is currently in
+/// trial — `supports_rollback && state == Activated`. That predicate is
+/// derived from NV (`activation_state` reports `Activated` for an uncommitted
+/// banked component even after the node reboot that wiped the in-memory
+/// `/updates` sessions), so the set is identical before and after the reboot —
+/// which is why a post-reboot verdict needs no per-component session to
+/// re-attach. Singleshot / HSM components report `supports_rollback == false`
+/// (or no activation state) and are skipped. Idempotent: an already-committed
+/// component is no longer `Activated`, so a re-issued verdict skips it.
+async fn run_verdict(components: &[Arc<dyn Component>], verdict: Verdict) -> VerdictOutcome {
+    let mut out = VerdictOutcome {
+        acted: Vec::new(),
+        skipped: Vec::new(),
+        errors: Vec::new(),
+    };
+    for comp in components {
+        let st = match comp.activation_state().await {
+            Ok(Some(st)) => st,
+            Ok(None) => {
+                out.skipped.push(comp.id().to_string());
+                continue;
+            }
+            Err(e) => {
+                out.errors
+                    .push(format!("{}: activation_state: {e}", comp.id()));
+                continue;
+            }
+        };
+        if !(st.supports_rollback && st.state == FlashState::Activated) {
+            out.skipped.push(comp.id().to_string());
+            continue;
+        }
+        // commit/rollback act on the active bank from NV; the per-component
+        // session id is gone after the reboot, so the FlashId is advisory.
+        let id = FlashId::new("");
+        let res = match verdict {
+            Verdict::Commit => comp.commit_install(&id).await,
+            Verdict::Rollback => comp.rollback_install(&id).await,
+        };
+        match res {
+            Ok(()) => out.acted.push(comp.id().to_string()),
+            Err(e) => out.errors.push(format!("{}: {e}", comp.id())),
+        }
+    }
+    out
+}
+
+/// Render a [`VerdictOutcome`] as an ISO 17978-3 §7.14 operation execution.
+fn verdict_response(verdict: Verdict, out: VerdictOutcome) -> axum::response::Response {
+    let failed = !out.errors.is_empty();
+    let mut result = serde_json::Map::new();
+    result.insert(
+        verdict.acted_key().to_string(),
+        serde_json::json!(out.acted),
+    );
+    result.insert("skipped".to_string(), serde_json::json!(out.skipped));
+    let now = chrono::Utc::now();
+    let body = OperationExecution {
+        execution_id: verdict.op_id().to_string(),
+        operation_id: verdict.op_id().to_string(),
+        status: if failed {
+            OperationStatus::Failed
+        } else {
+            OperationStatus::Completed
+        },
+        result: Some(serde_json::Value::Object(result)),
+        error: failed.then(|| out.errors.join("; ")),
+        started_at: now,
+        completed_at: Some(now),
+    };
+    let code = if failed {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    };
+    (code, Json(body)).into_response()
+}
+
+async fn handle_verdict(machine: Arc<dyn Machine>, verdict: Verdict) -> axum::response::Response {
+    let out = run_verdict(machine.components(), verdict).await;
+    let acted = out.acted.len();
+    let skipped = out.skipped.len();
+    let errors = out.errors.len();
+    tracing::info!(
+        op = verdict.op_id(),
+        acted,
+        skipped,
+        errors,
+        "node-level verdict fanned out across the registry"
+    );
+    verdict_response(verdict, out)
+}
+
+/// Build the node-level commit/rollback verdict routes.
+///
+/// Wire (ISO 17978-3 §7.14 operation executions, at the **entity root**):
+///
+///   `POST /vehicle/v1/operations/x-sumo-commit-trials/executions`
+///   `POST /vehicle/v1/operations/x-sumo-rollback-trials/executions`
+///
+/// The orchestrator issues ONE verdict per node per campaign step — the update
+/// *session* is the commit unit, never a single component. Entity-root
+/// addressing (no `{id}` segment) keeps these clear of the dynamic
+/// `/components/{id}/operations/{op_id}/...` routes (mirrors the entity-root
+/// `factory-reset` op) and means there is no per-component `/updates` session
+/// to re-attach after the node reboot — membership is the NV-derived in-trial
+/// set, identical before and after the reboot. Vendor extensions live here in
+/// sumo-mm, not SOVDd (the three-layer rule, like `csr_router`).
+pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
+    let commit = machine.clone();
+    Router::new()
+        .route(
+            "/vehicle/v1/operations/x-sumo-commit-trials/executions",
+            post(move || {
+                let machine = commit.clone();
+                async move { handle_verdict(machine, Verdict::Commit).await }
+            }),
+        )
+        .route(
+            "/vehicle/v1/operations/x-sumo-rollback-trials/executions",
+            post(move || {
+                let machine = machine.clone();
+                async move { handle_verdict(machine, Verdict::Rollback).await }
+            }),
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use machine_mgr::{
+        ActivationState, Capabilities, FlashCaps, LifecycleCaps, MachineResult, ResetKind,
+    };
+
+    /// Minimal `Component` whose `activation_state` is fixed at construction
+    /// and which counts commit/rollback calls. Only `id` + `capabilities` are
+    /// required by the trait; everything else takes the `NotSupported` default.
+    struct VerdictStub {
+        id: &'static str,
+        state: Option<ActivationState>,
+        commits: AtomicUsize,
+        rollbacks: AtomicUsize,
+        capabilities: Capabilities,
+    }
+
+    impl VerdictStub {
+        fn new(id: &'static str, supports_rollback: bool, state: Option<FlashState>) -> Self {
+            Self {
+                id,
+                state: state.map(|s| ActivationState {
+                    supports_rollback,
+                    state: s,
+                    active_version: None,
+                    previous_version: None,
+                    reset_kind: ResetKind::Local,
+                }),
+                commits: AtomicUsize::new(0),
+                rollbacks: AtomicUsize::new(0),
+                capabilities: Capabilities {
+                    did_store: false,
+                    flash: Some(FlashCaps {
+                        dual_bank: supports_rollback,
+                        supports_rollback,
+                        supports_trial_boot: supports_rollback,
+                        abortable_after_finalize: false,
+                        reset_kind: ResetKind::Local,
+                    }),
+                    lifecycle: Some(LifecycleCaps {
+                        restartable: false,
+                        has_runtime_state: false,
+                    }),
+                    hsm: None,
+                    dtcs: false,
+                    clear_dtcs: false,
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Component for VerdictStub {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.capabilities
+        }
+        async fn activation_state(&self) -> MachineResult<Option<ActivationState>> {
+            Ok(self.state.clone())
+        }
+        async fn commit_install(&self, _id: &FlashId) -> MachineResult<()> {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn rollback_install(&self, _id: &FlashId) -> MachineResult<()> {
+            self.rollbacks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn components(stubs: &[Arc<VerdictStub>]) -> Vec<Arc<dyn Component>> {
+        stubs
+            .iter()
+            .map(|s| s.clone() as Arc<dyn Component>)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn commits_only_in_trial_banked_components() {
+        // A banked component in trial, a banked component already committed, a
+        // singleshot (no rollback), and one with no activation concept.
+        let in_trial = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let already = Arc::new(VerdictStub::new("vm2", true, Some(FlashState::Committed)));
+        let singleshot = Arc::new(VerdictStub::new("hsm", false, Some(FlashState::Complete)));
+        let no_activation = Arc::new(VerdictStub::new("misc", false, None));
+        let comps = components(&[
+            in_trial.clone(),
+            already.clone(),
+            singleshot.clone(),
+            no_activation.clone(),
+        ]);
+
+        let out = run_verdict(&comps, Verdict::Commit).await;
+
+        assert_eq!(out.acted, vec!["vm1".to_string()]);
+        assert!(out.errors.is_empty());
+        assert_eq!(in_trial.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(already.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(singleshot.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(no_activation.commits.load(Ordering::SeqCst), 0);
+        assert!(out.skipped.contains(&"vm2".to_string()));
+        assert!(out.skipped.contains(&"hsm".to_string()));
+        assert!(out.skipped.contains(&"misc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn empty_in_trial_set_is_a_noop_success() {
+        // Nothing in trial (idempotent re-issue after a successful commit).
+        let already = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
+        let comps = components(&[already]);
+        let out = run_verdict(&comps, Verdict::Commit).await;
+        assert!(out.acted.is_empty());
+        assert!(out.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rollback_acts_on_the_in_trial_set() {
+        let in_trial = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let comps = components(std::slice::from_ref(&in_trial));
+        let out = run_verdict(&comps, Verdict::Rollback).await;
+        assert_eq!(out.acted, vec!["vm1".to_string()]);
+        assert_eq!(in_trial.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(in_trial.commits.load(Ordering::SeqCst), 0);
+    }
 }
