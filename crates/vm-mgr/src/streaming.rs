@@ -589,7 +589,7 @@ fn process_payload_sync(
         let first_n = read_exact_or_eof(&mut decrypt_reader, &mut first_buf)?;
 
         if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
-            // Encrypted + compressed: chain through ruzstd
+            // Encrypted + compressed: chain through zstd (libzstd)
             let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
             process_decompressed(prefixed, expected_digest, writer)
         } else {
@@ -684,8 +684,11 @@ fn process_decompressed<R: Read>(
         inner: reader,
         stats: in_stats.clone(),
     };
+    // Native libzstd (the `zstd` crate) — ~10x the pure-Rust ruzstd on the A53.
+    // `Decoder::new` wraps the input in a BufReader; the digest is identical
+    // (zstd output is deterministic), so the bank hash still matches.
     let mut decoder =
-        ruzstd::StreamingDecoder::new(timed).map_err(|e| format!("zstd init: {e}"))?;
+        zstd::stream::read::Decoder::new(timed).map_err(|e| format!("zstd init: {e}"))?;
 
     let mut hasher = Sha256::new();
     let mut total = 0usize;

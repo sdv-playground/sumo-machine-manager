@@ -10,7 +10,9 @@ sha2 = "0.10"
 crc32fast = "1"
 bytes = "1"
 futures = "0.3"
-ruzstd = "0.7"
+# Native libzstd (C). Pure-Rust ruzstd decompressed the OTA rootfs at only
+# ~45 MB/s on the A53 (the #2 upload cost after decrypt); libzstd is ~10x.
+zstd = "0.13"
 coset = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 serde = { version = "1", features = ["derive"] }
