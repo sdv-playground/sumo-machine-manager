@@ -287,7 +287,7 @@ pub fn build_manifest(
     identity: IvdIdentity,
 ) -> Result<IvdManifest, IvdError> {
     let mut files = Vec::new();
-    collect_files(bank_dir, bank_dir, &mut files)?;
+    collect_files(bank_dir, bank_dir, &mut files, true)?;
     Ok(build_manifest_from_files(files, gen, identity))
 }
 
@@ -322,7 +322,12 @@ pub fn build_manifest_from_files(
     }
 }
 
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<IvdFile>) -> Result<(), IvdError> {
+fn collect_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<IvdFile>,
+    with_hashes: bool,
+) -> Result<(), IvdError> {
     let entries = fs::read_dir(dir).map_err(|e| IvdError::Io(e, dir.to_path_buf()))?;
     for entry in entries {
         let entry = entry.map_err(|e| IvdError::Io(e, dir.to_path_buf()))?;
@@ -341,7 +346,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<IvdFile>) -> Result<(), 
             .map_err(|e| IvdError::Io(e, path.clone()))?;
 
         if meta.file_type().is_dir() {
-            collect_files(root, &path, out)?;
+            collect_files(root, &path, out, with_hashes)?;
             continue;
         }
         if !meta.file_type().is_file() {
@@ -358,8 +363,17 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<IvdFile>) -> Result<(), 
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
 
-        let (sha256, size) =
-            sha256_file(&path, hash_block_size()).map_err(|e| IvdError::Io(e, path.clone()))?;
+        // Verify's unexpected-file scan needs only the path inventory, so it
+        // passes `with_hashes = false`. Skipping the hash here is what stops
+        // the bank — notably the ~600 MB rootfs — from being hashed TWICE per
+        // verify (once here, once in the compare loop below); `size` stays
+        // correct from cheap metadata. Sign passes `true`: the manifest needs
+        // the real digests.
+        let (sha256, size) = if with_hashes {
+            sha256_file(&path, hash_block_size()).map_err(|e| IvdError::Io(e, path.clone()))?
+        } else {
+            (Vec::new(), meta.len())
+        };
         out.push(IvdFile {
             relative_path,
             sha256,
@@ -415,7 +429,7 @@ pub fn sign_bank(
 ) -> Result<IvdManifest, IvdError> {
     let hash_start = std::time::Instant::now();
     let mut files = Vec::new();
-    collect_files(bank_dir, bank_dir, &mut files)?;
+    collect_files(bank_dir, bank_dir, &mut files, true)?;
     let hash_ms = hash_start.elapsed().as_millis() as u64;
     sign_bank_with_files(hsm, bank_dir, gen, identity, files, Some(hash_ms))
 }
@@ -585,7 +599,7 @@ fn verify_bank_inner(
 
     let mut on_disk = std::collections::BTreeSet::new();
     let mut probe = Vec::new();
-    collect_files(bank_dir, bank_dir, &mut probe)?;
+    collect_files(bank_dir, bank_dir, &mut probe, false)?;
     for f in &probe {
         on_disk.insert(f.relative_path.clone());
     }
@@ -614,10 +628,11 @@ fn verify_bank_inner(
 
         // Stream the file through SHA-256 in `block`-byte chunks — identical
         // digest to hashing the whole file at once, but constant memory + large
-        // sequential reads. Measured on-device (S32G3, fresh 593 MB rootfs,
-        // cold cache): ~2.6x faster than the old whole-file `fs::read` + digest
-        // (~28.5 s → ~11 s) — the whole-file read + the 593 MB allocation, not
-        // the SHA math, was the slow part.
+        // sequential reads. This is the bank's ONE hash pass: `collect_files`
+        // above no longer re-hashes for the on-disk path scan. On-device
+        // (S32G3, fresh 593 MB rootfs, cold cache) the single streamed pass is
+        // ~11 s (~54 MB/s) — vs ~22 s back when the rootfs was hashed twice,
+        // and ~28 s for the old whole-file `fs::read` + 593 MB allocation.
         let file_start = std::time::Instant::now();
         let (actual, size) = match sha256_file(&path, block) {
             Ok(r) => r,
