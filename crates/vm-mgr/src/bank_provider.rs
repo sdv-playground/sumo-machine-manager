@@ -385,7 +385,13 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         std::fs::create_dir_all(&bank_dir)?;
         let path = bank_dir.join(name);
         let file = std::fs::File::create(&path)?;
-        Ok(Box::new(BufWriter::new(file)))
+        // 4 MiB buffer (vs the 8 KiB default): the OTA pipeline writes the
+        // decompressed bank in 64 KiB chunks, and after the decrypt+decompress
+        // speedups the eMMC write became the #1 upload stage (~80 MB/s). Larger,
+        // fewer write() syscalls give the device better sequential-write
+        // throughput. Flushed by the pipeline before the sink is dropped.
+        const WRITE_BUF: usize = 4 * 1024 * 1024;
+        Ok(Box::new(BufWriter::with_capacity(WRITE_BUF, file)))
     }
 
     fn seal(&self, bank: Bank, identity: FirmwareIdentity, gen: u64) -> Result<(), BankError> {
