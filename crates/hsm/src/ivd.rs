@@ -605,15 +605,15 @@ fn verify_bank_inner(
         .collect();
     let mut total_bytes: u64 = 0;
     let block = hash_block_size();
-    let bench = std::env::var("SUMO_IVD_HASH_BENCH").is_ok();
     for claim in manifest.files.iter() {
         let path = bank_dir.join(&claim.relative_path);
 
         // Stream the file through SHA-256 in `block`-byte chunks — identical
         // digest to hashing the whole file at once, but constant memory + large
-        // sequential reads. (The old whole-file `fs::read` of a 646 MB rootfs
-        // was the slow part of verify, not the SHA math.)
-        let stream_start = std::time::Instant::now();
+        // sequential reads. Measured on-device (S32G3, 593 MB rootfs, cold
+        // cache): ~2.6x faster than the old whole-file `fs::read` + digest
+        // (~28.5 s → ~11 s) — the whole-file read + the 593 MB allocation, not
+        // the SHA math, was the slow part.
         let (actual, size) = match sha256_file(&path, block) {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -621,26 +621,6 @@ fn verify_bank_inner(
             }
             Err(e) => return Err(IvdError::Io(e, path)),
         };
-        let stream_ms = stream_start.elapsed().as_millis() as u64;
-
-        // A/B benchmark hook (set SUMO_IVD_HASH_BENCH): also hash the OLD way
-        // (whole-file `fs::read` + digest) and log both timings + that the two
-        // digests match. Off by default — it doubles the I/O. Tune the streamed
-        // block size with SUMO_IVD_HASH_BLOCK.
-        if bench {
-            let whole_start = std::time::Instant::now();
-            let whole = fs::read(&path).map(|b| sha256(&b));
-            let whole_ms = whole_start.elapsed().as_millis() as u64;
-            tracing::info!(
-                file = %claim.relative_path,
-                size,
-                block,
-                stream_ms,
-                whole_file_ms = whole_ms,
-                matches = matches!(&whole, Ok(h) if *h == actual),
-                "ivd hash bench: streamed vs whole-file",
-            );
-        }
 
         if size != claim.size {
             return Err(IvdError::SizeMismatch {
@@ -840,18 +820,13 @@ fn sha256_file(_path: &Path, _block_size: usize) -> std::io::Result<(Vec<u8>, u6
     panic!("hsm::ivd::sha256_file requires the `crypto` feature")
 }
 
-/// SHA-256 of `bytes`. Uses `sha2` when the `crypto` feature is on;
-/// falls back to a minimal panic on non-crypto builds (no HSM op
-/// path needs hashing without crypto).
-#[cfg(feature = "crypto")]
+/// SHA-256 of `bytes` (whole-buffer). Test-only: production bank-file hashing
+/// streams via `sha256_file`; this remains the reference digest the
+/// streaming-equivalence test checks against.
+#[cfg(all(test, feature = "crypto"))]
 fn sha256(bytes: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).to_vec()
-}
-
-#[cfg(not(feature = "crypto"))]
-fn sha256(_bytes: &[u8]) -> Vec<u8> {
-    panic!("hsm::ivd::sha256 requires the `crypto` feature")
 }
 
 #[cfg(all(test, feature = "crypto"))]
@@ -918,44 +893,6 @@ mod tests {
         let (digest, size) = sha256_file(&empty, 4096).unwrap();
         assert_eq!(digest, sha256(&[]));
         assert_eq!(size, 0);
-    }
-
-    /// Opt-in local A/B benchmark — run with
-    /// `cargo test -p hsm --features crypto --ignored bench_ -- --nocapture`.
-    /// Times the old whole-file `fs::read` + digest vs streamed `sha256_file` at
-    /// a few block sizes. NOTE: on a fast SSD with the file in page cache the gap
-    /// is understated — the production win is on slow eMMC + not allocating the
-    /// whole 646 MB rootfs. Use the on-device `SUMO_IVD_HASH_BENCH=1` path for
-    /// real numbers.
-    #[test]
-    #[ignore]
-    fn bench_streamed_vs_whole_file() {
-        use std::io::Write;
-        let dir = temp_bank("hash-bench");
-        let path = dir.join("big.bin");
-        let size = 512 * 1024 * 1024usize; // 512 MiB ≈ a real rootfs
-        {
-            let mut f = std::fs::File::create(&path).unwrap();
-            let chunk = vec![0xABu8; 4 * 1024 * 1024];
-            let mut w = 0;
-            while w < size {
-                f.write_all(&chunk).unwrap();
-                w += chunk.len();
-            }
-            f.sync_all().unwrap();
-        }
-        let t = std::time::Instant::now();
-        let whole = sha256(&std::fs::read(&path).unwrap());
-        let whole_ms = t.elapsed().as_millis();
-        eprintln!("whole-file fs::read + digest: {whole_ms} ms");
-        for block in [64 * 1024usize, 1 << 20, 4 << 20, 16 << 20] {
-            let t = std::time::Instant::now();
-            let (streamed, n) = sha256_file(&path, block).unwrap();
-            let ms = t.elapsed().as_millis();
-            assert_eq!(streamed, whole);
-            assert_eq!(n, size as u64);
-            eprintln!("streamed block={block:>9}: {ms} ms");
-        }
     }
 
     #[test]
