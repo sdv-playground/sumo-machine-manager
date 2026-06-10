@@ -630,9 +630,11 @@ fn verify_bank_inner(
         // digest to hashing the whole file at once, but constant memory + large
         // sequential reads. This is the bank's ONE hash pass: `collect_files`
         // above no longer re-hashes for the on-disk path scan. On-device
-        // (S32G3, fresh 593 MB rootfs, cold cache) the single streamed pass is
-        // ~11 s (~54 MB/s) — vs ~22 s back when the rootfs was hashed twice,
-        // and ~28 s for the old whole-file `fs::read` + 593 MB allocation.
+        // (S32G3, fresh 593 MB rootfs, cold cache): ~5 s / ~127 MB/s with the
+        // hardware SHA backend (read-bound — build.sh's +sha2 + the hsm sha2
+        // `asm` feature), or ~11 s on pure-software SHA. Both beat the ~22 s
+        // when the rootfs was hashed twice and ~28 s for the old whole-file
+        // `fs::read` + 593 MB allocation.
         let file_start = std::time::Instant::now();
         let (actual, size) = match sha256_file(&path, block) {
             Ok(r) => r,
