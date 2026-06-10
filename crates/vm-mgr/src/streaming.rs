@@ -646,6 +646,31 @@ fn process_plain<R: Read>(
     Ok((total, hash))
 }
 
+/// Accumulates time + bytes spent in an inner reader. Lets the upload pipeline
+/// split decrypt vs decompress: the zstd decoder reads *through* this shim, so
+/// the time recorded here is the decrypt/channel cost, and the decoder's own
+/// read time minus this is the pure decompress cost. Bytes counted are the
+/// compressed (post-decrypt) bytes the decoder consumed.
+#[derive(Default)]
+struct ReadStats {
+    nanos: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+struct TimedReader<R> {
+    inner: R,
+    stats: std::sync::Arc<ReadStats>,
+}
+impl<R: Read> Read for TimedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let t = std::time::Instant::now();
+        let n = self.inner.read(buf)?;
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.stats.nanos.fetch_add(t.elapsed().as_nanos() as u64, o);
+        self.stats.bytes.fetch_add(n as u64, o);
+        Ok(n)
+    }
+}
+
 /// Process a compressed stream: decompress → hash → write to the provider's
 /// sink. Same `writer` contract as [`process_plain`] (flushed before return).
 fn process_decompressed<R: Read>(
@@ -653,23 +678,36 @@ fn process_decompressed<R: Read>(
     expected_digest: &[u8],
     mut writer: Option<Box<dyn IoWrite + Send>>,
 ) -> Result<(usize, [u8; 32]), String> {
+    // Time the decrypt stage by reading the decoder's input through a shim.
+    let in_stats = std::sync::Arc::new(ReadStats::default());
+    let timed = TimedReader {
+        inner: reader,
+        stats: in_stats.clone(),
+    };
     let mut decoder =
-        ruzstd::StreamingDecoder::new(reader).map_err(|e| format!("zstd init: {e}"))?;
+        ruzstd::StreamingDecoder::new(timed).map_err(|e| format!("zstd init: {e}"))?;
 
     let mut hasher = Sha256::new();
     let mut total = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
+    let (mut up_ns, mut hash_ns, mut write_ns) = (0u64, 0u64, 0u64);
 
     loop {
+        let t0 = std::time::Instant::now();
         let n = decoder
             .read(&mut buf)
             .map_err(|e| format!("decompress: {e}"))?;
+        up_ns += t0.elapsed().as_nanos() as u64;
         if n == 0 {
             break;
         }
+        let t1 = std::time::Instant::now();
         hasher.update(&buf[..n]);
+        hash_ns += t1.elapsed().as_nanos() as u64;
         if let Some(ref mut w) = writer {
+            let t2 = std::time::Instant::now();
             w.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
+            write_ns += t2.elapsed().as_nanos() as u64;
         }
         total += n;
     }
@@ -677,6 +715,33 @@ fn process_decompressed<R: Read>(
     if let Some(ref mut w) = writer {
         w.flush().map_err(|e| format!("flush: {e}"))?;
     }
+
+    // Stage breakdown: decrypt from the shim; decompress = decoder time minus
+    // decrypt; hash/write timed inline. `decrypt_mb_s` is over ciphertext bytes;
+    // the rest over the decompressed output. One line per payload (OTA only).
+    let o = std::sync::atomic::Ordering::Relaxed;
+    let decrypt_ms = in_stats.nanos.load(o) / 1_000_000;
+    let in_bytes = in_stats.bytes.load(o);
+    let decompress_ms = (up_ns / 1_000_000).saturating_sub(decrypt_ms);
+    let mb_s = |bytes: u64, ms: u64| -> u64 {
+        if ms == 0 {
+            0
+        } else {
+            bytes.saturating_mul(1000) / (ms * 1024 * 1024)
+        }
+    };
+    tracing::info!(
+        out_mb = total / (1024 * 1024),
+        decrypt_ms,
+        decrypt_mb_s = mb_s(in_bytes, decrypt_ms),
+        decompress_ms,
+        decompress_mb_s = mb_s(total as u64, decompress_ms),
+        hash_ms = hash_ns / 1_000_000,
+        hash_mb_s = mb_s(total as u64, hash_ns / 1_000_000),
+        write_ms = write_ns / 1_000_000,
+        write_mb_s = mb_s(total as u64, write_ns / 1_000_000),
+        "payload pipeline stage timing",
+    );
 
     let hash = verify_digest(hasher, expected_digest)?;
     Ok((total, hash))
