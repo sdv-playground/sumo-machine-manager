@@ -672,56 +672,115 @@ impl<R: Read> Read for TimedReader<R> {
 }
 
 /// Process a compressed stream: decompress → hash → write to the provider's
-/// sink. Same `writer` contract as [`process_plain`] (flushed before return).
+/// sink. PIPELINED — THIS thread runs decrypt+decompress and hands decompressed
+/// chunks over a recycled buffer pool to a spawned consumer thread that hashes +
+/// writes them, so the two halves overlap and wall-time is ~max(decrypt+
+/// decompress, hash+write) instead of their sum. The consumer is the spawned
+/// side because the decrypt reader is not `Send`, whereas the hasher and the
+/// `'static + Send` writer are. Buffers are recycled (not per-chunk allocated)
+/// so the producer's alloc and consumer's free don't serialize on the global
+/// allocator lock. Output order is preserved, so the digest is unchanged. Same
+/// `writer` contract as [`process_plain`] (flushed before return).
 fn process_decompressed<R: Read>(
     reader: R,
     expected_digest: &[u8],
-    mut writer: Option<Box<dyn IoWrite + Send>>,
+    writer: Option<Box<dyn IoWrite + Send>>,
 ) -> Result<(usize, [u8; 32]), String> {
-    // Time the decrypt stage by reading the decoder's input through a shim.
+    use std::sync::mpsc::sync_channel;
+
     let in_stats = std::sync::Arc::new(ReadStats::default());
+    let wall = std::time::Instant::now();
+    // Buffer POOL, not per-chunk allocation. The producer fills a recycled
+    // buffer and hands it over (`full`); the consumer processes it and returns
+    // it (`free`). Recycling avoids ~9500 per-chunk 64 KiB malloc/free per
+    // upload — on QNX the global allocator lock otherwise serializes the
+    // producer's alloc against the consumer's free. The pool must also be LARGER
+    // than the write burst: the 4 MiB BufWriter flushes eMMC in bursts, and a
+    // pool smaller than that stalls the producer (full pool) during every flush,
+    // so the two halves never overlap. 256 * 64 KiB = 16 MiB covers several
+    // flushes of runway (the device has GBs free).
+    const POOL: usize = 256;
+    const CHUNK: usize = 64 * 1024;
+    let (full_tx, full_rx) = sync_channel::<Vec<u8>>(POOL);
+    let (free_tx, free_rx) = sync_channel::<Vec<u8>>(POOL);
+    for _ in 0..POOL {
+        free_tx.send(vec![0u8; CHUNK]).ok();
+    }
+
+    // Consumer thread: hash + write each chunk in stream (receive = send) order.
+    // Returns the computed digest + busy times; the caller checks the digest
+    // (expected_digest is borrowed, so it stays on this thread).
+    let consumer = std::thread::spawn(move || -> Result<(usize, [u8; 32], u64, u64), String> {
+        let mut hasher = Sha256::new();
+        let mut writer = writer;
+        let mut total = 0usize;
+        let (mut hash_ns, mut write_ns) = (0u64, 0u64);
+        while let Ok(chunk) = full_rx.recv() {
+            let t1 = std::time::Instant::now();
+            hasher.update(&chunk);
+            hash_ns += t1.elapsed().as_nanos() as u64;
+            if let Some(w) = writer.as_mut() {
+                let t2 = std::time::Instant::now();
+                w.write_all(&chunk).map_err(|e| format!("write: {e}"))?;
+                write_ns += t2.elapsed().as_nanos() as u64;
+            }
+            total += chunk.len();
+            // Return the buffer for reuse (producer may be gone → ignore).
+            let mut chunk = chunk;
+            chunk.clear();
+            let _ = free_tx.send(chunk);
+        }
+        if let Some(w) = writer.as_mut() {
+            w.flush().map_err(|e| format!("flush: {e}"))?;
+        }
+        let digest: [u8; 32] = hasher.finalize().into();
+        Ok((total, digest, hash_ns, write_ns))
+    });
+
+    // Producer (this thread): decrypt (via the timing shim) + decompress, stream
+    // chunks to the consumer. Run in a closure so a producer error doesn't skip
+    // joining the consumer.
     let timed = TimedReader {
         inner: reader,
         stats: in_stats.clone(),
     };
-    // Native libzstd (the `zstd` crate) — ~10x the pure-Rust ruzstd on the A53.
-    // `Decoder::new` wraps the input in a BufReader; the digest is identical
-    // (zstd output is deterministic), so the bank hash still matches.
-    let mut decoder =
-        zstd::stream::read::Decoder::new(timed).map_err(|e| format!("zstd init: {e}"))?;
-
-    let mut hasher = Sha256::new();
-    let mut total = 0usize;
-    let mut buf = vec![0u8; 64 * 1024];
-    let (mut up_ns, mut hash_ns, mut write_ns) = (0u64, 0u64, 0u64);
-
-    loop {
-        let t0 = std::time::Instant::now();
-        let n = decoder
-            .read(&mut buf)
-            .map_err(|e| format!("decompress: {e}"))?;
-        up_ns += t0.elapsed().as_nanos() as u64;
-        if n == 0 {
-            break;
+    let mut up_ns = 0u64;
+    let produce = (|| -> Result<(), String> {
+        // Native libzstd — ~10x pure-Rust ruzstd on the A53; deterministic
+        // output, so the bank digest is unchanged.
+        let mut decoder =
+            zstd::stream::read::Decoder::new(timed).map_err(|e| format!("zstd init: {e}"))?;
+        loop {
+            // Take a recycled buffer (alloc only if the pool ever runs dry).
+            let mut buf = free_rx.recv().unwrap_or_else(|_| vec![0u8; CHUNK]);
+            buf.resize(CHUNK, 0);
+            let t0 = std::time::Instant::now();
+            let n = decoder
+                .read(&mut buf)
+                .map_err(|e| format!("decompress: {e}"))?;
+            up_ns += t0.elapsed().as_nanos() as u64;
+            if n == 0 {
+                break;
+            }
+            buf.truncate(n);
+            // Err => consumer dropped full_rx (write error): stop early.
+            if full_tx.send(buf).is_err() {
+                break;
+            }
         }
-        let t1 = std::time::Instant::now();
-        hasher.update(&buf[..n]);
-        hash_ns += t1.elapsed().as_nanos() as u64;
-        if let Some(ref mut w) = writer {
-            let t2 = std::time::Instant::now();
-            w.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
-            write_ns += t2.elapsed().as_nanos() as u64;
-        }
-        total += n;
-    }
+        Ok(())
+    })();
+    drop(full_tx); // signal the consumer that no more chunks are coming
 
-    if let Some(ref mut w) = writer {
-        w.flush().map_err(|e| format!("flush: {e}"))?;
-    }
+    // Consumer errors (write/flush/panic) surface first; then the producer error.
+    let (total, digest, hash_ns, write_ns) = consumer
+        .join()
+        .map_err(|_| "hash/write thread panicked".to_string())??;
+    produce?;
 
-    // Stage breakdown: decrypt from the shim; decompress = decoder time minus
-    // decrypt; hash/write timed inline. `decrypt_mb_s` is over ciphertext bytes;
-    // the rest over the decompressed output. One line per payload (OTA only).
+    // Per-stage BUSY times: decrypt/decompress (this thread) and hash/write (the
+    // consumer) overlap, so their sum exceeds `wall_ms` — that gap is the win.
+    // `decrypt_mb_s` is over ciphertext bytes; the rest over decompressed output.
     let o = std::sync::atomic::Ordering::Relaxed;
     let decrypt_ms = in_stats.nanos.load(o) / 1_000_000;
     let in_bytes = in_stats.bytes.load(o);
@@ -735,6 +794,7 @@ fn process_decompressed<R: Read>(
     };
     tracing::info!(
         out_mb = total / (1024 * 1024),
+        wall_ms = wall.elapsed().as_millis() as u64,
         decrypt_ms,
         decrypt_mb_s = mb_s(in_bytes, decrypt_ms),
         decompress_ms,
@@ -743,11 +803,13 @@ fn process_decompressed<R: Read>(
         hash_mb_s = mb_s(total as u64, hash_ns / 1_000_000),
         write_ms = write_ns / 1_000_000,
         write_mb_s = mb_s(total as u64, write_ns / 1_000_000),
-        "payload pipeline stage timing",
+        "payload pipeline stage timing (pipelined; sum > wall_ms)",
     );
 
-    let hash = verify_digest(hasher, expected_digest)?;
-    Ok((total, hash))
+    if digest.as_slice() != expected_digest {
+        return Err("image digest mismatch".into());
+    }
+    Ok((total, digest))
 }
 
 fn verify_digest(hasher: Sha256, expected: &[u8]) -> Result<[u8; 32], String> {
@@ -1243,4 +1305,57 @@ pub fn validate_manifest(
     manifest_provider
         .validate_header_only(manifest_bytes, min_security_ver)
         .map_err(|e| BackendError::InvalidRequest(format!("manifest validation: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    /// In-memory `Write` sink to capture exactly what the pipeline produced.
+    struct VecSink(Arc<Mutex<Vec<u8>>>);
+    impl IoWrite for VecSink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The pipelined decompress must reproduce the exact bytes IN ORDER and the
+    /// correct digest — the property the producer/consumer split could break.
+    #[test]
+    fn pipelined_decompress_roundtrips_bytes_and_digest() {
+        // ~3 MiB (> the 2 MiB channel) so the bounded channel fills and the
+        // producer/consumer overlap + backpressure across many chunks.
+        let original: Vec<u8> = (0..3_000_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let expected = Sha256::digest(&original).to_vec();
+        let compressed = zstd::encode_all(&original[..], 3).unwrap();
+
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let writer: Box<dyn IoWrite + Send> = Box::new(VecSink(out.clone()));
+        let (total, digest) =
+            process_decompressed(Cursor::new(compressed), &expected, Some(writer)).unwrap();
+
+        assert_eq!(total, original.len(), "byte count");
+        assert_eq!(digest.as_slice(), expected.as_slice(), "digest");
+        assert_eq!(*out.lock().unwrap(), original, "bytes match, in order");
+    }
+
+    /// A wrong expected digest must still be rejected after pipelining.
+    #[test]
+    fn pipelined_decompress_rejects_wrong_digest() {
+        let original = vec![0x5Au8; 500_000];
+        let compressed = zstd::encode_all(&original[..], 3).unwrap();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let writer: Box<dyn IoWrite + Send> = Box::new(VecSink(out));
+        let res = process_decompressed(Cursor::new(compressed), &[0u8; 32], Some(writer));
+        assert!(res.is_err(), "wrong digest must be rejected");
+    }
 }
