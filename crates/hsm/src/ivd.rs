@@ -577,6 +577,10 @@ fn verify_bank_inner(
     }
 
     // ---- Phase 2: re-hash every file the manifest claims ----
+    // One-shot in-memory SHA throughput probe (logged once per process) so the
+    // per-file numbers below can be read correctly — it tells whether the
+    // hardware SHA path (`-C target-feature=+sha2`) actually engaged.
+    SHA_SELF_TEST.call_once(sha256_self_test);
     let hash_start = std::time::Instant::now();
 
     let mut on_disk = std::collections::BTreeSet::new();
@@ -610,10 +614,11 @@ fn verify_bank_inner(
 
         // Stream the file through SHA-256 in `block`-byte chunks — identical
         // digest to hashing the whole file at once, but constant memory + large
-        // sequential reads. Measured on-device (S32G3, 593 MB rootfs, cold
-        // cache): ~2.6x faster than the old whole-file `fs::read` + digest
+        // sequential reads. Measured on-device (S32G3, fresh 593 MB rootfs,
+        // cold cache): ~2.6x faster than the old whole-file `fs::read` + digest
         // (~28.5 s → ~11 s) — the whole-file read + the 593 MB allocation, not
         // the SHA math, was the slow part.
+        let file_start = std::time::Instant::now();
         let (actual, size) = match sha256_file(&path, block) {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -621,6 +626,18 @@ fn verify_bank_inner(
             }
             Err(e) => return Err(IvdError::Io(e, path)),
         };
+        // Per-file streaming time (single read — NOT the old A/B). `mb_per_s`
+        // conflates disk read + SHA; read it next to the in-memory `sha256
+        // self-test` line to separate a slow disk (e.g. a rewritten, fragmented
+        // rootfs) from a slow hash.
+        let file_ms = file_start.elapsed().as_millis().max(1) as u64;
+        tracing::info!(
+            file = %claim.relative_path,
+            size,
+            ms = file_ms,
+            mb_per_s = size.saturating_mul(1000) / (file_ms * 1024 * 1024),
+            "ivd file hashed",
+        );
 
         if size != claim.size {
             return Err(IvdError::SizeMismatch {
@@ -770,6 +787,34 @@ pub fn read_manifest_unverified(bank_dir: &Path) -> Result<VerifiedManifest, Ivd
 pub fn read_identity(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<IvdIdentity, IvdError> {
     Ok(read_manifest(hsm, bank_dir)?.manifest.identity)
 }
+
+/// One-shot in-memory SHA-256 throughput probe — hashes a fixed 64 MiB buffer
+/// with NO file I/O, isolating the SHA implementation's raw speed from storage.
+/// Logged once per process via [`SHA_SELF_TEST`]. This is how we tell whether
+/// the hardware SHA path engaged: a build with `-C target-feature=+sha2` on an
+/// ARMv8 core that has the crypto extension runs ~1-2 GB/s; the pure-software
+/// fallback is ~150-300 MB/s. (A +sha2 build on a core WITHOUT the extension
+/// faults with an illegal instruction long before this, so reaching here at
+/// software speed means +sha2 did not actually select the hardware backend.)
+#[cfg(feature = "crypto")]
+fn sha256_self_test() {
+    use sha2::{Digest, Sha256};
+    let buf = vec![0u8; 64 * 1024 * 1024];
+    let t = std::time::Instant::now();
+    let digest = Sha256::digest(&buf);
+    let ms = t.elapsed().as_millis().max(1) as u64;
+    tracing::info!(
+        mib = 64,
+        ms,
+        mb_per_s = (buf.len() as u64 * 1000) / (ms * 1024 * 1024),
+        digest0 = digest[0], // touch the result so the hash isn't optimized away
+        "sha256 self-test (in-memory): ~150-300 MB/s software, ~1-2 GB/s hw (+sha2)",
+    );
+}
+
+/// Ensures [`sha256_self_test`] logs exactly once per process.
+#[cfg(feature = "crypto")]
+static SHA_SELF_TEST: std::sync::Once = std::sync::Once::new();
 
 /// Default block size for streaming the file hash: 4 MiB. Big enough that
 /// read() syscall + readahead overhead is negligible, and the whole file is
