@@ -259,17 +259,6 @@ struct FlashTransferState {
     package_id: String,
     state: FlashState,
     image_size: u64,
-    /// Guest `boot_id` captured just before reset. `Verifying → Activated`
-    /// promotes once the live heartbeat reports a *different* boot_id —
-    /// definitive proof of a new guest lifetime. We can't compare hb_seq
-    /// here: qvm-shmem regions persist across stops/starts, so the new
-    /// daemon's seq counter starts above the old one and a "seq dropped"
-    /// check would never fire.
-    ///
-    /// `None` means the pre-reset health probe couldn't read a boot_id
-    /// (vm-service down, factory-provisioning case, etc.). Then any new
-    /// running heartbeat is accepted as a fresh boot.
-    verify_baseline_boot_id: Option<u32>,
     /// `(relative_path, size, sha256)` for each payload as the streaming
     /// pipeline wrote it into the target bank dir. Lets
     /// `ivd_sign_staged_bank` build the IVD manifest without re-reading
@@ -1776,50 +1765,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             Err(format!("vm-service returned: {status_line}"))
         }
     }
-
-    /// Whether the guest backing this component has finished its
-    /// post-update boot. Used by `get_activation_state` to lazily
-    /// promote `Verifying → Activated`.
-    ///
-    /// True when:
-    /// - there is no guest concept (no vm-service socket configured), or
-    /// - vm-service reports the guest as fresh AND live:
-    ///   * `status == "running"` — vm-service has seen the hb_seq counter
-    ///     advance recently (its 5 s liveness window catches the
-    ///     stale-heartbeat case where the daemon stopped publishing);
-    ///   * `guest_state == 1` (Running) — the daemon itself declares
-    ///     services-ready;
-    ///   * `boot_id != baseline_boot_id` — the heartbeat we're reading
-    ///     is from the post-reset lifetime, not stale shmem from the
-    ///     previous one. (`boot_id` is randomly generated per guest
-    ///     lifetime and is part of every heartbeat frame.)
-    ///   * If no baseline was captured (VM was offline pre-reset, e.g.
-    ///     factory provision) we accept any running heartbeat.
-    async fn guest_is_running(&self) -> bool {
-        let socket = match &self.vm_service_addr {
-            Some(s) => s,
-            None => return true,
-        };
-        let baseline = self
-            .flash_transfer
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|t| t.verify_baseline_boot_id);
-        let Some(h) = query_vm_health(socket, &self.entity_info.id).await else {
-            return false;
-        };
-        // vm-service flips status off "running" when hb_seq hasn't
-        // advanced within HEARTBEAT_STALE_AFTER — guards against a
-        // daemon that crashed mid-update and left stale shmem behind.
-        if h.status != "running" || h.guest_state != 1 {
-            return false;
-        }
-        match baseline {
-            Some(b) => h.boot_id != b,
-            None => true,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2437,7 +2382,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 package_id: String::new(),
                 state: FlashState::Transferring,
                 image_size: content_length.unwrap_or(0),
-                verify_baseline_boot_id: None,
                 streamed_files: Vec::new(),
             });
         }
@@ -2674,7 +2618,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 package_id: String::new(),
                 state: FlashState::Transferring,
                 image_size: 0,
-                verify_baseline_boot_id: None,
                 streamed_files: Vec::new(),
             });
             return Ok(transfer_id);
@@ -2754,7 +2697,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     package_id: package_id.to_string(),
                     state: FlashState::AwaitingActivation,
                     image_size: 0,
-                    verify_baseline_boot_id: None,
                     streamed_files: Vec::new(),
                 });
             }
@@ -2897,7 +2839,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                         package_id: package_id.to_string(),
                         state: FlashState::AwaitingActivation,
                         image_size,
-                        verify_baseline_boot_id: None,
                         streamed_files: Vec::new(),
                     });
                     (id, tb)
@@ -3178,11 +3119,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// Read the entity's runtime status — ISO 17978-3 §7.19.2. Liveness comes
     /// from the guest heartbeat (`ready` = running + a fresh heartbeat; otherwise
     /// `notReady`); non-guest components (no vm-service addr) are present-by-
-    /// definition → `ready` (mirrors `guest_is_running`). The vendor
-    /// `x-sumo-runtime` block (§5.4.5) carries the per-component `boot_count` (the
-    /// NV trial counter, bumped on each (re)boot — see `ecu_reset`/`process_boot`)
-    /// that an orchestrator reads to verify a reset took effect, plus the
-    /// heartbeat seq as a liveness signal.
+    /// definition → `ready`. The vendor `x-sumo-runtime` block (§5.4.5) carries
+    /// the heartbeat `boot_id` (a per-lifetime nonce — the orchestrator's reboot
+    /// witness: a *changed* boot_id proves a fresh guest lifetime, including a
+    /// node reboot, which `boot_count` cannot witness), the heartbeat `hb_seq`
+    /// (liveness), and `boot_count` (the NV trial counter — a metric, bumped only
+    /// by a per-component `ecu_reset`).
     async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {
         let health = match &self.vm_service_addr {
             Some(socket) => query_vm_health(socket, &self.entity_info.id).await,
@@ -3210,6 +3152,13 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         runtime.insert("boot_count".into(), serde_json::json!(boot_count));
         if let Some(h) = &health {
             runtime.insert("hb_seq".into(), serde_json::json!(h.hb_seq));
+            // Per-lifetime nonce — changes on every guest (re)boot (node reboot
+            // OR per-VM relaunch). The orchestrator's reboot witness: a changed
+            // boot_id proves a fresh guest lifetime and can't be faked by a
+            // stale heartbeat (which carries the OLD boot_id). Unlike boot_count
+            // (bumped only by a per-component ecu_reset), this also witnesses a
+            // node reboot.
+            runtime.insert("boot_id".into(), serde_json::json!(h.boot_id));
         }
         let mut extensions = serde_json::Map::new();
         extensions.insert("x-sumo-runtime".into(), serde_json::Value::Object(runtime));
@@ -3244,63 +3193,32 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         }
         // Single-bank components: no bank switch, always bank A, always committed
 
-        // For dual-bank components, snapshot the live boot_id before the
-        // VM restarts. Promotion out of Verifying needs a baseline to
-        // distinguish "the previous fw is still publishing" from "the new
-        // fw is now reporting" — the new fw boots with a freshly generated
-        // boot_id (random per guest lifetime), so a *different* boot_id is
-        // definitive proof we're reading post-reset data. hb_seq alone
-        // can't tell us: qvm-shmem regions persist across guest lifetimes
-        // and the new daemon's seq counter is observed continuing from
-        // whatever the previous lifetime left there.
-        //
-        // Capture the boot_id whenever ANY heartbeat is present, regardless
-        // of guest_state. Previously this gated on `guest_state == 1` which
-        // caused a real bug: if the guest happened to be in Booting /
-        // Degraded / ShuttingDown / momentarily-stale at probe time, the
-        // baseline was discarded → guest_is_running then accepted any
-        // running heartbeat → Activated declared 45ms after the new qvm
-        // spawn, reading the previous lifetime's stale shmem.
-        //
-        // For factory-provision (truly never-started VM) shmem has no
-        // valid heartbeat → query_vm_health returns None → baseline
-        // remains None → guest_is_running fallback accepts any running
-        // heartbeat. That path is preserved.
-        let baseline_boot_id = if self.config.single_bank {
-            None
+        // Was the guest running before this reset? Used ONLY to pick the
+        // vm-service "restart" vs "start" intent (a never-started guest
+        // shouldn't render as "Shutting Down"). The activation verdict is the
+        // orchestrator's job now: it reads `/status` and confirms the guest's
+        // heartbeat `boot_id` changed (a fresh lifetime) AND status==ready.
+        // The device no longer keeps an in-memory boot_id baseline.
+        let was_running = if self.config.single_bank {
+            false
         } else {
-            let health = match self.vm_service_addr.as_ref() {
-                Some(sock) => query_vm_health(sock, &self.entity_info.id).await,
-                None => None,
-            };
-            let baseline = health.map(|h| h.boot_id);
-            tracing::info!(
-                component = %self.entity_info.id,
-                baseline_boot_id = ?baseline,
-                "captured baseline boot_id for activation check"
-            );
-            baseline
+            match self.vm_service_addr.as_ref() {
+                Some(sock) => query_vm_health(sock, &self.entity_info.id).await.is_some(),
+                None => false,
+            }
         };
 
-        // Advance flash state.
-        //
-        // Single-bank (HSM): no reboot, no trial — already Activated since
-        // finalize_flash, leave it.
-        //
-        // Dual-bank (VM, hypervisor): the bank flip starts the new
-        // firmware coming up. Move to Verifying; get_activation_state
-        // will lazily promote to Activated once the component-specific
-        // health check (vm-service guest health for VMs) reports ready.
+        // Advance flash state to Activated — the bank is flipped and the trial
+        // is armed. The device reports the NV/bank truth; it no longer does its
+        // own in-memory "is the guest healthy" promotion (that was the
+        // `verify_baseline_boot_id`/`guest_is_running` path, the source of the
+        // original "promoted too soon → commit 404" bug). The orchestrator owns
+        // the health verdict now, confirming the guest's heartbeat `boot_id`
+        // changed AND status==ready via `/status` before it commits.
         {
             let mut ft = self.flash_transfer.lock().unwrap();
             if let Some(ref mut t) = *ft {
-                if self.config.single_bank || self.bank_set == BankSet::Os {
-                    // Single-bank (HSM) and host-os: no guest health to verify
-                    t.state = FlashState::Activated;
-                } else {
-                    t.state = FlashState::Verifying;
-                    t.verify_baseline_boot_id = baseline_boot_id;
-                }
+                t.state = FlashState::Activated;
             }
         }
 
@@ -3312,18 +3230,13 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // not here. ecu_reset just transitions the flash state machine.
 
         // Pick "restart" vs "start" based on whether the guest was actually
-        // running pre-reset. The baseline_hb_seq probe above already told us
-        // (Some = guest_state==1 = running). For an offline guest (factory
-        // provision, post-crash) the shutdown step is a phantom — vm-service
-        // would handle it (NotRunning → fall through to start_vm) but the
-        // orchestrator-/GUI-visible intent should be "start", not "restart",
-        // so the cluster tile doesn't display "Shutting Down" for a guest
-        // that never ran.
-        let action = if baseline_boot_id.is_some() {
-            "restart"
-        } else {
-            "start"
-        };
+        // running pre-reset (the `was_running` probe above). For an offline
+        // guest (factory provision, post-crash) the shutdown step is a phantom
+        // — vm-service would handle it (NotRunning → fall through to start_vm)
+        // but the orchestrator-/GUI-visible intent should be "start", not
+        // "restart", so the cluster tile doesn't display "Shutting Down" for a
+        // guest that never ran.
+        let action = if was_running { "restart" } else { "start" };
 
         // Notify vm-service to (re)launch the guest on the just-activated bank.
         // The boot selector is the authority for which bank actually boots; we
@@ -3366,26 +3279,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // Check upload phase first (streaming firmware download in progress)
         let upload_state = *self.upload_phase.lock().unwrap();
 
-        // If we're in Verifying, ask the component's health source whether
-        // it's now ready. Promote to Activated lazily on poll so the
-        // orchestrator just sees the state advance — no background task,
-        // no out-of-band signal.
-        if matches!(*self.flash_transfer.lock().unwrap(),
-            Some(ref t) if t.state == FlashState::Verifying)
-            && self.guest_is_running().await
-        {
-            let mut ft = self.flash_transfer.lock().unwrap();
-            if let Some(ref mut t) = *ft {
-                if t.state == FlashState::Verifying {
-                    t.state = FlashState::Activated;
-                    tracing::info!(
-                        component = %self.entity_info.id,
-                        "verifying → activated (guest health ok)"
-                    );
-                }
-            }
-        }
-
+        // The device no longer promotes Verifying→Activated from its own
+        // in-memory guest-health check (the retired `guest_is_running` /
+        // `verify_baseline_boot_id` path). `ecu_reset` sets Activated directly
+        // (bank flipped + trial armed); the orchestrator confirms the guest is
+        // actually healthy via `/status` (boot_id changed + ready).
         let flash_state = {
             let ft = self.flash_transfer.lock().unwrap();
             ft.as_ref().map(|t| t.state)
@@ -4051,10 +3949,10 @@ fn map_ota_error(e: ota::OtaError) -> BackendError {
 pub struct GuestHealth {
     pub guest_state: u32,
     pub hb_seq: u32,
-    /// Random per-guest-lifetime id from the heartbeat wire format. Used
-    /// by `guest_is_running` to confirm we're reading data from the
-    /// post-reset lifetime, not stale shmem data from the previous one
-    /// (qvm-shmem regions persist across stop/start).
+    /// Random per-guest-lifetime id from the heartbeat wire format. Surfaced in
+    /// `/status` `x-sumo-runtime.boot_id` — the orchestrator's reboot witness: a
+    /// *changed* boot_id confirms a fresh post-reset lifetime, not stale shmem
+    /// from the previous one (qvm-shmem regions persist across stop/start).
     pub boot_id: u32,
     /// Coarse health status string ("running" / "stopped" / "unhealthy").
     /// ComponentBackend treats anything not "running" as not-yet-activated —
@@ -4294,7 +4192,6 @@ mod identity_tests {
             package_id: pkg_id,
             state: FlashState::AwaitingActivation,
             image_size: 16,
-            verify_baseline_boot_id: None,
             streamed_files: Vec::new(),
         });
 
@@ -5041,7 +4938,6 @@ mod abort_flash_tests {
             package_id: "pkg-1".into(),
             state,
             image_size: 0,
-            verify_baseline_boot_id: None,
             streamed_files: Vec::new(),
         });
     }
