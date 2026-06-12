@@ -23,9 +23,9 @@ hex = "0.4"
 # manifest format mirrors SUIT (RFC 9019); we share sumo-rs's CBOR
 # helpers + verification primitives so the device path is identical
 # to the off-board signing path.
-sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
-sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
-sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
 coset = "0.3"
 
 serde = { version = "1", features = ["derive"] }
@@ -40,4 +40,4 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }
 http-body-util = "0.1"
 tempfile = "3"
-sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
