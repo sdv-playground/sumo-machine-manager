@@ -2351,6 +2351,13 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
 
         // --- Legacy path: integrated SUIT envelope (HSM keys, etc.) ---
 
+        // This path never went through `start_flash`, so it must enforce the
+        // same trial-mode guard here before touching any bank. Otherwise a flash
+        // issued while a trial is uncommitted resolves the target to the
+        // *committed* bank (`active.other()`) and `prepare_target_bank_dir` wipes
+        // the rollback target. (No-op for single-bank/HSM, which has no trial.)
+        self.ensure_flash_can_start()?;
+
         let min_security_ver = {
             let nv = self
                 .nv
@@ -4666,6 +4673,73 @@ mod identity_tests {
                 "rollback must leave the bank committed"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+    }
+
+    /// B5 regression: a flash that lands on the session-less *legacy* path while
+    /// the bank set is in trial mode must be refused (`Busy`) *before* it touches
+    /// any bank — it must never wipe the committed rollback bank. Without the
+    /// `ensure_flash_can_start()` guard in the legacy branch of
+    /// `receive_package_stream`, the path resolved the target to the committed
+    /// bank (`active.other()`) and `prepare_target_bank_dir` wiped it.
+    #[tokio::test]
+    async fn legacy_upload_in_trial_is_refused_without_wiping_committed_bank() {
+        let images_dir = std::env::temp_dir().join("vm-mgr-b5-trial-legacy-img");
+        let _ = std::fs::remove_dir_all(&images_dir);
+        std::fs::create_dir_all(&images_dir).unwrap();
+
+        // Trial state: active=B, committed=false → the committed (rollback) bank
+        // is A = active.other(), which the buggy legacy path would target+wipe.
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        let idx = BankSet::Vm1.as_index();
+        boot.banks[idx].active_bank = Bank::B;
+        boot.banks[idx].committed = false;
+        nv.write_boot_state(&mut boot).unwrap();
+        let nv = Arc::new(Mutex::new(nv));
+
+        // Sentinel in the committed bank (A) that must survive.
+        let bank_a = images_dir.join("vm1").join("bank_a");
+        std::fs::create_dir_all(&bank_a).unwrap();
+        let sentinel = bank_a.join("rootfs.img");
+        std::fs::write(&sentinel, b"committed rollback bytes").unwrap();
+
+        let backend = ComponentBackend::with_options(
+            BankSet::Vm1,
+            nv,
+            Arc::new(NoopManifest),
+            Arc::new(NoopSecurity),
+            ComponentConfig::default(),
+            None,
+            Some(images_dir.clone()),
+            None,
+        );
+
+        // No flash session → session-less legacy branch. The guard fires before
+        // the stream is read, so an empty stream is sufficient.
+        let stream: PackageStream = Box::pin(futures::stream::iter(Vec::<
+            Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>>,
+        >::new()));
+        let err = backend
+            .receive_package_stream(stream, None)
+            .await
+            .expect_err("legacy upload in trial mode must be refused");
+        assert!(
+            matches!(err, BackendError::Busy(_)),
+            "expected Busy (trial mode), got: {err:?}"
+        );
+
+        // The committed rollback bank must be untouched.
+        assert!(
+            sentinel.exists(),
+            "committed bank A must NOT be wiped by a refused trial-mode flash"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"committed rollback bytes",
+            "committed bank contents must be intact"
+        );
 
         let _ = std::fs::remove_dir_all(&images_dir);
     }
