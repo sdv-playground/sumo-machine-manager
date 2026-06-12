@@ -36,6 +36,7 @@ host-os-mgr = { path = "../host-os-mgr" }
 app-mgr = { path = "../app-mgr" }
 hex = "0.4.3"
 base64 = "0.22"
+jsonwebtoken = "10"
 
 [dev-dependencies]
 http-body-util = "0.1"
@@ -45,6 +46,7 @@ sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "
 coset = "0.3"
 ciborium = "0.2"
 tempfile = "3"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 
 [[bin]]
 name = "vm-diagserver"

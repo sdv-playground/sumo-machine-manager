@@ -64,6 +64,7 @@ pub mod streaming;
 pub mod suit_provider;
 
 pub mod sovd {
+    pub mod authz;
     pub mod routes;
     pub mod security;
 }
