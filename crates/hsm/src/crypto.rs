@@ -354,6 +354,7 @@ impl HsmCryptoProvider for SimHsm {
 
         std::fs::create_dir_all(self.keys_dir())
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
+        crate::sim::restrict_dir_700(&self.keys_dir());
 
         let write_raw = |ext: &str, len: usize| -> Result<(), HsmError> {
             let mut key = vec![0u8; len];
@@ -361,6 +362,7 @@ impl HsmCryptoProvider for SimHsm {
             let path = self.keys_dir().join(format!("{key_id}.{ext}"));
             std::fs::write(&path, &key)
                 .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))?;
+            crate::sim::restrict_file_600(&path);
             Ok(())
         };
 
@@ -409,6 +411,7 @@ impl HsmCryptoProvider for SimHsm {
                 std::fs::write(&priv_path, priv_pem.as_bytes()).map_err(|e| {
                     HsmError::KeystoreError(format!("write {}: {e}", priv_path.display()))
                 })?;
+                crate::sim::restrict_file_600(&priv_path);
 
                 let pub_pem = vk
                     .to_public_key_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)

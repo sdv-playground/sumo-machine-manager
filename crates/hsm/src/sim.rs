@@ -195,6 +195,7 @@ impl SimHsm {
     pub fn ensure_device_keys(&self) -> Result<(), HsmError> {
         std::fs::create_dir_all(self.keys_dir())
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
+        restrict_dir_700(&self.keys_dir());
 
         for role in KeyRole::mandatory_roles() {
             if !role.is_device_generated() {
@@ -257,6 +258,7 @@ impl SimHsm {
         let keys_dir = self.keys_dir();
         std::fs::create_dir_all(&keys_dir)
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
+        restrict_dir_700(&keys_dir);
 
         for slot in &ks.slots {
             self.write_key_files(slot, &keys_dir)?;
@@ -1386,8 +1388,37 @@ fn write_pem_file(path: &Path, label: &str, der: &[u8]) -> Result<(), HsmError> 
     writeln!(pem, "-----END {label}-----").unwrap();
 
     std::fs::write(path, pem.as_bytes())
-        .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))
+        .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))?;
+    // Private key material → owner-only (0600). Public keys / certs stay readable.
+    if label.contains("PRIVATE") {
+        restrict_file_600(path);
+    }
+    Ok(())
 }
+
+/// Best-effort: restrict a keystore directory to the owner (0700) so other local
+/// users can't traverse into it to read private key material. The 0700 directory
+/// is the primary protection for the file keystore; key files are also set 0600.
+#[cfg(unix)]
+pub(crate) fn restrict_dir_700(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
+        tracing::warn!(path = %path.display(), error = %e, "could not restrict keystore dir to 0700");
+    }
+}
+#[cfg(not(unix))]
+pub(crate) fn restrict_dir_700(_path: &Path) {}
+
+/// Best-effort: restrict a freshly-written private-key file to the owner (0600).
+#[cfg(unix)]
+pub(crate) fn restrict_file_600(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(path = %path.display(), error = %e, "could not restrict key file to 0600");
+    }
+}
+#[cfg(not(unix))]
+pub(crate) fn restrict_file_600(_path: &Path) {}
 
 /// Build a COSE_Key (EC2, P-256, public only) as CBOR bytes.
 fn build_public_cose_key_with_alg(
