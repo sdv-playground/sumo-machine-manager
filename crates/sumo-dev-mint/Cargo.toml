@@ -1,0 +1,20 @@
+[package]
+name = "sumo-dev-mint"
+version = "0.1.0"
+edition = "2021"
+description = "Dev SOVD capability-token minter — signs with the well-known dev key (P-256 scalar=1) so dev rigs are always resettable. NOT for production."
+
+[[bin]]
+name = "sumo-dev-mint"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+hsm = { path = "../hsm" }
+serde_json = "1"
