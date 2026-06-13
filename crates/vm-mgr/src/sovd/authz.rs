@@ -78,11 +78,25 @@ pub struct TrustedIssuer {
 /// scope.
 pub struct TieredAuthorizer {
     issuers: Vec<TrustedIssuer>,
+    /// When set, a token's `boot_id` claim must equal this — the device's
+    /// current boot. Kills cross-boot replay (§7.1). `None` = no binding.
+    expected_boot_id: Option<String>,
 }
 
 impl TieredAuthorizer {
     pub fn new(issuers: Vec<TrustedIssuer>) -> Self {
-        Self { issuers }
+        Self {
+            issuers,
+            expected_boot_id: None,
+        }
+    }
+
+    /// Bind accepted tokens to the device's current boot: a token whose
+    /// `boot_id` claim doesn't equal `boot_id` is rejected as stale (§7.1) — a
+    /// token sniffed before a reboot is dead after it. Omit for no binding.
+    pub fn with_boot_id(mut self, boot_id: impl Into<String>) -> Self {
+        self.expected_boot_id = Some(boot_id.into());
+        self
     }
 }
 
@@ -93,6 +107,9 @@ struct Claims {
     scope: Option<String>,
     #[serde(default)]
     scopes: Option<Vec<String>>,
+    /// Per-boot freshness binding (§7.1) — the target's `boot_id` at mint time.
+    #[serde(default)]
+    boot_id: Option<String>,
 }
 
 impl Claims {
@@ -153,6 +170,18 @@ impl Authorizer for TieredAuthorizer {
                 "issuer '{}' (ceiling {:?}) may not grant a {:?} capability",
                 issuer.id, issuer.ceiling, needed
             ));
+        }
+
+        // Freshness (§7.1): when the device pins its current boot, a token must
+        // name it — one minted for an earlier boot is stale after a reboot, so a
+        // sniffed token dies at the next reboot. (Cross-boot replay guard;
+        // intra-boot replay would need a `jti` cache, out of scope here.)
+        if let Some(expected) = &self.expected_boot_id {
+            if claims.boot_id.as_deref() != Some(expected.as_str()) {
+                return Err(
+                    "stale token: boot_id does not match the device's current boot".to_string(),
+                );
+            }
         }
 
         let ctx = ClientContext {
@@ -407,5 +436,49 @@ mod tests {
             capability: Capability::DataRead,
         };
         assert!(authz.authorize(&req).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn boot_id_binding_rejects_stale_and_missing() {
+        let (enc, dec) = issuer_keys(2);
+        let authz = TieredAuthorizer::new(vec![TrustedIssuer {
+            id: "external".into(),
+            audience: "vehicle-1".into(),
+            key: dec,
+            ceiling: Tier::HighConsequence,
+        }])
+        .with_boot_id("boot-42");
+
+        let token = |boot: Option<&str>| {
+            let mut header = Header::new(Algorithm::ES256);
+            header.kid = Some("external".to_string());
+            let mut claims = serde_json::json!({
+                "sub": "op", "iss": "external", "aud": "vehicle-1",
+                "exp": 9_999_999_999u64, "scope": "factory-reset",
+            });
+            if let Some(b) = boot {
+                claims["boot_id"] = serde_json::json!(b);
+            }
+            format!("Bearer {}", encode(&header, &claims, &enc).unwrap())
+        };
+
+        // Fresh: boot_id names the live boot → accepted.
+        let fresh = token(Some("boot-42"));
+        assert!(authz
+            .authorize(&access(&fresh, None, Capability::FactoryReset))
+            .await
+            .is_ok());
+        // Stale: a different (earlier) boot → rejected.
+        let stale = token(Some("boot-7"));
+        assert!(authz
+            .authorize(&access(&stale, None, Capability::FactoryReset))
+            .await
+            .is_err());
+        // Missing boot_id while the device pins one → rejected.
+        let none = token(None);
+        assert!(authz
+            .authorize(&access(&none, None, Capability::FactoryReset))
+            .await
+            .is_err());
     }
 }
