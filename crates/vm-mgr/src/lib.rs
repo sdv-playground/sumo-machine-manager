@@ -65,6 +65,7 @@ pub mod suit_provider;
 
 pub mod sovd {
     pub mod authz;
+    pub mod issuer_keys;
     pub mod routes;
     pub mod security;
 }
