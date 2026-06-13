@@ -70,6 +70,46 @@ pub fn csr_router(machine: Arc<dyn Machine>) -> Router {
     )
 }
 
+/// Build the `x-sumo-id` route.
+///
+/// `GET /vehicle/v1/components/hsm/x-sumo-id` → 200, body = the ECU's id (its
+/// HSM device-key thumbprint, lowercase hex) — the token `aud`. Unlike the CSR
+/// this is read-only identity, served whether or not the device is provisioned.
+/// Vendor extension per ISO 17978-3 §5.3.6.
+pub fn device_id_router(machine: Arc<dyn Machine>) -> Router {
+    Router::new().route(
+        "/vehicle/v1/components/hsm/x-sumo-id",
+        get(move || {
+            let machine = machine.clone();
+            async move {
+                let Some(comp) = machine.component("hsm") else {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "no hsm component".to_string(),
+                    )
+                        .into_response();
+                };
+                match comp.get_device_id().await {
+                    Ok(Some(id)) => ([(header::CONTENT_TYPE, "text/plain")], id).into_response(),
+                    Ok(None) => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "device id unavailable".to_string(),
+                    )
+                        .into_response(),
+                    Err(e) => {
+                        tracing::error!(error = %e, "device id read failed");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("device id error: {e}"),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+        }),
+    )
+}
+
 /// Which way a node-level verdict resolves the node's in-trial components.
 #[derive(Clone, Copy)]
 enum Verdict {

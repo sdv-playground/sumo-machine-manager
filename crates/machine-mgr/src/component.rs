@@ -163,6 +163,13 @@ pub trait Component: Send + Sync {
         Err(MachineError::NotSupported("get_csr"))
     }
 
+    /// The ECU's self-sovereign id — a thumbprint of its HSM device key, used as
+    /// the token `aud`. `None` for non-HSM components or before the device key
+    /// exists. See `vm_mgr::sovd::identity`.
+    async fn get_device_id(&self) -> MachineResult<Option<String>> {
+        Ok(None)
+    }
+
     async fn install_keys(&self, _envelope: &[u8]) -> MachineResult<()> {
         Err(MachineError::NotSupported("install_keys"))
     }

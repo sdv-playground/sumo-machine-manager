@@ -340,6 +340,22 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
         Ok(Csr::from_bytes(der))
     }
 
+    /// The ECU's self-sovereign id: a thumbprint of its HSM device key (the
+    /// token `aud`). Read-only identity, served whether or not the device is
+    /// provisioned — the device key exists from first boot, so no CSR-style gate.
+    async fn get_device_id(&self) -> MachineResult<Option<String>> {
+        let Some(keystore) = self.csr_keystore.as_ref() else {
+            return Ok(None);
+        };
+        let tmp =
+            hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
+        use hsm::HsmCryptoProvider;
+        match tmp.get_public_key_der("device-decrypt") {
+            Ok(der) => Ok(Some(crate::sovd::identity::ecu_id_from_spki_der(&der))),
+            Err(_) => Ok(None),
+        }
+    }
+
     // install_keys / list_dids / abort_install use trait defaults (NotSupported).
     // HSM key install today goes through the standard SOVD package flow
     // (receive_package -> upload_envelope), so install_keys is reserved for

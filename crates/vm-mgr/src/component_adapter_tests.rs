@@ -267,6 +267,35 @@ async fn get_csr_generates_csr_when_keystore_configured() {
 }
 
 #[tokio::test]
+async fn get_device_id_returns_a_stable_device_key_thumbprint() {
+    use std::path::PathBuf;
+    let nv = make_nv();
+    let vm = vm_backend(
+        nv,
+        BankSet::Hsm,
+        ComponentConfig {
+            supports_rollback: false,
+            single_bank: true,
+            entity_type: "hsm".into(),
+        },
+    );
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let keystore = PathBuf::from(tmp.path());
+    let setup = hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), 5102);
+    setup.ensure_device_keys().expect("device keys created");
+    let comp = ComponentAdapter::new(vm).with_csr_keystore(keystore, 5102);
+
+    let id = comp
+        .get_device_id()
+        .await
+        .expect("ok")
+        .expect("device id present");
+    assert_eq!(id.len(), 64, "hex SHA-256 thumbprint");
+    let again = comp.get_device_id().await.expect("ok").expect("present");
+    assert_eq!(id, again, "stable across calls");
+}
+
+#[tokio::test]
 async fn abort_install_clears_session_pre_finalize() {
     use machine_mgr::FlashId;
 
