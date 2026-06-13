@@ -52,6 +52,10 @@ struct Cli {
     /// Token lifetime, seconds.
     #[arg(long, default_value_t = 900)]
     ttl_secs: u64,
+    /// `boot_id` claim — binds the token to the device's current boot (§7.1
+    /// freshness). Omit for no binding; read the live value from x-sumo-boot-id.
+    #[arg(long)]
+    boot_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -62,8 +66,11 @@ struct Claims {
     iat: u64,
     exp: u64,
     scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boot_id: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mint(
     scalar: &[u8; 32],
     issuer: &str,
@@ -72,6 +79,7 @@ fn mint(
     scope: &str,
     iat: u64,
     ttl_secs: u64,
+    boot_id: Option<&str>,
 ) -> Result<String> {
     let sk = SigningKey::from_bytes(&p256::FieldBytes::from(*scalar))?;
     let pem = sk.to_pkcs8_pem(LineEnding::LF)?;
@@ -85,6 +93,7 @@ fn mint(
         iat,
         exp: iat.saturating_add(ttl_secs),
         scope: scope.to_string(),
+        boot_id: boot_id.map(str::to_string),
     };
     Ok(encode(&header, &claims, &key)?)
 }
@@ -100,6 +109,7 @@ fn main() -> Result<()> {
         &cli.capability,
         now,
         cli.ttl_secs,
+        cli.boot_id.as_deref(),
     )?;
     println!("{token}");
     Ok(())
@@ -137,6 +147,7 @@ mod tests {
             "factory-reset",
             1_000,
             LONG_TTL,
+            None,
         )
         .unwrap();
 
@@ -179,11 +190,49 @@ mod tests {
             "factory-reset",
             1_000,
             LONG_TTL,
+            None,
         )
         .unwrap();
         let mut v = Validation::new(Algorithm::ES256);
         v.set_audience(&["other-rig"]);
         v.set_issuer(&["high-consequence-issuer"]);
         assert!(decode::<serde_json::Value>(&token, &decoding_key(), &v).is_err());
+    }
+
+    #[test]
+    fn boot_id_claim_present_only_when_provided() {
+        let mut v = Validation::new(Algorithm::ES256);
+        v.set_audience(&["rig-1"]);
+        v.set_issuer(&["high-consequence-issuer"]);
+
+        // --boot-id given → the claim is set (the §7.1 freshness binding).
+        let token = mint(
+            &dev_signing_scalar(),
+            "high-consequence-issuer",
+            "op",
+            "rig-1",
+            "factory-reset",
+            1_000,
+            LONG_TTL,
+            Some("boot-42"),
+        )
+        .unwrap();
+        let data = decode::<serde_json::Value>(&token, &decoding_key(), &v).unwrap();
+        assert_eq!(data.claims["boot_id"], "boot-42");
+
+        // omitted → no boot_id claim (no binding).
+        let token = mint(
+            &dev_signing_scalar(),
+            "high-consequence-issuer",
+            "op",
+            "rig-1",
+            "factory-reset",
+            1_000,
+            LONG_TTL,
+            None,
+        )
+        .unwrap();
+        let data = decode::<serde_json::Value>(&token, &decoding_key(), &v).unwrap();
+        assert!(data.claims.get("boot_id").is_none());
     }
 }
