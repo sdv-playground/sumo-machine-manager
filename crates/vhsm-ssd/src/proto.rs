@@ -245,6 +245,10 @@ pub const HANDLE_IAM_SIGNING: u32 = 0x0004;
 pub const HANDLE_KEY_AUTHORITY: u32 = 0x0005;
 pub const HANDLE_JWT_SIGNING: u32 = 0x0006;
 pub const HANDLE_STORAGE: u32 = 0x0007;
+// SOVD token-issuer verify anchors (external authorities, pinned per
+// tier). VERIFY + GET_PUBKEY; the matching private minters live offboard.
+pub const HANDLE_OPERATIONAL_ISSUER: u32 = 0x0008;
+pub const HANDLE_HIGH_CONSEQUENCE_ISSUER: u32 = 0x0009;
 
 /// Lower boundary of the project-extension well-known range. Sumo owns
 /// the slots strictly below this; downstream projects own
@@ -485,6 +489,8 @@ mod tests {
             HANDLE_KEY_AUTHORITY,
             HANDLE_JWT_SIGNING,
             HANDLE_STORAGE,
+            HANDLE_OPERATIONAL_ISSUER,
+            HANDLE_HIGH_CONSEQUENCE_ISSUER,
         ] {
             assert!(handle_is_sumo_core(h), "0x{h:04x} should be sumo-core");
             assert!(
@@ -519,6 +525,8 @@ mod tests {
             HANDLE_KEY_AUTHORITY,
             HANDLE_JWT_SIGNING,
             HANDLE_STORAGE,
+            HANDLE_OPERATIONAL_ISSUER,
+            HANDLE_HIGH_CONSEQUENCE_ISSUER,
         ];
         for (i, a) in hs.iter().enumerate() {
             for b in &hs[i + 1..] {

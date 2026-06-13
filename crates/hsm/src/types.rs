@@ -47,14 +47,17 @@ impl std::error::Error for HsmError {}
 
 /// Well-known HSM key slot roles.
 ///
-/// Three trust tiers verify code that runs on this device, plus a few
-/// per-device operational keys. Each role lives in a distinct slot and
-/// rotates on its own cadence; the factory-floor anchor is `KeyAuthority`
-/// (rarely rotated) and everything else can be replaced via SUIT
-/// envelopes signed by the appropriate authority above it.
+/// Three trust tiers verify code that runs on this device, plus the
+/// per-device operational keys and the SOVD token-trust slots (an
+/// onboard JWT minter + the external token-issuer anchors). Each role
+/// lives in a distinct slot and rotates on its own cadence; the
+/// factory-floor anchor is `KeyAuthority` (rarely rotated) and
+/// everything else can be replaced via SUIT envelopes signed by the
+/// appropriate authority above it.
 ///
-/// Slot count is fixed — see [`KeyRole::mandatory_roles`] for the list
-/// every provisioned device must populate.
+/// The role set is the canonical device wire contract — see
+/// [`KeyRole::mandatory_roles`] for the list every provisioned device
+/// must populate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyRole {
     // ------------------------- trust anchors ------------------------
@@ -105,6 +108,34 @@ pub enum KeyRole {
     /// before launching the component. Rotation: never on-device
     /// (regenerated only on HSM reset / device repurpose).
     IvdSigning,
+
+    // ----------------------- onboard minter -------------------------
+    //
+    /// EC-P256 signing key generated **inside the HSM at provisioning
+    /// time, private NEVER leaves** — the device's onboard SOVD-token
+    /// minter (the in-vehicle `jwt-mgr`). Signs Operational-tier bearer
+    /// JWTs for in-vehicle callers; the SOVD authorizer verifies them
+    /// against this key's public half (`OP_GET_PUBKEY`). Operational
+    /// tier only — by policy it can never mint a HighConsequence token.
+    JwtSigning,
+
+    // --------------------- token-issuer anchors ---------------------
+    //
+    // Verify-only public keys for the EXTERNAL SOVD-token issuers,
+    // pinned per authority tier. A distinct trust domain from the
+    // `*-authority` firmware/container anchors above — these verify JWT
+    // signatures, not SUIT envelopes. Provisioned by Tower 1 (public
+    // half only); the matching private minters live offboard.
+    //
+    /// Verifies Operational-tier tokens from an external authority — the
+    /// workshop CA / OEM operational issuer (e.g. the `sovd-token-helper`
+    /// `x5c` root). Routine OTA + reads.
+    OperationalIssuer,
+
+    /// Verifies HighConsequence-tier tokens (factory-reset, vehicle
+    /// reboot, HSM keystore) from the OEM / external authority — the
+    /// ceiling an in-vehicle minter can never reach.
+    HighConsequenceIssuer,
 }
 
 impl KeyRole {
@@ -119,6 +150,9 @@ impl KeyRole {
             KeyRole::DeviceDecryption => "device-decrypt",
             KeyRole::IamSigning => "iam-signing",
             KeyRole::IvdSigning => "ivd-signing",
+            KeyRole::JwtSigning => "jwt-signing",
+            KeyRole::OperationalIssuer => "operational-issuer",
+            KeyRole::HighConsequenceIssuer => "high-consequence-issuer",
         }
     }
 
@@ -135,6 +169,9 @@ impl KeyRole {
             KeyRole::DeviceDecryption,
             KeyRole::IamSigning,
             KeyRole::IvdSigning,
+            KeyRole::JwtSigning,
+            KeyRole::OperationalIssuer,
+            KeyRole::HighConsequenceIssuer,
         ]
     }
 
@@ -145,14 +182,19 @@ impl KeyRole {
     /// no `get_private_key` to pull them back out either.
     ///
     /// The other roles (`KeyAuthority`, `SoftwareAuthority`,
-    /// `PlatformAuthority`, `ApplicationAuthority`) are trust anchors
-    /// — their private halves live off-device, with the corresponding
-    /// signing infrastructure. The HSM only stores their public halves
-    /// for envelope verification.
+    /// `PlatformAuthority`, `ApplicationAuthority`, `OperationalIssuer`,
+    /// `HighConsequenceIssuer`) are trust anchors — their private halves
+    /// live off-device, with the corresponding signing infrastructure.
+    /// The HSM only stores their public halves for verification (SUIT
+    /// envelopes for the `*-authority` set, JWT signatures for the
+    /// issuer anchors).
     pub fn is_device_generated(self) -> bool {
         matches!(
             self,
-            KeyRole::DeviceDecryption | KeyRole::IamSigning | KeyRole::IvdSigning,
+            KeyRole::DeviceDecryption
+                | KeyRole::IamSigning
+                | KeyRole::IvdSigning
+                | KeyRole::JwtSigning,
         )
     }
 }
@@ -300,6 +342,9 @@ mod tests {
             KeyRole::DeviceDecryption,
             KeyRole::IamSigning,
             KeyRole::IvdSigning,
+            KeyRole::JwtSigning,
+            KeyRole::OperationalIssuer,
+            KeyRole::HighConsequenceIssuer,
         ];
         let ids: HashSet<_> = roles.iter().map(|r| r.key_id()).collect();
         assert_eq!(ids.len(), roles.len(), "key_id() must be unique per role");
@@ -317,6 +362,12 @@ mod tests {
         assert_eq!(KeyRole::DeviceDecryption.key_id(), "device-decrypt");
         assert_eq!(KeyRole::IamSigning.key_id(), "iam-signing");
         assert_eq!(KeyRole::IvdSigning.key_id(), "ivd-signing");
+        assert_eq!(KeyRole::JwtSigning.key_id(), "jwt-signing");
+        assert_eq!(KeyRole::OperationalIssuer.key_id(), "operational-issuer");
+        assert_eq!(
+            KeyRole::HighConsequenceIssuer.key_id(),
+            "high-consequence-issuer"
+        );
     }
 
     #[test]
@@ -326,7 +377,7 @@ mod tests {
         // should be either mandatory or explicitly opted out (and
         // there are no opt-outs today).
         let mandatory = KeyRole::mandatory_roles();
-        assert_eq!(mandatory.len(), 7);
+        assert_eq!(mandatory.len(), 10);
 
         // Sanity: every entry is distinct.
         use std::collections::HashSet;
@@ -343,12 +394,15 @@ mod tests {
             KeyRole::DeviceDecryption,
             KeyRole::IamSigning,
             KeyRole::IvdSigning,
+            KeyRole::JwtSigning,
         ];
         let trust_anchors = [
             KeyRole::KeyAuthority,
             KeyRole::SoftwareAuthority,
             KeyRole::PlatformAuthority,
             KeyRole::ApplicationAuthority,
+            KeyRole::OperationalIssuer,
+            KeyRole::HighConsequenceIssuer,
         ];
 
         for &r in &device_generated {

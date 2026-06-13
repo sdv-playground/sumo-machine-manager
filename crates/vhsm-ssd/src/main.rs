@@ -722,6 +722,21 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
             ALG_AES_256,
             PERM_ENCRYPT | PERM_DECRYPT,
         ),
+        // External SOVD-token issuer verify anchors (Tower-provisioned,
+        // public-only). Guests/authorizer verify JWT signatures and read
+        // the pubkey; they never sign with these.
+        (
+            HANDLE_OPERATIONAL_ISSUER,
+            "operational-issuer",
+            ALG_ECC_P256,
+            PERM_VERIFY | PERM_GET_PUBKEY,
+        ),
+        (
+            HANDLE_HIGH_CONSEQUENCE_ISSUER,
+            "high-consequence-issuer",
+            ALG_ECC_P256,
+            PERM_VERIFY | PERM_GET_PUBKEY,
+        ),
     ];
 
     for (handle, key_id, alg, perms) in &well_known {
