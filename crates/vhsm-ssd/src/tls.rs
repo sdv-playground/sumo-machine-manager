@@ -26,18 +26,8 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// `device-identity-root.pem`) into a `RootCertStore` for verifying peer client
 /// certs.
 pub fn identity_root_store(pem: &[u8]) -> Result<RootCertStore, BoxError> {
-    let mut reader = std::io::BufReader::new(pem);
-    let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut reader) {
-        let cert = cert.map_err(|e| format!("parse identity root PEM: {e}"))?;
-        roots
-            .add(cert)
-            .map_err(|e| format!("add identity root: {e}"))?;
-    }
-    if roots.is_empty() {
-        return Err("identity root PEM contained no certificates".into());
-    }
-    Ok(roots)
+    // One implementation, shared with the cross-node client connector.
+    hsm_rustls::roots_from_pem(pem)
 }
 
 /// Build the cross-node mTLS `ServerConfig`: present `server_chain` (this host's

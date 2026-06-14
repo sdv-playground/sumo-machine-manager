@@ -26,4 +26,5 @@ members = [
     "crates/hsm-rustls",
     "crates/vhsm-proto",
     "crates/vhsm-client",
+    "crates/vhsm-crossnode-client",
 ]

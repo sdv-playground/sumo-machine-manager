@@ -1,0 +1,24 @@
+[package]
+name = "vhsm-crossnode-client"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-node vHSM client connector — HSM-backed mTLS dial to a peer node's listener, returning a VhsmClient"
+
+[dependencies]
+# The op codec (returned to the caller) + the HSM<->rustls seam + rustls itself.
+# Deliberately NOT depending on `hsm`: the HSM is reached through a sign closure,
+# so this crate stays provider-agnostic like hsm-rustls.
+vhsm-client = { path = "../vhsm-client" }
+hsm-rustls = { path = "../hsm-rustls" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[dev-dependencies]
+# e2e: dial the REAL vhsm-ssd cross-node listener with an HSM-backed identity.
+vhsm-ssd = { path = "../vhsm-ssd" }
+vhsm-proto = { path = "../vhsm-proto" }
+hsm = { path = "../hsm", features = ["crypto"] }
+x509-cert = { version = "0.2", features = ["std", "pem", "builder"] }
+const-oid = { version = "0.9", features = ["db"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+rand = "0.8"
+tempfile = "3"

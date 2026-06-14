@@ -17,12 +17,32 @@ use rustls::client::ResolvesClientCert;
 use rustls::pki_types::CertificateDer;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::{CertifiedKey, Signer, SigningKey};
-use rustls::{SignatureAlgorithm, SignatureScheme};
+use rustls::{RootCertStore, SignatureAlgorithm, SignatureScheme};
 
 /// Signs `message` with the device's mTLS private key — ECDSA-P256 over
 /// SHA-256(message), DER-encoded. The private key stays in the HSM; only this
 /// closure crosses into the TLS stack.
 pub type SignFn = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Parse PEM CA certificate(s) into a [`RootCertStore`] — the trust anchor a
+/// cross-node mTLS peer (server OR client) cert must chain to, typically the
+/// fleet identity root delivered on the policy partition. Errors on a PEM that
+/// decodes to no certificates, so a misconfigured anchor fails loud rather than
+/// trusting nothing.
+pub fn roots_from_pem(pem: &[u8]) -> Result<RootCertStore, BoxError> {
+    let mut reader = std::io::BufReader::new(pem);
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut reader) {
+        let cert = cert.map_err(|e| format!("parse root PEM: {e}"))?;
+        roots.add(cert).map_err(|e| format!("add root: {e}"))?;
+    }
+    if roots.is_empty() {
+        return Err("root PEM contained no certificates".into());
+    }
+    Ok(roots)
+}
 
 struct HsmSigningKey {
     sign_fn: SignFn,

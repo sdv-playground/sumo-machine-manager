@@ -8,6 +8,9 @@ description = "HSM-backed rustls client identity — mTLS where the private key 
 # `ring` provider: pure-enough for the Linux dev path. A QNX-buildable provider
 # is the follow-up before this runs on the target.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Parse PEM trust anchors (the identity root) into a RootCertStore — shared by
+# the server (vhsm-ssd) and the cross-node client connector.
+rustls-pemfile = "2"
 
 [dev-dependencies]
 hsm = { path = "../hsm", features = ["crypto"] }
