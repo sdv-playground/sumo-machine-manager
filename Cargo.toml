@@ -23,4 +23,5 @@ members = [
     "crates/host-metrics",
     "crates/log-rotate",
     "crates/puller",
+    "crates/hsm-rustls",
 ]

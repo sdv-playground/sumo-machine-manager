@@ -1,0 +1,18 @@
+[package]
+name = "hsm-rustls"
+version = "0.1.0"
+edition = "2021"
+description = "HSM-backed rustls client identity — mTLS where the private key never leaves the HSM"
+
+[dependencies]
+# `ring` provider: pure-enough for the Linux dev path. A QNX-buildable provider
+# is the follow-up before this runs on the target.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[dev-dependencies]
+hsm = { path = "../hsm", features = ["crypto"] }
+x509-cert = { version = "0.2", features = ["std", "builder"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+const-oid = { version = "0.9", features = ["db"] }
+rand = "0.8"
+tempfile = "3"
