@@ -247,6 +247,17 @@ fn main() {
         std::process::exit(1);
     });
 
+    // Cross-node mTLS verifies a peer's `tls-identity` leaf against the fleet
+    // identity-root CA — public trust material shipped in the policy partition's
+    // roots/ as `device-identity-root.pem`, a DISTINCT anchor from the IAM/sw
+    // roots (only this CA may vouch for a peer node's identity). Default to it
+    // inside --policy-dir so operators wire one path, not two; an explicit
+    // --identity-root still wins. If the file isn't there yet (not provisioned),
+    // build_cross_node_server_config fails and the listener logs + stays
+    // disabled until a policy update ships the root.
+    let identity_root =
+        identity_root.or_else(|| Some(policy_dir.join("roots/device-identity-root.pem")));
+
     let listen_addr =
         listen_addr.unwrap_or_else(|| DEFAULT_LISTEN.parse().expect("DEFAULT_LISTEN parse"));
 
@@ -990,7 +1001,7 @@ fn print_usage() {
         "  --identity-root <pem>          Trust anchor (identity-root CA, PEM) peer client certs"
     );
     eprintln!(
-        "                                 must chain to — typically the policy partition's roots/."
+        "                                 must chain to. Default: <policy-dir>/roots/device-identity-root.pem."
     );
     eprintln!();
     eprintln!("Storage / handles:");
