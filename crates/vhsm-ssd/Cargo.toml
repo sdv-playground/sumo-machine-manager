@@ -32,6 +32,10 @@ sha2 = "0.10"
 hsm-rustls = { path = "../hsm-rustls" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+# Cross-node principal derivation (crossnode.rs): parse the verified mTLS client
+# leaf and read its subject CN as the node id. const-oid `db` names COMMON_NAME.
+x509-cert = { version = "0.2", features = ["std"] }
+const-oid = { version = "0.9", features = ["db"] }
 
 [dev-dependencies]
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }

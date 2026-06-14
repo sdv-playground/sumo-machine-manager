@@ -41,12 +41,13 @@ use vhsm_ssd::bootstrap::BootstrapState;
 use vhsm_ssd::cert::EcuSigner;
 use vhsm_ssd::codec;
 use vhsm_ssd::handle_table::HandleTable;
-use vhsm_ssd::handler::{self, CallerId};
+use vhsm_ssd::handler::CallerId;
 use vhsm_ssd::iam::IamPolicy;
 use vhsm_ssd::proto::*;
+use vhsm_ssd::serve::{self, Dispatch};
 use vhsm_ssd::transport::{Connection, TcpListener};
 
-use secstore::{FileBackend, KeyMetadata, LinuxSimEncryptor, Secstore};
+use secstore::{FileBackend, LinuxSimEncryptor, Secstore};
 
 const DEFAULT_LISTEN: &str = "10.0.200.1:5100";
 const DEFAULT_CERT_LIFETIME_SECS: u64 = 365 * 24 * 60 * 60; // 1 year
@@ -626,47 +627,20 @@ fn serve_connection(
             "request"
         );
 
-        let table_len_before = handle_table.lock().unwrap().len();
-
-        let (resp, authz) = {
-            let mut table = handle_table.lock().unwrap();
-            handler::handle_request(&req, &caller, &mut table, iam, crypto)
-        };
-
-        // Persist if a dynamic handle was added (KEY_GENERATE success)
-        if let Some(s) = store {
-            let table = handle_table.lock().unwrap();
-            if table.len() > table_len_before {
-                if let Some(entry) = table.last() {
-                    if entry.persistent {
-                        let label_str = std::str::from_utf8(&entry.label)
-                            .unwrap_or("")
-                            .trim_end_matches('\0')
-                            .to_string();
-                        let meta = KeyMetadata {
-                            vhsm_handle: entry.handle,
-                            key_id: entry.key_id.clone(),
-                            algorithm: entry.algorithm,
-                            permitted_ops: entry.permitted_ops,
-                            owner_vm_id: entry.owner_vm_id.clone(),
-                            persistent: true,
-                            label: label_str,
-                        };
-                        if let Err(e) = s.store(&meta) {
-                            tracing::warn!(handle = entry.handle, error = %e, "failed to persist handle");
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Err(e) = audit.lock().unwrap().record(&caller, &req, &resp, authz) {
-            tracing::error!(vm = %caller.vm_id, error = %e, "audit log write failed");
-        }
-
-        if let Err(e) = codec::write_response(conn.writer(), &resp) {
-            tracing::warn!(vm = %caller.vm_id, error = %e, "write error, closing connection");
-            break;
+        // Identity is bound; run the shared post-handshake dispatch (also used
+        // by the cross-node TLS path) — handle_request + persist + audit + write.
+        match serve::dispatch_request(
+            &req,
+            &caller,
+            conn.writer(),
+            handle_table,
+            iam,
+            crypto,
+            store,
+            audit,
+        ) {
+            Dispatch::Continue => {}
+            Dispatch::Close => break,
         }
     }
 
