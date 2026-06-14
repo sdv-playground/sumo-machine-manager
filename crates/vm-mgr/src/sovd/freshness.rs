@@ -143,9 +143,8 @@ mod tests {
     }
 
     fn verifier_for(signed: &SignedFreshness) -> impl Fn(&[u8], &[u8]) -> bool {
-        let vk =
-            VerifyingKey::from_public_key_der(&hex::decode(&signed.signing_key_hex).unwrap())
-                .unwrap();
+        let vk = VerifyingKey::from_public_key_der(&hex::decode(&signed.signing_key_hex).unwrap())
+            .unwrap();
         move |bytes: &[u8], sig: &[u8]| {
             Signature::from_der(sig)
                 .map(|s| vk.verify(bytes, &s).is_ok())
@@ -174,7 +173,10 @@ mod tests {
         for tamper in tampers {
             let mut t = signed.clone();
             tamper(&mut t);
-            assert!(!t.verify(&verify), "a tampered field must fail verification");
+            assert!(
+                !t.verify(&verify),
+                "a tampered field must fail verification"
+            );
         }
     }
 

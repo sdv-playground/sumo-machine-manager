@@ -219,9 +219,7 @@ impl Authorizer for TieredAuthorizer {
                             .to_string(),
                     )
                 }
-                None => {
-                    return Err("vehicle-wide token is missing its `epoch` claim".to_string())
-                }
+                None => return Err("vehicle-wide token is missing its `epoch` claim".to_string()),
             }
         }
 
