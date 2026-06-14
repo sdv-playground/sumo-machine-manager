@@ -25,4 +25,5 @@ members = [
     "crates/puller",
     "crates/hsm-rustls",
     "crates/vhsm-proto",
+    "crates/vhsm-client",
 ]

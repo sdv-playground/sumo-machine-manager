@@ -1,0 +1,17 @@
+[package]
+name = "vhsm-client"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-agnostic client for the vHSM wire protocol — cross-node, cert-as-principal"
+
+[dependencies]
+# The shared wire contract (op codes, status, framing). The ONLY runtime dep:
+# the client is transport-agnostic and brings in no TLS/TCP itself.
+vhsm-proto = { path = "../vhsm-proto" }
+
+[dev-dependencies]
+# The interop test drives the REAL daemon dispatch over a loopback TCP socket,
+# so the client's framing is proven byte-exact against the server it talks to.
+vhsm-ssd = { path = "../vhsm-ssd" }
+hsm = { path = "../hsm", features = ["crypto"] }
+tempfile = "3"

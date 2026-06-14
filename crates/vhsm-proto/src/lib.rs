@@ -212,6 +212,27 @@ pub enum StatusCode {
     Internal = 0x00000009,
 }
 
+impl StatusCode {
+    /// Map a wire status word back to a [`StatusCode`]. Returns `None` for
+    /// any value outside the defined set — clients surface those as an
+    /// "unknown status" rather than guessing. The inverse of `as u32`.
+    pub fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            0x00000000 => Some(StatusCode::Ok),
+            0x00000001 => Some(StatusCode::InvalidHandle),
+            0x00000002 => Some(StatusCode::PermissionDeny),
+            0x00000003 => Some(StatusCode::PolicyReject),
+            0x00000004 => Some(StatusCode::HseError),
+            0x00000005 => Some(StatusCode::InvalidParam),
+            0x00000006 => Some(StatusCode::NoResource),
+            0x00000007 => Some(StatusCode::StorageError),
+            0x00000008 => Some(StatusCode::CryptoError),
+            0x00000009 => Some(StatusCode::Internal),
+            _ => None,
+        }
+    }
+}
+
 // ---- Algorithm identifiers (uint32) -------------------------------------
 
 pub const ALG_AES_128: u32 = 0x0001;
@@ -579,6 +600,28 @@ mod tests {
         assert_eq!(StatusCode::StorageError as u32, 7);
         assert_eq!(StatusCode::CryptoError as u32, 8);
         assert_eq!(StatusCode::Internal as u32, 9);
+    }
+
+    #[test]
+    fn status_code_from_u32_roundtrips_all_variants() {
+        // Every variant must survive the u32 → StatusCode → u32 round-trip,
+        // and unknown words must map to None (clients report "unknown status").
+        for s in [
+            StatusCode::Ok,
+            StatusCode::InvalidHandle,
+            StatusCode::PermissionDeny,
+            StatusCode::PolicyReject,
+            StatusCode::HseError,
+            StatusCode::InvalidParam,
+            StatusCode::NoResource,
+            StatusCode::StorageError,
+            StatusCode::CryptoError,
+            StatusCode::Internal,
+        ] {
+            assert_eq!(StatusCode::from_u32(s as u32), Some(s), "status {s:?}");
+        }
+        assert_eq!(StatusCode::from_u32(0x0000_000A), None);
+        assert_eq!(StatusCode::from_u32(0xFFFF_FFFF), None);
     }
 
     #[test]
