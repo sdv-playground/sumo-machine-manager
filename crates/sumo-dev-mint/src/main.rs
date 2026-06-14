@@ -56,6 +56,10 @@ struct Cli {
     /// freshness). Omit for no binding; read the live value from x-sumo-boot-id.
     #[arg(long)]
     boot_id: Option<String>,
+    /// `epoch` claim — binds a VEHICLE-WIDE token to the vehicle-epoch (§7.3
+    /// freshness). Omit for no binding; read the live value from x-sumo-freshness.
+    #[arg(long)]
+    epoch: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -68,6 +72,8 @@ struct Claims {
     scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     boot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -80,6 +86,7 @@ fn mint(
     iat: u64,
     ttl_secs: u64,
     boot_id: Option<&str>,
+    epoch: Option<u64>,
 ) -> Result<String> {
     let sk = SigningKey::from_bytes(&p256::FieldBytes::from(*scalar))?;
     let pem = sk.to_pkcs8_pem(LineEnding::LF)?;
@@ -94,6 +101,7 @@ fn mint(
         exp: iat.saturating_add(ttl_secs),
         scope: scope.to_string(),
         boot_id: boot_id.map(str::to_string),
+        epoch,
     };
     Ok(encode(&header, &claims, &key)?)
 }
@@ -110,6 +118,7 @@ fn main() -> Result<()> {
         now,
         cli.ttl_secs,
         cli.boot_id.as_deref(),
+        cli.epoch,
     )?;
     println!("{token}");
     Ok(())
@@ -147,6 +156,7 @@ mod tests {
             "factory-reset",
             1_000,
             LONG_TTL,
+            None,
             None,
         )
         .unwrap();
@@ -191,6 +201,7 @@ mod tests {
             1_000,
             LONG_TTL,
             None,
+            None,
         )
         .unwrap();
         let mut v = Validation::new(Algorithm::ES256);
@@ -215,6 +226,7 @@ mod tests {
             1_000,
             LONG_TTL,
             Some("boot-42"),
+            None,
         )
         .unwrap();
         let data = decode::<serde_json::Value>(&token, &decoding_key(), &v).unwrap();
@@ -230,9 +242,49 @@ mod tests {
             1_000,
             LONG_TTL,
             None,
+            None,
         )
         .unwrap();
         let data = decode::<serde_json::Value>(&token, &decoding_key(), &v).unwrap();
         assert!(data.claims.get("boot_id").is_none());
+    }
+
+    #[test]
+    fn epoch_claim_present_only_when_provided() {
+        let mut v = Validation::new(Algorithm::ES256);
+        v.set_audience(&["veh-1"]);
+        v.set_issuer(&["high-consequence-issuer"]);
+
+        // --epoch given → the claim is set (the §7.3 vehicle-wide freshness binding).
+        let token = mint(
+            &dev_signing_scalar(),
+            "high-consequence-issuer",
+            "op",
+            "veh-1",
+            "factory-reset",
+            1_000,
+            LONG_TTL,
+            None,
+            Some(5),
+        )
+        .unwrap();
+        let data = decode::<serde_json::Value>(&token, &decoding_key(), &v).unwrap();
+        assert_eq!(data.claims["epoch"], 5);
+
+        // omitted → no epoch claim (no binding).
+        let token = mint(
+            &dev_signing_scalar(),
+            "high-consequence-issuer",
+            "op",
+            "veh-1",
+            "factory-reset",
+            1_000,
+            LONG_TTL,
+            None,
+            None,
+        )
+        .unwrap();
+        let data = decode::<serde_json::Value>(&token, &decoding_key(), &v).unwrap();
+        assert!(data.claims.get("epoch").is_none());
     }
 }

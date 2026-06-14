@@ -81,6 +81,9 @@ pub struct TieredAuthorizer {
     /// When set, a token's `boot_id` claim must equal this — the device's
     /// current boot. Kills cross-boot replay (§7.1). `None` = no binding.
     expected_boot_id: Option<String>,
+    /// When set, a vehicle-wide token's `epoch` claim must be `>=` this — the
+    /// device's current vehicle-epoch floor (§7.3). `None` = no binding.
+    expected_epoch: Option<u64>,
 }
 
 impl TieredAuthorizer {
@@ -88,6 +91,7 @@ impl TieredAuthorizer {
         Self {
             issuers,
             expected_boot_id: None,
+            expected_epoch: None,
         }
     }
 
@@ -96,6 +100,17 @@ impl TieredAuthorizer {
     /// token sniffed before a reboot is dead after it. Omit for no binding.
     pub fn with_boot_id(mut self, boot_id: impl Into<String>) -> Self {
         self.expected_boot_id = Some(boot_id.into());
+        self
+    }
+
+    /// Bind accepted vehicle-wide tokens to the current vehicle-epoch (§7.3): a
+    /// token whose `epoch` claim is below the device's epoch is rejected as
+    /// stale, and one missing the claim is rejected. The epoch is a monotonic
+    /// floor the master only ratchets up (§7.2), so this is the cross-boot
+    /// freshness guard for grants that span ECUs and so can't name one ECU's
+    /// `boot_id`. Omit for no binding.
+    pub fn with_epoch(mut self, epoch: u64) -> Self {
+        self.expected_epoch = Some(epoch);
         self
     }
 }
@@ -110,6 +125,10 @@ struct Claims {
     /// Per-boot freshness binding (§7.1) — the target's `boot_id` at mint time.
     #[serde(default)]
     boot_id: Option<String>,
+    /// Vehicle-wide freshness binding (§7.3) — the vehicle-epoch a vehicle-wide
+    /// token was minted against.
+    #[serde(default)]
+    epoch: Option<u64>,
 }
 
 impl Claims {
@@ -181,6 +200,28 @@ impl Authorizer for TieredAuthorizer {
                 return Err(
                     "stale token: boot_id does not match the device's current boot".to_string(),
                 );
+            }
+        }
+
+        // Vehicle-wide freshness (§7.3): when the device pins its current
+        // vehicle-epoch, a vehicle-wide token must carry an `epoch` claim at
+        // least that high. The epoch is a monotonic floor the master ratchets
+        // up (§7.2 "never accept an epoch older than its current"), so a token
+        // minted against a superseded epoch is stale — the cross-boot guard for
+        // grants that span ECUs (which can't name one ECU's `boot_id`). A token
+        // ahead of the floor is fine (this device merely lags the master).
+        if let Some(expected) = self.expected_epoch {
+            match claims.epoch {
+                Some(epoch) if epoch >= expected => {}
+                Some(_) => {
+                    return Err(
+                        "stale token: vehicle-epoch is older than the device's current epoch"
+                            .to_string(),
+                    )
+                }
+                None => {
+                    return Err("vehicle-wide token is missing its `epoch` claim".to_string())
+                }
             }
         }
 
@@ -475,6 +516,56 @@ mod tests {
             .await
             .is_err());
         // Missing boot_id while the device pins one → rejected.
+        let none = token(None);
+        assert!(authz
+            .authorize(&access(&none, None, Capability::FactoryReset))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn epoch_binding_accepts_fresh_rejects_stale_and_missing() {
+        let (enc, dec) = issuer_keys(2);
+        let authz = TieredAuthorizer::new(vec![TrustedIssuer {
+            id: "external".into(),
+            audience: "vehicle-1".into(),
+            key: dec,
+            ceiling: Tier::HighConsequence,
+        }])
+        .with_epoch(5);
+
+        let token = |epoch: Option<u64>| {
+            let mut header = Header::new(Algorithm::ES256);
+            header.kid = Some("external".to_string());
+            let mut claims = serde_json::json!({
+                "sub": "op", "iss": "external", "aud": "vehicle-1",
+                "exp": 9_999_999_999u64, "scope": "factory-reset",
+            });
+            if let Some(e) = epoch {
+                claims["epoch"] = serde_json::json!(e);
+            }
+            format!("Bearer {}", encode(&header, &claims, &enc).unwrap())
+        };
+
+        // Fresh: epoch == the floor → accepted.
+        let fresh = token(Some(5));
+        assert!(authz
+            .authorize(&access(&fresh, None, Capability::FactoryReset))
+            .await
+            .is_ok());
+        // Ahead of the floor (this device lags the master) → still accepted.
+        let ahead = token(Some(6));
+        assert!(authz
+            .authorize(&access(&ahead, None, Capability::FactoryReset))
+            .await
+            .is_ok());
+        // Stale: an epoch below the floor (superseded by a bump) → rejected.
+        let stale = token(Some(4));
+        assert!(authz
+            .authorize(&access(&stale, None, Capability::FactoryReset))
+            .await
+            .is_err());
+        // Missing epoch while the device pins one → rejected.
         let none = token(None);
         assert!(authz
             .authorize(&access(&none, None, Capability::FactoryReset))
