@@ -28,24 +28,30 @@
 //!   --iam-policy is the legacy single-file path. Still supported for
 //!   dev rigs and SimHsm spawn lines that haven't migrated.
 
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use hsm::sim::SimHsm;
-use hsm::{HsmCryptoProvider, HsmProvider};
+use hsm::{HsmCryptoProvider, HsmProvider, KeyRole};
 
+use vhsm_ssd::audit::AuditLogger;
 use vhsm_ssd::auth::{self, EnrollContext, HandshakeState, IpResolver, Principal};
 use vhsm_ssd::bootstrap::BootstrapState;
 use vhsm_ssd::cert::EcuSigner;
 use vhsm_ssd::codec;
+use vhsm_ssd::crossnode;
 use vhsm_ssd::handle_table::HandleTable;
 use vhsm_ssd::handler::CallerId;
 use vhsm_ssd::iam::IamPolicy;
 use vhsm_ssd::proto::*;
 use vhsm_ssd::serve::{self, Dispatch};
+use vhsm_ssd::tls;
 use vhsm_ssd::transport::{Connection, TcpListener};
+
+use rustls::pki_types::CertificateDer;
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
 use secstore::{FileBackend, LinuxSimEncryptor, Secstore};
 
@@ -124,6 +130,8 @@ fn main() {
     let mut audit_log_max_rotated: u32 = vhsm_ssd::audit::DEFAULT_MAX_ROTATED;
     let mut issuer: String = DEFAULT_ISSUER.to_string();
     let mut ip_map: Vec<(IpAddr, String)> = Vec::new();
+    let mut cross_node_listen: Option<SocketAddr> = None;
+    let mut identity_root: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -197,6 +205,17 @@ fn main() {
                     std::process::exit(1);
                 });
                 ip_map.push((ip, vm_id.to_string()));
+                i += 2;
+            }
+            "--cross-node-listen" if i + 1 < args.len() => {
+                cross_node_listen = Some(args[i + 1].parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --cross-node-listen '{}': {e}", args[i + 1]);
+                    std::process::exit(1);
+                }));
+                i += 2;
+            }
+            "--identity-root" if i + 1 < args.len() => {
+                identity_root = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--help" | "-h" => {
@@ -437,6 +456,51 @@ fn main() {
         "vhsm-ssd v3 starting"
     );
 
+    // Optional cross-node mTLS listener (a SECOND bind, distinct from the guest
+    // private-bridge listener below). Off unless --cross-node-listen is set. It
+    // needs the host's TlsIdentity leaf (an HSM cert object) and the identity
+    // root PEM (the policy-partition trust anchor for peer client certs). If
+    // either isn't provisioned yet, we log and run WITHOUT it — the guest
+    // listener still comes up, and a host restart after provisioning lights this
+    // up. Spawned as a detached thread so it serves alongside the guest loop.
+    if let Some(xnode_addr) = cross_node_listen {
+        match build_cross_node_server_config(&crypto, identity_root.as_deref()) {
+            Ok(server_cfg) => {
+                let server_cfg = Arc::new(server_cfg);
+                let handle_table = Arc::clone(&handle_table);
+                let iam = Arc::clone(&iam);
+                let crypto = Arc::clone(&crypto);
+                let store = store.clone();
+                let audit = Arc::clone(&audit);
+                let spawned = std::thread::Builder::new()
+                    .name("vhsm-xnode-listener".to_string())
+                    .spawn(move || {
+                        run_cross_node_listener(
+                            xnode_addr,
+                            server_cfg,
+                            handle_table,
+                            iam,
+                            crypto,
+                            store,
+                            audit,
+                        );
+                    });
+                if let Err(e) = spawned {
+                    tracing::error!(error = %e, "failed to spawn cross-node listener thread");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    addr = %xnode_addr,
+                    reason = %e,
+                    "cross-node listener configured but TLS identity not ready — disabled until provisioned"
+                );
+            }
+        }
+    } else {
+        tracing::info!("cross-node mTLS listener disabled (no --cross-node-listen)");
+    }
+
     // Bind TCP listener.
     let listener = match TcpListener::bind(listen_addr) {
         Ok(l) => {
@@ -653,6 +717,153 @@ fn serve_connection(
     }
 }
 
+/// Assemble the cross-node mTLS `ServerConfig` from provisioned material: the
+/// host's `TlsIdentity` leaf (an HSM cert object, fetched via `get_certificate_der`)
+/// and the identity-root PEM (the policy-partition trust anchor that peer client
+/// certs must chain to). Returns `Err` — the caller logs and disables the
+/// listener — when `--identity-root` is missing or either piece isn't yet
+/// provisioned, so a fresh device comes up serving guests with cross-node off
+/// until its identity lands.
+fn build_cross_node_server_config(
+    crypto: &Arc<dyn HsmCryptoProvider>,
+    identity_root_pem: Option<&Path>,
+) -> Result<ServerConfig, String> {
+    let root_path = identity_root_pem
+        .ok_or("--identity-root <pem> is required when --cross-node-listen is set")?;
+    let root_pem = std::fs::read(root_path)
+        .map_err(|e| format!("read identity root {}: {e}", root_path.display()))?;
+    let client_roots =
+        tls::identity_root_store(&root_pem).map_err(|e| format!("parse identity root: {e}"))?;
+
+    let tls_kid = KeyRole::TlsIdentity.key_id();
+    let leaf_der = crypto
+        .get_certificate_der(tls_kid)
+        .map_err(|e| format!("TlsIdentity leaf cert not provisioned ('{tls_kid}'): {e}"))?;
+    let server_chain = vec![CertificateDer::from(leaf_der)];
+
+    tls::server_config(Arc::clone(crypto), tls_kid, server_chain, client_roots)
+        .map_err(|e| format!("build server config: {e}"))
+}
+
+/// Cross-node mTLS accept loop. One thread per connection (like the guest loop)
+/// so a slow handshake or a long-lived peer can't block other nodes. Runs until
+/// the process exits; a bind failure logs and returns (cross-node unavailable,
+/// guests unaffected).
+#[allow(clippy::too_many_arguments)]
+fn run_cross_node_listener(
+    listen: SocketAddr,
+    server_cfg: Arc<ServerConfig>,
+    handle_table: Arc<Mutex<HandleTable>>,
+    iam: Arc<IamPolicy>,
+    crypto: Arc<dyn HsmCryptoProvider>,
+    store: Option<Arc<Secstore<LinuxSimEncryptor, FileBackend>>>,
+    audit: Arc<Mutex<AuditLogger>>,
+) {
+    let listener = match StdTcpListener::bind(listen) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(addr = %listen, error = %e, "cross-node mTLS bind failed; cross-node access unavailable");
+            return;
+        }
+    };
+    tracing::info!(addr = %listen, "cross-node mTLS listener bound");
+
+    loop {
+        let (tcp, peer) = match listener.accept() {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!(error = %e, "cross-node accept failed, retrying");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+        };
+        let _ = tcp.set_nodelay(true);
+        let peer_ip = peer.ip();
+
+        let server_cfg = Arc::clone(&server_cfg);
+        let handle_table = Arc::clone(&handle_table);
+        let iam = Arc::clone(&iam);
+        let crypto = Arc::clone(&crypto);
+        let store = store.clone();
+        let audit = Arc::clone(&audit);
+
+        let spawned = std::thread::Builder::new()
+            .name(format!("vhsm-xnode-{peer_ip}"))
+            .spawn(move || {
+                serve_one_cross_node(
+                    tcp,
+                    peer_ip,
+                    server_cfg,
+                    &handle_table,
+                    &iam,
+                    &*crypto,
+                    store.as_deref(),
+                    &audit,
+                );
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "failed to spawn cross-node worker, dropping connection");
+        }
+    }
+}
+
+/// Complete the mTLS handshake on one accepted cross-node socket, derive the
+/// principal from the verified client cert, then hand off to the shared
+/// cross-node dispatch loop. Any failure before a principal is bound just drops
+/// the connection (logged) — the daemon stays up.
+#[allow(clippy::too_many_arguments)]
+fn serve_one_cross_node(
+    mut tcp: StdTcpStream,
+    peer_ip: IpAddr,
+    server_cfg: Arc<ServerConfig>,
+    handle_table: &Arc<Mutex<HandleTable>>,
+    iam: &IamPolicy,
+    crypto: &dyn HsmCryptoProvider,
+    store: Option<&Secstore<LinuxSimEncryptor, FileBackend>>,
+    audit: &Arc<Mutex<AuditLogger>>,
+) {
+    let mut conn = match ServerConnection::new(server_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(peer = %peer_ip, error = %e, "cross-node rustls session init failed");
+            return;
+        }
+    };
+    // Drive the handshake to completion; the client cert is verified here
+    // against the identity root before any vHSM byte is read.
+    if let Err(e) = conn.complete_io(&mut tcp) {
+        tracing::warn!(peer = %peer_ip, error = %e, "cross-node mTLS handshake failed");
+        return;
+    }
+    let principal = match conn.peer_certificates().and_then(|certs| certs.first()) {
+        Some(leaf) => match crossnode::principal_from_client_cert(leaf.as_ref()) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(peer = %peer_ip, error = %e, "cross-node client cert yields no principal");
+                return;
+            }
+        },
+        None => {
+            // WebPkiClientVerifier requires a client cert, so reaching here means
+            // a rustls contract changed — fail closed.
+            tracing::warn!(peer = %peer_ip, "cross-node client presented no certificate");
+            return;
+        }
+    };
+
+    let mut tls = StreamOwned::new(conn, tcp);
+    crossnode::serve_crossnode_connection(
+        &mut tls,
+        &principal,
+        peer_ip,
+        handle_table,
+        iam,
+        crypto,
+        store,
+        audit,
+    );
+}
+
 /// Populate handle table with well-known handles from the keystore.
 fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     let mut table = HandleTable::new();
@@ -769,6 +980,19 @@ fn print_usage() {
     eprintln!("  --cert-max-age <secs>       Lifetime of CWTs minted via ENROLL (default {DEFAULT_CERT_LIFETIME_SECS})");
     eprintln!("  --issuer <string>           CWT `iss` claim value (default '{DEFAULT_ISSUER}')");
     eprintln!();
+    eprintln!("Cross-node mTLS (off unless --cross-node-listen is set):");
+    eprintln!("  --cross-node-listen <ip:port>  Second bind for node-to-node access; the peer is");
+    eprintln!(
+        "                                 authenticated by its TLS client cert (cert = principal),"
+    );
+    eprintln!("                                 then authorized per-node via the same IAM policy.");
+    eprintln!(
+        "  --identity-root <pem>          Trust anchor (identity-root CA, PEM) peer client certs"
+    );
+    eprintln!(
+        "                                 must chain to — typically the policy partition's roots/."
+    );
+    eprintln!();
     eprintln!("Storage / handles:");
     eprintln!("  --persist-dir <dir>         Persist dynamic handles to this directory");
     eprintln!("  --extension-handles <file>  YAML manifest of project well-known handles (0x0080..0x00FF)");
@@ -777,4 +1001,43 @@ fn print_usage() {
     eprintln!("  --audit-log <path>          Enable per-op audit log at this path (size-rotated, fsync per line)");
     eprintln!("  --audit-log-max-bytes <N>   Cap on the active audit log size (default 67108864 = 64 MiB)");
     eprintln!("  --audit-log-max-rotated <K> Number of rotated copies to keep (default 4)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Both cases fail at the identity-root PEM step, before any keystore/HSM
+    // access, so the keystore path need not exist.
+    fn unprovisioned_crypto() -> Arc<dyn HsmCryptoProvider> {
+        Arc::new(SimHsm::new(
+            PathBuf::from("unused"),
+            PathBuf::from("/nonexistent-keystore"),
+            0,
+        ))
+    }
+
+    // The startup path turns these Errs into a warn-and-disable (a fresh device
+    // serves guests with cross-node off until its identity is provisioned),
+    // rather than crashing the daemon — so they must be Errs, not panics.
+    #[test]
+    fn cross_node_config_requires_identity_root() {
+        let crypto = unprovisioned_crypto();
+        let err = build_cross_node_server_config(&crypto, None).unwrap_err();
+        assert!(
+            err.contains("identity-root"),
+            "a missing --identity-root must be reported, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cross_node_config_errors_on_unreadable_identity_root() {
+        let crypto = unprovisioned_crypto();
+        let err = build_cross_node_server_config(&crypto, Some(Path::new("/nonexistent/root.pem")))
+            .unwrap_err();
+        assert!(
+            err.contains("read identity root"),
+            "an unreadable identity root must be reported, got: {err}"
+        );
+    }
 }
