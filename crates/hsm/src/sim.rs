@@ -1083,7 +1083,8 @@ impl HsmProvider for SimHsm {
             | KeyRole::IvdSigning
             | KeyRole::JwtSigning
             | KeyRole::OperationalIssuer
-            | KeyRole::HighConsequenceIssuer => Some(coset::iana::Algorithm::ES256),
+            | KeyRole::HighConsequenceIssuer
+            | KeyRole::FreshnessSigning => Some(coset::iana::Algorithm::ES256),
             KeyRole::DeviceDecryption => None,
         };
         Ok(build_public_cose_key_with_alg(&x, &y, alg))

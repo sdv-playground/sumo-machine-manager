@@ -14,7 +14,8 @@ Offset      Size        Sectors   Content
 0x000000    8 KB        2         Boot State (all bank sets)
 0x002000    8 KB        2         Factory (write-once, shared)
 0x004000    8 KB        2         App (shared application data)
-0x006000    40 KB       --        (reserved)
+0x006000    8 KB        2         Vehicle (freshness coordinator, §7.2)
+0x008000    32 KB       --        (reserved)
 
 0x010000    16 KB       4         Hypervisor FW Meta A
 0x014000    16 KB       4         Hypervisor FW Meta B
@@ -70,6 +71,7 @@ Magic numbers:
 - FW Meta:    `0x4E564D31` ("NVM1")
 - Runtime:    `0x4E565231` ("NVR1")
 - App:        `0x4E564131` ("NVA1")
+- Vehicle:    `0x4E565631` ("NVV1")
 
 ## Boot State
 
@@ -177,6 +179,27 @@ Offset  Size   Field
 0x08    2048   data (application-defined)
 0x808   4      crc32
 ```
+
+## Vehicle
+
+Vehicle-level mutable coordinator state — the §7.2 freshness epoch (and,
+once a trustworthy time source lands, the safe-time-floor). Vehicle-wide,
+persists across all bank switches; distinct from the write-once VIN in
+Factory.
+
+```
+Offset  Size   Field
+0x00    4      magic (NVV1)
+0x04    4      write_seq
+0x08    8      vehicle_epoch (u64, monotonic — bumped each power-on/online-sync)
+0x10    8      safe_time_floor_ns (u64, ns since Unix epoch; 0 until sourced)
+0x18    4      crc32
+```
+
+Total: 24-byte record (rest of 4 KB sector is unused/zero-padded). The
+`vehicle_epoch` only ever moves forward; peer ECUs adopt `max(local,
+master)` and never rewind, so a bad master can stall freshness but never
+replay an old epoch into validity.
 
 ## Integrity
 

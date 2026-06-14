@@ -136,6 +136,17 @@ pub enum KeyRole {
     /// reboot, HSM keystore) from the OEM / external authority — the
     /// ceiling an in-vehicle minter can never reach.
     HighConsequenceIssuer,
+
+    // --------------------- freshness coordinator --------------------
+    //
+    /// EC-P256 signing key generated **inside the HSM at provisioning
+    /// time, private NEVER leaves** — the master freshness coordinator's
+    /// assertion signer (§7.2). Signs the vehicle's `{safe-time-floor,
+    /// vehicle-epoch}` freshness assertion; peer ECUs verify it against
+    /// this key's pinned public half. Host-in-process only (like
+    /// `IvdSigning`): deliberately NOT addressable on the guest vHSM wire
+    /// — a guest must never be able to forge a freshness assertion.
+    FreshnessSigning,
 }
 
 impl KeyRole {
@@ -153,6 +164,7 @@ impl KeyRole {
             KeyRole::JwtSigning => "jwt-signing",
             KeyRole::OperationalIssuer => "operational-issuer",
             KeyRole::HighConsequenceIssuer => "high-consequence-issuer",
+            KeyRole::FreshnessSigning => "freshness-signing",
         }
     }
 
@@ -172,6 +184,7 @@ impl KeyRole {
             KeyRole::JwtSigning,
             KeyRole::OperationalIssuer,
             KeyRole::HighConsequenceIssuer,
+            KeyRole::FreshnessSigning,
         ]
     }
 
@@ -194,7 +207,8 @@ impl KeyRole {
             KeyRole::DeviceDecryption
                 | KeyRole::IamSigning
                 | KeyRole::IvdSigning
-                | KeyRole::JwtSigning,
+                | KeyRole::JwtSigning
+                | KeyRole::FreshnessSigning,
         )
     }
 }
@@ -345,6 +359,7 @@ mod tests {
             KeyRole::JwtSigning,
             KeyRole::OperationalIssuer,
             KeyRole::HighConsequenceIssuer,
+            KeyRole::FreshnessSigning,
         ];
         let ids: HashSet<_> = roles.iter().map(|r| r.key_id()).collect();
         assert_eq!(ids.len(), roles.len(), "key_id() must be unique per role");
@@ -368,6 +383,7 @@ mod tests {
             KeyRole::HighConsequenceIssuer.key_id(),
             "high-consequence-issuer"
         );
+        assert_eq!(KeyRole::FreshnessSigning.key_id(), "freshness-signing");
     }
 
     #[test]
@@ -377,7 +393,7 @@ mod tests {
         // should be either mandatory or explicitly opted out (and
         // there are no opt-outs today).
         let mandatory = KeyRole::mandatory_roles();
-        assert_eq!(mandatory.len(), 10);
+        assert_eq!(mandatory.len(), 11);
 
         // Sanity: every entry is distinct.
         use std::collections::HashSet;
@@ -395,6 +411,7 @@ mod tests {
             KeyRole::IamSigning,
             KeyRole::IvdSigning,
             KeyRole::JwtSigning,
+            KeyRole::FreshnessSigning,
         ];
         let trust_anchors = [
             KeyRole::KeyAuthority,

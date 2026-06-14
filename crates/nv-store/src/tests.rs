@@ -158,6 +158,56 @@ fn app_roundtrip() {
     assert_eq!(read.data[100], 0); // untouched bytes stay zero
 }
 
+#[test]
+fn vehicle_state_roundtrip() {
+    let mut store = make_store();
+    let mut v = NvVehicle::default();
+    v.vehicle_epoch = 7;
+    v.safe_time_floor_ns = 1_700_000_000_000_000_000;
+
+    store.write_vehicle_state(&mut v).unwrap();
+    let read = store.read_vehicle_state().unwrap();
+
+    assert_eq!(read.vehicle_epoch, 7);
+    assert_eq!(read.safe_time_floor_ns, 1_700_000_000_000_000_000);
+}
+
+#[test]
+fn vehicle_epoch_bump_is_monotonic() {
+    let mut store = make_store();
+    // No record yet → first bump starts from default 0 → 1.
+    assert_eq!(store.bump_vehicle_epoch().unwrap(), 1);
+    assert_eq!(store.bump_vehicle_epoch().unwrap(), 2);
+    assert_eq!(store.bump_vehicle_epoch().unwrap(), 3);
+    // Persisted: a fresh read sees the latest, never an older value.
+    assert_eq!(store.read_vehicle_state().unwrap().vehicle_epoch, 3);
+
+    // A bump preserves the floor field it doesn't touch.
+    let mut v = NvVehicle::default();
+    v.vehicle_epoch = 3;
+    v.safe_time_floor_ns = 42;
+    store.write_vehicle_state(&mut v).unwrap();
+    assert_eq!(store.bump_vehicle_epoch().unwrap(), 4);
+    assert_eq!(store.read_vehicle_state().unwrap().safe_time_floor_ns, 42);
+}
+
+#[test]
+fn vehicle_region_isolated_from_app() {
+    // The new region must not overlap App (or any other) — write both,
+    // each survives the other.
+    let mut store = make_store();
+    let mut app = NvApp::default();
+    app.data[0] = 0xAB;
+    store.write_app(&mut app).unwrap();
+
+    let mut v = NvVehicle::default();
+    v.vehicle_epoch = 99;
+    store.write_vehicle_state(&mut v).unwrap();
+
+    assert_eq!(store.read_app().unwrap().data[0], 0xAB);
+    assert_eq!(store.read_vehicle_state().unwrap().vehicle_epoch, 99);
+}
+
 // --- Sector rotation tests ---
 
 #[test]

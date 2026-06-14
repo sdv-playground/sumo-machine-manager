@@ -117,6 +117,7 @@ pub const MAGIC_FACTORY: u32 = 0x4E564631; // "NVF1"
 pub const MAGIC_FW_META: u32 = 0x4E564D32; // "NVM2" (v2: SW identity moved to signed IVD manifest)
 pub const MAGIC_RUNTIME: u32 = 0x4E565231; // "NVR1"
 pub const MAGIC_APP: u32 = 0x4E564131; // "NVA1"
+pub const MAGIC_VEHICLE: u32 = 0x4E565631; // "NVV1"
 
 /// Trait for NV records that can be serialized to/from raw sector bytes.
 ///
@@ -652,6 +653,68 @@ impl NvRecord for NvApp {
         Some(Self {
             write_seq: get_u32_le(buf, 4),
             data: get_bytes(buf, 8),
+        })
+    }
+}
+
+/// Vehicle-level mutable coordinator state — the §7.2 freshness epoch
+/// (and, once sourced, the safe-time-floor).
+///
+/// `vehicle_epoch` is a monotonic counter the master freshness
+/// coordinator bumps at each power-on / online-sync; peer ECUs adopt
+/// `max(local, master)` and never rewind, so a bad master can stall
+/// freshness but never replay an old epoch into validity. Vehicle-wide
+/// (not per-bank) and distinct from the write-once VIN in [`NvFactory`].
+///
+/// `safe_time_floor_ns` is the §6.5/§7.2 monotonic time floor (ns since
+/// the Unix epoch); 0 until a trustworthy source (Roughtime) lands. The
+/// field is persisted now so the floor survives reboots once sourced —
+/// no on-device format bump needed when it goes live.
+///
+/// Wire format (24 bytes):
+/// ```text
+/// [0..4]    magic (NVV1)
+/// [4..8]    write_seq
+/// [8..16]   vehicle_epoch (u64)
+/// [16..24]  safe_time_floor_ns (u64)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NvVehicle {
+    pub write_seq: u32,
+    pub vehicle_epoch: u64,
+    pub safe_time_floor_ns: u64,
+}
+
+impl NvRecord for NvVehicle {
+    const MAGIC: u32 = MAGIC_VEHICLE;
+
+    fn size() -> usize {
+        24
+    }
+
+    fn write_seq(&self) -> u32 {
+        self.write_seq
+    }
+
+    fn set_write_seq(&mut self, seq: u32) {
+        self.write_seq = seq;
+    }
+
+    fn serialize(&self, buf: &mut [u8]) {
+        put_u32_le(buf, 0, Self::MAGIC);
+        put_u32_le(buf, 4, self.write_seq);
+        put_u64_le(buf, 8, self.vehicle_epoch);
+        put_u64_le(buf, 16, self.safe_time_floor_ns);
+    }
+
+    fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::size() {
+            return None;
+        }
+        Some(Self {
+            write_seq: get_u32_le(buf, 4),
+            vehicle_epoch: get_u64_le(buf, 8),
+            safe_time_floor_ns: get_u64_le(buf, 16),
         })
     }
 }

@@ -19,6 +19,11 @@ pub mod layout {
     pub const APP_OFFSET: u64 = 0x004000;
     pub const APP_SECTORS: usize = 2;
 
+    // Vehicle-level coordinator state (§7.2 freshness epoch). Lives in the
+    // pre-bankset header region (0x6000..0x8000), well below BANKSET_BASE.
+    pub const VEHICLE_OFFSET: u64 = 0x006000;
+    pub const VEHICLE_SECTORS: usize = 2;
+
     pub const BANKSET_BASE: u64 = 0x010000;
     pub const BANKSET_STRIDE: u64 = 0x018000; // 96 KB per bank set
 
@@ -215,6 +220,34 @@ impl<D: BlockDevice> NvStore<D> {
 
     pub fn write_app(&mut self, app: &mut NvApp) -> Result<(), BlockError> {
         write_record(&mut self.dev, layout::APP_OFFSET, layout::APP_SECTORS, app)
+    }
+
+    // --- Vehicle (freshness coordinator state, §7.2) ---
+
+    pub fn read_vehicle_state(&self) -> Option<NvVehicle> {
+        read_record(&self.dev, layout::VEHICLE_OFFSET, layout::VEHICLE_SECTORS)
+    }
+
+    pub fn write_vehicle_state(&mut self, vehicle: &mut NvVehicle) -> Result<(), BlockError> {
+        write_record(
+            &mut self.dev,
+            layout::VEHICLE_OFFSET,
+            layout::VEHICLE_SECTORS,
+            vehicle,
+        )
+    }
+
+    /// Bump the monotonic vehicle-epoch (§7.2) and return the new value.
+    /// Read-modify-write: reads the latest persisted record (or default),
+    /// increments the epoch, writes it back. Because `write_record` always
+    /// rotates to a higher `write_seq` and `read_record` returns the
+    /// highest, the epoch never rewinds across reboots — the master's
+    /// freshness counter only moves forward.
+    pub fn bump_vehicle_epoch(&mut self) -> Result<u64, BlockError> {
+        let mut v = self.read_vehicle_state().unwrap_or_default();
+        v.vehicle_epoch = v.vehicle_epoch.saturating_add(1);
+        self.write_vehicle_state(&mut v)?;
+        Ok(v.vehicle_epoch)
     }
 
     // --- FW Meta (per bank set, per bank) ---
