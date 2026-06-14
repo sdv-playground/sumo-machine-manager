@@ -4,7 +4,7 @@ use bytes::Bytes;
 use crate::error::{MachineError, MachineResult};
 use crate::types::{
     Capabilities, Csr, DidFilter, DidKind, DtcFilter, EnvelopeStream, FlashId, FlashSession,
-    KeyDescriptor, RuntimeState,
+    KeyInventory, RuntimeState,
 };
 use crate::{ActivationState, ClearFaultsResult, Fault, FlashStatus};
 
@@ -168,9 +168,10 @@ pub trait Component: Send + Sync {
         Err(MachineError::NotSupported("get_csr"))
     }
 
-    /// List the HSM component's key slots — the `data/keys` SOVD resource. No
-    /// key material, just the slot inventory. Default: not an HSM component.
-    async fn list_keys(&self) -> MachineResult<Vec<KeyDescriptor>> {
+    /// The HSM component's key inventory — the `data/keys` SOVD resource: the
+    /// device's provisioning state + its key slots (public metadata only).
+    /// Default: not an HSM component.
+    async fn list_keys(&self) -> MachineResult<KeyInventory> {
         Err(MachineError::NotSupported("list_keys"))
     }
 

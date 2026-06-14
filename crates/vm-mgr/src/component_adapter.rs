@@ -18,7 +18,8 @@ use machine_mgr::component::DidEntry;
 use machine_mgr::{
     ActivationState, Capabilities, ClearFaultsResult, Component, Csr, DidFilter, DidKind,
     DtcFilter, EnvelopeStream, Fault, FlashCaps, FlashId, FlashSession, FlashStatus, HsmCaps,
-    KeyDescriptor, LifecycleCaps, MachineError, MachineResult, RuntimeState, RuntimeStatus,
+    KeyDescriptor, KeyInventory, LifecycleCaps, MachineError, MachineResult, RuntimeState,
+    RuntimeStatus,
 };
 
 use crate::backend::{ComponentBackend, DID_REGISTRY};
@@ -345,20 +346,24 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
         Ok(Csr::from_bytes(der))
     }
 
-    async fn list_keys(&self) -> MachineResult<Vec<KeyDescriptor>> {
+    async fn list_keys(&self) -> MachineResult<KeyInventory> {
         let keystore = self
             .csr_keystore
             .as_ref()
             .ok_or(MachineError::NotSupported(
                 "list_keys (no keystore configured)",
             ))?;
+        // The device reports its own provisioning state — no inference.
+        let provisioned = matches!(
+            self.inner.hsm_provisioning_state(),
+            Some(Ok(hsm::ProvisioningState::Provisioned))
+        );
         let tmp =
             hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
         use hsm::{HsmCryptoProvider, HsmProvider};
         let keys = tmp
             .list_keys()
-            .map_err(|e| MachineError::Internal(format!("list keys failed: {e}")))?;
-        Ok(keys
+            .map_err(|e| MachineError::Internal(format!("list keys failed: {e}")))?
             .into_iter()
             .map(|k| {
                 // Public-only: the SPKI for asymmetric slots (safe to return),
@@ -377,7 +382,8 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                     public_key,
                 }
             })
-            .collect())
+            .collect();
+        Ok(KeyInventory { provisioned, keys })
     }
 
     /// The ECU's self-sovereign id: a thumbprint of its HSM device key (the

@@ -23,9 +23,12 @@ use sovd_core::{OperationExecution, OperationStatus};
 /// Wire:
 ///
 ///   `GET  /vehicle/v1/components/hsm/data/keys`
-///        → 200 JSON `{ "items": [ { id, key_type, has_certificate, allowed_ops,
-///          public_key_der_base64 } ] }` (public-only; `public_key_der_base64`
-///          is the SPKI for asymmetric slots, `null` for symmetric)
+///        → 200 JSON `{ "provisioned": bool, "items": [ { id, key_type,
+///          has_certificate, allowed_ops, public_key_der_base64 } ] }` — ALWAYS
+///          served (device-generated keys exist from first boot); `provisioned`
+///          is the device's own state, so callers read it instead of inferring
+///          from a status code. Public-only; `public_key_der_base64` is the SPKI
+///          for asymmetric slots, `null` for symmetric.
 ///   `POST /vehicle/v1/components/hsm/operations/x-sumo-csr/executions`
 ///        body `{ "key_id": "<slot>" }` → 200 ISO 17978-3 §7.14 operation
 ///        execution; `result.csr_der_base64` is the PKCS#10 CSR.
@@ -70,8 +73,9 @@ async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
             .into_response();
     };
     match comp.list_keys().await {
-        Ok(keys) => {
-            let items: Vec<_> = keys
+        Ok(inv) => {
+            let items: Vec<_> = inv
+                .keys
                 .into_iter()
                 .map(|k| {
                     use base64::Engine;
@@ -88,7 +92,8 @@ async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
                     })
                 })
                 .collect();
-            Json(serde_json::json!({ "items": items })).into_response()
+            Json(serde_json::json!({ "provisioned": inv.provisioned, "items": items }))
+                .into_response()
         }
         Err(MachineError::NotSupported(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,

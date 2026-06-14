@@ -511,6 +511,40 @@ impl SimHsm {
         Ok(keys)
     }
 
+    /// List the device-generated keys present on disk — the pre-provision path
+    /// where no manifest exists yet. EC keys appear as `{id}.priv`, AES as
+    /// `{id}.bin`; trust anchors (`.pub`-only) don't exist until provisioning.
+    /// No ACL metadata (the manifest carries that), so `allowed_*` are `None`.
+    fn list_device_keys_from_disk(&self) -> Result<Vec<KeyInfo>, HsmError> {
+        let keys_dir = self.keys_dir();
+        let mut keys = Vec::new();
+        let entries = match std::fs::read_dir(&keys_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(keys), // no keys dir yet → empty inventory
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let (key_id, key_type) = if let Some(id) = name.strip_suffix(".priv") {
+                (id.to_string(), KeyType::EcP256)
+            } else if let Some(id) = name.strip_suffix(".bin") {
+                (id.to_string(), KeyType::Aes256)
+            } else {
+                continue;
+            };
+            let has_certificate = keys_dir.join(format!("{key_id}.cert")).exists();
+            keys.push(KeyInfo {
+                key_id,
+                key_type,
+                has_certificate,
+                allowed_guests: None,
+                allowed_ops: None,
+            });
+        }
+        keys.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        Ok(keys)
+    }
+
     /// Check if the daemon process is still alive.
     fn is_running(&mut self) -> bool {
         let Some(child) = self.child.as_mut() else {
@@ -917,10 +951,15 @@ impl HsmProvider for SimHsm {
     }
 
     fn list_keys(&self) -> Result<Vec<KeyInfo>, HsmError> {
-        if !self.is_provisioned()? {
-            return Err(HsmError::NotProvisioned);
+        if self.is_provisioned()? {
+            self.parse_manifest()
+        } else {
+            // Pre-provision there is no manifest, but the device-generated keys
+            // exist on disk (ensure_device_keys at first boot). List them so the
+            // key inventory is available whether or not the device is provisioned
+            // — the caller reports the provisioning state separately.
+            self.list_device_keys_from_disk()
         }
-        self.parse_manifest()
     }
 
     fn start_service(&mut self) -> Result<u16, HsmError> {
@@ -1646,6 +1685,26 @@ mod tests {
         // The re-provision kept the original keypair the leaf certifies.
         assert!(tmp.join("keys/mykey.priv").exists());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(feature = "crypto")]
+    fn list_keys_lists_device_keys_pre_provision() {
+        let tmp = std::env::temp_dir().join("hsm-test-list-preprov");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
+        // Device-generated keys exist at first boot, but the device is NOT
+        // provisioned (no manifest). list_keys used to error here; now it
+        // disk-lists the device keys so the inventory is available either way.
+        hsm.ensure_device_keys().unwrap();
+        assert!(!hsm.is_provisioned().unwrap(), "not provisioned yet");
+        let keys = HsmProvider::list_keys(&hsm).unwrap();
+        assert!(
+            keys.iter().any(|k| k.key_id == "tls-identity"),
+            "tls-identity device key listed pre-provision"
+        );
+        assert!(keys.iter().any(|k| k.key_id == "device-decrypt"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

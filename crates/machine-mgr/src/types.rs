@@ -200,3 +200,16 @@ pub struct KeyDescriptor {
     /// `None` for symmetric keys. Never any private material.
     pub public_key: Option<Vec<u8>>,
 }
+
+/// The HSM key inventory returned by [`Component::list_keys`](crate::Component::list_keys)
+/// — the device's own provisioning state plus the key slots. Always available
+/// (the device-generated keys exist from first boot), so callers read
+/// `provisioned` directly instead of inferring it from an endpoint's status.
+#[derive(Debug, Clone)]
+pub struct KeyInventory {
+    /// Whether the HSM has been provisioned (its keystore installed). The device
+    /// reports its own truth — no heuristic.
+    pub provisioned: bool,
+    /// The key slots (public metadata only; see [`KeyDescriptor`]).
+    pub keys: Vec<KeyDescriptor>,
+}
