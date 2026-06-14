@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use rustls::client::ResolvesClientCert;
 use rustls::pki_types::CertificateDer;
+use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::{CertifiedKey, Signer, SigningKey};
 use rustls::{SignatureAlgorithm, SignatureScheme};
 
@@ -110,6 +111,27 @@ impl ResolvesClientCert for HsmClientIdentity {
 
     fn has_certs(&self) -> bool {
         true
+    }
+}
+
+/// A [`ResolvesServerCert`] that always presents one HSM-backed identity — wire
+/// it into `ServerConfig::builder()...with_cert_resolver(Arc::new(_))` to serve
+/// (m)TLS with the private key staying in the HSM. Same `CertifiedKey` shape as
+/// the client side; a node uses one HSM `TlsIdentity` leaf for both directions.
+#[derive(Debug)]
+pub struct HsmServerIdentity {
+    certified: Arc<CertifiedKey>,
+}
+
+impl HsmServerIdentity {
+    pub fn new(certified: Arc<CertifiedKey>) -> Self {
+        Self { certified }
+    }
+}
+
+impl ResolvesServerCert for HsmServerIdentity {
+    fn resolve(&self, _client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        Some(self.certified.clone())
     }
 }
 

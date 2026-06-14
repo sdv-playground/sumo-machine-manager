@@ -28,4 +28,5 @@ pub mod handle_table;
 pub mod handler;
 pub mod iam;
 pub mod proto;
+pub mod tls;
 pub mod transport;
