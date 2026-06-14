@@ -6,6 +6,7 @@ description = "vHSM Secure Storage Daemon — host-side crypto service for guest
 
 [dependencies]
 hsm = { path = "../hsm", features = ["crypto"] }
+vhsm-proto = { path = "../vhsm-proto" }
 policy-eval = { path = "../policy-eval" }
 policy-partition = { path = "../policy-partition" }
 secstore = { path = "../secstore" }

@@ -24,4 +24,5 @@ members = [
     "crates/log-rotate",
     "crates/puller",
     "crates/hsm-rustls",
+    "crates/vhsm-proto",
 ]

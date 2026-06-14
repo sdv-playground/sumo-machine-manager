@@ -1,0 +1,5 @@
+[package]
+name = "vhsm-proto"
+version = "0.1.0"
+edition = "2021"
+description = "vHSM wire protocol (v3) — op codes, status, well-known handles, and request/response framing, shared by the host daemon and clients"
