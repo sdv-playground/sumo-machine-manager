@@ -18,7 +18,7 @@ sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0
 sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
 
 # RustCrypto — used by HsmCryptoProvider for software crypto (simulation)
-p256 = { version = "0.13", features = ["ecdsa"], optional = true }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem", "std"], optional = true }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "der"], optional = true }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"], optional = true }
 aes-gcm = { version = "0.10", optional = true }
@@ -29,11 +29,16 @@ hkdf = { version = "0.12", optional = true }
 # bank verify is bound by. On QNX it also needs `-C target-feature=+sha2` at
 # build time (cpufeatures has no runtime detection there). x86 host builds use
 # sha2-asm's x86 path.
-sha2 = { version = "0.10", features = ["asm"], optional = true }
+sha2 = { version = "0.10", features = ["asm", "oid"], optional = true }
 hmac = { version = "0.12", optional = true }
 rand = { version = "0.8", optional = true }
 cmac = { version = "0.7", optional = true }
 aes = { version = "0.8", optional = true }
+# X.509: build the device TLS-identity CSR (PKCS#10) on the same der/spki/p256
+# stack the Tower CA parses with, so the request round-trips exactly. Pure-Rust,
+# cross-compiles to QNX. `oid` on sha2 lets x509-cert emit ecdsa-with-SHA256.
+x509-cert = { version = "0.2", features = ["std", "pem", "builder"], optional = true }
+const-oid = { version = "0.9", features = ["db"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -41,4 +46,4 @@ tempfile = "3"
 [features]
 default = ["suit"]
 suit = ["dep:sumo-onboard", "dep:sumo-crypto", "dep:sumo-codec"]
-crypto = ["dep:p256", "dep:ecdsa", "dep:ed25519-dalek", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:hmac", "dep:rand", "dep:cmac", "dep:aes"]
+crypto = ["dep:p256", "dep:ecdsa", "dep:ed25519-dalek", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:hmac", "dep:rand", "dep:cmac", "dep:aes", "dep:x509-cert", "dep:const-oid"]

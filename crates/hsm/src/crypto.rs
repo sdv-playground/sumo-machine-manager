@@ -441,13 +441,28 @@ impl HsmCryptoProvider for SimHsm {
         let pem = std::fs::read_to_string(&priv_path)
             .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", priv_path.display())))?;
         let scalar = extract_ec_scalar_from_pem(&pem)?;
-
         let signing_key = SigningKey::from_bytes((&scalar[..]).into())
             .map_err(|e| HsmError::CryptoError(format!("invalid signing key: {e}")))?;
-        let verifying_key = signing_key.verifying_key();
-        let pub_point = verifying_key.to_encoded_point(false);
 
-        build_pkcs10_csr(subject_cn, pub_point.as_bytes(), &signing_key)
+        // Build the PKCS#10 CSR with x509-cert — the same library the Tower CA
+        // parses with — so the CertificationRequestInfo round-trips exactly (the
+        // CA verifies proof-of-possession over a re-serialization of it). On real
+        // hardware the signature would be delegated to the HSM; here the SimHsm
+        // signs with the in-process key.
+        use std::str::FromStr;
+        use x509_cert::builder::{Builder, RequestBuilder};
+        use x509_cert::der::Encode;
+        use x509_cert::name::Name;
+
+        let subject = Name::from_str(&format!("CN={subject_cn}"))
+            .map_err(|e| HsmError::CryptoError(format!("invalid subject CN: {e}")))?;
+        let builder = RequestBuilder::new(subject, &signing_key)
+            .map_err(|e| HsmError::CryptoError(format!("CSR builder init: {e}")))?;
+        let csr = builder
+            .build::<p256::ecdsa::DerSignature>()
+            .map_err(|e| HsmError::CryptoError(format!("CSR build/sign: {e}")))?;
+        csr.to_der()
+            .map_err(|e| HsmError::CryptoError(format!("CSR encode: {e}")))
     }
 
     /// CEK unwrap via in-host crypto, using the symmetric key stored
@@ -516,131 +531,6 @@ fn load_ec_verifying_key(hsm: &SimHsm, key_id: &str) -> Result<VerifyingKey, Hsm
     let der = decode_pem(&pem, "PUBLIC KEY")?;
     VerifyingKey::from_sec1_bytes(&der[der.len() - 65..])
         .map_err(|e| HsmError::CryptoError(format!("invalid verifying key: {e}")))
-}
-
-/// Build a PKCS#10 CertificationRequest (CSR) DER for EC-P256.
-///
-/// Structure:
-///   SEQUENCE {
-///     CertificationRequestInfo ::= SEQUENCE {
-///       version INTEGER 0
-///       subject Name (SEQUENCE { SET { SEQUENCE { OID cn, UTF8String } } })
-///       subjectPKInfo SubjectPublicKeyInfo
-///       attributes [0] (empty)
-///     }
-///     signatureAlgorithm AlgorithmIdentifier (ecdsa-with-SHA256)
-///     signature BIT STRING
-///   }
-fn build_pkcs10_csr(
-    cn: &str,
-    public_key_uncompressed: &[u8], // 65 bytes (0x04 || x || y)
-    signing_key: &SigningKey,
-) -> Result<Vec<u8>, HsmError> {
-    // --- Build CertificationRequestInfo ---
-    let mut cri = Vec::with_capacity(256);
-
-    // version INTEGER 0
-    cri.extend_from_slice(&[0x02, 0x01, 0x00]);
-
-    // subject: Name = SEQUENCE { SET { SEQUENCE { OID 2.5.4.3 (cn), UTF8String } } }
-    let cn_bytes = cn.as_bytes();
-    let cn_oid: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03]; // OID 2.5.4.3
-    let cn_val_tag: &[u8] = &[0x0C]; // UTF8String tag
-                                     // inner SEQUENCE: OID + UTF8String
-    let inner_seq_len = cn_oid.len() + 1 + der_len_size(cn_bytes.len()) + cn_bytes.len();
-    // SET wrapping inner SEQUENCE
-    let set_len = 1 + der_len_size(inner_seq_len) + inner_seq_len;
-    // outer SEQUENCE wrapping SET
-    let name_len = 1 + der_len_size(set_len) + set_len;
-
-    cri.push(0x30); // SEQUENCE (Name)
-    push_der_len(&mut cri, name_len);
-    cri.push(0x31); // SET
-    push_der_len(&mut cri, inner_seq_len + 1 + der_len_size(inner_seq_len));
-    cri.push(0x30); // SEQUENCE (AttributeTypeAndValue)
-    push_der_len(&mut cri, inner_seq_len);
-    cri.extend_from_slice(cn_oid);
-    cri.push(cn_val_tag[0]);
-    push_der_len(&mut cri, cn_bytes.len());
-    cri.extend_from_slice(cn_bytes);
-
-    // subjectPKInfo: SubjectPublicKeyInfo for EC-P256
-    // SEQUENCE { SEQUENCE { OID ecPublicKey, OID P-256 }, BIT STRING { 0x00 || uncompressed } }
-    let ec_pk_oid: &[u8] = &[
-        0x30, 0x13, // SEQUENCE (AlgorithmIdentifier)
-        0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, // OID ecPublicKey
-        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, // OID P-256
-    ];
-    let bit_string_len = 1 + public_key_uncompressed.len(); // 0x00 padding + key
-    let spki_inner_len = ec_pk_oid.len() + 1 + der_len_size(bit_string_len) + bit_string_len;
-
-    cri.push(0x30); // SEQUENCE (SubjectPublicKeyInfo)
-    push_der_len(&mut cri, spki_inner_len);
-    cri.extend_from_slice(ec_pk_oid);
-    cri.push(0x03); // BIT STRING
-    push_der_len(&mut cri, bit_string_len);
-    cri.push(0x00); // no unused bits
-    cri.extend_from_slice(public_key_uncompressed);
-
-    // attributes [0] IMPLICIT (empty)
-    cri.extend_from_slice(&[0xA0, 0x00]);
-
-    // Wrap CRI in SEQUENCE
-    let mut cri_seq = Vec::with_capacity(cri.len() + 4);
-    cri_seq.push(0x30);
-    push_der_len(&mut cri_seq, cri.len());
-    cri_seq.extend_from_slice(&cri);
-
-    // --- Sign CRI ---
-    let signature: ecdsa::der::Signature<p256::NistP256> = signing_key.sign(&cri_seq);
-    let sig_bytes = signature.to_bytes();
-
-    // --- Build outer CertificationRequest ---
-    // signatureAlgorithm: ecdsa-with-SHA256
-    let sig_alg: &[u8] = &[
-        0x30, 0x0A, // SEQUENCE (AlgorithmIdentifier)
-        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02, // OID ecdsa-with-SHA256
-    ];
-
-    let bit_sig_len = 1 + sig_bytes.len(); // 0x00 + DER signature
-    let outer_len = cri_seq.len() + sig_alg.len() + 1 + der_len_size(bit_sig_len) + bit_sig_len;
-
-    let mut csr = Vec::with_capacity(outer_len + 4);
-    csr.push(0x30); // SEQUENCE (CertificationRequest)
-    push_der_len(&mut csr, outer_len);
-    csr.extend_from_slice(&cri_seq);
-    csr.extend_from_slice(sig_alg);
-    csr.push(0x03); // BIT STRING
-    push_der_len(&mut csr, bit_sig_len);
-    csr.push(0x00); // no unused bits
-    csr.extend_from_slice(&sig_bytes);
-
-    Ok(csr)
-}
-
-/// Size of a DER length encoding.
-fn der_len_size(len: usize) -> usize {
-    if len < 0x80 {
-        1
-    } else if len < 0x100 {
-        2
-    } else {
-        3
-    }
-}
-
-/// Push a DER length encoding.
-fn push_der_len(buf: &mut Vec<u8>, len: usize) {
-    if len < 0x80 {
-        buf.push(len as u8);
-    } else if len < 0x100 {
-        buf.push(0x81);
-        buf.push(len as u8);
-    } else {
-        buf.push(0x82);
-        buf.push((len >> 8) as u8);
-        buf.push(len as u8);
-    }
 }
 
 /// Load a raw symmetric key of the expected size.
@@ -790,6 +680,43 @@ mod tests {
         // 0x0099 isn't on the wire; should be rejected with NotSupported.
         let err = hsm.generate_key("k-bogus", 0x0099).unwrap_err();
         assert!(matches!(err, HsmError::NotSupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn generate_csr_produces_a_ca_consumable_pkcs10() {
+        let (hsm, _tmp) = new_hsm();
+        let kid = crate::KeyRole::TlsIdentity.key_id();
+        hsm.generate_key(kid, ALG_ECC_P256).unwrap();
+        let csr_der = hsm.generate_csr(kid, "node-7").unwrap();
+
+        // Parse as PKCS#10 and verify proof-of-possession exactly as the Tower
+        // CA's parse_and_verify_csr does: reserialize the request info, verify
+        // the self-signature. Round-trips by construction (both sides x509-cert).
+        use x509_cert::der::{Decode, Encode};
+        use x509_cert::request::CertReq;
+        let csr = CertReq::from_der(&csr_der).expect("CSR must parse as PKCS#10");
+        let info_der = csr.info.to_der().unwrap();
+        let csr_point = csr.info.public_key.subject_public_key.as_bytes().unwrap();
+
+        // Verify proof-of-possession the same way the Tower CA does: the
+        // self-signature over the (reserialized) request info verifies against
+        // the CSR's own key.
+        use p256::ecdsa::signature::Verifier;
+        let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(csr_point).unwrap();
+        let sig =
+            ecdsa::der::Signature::<p256::NistP256>::try_from(csr.signature.as_bytes().unwrap())
+                .unwrap();
+        vk.verify(&info_der, &sig)
+            .expect("CSR self-signature (POP) must verify");
+
+        // The CSR carries this slot's key + the CN we asked for.
+        let slot_spki = hsm.get_public_key_der(kid).unwrap();
+        assert_eq!(
+            csr_point,
+            &slot_spki[slot_spki.len() - 65..],
+            "CSR public key must be the slot's key"
+        );
+        assert!(format!("{}", csr.info.subject).contains("node-7"));
     }
 
     #[test]
