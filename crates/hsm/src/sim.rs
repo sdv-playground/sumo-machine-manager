@@ -266,10 +266,33 @@ impl SimHsm {
 
         self.generate_missing_local_keys(ks)?;
 
+        // Install any signed leaf certs (v3) for device-generated identity
+        // keys — BEFORE the manifest, so write_manifest records their
+        // cert_path. The key was generated on an earlier provision; this
+        // re-provision lands the CA-issued leaf for it (e.g. tls-identity).
+        self.write_leaf_certs(&ks.certificates, &keys_dir)?;
+
         self.write_manifest(&ks.slots)?;
         self.write_identities(ks)?;
         self.save_state(ks.security_version)?;
 
+        Ok(())
+    }
+
+    /// Write each delivered leaf certificate to `{key_id}.cert` (PEM). The
+    /// cert is a public artifact bound to a device-generated key whose
+    /// private half never left the HSM; `payload::decode` has already
+    /// checked each names an EC-P256 slot in this keystore.
+    fn write_leaf_certs(
+        &self,
+        certs: &[crate::payload::LeafCert],
+        keys_dir: &Path,
+    ) -> Result<(), HsmError> {
+        for c in certs {
+            let cert_path = keys_dir.join(format!("{}.cert", c.key_id));
+            write_pem_certificate(&cert_path, &c.certificate)?;
+            tracing::info!(key_id = %c.key_id, "installed leaf certificate");
+        }
         Ok(())
     }
 
@@ -1370,11 +1393,10 @@ pub(crate) fn write_pem_ec_public(path: &Path, uncompressed: &[u8]) -> Result<()
     write_pem_file(path, "PUBLIC KEY", &der)
 }
 
-/// Write a DER-encoded X.509 certificate as PEM. Reserved for the
-/// CSR-issuance flow that writes a `{key_id}.cert` file alongside a
-/// device-generated key after a CA returns the signed cert. The v2
-/// envelope schema doesn't carry certs.
-#[allow(dead_code)]
+/// Write a DER-encoded X.509 certificate as PEM at `{key_id}.cert`.
+/// Driven by the v3 keystore `certificates` list (`write_leaf_certs`):
+/// the CA-issued leaf for a device-generated identity key, landed
+/// alongside the key it certifies. `get_certificate_der` reads it back.
 fn write_pem_certificate(path: &Path, der: &[u8]) -> Result<(), HsmError> {
     write_pem_file(path, "CERTIFICATE", der)
 }
@@ -1515,6 +1537,7 @@ mod tests {
                     allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT]),
                 },
             ],
+            certificates: Vec::new(),
         }
     }
 
@@ -1583,6 +1606,45 @@ mod tests {
         assert_eq!(keys[0].key_type, KeyType::EcP256);
         assert_eq!(keys[1].key_id, "storage-key");
         assert_eq!(keys[1].key_type, KeyType::Aes256);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(feature = "crypto")]
+    fn reprovision_installs_leaf_certificate() {
+        let tmp = std::env::temp_dir().join("hsm-test-leaf-cert");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
+
+        // First provision generates the EC key for "mykey"; no cert yet
+        // (the leaf can only be issued from the CSR that key emits).
+        hsm.write_keystore(&sample_keystore()).unwrap();
+        assert!(!tmp.join("keys/mykey.cert").exists());
+        assert!(tmp.join("keys/mykey.priv").exists());
+
+        // Re-provision delivering the CA-issued leaf for "mykey" (the v3
+        // top-level certificates list). get_certificate_der decodes the
+        // PEM body back to DER, so any byte blob round-trips here.
+        let leaf_der = vec![0x30, 0x82, 0x01, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        let mut ks2 = sample_keystore();
+        ks2.security_version = 2;
+        ks2.certificates.push(payload::LeafCert {
+            key_id: "mykey".into(),
+            certificate: leaf_der.clone(),
+        });
+        hsm.write_keystore(&ks2).unwrap();
+
+        // The leaf landed on disk, the manifest records its cert_path, and
+        // the runtime query returns the exact DER we shipped.
+        assert!(tmp.join("keys/mykey.cert").exists());
+        let manifest = std::fs::read_to_string(tmp.join("manifest")).unwrap();
+        assert!(manifest.contains("keys/mykey.cert"));
+        let got = crate::HsmCryptoProvider::get_certificate_der(&hsm, "mykey").unwrap();
+        assert_eq!(got, leaf_der);
+
+        // The re-provision kept the original keypair the leaf certifies.
+        assert!(tmp.join("keys/mykey.priv").exists());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

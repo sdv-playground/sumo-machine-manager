@@ -465,6 +465,7 @@ fn main() {
         security_version: 1,
         identities: identities.clone(),
         slots: slots.clone(),
+        certificates: Vec::new(),
     };
 
     let cbor = encode(&keystore).unwrap();

@@ -181,14 +181,15 @@ statements:
                     allowed_ops: Some(vec![OP_ENCRYPT, OP_DECRYPT]),
                 },
             ],
+            certificates: Vec::new(),
         };
 
-        // Simulate post-CSR cert issuance for `mykey`. In production
-        // a CA signs the device's CSR and the resulting cert lands
-        // on disk as `keys/mykey.cert`. v2 envelopes don't carry
-        // certs, so the test writes a placeholder PEM directly —
-        // and does so BEFORE write_keystore so the manifest writer
-        // picks it up via the on-disk file check.
+        // Simulate post-CSR cert issuance for `mykey`. In production a CA
+        // signs the device's CSR and the resulting leaf lands on disk as
+        // `keys/mykey.cert` (via the v3 envelope `certificates` list, or a
+        // CSR-flow). This test exercises the on-disk path directly,
+        // writing a placeholder PEM BEFORE write_keystore so the manifest
+        // writer picks it up via the on-disk file check.
         std::fs::create_dir_all(path.join("keys")).unwrap();
         let cert_pem = "-----BEGIN CERTIFICATE-----\n\
             MIIBADCB/DCBpaADAgECAhEAhAhAhAhAhAhAhAhAhAhACgYIKoZIzj0EAwIwGzEZ\n\

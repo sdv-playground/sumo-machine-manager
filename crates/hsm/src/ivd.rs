@@ -1012,6 +1012,7 @@ mod tests {
                 allowed_guests: None,
                 allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
             }],
+            certificates: Vec::new(),
         };
         hsm.write_keystore(&ks).unwrap();
         std::fs::write(keystore.join("provision_state"), b"1\n").unwrap();

@@ -5,7 +5,7 @@
 //! every backend (SimHsm in dev/test; HSE-backed providers in
 //! production).
 //!
-//! # Schema v2 — no private keys, ever
+//! # Schema v3 — no private keys; public leaf certs welcome
 //!
 //! The keystore enumerates the slots a provisioned HSM should expose
 //! and the trust anchors (public halves) used to verify subsequent
@@ -16,18 +16,26 @@
 //! keypair locally during provisioning and exposes the public half
 //! through `HsmCryptoProvider::get_public_key_der` afterwards.
 //!
-//! Removed in v2 vs v1: `private_key` field, `certificate` field
-//! (CSR-flow concern, never an envelope concern). Decoders reject v1
-//! envelopes outright — drop-compatibility was the point.
+//! v2 dropped v1's `private_key` field (never ship privates) and the
+//! per-key `certificate` field. v3 re-introduces leaf certificates, but
+//! ONLY as **signed leaves for device-generated identity keys** (e.g.
+//! the `tls-identity` mTLS leaf), carried in the top-level
+//! `certificates` list. A leaf is a public artifact, **inert without the
+//! HSM-held private key**, so carrying it in the already-signed +
+//! device-encrypted envelope adds no secret and no new trust
+//! assumption — it just lands the cert atomically with the key it
+//! certifies, on the one keystore channel. Private keys still never
+//! cross. Decoders reject v1/v2 envelopes outright.
 //!
 //! # Wire format (CBOR, integer keys)
 //!
 //! ```text
 //! HsmKeystore = {
-//!   0: uint,            ; schema_version (must be 2)
+//!   0: uint,            ; schema_version (must be 3)
 //!   1: uint,            ; security_version (anti-rollback floor)
 //!   2: [* Identity],
 //!   3: [* KeySlot],
+//!   4: [* LeafCert],    ; optional; signed leaves for device keys
 //! }
 //!
 //! Identity = {
@@ -44,15 +52,21 @@
 //!   3: ?[* tstr],       ; allowed_guests (None = unrestricted)
 //!   4: ?[* uint],       ; allowed_ops (None = all)
 //! }
+//!
+//! LeafCert = {
+//!   0: tstr,            ; key_id — must name an EC-P256 slot above
+//!   1: bstr,            ; certificate — DER X.509 leaf
+//! }
 //! ```
 
 use serde::{Deserialize, Serialize};
 
 use crate::KeyType;
 
-/// Schema version. Bumped to 2 to break compatibility with the v1
-/// shape that allowed pushed private keys + certificates.
-pub const SCHEMA_VERSION: u64 = 2;
+/// Schema version. v3 re-adds an optional top-level `certificates` list
+/// (signed leaves for device-generated identity keys — public, inert
+/// without the HSM-held private key). v1/v2 envelopes are rejected.
+pub const SCHEMA_VERSION: u64 = 3;
 
 /// Well-known factory signing key — verifies the very first HSM key
 /// provisioning envelope.
@@ -99,6 +113,27 @@ pub struct HsmKeystore {
     /// Key slots — enumerated, not key material.
     #[serde(rename = "3")]
     pub slots: Vec<KeySlot>,
+
+    /// Signed leaf certificates for device-generated identity keys
+    /// (v3). Empty on first provision; populated on re-provision once a
+    /// CA has issued the leaf from the device's CSR (e.g. the
+    /// `tls-identity` mTLS leaf). Each entry names a slot above.
+    #[serde(rename = "4", default, skip_serializing_if = "Vec::is_empty")]
+    pub certificates: Vec<LeafCert>,
+}
+
+/// A signed leaf certificate for one of the keystore's device-generated
+/// identity keys. Public + inert without the HSM-held private key — see
+/// the schema-v3 note. The device writes it to `{key_id}.cert`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeafCert {
+    /// The slot this leaf certifies — must name an EC-P256 `KeySlot`.
+    #[serde(rename = "0")]
+    pub key_id: String,
+
+    /// DER-encoded X.509 leaf certificate.
+    #[serde(rename = "1", with = "serde_bytes")]
+    pub certificate: Vec<u8>,
 }
 
 /// Guest identity for challenge-response registration.
@@ -163,11 +198,11 @@ pub const KEY_TYPE_HMAC_SHA256: u64 = 4;
 /// runtime vHSM wire operations a slot may serve once provisioned;
 /// they do NOT describe what the envelope contains.
 ///
-/// `OP_GET_CERT` stays in the list even though v2 envelopes never
-/// deliver certificates — the runtime cert query is fed by the
-/// CSR-issuance flow that issues certs for device-generated keys
-/// (e.g. `iam-signing`) post-provisioning, and the slot policy must
-/// permit the op.
+/// `OP_GET_CERT` gates the runtime cert query. The cert it returns is
+/// the slot's leaf — delivered in the v3 top-level `certificates` list
+/// (for the device's own identity keys, e.g. `tls-identity`) or written
+/// post-provisioning by a CSR-issuance flow; either way the slot policy
+/// must permit the op.
 pub const OP_SIGN: u64 = 0;
 pub const OP_VERIFY: u64 = 1;
 pub const OP_ENCRYPT: u64 = 2;
@@ -255,12 +290,27 @@ pub fn decode(data: &[u8]) -> Result<HsmKeystore, String> {
     if ks.schema_version != SCHEMA_VERSION {
         return Err(format!(
             "unsupported schema version {} (this build only accepts {SCHEMA_VERSION}; \
-             v1 envelopes that pushed private keys are not decoded)",
+             v1/v2 envelopes are not decoded)",
             ks.schema_version
         ));
     }
     for slot in &ks.slots {
         slot.validate()?;
+    }
+    // A leaf cert must certify an EC-P256 slot present in this keystore
+    // (you can't have an X.509 cert for an AES key, nor for a key the
+    // device won't provision).
+    for c in &ks.certificates {
+        match ks.slots.iter().find(|s| s.key_id == c.key_id) {
+            Some(s) if s.key_kind == KEY_TYPE_EC_P256 => {}
+            Some(s) => {
+                return Err(format!(
+                    "leaf cert for '{}' requires an EC-P256 slot (got kind {})",
+                    c.key_id, s.key_kind
+                ))
+            }
+            None => return Err(format!("leaf cert references unknown slot '{}'", c.key_id)),
+        }
     }
     Ok(ks)
 }
@@ -349,6 +399,7 @@ mod tests {
                 device_generated_ec("ivd-signing", "bali-vm-1"),
                 device_generated_aes("storage-key", "bali-vm-1"),
             ],
+            certificates: Vec::new(),
         }
     }
 
@@ -364,13 +415,66 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_v1() {
+    fn decode_rejects_old_versions() {
+        for v in [1u64, 2] {
+            let mut ks = sample_keystore();
+            ks.schema_version = v;
+            let bytes = encode(&ks).unwrap();
+            let err = decode(&bytes).unwrap_err();
+            assert!(err.contains(&format!("unsupported schema version {v}")));
+            assert!(err.contains("not decoded"));
+        }
+    }
+
+    #[test]
+    fn roundtrip_preserves_leaf_certificate() {
         let mut ks = sample_keystore();
-        ks.schema_version = 1;
+        // A (stand-in) DER leaf for a device-generated EC slot.
+        let leaf = vec![0x30, 0x82, 0x01, 0x23, 0xAB, 0xCD];
+        ks.certificates.push(LeafCert {
+            key_id: "iam-signing".into(),
+            certificate: leaf.clone(),
+        });
         let bytes = encode(&ks).unwrap();
-        let err = decode(&bytes).unwrap_err();
-        assert!(err.contains("unsupported schema version 1"));
-        assert!(err.contains("not decoded"));
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.certificates.len(), 1);
+        assert_eq!(back.certificates[0].key_id, "iam-signing");
+        assert_eq!(back.certificates[0].certificate, leaf);
+    }
+
+    #[test]
+    fn empty_certificates_is_wire_compatible_omitted() {
+        // First-provision keystore (no certs) must not emit the field.
+        let ks = sample_keystore();
+        assert!(ks.certificates.is_empty());
+        let bytes = encode(&ks).unwrap();
+        // Round-trips back to an empty list (default on absence).
+        assert!(decode(&bytes).unwrap().certificates.is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_leaf_cert_for_unknown_slot() {
+        let mut ks = sample_keystore();
+        ks.certificates.push(LeafCert {
+            key_id: "no-such-slot".into(),
+            certificate: vec![0x30, 0x00],
+        });
+        let err = decode(&encode(&ks).unwrap()).unwrap_err();
+        assert!(err.contains("no-such-slot"));
+        assert!(err.contains("unknown slot"));
+    }
+
+    #[test]
+    fn decode_rejects_leaf_cert_for_aes_slot() {
+        let mut ks = sample_keystore();
+        // sample has an AES "storage-key" slot — a cert for it is invalid.
+        ks.certificates.push(LeafCert {
+            key_id: "storage-key".into(),
+            certificate: vec![0x30, 0x00],
+        });
+        let err = decode(&encode(&ks).unwrap()).unwrap_err();
+        assert!(err.contains("storage-key"));
+        assert!(err.contains("requires an EC-P256 slot"));
     }
 
     #[test]
