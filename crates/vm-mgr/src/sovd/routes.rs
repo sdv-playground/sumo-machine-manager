@@ -17,57 +17,157 @@ use axum::{Json, Router};
 use machine_mgr::{Component, FlashId, FlashState, Machine, MachineError};
 use sovd_core::{OperationExecution, OperationStatus};
 
-/// Build the `x-sumo-csr` route.
+/// Build the HSM component's SOVD vendor surface — the key-slot data resource
+/// and the CSR operation.
 ///
 /// Wire:
 ///
-///   `GET /vehicle/v1/components/hsm/x-sumo-csr` → 200, body = DER CSR,
-///   `Content-Type: application/pkcs10`.
+///   `GET  /vehicle/v1/components/hsm/data/keys`
+///        → 200 JSON `{ "items": [ { id, key_type, has_certificate, allowed_ops,
+///          public_key_der_base64 } ] }` (public-only; `public_key_der_base64`
+///          is the SPKI for asymmetric slots, `null` for symmetric)
+///   `POST /vehicle/v1/components/hsm/operations/x-sumo-csr/executions`
+///        body `{ "key_id": "<slot>" }` → 200 ISO 17978-3 §7.14 operation
+///        execution; `result.csr_der_base64` is the PKCS#10 CSR.
 ///
-/// `x-sumo-csr` is a vendor extension per ISO 17978-3 §5.3.6.  CSR
-/// retrieval is read-only — the signed device certificate that comes
-/// back from the CA ships in via the standard SUIT keystore update
-/// (one channel for HSM key material — see
-/// `feedback_hsm_one_channel_key_material.md`).
-pub fn csr_router(machine: Arc<dyn Machine>) -> Router {
-    Router::new().route(
-        "/vehicle/v1/components/hsm/x-sumo-csr",
-        get(move || {
-            let machine = machine.clone();
-            async move {
-                let Some(comp) = machine.component("hsm") else {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "no hsm component".to_string(),
-                    )
-                        .into_response();
-                };
-                match comp.get_csr().await {
-                    Ok(csr) => {
-                        tracing::info!("CSR generated ({} bytes)", csr.0.len());
-                        (
-                            [(header::CONTENT_TYPE, "application/pkcs10")],
-                            csr.0.to_vec(),
-                        )
-                            .into_response()
-                    }
-                    Err(MachineError::PolicyRejected(s)) => {
-                        (StatusCode::FORBIDDEN, s).into_response()
-                    }
-                    Err(MachineError::NotSupported(_)) => (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "CSR not configured".to_string(),
-                    )
-                        .into_response(),
-                    Err(e) => {
-                        tracing::error!(error = %e, "CSR generation failed");
-                        (StatusCode::INTERNAL_SERVER_ERROR, format!("CSR error: {e}"))
-                            .into_response()
-                    }
-                }
-            }
-        }),
-    )
+/// `data/keys` is a SOVD **data** resource and returns only non-compromising
+/// metadata — never key material (the keystore manifest holds no private bytes).
+/// Generating a CSR **signs** (proof-of-possession), so it's an **operation**,
+/// not a data read — a `POST …/operations/x-sumo-csr/executions` keyed on the
+/// slot, addressing any device-generated key (`tls-identity`, `device-decrypt`,
+/// …). Both are `x-sumo` vendor extensions (neither is SOVD-native) and live in
+/// sumo-mm, not SOVDd, per the three-layer rule. The signed cert comes back via
+/// the SUIT keystore update (one channel — `feedback_hsm_one_channel_key_material.md`).
+///
+/// NOTE: this is machine-level SOVD surface that happens to live in the
+/// `vm-mgr` crate — see `project_vm_mgr_outgrew_its_name` (rename pending).
+pub fn hsm_router(machine: Arc<dyn Machine>) -> Router {
+    let csr = machine.clone();
+    Router::new()
+        .route(
+            "/vehicle/v1/components/hsm/data/keys",
+            get(move || {
+                let machine = machine.clone();
+                async move { hsm_keys_list(machine).await }
+            }),
+        )
+        .route(
+            "/vehicle/v1/components/hsm/operations/x-sumo-csr/executions",
+            post(move |Json(req): Json<CsrRequest>| {
+                let machine = csr.clone();
+                async move { hsm_csr_execute(machine, req).await }
+            }),
+        )
+}
+
+/// `GET …/hsm/data/keys` — the key-slot inventory (public metadata only).
+async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
+    let Some(comp) = machine.component("hsm") else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no hsm component".to_string(),
+        )
+            .into_response();
+    };
+    match comp.list_keys().await {
+        Ok(keys) => {
+            let items: Vec<_> = keys
+                .into_iter()
+                .map(|k| {
+                    use base64::Engine;
+                    let public_key_der_base64 = k
+                        .public_key
+                        .as_ref()
+                        .map(|der| base64::engine::general_purpose::STANDARD.encode(der));
+                    serde_json::json!({
+                        "id": k.key_id,
+                        "key_type": k.key_type,
+                        "has_certificate": k.has_certificate,
+                        "allowed_ops": k.allowed_ops,
+                        "public_key_der_base64": public_key_der_base64,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "items": items })).into_response()
+        }
+        Err(MachineError::NotSupported(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HSM keys unavailable".to_string(),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "list keys failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("list keys error: {e}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Body of the `x-sumo-csr` operation: which key slot to generate a CSR for.
+#[derive(serde::Deserialize)]
+struct CsrRequest {
+    key_id: String,
+}
+
+/// `POST …/hsm/operations/x-sumo-csr/executions` — sign a PKCS#10 CSR for the
+/// requested slot and return it (DER, base64) in an operation execution.
+async fn hsm_csr_execute(machine: Arc<dyn Machine>, req: CsrRequest) -> axum::response::Response {
+    const OP_ID: &str = "x-sumo-csr";
+    let Some(comp) = machine.component("hsm") else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no hsm component".to_string(),
+        )
+            .into_response();
+    };
+    let now = chrono::Utc::now();
+    match comp.get_csr(&req.key_id).await {
+        Ok(csr) => {
+            use base64::Engine;
+            let der_b64 = base64::engine::general_purpose::STANDARD.encode(csr.as_bytes());
+            tracing::info!(key = %req.key_id, "CSR generated ({} bytes)", csr.as_bytes().len());
+            let body = OperationExecution {
+                execution_id: OP_ID.to_string(),
+                operation_id: OP_ID.to_string(),
+                status: OperationStatus::Completed,
+                result: Some(serde_json::json!({
+                    "key_id": req.key_id,
+                    "csr_der_base64": der_b64,
+                })),
+                error: None,
+                started_at: now,
+                completed_at: Some(now),
+            };
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(e) => {
+            let (code, msg) = match &e {
+                MachineError::PolicyRejected(s) => (StatusCode::FORBIDDEN, s.clone()),
+                MachineError::NotSupported(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CSR not configured".to_string(),
+                ),
+                other => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("CSR error: {other}"),
+                ),
+            };
+            tracing::warn!(key = %req.key_id, error = %e, "CSR operation failed");
+            let body = OperationExecution {
+                execution_id: OP_ID.to_string(),
+                operation_id: OP_ID.to_string(),
+                status: OperationStatus::Failed,
+                result: None,
+                error: Some(msg),
+                started_at: now,
+                completed_at: Some(now),
+            };
+            (code, Json(body)).into_response()
+        }
+    }
 }
 
 /// Build the `x-sumo-id` route.

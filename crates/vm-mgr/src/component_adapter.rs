@@ -18,7 +18,7 @@ use machine_mgr::component::DidEntry;
 use machine_mgr::{
     ActivationState, Capabilities, ClearFaultsResult, Component, Csr, DidFilter, DidKind,
     DtcFilter, EnvelopeStream, Fault, FlashCaps, FlashId, FlashSession, FlashStatus, HsmCaps,
-    LifecycleCaps, MachineError, MachineResult, RuntimeState, RuntimeStatus,
+    KeyDescriptor, LifecycleCaps, MachineError, MachineResult, RuntimeState, RuntimeStatus,
 };
 
 use crate::backend::{ComponentBackend, DID_REGISTRY};
@@ -65,6 +65,18 @@ impl<D: BlockDevice + Send + Sync + 'static> ComponentAdapter<D> {
 
     pub fn inner(&self) -> &Arc<ComponentBackend<D>> {
         &self.inner
+    }
+}
+
+/// Map an HSM key type to the manifest-style label the `data/keys` SOVD
+/// resource reports.
+fn key_type_label(t: hsm::KeyType) -> &'static str {
+    match t {
+        hsm::KeyType::EcP256 => "EC-P256",
+        hsm::KeyType::Aes256 => "AES-256",
+        hsm::KeyType::Aes128 => "AES-128",
+        hsm::KeyType::Ed25519 => "Ed25519",
+        hsm::KeyType::HmacSha256 => "HMAC-SHA256",
     }
 }
 
@@ -308,7 +320,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
     // HSM
     // ---------------------------------------------------------------
 
-    async fn get_csr(&self) -> MachineResult<Csr> {
+    async fn get_csr(&self, key_id: &str) -> MachineResult<Csr> {
         let keystore = self
             .csr_keystore
             .as_ref()
@@ -316,28 +328,56 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                 "get_csr (no keystore configured)",
             ))?;
 
-        // Refuse if already provisioned — CSR is one-time provisioning.
-        if let Some(state_res) = self.inner.hsm_provisioning_state() {
-            match state_res {
-                Ok(hsm::ProvisioningState::Provisioned) => {
-                    return Err(MachineError::PolicyRejected(
-                        "device already provisioned".into(),
-                    ));
-                }
-                Ok(hsm::ProvisioningState::Unprovisioned) => { /* proceed */ }
-                Err(e) => return Err(MachineError::Internal(format!("hsm state: {e}"))),
-            }
-        }
-
-        // Transient SimHsm just for CSR signing. The keystore on disk is the
-        // authoritative state; this instance reads the device key and signs.
+        // No provisioning-state gate: a device may re-provision with fresh certs
+        // whenever it wants, and identity keys generated DURING provisioning
+        // (e.g. tls-identity) can only be CSR'd afterwards. The key must exist in
+        // the keystore — generate_csr fails with KeyNotFound otherwise.
+        //
+        // Transient SimHsm just for CSR signing; the keystore on disk is the
+        // authoritative state. The CSR subject CN is the key_id (self-describing);
+        // the issuing CA sets the real cert subject to the device id regardless.
         let tmp =
             hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
         use hsm::HsmCryptoProvider;
         let der = tmp
-            .generate_csr("device-decrypt", "cvc-vm-device")
+            .generate_csr(key_id, key_id)
             .map_err(|e| MachineError::Internal(format!("csr generation failed: {e}")))?;
         Ok(Csr::from_bytes(der))
+    }
+
+    async fn list_keys(&self) -> MachineResult<Vec<KeyDescriptor>> {
+        let keystore = self
+            .csr_keystore
+            .as_ref()
+            .ok_or(MachineError::NotSupported(
+                "list_keys (no keystore configured)",
+            ))?;
+        let tmp =
+            hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
+        use hsm::{HsmCryptoProvider, HsmProvider};
+        let keys = tmp
+            .list_keys()
+            .map_err(|e| MachineError::Internal(format!("list keys failed: {e}")))?;
+        Ok(keys
+            .into_iter()
+            .map(|k| {
+                // Public-only: the SPKI for asymmetric slots (safe to return),
+                // never any private bytes; None for symmetric keys.
+                let public_key = match k.key_type {
+                    hsm::KeyType::EcP256 | hsm::KeyType::Ed25519 => {
+                        tmp.get_public_key_der(&k.key_id).ok()
+                    }
+                    _ => None,
+                };
+                KeyDescriptor {
+                    key_id: k.key_id,
+                    key_type: key_type_label(k.key_type).to_string(),
+                    has_certificate: k.has_certificate,
+                    allowed_ops: k.allowed_ops,
+                    public_key,
+                }
+            })
+            .collect())
     }
 
     /// The ECU's self-sovereign id: a thumbprint of its HSM device key (the

@@ -121,7 +121,7 @@ async fn component_defaults_return_not_supported() {
 
     // HSM
     assert!(matches!(
-        c.get_csr().await,
+        c.get_csr("device-decrypt").await,
         Err(MachineError::NotSupported(_))
     ));
     assert!(matches!(
@@ -167,7 +167,7 @@ async fn component_overrides_take_precedence() {
     assert!(c.restart().await.is_ok());
     // But unchanged defaults still surface:
     assert!(matches!(
-        c.get_csr().await,
+        c.get_csr("device-decrypt").await,
         Err(MachineError::NotSupported(_))
     ));
 }

@@ -4,7 +4,7 @@ use bytes::Bytes;
 use crate::error::{MachineError, MachineResult};
 use crate::types::{
     Capabilities, Csr, DidFilter, DidKind, DtcFilter, EnvelopeStream, FlashId, FlashSession,
-    RuntimeState,
+    KeyDescriptor, RuntimeState,
 };
 use crate::{ActivationState, ClearFaultsResult, Fault, FlashStatus};
 
@@ -159,8 +159,19 @@ pub trait Component: Send + Sync {
     // HSM-specific
     // ------------------------------------------------------------------
 
-    async fn get_csr(&self) -> MachineResult<Csr> {
+    /// Generate a PKCS#10 CSR for the named key slot (e.g. `tls-identity`,
+    /// `device-decrypt`). The key must already exist in the keystore — identity
+    /// keys generated during provisioning (like `tls-identity`) are CSR'd
+    /// afterwards. No provisioning-state gate: a device may re-provision with
+    /// fresh certs at any time.
+    async fn get_csr(&self, _key_id: &str) -> MachineResult<Csr> {
         Err(MachineError::NotSupported("get_csr"))
+    }
+
+    /// List the HSM component's key slots — the `data/keys` SOVD resource. No
+    /// key material, just the slot inventory. Default: not an HSM component.
+    async fn list_keys(&self) -> MachineResult<Vec<KeyDescriptor>> {
+        Err(MachineError::NotSupported("list_keys"))
     }
 
     /// The ECU's self-sovereign id — a thumbprint of its HSM device key, used as

@@ -212,7 +212,7 @@ async fn defaults_return_not_supported() {
 
     // Methods not yet wired must still return NotSupported.
     // (CSR requires explicit with_csr_keystore; install_keys has no use case yet.)
-    let err = comp.get_csr().await.unwrap_err();
+    let err = comp.get_csr("device-decrypt").await.unwrap_err();
     assert!(matches!(err, MachineError::NotSupported(_)));
 
     let err = comp.install_keys(&[]).await.unwrap_err();
@@ -226,7 +226,7 @@ async fn get_csr_not_supported_without_keystore() {
     let comp = ComponentAdapter::new(vm1);
 
     // No with_csr_keystore call → NotSupported.
-    let err = comp.get_csr().await.unwrap_err();
+    let err = comp.get_csr("device-decrypt").await.unwrap_err();
     assert!(matches!(err, MachineError::NotSupported(_)), "got {err:?}");
     assert!(comp.capabilities().hsm.is_none());
 }
@@ -260,7 +260,9 @@ async fn get_csr_generates_csr_when_keystore_configured() {
     // Capability should reflect CSR support.
     assert!(comp.capabilities().hsm.as_ref().unwrap().supports_csr);
 
-    let csr = comp.get_csr().await.expect("csr generated");
+    // tls-identity is the canonical cert-bearing key; ensure_device_keys
+    // generates every device-generated role, so the slot exists to sign over.
+    let csr = comp.get_csr("tls-identity").await.expect("csr generated");
     // PKCS#10 CSR DER blobs start with a SEQUENCE tag (0x30).
     assert!(!csr.as_bytes().is_empty());
     assert_eq!(csr.as_bytes()[0], 0x30);

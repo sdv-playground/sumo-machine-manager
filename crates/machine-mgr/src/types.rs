@@ -180,3 +180,23 @@ impl Csr {
         &self.0
     }
 }
+
+/// A key slot surfaced by an HSM component's `data/keys` SOVD resource — the
+/// public, SOVD-facing view of one keystore slot (never any key material).
+/// Returned by [`Component::list_keys`](crate::Component::list_keys).
+#[derive(Debug, Clone)]
+pub struct KeyDescriptor {
+    /// The slot id (e.g. `tls-identity`, `device-decrypt`) — the slot's
+    /// identifier (there is no separate numeric slot index).
+    pub key_id: String,
+    /// Key type label (`EC-P256`, `AES-256`, …); the algorithm is implied.
+    pub key_type: String,
+    /// Whether the slot already holds a leaf certificate.
+    pub has_certificate: bool,
+    /// Permitted operations (e.g. `["sign","verify"]`); `None` = unrestricted.
+    pub allowed_ops: Option<Vec<String>>,
+    /// The slot's public key (DER SubjectPublicKeyInfo) for asymmetric keys —
+    /// safe to return (e.g. the device-decryption pubkey a Tower encrypts to);
+    /// `None` for symmetric keys. Never any private material.
+    pub public_key: Option<Vec<u8>>,
+}

@@ -337,7 +337,7 @@ async fn main() {
 
     let state = sovd_api::AppState::new(backends);
     let router =
-        sovd_api::create_router(state).merge(vm_mgr::sovd::routes::csr_router(machine.clone()));
+        sovd_api::create_router(state).merge(vm_mgr::sovd::routes::hsm_router(machine.clone()));
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
