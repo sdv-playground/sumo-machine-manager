@@ -28,3 +28,16 @@ members = [
     "crates/vhsm-client",
     "crates/vhsm-crossnode-client",
 ]
+
+# QNX (nto) cross-compile patch. vhsm-ssd's cross-node mTLS listener pulls in
+# rustls → ring, whose `SystemRandom` only implements `SecureRandom` on nto with
+# the upstream "add qnx support" commit (briansmith/ring#2740), not yet in a
+# tagged release. vhsm-ssd is built FROM THIS workspace for QNX (supernova-
+# machine-manager/examples/managed-qnx71/build.sh runs `cd sumo-machine-manager
+# && cargo build -p vhsm-ssd --target aarch64-unknown-nto-qnx710`), and a
+# [patch] only applies to its own workspace root — so it must live here too, not
+# only in supernova's Cargo.toml. It is ring 0.17.14 + the nto cfg line, so it is
+# byte-for-byte the released crate on non-nto targets (the new code is cfg-gated
+# to target_os = "nto").
+[patch.crates-io]
+ring = { git = "https://github.com/briansmith/ring", rev = "d018db62e1a4a92689611c86d33d6a85939197c4" }
