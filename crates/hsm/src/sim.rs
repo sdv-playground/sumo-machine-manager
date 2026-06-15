@@ -27,7 +27,7 @@
 ///     {key_id}.bin       — AES-256 raw key (32 bytes)
 /// ```
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
@@ -68,6 +68,15 @@ pub struct SimHsm {
     /// synthetic wildcard generator was retired once the in-bank
     /// policy partition proved out on managed-cvc (AUTH-ARCH-001 §4).
     policy_dir: Option<PathBuf>,
+    /// Optional second bind for node-to-node ("cross-node") mTLS access.
+    /// When `Some`, the spawned daemon gets `--cross-node-listen <addr>` — a
+    /// SECOND bind, distinct from the guest TCP listener — and serves peer
+    /// nodes over mTLS (identity = the peer's client cert), verifying them
+    /// against the identity root the daemon defaults to inside `--policy-dir`
+    /// (`roots/device-identity-root.pem`). Off by default. Set via
+    /// [`Self::with_cross_node_listen`]. This configures the vHSM *service*,
+    /// so it is backend-agnostic — the real NXP HSE path sets it the same way.
+    cross_node_listen: Option<SocketAddr>,
     /// Running daemon process handle.
     child: Option<Child>,
 }
@@ -123,6 +132,7 @@ impl SimHsm {
             tcp_port,
             audit_log: None,
             policy_dir: None,
+            cross_node_listen: None,
             child: None,
         }
     }
@@ -147,6 +157,18 @@ impl SimHsm {
     /// daemon — kill + relaunch to change.
     pub fn with_audit_log(mut self, path: impl Into<PathBuf>) -> Self {
         self.audit_log = Some(path.into());
+        self
+    }
+
+    /// Builder-style: enable the node-to-node ("cross-node") mTLS listener at
+    /// `addr`. The spawned daemon receives `--cross-node-listen <addr>` — a
+    /// SECOND bind, distinct from the guest TCP listener — and verifies a peer
+    /// node's client cert against the identity root the daemon defaults to
+    /// inside `--policy-dir` (`roots/device-identity-root.pem`). Off unless
+    /// set; call before `start_service()`. Backend-agnostic: the same wiring
+    /// applies when the real NXP HSE backend replaces this sim impl.
+    pub fn with_cross_node_listen(mut self, addr: SocketAddr) -> Self {
+        self.cross_node_listen = Some(addr);
         self
     }
 
@@ -1042,6 +1064,13 @@ impl HsmProvider for SimHsm {
                 path = %audit_path.display(),
                 "vhsm-ssd audit log enabled"
             );
+        }
+        // Optional node-to-node mTLS bind. The daemon defaults its trust anchor
+        // (--identity-root) to `<policy-dir>/roots/device-identity-root.pem`, so
+        // passing the address is enough — no second path to wire here.
+        if let Some(addr) = self.cross_node_listen {
+            cmd.arg("--cross-node-listen").arg(addr.to_string());
+            tracing::info!(%addr, "vhsm-ssd cross-node mTLS listener enabled");
         }
         let child = cmd
             .spawn()
