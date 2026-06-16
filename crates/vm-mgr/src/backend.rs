@@ -1220,6 +1220,30 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         })
     }
 
+    /// Set or clear this component's bit in the node-level reboot-owed record
+    /// (`NvUpdateSession`) — the durable "a node reboot is owed" marker the gate
+    /// checks. Read-modify-write of the shared node NV; idempotent (writes only on
+    /// a change). The mirror of [`node_reboot_owed`](Self::node_reboot_owed).
+    fn set_reboot_owed(&self, owed: bool) -> BackendResult<()> {
+        let mut nv = self
+            .nv
+            .lock()
+            .map_err(|_| BackendError::Internal("nv lock".into()))?;
+        let mut s = nv.read_update_session().unwrap_or_default();
+        let bit = 1u16 << self.bank_set.as_index();
+        let before = s.reboot_owed;
+        if owed {
+            s.reboot_owed |= bit;
+        } else {
+            s.reboot_owed &= !bit;
+        }
+        if s.reboot_owed != before {
+            nv.write_update_session(&mut s)
+                .map_err(|e| BackendError::Internal(format!("nv write update-session: {e:?}")))?;
+        }
+        Ok(())
+    }
+
     // =================================================================
     // Separate manifest + payload upload methods (new flash path)
     // =================================================================
@@ -3101,6 +3125,20 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 FlashState::AwaitingReboot
             };
         }
+
+        // A write-through singleshot that still needs a node reboot (e.g. rt):
+        // `committed` stays true, so this reboot-owed bit is the only durable
+        // record that "a node reboot is owed" — and it survives a power cycle (or
+        // a failed/refused reset), which the in-memory flash state does not. The
+        // gate then refuses a new flash node-wide until the reboot runs and the
+        // trial is resolved (cleared in commit_flash). Rollbackable (banked)
+        // components do NOT mark here: they stage together before one reboot, so
+        // it would refuse their own siblings. See docs/design/node-update-state.md.
+        if !self.config.supports_rollback
+            && self.reset_kind() == machine_mgr::ResetKind::RequiresEcuReset
+        {
+            self.set_reboot_owed(true)?;
+        }
         Ok(())
     }
 
@@ -3412,6 +3450,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         self.bank_provider
             .commit()
             .map_err(|e| BackendError::Internal(e.to_string()))?;
+        // Trial resolved — the node no longer owes a reboot for this component;
+        // clear its bit in the node-level reboot-owed record (no-op for the banked
+        // components that never set it).
+        self.set_reboot_owed(false)?;
         {
             let nv = self
                 .nv
@@ -4907,6 +4949,25 @@ mod bank_provider_injection_tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn reboot_owed_round_trips_through_nv() {
+        // The step-3 durable marker: set/clear this component's node reboot-owed
+        // bit and read it back via the same NvUpdateSession record the gate
+        // consults. (The refuse-on-RebootPending decision is covered by
+        // machine-mgr's node_update tests; this proves the vm-mgr NV plumbing.)
+        let b = backend(); // BankSet::Vm1
+        assert!(b.node_reboot_owed().unwrap().reboot_owed.is_empty());
+
+        b.set_reboot_owed(true).unwrap();
+        assert_eq!(
+            b.node_reboot_owed().unwrap().reboot_owed,
+            vec![format!("bank-set {}", BankSet::Vm1.as_index())]
+        );
+
+        b.set_reboot_owed(false).unwrap();
+        assert!(b.node_reboot_owed().unwrap().reboot_owed.is_empty());
     }
 
     #[tokio::test]
