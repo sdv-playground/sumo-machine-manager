@@ -24,6 +24,11 @@ pub mod layout {
     pub const VEHICLE_OFFSET: u64 = 0x006000;
     pub const VEHICLE_SECTORS: usize = 2;
 
+    // Node update-transaction state (the "reboot owed" record). Header region,
+    // after VEHICLE (0x8000..0xA000), still below BANKSET_BASE.
+    pub const UPDATE_SESSION_OFFSET: u64 = 0x008000;
+    pub const UPDATE_SESSION_SECTORS: usize = 2;
+
     pub const BANKSET_BASE: u64 = 0x010000;
     pub const BANKSET_STRIDE: u64 = 0x018000; // 96 KB per bank set
 
@@ -248,6 +253,36 @@ impl<D: BlockDevice> NvStore<D> {
         v.vehicle_epoch = v.vehicle_epoch.saturating_add(1);
         self.write_vehicle_state(&mut v)?;
         Ok(v.vehicle_epoch)
+    }
+
+    // --- Update session (node update-transaction state) ---
+
+    pub fn read_update_session(&self) -> Option<NvUpdateSession> {
+        read_record(
+            &self.dev,
+            layout::UPDATE_SESSION_OFFSET,
+            layout::UPDATE_SESSION_SECTORS,
+        )
+    }
+
+    pub fn write_update_session(
+        &mut self,
+        session: &mut NvUpdateSession,
+    ) -> Result<(), BlockError> {
+        write_record(
+            &mut self.dev,
+            layout::UPDATE_SESSION_OFFSET,
+            layout::UPDATE_SESSION_SECTORS,
+            session,
+        )
+    }
+
+    /// Clear the open update session (no reboot owed): write a zeroed record so
+    /// the rotation advances `write_seq` and the cleared state is what
+    /// `read_update_session` returns after the next reboot.
+    pub fn clear_update_session(&mut self) -> Result<(), BlockError> {
+        let mut s = NvUpdateSession::default();
+        self.write_update_session(&mut s)
     }
 
     // --- FW Meta (per bank set, per bank) ---

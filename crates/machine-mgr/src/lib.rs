@@ -69,6 +69,7 @@ pub mod bank_provider;
 pub mod component;
 pub mod error;
 pub mod machine;
+pub mod node_update;
 pub mod system_bank_state;
 pub mod types;
 

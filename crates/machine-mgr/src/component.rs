@@ -7,6 +7,7 @@ use crate::types::{
     KeyInventory, RuntimeState,
 };
 use crate::{ActivationState, ClearFaultsResult, Fault, FlashStatus};
+use nv_store::types::BankSet;
 
 /// One independently-updatable thing on the machine: the host OS, a guest VM,
 /// the HSM, an attached ECU.
@@ -22,6 +23,15 @@ pub trait Component: Send + Sync {
     /// Capability descriptor. Controls which operations the orchestrator may
     /// attempt and (loosely) which trait methods it should expect to succeed.
     fn capabilities(&self) -> &Capabilities;
+
+    /// The NV bank set this component's banked state lives in, if any. The node
+    /// update-transaction gate maps the reboot-owed bitmask to/from component ids
+    /// through this — `None` for components with no banked NV state (the gate's
+    /// boolean phase still holds; it just can't name them). See
+    /// [`node_update`](crate::node_update).
+    fn bank_set(&self) -> Option<BankSet> {
+        None
+    }
 
     // ------------------------------------------------------------------
     // DID store

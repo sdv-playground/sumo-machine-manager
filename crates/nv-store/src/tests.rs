@@ -208,6 +208,53 @@ fn vehicle_region_isolated_from_app() {
     assert_eq!(store.read_vehicle_state().unwrap().vehicle_epoch, 99);
 }
 
+#[test]
+fn update_session_roundtrip() {
+    let mut store = make_store();
+    let mut s = NvUpdateSession::default();
+    s.session_id = [0xAB; 32];
+    s.reboot_owed = 0b101; // bank sets 0 and 2 owe the node reboot
+    store.write_update_session(&mut s).unwrap();
+
+    let read = store.read_update_session().unwrap();
+    assert_eq!(read.session_id, [0xAB; 32]);
+    assert_eq!(read.reboot_owed, 0b101);
+    assert!(read.reboot_pending());
+    assert!(read.owes(BankSet(0)) && read.owes(BankSet(2)));
+    assert!(!read.owes(BankSet(1)));
+}
+
+#[test]
+fn update_session_clear_drops_the_reboot_owed() {
+    let mut store = make_store();
+    let mut s = NvUpdateSession::default();
+    s.session_id = [0x11; 32];
+    s.reboot_owed = 0b1;
+    store.write_update_session(&mut s).unwrap();
+    assert!(store.read_update_session().unwrap().reboot_pending());
+
+    store.clear_update_session().unwrap();
+    let read = store.read_update_session().unwrap();
+    assert!(!read.reboot_pending());
+    assert_eq!(read.reboot_owed, 0);
+}
+
+#[test]
+fn update_session_region_isolated() {
+    // The new 0x8000 region must not overlap the vehicle / boot / app regions.
+    let mut store = make_store();
+    let mut v = NvVehicle::default();
+    v.vehicle_epoch = 99;
+    store.write_vehicle_state(&mut v).unwrap();
+
+    let mut s = NvUpdateSession::default();
+    s.reboot_owed = 0b10;
+    store.write_update_session(&mut s).unwrap();
+
+    assert_eq!(store.read_vehicle_state().unwrap().vehicle_epoch, 99);
+    assert_eq!(store.read_update_session().unwrap().reboot_owed, 0b10);
+}
+
 // --- Sector rotation tests ---
 
 #[test]

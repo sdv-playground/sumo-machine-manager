@@ -118,6 +118,7 @@ pub const MAGIC_FW_META: u32 = 0x4E564D32; // "NVM2" (v2: SW identity moved to s
 pub const MAGIC_RUNTIME: u32 = 0x4E565231; // "NVR1"
 pub const MAGIC_APP: u32 = 0x4E564131; // "NVA1"
 pub const MAGIC_VEHICLE: u32 = 0x4E565631; // "NVV1"
+pub const MAGIC_UPDATE_SESSION: u32 = 0x4E565531; // "NVU1" (node update transaction)
 
 /// Trait for NV records that can be serialized to/from raw sector bytes.
 ///
@@ -715,6 +716,80 @@ impl NvRecord for NvVehicle {
             write_seq: get_u32_le(buf, 4),
             vehicle_epoch: get_u64_le(buf, 8),
             safe_time_floor_ns: get_u64_le(buf, 16),
+        })
+    }
+}
+
+/// Node update-transaction state — the durable half of the per-ECU update
+/// session. Written once a node activation reboot is *owed*: that's the one bit
+/// that can't be reconstructed from the per-bank `committed` flags after a power
+/// cycle (a singleshot write-through commits immediately, so "a reboot is still
+/// owed to run the new code" lives nowhere else). The gate reads it to refuse a
+/// new flash while a reboot is pending; the orchestrator reads it (over SOVD) to
+/// reconstruct where a campaign was. `reboot_owed == 0` ⇒ no open session.
+///
+/// ```text
+/// [0..4]    magic (NVU1)
+/// [4..8]    write_seq
+/// [8..40]   session_id (32 bytes; the transaction's provenance — zero = none)
+/// [40..42]  reboot_owed (u16 bitmask over bank sets; bit i = BankSet(i))
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NvUpdateSession {
+    pub write_seq: u32,
+    /// The update transaction's session id — its provenance, so a re-run can tell
+    /// *its own* interrupted transaction from a different one. Interim: the
+    /// vehicle-release content identity; later the SUIT L1 campaign-manifest id
+    /// (both reduced to 32 bytes). All-zero ⇒ no open session.
+    pub session_id: [u8; 32],
+    /// Bank sets that owe the coalesced node reboot (bit i ⇒ `BankSet(i)`).
+    /// Nonzero ⇒ the node is `RebootPending`.
+    pub reboot_owed: u16,
+}
+
+impl NvUpdateSession {
+    /// True when a node reboot is owed — an open transaction awaits its
+    /// activation reboot.
+    pub fn reboot_pending(&self) -> bool {
+        self.reboot_owed != 0
+    }
+
+    /// True when bank set `set` owes the pending node reboot.
+    pub fn owes(&self, set: BankSet) -> bool {
+        self.reboot_owed & (1u16 << set.as_index()) != 0
+    }
+}
+
+impl NvRecord for NvUpdateSession {
+    const MAGIC: u32 = MAGIC_UPDATE_SESSION;
+
+    fn size() -> usize {
+        42
+    }
+
+    fn write_seq(&self) -> u32 {
+        self.write_seq
+    }
+
+    fn set_write_seq(&mut self, seq: u32) {
+        self.write_seq = seq;
+    }
+
+    fn serialize(&self, buf: &mut [u8]) {
+        put_u32_le(buf, 0, Self::MAGIC);
+        put_u32_le(buf, 4, self.write_seq);
+        put_bytes(buf, 8, &self.session_id);
+        put_u16_le(buf, 40, self.reboot_owed);
+    }
+
+    fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::size() {
+            return None;
+        }
+        Some(Self {
+            write_seq: get_u32_le(buf, 4),
+            session_id: get_bytes::<32>(buf, 8),
+            reboot_owed: get_u16_le(buf, 40),
         })
     }
 }
