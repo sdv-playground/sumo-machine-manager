@@ -4,7 +4,6 @@ use std::sync::{Arc, RwLock};
 use nv_store::types::{Bank, BankSet};
 
 use crate::component::Component;
-use crate::node_update::{self, Admit, Durable, NodeUpdateState, Refused, Staging};
 use crate::system_bank_state::{
     BootSelector, SelectorStore, SharedSystemBankState, Signer, StubSelectorStore, StubSigner,
     SystemBankManager,
@@ -63,12 +62,6 @@ pub struct MachineRegistry {
     /// write handle ([`shared_selector`](Self::shared_selector)) to the
     /// seed/OTA path — without each holding its own copy of the manager.
     system_bank: SharedSystemBankState,
-    /// The node's in-memory `Staging` session — the ephemeral half of the
-    /// update-transaction state (the durable half is the NV reboot-owed record).
-    /// The gate admits a sibling component into this only when its session id
-    /// matches, so two updates never coalesce into one reboot. See `node_update`
-    /// and `docs/design/node-update-state.md`.
-    staging: RwLock<Option<Staging>>,
 }
 
 impl MachineRegistry {
@@ -142,49 +135,6 @@ impl MachineRegistry {
             sb.seal();
             sb.commit();
         }
-    }
-
-    // ------------------------------------------------------------------
-    // Node update-transaction state — the "one transaction at a time" gate.
-    // The registry owns the in-memory `Staging`; the durable facts — the
-    // RebootPending set (`durable`, from the NV update-session record) and the
-    // in-trial set (from each component's `activation_state`) — are supplied by
-    // the caller (vm-mgr / the SOVD layer, which holds NV).
-    // See `docs/design/node-update-state.md`.
-    // ------------------------------------------------------------------
-
-    /// Admit (or refuse → SOVD 409) a new flash session for `comp` under
-    /// `session_id`. Mutates the in-memory staging on admit; a sibling joins only
-    /// if the session id matches (no mixing two updates into one reboot).
-    pub fn gate_new_session(
-        &self,
-        session_id: node_update::SessionId,
-        comp: &str,
-        durable: &Durable,
-        in_trial: &[String],
-    ) -> Result<Admit, Refused> {
-        let mut staging = self.staging.write().expect("staging lock poisoned");
-        node_update::admit(session_id, comp, durable, in_trial, &mut staging)
-    }
-
-    /// The node's current update-transaction state (for the `x-sumo-update-state`
-    /// resource), combining the durable facts with the in-memory staging.
-    pub fn node_update_state(&self, durable: &Durable, in_trial: &[String]) -> NodeUpdateState {
-        let staging = self.staging.read().expect("staging lock poisoned");
-        node_update::derive(durable, in_trial, staging.as_ref())
-    }
-
-    /// Take and clear the in-memory staging — called when staging is promoted to
-    /// the durable NV reboot-owed record (the node reboot is issued), so the
-    /// transaction moves `Staging` -> `RebootPending` with the NV record now the
-    /// authority. Returns what was staged (the components owing the reboot).
-    pub fn take_staging(&self) -> Option<Staging> {
-        self.staging.write().expect("staging lock poisoned").take()
-    }
-
-    /// Drop the in-memory staging (an abandoned `Staging` window, no reboot owed).
-    pub fn clear_staging(&self) {
-        *self.staging.write().expect("staging lock poisoned") = None;
     }
 }
 
@@ -297,7 +247,6 @@ impl MachineRegistryBuilder {
             components: self.components,
             by_id,
             system_bank,
-            staging: RwLock::new(None),
         }
     }
 
@@ -318,7 +267,6 @@ impl MachineRegistryBuilder {
             components: self.components,
             by_id,
             system_bank,
-            staging: RwLock::new(None),
         })
     }
 }

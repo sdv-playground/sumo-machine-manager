@@ -5,9 +5,12 @@
 //! *same* `Staging` transaction only if its session id matches — so two updates
 //! never get coalesced into one reboot.
 //!
-//! The logic here is pure. The registry feeds it the durable facts (the NV
-//! reboot-owed record, per-component `committed`) and holds the in-memory
-//! [`Staging`]. See `docs/design/node-update-state.md`.
+//! The phase/gate logic here is pure. [`NodeCoordinator`] holds the in-memory
+//! [`Staging`]; the caller (vm-mgr, which holds NV + the components) feeds it the
+//! durable facts (the NV reboot-owed record, per-component `committed`). See
+//! `docs/design/node-update-state.md`.
+
+use std::sync::RwLock;
 
 /// A 32-byte update-transaction session id (provenance). Interim: the
 /// vehicle-release content identity; later the SUIT L1 campaign-manifest id.
@@ -187,6 +190,58 @@ pub fn admit(
         Some(s) => Err(Refused::Mixing {
             open_session_id: s.session_id,
         }),
+    }
+}
+
+/// The node's update-transaction coordinator — the single home for the
+/// node-level ("uber-component") update state. Owns the in-memory [`Staging`] and
+/// the gate; built once and shared (`Arc`) into each component (for the
+/// `start_flash` gate) and the SOVD layer (reboot / verdict / the
+/// `x-sumo-update-state` report). The durable facts (`Durable` reboot-owed,
+/// `in_trial`) are supplied by the caller — vm-mgr, which holds NV + the
+/// components. See `docs/design/node-update-state.md`.
+#[derive(Default)]
+pub struct NodeCoordinator {
+    staging: RwLock<Option<Staging>>,
+}
+
+impl NodeCoordinator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Admit (or refuse -> SOVD 409) a new flash session for `comp` under
+    /// `session_id`. Mutates the in-memory staging on admit; a sibling joins only
+    /// if the session id matches (no mixing two updates into one reboot).
+    pub fn gate_new_session(
+        &self,
+        session_id: SessionId,
+        comp: &str,
+        durable: &Durable,
+        in_trial: &[String],
+    ) -> Result<Admit, Refused> {
+        let mut staging = self.staging.write().expect("staging lock poisoned");
+        admit(session_id, comp, durable, in_trial, &mut staging)
+    }
+
+    /// The node's current update-transaction state (for the `x-sumo-update-state`
+    /// resource), combining the durable facts with the in-memory staging.
+    pub fn node_update_state(&self, durable: &Durable, in_trial: &[String]) -> NodeUpdateState {
+        let staging = self.staging.read().expect("staging lock poisoned");
+        derive(durable, in_trial, staging.as_ref())
+    }
+
+    /// Take and clear the in-memory staging — called when staging is promoted to
+    /// the durable NV reboot-owed record (the node reboot is issued), so the
+    /// transaction moves `Staging` -> `RebootPending` with the NV record now the
+    /// authority. Returns what was staged (the components owing the reboot).
+    pub fn take_staging(&self) -> Option<Staging> {
+        self.staging.write().expect("staging lock poisoned").take()
+    }
+
+    /// Drop the in-memory staging (an abandoned `Staging` window, no reboot owed).
+    pub fn clear_staging(&self) {
+        *self.staging.write().expect("staging lock poisoned") = None;
     }
 }
 

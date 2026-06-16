@@ -311,33 +311,33 @@ fn registry_build_accepts_zero_components() {
 }
 
 #[test]
-fn registry_owns_staging_across_gate_calls() {
-    use crate::node_update::{Admit, Durable, NodePhase};
-    let m = MachineRegistry::builder(entity("veh")).build();
+fn coordinator_owns_staging_across_gate_calls() {
+    use crate::node_update::{Admit, Durable, NodeCoordinator, NodePhase};
+    let c = NodeCoordinator::new();
     let id_a: [u8; 32] = [1; 32];
     let idle = Durable::default();
 
     // First component opens the transaction; a sibling with the SAME id joins it
-    // — the registry persists the Staging session between calls.
+    // — the coordinator persists the Staging session between calls.
     assert_eq!(
-        m.gate_new_session(id_a, "vm1", &idle, &[]).unwrap(),
+        c.gate_new_session(id_a, "vm1", &idle, &[]).unwrap(),
         Admit::OpenedNew
     );
     assert_eq!(
-        m.gate_new_session(id_a, "vm2", &idle, &[]).unwrap(),
+        c.gate_new_session(id_a, "vm2", &idle, &[]).unwrap(),
         Admit::Joined
     );
-    let st = m.node_update_state(&idle, &[]);
+    let st = c.node_update_state(&idle, &[]);
     assert_eq!(st.phase, NodePhase::Staging);
     assert_eq!(st.components, vec!["vm1".to_string(), "vm2".to_string()]);
 
     // A DIFFERENT id is refused (would mix updates); the open session is untouched.
-    assert!(m.gate_new_session([9; 32], "vm3", &idle, &[]).is_err());
-    assert_eq!(m.node_update_state(&idle, &[]).components.len(), 2);
+    assert!(c.gate_new_session([9; 32], "vm3", &idle, &[]).is_err());
+    assert_eq!(c.node_update_state(&idle, &[]).components.len(), 2);
 
     // Promoting staging (reboot issued) clears it → back to Idle.
-    assert!(m.take_staging().is_some());
-    assert_eq!(m.node_update_state(&idle, &[]).phase, NodePhase::Idle);
+    assert!(c.take_staging().is_some());
+    assert_eq!(c.node_update_state(&idle, &[]).phase, NodePhase::Idle);
 }
 
 // ---------------------------------------------------------------------------
