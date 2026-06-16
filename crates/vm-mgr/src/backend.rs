@@ -307,6 +307,12 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     bank_spec: crate::bank_spec::BankSetSpec,
     config: ComponentConfig,
     nv: Arc<Mutex<NvStore<D>>>,
+    /// The node-level update-transaction coordinator (the "one transaction at a
+    /// time" gate), shared across every component on this node. `None` until
+    /// `vm-sovd` injects it via [`with_node_coordinator`](Self::with_node_coordinator);
+    /// when set, `ensure_flash_can_start` consults it. See `machine_mgr::node_update`
+    /// + docs/design/node-update-state.md.
+    node_coordinator: Option<Arc<machine_mgr::node_update::NodeCoordinator>>,
     manifest_provider: Arc<dyn ManifestProvider>,
     security_provider: Arc<dyn SecurityProvider>,
     packages: Mutex<HashMap<String, StoredPackage>>,
@@ -544,6 +550,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             verified_manifest_cache: Mutex::new(None),
             bank_provider,
             bank_provider_override: false,
+            node_coordinator: None,
         };
         // Populate DID cache from NV once at construction time. After this,
         // SOVD reads of NV-backed DIDs hit RAM only — see refresh_did_cache.
@@ -557,6 +564,18 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Override the component display name (shown in SOVD component listing).
     pub fn with_display_name(mut self, name: String) -> Self {
         self.entity_info.name = name;
+        self
+    }
+
+    /// Inject the shared node update-transaction coordinator (the `start_flash`
+    /// gate). `vm-sovd` builds ONE coordinator and hands the same `Arc` to every
+    /// component on the node, so the gate sees one node-wide staging state. See
+    /// `machine_mgr::node_update::NodeCoordinator`.
+    pub fn with_node_coordinator(
+        mut self,
+        coordinator: Arc<machine_mgr::node_update::NodeCoordinator>,
+    ) -> Self {
+        self.node_coordinator = Some(coordinator);
         self
     }
 
@@ -1162,7 +1181,43 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             }
         }
 
+        // Node-level update-transaction gate: refuse a new flash while the node
+        // owes an activation reboot for a prior staged update (the durable half —
+        // survives a power cycle, unlike the in-memory flash state, which is how a
+        // singleshot rt slipped through). A sibling joining the SAME transaction
+        // (matching session id) is admitted, so the banked group can stage
+        // together. On admit, this component joins the staging set. No-op until
+        // `vm-sovd` injects the coordinator. The session id is the interim zero
+        // until the campaign manifest stamps one (B5/B6); in-trial is wired with
+        // the verdict lifecycle.
+        if let Some(coord) = &self.node_coordinator {
+            let durable = self.node_reboot_owed()?;
+            coord
+                .gate_new_session([0u8; 32], &self.entity_info.id, &durable, &[])
+                .map_err(|r| BackendError::Busy(r.to_string()))?;
+        }
+
         Ok(())
+    }
+
+    /// Read the node-level reboot-owed set from this node's shared NV
+    /// (`NvUpdateSession`) as a [`machine_mgr::node_update::Durable`] — the durable
+    /// half of the update-transaction state the gate checks. Labelled by bank set;
+    /// the per-component names arrive once the coordinator holds the bank-set->id map.
+    fn node_reboot_owed(&self) -> BackendResult<machine_mgr::node_update::Durable> {
+        let nv = self
+            .nv
+            .lock()
+            .map_err(|_| BackendError::Internal("nv lock".into()))?;
+        let session = nv.read_update_session().unwrap_or_default();
+        let reboot_owed = (0..nv_store::types::NUM_BANK_SETS)
+            .filter(|&i| session.reboot_owed & (1u16 << i) != 0)
+            .map(|i| format!("bank-set {i}"))
+            .collect();
+        Ok(machine_mgr::node_update::Durable {
+            session_id: session.session_id,
+            reboot_owed,
+        })
     }
 
     // =================================================================

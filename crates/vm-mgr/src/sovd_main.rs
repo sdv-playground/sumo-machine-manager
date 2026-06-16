@@ -235,6 +235,10 @@ async fn main() {
         href: "/vehicle/v1".into(),
         status: None,
     });
+    // One node update-transaction coordinator, shared into every component's
+    // start_flash gate (the "one transaction at a time" / no-mixing gate). The
+    // SOVD reset/verdict handlers will share this same Arc in the next steps.
+    let node_coordinator = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
     for (id, set, config) in components {
         let mut backend = ComponentBackend::with_options(
             set,
@@ -246,6 +250,7 @@ async fn main() {
             images_dir.clone(),
             hsm_provider.clone(),
         );
+        backend = backend.with_node_coordinator(node_coordinator.clone());
         // Read display_name from the active bank's vm-config.yaml if available.
         // No `current` symlink any more — resolve the active bank from NV, and
         // if that's unreadable fall back to trying bank_a then bank_b
