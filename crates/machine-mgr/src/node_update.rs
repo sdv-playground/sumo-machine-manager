@@ -203,11 +203,42 @@ pub fn admit(
 #[derive(Default)]
 pub struct NodeCoordinator {
     staging: RwLock<Option<Staging>>,
+    /// Bank-set index -> component id, so the node-state report and the gate's
+    /// refusal name the components instead of "bank-set N". Built from the
+    /// machine's components at construction.
+    id_map: Vec<(usize, String)>,
 }
 
 impl NodeCoordinator {
-    pub fn new() -> Self {
-        Self::default()
+    /// Build a coordinator with the bank-set-index -> component-id map (for
+    /// naming). Pass `vec![]` for no map (labels fall back to "bank-set N").
+    pub fn new(id_map: Vec<(usize, String)>) -> Self {
+        Self {
+            staging: RwLock::new(None),
+            id_map,
+        }
+    }
+
+    /// Name a bank set by its index, via the id map; falls back to "bank-set N".
+    pub fn label(&self, bank_set_index: usize) -> String {
+        self.id_map
+            .iter()
+            .find(|(i, _)| *i == bank_set_index)
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(|| format!("bank-set {bank_set_index}"))
+    }
+
+    /// Remove `comp` from the open staging session (its flash resolved); clears
+    /// the session when the last component leaves — so the report returns to
+    /// `Idle` instead of showing a stale `Staging`.
+    pub fn remove_from_staging(&self, comp: &str) {
+        let mut staging = self.staging.write().expect("staging lock poisoned");
+        if let Some(s) = staging.as_mut() {
+            s.components.retain(|c| c != comp);
+            if s.components.is_empty() {
+                *staging = None;
+            }
+        }
     }
 
     /// Admit (or refuse -> SOVD 409) a new flash session for `comp` under

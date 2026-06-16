@@ -238,15 +238,13 @@ async fn main() {
     // One node update-transaction coordinator, shared into every component's
     // start_flash gate (the "one transaction at a time" / no-mixing gate). The
     // SOVD reset/verdict handlers will share this same Arc in the next steps.
-    let node_coordinator = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
-    // Bank-set -> component-id map, so the node update-state report names the
-    // components (not "bank-set N").
-    let id_map: Arc<Vec<(BankSet, String)>> = Arc::new(
-        components
-            .iter()
-            .map(|(id, set, _)| (*set, id.to_string()))
-            .collect(),
-    );
+    // Bank-set-index -> component-id map, so the node update-state report and the
+    // gate's refusal name the components (not "bank-set N").
+    let id_map: Vec<(usize, String)> = components
+        .iter()
+        .map(|(id, set, _)| (set.as_index(), id.to_string()))
+        .collect();
+    let node_coordinator = Arc::new(machine_mgr::node_update::NodeCoordinator::new(id_map));
     for (id, set, config) in components {
         let mut backend = ComponentBackend::with_options(
             set,
@@ -354,7 +352,6 @@ async fn main() {
         .merge(vm_mgr::sovd::routes::update_state_router(
             nv.clone(),
             node_coordinator.clone(),
-            id_map.clone(),
         ));
 
     let listener = tokio::net::TcpListener::bind(bind_addr)

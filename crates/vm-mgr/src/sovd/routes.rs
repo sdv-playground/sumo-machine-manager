@@ -18,7 +18,7 @@ use machine_mgr::node_update::{Durable, NodeCoordinator};
 use machine_mgr::{Component, FlashId, FlashState, Machine, MachineError};
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
-use nv_store::types::{BankSet, NUM_BANK_SETS};
+use nv_store::types::NUM_BANK_SETS;
 use sovd_core::{OperationExecution, OperationStatus};
 
 /// `GET /vehicle/v1/data/x-sumo-update-state` — the node's update-transaction
@@ -30,35 +30,26 @@ use sovd_core::{OperationExecution, OperationStatus};
 pub fn update_state_router<D: BlockDevice + Send + 'static>(
     nv: Arc<Mutex<NvStore<D>>>,
     coord: Arc<NodeCoordinator>,
-    id_map: Arc<Vec<(BankSet, String)>>,
 ) -> Router {
     Router::new().route(
         "/vehicle/v1/data/x-sumo-update-state",
         get(move || {
             let nv = nv.clone();
             let coord = coord.clone();
-            let id_map = id_map.clone();
             async move {
-                let label = |i: usize| {
-                    id_map
-                        .iter()
-                        .find(|(s, _)| s.as_index() == i)
-                        .map(|(_, id)| id.clone())
-                        .unwrap_or_else(|| format!("bank-set {i}"))
-                };
                 let (durable, in_trial) = {
                     let nv = nv.lock().expect("nv lock poisoned");
                     let session = nv.read_update_session().unwrap_or_default();
                     let reboot_owed: Vec<String> = (0..NUM_BANK_SETS)
                         .filter(|&i| session.reboot_owed & (1u16 << i) != 0)
-                        .map(&label)
+                        .map(|i| coord.label(i))
                         .collect();
                     let in_trial: Vec<String> = nv
                         .read_boot_state()
                         .map(|s| {
                             (0..NUM_BANK_SETS)
                                 .filter(|&i| !s.banks[i].committed)
-                                .map(&label)
+                                .map(|i| coord.label(i))
                                 .collect()
                         })
                         .unwrap_or_default();

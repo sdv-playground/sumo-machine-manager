@@ -1212,7 +1212,12 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         let session = nv.read_update_session().unwrap_or_default();
         let reboot_owed = (0..nv_store::types::NUM_BANK_SETS)
             .filter(|&i| session.reboot_owed & (1u16 << i) != 0)
-            .map(|i| format!("bank-set {i}"))
+            .map(|i| {
+                self.node_coordinator
+                    .as_ref()
+                    .map(|c| c.label(i))
+                    .unwrap_or_else(|| format!("bank-set {i}"))
+            })
             .collect();
         Ok(machine_mgr::node_update::Durable {
             session_id: session.session_id,
@@ -3452,8 +3457,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             .map_err(|e| BackendError::Internal(e.to_string()))?;
         // Trial resolved — the node no longer owes a reboot for this component;
         // clear its bit in the node-level reboot-owed record (no-op for the banked
-        // components that never set it).
+        // components that never set it), and drop it from the coordinator's staging
+        // so a fully-resolved transaction returns the node to Idle.
         self.set_reboot_owed(false)?;
+        if let Some(coord) = &self.node_coordinator {
+            coord.remove_from_staging(&self.entity_info.id);
+        }
         {
             let nv = self
                 .nv
