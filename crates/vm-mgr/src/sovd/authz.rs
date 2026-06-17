@@ -16,9 +16,13 @@
 //! pinned roots); this type stays HSM-agnostic.
 
 use async_trait::async_trait;
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Header, Validation};
 use serde::Deserialize;
 use sovd_api::{AccessRequest, Authorizer, Capability, ClientContext};
+
+// Delegated (`x5c`) path: chain verification lives in `delegation`; deriving the
+// JWT verifying key from the verified leaf needs the x509/p256 SPKI surface.
+use crate::sovd::delegation::verify_delegate_chain;
 
 /// Authority tier. A token may only exercise a capability whose tier is `<=` the
 /// ceiling of the issuer that signed it. Order matters: `Operational <
@@ -84,15 +88,54 @@ pub struct TieredAuthorizer {
     /// When set, a vehicle-wide token's `epoch` claim must be `>=` this — the
     /// device's current vehicle-epoch floor (§7.3). `None` = no binding.
     expected_epoch: Option<u64>,
+    /// When set, delegated (`x5c`) tokens are accepted: the leaf-first cert
+    /// chain in the token header must terminate at this pinned root, and the
+    /// leaf's delegated-rights extension caps what the token may exercise
+    /// (§5/§6). `None` = delegation unsupported (a token bearing `x5c` is
+    /// rejected — the device pins no delegation root).
+    pinned_root_pem: Option<Vec<u8>>,
+    /// The device's own id — the expected `aud` for *every* accepted token,
+    /// pinned issuer or delegate alike (the cross-target replay guard). The
+    /// pinned-issuer path reads `aud` per-issuer (all issuers share this id);
+    /// the delegated path has no pinned issuer, so it enforces `aud` from here.
+    /// Defaults in [`Self::new`] to the issuers' shared audience.
+    aud: Option<String>,
 }
 
 impl TieredAuthorizer {
     pub fn new(issuers: Vec<TrustedIssuer>) -> Self {
+        // The device audience is the same id on every pinned issuer (see
+        // `issuer_keys::authorizer_from_anchors`, which pins each issuer's
+        // `audience` to the device id). Derive it here so the delegated path —
+        // which has no pinned issuer to read `aud` from — enforces the same
+        // value. `with_aud` overrides it (e.g. a delegation-only authorizer
+        // with no issuers).
+        let aud = issuers.first().map(|i| i.audience.clone());
         Self {
             issuers,
             expected_boot_id: None,
             expected_epoch: None,
+            pinned_root_pem: None,
+            aud,
         }
+    }
+
+    /// Pin the delegation root: enables the delegated (`x5c`) path. A token
+    /// whose header carries a cert chain is then verified against this root
+    /// (root-pinning + path + signature + validity, via
+    /// [`verify_delegate_chain`]), and the leaf's delegated-rights extension
+    /// caps what it may grant. Omit to refuse all delegated tokens.
+    pub fn with_pinned_root(mut self, pem: Vec<u8>) -> Self {
+        self.pinned_root_pem = Some(pem);
+        self
+    }
+
+    /// Set the device audience explicitly — the expected `aud` for every
+    /// accepted token. Use this when there are no pinned issuers to derive it
+    /// from (a delegation-only authorizer), or to override the derived value.
+    pub fn with_aud(mut self, aud: impl Into<String>) -> Self {
+        self.aud = Some(aud.into());
+        self
     }
 
     /// Bind accepted tokens to the device's current boot: a token whose
@@ -112,6 +155,47 @@ impl TieredAuthorizer {
     pub fn with_epoch(mut self, epoch: u64) -> Self {
         self.expected_epoch = Some(epoch);
         self
+    }
+
+    /// Freshness gate shared by both verification paths (pinned-issuer and
+    /// delegated), so the boot_id + epoch rules have exactly ONE implementation
+    /// and can never drift apart. Behaviour is identical to the formerly-inline
+    /// block in [`Self::authorize`].
+    ///
+    /// Freshness (§7.1): when the device pins its current boot, a token must
+    /// name it — one minted for an earlier boot is stale after a reboot, so a
+    /// sniffed token dies at the next reboot. (Cross-boot replay guard;
+    /// intra-boot replay would need a `jti` cache, out of scope here.)
+    ///
+    /// Vehicle-wide freshness (§7.3): when the device pins its current
+    /// vehicle-epoch, a vehicle-wide token must carry an `epoch` claim at least
+    /// that high. The epoch is a monotonic floor the master ratchets up (§7.2
+    /// "never accept an epoch older than its current"), so a token minted
+    /// against a superseded epoch is stale — the cross-boot guard for grants
+    /// that span ECUs (which can't name one ECU's `boot_id`). A token ahead of
+    /// the floor is fine (this device merely lags the master).
+    fn check_freshness(&self, boot_id: Option<&str>, epoch: Option<u64>) -> Result<(), String> {
+        if let Some(expected) = &self.expected_boot_id {
+            if boot_id != Some(expected.as_str()) {
+                return Err(
+                    "stale token: boot_id does not match the device's current boot".to_string(),
+                );
+            }
+        }
+
+        if let Some(expected) = self.expected_epoch {
+            match epoch {
+                Some(epoch) if epoch >= expected => {}
+                Some(_) => {
+                    return Err(
+                        "stale token: vehicle-epoch is older than the device's current epoch"
+                            .to_string(),
+                    )
+                }
+                None => return Err("vehicle-wide token is missing its `epoch` claim".to_string()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -155,14 +239,25 @@ impl Authorizer for TieredAuthorizer {
     async fn authorize(&self, req: &AccessRequest<'_>) -> Result<ClientContext, String> {
         let token = strip_bearer(req.bearer)?;
 
+        let header = decode_header(token).map_err(|e| format!("invalid token header: {e}"))?;
+
+        // A token bearing a cert chain (`x5c`) is a delegate's: its authority
+        // rides in the leaf's cert, not in a pinned issuer. Route it to the
+        // delegated path. (If we pin no delegation root, we trust no delegate —
+        // reject rather than silently falling through to the pinned-issuer path,
+        // which would just fail with "untrusted issuer" anyway.)
+        if header.x5c.is_some() {
+            let Some(pinned_root) = self.pinned_root_pem.as_deref() else {
+                return Err("delegation not configured".to_string());
+            };
+            return self.authorize_delegated(token, &header, pinned_root, req);
+        }
+
         // Select the candidate issuer by the token's `kid` (key id). This is
         // unauthenticated until the signature verifies below against this exact
         // issuer's key — which is what binds the token to the issuer whose
         // ceiling then applies.
-        let kid = decode_header(token)
-            .map_err(|e| format!("invalid token header: {e}"))?
-            .kid
-            .ok_or("token is missing its `kid` (issuer)")?;
+        let kid = header.kid.ok_or("token is missing its `kid` (issuer)")?;
         let issuer = self
             .issuers
             .iter()
@@ -191,37 +286,9 @@ impl Authorizer for TieredAuthorizer {
             ));
         }
 
-        // Freshness (§7.1): when the device pins its current boot, a token must
-        // name it — one minted for an earlier boot is stale after a reboot, so a
-        // sniffed token dies at the next reboot. (Cross-boot replay guard;
-        // intra-boot replay would need a `jti` cache, out of scope here.)
-        if let Some(expected) = &self.expected_boot_id {
-            if claims.boot_id.as_deref() != Some(expected.as_str()) {
-                return Err(
-                    "stale token: boot_id does not match the device's current boot".to_string(),
-                );
-            }
-        }
-
-        // Vehicle-wide freshness (§7.3): when the device pins its current
-        // vehicle-epoch, a vehicle-wide token must carry an `epoch` claim at
-        // least that high. The epoch is a monotonic floor the master ratchets
-        // up (§7.2 "never accept an epoch older than its current"), so a token
-        // minted against a superseded epoch is stale — the cross-boot guard for
-        // grants that span ECUs (which can't name one ECU's `boot_id`). A token
-        // ahead of the floor is fine (this device merely lags the master).
-        if let Some(expected) = self.expected_epoch {
-            match claims.epoch {
-                Some(epoch) if epoch >= expected => {}
-                Some(_) => {
-                    return Err(
-                        "stale token: vehicle-epoch is older than the device's current epoch"
-                            .to_string(),
-                    )
-                }
-                None => return Err("vehicle-wide token is missing its `epoch` claim".to_string()),
-            }
-        }
+        // Freshness (§7.1 boot_id / §7.3 vehicle-epoch) — shared with the
+        // delegated path via one helper so the two can't drift.
+        self.check_freshness(claims.boot_id.as_deref(), claims.epoch)?;
 
         let ctx = ClientContext {
             subject: claims.sub.clone(),
@@ -238,6 +305,126 @@ impl Authorizer for TieredAuthorizer {
         if let Some(scope) = capability_scope(req.capability) {
             if !ctx.scopes.iter().any(|s| s == scope) {
                 return Err(format!("token lacks the '{scope}' capability"));
+            }
+        }
+        Ok(ctx)
+    }
+}
+
+impl TieredAuthorizer {
+    /// The delegated (`x5c`) verification path. The token bears a leaf-first
+    /// cert chain; the leaf's delegated-rights extension is the ceiling on what
+    /// the token may exercise — there is NO pinned issuer and NO issuer-tier
+    /// ceiling here. The trust chain is:
+    ///
+    /// 1. the chain verifies to the pinned root (root-pinning + path + signature
+    ///    + validity) — done by [`verify_delegate_chain`];
+    /// 2. the JWT is verified against the *verified leaf's* public key (so the
+    ///    presenter holds the leaf's private key), with the device `aud`;
+    /// 3. the token may only exercise a capability whose scope the *leaf's cert*
+    ///    grants — a delegate cannot mint beyond what the root vouched for.
+    fn authorize_delegated(
+        &self,
+        token: &str,
+        header: &Header,
+        pinned_root: &[u8],
+        req: &AccessRequest<'_>,
+    ) -> Result<ClientContext, String> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use p256::pkcs8::{DecodePublicKey, EncodePublicKey, LineEnding};
+        use x509_cert::der::{Decode, Encode};
+
+        // (a) `x5c` is standard-base64 of DER, leaf-first (RFC 7515 §4.1.6).
+        let x5c = header
+            .x5c
+            .as_ref()
+            .ok_or("delegated token is missing its `x5c` chain")?;
+        let chain_ders: Vec<Vec<u8>> = x5c
+            .iter()
+            .map(|b64| B64.decode(b64))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("malformed `x5c` (not standard-base64 DER): {e}"))?;
+
+        // (b) Delegation is the *cable-connected workshop* path: an operator is
+        // physically present, so a usable wall clock is a reasonable assumption
+        // and we verify the chain's validity window against `now`. The
+        // OTA/clockless paths never use delegation — they go through pinned
+        // issuers above, whose freshness comes from boot_id/epoch, not a clock.
+        let now = rustls::pki_types::UnixTime::now();
+
+        // (c) THE chain trust decision: root-pinning + path building + signature
+        // + validity, plus the leaf's granted scopes. We do not re-implement any
+        // of it.
+        let authority = verify_delegate_chain(&chain_ders, pinned_root, now)
+            .map_err(|e| format!("delegate chain rejected: {e}"))?;
+
+        // (d) Derive the JWT verifying key from the *verified* leaf's SPKI — the
+        // token must be signed by the key the root just vouched for, nothing
+        // else. (Mirror `issuer_keys::decoding_key_from_spki_der`: SPKI-DER ->
+        // P-256 public key -> PEM -> jsonwebtoken DecodingKey.)
+        let leaf = x509_cert::Certificate::from_der(&authority.leaf_der)
+            .map_err(|e| format!("verified leaf did not re-parse: {e}"))?;
+        let spki_der = leaf
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .map_err(|e| format!("leaf SPKI re-encode failed: {e}"))?;
+        let leaf_pub = p256::PublicKey::from_public_key_der(&spki_der)
+            .map_err(|e| format!("leaf key is not EC-P256: {e}"))?;
+        let leaf_pem = leaf_pub
+            .to_public_key_pem(LineEnding::LF)
+            .map_err(|e| format!("leaf key re-encode failed: {e}"))?;
+        let leaf_key = DecodingKey::from_ec_pem(leaf_pem.as_bytes())
+            .map_err(|e| format!("build leaf decoding key: {e}"))?;
+
+        // (e) Verify the token against the leaf key. ES256 only (asymmetric, so
+        // `HS*` is rejected — alg-confusion defence). The device `aud` is the
+        // same cross-target replay guard the pinned-issuer path enforces; there
+        // is NO pinned issuer here, so `iss` is NOT pinned.
+        let device_aud = self
+            .aud
+            .as_deref()
+            .ok_or("authorizer has no device audience configured for delegation")?;
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.set_audience(&[device_aud]);
+        validation.set_required_spec_claims(&["exp", "aud", "sub"]);
+        let claims = decode::<Claims>(token, &leaf_key, &validation)
+            .map_err(|e| format!("token verification failed: {e}"))?
+            .claims;
+
+        // (f) Freshness — the SAME helper the pinned-issuer path uses.
+        self.check_freshness(claims.boot_id.as_deref(), claims.epoch)?;
+
+        // (g) Identity + the token's own requested scopes.
+        let granted_scopes = authority.granted_scopes;
+        let ctx = ClientContext {
+            subject: claims.sub.clone(),
+            scopes: claims.into_scopes(),
+        };
+
+        // (h) Component scope (C-031) + capability (verb) scope — identical to
+        // the pinned-issuer path.
+        if let Some(component) = req.component {
+            if !ctx.can_access_component(component) {
+                return Err(format!("token has no scope for component '{component}'"));
+            }
+        }
+        if let Some(scope) = capability_scope(req.capability) {
+            if !ctx.scopes.iter().any(|s| s == scope) {
+                return Err(format!("token lacks the '{scope}' capability"));
+            }
+
+            // (i) THE escalation ceiling — the crux of delegation. The token may
+            // carry the scope and the chain may be valid, but the delegate may
+            // only exercise a capability its *certificate* was granted the right
+            // to. A workshop cert granting `update:transfer` can never have a
+            // token it signs perform `reset:execute`, even if the operator asks.
+            // The cert's granted scopes ARE the ceiling (no issuer-tier here).
+            if !granted_scopes.iter().any(|g| g == scope) {
+                return Err(format!(
+                    "delegate's certificate does not authorise granting '{scope}'"
+                ));
             }
         }
         Ok(ctx)
@@ -569,5 +756,275 @@ mod tests {
             .authorize(&access(&none, None, Capability::FactoryReset))
             .await
             .is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Delegated (`x5c`) path — a delegate presents a cert chain to a pinned
+    // root, and the cert's delegated-rights extension is the ceiling on what
+    // tokens it signs may exercise. The JWT is verified against the verified
+    // leaf's key (no pinned issuer). See `docs/design/authorization.md` §5/§6.
+    // -----------------------------------------------------------------------
+    mod delegated {
+        use super::super::*;
+        use super::access;
+        use jsonwebtoken::{encode, EncodingKey, Header};
+
+        use std::str::FromStr;
+        use std::time::Duration;
+
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use const_oid::db::rfc5280::ID_KP_CLIENT_AUTH;
+        use p256::ecdsa::{DerSignature, SigningKey};
+        use p256::pkcs8::{EncodePrivateKey, LineEnding};
+        use rand::rngs::OsRng;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::der::{Encode, EncodePem};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+        use x509_cert::Certificate as X509Certificate;
+
+        use crate::sovd::delegated_rights::DelegatedRightsExt;
+
+        const DEVICE_AUD: &str = "vehicle-1";
+
+        fn one_hour() -> Validity {
+            Validity::from_now(Duration::from_secs(3600)).unwrap()
+        }
+
+        /// PEM of a self-signed root for `ca_key`/`ca_name` (mirrors
+        /// `delegation::tests::ca_root_pem`).
+        fn ca_root_pem(ca_key: &SigningKey, ca_name: &Name) -> Vec<u8> {
+            let spki = SubjectPublicKeyInfoOwned::from_key(*ca_key.verifying_key()).unwrap();
+            let cert: X509Certificate = CertificateBuilder::new(
+                Profile::Root,
+                SerialNumber::new(&[1]).unwrap(),
+                one_hour(),
+                ca_name.clone(),
+                spki,
+                ca_key,
+            )
+            .unwrap()
+            .build::<DerSignature>()
+            .unwrap();
+            cert.to_pem(x509_cert::der::pem::LineEnding::LF)
+                .unwrap()
+                .into_bytes()
+        }
+
+        /// Issue a delegate leaf signed by `ca_key`/`ca_name` over `leaf_key`'s
+        /// public half, with the clientAuth EKU and an optional delegated-rights
+        /// extension carrying `scopes`. Returns the leaf DER. The caller keeps
+        /// `leaf_key` so it can sign the JWT with the leaf's private half
+        /// (mirrors `delegation::tests::issue_leaf`, but the key is provided so
+        /// we can mint with it).
+        fn issue_leaf(
+            ca_key: &SigningKey,
+            ca_name: &Name,
+            leaf_key: &SigningKey,
+            scopes: Option<&str>,
+        ) -> Vec<u8> {
+            let spki = SubjectPublicKeyInfoOwned::from_key(*leaf_key.verifying_key()).unwrap();
+            let mut builder = CertificateBuilder::new(
+                Profile::Leaf {
+                    issuer: ca_name.clone(),
+                    enable_key_agreement: false,
+                    enable_key_encipherment: false,
+                },
+                SerialNumber::new(&[2]).unwrap(),
+                one_hour(),
+                Name::from_str("CN=workshop delegate").unwrap(),
+                spki,
+                ca_key,
+            )
+            .unwrap();
+            builder
+                .add_extension(&ExtendedKeyUsage(vec![ID_KP_CLIENT_AUTH]))
+                .unwrap();
+            if let Some(s) = scopes {
+                builder
+                    .add_extension(&DelegatedRightsExt(s.to_string()))
+                    .unwrap();
+            }
+            builder.build::<DerSignature>().unwrap().to_der().unwrap()
+        }
+
+        /// Mint an ES256 token signed by `signing_key`, carrying `leaf_der` as
+        /// the single-element `x5c` (standard-base64 of DER, per RFC 7515). No
+        /// `kid` — the delegated path keys off `x5c`, not a pinned issuer. The
+        /// signing key is decoupled from the cert so a "wrong key" test can sign
+        /// with a non-leaf key while presenting the leaf's cert.
+        fn mint_delegated(
+            signing_key: &SigningKey,
+            leaf_der: &[u8],
+            aud: &str,
+            scope: &str,
+        ) -> String {
+            let enc = EncodingKey::from_ec_pem(
+                signing_key.to_pkcs8_pem(LineEnding::LF).unwrap().as_bytes(),
+            )
+            .unwrap();
+            let mut header = Header::new(Algorithm::ES256);
+            header.x5c = Some(vec![B64.encode(leaf_der)]);
+            let claims = serde_json::json!({
+                "sub": "workshop-operator",
+                "aud": aud,
+                "exp": 9_999_999_999u64,
+                "scope": scope,
+            });
+            encode(&header, &claims, &enc).unwrap()
+        }
+
+        /// An authorizer that pins `root_pem` and the device audience, trusting
+        /// NO pinned issuers (delegation-only — proves the delegated path stands
+        /// on its own, with the cert as the sole authority).
+        fn delegated_authorizer(root_pem: Vec<u8>) -> TieredAuthorizer {
+            TieredAuthorizer::new(vec![])
+                .with_aud(DEVICE_AUD.to_string())
+                .with_pinned_root(root_pem)
+        }
+
+        /// THE test: the cert grants only `update:transfer`, but the operator
+        /// over-asks — the token claims `reset:execute`. The chain is valid and
+        /// the token genuinely carries the scope, yet authorization MUST fail,
+        /// because the delegate's *certificate* does not authorise granting
+        /// `reset:execute`. The cert is the ceiling, not the token's claims.
+        #[tokio::test]
+        async fn delegate_cannot_exceed_its_granted_scopes() {
+            let ca_key = SigningKey::random(&mut OsRng);
+            let ca_name = Name::from_str("CN=workshop root").unwrap();
+            let root_pem = ca_root_pem(&ca_key, &ca_name);
+            let leaf_key = SigningKey::random(&mut OsRng);
+            // Cert grants ONLY update:transfer.
+            let leaf = issue_leaf(&ca_key, &ca_name, &leaf_key, Some("update:transfer"));
+
+            // Token over-asks: claims reset:execute (+ component:rt) anyway.
+            let token = mint_delegated(&leaf_key, &leaf, DEVICE_AUD, "reset:execute component:rt");
+            let bearer = format!("Bearer {token}");
+            let authz = delegated_authorizer(root_pem);
+
+            let err = authz
+                .authorize(&access(&bearer, Some("rt"), Capability::ResetExecute))
+                .await
+                .expect_err("a delegate may not exceed its cert's granted scopes");
+            // Fails for the RIGHT reason: the escalation (granted-scopes) check,
+            // NOT the chain (it verified) and NOT the verb-scope check (the token
+            // DOES carry reset:execute).
+            assert!(
+                err.contains("does not authorise granting 'reset:execute'"),
+                "must reject at the granted-scopes ceiling, got: {err}"
+            );
+        }
+
+        /// Same shape, but now the cert DOES grant `reset:execute` (alongside
+        /// `update:transfer`). The token claims `reset:execute component:rt`;
+        /// the delegate is within its ceiling, so `ResetExecute` on `rt` is Ok.
+        #[tokio::test]
+        async fn delegate_granted_reset_is_authorized() {
+            let ca_key = SigningKey::random(&mut OsRng);
+            let ca_name = Name::from_str("CN=workshop root").unwrap();
+            let root_pem = ca_root_pem(&ca_key, &ca_name);
+            let leaf_key = SigningKey::random(&mut OsRng);
+            let leaf = issue_leaf(
+                &ca_key,
+                &ca_name,
+                &leaf_key,
+                Some("reset:execute update:transfer"),
+            );
+
+            let token = mint_delegated(&leaf_key, &leaf, DEVICE_AUD, "reset:execute component:rt");
+            let bearer = format!("Bearer {token}");
+            let authz = delegated_authorizer(root_pem);
+
+            let ctx = authz
+                .authorize(&access(&bearer, Some("rt"), Capability::ResetExecute))
+                .await
+                .expect("a delegate within its cert's grant is authorized");
+            assert_eq!(ctx.subject, "workshop-operator");
+            assert!(ctx.scopes.iter().any(|s| s == "reset:execute"));
+        }
+
+        /// Root pinning on the delegated path: a valid delegate token, but the
+        /// authorizer pins a DIFFERENT root. `verify_delegate_chain` cannot
+        /// build a path to the pinned root → rejected before any JWT work.
+        #[tokio::test]
+        async fn delegated_token_under_wrong_root_rejected() {
+            let ca_a = SigningKey::random(&mut OsRng);
+            let name_a = Name::from_str("CN=root A").unwrap();
+            let leaf_key = SigningKey::random(&mut OsRng);
+            let leaf = issue_leaf(&ca_a, &name_a, &leaf_key, Some("reset:execute"));
+            let token = mint_delegated(&leaf_key, &leaf, DEVICE_AUD, "reset:execute component:rt");
+            let bearer = format!("Bearer {token}");
+
+            // Pin an unrelated root B.
+            let ca_b = SigningKey::random(&mut OsRng);
+            let name_b = Name::from_str("CN=root B").unwrap();
+            let authz = delegated_authorizer(ca_root_pem(&ca_b, &name_b));
+
+            let err = authz
+                .authorize(&access(&bearer, Some("rt"), Capability::ResetExecute))
+                .await
+                .expect_err("a delegate under root A must not verify against pinned root B");
+            assert!(
+                err.contains("pinned root"),
+                "wrong-root rejection must come from the chain check, got: {err}"
+            );
+        }
+
+        /// The leaf key must be the JWT signing key. `x5c` carries leaf A's
+        /// cert (validly chained), but the JWT is signed by a DIFFERENT key →
+        /// the signature can't verify against the leaf's public key → rejected.
+        #[tokio::test]
+        async fn delegated_token_signed_by_non_leaf_key_rejected() {
+            let ca_key = SigningKey::random(&mut OsRng);
+            let ca_name = Name::from_str("CN=workshop root").unwrap();
+            let root_pem = ca_root_pem(&ca_key, &ca_name);
+            let leaf_key = SigningKey::random(&mut OsRng);
+            let leaf = issue_leaf(
+                &ca_key,
+                &ca_name,
+                &leaf_key,
+                Some("reset:execute update:transfer"),
+            );
+
+            // Sign the JWT with an UNRELATED key, but present the real leaf cert.
+            let imposter = SigningKey::random(&mut OsRng);
+            let token = mint_delegated(&imposter, &leaf, DEVICE_AUD, "reset:execute component:rt");
+            let bearer = format!("Bearer {token}");
+            let authz = delegated_authorizer(root_pem);
+
+            let err = authz
+                .authorize(&access(&bearer, Some("rt"), Capability::ResetExecute))
+                .await
+                .expect_err("a JWT not signed by the leaf key must be rejected");
+            assert!(
+                err.contains("token verification failed"),
+                "must reject at JWT signature verification against the leaf key, got: {err}"
+            );
+        }
+
+        /// The existing pinned-issuer path is untouched by the `x5c` branch: a
+        /// classic token (no `x5c`, signed by a pinned issuer) authorizes exactly
+        /// as before. Reuses the two-tier fixture from the parent module.
+        #[tokio::test]
+        async fn pinned_issuer_path_unaffected() {
+            let (op_enc, _ext_enc, authz) = super::two_tier_authorizer();
+            let token = super::mint(
+                &op_enc,
+                "onboard",
+                "vehicle-1",
+                &["component:vm1", "data:read"],
+            );
+            let bearer = format!("Bearer {token}");
+            let ctx = authz
+                .authorize(&access(&bearer, Some("vm1"), Capability::DataRead))
+                .await
+                .expect("classic pinned-issuer token still authorizes");
+            assert_eq!(ctx.subject, "operator");
+            assert!(ctx.scopes.iter().any(|s| s == "data:read"));
+        }
     }
 }
