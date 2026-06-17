@@ -72,6 +72,19 @@ pub struct ComponentSpec {
     /// Also suppresses vm-service notifications for this component.
     #[serde(default)]
     pub activator: Option<String>,
+
+    /// Human-readable display name for SOVD reads. Optional override; `None`
+    /// keeps the component's default name. The binary typically reads this from
+    /// the active bank's `vm-config.yaml` and sets it here — keeping that file
+    /// I/O in the caller rather than the factory.
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// SOVD `entity_type` override. When `None`, defaults to `component_type` (the
+    /// routing key). Set this to keep the reported type distinct from the factory's
+    /// routing taxonomy — e.g. id "vm1" routes as "bank" but reports as "vm".
+    #[serde(default)]
+    pub entity_type: Option<String>,
 }
 
 /// Result of building a component — includes the Component trait object,
@@ -269,6 +282,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             ) {
                 backend = backend.with_bank_provider(provider);
             }
+            if let Some(name) = &spec.display_name {
+                backend = backend.with_display_name(name.clone());
+            }
             if let Some(coord) = &deps.node_coordinator {
                 backend = backend.with_node_coordinator(coord.clone());
             }
@@ -309,7 +325,10 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
         // provisioning).
         "bank" | "hpc" | "hsm" => {
             let comp_config = ComponentConfig {
-                entity_type: spec.component_type.clone(),
+                entity_type: spec
+                    .entity_type
+                    .clone()
+                    .unwrap_or_else(|| spec.component_type.clone()),
                 supports_rollback: spec.rollback,
                 single_bank: spec.single_bank,
             };
@@ -358,6 +377,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 backend = backend.with_bank_provider(provider);
             }
 
+            if let Some(name) = &spec.display_name {
+                backend = backend.with_display_name(name.clone());
+            }
             if let Some(coord) = &deps.node_coordinator {
                 backend = backend.with_node_coordinator(coord.clone());
             }
