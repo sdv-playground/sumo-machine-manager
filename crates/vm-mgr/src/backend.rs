@@ -3562,6 +3562,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             ));
         }
         self.clear_flash_session();
+        // The gate staged this component at start_flash; an abort is a terminal
+        // resolution too, so drop it from the coordinator's staging (return the
+        // node toward Idle). reboot-owed clear is a no-op here — abort is rejected
+        // post-finalize above, so nothing was ever marked.
+        self.resolve_node_transaction()?;
         Ok(())
     }
 
