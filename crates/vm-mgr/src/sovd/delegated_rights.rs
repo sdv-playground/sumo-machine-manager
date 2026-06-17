@@ -13,10 +13,11 @@
 //! `"reset:execute update:transfer update:verdict"`. Non-critical so a verifier that
 //! predates the extension simply grants nothing extra rather than rejecting the cert.
 
-use const_oid::ObjectIdentifier;
+use const_oid::{AssociatedOid, ObjectIdentifier};
 use der::asn1::{OctetString, Utf8StringRef};
 use der::{Decode, Encode};
-use x509_cert::ext::Extension;
+use x509_cert::ext::{AsExtension, Extension};
+use x509_cert::name::Name;
 use x509_cert::Certificate;
 
 /// OID for the delegated-rights extension.
@@ -35,6 +36,39 @@ pub fn build_extension(scopes: &str) -> der::Result<Extension> {
         critical: false,
         extn_value: OctetString::new(value_der)?,
     })
+}
+
+/// Issuance newtype for the delegated-rights extension, for use with
+/// [`x509_cert::builder::CertificateBuilder::add_extension`].
+///
+/// Holds the space-delimited scope string. Its DER form is a **bare
+/// `UTF8String`** (no `SEQUENCE`, no `OCTET STRING` wrapper) — the builder's
+/// `AsExtension::to_extension` is what wraps that in the extension's
+/// `extn_value` `OCTET STRING`. That makes the on-the-wire bytes identical to
+/// [`build_extension`], so [`granted_scopes`] / [`parse_scopes`] read it back
+/// unchanged.
+pub struct DelegatedRightsExt(pub String);
+
+impl AssociatedOid for DelegatedRightsExt {
+    const OID: ObjectIdentifier = DELEGATED_RIGHTS_OID;
+}
+
+impl Encode for DelegatedRightsExt {
+    fn encoded_len(&self) -> der::Result<der::Length> {
+        Utf8StringRef::new(&self.0)?.encoded_len()
+    }
+
+    fn encode(&self, encoder: &mut impl der::Writer) -> der::Result<()> {
+        Utf8StringRef::new(&self.0)?.encode(encoder)
+    }
+}
+
+impl AsExtension for DelegatedRightsExt {
+    fn critical(&self, _subject: &Name, _extensions: &[Extension]) -> bool {
+        // Non-critical: a verifier predating the extension grants nothing extra
+        // rather than rejecting the cert (see module docs).
+        false
+    }
 }
 
 /// Decode the granted scopes from an extension's DER value (the inner `UTF8String`).
@@ -79,5 +113,56 @@ mod tests {
     fn garbage_value_is_none_never_panics() {
         assert!(parse_scopes(&[0xff, 0x00, 0x13]).is_none());
         assert!(parse_scopes(&[]).is_none());
+    }
+
+    /// Issuance↔reading round-trip through a *real* certificate: build a leaf
+    /// carrying `DelegatedRightsExt`, then read the scopes back with
+    /// `granted_scopes`. Proves the `AsExtension` newtype emits the exact bytes
+    /// the reader expects.
+    #[test]
+    fn ext_newtype_round_trips_through_a_cert() {
+        use std::str::FromStr;
+        use std::time::Duration;
+
+        use const_oid::db::rfc5280::ID_KP_CLIENT_AUTH;
+        use p256::ecdsa::{DerSignature, SigningKey};
+        use rand::rngs::OsRng;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+
+        let ca_key = SigningKey::random(&mut OsRng);
+        let ca_name = Name::from_str("CN=test delegated-rights root").unwrap();
+        let leaf_key = SigningKey::random(&mut OsRng);
+        let leaf_spki = SubjectPublicKeyInfoOwned::from_key(*leaf_key.verifying_key()).unwrap();
+
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: ca_name.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::new(&[1]).unwrap(),
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Name::from_str("CN=delegate").unwrap(),
+            leaf_spki,
+            &ca_key,
+        )
+        .unwrap();
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![ID_KP_CLIENT_AUTH]))
+            .unwrap();
+        builder
+            .add_extension(&DelegatedRightsExt(
+                "reset:execute update:transfer".to_string(),
+            ))
+            .unwrap();
+        let cert = builder.build::<DerSignature>().unwrap();
+
+        let got = granted_scopes(&cert).expect("cert should carry delegated-rights");
+        assert_eq!(got, vec!["reset:execute", "update:transfer"]);
     }
 }

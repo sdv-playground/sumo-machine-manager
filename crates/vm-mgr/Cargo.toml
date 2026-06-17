@@ -41,6 +41,8 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 x509-cert = { version = "0.2", features = ["std", "pem", "builder"] }
 const-oid = { version = "0.9", features = ["db"] }
 der = { version = "0.7", features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
 http-body-util = "0.1"
@@ -50,6 +52,7 @@ sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "
 coset = "0.3"
 ciborium = "0.2"
 tempfile = "3"
+rand = "0.8"
 
 [[bin]]
 name = "vm-diagserver"

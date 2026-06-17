@@ -66,6 +66,7 @@ pub mod suit_provider;
 pub mod sovd {
     pub mod authz;
     pub mod delegated_rights;
+    pub mod delegation;
     pub mod freshness;
     pub mod identity;
     pub mod issuer_keys;
