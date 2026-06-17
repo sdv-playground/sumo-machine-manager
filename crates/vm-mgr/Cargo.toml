@@ -38,6 +38,9 @@ hex = "0.4.3"
 base64 = "0.22"
 jsonwebtoken = "10"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+x509-cert = { version = "0.2", features = ["std", "pem", "builder"] }
+const-oid = { version = "0.9", features = ["db"] }
+der = { version = "0.7", features = ["std"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
