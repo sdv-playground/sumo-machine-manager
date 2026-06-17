@@ -8,10 +8,7 @@ use nv_store::types::{BankSet, NvBootState};
 
 use sovd_core::DiagnosticBackend;
 
-use vm_mgr::app_install_router::AppInstallRouterComponent;
-use vm_mgr::backend::{ComponentBackend, ComponentConfig};
-use vm_mgr::component_adapter::ComponentAdapter;
-use vm_mgr::install_router_diag::InstallRouterDiag;
+use component_factory::{build_component, ComponentSpec, FactoryDeps};
 use vm_mgr::sovd::security::TestSecurityProvider;
 use vm_mgr::suit_provider::SuitProvider;
 
@@ -203,28 +200,127 @@ async fn main() {
         );
     }
 
-    // Create one backend per bank set
-    let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
+    // Read display_name from the active bank's vm-config.yaml (best-effort):
+    // resolve the active bank from NV, falling back to probing bank_a then bank_b
+    // (display_name is the same in both). File I/O stays in the binary — the
+    // factory just applies whatever name the spec carries.
+    let (hostos_name, vm1_name, vm2_name) = {
+        let read_display_name = |id: &str, set: BankSet| -> Option<String> {
+            let dir = images_dir.as_ref()?;
+            let set_dir = dir.join(id);
+            let active = nv
+                .lock()
+                .ok()
+                .and_then(|n| n.read_boot_state())
+                .map(|s| match s.banks[set.as_index()].active_bank {
+                    nv_store::types::Bank::A => "bank_a",
+                    nv_store::types::Bank::B => "bank_b",
+                });
+            let candidates: &[&str] = match active {
+                Some("bank_b") => &["bank_b"],
+                Some(_) => &["bank_a"],
+                None => &["bank_a", "bank_b"],
+            };
+            for bank in candidates {
+                let config_path = set_dir.join(bank).join("vm-config.yaml");
+                if let Ok(content) = std::fs::read_to_string(&config_path) {
+                    if let Ok(map) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                        if let Some(name) = map.get("display_name").and_then(|v| v.as_str()) {
+                            return Some(name.to_string());
+                        }
+                    }
+                    break;
+                }
+            }
+            None
+        };
         (
-            "host-os",
-            BankSet::Os,
-            ComponentConfig {
-                entity_type: "host_os".into(),
-                ..ComponentConfig::default()
-            },
-        ),
-        ("vm1", BankSet::Vm1, ComponentConfig::default()),
-        ("vm2", BankSet::Vm2, ComponentConfig::default()),
-        (
-            "hsm",
-            BankSet::Hsm,
-            ComponentConfig {
-                supports_rollback: false,
-                single_bank: true,
-                entity_type: "hsm".into(),
-            },
-        ),
+            read_display_name("host-os", BankSet::Os),
+            read_display_name("vm1", BankSet::Vm1),
+            read_display_name("vm2", BankSet::Vm2),
+        )
+    };
+
+    // One backend per bank set, built through the shared component-factory — the
+    // same path supernova-mm uses, no hand-rolled composition. vm2 is a plain bank:
+    // installing containers *inside* vm2 is the guest's own SOVD server's job, not
+    // the host vm-manager's. `entity_type` is pinned to vm-sovd's historical values
+    // (the factory would otherwise report the routing key).
+    let specs: Vec<ComponentSpec> = vec![
+        ComponentSpec {
+            id: "host-os".into(),
+            component_type: "hpc".into(),
+            rollback: true,
+            single_bank: false,
+            storage_path: images_dir.clone(),
+            base_path: None,
+            bank_set: None,
+            slot: None,
+            storage_subdir: None,
+            bank_layout: None,
+            activator: boot_device.as_ref().map(|_| "ifs".to_string()),
+            display_name: hostos_name,
+            entity_type: Some("host_os".into()),
+        },
+        ComponentSpec {
+            id: "vm1".into(),
+            component_type: "bank".into(),
+            rollback: true,
+            single_bank: false,
+            storage_path: images_dir.clone(),
+            base_path: None,
+            bank_set: None,
+            slot: None,
+            storage_subdir: None,
+            bank_layout: None,
+            activator: None,
+            display_name: vm1_name,
+            entity_type: Some("vm".into()),
+        },
+        ComponentSpec {
+            id: "vm2".into(),
+            component_type: "bank".into(),
+            rollback: true,
+            single_bank: false,
+            storage_path: images_dir.clone(),
+            base_path: None,
+            bank_set: None,
+            slot: None,
+            storage_subdir: None,
+            bank_layout: None,
+            activator: None,
+            display_name: vm2_name,
+            entity_type: Some("vm".into()),
+        },
+        ComponentSpec {
+            id: "hsm".into(),
+            component_type: "hsm".into(),
+            rollback: false,
+            single_bank: true,
+            storage_path: images_dir.clone(),
+            base_path: None,
+            bank_set: None,
+            slot: None,
+            storage_subdir: None,
+            bank_layout: None,
+            activator: None,
+            display_name: None,
+            entity_type: Some("hsm".into()),
+        },
     ];
+
+    // Host-os bank activator (raw IFS write), keyed by id for the factory to wire.
+    // Only when a boot device is configured.
+    let mut bank_activators: HashMap<String, Arc<dyn machine_mgr::BankActivator>> = HashMap::new();
+    if let Some(ref dev) = boot_device {
+        bank_activators.insert(
+            "host-os".into(),
+            Arc::new(host_os_mgr::ifs::dev::DevBankActivator::new(
+                dev.clone(),
+                boot_mount.clone(),
+            )),
+        );
+    }
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     let mut machine_builder = MachineRegistry::builder(EntityInfo {
@@ -240,108 +336,34 @@ async fn main() {
     // SOVD reset/verdict handlers will share this same Arc in the next steps.
     // Bank-set-index -> component-id map, so the node update-state report and the
     // gate's refusal name the components (not "bank-set N").
-    let id_map: Vec<(usize, String)> = components
+    let id_map: Vec<(usize, String)> = specs
         .iter()
-        .map(|(id, set, _)| (set.as_index(), id.to_string()))
+        .filter_map(|s| {
+            component_factory::resolve_bank_set(s).map(|bs| (bs.as_index(), s.id.clone()))
+        })
         .collect();
     let node_coordinator = Arc::new(machine_mgr::node_update::NodeCoordinator::new(id_map));
-    for (id, set, config) in components {
-        let mut backend = ComponentBackend::with_options(
-            set,
-            nv.clone(),
-            manifest_provider.clone(),
-            security_provider.clone(),
-            config,
-            vm_service_addr.clone(),
-            images_dir.clone(),
-            hsm_provider.clone(),
-        );
-        backend = backend.with_node_coordinator(node_coordinator.clone());
-        // Read display_name from the active bank's vm-config.yaml if available.
-        // No `current` symlink any more — resolve the active bank from NV, and
-        // if that's unreadable fall back to trying bank_a then bank_b
-        // (display_name is the same in both). Best-effort: skip on any miss.
-        if let Some(ref dir) = images_dir {
-            let set_dir = dir.join(id);
-            let active = nv.lock().ok().and_then(|nv| nv.read_boot_state()).map(|s| {
-                match s.banks[set.as_index()].active_bank {
-                    nv_store::types::Bank::A => "bank_a",
-                    nv_store::types::Bank::B => "bank_b",
-                }
-            });
-            // Active bank first when known; otherwise probe both (same name).
-            let candidates: &[&str] = match active {
-                Some("bank_b") => &["bank_b"],
-                Some(_) => &["bank_a"],
-                None => &["bank_a", "bank_b"],
-            };
-            for bank in candidates {
-                let config_path = set_dir.join(bank).join("vm-config.yaml");
-                if let Ok(content) = std::fs::read_to_string(&config_path) {
-                    // Lightweight parse — just extract display_name
-                    if let Ok(map) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                        if let Some(name) = map.get("display_name").and_then(|v| v.as_str()) {
-                            backend = backend.with_display_name(name.to_string());
-                        }
-                    }
-                    break;
-                }
+
+    let deps = FactoryDeps {
+        nv: nv.clone(),
+        manifest_provider: manifest_provider.clone(),
+        security_provider: security_provider.clone(),
+        vm_service_addr: vm_service_addr.clone(),
+        hsm_provider: hsm_provider.clone(),
+        hsm_keystore: Some(hsm_keystore_path.clone()),
+        hsm_port,
+        bank_activators,
+        health_probes: HashMap::new(),
+        boot_selector: None,
+        node_coordinator: Some(node_coordinator.clone()),
+    };
+    for spec in &specs {
+        if let Some(built) = build_component(spec, &deps) {
+            machine_builder = machine_builder.with_arc(built.component);
+            if let Some(diag) = built.diag_backend {
+                backends.insert(spec.id.clone(), diag);
             }
         }
-        // Wire bank activator into the boot backend
-        if set == BankSet::Os {
-            if let Some(ref dev) = boot_device {
-                let activator =
-                    host_os_mgr::ifs::dev::DevBankActivator::new(dev.clone(), boot_mount.clone());
-                backend = backend.with_bank_activator(Arc::new(activator));
-            }
-        }
-        let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
-        let mut component_inner = ComponentAdapter::new(backend_arc.clone());
-        // Wire CSR signing for the HSM component so the route below can
-        // call machine.component("hsm").get_csr() instead of building a
-        // transient SimHsm at request time.
-        if set == BankSet::Hsm {
-            component_inner =
-                component_inner.with_csr_keystore(hsm_keystore_path.clone(), hsm_port);
-        }
-        let vm_component: Arc<dyn machine_mgr::Component> = Arc::new(component_inner);
-
-        // vm2 routes installs container-vs-VM through AppInstallRouterComponent;
-        // every other component's install/flash lives natively on
-        // ComponentBackend. The registry gets `component` either way; only the
-        // SOVD diag backend differs.
-        let component: Arc<dyn machine_mgr::Component> = if id == "vm2" {
-            let container_images_dir = images_dir
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("/tmp/sumo-container-images"))
-                .join("vm2")
-                .join("container-images");
-            let container_image: Arc<dyn machine_mgr::Component> =
-                Arc::new(app_mgr::ContainerImageComponent::new(
-                    app_mgr::ContainerImageConfig::new("container_image", container_images_dir),
-                ));
-            Arc::new(AppInstallRouterComponent::new(
-                "vm2",
-                vm_component,
-                container_image,
-                manifest_provider.clone(),
-            ))
-        } else {
-            vm_component
-        };
-
-        machine_builder = machine_builder.with_arc(component.clone());
-
-        // vm2: wrap the install router so install/flash route through it and
-        // everything else (data, faults, modes) delegates to the engine.
-        // All others: the engine IS the DiagnosticBackend — wire it directly.
-        let diag: Arc<dyn DiagnosticBackend> = if id == "vm2" {
-            Arc::new(InstallRouterDiag::new(component, backend_arc.clone()))
-        } else {
-            backend_arc.clone() as Arc<dyn DiagnosticBackend>
-        };
-        backends.insert(id.to_string(), diag);
     }
 
     let machine: Arc<dyn Machine> = Arc::new(machine_builder.build());
