@@ -113,6 +113,10 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// keeps the NV/symlink-only providers (the in-backend default) —
     /// behaviour-preserving, since the selector tracks `NvBootState` (dual-write).
     pub boot_selector: Option<machine_mgr::SharedSystemBankState>,
+    /// The node update-transaction coordinator (the "one transaction at a time"
+    /// gate). When `Some`, each built component gets it via `with_node_coordinator`
+    /// so its `start_flash` consults the node-wide gate; `None` leaves it inert.
+    pub node_coordinator: Option<Arc<machine_mgr::node_update::NodeCoordinator>>,
 }
 
 pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
@@ -265,6 +269,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             ) {
                 backend = backend.with_bank_provider(provider);
             }
+            if let Some(coord) = &deps.node_coordinator {
+                backend = backend.with_node_coordinator(coord.clone());
+            }
             let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
             let component: Arc<dyn Component> = Arc::new(comp);
 
@@ -351,6 +358,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 backend = backend.with_bank_provider(provider);
             }
 
+            if let Some(coord) = &deps.node_coordinator {
+                backend = backend.with_node_coordinator(coord.clone());
+            }
             let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
             let mut component_inner = ComponentAdapter::new(backend_arc.clone());
 
