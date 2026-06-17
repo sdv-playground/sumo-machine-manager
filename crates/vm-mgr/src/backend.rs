@@ -1249,6 +1249,21 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         Ok(())
     }
 
+    /// A node update-transaction for this component has resolved — committed OR
+    /// rolled back. Clear its durable reboot-owed bit and drop it from the
+    /// coordinator's staging, so a fully-resolved transaction returns the node to
+    /// `Idle`. Called from BOTH `commit_flash` and `rollback_flash` (the two
+    /// resolution points) so neither path can leave the node wedged in
+    /// `RebootPending`/`Staging`. The reboot-owed clear is a no-op for banked
+    /// components (they never set it) — kept for symmetry and as a safety net.
+    fn resolve_node_transaction(&self) -> BackendResult<()> {
+        self.set_reboot_owed(false)?;
+        if let Some(coord) = &self.node_coordinator {
+            coord.remove_from_staging(&self.entity_info.id);
+        }
+        Ok(())
+    }
+
     // =================================================================
     // Separate manifest + payload upload methods (new flash path)
     // =================================================================
@@ -3455,14 +3470,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         self.bank_provider
             .commit()
             .map_err(|e| BackendError::Internal(e.to_string()))?;
-        // Trial resolved — the node no longer owes a reboot for this component;
-        // clear its bit in the node-level reboot-owed record (no-op for the banked
-        // components that never set it), and drop it from the coordinator's staging
-        // so a fully-resolved transaction returns the node to Idle.
-        self.set_reboot_owed(false)?;
-        if let Some(coord) = &self.node_coordinator {
-            coord.remove_from_staging(&self.entity_info.id);
-        }
+        // Trial resolved — return the node toward Idle (clear reboot-owed + drop
+        // from staging). Shared with rollback_flash via resolve_node_transaction.
+        self.resolve_node_transaction()?;
         {
             let nv = self
                 .nv
@@ -3520,6 +3530,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         self.bank_provider
             .rollback()
             .map_err(|e| BackendError::Internal(e.to_string()))?;
+        // Transaction resolved (reverted) — return the node toward Idle, same as
+        // commit. Without this a rolled-back banked component stays in the
+        // coordinator's staging and the node never leaves Staging/Trial.
+        self.resolve_node_transaction()?;
         {
             let nv = self
                 .nv
@@ -4977,6 +4991,44 @@ mod bank_provider_injection_tests {
 
         b.set_reboot_owed(false).unwrap();
         assert!(b.node_reboot_owed().unwrap().reboot_owed.is_empty());
+    }
+
+    #[test]
+    fn commit_and_rollback_share_one_resolve_hook() {
+        // Regression for the asymmetry saka caught: commit_flash cleared the node
+        // transaction but rollback_flash did not, so a rolled-back banked component
+        // stayed wedged in Staging/RebootPending and the node never returned to
+        // Idle. Both paths now route through `resolve_node_transaction`; this proves
+        // the hook clears the durable reboot-owed bit AND drops the component from
+        // the coordinator's staging.
+        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new(vec![(
+            BankSet::Vm1.as_index(),
+            "vm1".to_string(),
+        )]));
+        let b = backend().with_node_coordinator(coord.clone());
+        let id = b.entity_info().id.clone();
+
+        // Stage it (what start_flash's gate does) + mark a reboot owed (finalize).
+        coord
+            .gate_new_session([0u8; 32], &id, &b.node_reboot_owed().unwrap(), &[])
+            .unwrap();
+        b.set_reboot_owed(true).unwrap();
+        let d = b.node_reboot_owed().unwrap();
+        assert_eq!(
+            coord.node_update_state(&d, &[]).phase.as_str(),
+            "RebootPending"
+        );
+
+        // The single hook both commit_flash and rollback_flash call.
+        b.resolve_node_transaction().unwrap();
+
+        let d = b.node_reboot_owed().unwrap();
+        assert!(d.reboot_owed.is_empty(), "reboot-owed must be cleared");
+        assert_eq!(
+            coord.node_update_state(&d, &[]).phase.as_str(),
+            "Idle",
+            "staging must be cleared -> node Idle"
+        );
     }
 
     #[tokio::test]
