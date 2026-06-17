@@ -10,9 +10,6 @@ path = "src/main.rs"
 # The simulated-ECU SOVD/OTA server. Lives ABOVE the engine (vm-mgr) and the
 # component-factory so it can compose components through the SAME factory
 # supernova-mm uses — no hand-rolled, double-maintained composition.
-#
-# Dependency list is a superset of vm-mgr's (vm-sovd was a [[bin]] inside vm-mgr
-# and inherited them); trim the unused engine-only crates in a follow-up.
 [dependencies]
 vm-mgr = { path = "../vm-mgr" }
 component-factory = { path = "../component-factory" }
@@ -20,31 +17,11 @@ nv-store = { path = "../nv-store" }
 machine-mgr = { path = "../machine-mgr" }
 hsm = { path = "../hsm", features = ["crypto"] }
 host-os-mgr = { path = "../host-os-mgr" }
-app-mgr = { path = "../app-mgr" }
-sha2 = "0.10"
-crc32fast = "1"
-bytes = "1"
-futures = "0.3"
-zstd = "0.13"
-coset = "0.3"
-tokio-util = { version = "0.7", features = ["io"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_yaml = "0.9"
-getrandom = "0.2"
-async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
 sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
-sumo-processor = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
-sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
-sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
-hex = "0.4.3"
-base64 = "0.22"
-jsonwebtoken = "10"
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
