@@ -27,6 +27,7 @@ members = [
     "crates/vhsm-proto",
     "crates/vhsm-client",
     "crates/vhsm-crossnode-client",
+    "crates/vm-sovd",
 ]
 
 # QNX (nto) cross-compile patch. vhsm-ssd's cross-node mTLS listener pulls in
