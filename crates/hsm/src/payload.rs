@@ -63,10 +63,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::KeyType;
 
-/// Schema version. v3 re-adds an optional top-level `certificates` list
-/// (signed leaves for device-generated identity keys — public, inert
-/// without the HSM-held private key). v1/v2 envelopes are rejected.
-pub const SCHEMA_VERSION: u64 = 3;
+/// Schema version. v4 adds an optional top-level `trust_anchors` list
+/// (foreign CA roots the device pins, e.g. the delegation root) on top of
+/// v3's `certificates` (signed leaves for device-generated identity keys).
+/// All public, never a private byte. v1/v2/v3 envelopes are rejected.
+pub const SCHEMA_VERSION: u64 = 4;
 
 /// Well-known factory signing key — verifies the very first HSM key
 /// provisioning envelope.
@@ -120,6 +121,15 @@ pub struct HsmKeystore {
     /// `tls-identity` mTLS leaf). Each entry names a slot above.
     #[serde(rename = "4", default, skip_serializing_if = "Vec::is_empty")]
     pub certificates: Vec<LeafCert>,
+
+    /// Foreign CA root certificates the device pins (v4). Each is a trust
+    /// anchor a delegated token's `x5c` chain must validate to — e.g. the
+    /// `delegation-root` (the CA that signs workshop reset-grant leaves).
+    /// Distinct from `certificates`: those certify the device's OWN keys; a
+    /// trust anchor certifies no slot here. Empty when the device pins no
+    /// external roots.
+    #[serde(rename = "5", default, skip_serializing_if = "Vec::is_empty")]
+    pub trust_anchors: Vec<TrustAnchorCert>,
 }
 
 /// A signed leaf certificate for one of the keystore's device-generated
@@ -132,6 +142,26 @@ pub struct LeafCert {
     pub key_id: String,
 
     /// DER-encoded X.509 leaf certificate.
+    #[serde(rename = "1", with = "serde_bytes")]
+    pub certificate: Vec<u8>,
+}
+
+/// Well-known [`TrustAnchorCert::anchor_id`] for the delegation root — the CA
+/// whose chain a delegated operator token (`x5c`) must validate to. Shared by
+/// the minter (which embeds it) and the device authorizer (which pins it).
+pub const DELEGATION_ROOT_ANCHOR_ID: &str = "delegation-root";
+
+/// A foreign CA root certificate the device pins as a trust anchor (v4). The
+/// root a delegated token's `x5c` chain validates to — NOT a cert for any slot
+/// in this keystore. Public trust material; the device writes it to
+/// `roots/{anchor_id}.cert`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustAnchorCert {
+    /// Stable id for this anchor, e.g. [`DELEGATION_ROOT_ANCHOR_ID`].
+    #[serde(rename = "0")]
+    pub anchor_id: String,
+
+    /// DER-encoded X.509 CA root certificate.
     #[serde(rename = "1", with = "serde_bytes")]
     pub certificate: Vec<u8>,
 }
@@ -290,7 +320,7 @@ pub fn decode(data: &[u8]) -> Result<HsmKeystore, String> {
     if ks.schema_version != SCHEMA_VERSION {
         return Err(format!(
             "unsupported schema version {} (this build only accepts {SCHEMA_VERSION}; \
-             v1/v2 envelopes are not decoded)",
+             v1/v2/v3 envelopes are not decoded)",
             ks.schema_version
         ));
     }
@@ -310,6 +340,17 @@ pub fn decode(data: &[u8]) -> Result<HsmKeystore, String> {
                 ))
             }
             None => return Err(format!("leaf cert references unknown slot '{}'", c.key_id)),
+        }
+    }
+    // A trust anchor must look like a DER X.509 cert (SEQUENCE). It certifies no
+    // slot here — it's a foreign CA root the device pins — so there's nothing to
+    // cross-check against `slots`, just basic well-formedness.
+    for a in &ks.trust_anchors {
+        if a.certificate.first() != Some(&0x30) {
+            return Err(format!(
+                "trust anchor '{}': certificate is not DER X.509 (expected SEQUENCE 0x30)",
+                a.anchor_id
+            ));
         }
     }
     Ok(ks)
@@ -400,6 +441,7 @@ mod tests {
                 device_generated_aes("storage-key", "bali-vm-1"),
             ],
             certificates: Vec::new(),
+            trust_anchors: Vec::new(),
         }
     }
 
@@ -416,7 +458,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_old_versions() {
-        for v in [1u64, 2] {
+        for v in [1u64, 2, 3] {
             let mut ks = sample_keystore();
             ks.schema_version = v;
             let bytes = encode(&ks).unwrap();
@@ -440,6 +482,44 @@ mod tests {
         assert_eq!(back.certificates.len(), 1);
         assert_eq!(back.certificates[0].key_id, "iam-signing");
         assert_eq!(back.certificates[0].certificate, leaf);
+    }
+
+    #[test]
+    fn roundtrip_preserves_trust_anchor() {
+        let mut ks = sample_keystore();
+        // A (stand-in) DER CA root — leading SEQUENCE tag.
+        let root = vec![0x30, 0x82, 0x02, 0x00, 0xCA, 0xFE];
+        ks.trust_anchors.push(TrustAnchorCert {
+            anchor_id: DELEGATION_ROOT_ANCHOR_ID.into(),
+            certificate: root.clone(),
+        });
+        let back = decode(&encode(&ks).unwrap()).unwrap();
+        assert_eq!(back.trust_anchors.len(), 1);
+        assert_eq!(back.trust_anchors[0].anchor_id, DELEGATION_ROOT_ANCHOR_ID);
+        assert_eq!(back.trust_anchors[0].certificate, root);
+    }
+
+    #[test]
+    fn empty_trust_anchors_is_wire_compatible_omitted() {
+        // A keystore pinning no external roots must not emit the field.
+        let ks = sample_keystore();
+        assert!(ks.trust_anchors.is_empty());
+        assert!(decode(&encode(&ks).unwrap())
+            .unwrap()
+            .trust_anchors
+            .is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_non_der_trust_anchor() {
+        let mut ks = sample_keystore();
+        ks.trust_anchors.push(TrustAnchorCert {
+            anchor_id: "delegation-root".into(),
+            certificate: vec![0x99, 0x00], // not a DER SEQUENCE
+        });
+        let err = decode(&encode(&ks).unwrap()).unwrap_err();
+        assert!(err.contains("delegation-root"));
+        assert!(err.contains("not DER X.509"));
     }
 
     #[test]

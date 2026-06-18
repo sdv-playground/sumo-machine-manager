@@ -294,6 +294,11 @@ impl SimHsm {
         // re-provision lands the CA-issued leaf for it (e.g. tls-identity).
         self.write_leaf_certs(&ks.certificates, &keys_dir)?;
 
+        // Install any pinned trust-anchor CA roots (v4) — foreign roots the
+        // device pins for delegated-token x5c validation (e.g. the delegation
+        // root). Public trust material, not a device key.
+        self.write_trust_anchors(&ks.trust_anchors, &keys_dir)?;
+
         self.write_manifest(&ks.slots)?;
         self.write_identities(ks)?;
         self.save_state(ks.security_version)?;
@@ -314,6 +319,30 @@ impl SimHsm {
             let cert_path = keys_dir.join(format!("{}.cert", c.key_id));
             write_pem_certificate(&cert_path, &c.certificate)?;
             tracing::info!(key_id = %c.key_id, "installed leaf certificate");
+        }
+        Ok(())
+    }
+
+    /// Write each pinned trust-anchor CA root to `roots/{anchor_id}.cert` (PEM).
+    /// A foreign CA root the device pins for delegated-token `x5c` validation —
+    /// public trust material, NOT a device key, so it lives in its own `roots/`
+    /// namespace, not beside the slot files. `payload::decode` has already
+    /// checked each is a DER X.509 cert.
+    fn write_trust_anchors(
+        &self,
+        anchors: &[crate::payload::TrustAnchorCert],
+        keys_dir: &Path,
+    ) -> Result<(), HsmError> {
+        if anchors.is_empty() {
+            return Ok(());
+        }
+        let roots_dir = keys_dir.join("roots");
+        std::fs::create_dir_all(&roots_dir)
+            .map_err(|e| HsmError::KeystoreError(format!("create roots dir: {e}")))?;
+        for a in anchors {
+            let path = roots_dir.join(format!("{}.cert", a.anchor_id));
+            write_pem_certificate(&path, &a.certificate)?;
+            tracing::info!(anchor_id = %a.anchor_id, "installed trust-anchor CA root");
         }
         Ok(())
     }
@@ -1606,6 +1635,7 @@ mod tests {
                 },
             ],
             certificates: Vec::new(),
+            trust_anchors: Vec::new(),
         }
     }
 
@@ -1614,6 +1644,34 @@ mod tests {
     // the `crypto` feature is on (it needs p256 + rand). Gate them
     // accordingly so the trait-only build still runs the rest of the
     // test surface clean.
+
+    #[test]
+    #[cfg(feature = "crypto")]
+    fn provisions_and_reads_back_a_trust_anchor() {
+        use crate::payload::{TrustAnchorCert, DELEGATION_ROOT_ANCHOR_ID};
+        use crate::HsmCryptoProvider;
+        let tmp = std::env::temp_dir().join("hsm-test-trust-anchor");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
+
+        // Stand-in DER (round-trips through the PEM enclosure byte-for-byte).
+        let der = vec![0x30u8, 0x82, 0x01, 0x00, 0xAB, 0xCD];
+        let mut ks = sample_keystore();
+        ks.trust_anchors.push(TrustAnchorCert {
+            anchor_id: DELEGATION_ROOT_ANCHOR_ID.into(),
+            certificate: der.clone(),
+        });
+        hsm.write_keystore(&ks).unwrap();
+
+        // Landed as roots/{anchor_id}.cert and reads back byte-identical DER.
+        assert!(tmp
+            .join(format!("keys/roots/{DELEGATION_ROOT_ANCHOR_ID}.cert"))
+            .exists());
+        let got = hsm.get_trust_anchor_der(DELEGATION_ROOT_ANCHOR_ID).unwrap();
+        assert_eq!(got, der);
+        // An unprovisioned anchor id is a clean error (delegation stays OFF).
+        assert!(hsm.get_trust_anchor_der("nope").is_err());
+    }
 
     #[test]
     #[cfg(feature = "crypto")]

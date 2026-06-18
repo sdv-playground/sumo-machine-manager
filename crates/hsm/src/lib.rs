@@ -234,6 +234,21 @@ pub trait HsmCryptoProvider: Send + Sync {
     /// Retrieve public key as SubjectPublicKeyInfo DER bytes.
     fn get_public_key_der(&self, key_id: &str) -> Result<Vec<u8>, HsmError>;
 
+    /// Retrieve a pinned trust-anchor CA root certificate as raw DER bytes.
+    ///
+    /// Unlike [`get_certificate_der`](Self::get_certificate_der) — a leaf for one
+    /// of the device's OWN key slots — this is a *foreign* CA root the device
+    /// pins (e.g. the delegation root), provisioned via the keystore's
+    /// `trust_anchors` list. `anchor_id` is e.g.
+    /// [`payload::DELEGATION_ROOT_ANCHOR_ID`](crate::payload::DELEGATION_ROOT_ANCHOR_ID).
+    /// Default: unsupported — a provider without a trust-anchor store declines,
+    /// which simply leaves delegated-token verification off.
+    fn get_trust_anchor_der(&self, _anchor_id: &str) -> Result<Vec<u8>, HsmError> {
+        Err(HsmError::NotSupported(
+            "this HSM provider has no trust-anchor store".into(),
+        ))
+    }
+
     /// Get key metadata including ACL information.
     fn get_key_info(&self, key_id: &str) -> Result<KeyInfo, HsmError>;
 

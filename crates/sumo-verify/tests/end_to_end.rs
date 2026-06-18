@@ -59,6 +59,7 @@ fn provisioned_keystore(scratch: &Scratch) -> PathBuf {
             ]),
         }],
         certificates: Vec::new(),
+        trust_anchors: Vec::new(),
     };
     hsm.write_keystore(&ks).unwrap();
     std::fs::write(keystore.join("provision_state"), b"1\n").unwrap();

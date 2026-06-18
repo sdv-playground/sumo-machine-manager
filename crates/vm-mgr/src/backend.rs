@@ -4241,6 +4241,7 @@ mod identity_tests {
                 allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
             }],
             certificates: Vec::new(),
+            trust_anchors: Vec::new(),
         };
         hsm.write_keystore(&ks).unwrap();
         hsm.ensure_device_keys().unwrap();

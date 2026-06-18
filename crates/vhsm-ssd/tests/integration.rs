@@ -182,6 +182,7 @@ statements:
                 },
             ],
             certificates: Vec::new(),
+            trust_anchors: Vec::new(),
         };
 
         // Simulate post-CSR cert issuance for `mykey`. In production a CA
