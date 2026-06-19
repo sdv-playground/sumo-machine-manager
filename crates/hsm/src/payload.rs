@@ -31,11 +31,12 @@
 //!
 //! ```text
 //! HsmKeystore = {
-//!   0: uint,            ; schema_version (must be 3)
+//!   0: uint,            ; schema_version (must be 4)
 //!   1: uint,            ; security_version (anti-rollback floor)
 //!   2: [* Identity],
 //!   3: [* KeySlot],
-//!   4: [* LeafCert],    ; optional; signed leaves for device keys
+//!   4: [* LeafCert],        ; optional; signed leaves for device keys
+//!   5: [* TrustAnchorCert], ; optional; foreign CA roots the device pins
 //! }
 //!
 //! Identity = {
@@ -56,6 +57,11 @@
 //! LeafCert = {
 //!   0: tstr,            ; key_id — must name an EC-P256 slot above
 //!   1: bstr,            ; certificate — DER X.509 leaf
+//! }
+//!
+//! TrustAnchorCert = {
+//!   0: tstr,            ; anchor_id (e.g. "delegation-root")
+//!   1: bstr,            ; certificate — DER X.509 CA root
 //! }
 //! ```
 
