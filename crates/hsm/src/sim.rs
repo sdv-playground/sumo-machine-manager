@@ -1203,7 +1203,7 @@ impl HsmProvider for SimHsm {
             | KeyRole::IvdSigning
             | KeyRole::JwtSigning
             | KeyRole::OperationalIssuer
-            | KeyRole::HighConsequenceIssuer
+            | KeyRole::ResetIssuer
             | KeyRole::FreshnessSigning
             | KeyRole::TlsIdentity => Some(coset::iana::Algorithm::ES256),
             KeyRole::DeviceDecryption => None,

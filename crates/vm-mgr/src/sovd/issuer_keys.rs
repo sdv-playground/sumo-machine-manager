@@ -20,7 +20,7 @@ use super::authz::{Tier, TieredAuthorizer, TrustedIssuer};
 /// in-vehicle minter (`jwt-signing`) is not listed: it is the device's own
 /// Operational issuer and is added by the deployment when present.
 const ISSUER_ANCHORS: &[(KeyRole, Tier)] = &[
-    (KeyRole::HighConsequenceIssuer, Tier::HighConsequence),
+    (KeyRole::ResetIssuer, Tier::HighConsequence),
     (KeyRole::OperationalIssuer, Tier::Operational),
 ];
 
@@ -100,7 +100,7 @@ mod tests {
     use sovd_api::{AccessRequest, Authorizer, Capability};
 
     /// The well-known dev HC key (P-256 scalar=1) — the same key `sumo-dev-mint`
-    /// signs with and that Tower provisions into the high-consequence-issuer
+    /// signs with and that Tower provisions into the reset-issuer
     /// anchor (`FACTORY_SIGNING_PUBLIC`).
     fn dev_hc() -> SigningKey {
         let mut s = [0u8; 32];
@@ -134,7 +134,7 @@ mod tests {
     async fn authorizer_from_hc_anchor_accepts_a_dev_factory_reset_token() {
         let sk = dev_hc();
         let spki = sk.verifying_key().to_public_key_der().unwrap().into_vec();
-        let hc = KeyRole::HighConsequenceIssuer.key_id();
+        let hc = KeyRole::ResetIssuer.key_id();
 
         let authz =
             authorizer_from_anchors(|id| (id == hc).then(|| spki.clone()), |_| None, "rig-1")
@@ -151,7 +151,7 @@ mod tests {
     async fn token_bound_to_another_device_is_rejected() {
         let sk = dev_hc();
         let spki = sk.verifying_key().to_public_key_der().unwrap().into_vec();
-        let hc = KeyRole::HighConsequenceIssuer.key_id();
+        let hc = KeyRole::ResetIssuer.key_id();
         let authz =
             authorizer_from_anchors(|id| (id == hc).then(|| spki.clone()), |_| None, "rig-1")
                 .unwrap();

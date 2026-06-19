@@ -132,10 +132,13 @@ pub enum KeyRole {
     /// `x5c` root). Routine OTA + reads.
     OperationalIssuer,
 
-    /// Verifies HighConsequence-tier tokens (factory-reset, vehicle
-    /// reboot, HSM keystore) from the OEM / external authority — the
-    /// ceiling an in-vehicle minter can never reach.
-    HighConsequenceIssuer,
+    /// Verifies operator tokens that authorise a **reset** — ECU reboot
+    /// and factory-reset (the `Tier::HighConsequence` ceiling, a level no
+    /// in-vehicle minter can reach) — from the OEM / external authority.
+    /// Named for the capability it grants, not a tier (this replaced the
+    /// tier-era `HighConsequenceIssuer`; the vHSM handle 0x0009 keeps the
+    /// old `HANDLE_HIGH_CONSEQUENCE_ISSUER` const name in the proto layer).
+    ResetIssuer,
 
     // --------------------- freshness coordinator --------------------
     //
@@ -176,7 +179,7 @@ impl KeyRole {
             KeyRole::IvdSigning => "ivd-signing",
             KeyRole::JwtSigning => "jwt-signing",
             KeyRole::OperationalIssuer => "operational-issuer",
-            KeyRole::HighConsequenceIssuer => "high-consequence-issuer",
+            KeyRole::ResetIssuer => "reset-issuer",
             KeyRole::FreshnessSigning => "freshness-signing",
             KeyRole::TlsIdentity => "tls-identity",
         }
@@ -197,7 +200,7 @@ impl KeyRole {
             KeyRole::IvdSigning,
             KeyRole::JwtSigning,
             KeyRole::OperationalIssuer,
-            KeyRole::HighConsequenceIssuer,
+            KeyRole::ResetIssuer,
             KeyRole::FreshnessSigning,
             KeyRole::TlsIdentity,
         ]
@@ -211,7 +214,7 @@ impl KeyRole {
     ///
     /// The other roles (`KeyAuthority`, `SoftwareAuthority`,
     /// `PlatformAuthority`, `ApplicationAuthority`, `OperationalIssuer`,
-    /// `HighConsequenceIssuer`) are trust anchors — their private halves
+    /// `ResetIssuer`) are trust anchors — their private halves
     /// live off-device, with the corresponding signing infrastructure.
     /// The HSM only stores their public halves for verification (SUIT
     /// envelopes for the `*-authority` set, JWT signatures for the
@@ -374,7 +377,7 @@ mod tests {
             KeyRole::IvdSigning,
             KeyRole::JwtSigning,
             KeyRole::OperationalIssuer,
-            KeyRole::HighConsequenceIssuer,
+            KeyRole::ResetIssuer,
             KeyRole::FreshnessSigning,
             KeyRole::TlsIdentity,
         ];
@@ -397,8 +400,8 @@ mod tests {
         assert_eq!(KeyRole::JwtSigning.key_id(), "jwt-signing");
         assert_eq!(KeyRole::OperationalIssuer.key_id(), "operational-issuer");
         assert_eq!(
-            KeyRole::HighConsequenceIssuer.key_id(),
-            "high-consequence-issuer"
+            KeyRole::ResetIssuer.key_id(),
+            "reset-issuer"
         );
         assert_eq!(KeyRole::FreshnessSigning.key_id(), "freshness-signing");
         assert_eq!(KeyRole::TlsIdentity.key_id(), "tls-identity");
@@ -438,7 +441,7 @@ mod tests {
             KeyRole::PlatformAuthority,
             KeyRole::ApplicationAuthority,
             KeyRole::OperationalIssuer,
-            KeyRole::HighConsequenceIssuer,
+            KeyRole::ResetIssuer,
         ];
 
         for &r in &device_generated {

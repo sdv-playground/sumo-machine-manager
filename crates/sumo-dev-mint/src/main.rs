@@ -3,10 +3,10 @@
 //! Signs tokens with the well-known dev key (P-256 `scalar = 1`, identical to
 //! `hsm::payload::FACTORY_SIGNING_SCALAR`; its public half is the generator G =
 //! `FACTORY_SIGNING_PUBLIC`, which dev rigs provision into the
-//! `high-consequence-issuer` anchor). The key is public *by design* — any dev
+//! `reset-issuer` anchor). The key is public *by design* — any dev
 //! tooling can mint a reset token, so a dev rig is always factory-resettable
 //! even if Tower 1's storage is lost. NOT for production: there the workshop /
-//! Tower-1 minter signs with a real, secret HighConsequence root.
+//! Tower-1 minter signs with a real, secret reset-issuer root.
 //!
 //! Token shape matches `vm-mgr::sovd::authz::TieredAuthorizer`: ES256, header
 //! `kid` = `iss` = the issuer id, `aud` = the device id, and a space-delimited
@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long, default_value = "factory-reset")]
     capability: String,
     /// `iss` claim + JWT `kid` — must name the issuer the device pins.
-    #[arg(long, default_value = "high-consequence-issuer")]
+    #[arg(long, default_value = "reset-issuer")]
     issuer: String,
     /// `sub` claim — the operator identity (dev placeholder).
     #[arg(long, default_value = "dev-operator")]
@@ -150,7 +150,7 @@ mod tests {
     fn minted_token_satisfies_the_authorizer_contract() {
         let token = mint(
             &dev_signing_scalar(),
-            "high-consequence-issuer",
+            "reset-issuer",
             "dev-operator",
             "rig-1",
             "factory-reset",
@@ -162,11 +162,11 @@ mod tests {
         .unwrap();
 
         let kid = decode_header(&token).unwrap().kid.unwrap();
-        assert_eq!(kid, "high-consequence-issuer", "kid must name the issuer");
+        assert_eq!(kid, "reset-issuer", "kid must name the issuer");
 
         let mut v = Validation::new(Algorithm::ES256);
         v.set_audience(&["rig-1"]);
-        v.set_issuer(&["high-consequence-issuer"]);
+        v.set_issuer(&["reset-issuer"]);
         v.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
         let data =
             decode::<serde_json::Value>(&token, &decoding_key(), &v).expect("token must verify");
@@ -194,7 +194,7 @@ mod tests {
     fn wrong_audience_is_rejected() {
         let token = mint(
             &dev_signing_scalar(),
-            "high-consequence-issuer",
+            "reset-issuer",
             "op",
             "rig-1",
             "factory-reset",
@@ -206,7 +206,7 @@ mod tests {
         .unwrap();
         let mut v = Validation::new(Algorithm::ES256);
         v.set_audience(&["other-rig"]);
-        v.set_issuer(&["high-consequence-issuer"]);
+        v.set_issuer(&["reset-issuer"]);
         assert!(decode::<serde_json::Value>(&token, &decoding_key(), &v).is_err());
     }
 
@@ -214,12 +214,12 @@ mod tests {
     fn boot_id_claim_present_only_when_provided() {
         let mut v = Validation::new(Algorithm::ES256);
         v.set_audience(&["rig-1"]);
-        v.set_issuer(&["high-consequence-issuer"]);
+        v.set_issuer(&["reset-issuer"]);
 
         // --boot-id given → the claim is set (the §7.1 freshness binding).
         let token = mint(
             &dev_signing_scalar(),
-            "high-consequence-issuer",
+            "reset-issuer",
             "op",
             "rig-1",
             "factory-reset",
@@ -235,7 +235,7 @@ mod tests {
         // omitted → no boot_id claim (no binding).
         let token = mint(
             &dev_signing_scalar(),
-            "high-consequence-issuer",
+            "reset-issuer",
             "op",
             "rig-1",
             "factory-reset",
@@ -253,12 +253,12 @@ mod tests {
     fn epoch_claim_present_only_when_provided() {
         let mut v = Validation::new(Algorithm::ES256);
         v.set_audience(&["veh-1"]);
-        v.set_issuer(&["high-consequence-issuer"]);
+        v.set_issuer(&["reset-issuer"]);
 
         // --epoch given → the claim is set (the §7.3 vehicle-wide freshness binding).
         let token = mint(
             &dev_signing_scalar(),
-            "high-consequence-issuer",
+            "reset-issuer",
             "op",
             "veh-1",
             "factory-reset",
@@ -274,7 +274,7 @@ mod tests {
         // omitted → no epoch claim (no binding).
         let token = mint(
             &dev_signing_scalar(),
-            "high-consequence-issuer",
+            "reset-issuer",
             "op",
             "veh-1",
             "factory-reset",
