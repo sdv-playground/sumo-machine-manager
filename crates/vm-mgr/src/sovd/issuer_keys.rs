@@ -16,12 +16,18 @@ use p256::pkcs8::{DecodePublicKey, EncodePublicKey, LineEnding};
 
 use super::authz::{Tier, TieredAuthorizer, TrustedIssuer};
 
-/// The token-issuer anchors a device pins, with the tier each may grant. The
-/// in-vehicle minter (`jwt-signing`) is not listed: it is the device's own
-/// Operational issuer and is added by the deployment when present.
+/// The token-issuer anchors a device pins, with the tier each may grant —
+/// including the device's own in-vehicle minter (`jwt-signing`, Operational).
+/// Each is resolved from the HSM by `key_id`; a slot the keystore didn't
+/// provision is skipped, so the set self-trims to what the device actually holds.
 const ISSUER_ANCHORS: &[(KeyRole, Tier)] = &[
     (KeyRole::ResetIssuer, Tier::HighConsequence),
     (KeyRole::OperationalIssuer, Tier::Operational),
+    // The device's own onboard minter — a mandatory device-generated slot, so the
+    // device trusts its in-vehicle `jwt-mgr` for Operational tokens. Reboot stays
+    // off the onboard path by minter policy (it never emits `reset:execute`), not
+    // by tier. Absent → skipped, so this is safe on a rig with no onboard minter.
+    (KeyRole::JwtSigning, Tier::Operational),
 ];
 
 /// Convert an SPKI-DER EC-P256 public key — what
@@ -98,6 +104,20 @@ mod tests {
     use p256::ecdsa::SigningKey;
     use p256::pkcs8::EncodePrivateKey;
     use sovd_api::{AccessRequest, Authorizer, Capability};
+
+    #[test]
+    fn onboard_jwt_signing_is_a_pinned_operational_issuer() {
+        // The onboard minter (jwt-signing) must be in the trust list as an
+        // Operational issuer — else the device would reject its own in-vehicle
+        // tokens once the general path enforces auth. Reboot is kept off this
+        // path at the minter, not by withholding trust.
+        assert!(
+            ISSUER_ANCHORS
+                .iter()
+                .any(|(r, t)| *r == KeyRole::JwtSigning && *t == Tier::Operational),
+            "jwt-signing must be pinned as an Operational issuer"
+        );
+    }
 
     /// The well-known dev HC key (P-256 scalar=1) — the same key `sumo-dev-mint`
     /// signs with and that Tower provisions into the reset-issuer
