@@ -224,6 +224,23 @@ impl SimHsm {
                 continue;
             }
             let key_id = role.key_id();
+
+            // The lone symmetric slot (`storage-key`) generates AES-256 key
+            // bytes; every other device-generated slot is an EC-P256 keypair.
+            if role.key_type() == KeyType::Aes256 {
+                let bin_path = self.keys_dir().join(format!("{key_id}.bin"));
+                if bin_path.exists() {
+                    continue;
+                }
+                let mut bytes = vec![0u8; 32];
+                use rand::RngCore;
+                rand::rngs::OsRng.fill_bytes(&mut bytes);
+                std::fs::write(&bin_path, &bytes)
+                    .map_err(|e| HsmError::KeystoreError(format!("write {key_id} key: {e}")))?;
+                tracing::info!(key_id = %key_id, "device-side AES-256 key generated (first boot)");
+                continue;
+            }
+
             let priv_path = self.keys_dir().join(format!("{key_id}.priv"));
             if priv_path.exists() {
                 continue;
@@ -1207,6 +1224,9 @@ impl HsmProvider for SimHsm {
             | KeyRole::FreshnessSigning
             | KeyRole::TlsIdentity => Some(coset::iana::Algorithm::ES256),
             KeyRole::DeviceDecryption => None,
+            // AES-256 — symmetric, no public COSE key (the pub_path read
+            // above already rejects a get_public_key on this slot).
+            KeyRole::Storage => None,
         };
         Ok(build_public_cose_key_with_alg(&x, &y, alg))
     }
@@ -1862,17 +1882,22 @@ mod tests {
         // envelope lands. Trust anchors (KeyAuthority, *Authority) stay
         // absent until provisioning supplies their public halves.
         for role in KeyRole::mandatory_roles() {
-            let priv_path = tmp.join("keys").join(format!("{}.priv", role.key_id()));
+            // EC slots bootstrap as {priv,pub}; the lone AES slot (storage-key)
+            // as {key_id}.bin — check the right material per key type.
+            let material = match role.key_type() {
+                KeyType::Aes256 => tmp.join("keys").join(format!("{}.bin", role.key_id())),
+                _ => tmp.join("keys").join(format!("{}.priv", role.key_id())),
+            };
             if role.is_device_generated() {
                 assert!(
-                    priv_path.exists(),
-                    "device-generated role {role:?} priv key missing at {}",
-                    priv_path.display()
+                    material.exists(),
+                    "device-generated role {role:?} key material missing at {}",
+                    material.display()
                 );
             } else {
                 assert!(
-                    !priv_path.exists(),
-                    "anchor role {role:?} priv key must NOT be bootstrapped",
+                    !material.exists(),
+                    "anchor role {role:?} key material must NOT be bootstrapped",
                 );
             }
         }

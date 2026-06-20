@@ -163,6 +163,15 @@ pub enum KeyRole {
     /// HSM cert object. Host-in-process (like `IvdSigning`): no guest
     /// vHSM wire handle.
     TlsIdentity,
+
+    // ------------------------ at-rest storage ----------------------
+    //
+    /// AES-256 symmetric key generated **inside the HSM at provisioning
+    /// time, key bytes NEVER leave** — the host's at-rest storage
+    /// encryption key (secstore / key-metadata). The lone symmetric slot;
+    /// addressable on the guest vHSM wire (handle `0x0007`) for ENCRYPT /
+    /// DECRYPT only — it has no public half, so never GET_PUBKEY / VERIFY.
+    Storage,
 }
 
 impl KeyRole {
@@ -182,6 +191,16 @@ impl KeyRole {
             KeyRole::ResetIssuer => "reset-issuer",
             KeyRole::FreshnessSigning => "freshness-signing",
             KeyRole::TlsIdentity => "tls-identity",
+            KeyRole::Storage => "storage-key",
+        }
+    }
+
+    /// The cryptographic key type for this role. Every role is EC-P256
+    /// except `Storage`, the lone AES-256 symmetric slot.
+    pub fn key_type(self) -> KeyType {
+        match self {
+            KeyRole::Storage => KeyType::Aes256,
+            _ => KeyType::EcP256,
         }
     }
 
@@ -203,6 +222,7 @@ impl KeyRole {
             KeyRole::ResetIssuer,
             KeyRole::FreshnessSigning,
             KeyRole::TlsIdentity,
+            KeyRole::Storage,
         ]
     }
 
@@ -227,7 +247,8 @@ impl KeyRole {
                 | KeyRole::IvdSigning
                 | KeyRole::JwtSigning
                 | KeyRole::FreshnessSigning
-                | KeyRole::TlsIdentity,
+                | KeyRole::TlsIdentity
+                | KeyRole::Storage,
         )
     }
 }
@@ -380,6 +401,7 @@ mod tests {
             KeyRole::ResetIssuer,
             KeyRole::FreshnessSigning,
             KeyRole::TlsIdentity,
+            KeyRole::Storage,
         ];
         let ids: HashSet<_> = roles.iter().map(|r| r.key_id()).collect();
         assert_eq!(ids.len(), roles.len(), "key_id() must be unique per role");
@@ -405,6 +427,7 @@ mod tests {
         );
         assert_eq!(KeyRole::FreshnessSigning.key_id(), "freshness-signing");
         assert_eq!(KeyRole::TlsIdentity.key_id(), "tls-identity");
+        assert_eq!(KeyRole::Storage.key_id(), "storage-key");
     }
 
     #[test]
@@ -414,7 +437,7 @@ mod tests {
         // should be either mandatory or explicitly opted out (and
         // there are no opt-outs today).
         let mandatory = KeyRole::mandatory_roles();
-        assert_eq!(mandatory.len(), 12);
+        assert_eq!(mandatory.len(), 13);
 
         // Sanity: every entry is distinct.
         use std::collections::HashSet;
@@ -434,6 +457,7 @@ mod tests {
             KeyRole::JwtSigning,
             KeyRole::FreshnessSigning,
             KeyRole::TlsIdentity,
+            KeyRole::Storage,
         ];
         let trust_anchors = [
             KeyRole::KeyAuthority,
