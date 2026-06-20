@@ -1214,8 +1214,6 @@ impl HsmProvider for SimHsm {
         let alg = match role {
             KeyRole::KeyAuthority
             | KeyRole::SoftwareAuthority
-            | KeyRole::PlatformAuthority
-            | KeyRole::ApplicationAuthority
             | KeyRole::IamSigning
             | KeyRole::IvdSigning
             | KeyRole::JwtSigning

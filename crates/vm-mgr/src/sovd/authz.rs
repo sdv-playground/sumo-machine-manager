@@ -32,15 +32,21 @@ pub enum Tier {
     /// Reads + routine OTA — mintable in-vehicle (onboard `jwt-mgr`), by a
     /// standalone tester, or online.
     Operational,
-    /// Physical-consequence / irreversible ops (ecu-wipe, vehicle reboot,
-    /// factory-reset, HSM keystore) — external authority only.
+    /// Irreversible ops — factory-reset (ecu-wipe) + HSM keystore — from an
+    /// external authority only. ECU reboot is deliberately NOT here: it is
+    /// Operational (reversible). `factory-reset` is the lone capability at this
+    /// tier, gated by the dedicated factory-reset issuer.
     HighConsequence,
 }
 
 /// The tier a capability requires.
 pub fn capability_tier(cap: Capability) -> Tier {
     match cap {
-        Capability::FactoryReset | Capability::ResetExecute => Tier::HighConsequence,
+        // factory-reset is the lone HighConsequence capability — gated by the
+        // dedicated factory-reset issuer (clear that slot → factory-reset is
+        // permanently revoked in production). ECU reboot (`reset:execute`) is
+        // Operational: workshop/operational and reversible, never irreversible.
+        Capability::FactoryReset => Tier::HighConsequence,
         _ => Tier::Operational,
     }
 }
@@ -434,6 +440,18 @@ impl TieredAuthorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reboot_is_operational_factory_reset_is_high_consequence() {
+        // ECU reboot (`reset:execute`) dropped to Operational — workshop /
+        // operational and reversible. factory-reset is the lone HighConsequence
+        // capability, gated by the dedicated factory-reset issuer.
+        assert_eq!(capability_tier(Capability::ResetExecute), Tier::Operational);
+        assert_eq!(capability_tier(Capability::FactoryReset), Tier::HighConsequence);
+        // Routine ops stay Operational.
+        assert_eq!(capability_tier(Capability::UpdateExecute), Tier::Operational);
+        assert_eq!(capability_tier(Capability::DataRead), Tier::Operational);
+    }
     use jsonwebtoken::{encode, EncodingKey, Header};
 
     /// A deterministic ES256 keypair from a small non-zero scalar — no RNG, so

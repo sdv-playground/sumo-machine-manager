@@ -37,18 +37,18 @@ use sumo_offboard::ImageManifestBuilder;
 
 use hsm::payload::*;
 
-/// Number of "application" key slots (beyond the 8 well-known + 3 test slots).
+/// Number of "application" key slots (beyond the 6 well-known + 3 test slots).
 const NUM_APP_SLOTS: usize = 89;
 
 /// Total well-known slots (in `KeyRole::mandatory_roles()` order plus
 /// `jwt-signing` which the dev/test rig needs alongside).
-const NUM_WELL_KNOWN_SLOTS: usize = 8;
+const NUM_WELL_KNOWN_SLOTS: usize = 6;
 const NUM_TEST_SLOTS: usize = 3;
 
 /// Load an EC-P256 keypair from disk if it exists, else generate a
 /// fresh one and persist it under the same path. Used for trust-anchor
-/// keys (key-authority / platform-authority / application-authority)
-/// and for device-local keys (ivd-signing) so consecutive build runs
+/// keys (key-authority) and for device-local keys (ivd-signing) so
+/// consecutive build runs
 /// reuse the same key material — otherwise re-provisioning would
 /// invalidate every previously-signed envelope and every previously-
 /// signed bank.
@@ -253,14 +253,6 @@ fn main() {
     // ---------------------------------------------------------------
     let (ka_priv, ka_pub) =
         load_or_generate_ec_keypair(&keys_dir.join("key-authority.keypair"), "key-authority");
-    let (_pa_priv, pa_pub) = load_or_generate_ec_keypair(
-        &keys_dir.join("platform-authority.keypair"),
-        "platform-authority",
-    );
-    let (_aa_priv, aa_pub) = load_or_generate_ec_keypair(
-        &keys_dir.join("application-authority.keypair"),
-        "application-authority",
-    );
 
     // ---------------------------------------------------------------
     // 2. Build key slots — well-known first (KeyRole order), then jwt,
@@ -292,30 +284,7 @@ fn main() {
         allowed_ops: Some(vec![OP_VERIFY, OP_GET_PUBKEY]),
     });
 
-    // Slot 2: Platform Authority — verifies platform-tier container
-    // envelopes (SOVD gateway, observability, security helpers).
-    // Public-key-only; the customer's platform-signing infra owns the
-    // private half.
-    slots.push(KeySlot {
-        key_id: "platform-authority".to_string(),
-        key_kind: KEY_TYPE_EC_P256,
-        anchor_public_key: Some(pa_pub.clone()),
-        allowed_guests: None,
-        allowed_ops: Some(vec![OP_VERIFY, OP_GET_PUBKEY]),
-    });
-
-    // Slot 3: Application Authority — verifies vehicle-function
-    // container envelopes (ADAS, infotainment, body control, third-
-    // party apps). Public-key-only; signing delegated wide.
-    slots.push(KeySlot {
-        key_id: "application-authority".to_string(),
-        key_kind: KEY_TYPE_EC_P256,
-        anchor_public_key: Some(aa_pub.clone()),
-        allowed_guests: None,
-        allowed_ops: Some(vec![OP_VERIFY, OP_GET_PUBKEY]),
-    });
-
-    // Slot 4: Device decryption key — device generates internally
+    // Slot 2: Device decryption key — device generates internally
     // (ensure_device_key on first boot, before the CSR is even
     // emitted). Factory tool reads the pub from the CSR for
     // envelope-encryption recipient binding, but the envelope itself
@@ -329,7 +298,7 @@ fn main() {
         allowed_ops: None,
     });
 
-    // Slot 5: ECU signing key — device generates internally during
+    // Slot 3: ECU signing key — device generates internally during
     // provisioning. No private bytes pushed; the certificate-issuance
     // flow (factory tool ↔ device CSR for ecu-signing) is a
     // follow-up — for now the slot ships with no certificate and the
@@ -342,7 +311,7 @@ fn main() {
         allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
     });
 
-    // Slot 6: IVD signing — device generates internally. Private
+    // Slot 4: IVD signing — device generates internally. Private
     // never crosses the HSM boundary in either direction. After
     // provisioning, `sumo-verify` fetches the public half via
     // `get_public_key("ivd-signing")` to validate bank signatures
@@ -355,7 +324,7 @@ fn main() {
         allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
     });
 
-    // Slot 7: JWT signing key for jwt-mgr — device-generated. The
+    // Slot 5: JWT signing key for jwt-mgr — device-generated. The
     // guest's jwt-mgr fetches the public half via vHSM OP_GET_PUBKEY
     // to validate locally-issued tokens.
     slots.push(KeySlot {

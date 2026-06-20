@@ -439,8 +439,6 @@ mod tests {
             slots: vec![
                 anchor("key-authority", 0xAA),
                 anchor("sw-authority", 0xBB),
-                anchor("platform-authority", 0xCC),
-                anchor("application-authority", 0xDD),
                 device_generated_ec("device-decrypt", "bali-vm-1"),
                 device_generated_ec("iam-signing", "bali-vm-1"),
                 device_generated_ec("ivd-signing", "bali-vm-1"),
@@ -459,7 +457,7 @@ mod tests {
         assert_eq!(back.schema_version, SCHEMA_VERSION);
         assert_eq!(back.slots.len(), ks.slots.len());
         assert!(back.slots[0].is_anchor());
-        assert!(back.slots[4].is_device_generated());
+        assert!(back.slots[2].is_device_generated());
     }
 
     #[test]

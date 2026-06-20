@@ -68,22 +68,10 @@ pub enum KeyRole {
     KeyAuthority,
 
     /// Verifies host-side firmware SUIT envelopes (host-os, vm1, vm2,
-    /// hsm bundle). Rotation: rare. Lives above PlatformAuthority and
-    /// ApplicationAuthority in the trust hierarchy.
+    /// hsm bundle). Rotation: rare. Verifies all host-side firmware and
+    /// software today — including platform-tier and vehicle-function
+    /// containers.
     SoftwareAuthority,
-
-    /// Verifies platform-tier container envelopes — load-bearing
-    /// guest services that participate in vehicle infrastructure
-    /// (SOVD gateway, observability, security helpers). Rotation: rare.
-    /// Containers verified with this key get the privileged runtime
-    /// tier (host SOVD access, broader sandbox).
-    PlatformAuthority,
-
-    /// Verifies vehicle-function container envelopes — ADAS,
-    /// infotainment, body control apps. Inherently untrusted in the
-    /// safety sense; sandboxed at runtime. Rotation: frequent. Can be
-    /// delegated wide (partner ecosystems, app developer pipelines).
-    ApplicationAuthority,
 
     // -------------------- per-device operational --------------------
     //
@@ -181,8 +169,6 @@ impl KeyRole {
         match self {
             KeyRole::KeyAuthority => "key-authority",
             KeyRole::SoftwareAuthority => "sw-authority",
-            KeyRole::PlatformAuthority => "platform-authority",
-            KeyRole::ApplicationAuthority => "application-authority",
             KeyRole::DeviceDecryption => "device-decrypt",
             KeyRole::IamSigning => "iam-signing",
             KeyRole::IvdSigning => "ivd-signing",
@@ -212,8 +198,6 @@ impl KeyRole {
         &[
             KeyRole::KeyAuthority,
             KeyRole::SoftwareAuthority,
-            KeyRole::PlatformAuthority,
-            KeyRole::ApplicationAuthority,
             KeyRole::DeviceDecryption,
             KeyRole::IamSigning,
             KeyRole::IvdSigning,
@@ -233,8 +217,8 @@ impl KeyRole {
     /// no `get_private_key` to pull them back out either.
     ///
     /// The other roles (`KeyAuthority`, `SoftwareAuthority`,
-    /// `PlatformAuthority`, `ApplicationAuthority`, `OperationalIssuer`,
-    /// `ResetIssuer`) are trust anchors — their private halves
+    /// `OperationalIssuer`, `ResetIssuer`) are trust anchors — their
+    /// private halves
     /// live off-device, with the corresponding signing infrastructure.
     /// The HSM only stores their public halves for verification (SUIT
     /// envelopes for the `*-authority` set, JWT signatures for the
@@ -391,8 +375,6 @@ mod tests {
         let roles = [
             KeyRole::KeyAuthority,
             KeyRole::SoftwareAuthority,
-            KeyRole::PlatformAuthority,
-            KeyRole::ApplicationAuthority,
             KeyRole::DeviceDecryption,
             KeyRole::IamSigning,
             KeyRole::IvdSigning,
@@ -411,11 +393,6 @@ mod tests {
         // every previously-provisioned device.
         assert_eq!(KeyRole::KeyAuthority.key_id(), "key-authority");
         assert_eq!(KeyRole::SoftwareAuthority.key_id(), "sw-authority");
-        assert_eq!(KeyRole::PlatformAuthority.key_id(), "platform-authority");
-        assert_eq!(
-            KeyRole::ApplicationAuthority.key_id(),
-            "application-authority"
-        );
         assert_eq!(KeyRole::DeviceDecryption.key_id(), "device-decrypt");
         assert_eq!(KeyRole::IamSigning.key_id(), "iam-signing");
         assert_eq!(KeyRole::IvdSigning.key_id(), "ivd-signing");
@@ -437,7 +414,7 @@ mod tests {
         // should be either mandatory or explicitly opted out (and
         // there are no opt-outs today).
         let mandatory = KeyRole::mandatory_roles();
-        assert_eq!(mandatory.len(), 13);
+        assert_eq!(mandatory.len(), 11);
 
         // Sanity: every entry is distinct.
         use std::collections::HashSet;
@@ -462,8 +439,6 @@ mod tests {
         let trust_anchors = [
             KeyRole::KeyAuthority,
             KeyRole::SoftwareAuthority,
-            KeyRole::PlatformAuthority,
-            KeyRole::ApplicationAuthority,
             KeyRole::OperationalIssuer,
             KeyRole::ResetIssuer,
         ];
