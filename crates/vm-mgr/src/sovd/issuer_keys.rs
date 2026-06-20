@@ -21,7 +21,7 @@ use super::authz::{Tier, TieredAuthorizer, TrustedIssuer};
 /// Each is resolved from the HSM by `key_id`; a slot the keystore didn't
 /// provision is skipped, so the set self-trims to what the device actually holds.
 const ISSUER_ANCHORS: &[(KeyRole, Tier)] = &[
-    (KeyRole::ResetIssuer, Tier::HighConsequence),
+    (KeyRole::FactoryResetIssuer, Tier::HighConsequence),
     (KeyRole::OperationalIssuer, Tier::Operational),
     // The device's own onboard minter — a mandatory device-generated slot, so the
     // device trusts its in-vehicle `jwt-mgr` for Operational tokens. Reboot stays
@@ -120,7 +120,7 @@ mod tests {
     }
 
     /// The well-known dev HC key (P-256 scalar=1) — the same key `sumo-dev-mint`
-    /// signs with and that Tower provisions into the reset-issuer
+    /// signs with and that Tower provisions into the factory-reset-issuer
     /// anchor (`FACTORY_SIGNING_PUBLIC`).
     fn dev_hc() -> SigningKey {
         let mut s = [0u8; 32];
@@ -154,7 +154,7 @@ mod tests {
     async fn authorizer_from_hc_anchor_accepts_a_dev_factory_reset_token() {
         let sk = dev_hc();
         let spki = sk.verifying_key().to_public_key_der().unwrap().into_vec();
-        let hc = KeyRole::ResetIssuer.key_id();
+        let hc = KeyRole::FactoryResetIssuer.key_id();
 
         let authz =
             authorizer_from_anchors(|id| (id == hc).then(|| spki.clone()), |_| None, "rig-1")
@@ -171,7 +171,7 @@ mod tests {
     async fn token_bound_to_another_device_is_rejected() {
         let sk = dev_hc();
         let spki = sk.verifying_key().to_public_key_der().unwrap().into_vec();
-        let hc = KeyRole::ResetIssuer.key_id();
+        let hc = KeyRole::FactoryResetIssuer.key_id();
         let authz =
             authorizer_from_anchors(|id| (id == hc).then(|| spki.clone()), |_| None, "rig-1")
                 .unwrap();

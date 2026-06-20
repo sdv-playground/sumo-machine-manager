@@ -120,13 +120,13 @@ pub enum KeyRole {
     /// `x5c` root). Routine OTA + reads.
     OperationalIssuer,
 
-    /// Verifies operator tokens that authorise a **reset** — ECU reboot
-    /// and factory-reset (the `Tier::HighConsequence` ceiling, a level no
-    /// in-vehicle minter can reach) — from the OEM / external authority.
-    /// Named for the capability it grants, not a tier (this replaced the
-    /// tier-era `HighConsequenceIssuer`; its vHSM wire handle is
-    /// `HANDLE_RESET_ISSUER` = 0x0009, the number unchanged by the rename).
-    ResetIssuer,
+    /// Verifies operator tokens that authorise a **factory-reset** — the lone
+    /// `Tier::HighConsequence` capability (ECU reboot is Operational now). The
+    /// device's dedicated factory-reset authority: clearing this slot in
+    /// production revokes factory-reset entirely. Held by the OEM / external
+    /// reset root (the well-known factory key in dev builds). vHSM wire handle
+    /// `HANDLE_FACTORY_RESET_ISSUER` = 0x0009, the number unchanged by the rename.
+    FactoryResetIssuer,
 
     // --------------------- freshness coordinator --------------------
     //
@@ -174,7 +174,7 @@ impl KeyRole {
             KeyRole::IvdSigning => "ivd-signing",
             KeyRole::JwtSigning => "jwt-signing",
             KeyRole::OperationalIssuer => "operational-issuer",
-            KeyRole::ResetIssuer => "reset-issuer",
+            KeyRole::FactoryResetIssuer => "factory-reset-issuer",
             KeyRole::FreshnessSigning => "freshness-signing",
             KeyRole::TlsIdentity => "tls-identity",
             KeyRole::Storage => "storage-key",
@@ -203,7 +203,7 @@ impl KeyRole {
             KeyRole::IvdSigning,
             KeyRole::JwtSigning,
             KeyRole::OperationalIssuer,
-            KeyRole::ResetIssuer,
+            KeyRole::FactoryResetIssuer,
             KeyRole::FreshnessSigning,
             KeyRole::TlsIdentity,
             KeyRole::Storage,
@@ -217,7 +217,7 @@ impl KeyRole {
     /// no `get_private_key` to pull them back out either.
     ///
     /// The other roles (`KeyAuthority`, `SoftwareAuthority`,
-    /// `OperationalIssuer`, `ResetIssuer`) are trust anchors — their
+    /// `OperationalIssuer`, `FactoryResetIssuer`) are trust anchors — their
     /// private halves
     /// live off-device, with the corresponding signing infrastructure.
     /// The HSM only stores their public halves for verification (SUIT
@@ -380,7 +380,7 @@ mod tests {
             KeyRole::IvdSigning,
             KeyRole::JwtSigning,
             KeyRole::OperationalIssuer,
-            KeyRole::ResetIssuer,
+            KeyRole::FactoryResetIssuer,
             KeyRole::FreshnessSigning,
             KeyRole::TlsIdentity,
             KeyRole::Storage,
@@ -399,8 +399,8 @@ mod tests {
         assert_eq!(KeyRole::JwtSigning.key_id(), "jwt-signing");
         assert_eq!(KeyRole::OperationalIssuer.key_id(), "operational-issuer");
         assert_eq!(
-            KeyRole::ResetIssuer.key_id(),
-            "reset-issuer"
+            KeyRole::FactoryResetIssuer.key_id(),
+            "factory-reset-issuer"
         );
         assert_eq!(KeyRole::FreshnessSigning.key_id(), "freshness-signing");
         assert_eq!(KeyRole::TlsIdentity.key_id(), "tls-identity");
@@ -440,7 +440,7 @@ mod tests {
             KeyRole::KeyAuthority,
             KeyRole::SoftwareAuthority,
             KeyRole::OperationalIssuer,
-            KeyRole::ResetIssuer,
+            KeyRole::FactoryResetIssuer,
         ];
 
         for &r in &device_generated {
