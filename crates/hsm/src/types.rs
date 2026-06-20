@@ -136,8 +136,8 @@ pub enum KeyRole {
     /// and factory-reset (the `Tier::HighConsequence` ceiling, a level no
     /// in-vehicle minter can reach) — from the OEM / external authority.
     /// Named for the capability it grants, not a tier (this replaced the
-    /// tier-era `HighConsequenceIssuer`; the vHSM handle 0x0009 keeps the
-    /// old `HANDLE_HIGH_CONSEQUENCE_ISSUER` const name in the proto layer).
+    /// tier-era `HighConsequenceIssuer`; its vHSM wire handle is
+    /// `HANDLE_RESET_ISSUER` = 0x0009, the number unchanged by the rename).
     ResetIssuer,
 
     // --------------------- freshness coordinator --------------------

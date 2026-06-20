@@ -920,9 +920,9 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
         ),
         // External SOVD-token issuer verify anchors (Tower-provisioned,
         // public-only). Guests/authorizer verify JWT signatures and read
-        // the pubkey; they never sign with these. The reset issuer's wire
-        // handle keeps its tier-era const name (HANDLE_HIGH_CONSEQUENCE_ISSUER,
-        // 0x0009) — only the slot id was renamed to the capability `reset-issuer`.
+        // the pubkey; they never sign with these. The reset issuer is slot
+        // `reset-issuer` at wire handle HANDLE_RESET_ISSUER (0x0009 — the
+        // number is the wire contract, unchanged by the capability rename).
         (
             HANDLE_OPERATIONAL_ISSUER,
             "operational-issuer",
@@ -930,7 +930,7 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
             PERM_VERIFY | PERM_GET_PUBKEY,
         ),
         (
-            HANDLE_HIGH_CONSEQUENCE_ISSUER,
+            HANDLE_RESET_ISSUER,
             "reset-issuer",
             ALG_ECC_P256,
             PERM_VERIFY | PERM_GET_PUBKEY,
