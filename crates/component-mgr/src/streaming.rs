@@ -25,6 +25,8 @@ use machine_mgr::bank_provider::BankProvider;
 
 use sovd_core::{BackendError, PackageStream};
 
+use puller::{content_address_sha256, Puller};
+
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Maximum envelope size we'll buffer for non-firmware manifests (e.g. HSM keys).
@@ -1157,6 +1159,82 @@ pub fn process_raw_payload(
             process_plain(prefixed, expected_digest, Some(writer))
         }
     }
+}
+
+/// Fetch a content-addressed payload and install it into the target component
+/// bank — the **PULL** counterpart to the pushed [`process_payload_stream`].
+///
+/// Instead of the orchestrator streaming bytes over SOVD, the device
+/// dereferences the (T2-signed) content-addressed `blob_uri` itself. Integrity
+/// is layered and unchanged from the push path:
+/// - **OUTER**: [`puller::Puller::fetch_blob`] verifies the fetched ciphertext
+///   against the sha parsed from the content-addressed URI — and that address
+///   rides *inside* the signed manifest, so the digest we check is itself
+///   signed. Resumable (`Range`); safe because content-addressed bytes are
+///   immutable, so a partial + continue can't be poisoned.
+/// - **INNER**: [`process_raw_payload`] decrypts/decompresses and verifies the
+///   plaintext against the manifest's `image_digest` (+ the AES-GCM tag).
+///
+/// The fetched ciphertext is staged in `tmp_dir`, named by its content-address
+/// so a re-attempt resumes the same partial; it is removed on a successful
+/// install and left in place on error (for resume).
+///
+/// Returns `(image_size, image_sha256)` of the installed (plaintext) image.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_and_install_component(
+    puller: &Puller,
+    blob_uri: &str,
+    expected_size: u64,
+    manifest_bytes: &[u8],
+    component_index: usize,
+    key_unwrap: Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>,
+    image_digest: &[u8],
+    writer: Box<dyn IoWrite + Send>,
+    tmp_dir: &Path,
+) -> Result<(usize, [u8; 32]), BackendError> {
+    // The outer integrity anchor is the content-address embedded in the (signed)
+    // URI. No address ⇒ we cannot verify the fetched bytes ⇒ hard reject rather
+    // than trust an unverifiable CDN URL.
+    let outer_sha = content_address_sha256(blob_uri).ok_or_else(|| {
+        BackendError::InvalidRequest(format!(
+            "remote payload uri is not content-addressed (cannot verify outer integrity): {blob_uri}"
+        ))
+    })?;
+
+    let tmp = tmp_dir.join(format!("cas-{}.part", hex::encode(outer_sha)));
+
+    // OUTER: resumable GET + verify content-address. fetch_blob leaves the
+    // partial on transient errors (resume next time) and truncates on a
+    // hash/size mismatch (no poisoned bytes survive on disk).
+    puller
+        .fetch_blob(blob_uri, outer_sha, expected_size, &tmp)
+        .await
+        .map_err(|e| BackendError::Internal(format!("fetch {blob_uri}: {e}")))?;
+
+    // INNER: decrypt → decompress → verify image_digest → write to the bank.
+    // process_raw_payload is sync/blocking (file I/O + crypto), so off-thread it.
+    let manifest_bytes = manifest_bytes.to_vec();
+    let image_digest = image_digest.to_vec();
+    let tmp_for_task = tmp.clone();
+    let installed = tokio::task::spawn_blocking(move || {
+        process_raw_payload(
+            &tmp_for_task,
+            &manifest_bytes,
+            component_index,
+            key_unwrap.as_deref(),
+            &image_digest,
+            writer,
+        )
+    })
+    .await
+    .map_err(|e| BackendError::Internal(format!("install task join: {e}")))?
+    .map_err(|e| BackendError::Internal(format!("install {blob_uri}: {e}")))?;
+
+    // Success → drop the staged ciphertext (left in place on the error paths
+    // above so a retry can resume).
+    let _ = std::fs::remove_file(&tmp);
+
+    Ok(installed)
 }
 
 /// Stream a payload from the network straight through decrypt →

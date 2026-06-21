@@ -356,6 +356,39 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Extract the sha256 **content-address** from a content-addressed blob URI.
+///
+/// The fetched OUTER integrity is anchored by content-addressing: the blob's
+/// sha256 IS its address, and that address rides inside the (T2-signed) SUIT
+/// manifest's `uri` parameter — so the digest the device verifies against is
+/// itself signed. This recognises:
+/// - the FLEET-REPO-001 `sha256:<hex>` scheme, and
+/// - a content-addressed path/URL whose terminal segment is the 64-char hex
+///   digest (e.g. `blobs/<hex>`, `https://repo/cas/<hex>`, `.../sha256:<hex>`).
+///
+/// Returns `None` when the URI carries no parseable content-address. Callers
+/// MUST treat that as a hard reject for a remote fetch — without the address
+/// the outer bytes can't be verified (secure-by-default; no silent trust of an
+/// unverifiable CDN URL).
+pub fn content_address_sha256(uri: &str) -> Option<[u8; 32]> {
+    // Drop any query / fragment before looking for the digest.
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    // Whole-URI `sha256:<hex>` scheme, else the terminal path segment, then
+    // tolerate a `sha256:` prefix on that segment too.
+    let candidate = path
+        .strip_prefix("sha256:")
+        .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path));
+    let candidate = candidate.strip_prefix("sha256:").unwrap_or(candidate);
+    decode_hex32(candidate)
+}
+
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    hex::decode(s).ok()?.try_into().ok()
+}
+
 async fn open_for_resume(path: &Path) -> PullerResult<File> {
     tokio::fs::OpenOptions::new()
         .create(true)
@@ -365,4 +398,61 @@ async fn open_for_resume(path: &Path) -> PullerResult<File> {
         .open(path)
         .await
         .map_err(|e| PullerError::Io(format!("open {path:?}: {e}")))
+}
+
+#[cfg(test)]
+mod content_address_tests {
+    use super::content_address_sha256;
+
+    // 16 bytes 00,11,22,…,ff repeated → 32 bytes, as 64 hex chars.
+    const HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn expected() -> [u8; 32] {
+        let mut e = [0u8; 32];
+        for i in 0..16u8 {
+            e[i as usize] = i.wrapping_mul(0x11);
+            e[i as usize + 16] = i.wrapping_mul(0x11);
+        }
+        e
+    }
+
+    #[test]
+    fn parses_sha256_scheme() {
+        assert_eq!(
+            content_address_sha256(&format!("sha256:{HEX}")),
+            Some(expected())
+        );
+    }
+
+    #[test]
+    fn parses_content_addressed_path_or_url() {
+        for uri in [
+            format!("blobs/{HEX}"),
+            format!("https://repo/cas/{HEX}"),
+            format!("https://repo/cas/sha256:{HEX}"),
+        ] {
+            assert_eq!(content_address_sha256(&uri), Some(expected()), "uri={uri}");
+        }
+    }
+
+    #[test]
+    fn strips_query_and_fragment() {
+        assert_eq!(
+            content_address_sha256(&format!("https://repo/cas/{HEX}?token=abc")),
+            Some(expected())
+        );
+        assert_eq!(
+            content_address_sha256(&format!("https://repo/cas/{HEX}#frag")),
+            Some(expected())
+        );
+    }
+
+    #[test]
+    fn rejects_non_content_addressed() {
+        // No digest at all, too-short, empty, and 64 non-hex chars.
+        assert_eq!(content_address_sha256("https://repo/firmware.bin"), None);
+        assert_eq!(content_address_sha256("blobs/deadbeef"), None);
+        assert_eq!(content_address_sha256(""), None);
+        assert_eq!(content_address_sha256(&"z".repeat(64)), None);
+    }
 }

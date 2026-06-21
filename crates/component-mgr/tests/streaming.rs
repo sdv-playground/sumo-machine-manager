@@ -30,6 +30,7 @@ use component_mgr::bank_provider::IvdBankProvider;
 use component_mgr::bank_spec::BankSetSpec;
 use component_mgr::streaming::process_envelope_stream;
 use component_mgr::suit_provider::SuitProvider;
+use puller::Puller;
 
 type PackageStream = Pin<
     Box<dyn futures::Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>,
@@ -706,4 +707,234 @@ async fn stream_error_mid_transfer() {
     .await;
 
     assert!(result.is_err());
+}
+
+// =============================================================================
+// PULL path: content-addressed fetch + install (fetch_and_install_component)
+// =============================================================================
+
+/// Minimal raw-HTTP/1.1 blob server on 127.0.0.1 for the pull tests. Serves the
+/// single blob for any path; honours `Range: bytes=N-` with a 206 so the resume
+/// path is at least wire-exercisable. Returns the base URL.
+async fn serve_blob(blob: Vec<u8>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let blob = blob.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let start = req
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Range: bytes="))
+                    .and_then(|r| r.split('-').next())
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .filter(|s| *s <= blob.len());
+                let (line, body): (&str, &[u8]) = match start {
+                    Some(s) => ("206 Partial Content", &blob[s..]),
+                    None => ("200 OK", &blob[..]),
+                };
+                let head = format!(
+                    "HTTP/1.1 {line}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+/// Build a manifest-only L2 envelope whose payload is a *remote* content-
+/// addressed blob (no integrated payload) — the pull shape.
+fn pull_manifest(
+    signing_key: &CoseKey,
+    inner_digest: &[u8],
+    inner_size: u64,
+    blob_uri: &str,
+    encryption_info: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut b = ImageManifestBuilder::new()
+        .component_id(vec!["vm1".to_string()])
+        .sequence_number(1)
+        .security_version(1)
+        .payload_digest(inner_digest, inner_size)
+        .payload_uri(blob_uri.to_string())
+        .text_version("1.0.0");
+    if let Some(ei) = encryption_info {
+        b = b.encryption_info(ei);
+    }
+    b.build(signing_key).unwrap()
+}
+
+#[tokio::test]
+async fn pull_fetch_install_unencrypted() {
+    let (signing_key, _) = test_keys();
+    let crypto = RustCryptoBackend::new();
+
+    // Unencrypted ⇒ fetched bytes == installed image ⇒ outer == inner digest.
+    let payload = vec![0x42u8; 4096];
+    let digest = crypto.sha256(&payload);
+    let blob_uri = format!("blobs/{}", hex::encode(digest));
+
+    let base = serve_blob(payload.clone()).await;
+    let puller = Puller::new(&base, &signing_key.public_key_bytes()).unwrap();
+    let envelope = pull_manifest(&signing_key, &digest, payload.len() as u64, &blob_uri, None);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bank = tmp.path().join("rootfs.img");
+    let (size, hash) = component_mgr::streaming::fetch_and_install_component(
+        &puller,
+        &blob_uri,
+        payload.len() as u64,
+        &envelope,
+        0,
+        None,
+        &digest,
+        file_writer(&bank),
+        tmp.path(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(size, 4096);
+    assert_eq!(hash.as_slice(), digest.as_slice());
+    assert_eq!(std::fs::read(&bank).unwrap(), payload);
+    // Staged ciphertext is removed on success.
+    let staged = tmp.path().join(format!("cas-{}.part", hex::encode(digest)));
+    assert!(
+        !staged.exists(),
+        "staged blob should be cleaned up after install"
+    );
+}
+
+#[tokio::test]
+async fn pull_fetch_install_encrypted() {
+    let (signing_key, device_key) = test_keys();
+    let crypto = RustCryptoBackend::new();
+
+    let plaintext = vec![0xABu8; 8192];
+    let inner = crypto.sha256(&plaintext); // image_digest (plaintext)
+    let encrypted = encrypt_payload(&plaintext, &device_key);
+    let outer = crypto.sha256(&encrypted.ciphertext); // content-address (ciphertext)
+    assert_ne!(
+        outer.as_slice(),
+        inner.as_slice(),
+        "outer (ciphertext) and inner (plaintext) digests must differ"
+    );
+    let blob_uri = format!("blobs/{}", hex::encode(outer));
+
+    let base = serve_blob(encrypted.ciphertext.clone()).await;
+    let puller = Puller::new(&base, &signing_key.public_key_bytes()).unwrap();
+    let envelope = pull_manifest(
+        &signing_key,
+        &inner,
+        plaintext.len() as u64,
+        &blob_uri,
+        Some(&encrypted.encryption_info),
+    );
+
+    let key_unwrap: std::sync::Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync> =
+        std::sync::Arc::new(OwnedInMemoryUnwrap {
+            device_key_cbor: device_key.to_cose_key_bytes(),
+        });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bank = tmp.path().join("rootfs.img");
+    let (size, hash) = component_mgr::streaming::fetch_and_install_component(
+        &puller,
+        &blob_uri,
+        encrypted.ciphertext.len() as u64, // OUTER size (what we fetch)
+        &envelope,
+        0,
+        Some(key_unwrap),
+        &inner,
+        file_writer(&bank),
+        tmp.path(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(size, 8192);
+    assert_eq!(hash.as_slice(), inner.as_slice());
+    assert_eq!(std::fs::read(&bank).unwrap(), plaintext);
+}
+
+#[tokio::test]
+async fn pull_rejects_content_address_mismatch() {
+    let (signing_key, _) = test_keys();
+    let crypto = RustCryptoBackend::new();
+
+    let payload = vec![0x42u8; 4096];
+    let digest = crypto.sha256(&payload);
+    let blob_uri = format!("blobs/{}", hex::encode(digest));
+
+    // Server returns TAMPERED bytes — sha won't match the content-address in
+    // the (signed) URI, so the fetch must be rejected before any install.
+    let mut tampered = payload.clone();
+    tampered[0] ^= 0xFF;
+    let base = serve_blob(tampered).await;
+    let puller = Puller::new(&base, &signing_key.public_key_bytes()).unwrap();
+    let envelope = pull_manifest(&signing_key, &digest, payload.len() as u64, &blob_uri, None);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let res = component_mgr::streaming::fetch_and_install_component(
+        &puller,
+        &blob_uri,
+        payload.len() as u64,
+        &envelope,
+        0,
+        None,
+        &digest,
+        file_writer(&tmp.path().join("rootfs.img")),
+        tmp.path(),
+    )
+    .await;
+
+    assert!(
+        res.is_err(),
+        "tampered CDN content must be rejected at the content-address check"
+    );
+}
+
+#[tokio::test]
+async fn pull_rejects_non_content_addressed_uri() {
+    let (signing_key, _) = test_keys();
+    let crypto = RustCryptoBackend::new();
+
+    let payload = vec![0x42u8; 1024];
+    let digest = crypto.sha256(&payload);
+    let blob_uri = "blobs/firmware.bin"; // NOT content-addressed
+
+    let base = serve_blob(payload.clone()).await;
+    let puller = Puller::new(&base, &signing_key.public_key_bytes()).unwrap();
+    let envelope = pull_manifest(&signing_key, &digest, payload.len() as u64, blob_uri, None);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let res = component_mgr::streaming::fetch_and_install_component(
+        &puller,
+        blob_uri,
+        payload.len() as u64,
+        &envelope,
+        0,
+        None,
+        &digest,
+        file_writer(&tmp.path().join("rootfs.img")),
+        tmp.path(),
+    )
+    .await;
+
+    assert!(
+        res.is_err(),
+        "non-content-addressed uri must be rejected (outer integrity unverifiable)"
+    );
 }

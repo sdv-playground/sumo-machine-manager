@@ -34,6 +34,8 @@ sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.
 hsm = { path = "../hsm", features = ["crypto"] }
 host-os-mgr = { path = "../host-os-mgr" }
 app-mgr = { path = "../app-mgr" }
+# Content-addressed fleet-repo pull (onboard/fleet PULL payload fetch).
+puller = { path = "../puller" }
 hex = "0.4.3"
 base64 = "0.22"
 jsonwebtoken = "10"
