@@ -273,9 +273,17 @@ impl Authorizer for TieredAuthorizer {
             && req.bearer.is_none()
             && matches!(req.capability, Capability::Read | Capability::DataRead)
         {
+            // The read-open principal may read ANY component — reads are open — but
+            // holds no verb/admin scope, so writes + destructive ops still require a
+            // token. The scope MUST be `component:*`, not empty: a handler that
+            // filters its listing by `can_access_component` for C-031 non-leakage
+            // (SOVDd `list_components`) treats an empty-scope context as "authorized
+            // for nothing" and hides every component — which silently emptied
+            // `read_rig_state` and made every update re-flash. `component:*` matches
+            // the prior auth-disabled "list everything" behaviour.
             return Ok(ClientContext {
                 subject: "anonymous".to_string(),
-                scopes: Vec::new(),
+                scopes: vec!["component:*".to_string()],
             });
         }
 
@@ -561,7 +569,13 @@ mod tests {
             .await
             .expect("tokenless read is served");
         assert_eq!(ctx.subject, "anonymous");
-        assert!(ctx.scopes.is_empty());
+        // Read-open sees ALL components (component:*), not nothing — else a
+        // scope-filtering listing handler hides every component (the empty-state
+        // regression that re-flashed on every update).
+        assert!(
+            ctx.can_access_component("any-component"),
+            "read-open principal must read all components"
+        );
         assert!(authz.authorize(&noauth(Capability::DataRead)).await.is_ok());
 
         // Writes + destructive ops require a token even when read-open.
