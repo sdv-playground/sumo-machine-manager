@@ -1237,6 +1237,75 @@ pub async fn fetch_and_install_component(
     Ok(installed)
 }
 
+/// Resolve every dependency's L2 envelope from a **pre-validated** L1 campaign
+/// manifest — the pull-aware analog of the dependency loop in
+/// `sumo-onboard::process_campaign`, adapted for the supernova path.
+///
+/// Integrated (`#`) dependencies come from the L1's embedded payloads. Remote
+/// dependencies are fetched by their content-addressed URI:
+/// [`puller::Puller::fetch_manifest`] validates the L2 signature, and we
+/// additionally bind the fetched bytes' sha to the content-address carried in
+/// the (signed) L1 — so a swapped CDN object is rejected (it would have to be
+/// separately T2-signed *and* collide on sha to pass).
+///
+/// Returns the L2 envelope bytes in dependency order. The caller validates the
+/// L1 signature *before* calling, then installs each L2 — routed to its target
+/// bank via [`process_envelope_stream`] for an integrated payload, or
+/// [`fetch_and_install_component`] for a remote content-addressed payload.
+pub async fn resolve_campaign_dependencies(
+    l1: &sumo_onboard::manifest::Manifest,
+    puller: &Puller,
+) -> Result<Vec<Vec<u8>>, BackendError> {
+    if !l1.is_campaign() {
+        return Err(BackendError::InvalidRequest(
+            "not a campaign manifest (no dependencies)".into(),
+        ));
+    }
+
+    let dep_count = l1.dependency_count();
+    let mut l2_envelopes = Vec::with_capacity(dep_count);
+
+    for idx in 0..dep_count {
+        let uri = l1.dependency_uri(idx).ok_or_else(|| {
+            BackendError::InvalidRequest(format!("campaign dependency {idx} has no uri"))
+        })?;
+
+        let l2 = if uri.starts_with('#') {
+            // Integrated L2 envelope embedded in the (signed) L1.
+            l1.integrated_payload(uri)
+                .ok_or_else(|| {
+                    BackendError::InvalidRequest(format!(
+                        "campaign references integrated dependency {uri} but it is absent"
+                    ))
+                })?
+                .to_vec()
+        } else {
+            // Remote, content-addressed L2 manifest. fetch_manifest validates
+            // the L2 signature; we additionally bind the fetched bytes to the
+            // content-address from the signed L1.
+            let outer = content_address_sha256(uri).ok_or_else(|| {
+                BackendError::InvalidRequest(format!(
+                    "campaign dependency uri is not content-addressed: {uri}"
+                ))
+            })?;
+            let validated = puller
+                .fetch_manifest(uri)
+                .await
+                .map_err(|e| BackendError::Internal(format!("fetch L2 manifest {uri}: {e}")))?;
+            if validated.sha256 != outer {
+                return Err(BackendError::InvalidRequest(format!(
+                    "fetched L2 manifest sha does not match content-address for {uri}"
+                )));
+            }
+            validated.raw
+        };
+
+        l2_envelopes.push(l2);
+    }
+
+    Ok(l2_envelopes)
+}
+
 /// Stream a payload from the network straight through decrypt →
 /// decompress → hash → write to disk in a single pass.
 ///

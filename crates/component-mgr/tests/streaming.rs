@@ -20,6 +20,7 @@ use nv_store::block::MemBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::{Bank, BankSet, NvBootState};
 use sumo_crypto::{CryptoBackend, RustCryptoBackend};
+use sumo_offboard::campaign_builder::CampaignBuilder;
 use sumo_offboard::cose_key::CoseKey;
 use sumo_offboard::encryptor;
 use sumo_offboard::image_builder::{ComponentSpec, ImageManifestBuilder, MultiComponentBuilder};
@@ -936,5 +937,112 @@ async fn pull_rejects_non_content_addressed_uri() {
     assert!(
         res.is_err(),
         "non-content-addressed uri must be rejected (outer integrity unverifiable)"
+    );
+}
+
+// =============================================================================
+// L1 campaign walk: resolve_campaign_dependencies
+// =============================================================================
+
+/// Build a minimal, signed L2 image envelope (integrated payload) for use as a
+/// campaign dependency.
+fn l2_envelope(signing_key: &CoseKey, component: &str, payload: &[u8]) -> Vec<u8> {
+    let crypto = RustCryptoBackend::new();
+    let digest = crypto.sha256(payload);
+    ImageManifestBuilder::new()
+        .component_id(vec![component.to_string()])
+        .sequence_number(1)
+        .security_version(1)
+        .payload_digest(&digest, payload.len() as u64)
+        .payload_uri("#firmware".to_string())
+        .integrated_payload("#firmware".to_string(), payload.to_vec())
+        .text_version("1.0.0")
+        .build(signing_key)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn campaign_resolves_integrated_and_remote_deps() {
+    let (signing_key, _) = test_keys();
+    let crypto = RustCryptoBackend::new();
+
+    let l2_a = l2_envelope(&signing_key, "vm1", &[0x11u8; 256]); // integrated in L1
+    let l2_b = l2_envelope(&signing_key, "vm2", &[0x22u8; 256]); // remote, content-addressed
+    let l2_b_uri = format!("manifests/{}", hex::encode(crypto.sha256(&l2_b)));
+
+    let l1 = CampaignBuilder::new()
+        .sequence_number(1)
+        .add_integrated_image("dep-a".to_string(), &l2_a)
+        .add_image(l2_b_uri, &l2_b)
+        .build(&signing_key)
+        .unwrap();
+
+    let base = serve_blob(l2_b.clone()).await;
+    let puller = Puller::new(&base, &signing_key.public_key_bytes()).unwrap();
+
+    let envelope = sumo_codec::decode::decode_envelope(&l1).unwrap();
+    let manifest = sumo_onboard::manifest::Manifest { envelope };
+    let l2s = component_mgr::streaming::resolve_campaign_dependencies(&manifest, &puller)
+        .await
+        .unwrap();
+
+    assert_eq!(l2s.len(), 2);
+    assert_eq!(l2s[0], l2_a, "integrated dep resolved from the signed L1");
+    assert_eq!(
+        l2s[1], l2_b,
+        "remote dep fetched + bound to its content-address"
+    );
+}
+
+#[tokio::test]
+async fn campaign_rejects_content_address_mismatch() {
+    let (signing_key, _) = test_keys();
+    let crypto = RustCryptoBackend::new();
+
+    let l2_b = l2_envelope(&signing_key, "vm2", &[0x22u8; 256]);
+    let l2_b_uri = format!("manifests/{}", hex::encode(crypto.sha256(&l2_b)));
+
+    // The server returns a DIFFERENT, validly-signed L2 — its sha won't match
+    // the content-address the signed L1 committed to, so it must be rejected
+    // even though it passes signature validation.
+    let l2_other = l2_envelope(&signing_key, "vm2", &[0x33u8; 256]);
+    let base = serve_blob(l2_other).await;
+    let puller = Puller::new(&base, &signing_key.public_key_bytes()).unwrap();
+
+    let l1 = CampaignBuilder::new()
+        .sequence_number(1)
+        .add_image(l2_b_uri, &l2_b)
+        .build(&signing_key)
+        .unwrap();
+
+    let envelope = sumo_codec::decode::decode_envelope(&l1).unwrap();
+    let manifest = sumo_onboard::manifest::Manifest { envelope };
+    let res = component_mgr::streaming::resolve_campaign_dependencies(&manifest, &puller).await;
+    assert!(
+        res.is_err(),
+        "swapped L2 (sha != content-address) must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn campaign_rejects_non_content_addressed_dep() {
+    let (signing_key, _) = test_keys();
+    let l2_b = l2_envelope(&signing_key, "vm2", &[0x22u8; 256]);
+
+    let l1 = CampaignBuilder::new()
+        .sequence_number(1)
+        .add_image("manifests/latest".to_string(), &l2_b) // NOT content-addressed
+        .build(&signing_key)
+        .unwrap();
+
+    let base = serve_blob(l2_b.clone()).await;
+    let puller = Puller::new(&base, &signing_key.public_key_bytes()).unwrap();
+
+    let envelope = sumo_codec::decode::decode_envelope(&l1).unwrap();
+    let manifest = sumo_onboard::manifest::Manifest { envelope };
+    let res = component_mgr::streaming::resolve_campaign_dependencies(&manifest, &puller).await;
+    assert!(
+        res.is_err(),
+        "non-content-addressed dependency uri must be rejected"
     );
 }
