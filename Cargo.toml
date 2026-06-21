@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/nv-store",
     "crates/boot",
-    "crates/vm-mgr",
+    "crates/component-mgr",
     "crates/host-os-mgr",
     "crates/app-mgr",
     "crates/machine-mgr",

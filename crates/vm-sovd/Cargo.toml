@@ -11,7 +11,7 @@ path = "src/main.rs"
 # component-factory so it can compose components through the SAME factory
 # supernova-mm uses — no hand-rolled, double-maintained composition.
 [dependencies]
-vm-mgr = { path = "../vm-mgr" }
+component-mgr = { path = "../component-mgr" }
 component-factory = { path = "../component-factory" }
 nv-store = { path = "../nv-store" }
 machine-mgr = { path = "../machine-mgr" }

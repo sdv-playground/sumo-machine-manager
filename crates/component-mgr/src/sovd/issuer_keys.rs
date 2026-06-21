@@ -223,18 +223,22 @@ mod tests {
         let id = DELEGATION_ROOT_ANCHOR_ID;
 
         // A provisioned delegation root loads (DER -> PEM -> pinned) without error.
-        assert!(
-            authorizer_from_anchors(|_| None, |a| (a == id).then(|| root_der.clone()), "rig-1")
-                .is_ok()
-        );
+        assert!(authorizer_from_anchors(
+            |_| None,
+            |a| (a == id).then(|| root_der.clone()),
+            "rig-1"
+        )
+        .is_ok());
 
         // No delegation root provisioned → still fine; delegated path just off.
         assert!(authorizer_from_anchors(|_| None, |_| None, "rig-1").is_ok());
 
         // A malformed trust anchor is rejected at LOAD, not deferred to first use.
-        assert!(
-            authorizer_from_anchors(|_| None, |a| (a == id).then(|| vec![0xDEu8, 0xAD]), "rig-1")
-                .is_err()
-        );
+        assert!(authorizer_from_anchors(
+            |_| None,
+            |a| (a == id).then(|| vec![0xDEu8, 0xAD]),
+            "rig-1"
+        )
+        .is_err());
     }
 }

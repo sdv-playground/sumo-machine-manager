@@ -7,7 +7,7 @@ description = "Config-driven component construction for sumo machine manager"
 [dependencies]
 machine-mgr = { path = "../machine-mgr" }
 nv-store = { path = "../nv-store" }
-vm-mgr = { path = "../vm-mgr" }
+component-mgr = { path = "../component-mgr" }
 app-mgr = { path = "../app-mgr" }
 hsm = { path = "../hsm", features = ["crypto"] }
 serde = { version = "1", features = ["derive"] }

@@ -26,10 +26,10 @@ use sumo_offboard::image_builder::{ComponentSpec, ImageManifestBuilder, MultiCom
 use sumo_offboard::keygen;
 use sumo_offboard::recipient::Recipient;
 
-use vm_mgr::bank_provider::IvdBankProvider;
-use vm_mgr::bank_spec::BankSetSpec;
-use vm_mgr::streaming::process_envelope_stream;
-use vm_mgr::suit_provider::SuitProvider;
+use component_mgr::bank_provider::IvdBankProvider;
+use component_mgr::bank_spec::BankSetSpec;
+use component_mgr::streaming::process_envelope_stream;
+use component_mgr::suit_provider::SuitProvider;
 
 type PackageStream = Pin<
     Box<dyn futures::Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>,
@@ -193,7 +193,7 @@ async fn single_component_unencrypted() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
+        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -237,7 +237,7 @@ async fn single_component_encrypted() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
+        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -256,7 +256,7 @@ async fn single_component_encrypted() {
 /// each payload using the manifest's component info.
 #[test]
 fn multi_component_separate_uploads() {
-    use vm_mgr::streaming::{process_raw_payload, validate_manifest};
+    use component_mgr::streaming::{process_raw_payload, validate_manifest};
 
     let (signing_key, _) = test_keys();
     let provider = test_provider(&signing_key, None);
@@ -336,7 +336,7 @@ fn multi_component_separate_uploads() {
 /// Multi-component with encryption: separate manifest + encrypted raw payloads.
 #[test]
 fn multi_component_encrypted_separate() {
-    use vm_mgr::streaming::process_raw_payload;
+    use component_mgr::streaming::process_raw_payload;
 
     let (signing_key, device_key) = test_keys();
     let crypto = RustCryptoBackend::new();
@@ -415,7 +415,7 @@ fn multi_component_encrypted_separate() {
 /// Corrupt payload fails digest verification.
 #[test]
 fn raw_payload_corrupt_fails() {
-    use vm_mgr::streaming::process_raw_payload;
+    use component_mgr::streaming::process_raw_payload;
 
     let (signing_key, _) = test_keys();
     let crypto = RustCryptoBackend::new();
@@ -479,7 +479,7 @@ async fn chunked_delivery() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
+        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -526,7 +526,7 @@ async fn corrupted_payload_digest_mismatch() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
+        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -569,7 +569,7 @@ async fn truncated_transfer() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
+        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -609,7 +609,7 @@ async fn wrong_device_key() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
+        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -649,7 +649,7 @@ async fn anti_rollback_rejects_old_security_version() {
         5, // min_security_ver = 5 — higher than manifest's 1
         Some(&bank_provider),
         BankSet::Vm1,
-        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
+        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -700,7 +700,7 @@ async fn stream_error_mid_transfer() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &vm_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
+        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;

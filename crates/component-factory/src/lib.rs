@@ -9,10 +9,10 @@ use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
 use nv_store::types::BankSet;
 
-use vm_mgr::backend::{ComponentBackend, ComponentConfig};
-use vm_mgr::component_adapter::ComponentAdapter;
-use vm_mgr::manifest_provider::ManifestProvider;
-use vm_mgr::sovd::security::SecurityProvider;
+use component_mgr::backend::{ComponentBackend, ComponentConfig};
+use component_mgr::component_adapter::ComponentAdapter;
+use component_mgr::manifest_provider::ManifestProvider;
+use component_mgr::sovd::security::SecurityProvider;
 
 /// Declarative component specification — parsed from YAML config.
 #[derive(Debug, Clone, Deserialize)]
@@ -116,7 +116,7 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// Used by activator-backed components that have no vm-service backing
     /// (e.g. RT/M7 surfaces `guest_state` via `m7loader -q`). VMs leave
     /// this empty and use vm-service over loopback HTTP instead.
-    pub health_probes: HashMap<String, Arc<dyn vm_mgr::backend::HealthProbe>>,
+    pub health_probes: HashMap<String, Arc<dyn component_mgr::backend::HealthProbe>>,
     /// The node's shared, signed boot selector — the **write** handle
     /// (`SharedSystemBankState`), created once by the binary and shared with the
     /// registry. When `Some`, each built component gets a selector-aware
@@ -170,17 +170,17 @@ pub fn resolve_bank_set(spec: &ComponentSpec) -> Option<BankSet> {
 /// Returns `None` if the slot can't be resolved.
 pub fn resolve_bank_set_spec(
     spec: &ComponentSpec,
-) -> Option<(BankSet, vm_mgr::bank_spec::BankSetSpec)> {
+) -> Option<(BankSet, component_mgr::bank_spec::BankSetSpec)> {
     let bank_set = resolve_bank_set(spec)?;
-    let mut bspec = vm_mgr::bank_spec::BankSetSpec::for_well_known(bank_set);
+    let mut bspec = component_mgr::bank_spec::BankSetSpec::for_well_known(bank_set);
     if let Some(ref subdir) = spec.storage_subdir {
         bspec.dir_name = subdir.clone();
     }
     if let Some(ref layout) = spec.bank_layout {
         bspec.layout = match layout.as_str() {
-            "vm" => vm_mgr::bank_spec::BankLayout::Vm,
-            "boot-ifs" | "bootifs" => vm_mgr::bank_spec::BankLayout::BootIfs,
-            "generic" | "custom" => vm_mgr::bank_spec::BankLayout::Generic,
+            "vm" => component_mgr::bank_spec::BankLayout::Vm,
+            "boot-ifs" | "bootifs" => component_mgr::bank_spec::BankLayout::BootIfs,
+            "generic" | "custom" => component_mgr::bank_spec::BankLayout::Generic,
             other => {
                 tracing::warn!(
                     component = %spec.id,
@@ -200,7 +200,7 @@ pub fn resolve_bank_set_spec(
 /// path mutates it). Returns `None` when no selector is configured (the backend
 /// then keeps its own NV/symlink-only provider — behaviour-preserving).
 ///
-/// Injected via [`vm_mgr::backend::ComponentBackend::with_bank_provider`] LAST
+/// Injected via [`component_mgr::backend::ComponentBackend::with_bank_provider`] LAST
 /// in the builder chain (after `with_bank_spec` / `with_bank_activator`, which
 /// otherwise rebuild the default provider), so it replaces the default wholesale
 /// and the override flag suppresses any later rebuild.
@@ -213,16 +213,18 @@ fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
     activator: Option<Arc<dyn machine_mgr::BankActivator>>,
 ) -> Option<Arc<dyn machine_mgr::BankProvider>> {
     let selector = deps.boot_selector.clone()?;
-    Some(Arc::new(vm_mgr::bank_provider::IvdBankProvider::new(
-        deps.nv.clone(),
-        bank_set,
-        single_bank,
-        images_dir,
-        dir_name,
-        deps.hsm_provider.clone(),
-        activator,
-        Some(selector),
-    )))
+    Some(Arc::new(
+        component_mgr::bank_provider::IvdBankProvider::new(
+            deps.nv.clone(),
+            bank_set,
+            single_bank,
+            images_dir,
+            dir_name,
+            deps.hsm_provider.clone(),
+            activator,
+            Some(selector),
+        ),
+    ))
 }
 
 /// Build a single component from its spec and shared dependencies.
@@ -306,8 +308,10 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             // install-router case: route install/flash through the `Component`
             // and delegate data/faults/modes to the engine (`backend_arc`).
             let engine: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
-            let diag =
-                vm_mgr::install_router_diag::InstallRouterDiag::new(component.clone(), engine);
+            let diag = component_mgr::install_router_diag::InstallRouterDiag::new(
+                component.clone(),
+                engine,
+            );
 
             Some(BuiltComponent {
                 component,

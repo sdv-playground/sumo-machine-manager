@@ -491,9 +491,15 @@ mod tests {
         // operational and reversible. factory-reset is the lone HighConsequence
         // capability, gated by the dedicated factory-reset issuer.
         assert_eq!(capability_tier(Capability::ResetExecute), Tier::Operational);
-        assert_eq!(capability_tier(Capability::FactoryReset), Tier::HighConsequence);
+        assert_eq!(
+            capability_tier(Capability::FactoryReset),
+            Tier::HighConsequence
+        );
         // Routine ops stay Operational.
-        assert_eq!(capability_tier(Capability::UpdateExecute), Tier::Operational);
+        assert_eq!(
+            capability_tier(Capability::UpdateExecute),
+            Tier::Operational
+        );
         assert_eq!(capability_tier(Capability::DataRead), Tier::Operational);
     }
     use jsonwebtoken::{encode, EncodingKey, Header};

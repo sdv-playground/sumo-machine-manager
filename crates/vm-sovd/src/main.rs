@@ -9,8 +9,8 @@ use nv_store::types::{BankSet, NvBootState};
 use sovd_core::DiagnosticBackend;
 
 use component_factory::{build_component, ComponentSpec, FactoryDeps};
-use vm_mgr::sovd::security::TestSecurityProvider;
-use vm_mgr::suit_provider::SuitProvider;
+use component_mgr::sovd::security::TestSecurityProvider;
+use component_mgr::suit_provider::SuitProvider;
 
 use machine_mgr::{Machine, MachineRegistry};
 use sovd_core::EntityInfo;
@@ -208,14 +208,12 @@ async fn main() {
         let read_display_name = |id: &str, set: BankSet| -> Option<String> {
             let dir = images_dir.as_ref()?;
             let set_dir = dir.join(id);
-            let active = nv
-                .lock()
-                .ok()
-                .and_then(|n| n.read_boot_state())
-                .map(|s| match s.banks[set.as_index()].active_bank {
+            let active = nv.lock().ok().and_then(|n| n.read_boot_state()).map(|s| {
+                match s.banks[set.as_index()].active_bank {
                     nv_store::types::Bank::A => "bank_a",
                     nv_store::types::Bank::B => "bank_b",
-                });
+                }
+            });
             let candidates: &[&str] = match active {
                 Some("bank_b") => &["bank_b"],
                 Some(_) => &["bank_a"],
@@ -370,8 +368,8 @@ async fn main() {
 
     let state = sovd_api::AppState::new(backends);
     let router = sovd_api::create_router(state)
-        .merge(vm_mgr::sovd::routes::hsm_router(machine.clone()))
-        .merge(vm_mgr::sovd::routes::update_state_router(
+        .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
+        .merge(component_mgr::sovd::routes::update_state_router(
             nv.clone(),
             node_coordinator.clone(),
         ));
