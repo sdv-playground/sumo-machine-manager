@@ -398,10 +398,7 @@ mod tests {
         assert_eq!(KeyRole::IvdSigning.key_id(), "ivd-signing");
         assert_eq!(KeyRole::JwtSigning.key_id(), "jwt-signing");
         assert_eq!(KeyRole::OperationalIssuer.key_id(), "operational-issuer");
-        assert_eq!(
-            KeyRole::FactoryResetIssuer.key_id(),
-            "factory-reset-issuer"
-        );
+        assert_eq!(KeyRole::FactoryResetIssuer.key_id(), "factory-reset-issuer");
         assert_eq!(KeyRole::FreshnessSigning.key_id(), "freshness-signing");
         assert_eq!(KeyRole::TlsIdentity.key_id(), "tls-identity");
         assert_eq!(KeyRole::Storage.key_id(), "storage-key");

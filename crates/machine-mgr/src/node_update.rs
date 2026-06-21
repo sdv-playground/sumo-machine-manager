@@ -131,7 +131,11 @@ impl std::fmt::Display for Refused {
 /// Derive the node phase + snapshot from the durable facts and the in-memory
 /// `staging`. Precedence: RebootPending > Trial > Staging > Idle — a transaction
 /// advances through those, and the most-advanced one wins.
-pub fn derive(durable: &Durable, in_trial: &[String], staging: Option<&Staging>) -> NodeUpdateState {
+pub fn derive(
+    durable: &Durable,
+    in_trial: &[String],
+    staging: Option<&Staging>,
+) -> NodeUpdateState {
     if !durable.reboot_owed.is_empty() {
         return NodeUpdateState {
             phase: NodePhase::RebootPending,

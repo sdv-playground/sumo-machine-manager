@@ -304,7 +304,10 @@ impl HsmCryptoProvider for SimHsm {
     fn get_trust_anchor_der(&self, anchor_id: &str) -> Result<Vec<u8>, HsmError> {
         // Pinned CA roots live under keys/roots/{anchor_id}.cert (PEM), kept
         // apart from device-key files. Not a slot — no get_key_info gate.
-        let path = self.keys_dir().join("roots").join(format!("{anchor_id}.cert"));
+        let path = self
+            .keys_dir()
+            .join("roots")
+            .join(format!("{anchor_id}.cert"));
         if !path.exists() {
             return Err(HsmError::KeyNotFound(format!(
                 "no pinned trust anchor '{anchor_id}'"
