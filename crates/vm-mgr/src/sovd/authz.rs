@@ -106,6 +106,14 @@ pub struct TieredAuthorizer {
     /// the delegated path has no pinned issuer, so it enforces `aud` from here.
     /// Defaults in [`Self::new`] to the issuers' shared audience.
     aud: Option<String>,
+    /// When set, a low-consequence read (`Capability::Read` / `DataRead`)
+    /// presented with NO bearer is served anonymously instead of rejected — the
+    /// general-path "read-open, writes enforced" policy (enforcement
+    /// proportionate to consequence: reads don't mutate). A read that DOES carry
+    /// a token still falls through to full verification, so its scopes apply;
+    /// writes and destructive ops always require a token. `false` = every route
+    /// needs a token (the destructive-route default).
+    read_open: bool,
 }
 
 impl TieredAuthorizer {
@@ -123,7 +131,19 @@ impl TieredAuthorizer {
             expected_epoch: None,
             pinned_root_pem: None,
             aud,
+            read_open: false,
         }
+    }
+
+    /// Serve low-consequence reads (`Capability::Read` / `DataRead`) without a
+    /// token: the general-path "read-open, writes enforced" policy. A no-token
+    /// read returns an anonymous [`ClientContext`]; writes and destructive ops
+    /// still require a valid token. A read that carries a token is still fully
+    /// verified (so its component/verb scopes apply). Omit on the destructive
+    /// routes — there every request needs a token.
+    pub fn with_read_open(mut self) -> Self {
+        self.read_open = true;
+        self
     }
 
     /// Pin the delegation root: enables the delegated (`x5c`) path. A token
@@ -243,6 +263,22 @@ fn strip_bearer(header: Option<&str>) -> Result<&str, String> {
 #[async_trait]
 impl Authorizer for TieredAuthorizer {
     async fn authorize(&self, req: &AccessRequest<'_>) -> Result<ClientContext, String> {
+        // Read-open (general path): a low-consequence read with NO token is
+        // served anonymously — reads don't mutate, so the general path enforces
+        // writes + destructive ops only. A read that DOES present a token still
+        // falls through to full verification below (so its scopes apply). Writes
+        // and destructive ops always require a token. Off by default (the
+        // destructive routes set no `read_open`, so they keep enforcing reads).
+        if self.read_open
+            && req.bearer.is_none()
+            && matches!(req.capability, Capability::Read | Capability::DataRead)
+        {
+            return Ok(ClientContext {
+                subject: "anonymous".to_string(),
+                scopes: Vec::new(),
+            });
+        }
+
         let token = strip_bearer(req.bearer)?;
 
         let header = decode_header(token).map_err(|e| format!("invalid token header: {e}"))?;
@@ -500,6 +536,57 @@ mod tests {
             component,
             capability: cap,
         }
+    }
+
+    /// A request with NO `Authorization` header — the tokenless case read-open
+    /// must serve and the destructive default must reject.
+    fn noauth(cap: Capability) -> AccessRequest<'static> {
+        AccessRequest {
+            bearer: None,
+            method: &axum::http::Method::GET,
+            path: "/test",
+            component: None,
+            capability: cap,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_open_serves_tokenless_reads_but_enforces_writes() {
+        // No issuers + read-open: a no-token READ is anonymous-OK; a no-token
+        // write or destructive op is still rejected (needs a token).
+        let authz = TieredAuthorizer::new(Vec::new()).with_read_open();
+
+        let ctx = authz
+            .authorize(&noauth(Capability::Read))
+            .await
+            .expect("tokenless read is served");
+        assert_eq!(ctx.subject, "anonymous");
+        assert!(ctx.scopes.is_empty());
+        assert!(authz.authorize(&noauth(Capability::DataRead)).await.is_ok());
+
+        // Writes + destructive ops require a token even when read-open.
+        for cap in [
+            Capability::DataWrite,
+            Capability::UpdateTransfer,
+            Capability::UpdateExecute,
+            Capability::OperationsExecute,
+            Capability::ModesSet,
+            Capability::ResetExecute,
+            Capability::FactoryReset,
+        ] {
+            assert!(
+                authz.authorize(&noauth(cap)).await.is_err(),
+                "{cap:?} must require a token even when read-open"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn without_read_open_even_reads_need_a_token() {
+        // The destructive-route default: no read bypass — a tokenless read is
+        // rejected like everything else.
+        let authz = TieredAuthorizer::new(Vec::new());
+        assert!(authz.authorize(&noauth(Capability::Read)).await.is_err());
     }
 
     fn two_tier_authorizer() -> (EncodingKey, EncodingKey, TieredAuthorizer) {
