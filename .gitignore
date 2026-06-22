@@ -1,4 +1,5 @@
 /target
+/target-qnx
 *.img
 Cargo.lock
 

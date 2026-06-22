@@ -1046,3 +1046,228 @@ async fn campaign_rejects_non_content_addressed_dep() {
         "non-content-addressed dependency uri must be rejected"
     );
 }
+
+// =============================================================================
+// Onboard PULL update route (x-sumo-pull-update) — authorize → resolve → install
+// =============================================================================
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use async_trait::async_trait;
+use component_mgr::sovd::authz::{Tier, TieredAuthorizer, TrustedIssuer};
+use component_mgr::sovd::routes::{run_pull_update, PullUpdateRequest};
+use machine_mgr::{
+    Capabilities, Component, EnvelopeStream, FlashCaps, FlashId, FlashSession, LifecycleCaps,
+    MachineResult, ResetKind,
+};
+
+/// A `Component` stub that records how many envelopes were uploaded + finalized,
+/// so the test can assert the pull handler drove the install lifecycle.
+struct PullStub {
+    uploads: AtomicUsize,
+    finalized: AtomicUsize,
+    caps: Capabilities,
+}
+
+impl PullStub {
+    fn new() -> Self {
+        Self {
+            uploads: AtomicUsize::new(0),
+            finalized: AtomicUsize::new(0),
+            caps: Capabilities {
+                did_store: false,
+                flash: Some(FlashCaps {
+                    dual_bank: false,
+                    supports_rollback: false,
+                    supports_trial_boot: false,
+                    abortable_after_finalize: false,
+                    reset_kind: ResetKind::Local,
+                }),
+                lifecycle: Some(LifecycleCaps {
+                    restartable: false,
+                    has_runtime_state: false,
+                }),
+                hsm: None,
+                dtcs: false,
+                clear_dtcs: false,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl Component for PullStub {
+    fn id(&self) -> &str {
+        "vm1"
+    }
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    async fn start_install(&self) -> MachineResult<FlashSession> {
+        Ok(FlashSession {
+            id: FlashId::new("pull-test"),
+            target_bank: None,
+            max_chunk_size: 65536,
+        })
+    }
+    async fn upload_envelope(
+        &self,
+        _id: &FlashId,
+        mut stream: EnvelopeStream,
+    ) -> MachineResult<String> {
+        use futures::StreamExt;
+        let mut total = 0usize;
+        while let Some(chunk) = stream.next().await {
+            total += chunk.expect("stream chunk").len();
+        }
+        assert!(total > 0, "uploaded envelope must be non-empty");
+        self.uploads.fetch_add(1, Ordering::SeqCst);
+        Ok(format!("part-{total}"))
+    }
+    async fn finalize_install(&self, _id: &FlashId) -> MachineResult<()> {
+        self.finalized.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A deterministic ES256 issuer keypair (no RNG) for the authz token.
+fn issuer_keys() -> (jsonwebtoken::EncodingKey, jsonwebtoken::DecodingKey) {
+    use p256::ecdsa::SigningKey;
+    use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+    let mut scalar = [0u8; 32];
+    scalar[31] = 9;
+    let sk = SigningKey::from_bytes(&p256::FieldBytes::from(scalar)).unwrap();
+    let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let pub_pem = sk
+        .verifying_key()
+        .to_public_key_pem(LineEnding::LF)
+        .unwrap();
+    (
+        jsonwebtoken::EncodingKey::from_ec_pem(priv_pem.as_bytes()).unwrap(),
+        jsonwebtoken::DecodingKey::from_ec_pem(pub_pem.as_bytes()).unwrap(),
+    )
+}
+
+/// Mint an ES256 token for issuer `iss`, audience `aud`, carrying `scope`.
+fn mint_token(enc: &jsonwebtoken::EncodingKey, iss: &str, aud: &str, scope: &str) -> String {
+    use jsonwebtoken::{encode, Algorithm, Header};
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some(iss.to_string());
+    let claims = serde_json::json!({
+        "sub": "operator", "iss": iss, "aud": aud,
+        "exp": 9_999_999_999u64, "scope": scope,
+    });
+    encode(&header, &claims, enc).unwrap()
+}
+
+/// An L1 campaign with one integrated + one remote (content-addressed)
+/// dependency, served from a mock CAS. Returns (l1_bytes, cas_base_url,
+/// trust_anchor).
+async fn campaign_fixture() -> (Vec<u8>, String, Vec<u8>) {
+    let (signing_key, _) = test_keys();
+    let crypto = RustCryptoBackend::new();
+    let l2_a = l2_envelope(&signing_key, "vm1", &[0x11u8; 256]);
+    let l2_b = l2_envelope(&signing_key, "vm1", &[0x22u8; 256]);
+    let l2_b_uri = format!("manifests/{}", hex::encode(crypto.sha256(&l2_b)));
+    let l1 = CampaignBuilder::new()
+        .sequence_number(1)
+        .add_integrated_image("dep-a".to_string(), &l2_a)
+        .add_image(l2_b_uri, &l2_b)
+        .build(&signing_key)
+        .unwrap();
+    let base = serve_blob(l2_b).await;
+    (l1, base, signing_key.public_key_bytes())
+}
+
+fn operational_authorizer(dec: jsonwebtoken::DecodingKey) -> TieredAuthorizer {
+    TieredAuthorizer::new(vec![TrustedIssuer {
+        id: "onboard".into(),
+        audience: "rig-1".into(),
+        key: dec,
+        ceiling: Tier::Operational,
+    }])
+}
+
+fn pull_request(l1: &[u8], cas_base_url: String) -> PullUpdateRequest {
+    use base64::Engine;
+    PullUpdateRequest {
+        component: "vm1".into(),
+        l1_base64: base64::engine::general_purpose::STANDARD.encode(l1),
+        cas_base_url,
+    }
+}
+
+#[tokio::test]
+async fn pull_update_installs_campaign_under_operational_token() {
+    let (l1, base, trust_anchor) = campaign_fixture().await;
+    let (enc, dec) = issuer_keys();
+    let authz = operational_authorizer(dec);
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(&enc, "onboard", "rig-1", "component:vm1 update:execute")
+    );
+
+    let stub = Arc::new(PullStub::new());
+    let comp: Arc<dyn Component> = stub.clone();
+    let req = pull_request(&l1, base);
+
+    let exec = run_pull_update(&comp, &authz, &trust_anchor, Some(&bearer), &req)
+        .await
+        .expect("authorized pull-update should not 4xx");
+    assert!(
+        matches!(exec.status, sovd_core::OperationStatus::Completed),
+        "status = {:?}, error = {:?}",
+        exec.status,
+        exec.error
+    );
+    // Both deps (integrated + remote content-addressed) installed; one finalize.
+    assert_eq!(
+        stub.uploads.load(Ordering::SeqCst),
+        2,
+        "both deps installed"
+    );
+    assert_eq!(stub.finalized.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn pull_update_rejects_without_token() {
+    let (l1, base, trust_anchor) = campaign_fixture().await;
+    let (_enc, dec) = issuer_keys();
+    let authz = operational_authorizer(dec);
+
+    let stub = Arc::new(PullStub::new());
+    let comp: Arc<dyn Component> = stub.clone();
+    let req = pull_request(&l1, base);
+
+    let err = run_pull_update(&comp, &authz, &trust_anchor, None, &req)
+        .await
+        .expect_err("a tokenless pull-update must be rejected");
+    assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        stub.uploads.load(Ordering::SeqCst),
+        0,
+        "nothing installed when unauthorized"
+    );
+}
+
+#[tokio::test]
+async fn pull_update_rejects_token_without_update_scope() {
+    let (l1, base, trust_anchor) = campaign_fixture().await;
+    let (enc, dec) = issuer_keys();
+    let authz = operational_authorizer(dec);
+    // Token has the component scope but NOT update:execute.
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(&enc, "onboard", "rig-1", "component:vm1 data:read")
+    );
+
+    let stub = Arc::new(PullStub::new());
+    let comp: Arc<dyn Component> = stub.clone();
+    let req = pull_request(&l1, base);
+
+    let err = run_pull_update(&comp, &authz, &trust_anchor, Some(&bearer), &req)
+        .await
+        .expect_err("missing update:execute must be rejected");
+    assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(stub.uploads.load(Ordering::SeqCst), 0);
+}

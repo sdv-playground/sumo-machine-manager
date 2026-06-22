@@ -19,6 +19,7 @@ use machine_mgr::{Component, FlashId, FlashState, Machine, MachineError};
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
 use nv_store::types::NUM_BANK_SETS;
+use puller::Puller;
 use sovd_core::{OperationExecution, OperationStatus};
 
 /// `GET /vehicle/v1/data/x-sumo-update-state` — the node's update-transaction
@@ -433,6 +434,214 @@ pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
                 async move { handle_verdict(machine, Verdict::Rollback).await }
             }),
         )
+}
+
+// =============================================================================
+// Onboard PULL update — the device-side counterpart of the push `/updates` wire
+// =============================================================================
+
+/// Body of the `x-sumo-pull-update` operation.
+#[derive(serde::Deserialize)]
+pub struct PullUpdateRequest {
+    /// Target component id to install the campaign into.
+    pub component: String,
+    /// The T2-signed L1 campaign manifest envelope (base64 of the COSE bytes).
+    /// Its dependency/payload URIs are content-addresses, so the device pins
+    /// what it fetches to what the signed manifest commits to.
+    pub l1_base64: String,
+    /// Base URL of the content-addressed store the device pulls dependencies
+    /// from. Untrusted — every fetched blob is verified against the signed
+    /// content-address before use.
+    pub cas_base_url: String,
+}
+
+const PULL_OP_ID: &str = "x-sumo-pull-update";
+const PULL_OP_PATH: &str = "/vehicle/v1/operations/x-sumo-pull-update/executions";
+
+/// Build the onboard pull-update route.
+///
+/// `POST /vehicle/v1/operations/x-sumo-pull-update/executions` body
+/// [`PullUpdateRequest`] → fetch a content-addressed campaign and install it
+/// into the target component.
+///
+/// Authorization is enforced **on this route** by the injected `authorizer`
+/// (route-scoped — independent of whether the host wires global enforcement):
+/// the op needs an Operational `update:execute` token bound to this device
+/// (`aud`) and the target component. SOVDd stays untouched — this is an
+/// `x-sumo` vendor extension in sumo-mm (the three-layer rule). `trust_anchor`
+/// is the device's pinned manifest-signing key (CBOR COSE_Key), used to verify
+/// every fetched dependency.
+pub fn pull_update_router(
+    machine: Arc<dyn Machine>,
+    authorizer: Arc<dyn sovd_api::Authorizer>,
+    trust_anchor: Vec<u8>,
+) -> Router {
+    Router::new().route(
+        PULL_OP_PATH,
+        post(
+            move |headers: axum::http::HeaderMap, Json(req): Json<PullUpdateRequest>| {
+                let machine = machine.clone();
+                let authorizer = authorizer.clone();
+                let trust_anchor = trust_anchor.clone();
+                async move {
+                    let Some(comp) = machine.component(&req.component) else {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            format!("no component '{}'", req.component),
+                        )
+                            .into_response();
+                    };
+                    let bearer = bearer_of(&headers);
+                    match run_pull_update(
+                        &comp,
+                        authorizer.as_ref(),
+                        &trust_anchor,
+                        bearer.as_deref(),
+                        &req,
+                    )
+                    .await
+                    {
+                        Ok(exec) => {
+                            let code = if matches!(exec.status, OperationStatus::Failed) {
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            } else {
+                                StatusCode::OK
+                            };
+                            (code, Json(exec)).into_response()
+                        }
+                        Err((code, msg)) => (code, msg).into_response(),
+                    }
+                }
+            },
+        ),
+    )
+}
+
+/// The full `Authorization` header value (`"Bearer <token>"`), if present — the
+/// authorizer strips the `Bearer ` prefix itself.
+fn bearer_of(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Authorize, then pull a content-addressed campaign and install every resolved
+/// dependency into `comp` via its install lifecycle. Returns the ISO 17978-3
+/// §7.14 operation execution, or an HTTP error for auth/decoding failures
+/// (operational failures come back as a `Failed` execution).
+///
+/// The CAS is untrusted: `resolve_campaign_dependencies` binds each fetched L2
+/// to the sha the signed L1 committed to, and the component's `upload_envelope`
+/// re-validates each L2 (signature + security version) before applying it.
+pub async fn run_pull_update(
+    comp: &Arc<dyn Component>,
+    authorizer: &dyn sovd_api::Authorizer,
+    trust_anchor: &[u8],
+    bearer: Option<&str>,
+    req: &PullUpdateRequest,
+) -> Result<OperationExecution, (StatusCode, String)> {
+    use sovd_api::{AccessRequest, Capability};
+
+    // (1) Authorize: Operational `update:execute`, bound to this device (aud)
+    // and scoped to the target component.
+    let access = AccessRequest {
+        bearer,
+        method: &axum::http::Method::POST,
+        path: PULL_OP_PATH,
+        component: Some(&req.component),
+        capability: Capability::UpdateExecute,
+    };
+    authorizer
+        .authorize(&access)
+        .await
+        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("unauthorized: {e}")))?;
+
+    // (2) Decode the signed L1 campaign manifest.
+    use base64::Engine;
+    let l1_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&req.l1_base64)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("l1_base64 not base64: {e}"),
+            )
+        })?;
+    let envelope = sumo_codec::decode::decode_envelope(&l1_bytes).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("L1 is not a SUIT envelope: {e:?}"),
+        )
+    })?;
+    let manifest = sumo_onboard::manifest::Manifest { envelope };
+
+    // (3) Pull + content-address-verify the campaign dependencies.
+    let now = chrono::Utc::now();
+    let puller = match Puller::new(&req.cas_base_url, trust_anchor) {
+        Ok(p) => p,
+        Err(e) => return Ok(pull_failed(now, format!("puller init: {e:?}"))),
+    };
+    let l2s = match crate::streaming::resolve_campaign_dependencies(&manifest, &puller).await {
+        Ok(l2s) => l2s,
+        Err(e) => return Ok(pull_failed(now, format!("dependency resolution: {e:?}"))),
+    };
+
+    // (4) Install each resolved dependency into the target component. Its
+    // `upload_envelope` validates each L2 inline and `finalize_install` applies.
+    let session = match comp.start_install().await {
+        Ok(s) => s,
+        Err(e) => return Ok(pull_failed(now, format!("start_install: {e}"))),
+    };
+    for (i, l2) in l2s.iter().enumerate() {
+        if let Err(e) = comp
+            .upload_envelope(&session.id, envelope_stream(l2.clone()))
+            .await
+        {
+            return Ok(pull_failed(now, format!("upload dependency {i}: {e}")));
+        }
+    }
+    if let Err(e) = comp.finalize_install(&session.id).await {
+        return Ok(pull_failed(now, format!("finalize_install: {e}")));
+    }
+
+    tracing::info!(
+        op = PULL_OP_ID,
+        component = %req.component,
+        deps = l2s.len(),
+        "pull-update installed a content-addressed campaign"
+    );
+    Ok(OperationExecution {
+        execution_id: PULL_OP_ID.to_string(),
+        operation_id: PULL_OP_ID.to_string(),
+        status: OperationStatus::Completed,
+        result: Some(serde_json::json!({
+            "component": req.component,
+            "dependencies_installed": l2s.len(),
+        })),
+        error: None,
+        started_at: now,
+        completed_at: Some(chrono::Utc::now()),
+    })
+}
+
+fn pull_failed(now: chrono::DateTime<chrono::Utc>, error: String) -> OperationExecution {
+    tracing::warn!(op = PULL_OP_ID, %error, "pull-update failed");
+    OperationExecution {
+        execution_id: PULL_OP_ID.to_string(),
+        operation_id: PULL_OP_ID.to_string(),
+        status: OperationStatus::Failed,
+        result: None,
+        error: Some(error),
+        started_at: now,
+        completed_at: Some(chrono::Utc::now()),
+    }
+}
+
+/// One-shot [`machine_mgr::EnvelopeStream`] over `bytes`.
+fn envelope_stream(bytes: Vec<u8>) -> machine_mgr::EnvelopeStream {
+    Box::pin(futures::stream::once(async move {
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(bytes::Bytes::from(bytes))
+    }))
 }
 
 #[cfg(test)]
