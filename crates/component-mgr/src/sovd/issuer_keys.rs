@@ -119,7 +119,7 @@ mod tests {
         );
     }
 
-    /// The well-known dev HC key (P-256 scalar=1) — the same key `sumo-dev-mint`
+    /// The well-known dev HC key (P-256 scalar=1) — the same key `sumo-factory-reset-mint`
     /// signs with and that Tower provisions into the factory-reset-issuer
     /// anchor (`FACTORY_SIGNING_PUBLIC`).
     fn dev_hc() -> SigningKey {

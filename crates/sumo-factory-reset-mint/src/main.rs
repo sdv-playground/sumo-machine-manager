@@ -33,8 +33,8 @@ fn dev_signing_scalar() -> [u8; 32] {
 
 #[derive(Parser)]
 #[command(
-    name = "sumo-dev-mint",
-    about = "Mint a dev SOVD capability token (well-known key; dev rigs only)"
+    name = "sumo-factory-reset-mint",
+    about = "Mint a dev factory-reset SOVD capability token (well-known key; dev rigs only — NOT the onboard minter)"
 )]
 struct Cli {
     /// `aud` claim — the device / vehicle id the token is bound to (replay guard).
