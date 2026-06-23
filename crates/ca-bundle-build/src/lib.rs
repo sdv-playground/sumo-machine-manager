@@ -78,10 +78,13 @@ pub struct CaBundleImageBuilder {
     /// from `$PATH`.
     pub tool_path: Option<PathBuf>,
     /// Override the qnx6 image's `num_sectors` (512-byte sectors).
-    /// `None` → 8192 (4 MB). Same reasoning as policy-build: under
-    /// ~2048 sectors trips io-blk's strict size check and devb-loopback
-    /// silently drops the registration. 4 MB is plenty for a single
-    /// concatenated PEM (~250 KB) with room to grow.
+    /// `None` → auto-sized to fit the source tree (see [`auto_qnx6_geometry`]),
+    /// floored at 8192 (4 MB). The floor matters: under ~2048 sectors trips
+    /// io-blk's strict size check and devb-loopback silently drops the
+    /// registration. Auto-sizing is what lets this tool image not just the
+    /// small PEM/policy bundles it was written for (~250 KB) but also the
+    /// t2-seed-cicd layer trees — where the gateway layer carries a large
+    /// `vm-sovd` binary that overruns a fixed 4 MB.
     pub qnx6_num_sectors: Option<u32>,
 }
 
@@ -188,10 +191,13 @@ impl CaBundleImageBuilder {
             .clone()
             .unwrap_or_else(|| PathBuf::from("mkqnx6fsimg"));
 
-        let num_sectors = self.qnx6_num_sectors.unwrap_or(8192);
+        let (num_sectors, num_inodes) = match self.qnx6_num_sectors {
+            Some(s) => (s, 512),
+            None => auto_qnx6_geometry(&self.source_dir),
+        };
         let build_file = output.with_extension("qnx6.buildfile");
         let buildfile_contents =
-            format!("[num_sectors={num_sectors}]\n[num_inodes=512]\n[blksize=4096]\n");
+            format!("[num_sectors={num_sectors}]\n[num_inodes={num_inodes}]\n[blksize=4096]\n");
         std::fs::write(&build_file, &buildfile_contents).map_err(|e| BuildError::Io {
             op: "write qnx6 build-file",
             path: build_file.clone(),
@@ -219,6 +225,53 @@ impl CaBundleImageBuilder {
         }
         Ok(())
     }
+}
+
+/// Compute a qnx6 geometry `(num_sectors, num_inodes)` that fits `dir`.
+///
+/// Sums every file's size rounded up to the 4 KiB block, adds per-file +
+/// fixed fs-metadata overhead and a 50% margin, converts to 512-byte sectors,
+/// and floors at 8192 (4 MiB; under ~2048 sectors trips io-blk). This is what
+/// makes the image "always large enough for whatever you add" — the promise
+/// t2-seed-cicd's `build_layers` relies on — instead of a fixed 4 MiB that
+/// overruns on a large binary like `vm-sovd`.
+fn auto_qnx6_geometry(dir: &Path) -> (u32, u32) {
+    const BLK: u64 = 4096;
+    const SECTOR: u64 = 512;
+    const MIN_SECTORS: u64 = 8192; // 4 MiB floor
+
+    fn walk(d: &Path, bytes: &mut u64, files: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(d) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                walk(&e.path(), bytes, files);
+            } else if ft.is_file() {
+                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                // Each file occupies whole 4 KiB blocks.
+                *bytes += ((len + BLK - 1) / BLK).saturating_mul(BLK);
+                *files += 1;
+            }
+        }
+    }
+
+    let (mut bytes, mut files) = (0u64, 0u64);
+    walk(dir, &mut bytes, &mut files);
+
+    // Per-file directory/inode slack + a fixed superblock/bitmap base, then a
+    // 50% margin so block-boundary growth never overruns.
+    let overhead = files.saturating_mul(BLK).saturating_add(1024 * 1024);
+    let needed = bytes.saturating_add(overhead).saturating_mul(3) / 2;
+    let sectors = ((needed + SECTOR - 1) / SECTOR).max(MIN_SECTORS);
+    // qnx6 inodes are cheap; scale with file count, floor at 512.
+    let inodes = files.saturating_mul(4).max(512);
+
+    (
+        sectors.min(u32::MAX as u64) as u32,
+        inodes.min(u32::MAX as u64) as u32,
+    )
 }
 
 fn has_any_regular_file(dir: &Path) -> bool {
@@ -395,6 +448,26 @@ mod tests {
     fn extension_matches_format() {
         assert_eq!(ImageFormat::Squashfs.extension(), "sqfs");
         assert_eq!(ImageFormat::Qnx6.extension(), "qnx6");
+    }
+
+    #[test]
+    fn qnx6_geometry_fits_contents_and_honours_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A tiny tree floors at the 8192-sector (4 MiB) minimum.
+        fs::write(
+            tmp.path().join("small.pem"),
+            b"-----BEGIN CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let (sectors, inodes) = auto_qnx6_geometry(tmp.path());
+        assert_eq!(sectors, 8192, "tiny tree floors at 4 MiB");
+        assert!(inodes >= 512);
+
+        // A 20 MiB binary is sized well past the floor, with margin.
+        fs::write(tmp.path().join("big.bin"), vec![0u8; 20 * 1024 * 1024]).unwrap();
+        let (sectors, _) = auto_qnx6_geometry(tmp.path());
+        // 20 MiB ≈ 40960 sectors of payload; +50% margin ⇒ comfortably > 60000.
+        assert!(sectors > 60_000, "20 MiB tree sized to {sectors} sectors");
     }
 
     #[test]
