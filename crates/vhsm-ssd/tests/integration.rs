@@ -59,7 +59,7 @@ impl TestFixture {
         let mut handle_table = HandleTable::new();
         handle_table.register_well_known(
             HANDLE_IAM_SIGNING,
-            "mykey",
+            "iam-signing",
             ALG_ECC_P256,
             PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY | PERM_GET_CERT,
         );
@@ -69,19 +69,26 @@ impl TestFixture {
             ALG_AES_256,
             PERM_ENCRYPT | PERM_DECRYPT,
         );
-        // restricted-key: only accessible via handle owned by OTHER_VM
+        // restricted-key: only accessible via handle owned by OTHER_VM. The
+        // dynamic key is stored under its handle-derived name, so generate it at
+        // the allocated handle (SimHsm names it dyn-{handle:08x}).
         let label = [0u8; LABEL_LEN];
-        handle_table.allocate(
-            "restricted-key",
-            ALG_AES_256,
-            PERM_ENCRYPT | PERM_DECRYPT,
-            OTHER_VM,
-            false,
-            &label,
-        );
+        let restricted_handle = handle_table
+            .allocate(
+                "restricted-key",
+                ALG_AES_256,
+                PERM_ENCRYPT | PERM_DECRYPT,
+                OTHER_VM,
+                false,
+                &label,
+            )
+            .expect("allocate restricted-key handle");
+        crypto
+            .generate_key(hsm::KeyHandle(restricted_handle), ALG_AES_256)
+            .expect("generate restricted-key material");
 
         // IAM policy:
-        //  - vm1 may use mykey (signing) for sign/verify/get-pubkey/get-cert.
+        //  - vm1 may use iam-signing (signing) for sign/verify/get-pubkey/get-cert.
         //  - vm1 may use storage-key for encrypt/decrypt.
         //  - vm1 may use the SYSTEM_HANDLE for get-random + key-generate.
         //  - vm2 may use storage-key for encrypt/decrypt only (no sign).
@@ -93,12 +100,12 @@ impl TestFixture {
             r#"
 version: 1
 statements:
-  # vm1 has broad access on mykey, INCLUDING the unrealistic
+  # vm1 has broad access on iam-signing, INCLUDING the unrealistic
   # encrypt/get-handle-info ops — needed by tests that exercise
   # the per-handle bitmask defense (bitmask rejects encrypt on a
   # sign-only key even though IAM allows it).
   - principals: [vm1]
-    handles: [mykey]
+    handles: [iam-signing]
     ops: [sign, verify, get-pubkey, get-cert, get-handle-info, encrypt]
   - principals: [vm1, vm2]
     handles: [storage-key]
@@ -160,7 +167,7 @@ statements:
             identities: vec![],
             slots: vec![
                 KeySlot {
-                    key_id: "mykey".into(),
+                    key_id: "iam-signing".into(),
                     key_kind: KEY_TYPE_EC_P256,
                     anchor_public_key: None,
                     allowed_guests: None,
@@ -185,9 +192,9 @@ statements:
             trust_anchors: Vec::new(),
         };
 
-        // Simulate post-CSR cert issuance for `mykey`. In production a CA
+        // Simulate post-CSR cert issuance for `iam-signing`. In production a CA
         // signs the device's CSR and the resulting leaf lands on disk as
-        // `keys/mykey.cert` (via the v3 envelope `certificates` list, or a
+        // `keys/iam-signing.cert` (via the v3 envelope `certificates` list, or a
         // CSR-flow). This test exercises the on-disk path directly,
         // writing a placeholder PEM BEFORE write_keystore so the manifest
         // writer picks it up via the on-disk file check.
@@ -198,7 +205,7 @@ statements:
             MDEwMDAwMDBaMBsxGTAXBgNVBAMTEHRlc3Qtc2VsZi1zaWduZWQwWTATBgcqhkjO\n\
             PQIBBggqhkjOPQMBBwNCAARxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\
             -----END CERTIFICATE-----\n";
-        std::fs::write(path.join("keys").join("mykey.cert"), cert_pem).unwrap();
+        std::fs::write(path.join("keys").join("iam-signing.cert"), cert_pem).unwrap();
 
         let hsm = SimHsm::new(PathBuf::from("unused"), path.to_path_buf(), 5100);
         hsm.write_keystore(&ks).unwrap();
@@ -481,7 +488,7 @@ fn iam_rejects_unknown_principal() {
 fn iam_denies_unpermitted_op() {
     let mut fix = TestFixture::new();
 
-    // vm2 may use storage-key for encrypt/decrypt but not mykey for sign.
+    // vm2 may use storage-key for encrypt/decrypt but not iam-signing for sign.
     let resp = fix.request(
         &caller(OTHER_IP, OTHER_VM),
         Op::Sign,

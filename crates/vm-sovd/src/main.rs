@@ -199,8 +199,9 @@ async fn main() {
             // CEK unwrap routed through the HSM, never extracts the
             // device decryption private key. Same Arc backs the
             // lifecycle ops below — no second view of the provider.
-            let unwrap: Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync> =
-                Arc::new(hsm::HsmKeyUnwrap::new(hsm_arc.clone(), "device-decrypt"));
+            let unwrap: Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync> = Arc::new(
+                hsm::HsmKeyUnwrap::new(hsm_arc.clone(), hsm::KeyRole::DeviceDecryption.handle()),
+            );
             manifest_provider.update_keys(sw_key, Some(unwrap), ka);
             tracing::info!("loaded sw-authority from HSM keystore; CEK unwrap routed through HSM");
         } else if provisioned {
@@ -498,7 +499,13 @@ where
     // Authorizer pinned to the device's HSM issuer anchors — so the onboard
     // minter's `jwt-signing` Operational tokens verify here.
     let authz = component_mgr::sovd::issuer_keys::authorizer_from_anchors(
-        |id| crypto.get_public_key_der(id).ok(),
+        // The authorizer pins issuer keys by their JWT issuer-id (the wire
+        // `kid`/`iss` string); map that to the slot handle for the HSM lookup.
+        |id| {
+            hsm::vhsm_proto::handle_for_key_id(id)
+                .and_then(|h| crypto.get_public_key_der(hsm::KeyHandle(h)).ok())
+        },
+        // Trust anchors are addressed by string anchor-id (not a slot handle).
         |id| crypto.get_trust_anchor_der(id).ok(),
         &device_id,
     )

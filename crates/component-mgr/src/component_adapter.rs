@@ -340,8 +340,13 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
         let tmp =
             hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
         use hsm::HsmCryptoProvider;
+        let handle = hsm::vhsm_proto::handle_for_key_id(key_id)
+            .map(hsm::KeyHandle)
+            .ok_or_else(|| {
+                MachineError::Internal(format!("CSR for unknown key slot '{key_id}'"))
+            })?;
         let der = tmp
-            .generate_csr(key_id, key_id)
+            .generate_csr(handle, key_id)
             .map_err(|e| MachineError::Internal(format!("csr generation failed: {e}")))?;
         Ok(Csr::from_bytes(der))
     }
@@ -370,7 +375,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                 // never any private bytes; None for symmetric keys.
                 let public_key = match k.key_type {
                     hsm::KeyType::EcP256 | hsm::KeyType::Ed25519 => {
-                        tmp.get_public_key_der(&k.key_id).ok()
+                        tmp.get_public_key_der(k.handle).ok()
                     }
                     _ => None,
                 };
@@ -396,7 +401,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
         let tmp =
             hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
         use hsm::HsmCryptoProvider;
-        match tmp.get_public_key_der("device-decrypt") {
+        match tmp.get_public_key_der(hsm::KeyRole::DeviceDecryption.handle()) {
             Ok(der) => Ok(Some(crate::sovd::identity::ecu_id_from_spki_der(&der))),
             Err(_) => Ok(None),
         }

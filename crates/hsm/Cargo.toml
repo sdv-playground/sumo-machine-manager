@@ -15,6 +15,10 @@ coset = { version = "0.3", default-features = false }
 # The slot registry (handle ↔ key_id ↔ alg ↔ perms) is single-sourced here;
 # KeyRole maps each role to a handle and derives key_id() from the registry.
 vhsm-proto = { path = "../vhsm-proto" }
+# The shared HSM crypto contract (handle-addressed HsmCryptoProvider + the
+# HsmError/KeyInfo/KeyType/KeyHandle types). hsm re-exports these and SimHsm
+# implements the trait.
+hsm-contract = { path = "../hsm-contract" }
 
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
 sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }

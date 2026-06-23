@@ -297,7 +297,7 @@ mod tests {
             dir.path().to_path_buf(),
             0,
         );
-        let kid = KeyRole::TlsIdentity.key_id();
+        let kid = KeyRole::TlsIdentity.handle();
         hsm.generate_key(kid, ALG_ECC_P256).unwrap();
         let client_leaf = issue_leaf(
             &ca_key,

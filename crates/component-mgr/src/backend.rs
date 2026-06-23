@@ -2777,7 +2777,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                             dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync,
                         > = std::sync::Arc::new(hsm::HsmKeyUnwrap::new(
                             hsm.clone(),
-                            "device-decrypt",
+                            hsm::KeyRole::DeviceDecryption.handle(),
                         ));
                         self.manifest_provider.update_keys(sw_key, Some(unwrap), ka);
                         tracing::info!(
@@ -3039,7 +3039,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                                         dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync,
                                     > = std::sync::Arc::new(hsm::HsmKeyUnwrap::new(
                                         hsm.clone(),
-                                        "device-decrypt",
+                                        hsm::KeyRole::DeviceDecryption.handle(),
                                     ));
                                     self.manifest_provider.update_keys(sw_key, Some(unwrap), ka);
                                     tracing::info!(
@@ -4601,7 +4601,8 @@ mod identity_tests {
         // Re-verify the signature over the manifest bytes via the HSM.
         let ok = {
             let hsm = backend.hsm_provider.as_ref().unwrap().lock().unwrap();
-            hsm.verify(hsm::ivd::IVD_KEY_ID, &mbytes, &sig).unwrap()
+            hsm.verify(hsm::KeyRole::IvdSigning.handle(), &mbytes, &sig)
+                .unwrap()
         };
         assert!(
             ok,
@@ -4718,7 +4719,8 @@ mod identity_tests {
             .expect("signature_b64 decodes");
         let ok = {
             let hsm = backend.hsm_provider.as_ref().unwrap().lock().unwrap();
-            hsm.verify(hsm::ivd::IVD_KEY_ID, &mbytes, &sig).unwrap()
+            hsm.verify(hsm::KeyRole::IvdSigning.handle(), &mbytes, &sig)
+                .unwrap()
         };
         assert!(
             !ok,

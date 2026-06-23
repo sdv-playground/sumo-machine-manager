@@ -72,7 +72,10 @@ struct HsmIamSigner {
 
 impl EcuSigner for HsmIamSigner {
     fn sign(&self, data: &[u8]) -> Vec<u8> {
-        match self.crypto.sign_raw_p256("iam-signing", data) {
+        match self
+            .crypto
+            .sign_raw_p256(KeyRole::IamSigning.handle(), data)
+        {
             Ok(sig) => sig,
             Err(e) => {
                 // Return an empty sig so the resulting CWT will fail
@@ -334,7 +337,7 @@ fn main() {
     // HsmIamSigner. The HSM stores the DER-encoded SPKI; convert
     // to raw SEC1 (0x04 || x || y) which is what cert::validate
     // expects.
-    let ecu_signing_pub = match crypto.get_public_key_der("iam-signing") {
+    let ecu_signing_pub = match crypto.get_public_key_der(KeyRole::IamSigning.handle()) {
         Ok(der) => match der_to_sec1_p256(&der) {
             Some(raw) => Arc::<[u8]>::from(raw.into_boxed_slice()),
             None => {
@@ -748,12 +751,17 @@ fn build_cross_node_server_config(
 
     let tls_kid = KeyRole::TlsIdentity.key_id();
     let leaf_der = crypto
-        .get_certificate_der(tls_kid)
+        .get_certificate_der(KeyRole::TlsIdentity.handle())
         .map_err(|e| format!("TlsIdentity leaf cert not provisioned ('{tls_kid}'): {e}"))?;
     let server_chain = vec![CertificateDer::from(leaf_der)];
 
-    tls::server_config(Arc::clone(crypto), tls_kid, server_chain, client_roots)
-        .map_err(|e| format!("build server config: {e}"))
+    tls::server_config(
+        Arc::clone(crypto),
+        KeyRole::TlsIdentity.handle(),
+        server_chain,
+        client_roots,
+    )
+    .map_err(|e| format!("build server config: {e}"))
 }
 
 /// Cross-node mTLS accept loop. One thread per connection (like the guest loop)
@@ -889,7 +897,7 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     // registered only if its key actually exists in the keystore (soft-missing
     // keys are skipped).
     for slot in SUMO_CORE_SLOTS.iter().filter(|s| s.guest_exposed) {
-        if crypto.get_key_info(slot.key_id).is_ok() {
+        if crypto.get_key_info(hsm::KeyHandle(slot.handle)).is_ok() {
             table.register_well_known(slot.handle, slot.key_id, slot.alg, slot.default_perms);
             tracing::debug!(
                 handle = slot.handle,

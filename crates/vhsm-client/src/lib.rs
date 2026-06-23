@@ -249,7 +249,8 @@ mod tests {
         thread::spawn(move || {
             let tmp = tempfile::tempdir().unwrap();
             let hsm = SimHsm::new(PathBuf::from("unused"), tmp.path().to_path_buf(), 0);
-            HsmCryptoProvider::generate_key(&hsm, "node-signer", ALG_ECC_P256).unwrap();
+            HsmCryptoProvider::generate_key(&hsm, hsm::KeyHandle(TEST_HANDLE), ALG_ECC_P256)
+                .unwrap();
 
             let mut table = HandleTable::new();
             table.register_well_known(

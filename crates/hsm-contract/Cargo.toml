@@ -1,0 +1,8 @@
+[package]
+name = "hsm-contract"
+version = "0.1.0"
+edition = "2021"
+description = "Shared HSM crypto contract — the handle-addressed HsmCryptoProvider trait plus HsmError / KeyInfo / KeyType / KeyHandle. Implemented host-side by SimHsm (and the future HSE backend) and guest-side by VhsmProvider, so both sides speak one slot-number-addressed interface."
+
+[dependencies]
+vhsm-proto = { path = "../vhsm-proto" }

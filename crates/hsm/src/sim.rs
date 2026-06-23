@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 use crate::payload::{self, HsmKeystore, KeySlot, KEY_TYPE_AES_256, KEY_TYPE_EC_P256};
-use crate::{HsmError, HsmProvider, HsmStatus, KeyInfo, KeyRole, KeyType, ProvisioningState};
+use crate::{
+    HsmError, HsmProvider, HsmStatus, KeyHandle, KeyInfo, KeyRole, KeyType, ProvisioningState,
+};
 
 pub struct SimHsm {
     /// Path to `vhsm-test-ssd` binary.
@@ -568,8 +570,13 @@ impl SimHsm {
                 }
             }
 
+            let key_id = parts[0].to_string();
+            let handle = vhsm_proto::handle_for_key_id(&key_id)
+                .map(KeyHandle)
+                .unwrap_or(KeyHandle(vhsm_proto::HANDLE_INVALID));
             keys.push(KeyInfo {
-                key_id: parts[0].to_string(),
+                handle,
+                key_id,
                 key_type,
                 has_certificate,
                 allowed_guests,
@@ -601,7 +608,11 @@ impl SimHsm {
                 continue;
             };
             let has_certificate = keys_dir.join(format!("{key_id}.cert")).exists();
+            let handle = vhsm_proto::handle_for_key_id(&key_id)
+                .map(KeyHandle)
+                .unwrap_or(KeyHandle(vhsm_proto::HANDLE_INVALID));
             keys.push(KeyInfo {
+                handle,
                 key_id,
                 key_type,
                 has_certificate,
@@ -1246,21 +1257,25 @@ impl HsmProvider for SimHsm {
     /// management trait so the OTA pipeline can call it via
     /// `Arc<Mutex<dyn HsmProvider>>`).
     #[cfg(feature = "crypto")]
-    fn unwrap_cek_a128kw(&self, key_id: &str, wrapped_cek: &[u8]) -> Result<Vec<u8>, HsmError> {
-        crate::HsmCryptoProvider::unwrap_cek_a128kw(self, key_id, wrapped_cek)
+    fn unwrap_cek_a128kw(
+        &self,
+        handle: KeyHandle,
+        wrapped_cek: &[u8],
+    ) -> Result<Vec<u8>, HsmError> {
+        crate::HsmCryptoProvider::unwrap_cek_a128kw(self, handle, wrapped_cek)
     }
 
     #[cfg(feature = "crypto")]
     fn unwrap_cek_ecdh_es(
         &self,
-        key_id: &str,
+        handle: KeyHandle,
         ephem_pub: &[u8],
         wrapped_cek: &[u8],
         recipient_protected: &[u8],
     ) -> Result<Vec<u8>, HsmError> {
         crate::HsmCryptoProvider::unwrap_cek_ecdh_es(
             self,
-            key_id,
+            handle,
             ephem_pub,
             wrapped_cek,
             recipient_protected,
@@ -1272,13 +1287,13 @@ impl HsmProvider for SimHsm {
     /// pipeline can self-sign banks (IVD) without needing two
     /// trait-object views of the same SimHsm.
     #[cfg(feature = "crypto")]
-    fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        crate::HsmCryptoProvider::sign(self, key_id, data)
+    fn sign(&self, handle: KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        crate::HsmCryptoProvider::sign(self, handle, data)
     }
 
     #[cfg(feature = "crypto")]
-    fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
-        crate::HsmCryptoProvider::verify(self, key_id, data, signature)
+    fn verify(&self, handle: KeyHandle, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
+        crate::HsmCryptoProvider::verify(self, handle, data, signature)
     }
 }
 
@@ -1638,7 +1653,7 @@ mod tests {
             }],
             slots: vec![
                 KeySlot {
-                    key_id: "mykey".into(),
+                    key_id: "jwt-signing".into(),
                     key_kind: KEY_TYPE_EC_P256,
                     anchor_public_key: None,
                     allowed_guests: Some(vec!["bali-vm-1".into()]),
@@ -1709,7 +1724,7 @@ mod tests {
         // the on-disk layout even when private bytes come from
         // generate_missing_local_keys instead of the envelope.
         let manifest = std::fs::read_to_string(tmp.join("manifest")).unwrap();
-        assert!(manifest.contains("mykey EC-P256 keys/mykey.priv"));
+        assert!(manifest.contains("jwt-signing EC-P256 keys/jwt-signing.priv"));
         assert!(manifest.contains("allowed_guests=bali-vm-1"));
         assert!(manifest.contains("allowed_ops=SIGN,VERIFY"));
         assert!(manifest.contains("storage-key AES-256 keys/storage-key.bin"));
@@ -1721,17 +1736,17 @@ mod tests {
         // The key files MUST exist — generated locally by
         // generate_missing_local_keys since the envelope had no
         // private bytes.
-        assert!(tmp.join("keys/mykey.priv").exists());
-        assert!(tmp.join("keys/mykey.pub").exists());
+        assert!(tmp.join("keys/jwt-signing.priv").exists());
+        assert!(tmp.join("keys/jwt-signing.pub").exists());
         assert!(tmp.join("keys/storage-key.bin").exists());
         assert!(tmp.join("keys/bali-vm-1.pub").exists());
 
         // Verify PEM format of locally-generated key.
-        let priv_pem = std::fs::read_to_string(tmp.join("keys/mykey.priv")).unwrap();
+        let priv_pem = std::fs::read_to_string(tmp.join("keys/jwt-signing.priv")).unwrap();
         assert!(priv_pem.starts_with("-----BEGIN EC PRIVATE KEY-----\n"));
         assert!(priv_pem.ends_with("-----END EC PRIVATE KEY-----\n"));
 
-        let pub_pem = std::fs::read_to_string(tmp.join("keys/mykey.pub")).unwrap();
+        let pub_pem = std::fs::read_to_string(tmp.join("keys/jwt-signing.pub")).unwrap();
         assert!(pub_pem.starts_with("-----BEGIN PUBLIC KEY-----\n"));
 
         // AES key is 32 bytes of OS-CSPRNG output now (not a constant).
@@ -1746,7 +1761,7 @@ mod tests {
 
         let keys = hsm.list_keys().unwrap();
         assert_eq!(keys.len(), 2);
-        assert_eq!(keys[0].key_id, "mykey");
+        assert_eq!(keys[0].key_id, "jwt-signing");
         assert_eq!(keys[0].key_type, KeyType::EcP256);
         assert_eq!(keys[1].key_id, "storage-key");
         assert_eq!(keys[1].key_type, KeyType::Aes256);
@@ -1761,34 +1776,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
 
-        // First provision generates the EC key for "mykey"; no cert yet
+        // First provision generates the EC key for "jwt-signing"; no cert yet
         // (the leaf can only be issued from the CSR that key emits).
         hsm.write_keystore(&sample_keystore()).unwrap();
-        assert!(!tmp.join("keys/mykey.cert").exists());
-        assert!(tmp.join("keys/mykey.priv").exists());
+        assert!(!tmp.join("keys/jwt-signing.cert").exists());
+        assert!(tmp.join("keys/jwt-signing.priv").exists());
 
-        // Re-provision delivering the CA-issued leaf for "mykey" (the v3
+        // Re-provision delivering the CA-issued leaf for "jwt-signing" (the v3
         // top-level certificates list). get_certificate_der decodes the
         // PEM body back to DER, so any byte blob round-trips here.
         let leaf_der = vec![0x30, 0x82, 0x01, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
         let mut ks2 = sample_keystore();
         ks2.security_version = 2;
         ks2.certificates.push(payload::LeafCert {
-            key_id: "mykey".into(),
+            key_id: "jwt-signing".into(),
             certificate: leaf_der.clone(),
         });
         hsm.write_keystore(&ks2).unwrap();
 
         // The leaf landed on disk, the manifest records its cert_path, and
         // the runtime query returns the exact DER we shipped.
-        assert!(tmp.join("keys/mykey.cert").exists());
+        assert!(tmp.join("keys/jwt-signing.cert").exists());
         let manifest = std::fs::read_to_string(tmp.join("manifest")).unwrap();
-        assert!(manifest.contains("keys/mykey.cert"));
-        let got = crate::HsmCryptoProvider::get_certificate_der(&hsm, "mykey").unwrap();
+        assert!(manifest.contains("keys/jwt-signing.cert"));
+        let got = crate::HsmCryptoProvider::get_certificate_der(
+            &hsm,
+            crate::KeyRole::JwtSigning.handle(),
+        )
+        .unwrap();
         assert_eq!(got, leaf_der);
 
         // The re-provision kept the original keypair the leaf certifies.
-        assert!(tmp.join("keys/mykey.priv").exists());
+        assert!(tmp.join("keys/jwt-signing.priv").exists());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1902,14 +1921,16 @@ mod tests {
 
         // get_key_info MUST resolve ivd-signing via the disk fallback path
         // — that's the chain that lets sign() work pre-provision.
-        let info = <SimHsm as HsmCryptoProvider>::get_key_info(&hsm, "ivd-signing").unwrap();
+        let info = <SimHsm as HsmCryptoProvider>::get_key_info(&hsm, KeyRole::IvdSigning.handle())
+            .unwrap();
         assert_eq!(info.key_type, KeyType::EcP256);
 
         // sign() with the bootstrap IVD key must succeed without a
         // populated manifest. This is the bootstrap escape for the very
         // first HSM-keys flash: the device must be able to attest its
         // own banks before any envelope is processed.
-        let sig = <SimHsm as HsmCryptoProvider>::sign(&hsm, "ivd-signing", b"hello").unwrap();
+        let sig = <SimHsm as HsmCryptoProvider>::sign(&hsm, KeyRole::IvdSigning.handle(), b"hello")
+            .unwrap();
         assert!(!sig.is_empty(), "signature must be non-empty");
 
         // Idempotent — calling twice must not regenerate (would invalidate

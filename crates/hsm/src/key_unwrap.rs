@@ -17,19 +17,16 @@ use std::sync::{Arc, Mutex};
 use sumo_onboard::decryptor::KeyUnwrap;
 use sumo_onboard::error::Sum2Error;
 
-use crate::HsmProvider;
+use crate::{HsmProvider, KeyHandle};
 
 pub struct HsmKeyUnwrap {
     provider: Arc<Mutex<dyn HsmProvider>>,
-    key_id: String,
+    handle: KeyHandle,
 }
 
 impl HsmKeyUnwrap {
-    pub fn new(provider: Arc<Mutex<dyn HsmProvider>>, key_id: impl Into<String>) -> Self {
-        Self {
-            provider,
-            key_id: key_id.into(),
-        }
+    pub fn new(provider: Arc<Mutex<dyn HsmProvider>>, handle: KeyHandle) -> Self {
+        Self { provider, handle }
     }
 }
 
@@ -37,7 +34,7 @@ impl KeyUnwrap for HsmKeyUnwrap {
     fn unwrap_cek_a128kw(&self, wrapped_cek: &[u8]) -> Result<Vec<u8>, Sum2Error> {
         let guard = self.provider.lock().map_err(|_| Sum2Error::DecryptFailed)?;
         guard
-            .unwrap_cek_a128kw(&self.key_id, wrapped_cek)
+            .unwrap_cek_a128kw(self.handle, wrapped_cek)
             .map_err(|_| Sum2Error::DecryptFailed)
     }
 
@@ -49,7 +46,7 @@ impl KeyUnwrap for HsmKeyUnwrap {
     ) -> Result<Vec<u8>, Sum2Error> {
         let guard = self.provider.lock().map_err(|_| Sum2Error::DecryptFailed)?;
         guard
-            .unwrap_cek_ecdh_es(&self.key_id, ephem_pub, wrapped_cek, recipient_protected)
+            .unwrap_cek_ecdh_es(self.handle, ephem_pub, wrapped_cek, recipient_protected)
             .map_err(|_| Sum2Error::DecryptFailed)
     }
 }

@@ -26,6 +26,15 @@ pub mod qnx;
 pub use key_unwrap::HsmKeyUnwrap;
 pub use types::*;
 
+// The crypto contract (the handle-addressed trait + the shared types) lives in
+// the `hsm-contract` crate; re-export so existing `hsm::HsmCryptoProvider` /
+// `hsm::HsmError` / `hsm::KeyInfo` / `hsm::KeyType` / `hsm::KeyHandle` paths
+// keep resolving.
+pub use hsm_contract::{HsmCryptoProvider, HsmError, KeyHandle, KeyInfo, KeyType};
+// Re-export the wire/slot-registry crate so consumers can map key_id ↔ handle
+// (e.g. component-mgr's CSR endpoint) without taking a separate dependency.
+pub use vhsm_proto;
+
 /// HSM management provider.
 ///
 /// Implementors manage the HSM keystore and service lifecycle.
@@ -94,8 +103,12 @@ pub trait HsmProvider: Send {
     /// unwrap requests without needing a second trait-object view.
     ///
     /// Default impl returns `NotSupported`; concrete providers override.
-    fn unwrap_cek_a128kw(&self, key_id: &str, wrapped_cek: &[u8]) -> Result<Vec<u8>, HsmError> {
-        let _ = (key_id, wrapped_cek);
+    fn unwrap_cek_a128kw(
+        &self,
+        handle: KeyHandle,
+        wrapped_cek: &[u8],
+    ) -> Result<Vec<u8>, HsmError> {
+        let _ = (handle, wrapped_cek);
         Err(HsmError::NotSupported(
             "HsmProvider::unwrap_cek_a128kw".into(),
         ))
@@ -105,12 +118,12 @@ pub trait HsmProvider: Send {
     /// [`HsmCryptoProvider::unwrap_cek_ecdh_es`] for parameter docs.
     fn unwrap_cek_ecdh_es(
         &self,
-        key_id: &str,
+        handle: KeyHandle,
         ephem_pub: &[u8],
         wrapped_cek: &[u8],
         recipient_protected: &[u8],
     ) -> Result<Vec<u8>, HsmError> {
-        let _ = (key_id, ephem_pub, wrapped_cek, recipient_protected);
+        let _ = (handle, ephem_pub, wrapped_cek, recipient_protected);
         Err(HsmError::NotSupported(
             "HsmProvider::unwrap_cek_ecdh_es".into(),
         ))
@@ -121,8 +134,8 @@ pub trait HsmProvider: Send {
     /// OTA pipeline (which holds the HSM as
     /// `Arc<Mutex<dyn HsmProvider>>`) can self-sign bank dirs via the
     /// IVD machinery without needing a second trait-object view.
-    fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        let _ = (key_id, data);
+    fn sign(&self, handle: KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
+        let _ = (handle, data);
         Err(HsmError::NotSupported("HsmProvider::sign".into()))
     }
 
@@ -175,135 +188,12 @@ pub trait HsmProvider: Send {
 
     /// ECDSA-SHA256 verify delegated to the HSM. Mirror of `sign`,
     /// used by `sumo-verify` on the management path.
-    fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
-        let _ = (key_id, data, signature);
+    fn verify(&self, handle: KeyHandle, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
+        let _ = (handle, data, signature);
         Err(HsmError::NotSupported("HsmProvider::verify".into()))
     }
 }
 
-/// Crypto operations — keys never leave the HSM.
-///
-/// Guest-facing services (vhsm-ssd) delegate all crypto here.
-/// On production hardware, the implementation routes to the HSM
-/// firmware — private keys never leave the secure boundary.
-///
-/// In simulation mode, `SimHsm` reads PEM keys from the
-/// keystore and performs operations in software via RustCrypto.
-pub trait HsmCryptoProvider: Send + Sync {
-    /// ECDSA-SHA256 sign with EC-P256 key. Returns DER-encoded signature.
-    fn sign(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError>;
-
-    /// ECDSA-SHA256 sign with EC-P256 key. Returns the raw 64-byte
-    /// `r || s` signature (each 32 bytes, big-endian, zero-padded).
-    /// This is what COSE_Sign1 (RFC 9053) and JWS ES256 (RFC 7515)
-    /// expect; `sign` returns DER which is wrong for both.
-    ///
-    /// Default impl errors with NotSupported; concrete providers
-    /// MUST override if they want CWT minting / JWT signing to work.
-    fn sign_raw_p256(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        let _ = (key_id, data);
-        Err(HsmError::NotSupported(
-            "HsmCryptoProvider::sign_raw_p256".into(),
-        ))
-    }
-
-    /// ECDSA-SHA256 verify with EC-P256 key. Returns true if valid.
-    fn verify(&self, key_id: &str, data: &[u8], signature: &[u8]) -> Result<bool, HsmError>;
-
-    /// AES-256-GCM encrypt. Returns `iv(12) || ciphertext || tag(16)`.
-    fn encrypt(&self, key_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, HsmError>;
-
-    /// AES-256-GCM decrypt. Input is `iv(12) || ciphertext || tag(16)`.
-    fn decrypt(&self, key_id: &str, ciphertext: &[u8]) -> Result<Vec<u8>, HsmError>;
-
-    /// AES-CMAC generate. Returns 16-byte MAC tag.
-    fn mac_generate(&self, key_id: &str, data: &[u8]) -> Result<Vec<u8>, HsmError>;
-
-    /// AES-CMAC verify. Returns true if MAC is valid.
-    fn mac_verify(&self, key_id: &str, data: &[u8], mac: &[u8]) -> Result<bool, HsmError>;
-
-    /// HKDF-SHA256 derivation. AES-256 key as IKM, context as info.
-    fn derive(&self, key_id: &str, context: &[u8], len: usize) -> Result<Vec<u8>, HsmError>;
-
-    /// OS CSPRNG random bytes.
-    fn random(&self, len: usize) -> Result<Vec<u8>, HsmError>;
-
-    /// Retrieve X.509 certificate as raw DER bytes.
-    fn get_certificate_der(&self, key_id: &str) -> Result<Vec<u8>, HsmError>;
-
-    /// Retrieve public key as SubjectPublicKeyInfo DER bytes.
-    fn get_public_key_der(&self, key_id: &str) -> Result<Vec<u8>, HsmError>;
-
-    /// Retrieve a pinned trust-anchor CA root certificate as raw DER bytes.
-    ///
-    /// Unlike [`get_certificate_der`](Self::get_certificate_der) — a leaf for one
-    /// of the device's OWN key slots — this is a *foreign* CA root the device
-    /// pins (e.g. the delegation root), provisioned via the keystore's
-    /// `trust_anchors` list. `anchor_id` is e.g.
-    /// [`payload::DELEGATION_ROOT_ANCHOR_ID`](crate::payload::DELEGATION_ROOT_ANCHOR_ID).
-    /// Default: unsupported — a provider without a trust-anchor store declines,
-    /// which simply leaves delegated-token verification off.
-    fn get_trust_anchor_der(&self, _anchor_id: &str) -> Result<Vec<u8>, HsmError> {
-        Err(HsmError::NotSupported(
-            "this HSM provider has no trust-anchor store".into(),
-        ))
-    }
-
-    /// Get key metadata including ACL information.
-    fn get_key_info(&self, key_id: &str) -> Result<KeyInfo, HsmError>;
-
-    /// Generate a new key in the keystore.
-    ///
-    /// `alg` uses the VHSM_ALG_* constants as defined by the vHSM wire protocol:
-    /// - `0x0002` → AES-256 (symmetric)
-    /// - `0x0021` → ECC-P256 (asymmetric)
-    ///
-    /// Returns the public key as SubjectPublicKeyInfo DER for asymmetric
-    /// algorithms, or an empty `Vec` for symmetric ones. Implementations
-    /// may reject other algorithms with `NotSupported`.
-    fn generate_key(&self, key_id: &str, alg: u32) -> Result<Vec<u8>, HsmError> {
-        let _ = (key_id, alg);
-        Err(HsmError::NotSupported("generate_key".into()))
-    }
-
-    /// Generate a PKCS#10 CSR signed by the given key. Returns DER bytes.
-    /// Used for CSR-based device provisioning — device proves possession
-    /// of its private key without exposing it.
-    fn generate_csr(&self, key_id: &str, subject_cn: &str) -> Result<Vec<u8>, HsmError> {
-        let _ = (key_id, subject_cn);
-        Err(HsmError::NotSupported("CSR generation".into()))
-    }
-
-    /// AES-KW unwrap a 128-bit Content Encryption Key (CEK) using a
-    /// symmetric key stored in the HSM as `key_id`. Returns the 16-byte
-    /// unwrapped CEK. The KEK never leaves the HSM.
-    ///
-    /// Used by the SUIT decrypt path when the manifest's
-    /// COSE_Encrypt recipient algorithm is `A128KW` and the device
-    /// key is symmetric. See [`HsmProvider::unwrap_cek_ecdh_es`] for
-    /// the more common ECDH-ES+A128KW variant.
-    fn unwrap_cek_a128kw(&self, key_id: &str, wrapped_cek: &[u8]) -> Result<Vec<u8>, HsmError> {
-        let _ = (key_id, wrapped_cek);
-        Err(HsmError::NotSupported("unwrap_cek_a128kw".into()))
-    }
-
-    /// ECDH-ES+A128KW unwrap. The HSM performs ECDH with its EC private
-    /// key (referenced by `key_id`) against the sender's `ephem_pub`
-    /// public key, derives the wrapping key via Concat-KDF as specified
-    /// by COSE (with `recipient_protected` mixed into the KDF context),
-    /// and unwraps the `wrapped_cek` with AES-KW. Returns the 16-byte
-    /// CEK. The EC private key never leaves the HSM.
-    ///
-    /// `ephem_pub` is the sender's ephemeral EC-P256 public key in
-    /// uncompressed SEC1 form (65 bytes, leading 0x04).
-    fn unwrap_cek_ecdh_es(
-        &self,
-        key_id: &str,
-        ephem_pub: &[u8],
-        wrapped_cek: &[u8],
-        recipient_protected: &[u8],
-    ) -> Result<Vec<u8>, HsmError> {
-        let _ = (key_id, ephem_pub, wrapped_cek, recipient_protected);
-        Err(HsmError::NotSupported("unwrap_cek_ecdh_es".into()))
-    }
-}
+// `HsmCryptoProvider` (the handle-addressed crypto trait) now lives in the
+// shared `hsm-contract` crate and is re-exported above. SimHsm implements it
+// in `crypto.rs`.

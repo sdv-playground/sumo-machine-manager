@@ -71,7 +71,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{HsmError, HsmProvider};
+use crate::{HsmError, HsmProvider, KeyRole};
 
 /// Slot key_id used by `hsm.sign(...)` / `hsm.verify(...)`. Mirrors
 /// `KeyRole::IvdSigning.key_id()`.
@@ -471,7 +471,7 @@ pub fn sign_bank_with_files(
     let hash_ms = walk_hash_ms.unwrap_or(0);
 
     let sig_start = std::time::Instant::now();
-    let sig = hsm.sign(IVD_KEY_ID, &manifest_bytes)?;
+    let sig = hsm.sign(KeyRole::IvdSigning.handle(), &manifest_bytes)?;
     let sig_ms = sig_start.elapsed().as_millis() as u64;
 
     fs::write(bank_dir.join(IVD_MANIFEST_FILE), &manifest_bytes)
@@ -554,7 +554,7 @@ fn verify_bank_inner(
     // ---- Phase 1: signature verification ----
     let sig_start = std::time::Instant::now();
     let ok = hsm
-        .verify(IVD_KEY_ID, &manifest_bytes, &sig)
+        .verify(KeyRole::IvdSigning.handle(), &manifest_bytes, &sig)
         .map_err(IvdError::Hsm)?;
     let sig_verify_ms = sig_start.elapsed().as_millis() as u64;
     if !ok {
@@ -734,7 +734,7 @@ pub fn read_manifest(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<VerifiedM
     // Signature verification over the exact on-disk bytes — must pass
     // before we trust anything the manifest claims.
     let ok = hsm
-        .verify(IVD_KEY_ID, &manifest_bytes, &sig)
+        .verify(KeyRole::IvdSigning.handle(), &manifest_bytes, &sig)
         .map_err(IvdError::Hsm)?;
     if !ok {
         return Err(IvdError::SignatureInvalid);
@@ -1311,7 +1311,11 @@ mod tests {
             std::fs::read(bank.join(IVD_SIGNATURE_FILE)).unwrap()
         );
         assert!(hsm
-            .verify(IVD_KEY_ID, &vm.manifest_bytes, &vm.signature)
+            .verify(
+                KeyRole::IvdSigning.handle(),
+                &vm.manifest_bytes,
+                &vm.signature
+            )
             .unwrap());
 
         let _ = std::fs::remove_dir_all(&bank);

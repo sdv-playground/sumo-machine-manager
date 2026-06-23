@@ -9,6 +9,7 @@ members = [
     "crates/machine-mgr",
     "crates/vm-service",
     "crates/hsm",
+    "crates/hsm-contract",
     "crates/sumo-factory-reset-mint",
     "crates/sumo-verify",
     "crates/policy-eval",

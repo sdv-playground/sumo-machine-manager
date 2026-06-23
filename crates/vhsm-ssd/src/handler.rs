@@ -216,23 +216,13 @@ fn handle_key_generate(
     let mut label = [0u8; LABEL_LEN];
     label.copy_from_slice(&req.payload[12..12 + LABEL_LEN]);
 
-    // Generate a key_id for internal use
+    // Audit label for the dynamic entry. The SimHsm storage name is derived
+    // from the handle (key_id_for_handle → `dyn-{handle:08x}`), not this label;
+    // the crypto contract is handle-addressed.
     let key_id = format!("gen-{}-{}", caller.vm_id, handle_table.len());
 
-    // Actually create the key material on disk (AES .bin or EC .priv+.pub)
-    // and collect the public key DER (empty for symmetric).
-    let pubkey = match crypto.generate_key(&key_id, algorithm) {
-        Ok(pk) => pk,
-        Err(e) => {
-            tracing::warn!(key = %key_id, alg = algorithm, error = %e, "generate_key failed");
-            let status = match e {
-                hsm::HsmError::NotSupported(_) => StatusCode::InvalidParam,
-                _ => StatusCode::Internal,
-            };
-            return Response::err(req.op, req.session_id, status);
-        }
-    };
-
+    // Allocate the handle FIRST so the key material is created under its
+    // handle-derived name (generate_key is addressed by KeyHandle).
     let handle = match handle_table.allocate(
         &key_id,
         algorithm,
@@ -243,6 +233,20 @@ fn handle_key_generate(
     ) {
         Some(h) => h,
         None => return Response::err(req.op, req.session_id, StatusCode::NoResource),
+    };
+
+    // Create the key material on disk (AES .bin or EC .priv+.pub) bound to the
+    // handle, and collect the public key DER (empty for symmetric).
+    let pubkey = match crypto.generate_key(hsm::KeyHandle(handle), algorithm) {
+        Ok(pk) => pk,
+        Err(e) => {
+            tracing::warn!(key = %key_id, alg = algorithm, error = %e, "generate_key failed");
+            let status = match e {
+                hsm::HsmError::NotSupported(_) => StatusCode::InvalidParam,
+                _ => StatusCode::Internal,
+            };
+            return Response::err(req.op, req.session_id, status);
+        }
     };
 
     // Response: handle(4) + pubkey_len(4) + pubkey
@@ -297,21 +301,21 @@ fn handle_crypto_with_handle(
     let data = &req.payload[4..];
 
     match op {
-        Op::Sign => match crypto.sign(key_id, data) {
+        Op::Sign => match crypto.sign(hsm::KeyHandle(handle), data) {
             Ok(sig) => Response::ok(req.op, req.session_id, sig),
             Err(e) => {
                 tracing::warn!(key = %key_id, error = %e, "sign failed");
                 Response::err(req.op, req.session_id, StatusCode::CryptoError)
             }
         },
-        Op::Encrypt => match crypto.encrypt(key_id, data) {
+        Op::Encrypt => match crypto.encrypt(hsm::KeyHandle(handle), data) {
             Ok(ct) => Response::ok(req.op, req.session_id, ct),
             Err(e) => {
                 tracing::warn!(key = %key_id, error = %e, "encrypt failed");
                 Response::err(req.op, req.session_id, StatusCode::CryptoError)
             }
         },
-        Op::Decrypt => match crypto.decrypt(key_id, data) {
+        Op::Decrypt => match crypto.decrypt(hsm::KeyHandle(handle), data) {
             Ok(pt) => Response::ok(req.op, req.session_id, pt),
             Err(e) => {
                 tracing::warn!(key = %key_id, error = %e, "decrypt failed");
@@ -320,7 +324,7 @@ fn handle_crypto_with_handle(
         },
         Op::MacGenerate => {
             // payload: data (variable length)
-            match crypto.mac_generate(key_id, data) {
+            match crypto.mac_generate(hsm::KeyHandle(handle), data) {
                 Ok(mac) => Response::ok(req.op, req.session_id, mac),
                 Err(e) => {
                     tracing::warn!(key = %key_id, error = %e, "mac_generate failed");
@@ -339,7 +343,7 @@ fn handle_crypto_with_handle(
             }
             let mac_tag = &data[4..4 + mac_len];
             let mac_data = &data[4 + mac_len..];
-            match crypto.mac_verify(key_id, mac_data, mac_tag) {
+            match crypto.mac_verify(hsm::KeyHandle(handle), mac_data, mac_tag) {
                 Ok(true) => Response::ok(req.op, req.session_id, Vec::new()),
                 Ok(false) => Response::err(req.op, req.session_id, StatusCode::CryptoError),
                 Err(e) => {
@@ -406,7 +410,7 @@ fn handle_verify(
     }
     let hash = &rest[hash_start + 4..hash_start + 4 + hash_len];
 
-    match crypto.verify(&entry.key_id, hash, signature) {
+    match crypto.verify(hsm::KeyHandle(handle), hash, signature) {
         Ok(true) => Response::ok(req.op, req.session_id, Vec::new()),
         Ok(false) => Response::err(req.op, req.session_id, StatusCode::CryptoError),
         Err(e) => {
@@ -480,7 +484,7 @@ fn handle_get_pubkey(
         return Response::err(req.op, req.session_id, StatusCode::PermissionDeny);
     }
 
-    match crypto.get_public_key_der(&entry.key_id) {
+    match crypto.get_public_key_der(hsm::KeyHandle(handle)) {
         Ok(pk) => {
             let mut result = Vec::with_capacity(4 + pk.len());
             result.extend_from_slice(&(pk.len() as u32).to_le_bytes());
@@ -529,7 +533,7 @@ fn handle_get_cert(
         return Response::err(req.op, req.session_id, StatusCode::PermissionDeny);
     }
 
-    match crypto.get_certificate_der(&entry.key_id) {
+    match crypto.get_certificate_der(hsm::KeyHandle(handle)) {
         Ok(cert) => {
             let mut result = Vec::with_capacity(4 + cert.len());
             result.extend_from_slice(&(cert.len() as u32).to_le_bytes());
@@ -611,8 +615,9 @@ mod tests {
 
         // Key file must actually exist on disk (regression test for the
         // pre-fix TODO where the handler allocated handles without calling
-        // generate_key — mac-generate then failed with CRYPTO_ERROR).
-        assert!(keys_dir.join("gen-vm1-0.bin").exists());
+        // generate_key — mac-generate then failed with CRYPTO_ERROR). The key
+        // is stored under its handle-derived name (dyn-{handle:08x}).
+        assert!(keys_dir.join(format!("dyn-{handle:08x}.bin")).exists());
     }
 
     #[test]
@@ -635,8 +640,10 @@ mod tests {
         // SubjectPublicKeyInfo DER starts with SEQUENCE (0x30).
         assert_eq!(pubkey[0], 0x30);
 
-        assert!(keys_dir.join("gen-vm1-0.priv").exists());
-        assert!(keys_dir.join("gen-vm1-0.pub").exists());
+        // The key is stored under its handle-derived name (dyn-{handle:08x}).
+        let handle = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert!(keys_dir.join(format!("dyn-{handle:08x}.priv")).exists());
+        assert!(keys_dir.join(format!("dyn-{handle:08x}.pub")).exists());
     }
 
     #[test]
@@ -735,10 +742,13 @@ mod tests {
         assert_eq!(resp.status, StatusCode::Ok as u32);
         let handle = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
 
-        let key_id = table.get(handle).expect("handle in table").key_id.clone();
-        let mac = hsm.mac_generate(&key_id, b"hello").unwrap();
+        // The generated key is addressed by its handle (SimHsm names it
+        // deterministically from the handle, not the entry's audit key_id).
+        let mac = hsm.mac_generate(hsm::KeyHandle(handle), b"hello").unwrap();
         assert_eq!(mac.len(), 16, "AES-CMAC tag");
-        assert!(hsm.mac_verify(&key_id, b"hello", &mac).unwrap());
+        assert!(hsm
+            .mac_verify(hsm::KeyHandle(handle), b"hello", &mac)
+            .unwrap());
     }
 
     /// Host-only ops (KeyImport / KeyDerive / KeyDelete) must return

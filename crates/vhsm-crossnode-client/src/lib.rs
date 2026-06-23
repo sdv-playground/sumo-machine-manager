@@ -170,12 +170,12 @@ mod tests {
         // signer that handle sw-authority points at.
         let server_dir = tempfile::tempdir().unwrap();
         let server_hsm = SimHsm::new(PathBuf::from("unused"), server_dir.path().to_path_buf(), 0);
-        let tls_kid = KeyRole::TlsIdentity.key_id();
+        let tls_kid = KeyRole::TlsIdentity.handle();
         let server_spki = server_hsm.generate_key(tls_kid, ALG_ECC_P256).unwrap();
-        // IAM matches on the handle's key_id, so the signer key_id must equal the
-        // name the policy authorizes ("sw-authority").
+        // The well-known handle resolves to key_id "sw-authority", the name the
+        // policy authorizes.
         server_hsm
-            .generate_key("sw-authority", ALG_ECC_P256)
+            .generate_key(KeyRole::SoftwareAuthority.handle(), ALG_ECC_P256)
             .unwrap();
         let server_leaf = issue_leaf(
             &ca_key,
@@ -240,7 +240,7 @@ mod tests {
         // connector under test.
         let client_dir = tempfile::tempdir().unwrap();
         let client_hsm = SimHsm::new(PathBuf::from("unused"), client_dir.path().to_path_buf(), 0);
-        let client_kid = "client-tls";
+        let client_kid = KeyRole::TlsIdentity.handle();
         let client_spki = client_hsm.generate_key(client_kid, ALG_ECC_P256).unwrap();
         let client_leaf = issue_leaf(
             &ca_key,
@@ -253,9 +253,8 @@ mod tests {
         );
         let client_hsm = Arc::new(client_hsm);
         let sign_hsm = client_hsm.clone();
-        let kid_owned = client_kid.to_string();
         let sign_fn = move |m: &[u8]| {
-            HsmCryptoProvider::sign(&*sign_hsm, &kid_owned, m).map_err(|e| e.to_string())
+            HsmCryptoProvider::sign(&*sign_hsm, client_kid, m).map_err(|e| e.to_string())
         };
 
         let cfg = Arc::new(client_config(sign_fn, vec![client_leaf], &root_pem).unwrap());

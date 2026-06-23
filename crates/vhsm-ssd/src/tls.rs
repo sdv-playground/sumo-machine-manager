@@ -37,18 +37,17 @@ pub fn identity_root_store(pem: &[u8]) -> Result<RootCertStore, BoxError> {
 /// the private key never leaves it.
 pub fn server_config(
     crypto: Arc<dyn HsmCryptoProvider>,
-    tls_key_id: &str,
+    tls_handle: hsm::KeyHandle,
     server_chain: Vec<CertificateDer<'static>>,
     client_roots: RootCertStore,
 ) -> Result<ServerConfig, BoxError> {
     // Idempotent — first caller installs the ring provider, the rest no-op.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let kid = tls_key_id.to_string();
     // ECDSA-P256/SHA-256 DER over the message — rustls hands the signer the
     // CertificateVerify message (not a digest), so the HSM's ordinary `sign` is
     // exactly the primitive (no pre-hash). See hsm-rustls.
-    let sign_fn = move |msg: &[u8]| crypto.sign(&kid, msg).map_err(|e| e.to_string());
+    let sign_fn = move |msg: &[u8]| crypto.sign(tls_handle, msg).map_err(|e| e.to_string());
     let certified = hsm_rustls::hsm_certified_key(server_chain, sign_fn);
     let resolver = Arc::new(hsm_rustls::HsmServerIdentity::new(certified));
 
@@ -194,7 +193,7 @@ mod tests {
             dir.path().to_path_buf(),
             0,
         );
-        let kid = KeyRole::TlsIdentity.key_id();
+        let kid = KeyRole::TlsIdentity.handle();
         let server_spki = hsm.generate_key(kid, ALG_ECC_P256).unwrap();
         let server_leaf = issue_leaf(
             &ca_key,
