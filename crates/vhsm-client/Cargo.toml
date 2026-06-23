@@ -2,12 +2,26 @@
 name = "vhsm-client"
 version = "0.1.0"
 edition = "2021"
-description = "Platform-agnostic client for the vHSM wire protocol — cross-node, cert-as-principal"
+description = "The one v3 vHSM wire client — pluggable transport (caller stream / TCP / AF_UNIX / QNX devctl) + optional guest CWT handshake"
 
 [dependencies]
-# The shared wire contract (op codes, status, framing). The ONLY runtime dep:
-# the client is transport-agnostic and brings in no TLS/TCP itself.
+# The shared wire contract (op codes, status, framing, well-known handles).
 vhsm-proto = { path = "../vhsm-proto" }
+
+# guest-auth: the in-band v3 CWT handshake (HELLO/AUTH/ENROLL) the guest
+# vhsm-daemons run on their upstream connection. Optional — host crypto callers
+# (cross-node mTLS, the vhsm-provider) authenticate out of band and don't need it.
+p256 = { version = "0.13", features = ["ecdsa"], optional = true }
+sha2 = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true }
+
+# QNX `/dev/vhsm` devctl transport — only compiled for nto.
+[target.'cfg(target_os = "nto")'.dependencies]
+libc = "0.2"
+
+[features]
+# Pull in the guest-side handshake layer (see `auth`).
+guest-auth = ["dep:p256", "dep:sha2", "dep:rand"]
 
 [dev-dependencies]
 # The interop test drives the REAL daemon dispatch over a loopback TCP socket,

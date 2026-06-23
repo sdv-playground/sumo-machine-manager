@@ -1,38 +1,52 @@
-//! Platform-agnostic client for the vHSM wire protocol (v3).
+//! The v3 vHSM wire client.
 //!
-//! Speaks the same [`vhsm_proto`] framing as the `vhsm-ssd` daemon, over any
-//! `Read + Write` stream — a plain `TcpStream` on the in-vehicle private
-//! bridge, or a mutually-authenticated rustls TLS stream for cross-node calls.
-//! The transport (and, for cross-node, the mTLS handshake that establishes the
-//! calling node's identity) is the *caller's* concern; this crate only encodes
-//! ops and decodes responses. That keeps it portable — `guest-vm-sdk` can reuse
-//! it unchanged, and a host cross-node service can hand it an HSM-backed TLS
-//! stream.
+//! One client for every caller of the vHSM wire protocol — the host cross-node
+//! path (a caller-supplied mTLS `Read + Write` stream) and the in-guest path
+//! (TCP, AF_UNIX, or the QNX `/dev/vhsm` devctl). The wire framing
+//! ([`vhsm_proto`]) is identical across carriers; only the carrier differs,
+//! abstracted behind the [`Transport`] trait.
 //!
-//! ## Identity (read before wiring auth)
+//! Keys are addressed by their numeric `handle` (the slot number from the
+//! [`vhsm_proto`] registry). This crate is the WIRE layer — it depends only on
+//! `vhsm_proto`, never `hsm-contract`; the typed `KeyHandle` /
+//! `HsmCryptoProvider` bridge lives one layer up in `vhsm-provider`.
 //!
-//! This client does **not** perform the in-band v3 CWT handshake
-//! (HELLO/AUTH/ENROLL). That flow authenticates a *guest VM* by source IP plus
-//! a bootstrap cert and is spoken by the C guest client (`libvhsm`). The Rust
-//! client targets the *cross-node* path, where the principal is the TLS client
-//! certificate — the node's HSM-backed `TlsIdentity` leaf — and the peer's IAM
-//! authorises that node per-op. There is no `random component does cross-node
-//! calls` hole: a caller can only obtain a usable stream by completing the mTLS
-//! handshake with a cert the peer's `identity-root` trusts, and the peer then
-//! gates every op through IAM keyed on the cert subject.
+//! ## Identity
 //!
-//! `session_id` here is a client-side correlation counter, not a security
-//! token; the daemon echoes it back and the client checks it to catch a desync.
+//! Crypto ops carry no in-band credential: the daemon authorises by the
+//! connection's established identity — source IP on the private bridge,
+//! SO_PEERCRED on the UDS, caller uid on devctl, or the mTLS client cert on the
+//! cross-node path. The optional `guest-auth` feature adds the in-band v3 CWT
+//! handshake (HELLO/AUTH/ENROLL) the guest vhsm-daemons run on their upstream
+//! connection — see [`auth`].
+//!
+//! `session_id` is a client-side correlation counter, not a security token; the
+//! daemon echoes it and the client checks it to catch a framing desync.
 
 use std::io::{self, Read, Write};
 
 use vhsm_proto::codec::{read_response, write_request};
-use vhsm_proto::{Op, Request, StatusCode};
+use vhsm_proto::{Op, Request, Response, StatusCode};
+
+#[cfg(feature = "guest-auth")]
+pub mod auth;
+
+#[cfg(target_os = "nto")]
+mod transport_devctl;
+#[cfg(target_os = "nto")]
+pub use transport_devctl::{DevctlTransport, DEFAULT_DEVCTL_PATH};
+
+/// Default `host:port` when `VHSM_HOST` is unset — the local vHSM endpoint.
+pub const DEFAULT_VHSM_HOST: &str = "127.0.0.1:5100";
+
+/// Default AF_UNIX path the local guest vhsm-daemon listens on.
+#[cfg(unix)]
+pub const DEFAULT_UDS_PATH: &str = "/run/sumo/vhsm.sock";
 
 /// An error from a vHSM client call.
 #[derive(Debug)]
 pub enum ClientError {
-    /// Transport-level failure (connection closed, short read/write).
+    /// Transport-level failure (connection closed, short read/write, devctl errno).
     Io(io::Error),
     /// The daemon returned a non-OK status for the op.
     Status(StatusCode),
@@ -74,48 +88,95 @@ impl From<io::Error> for ClientError {
 /// Result alias for client calls.
 pub type Result<T> = std::result::Result<T, ClientError>;
 
-/// A synchronous vHSM client over a single connected stream.
+/// A carrier for the vHSM wire protocol: one request in, one response out.
+///
+/// Implemented for any `Read + Write` stream (TCP, AF_UNIX, an mTLS stream) via
+/// the blanket impl below, and directly by [`DevctlTransport`] on QNX (where a
+/// request is a `devctl` syscall, not a byte stream).
+pub trait Transport {
+    /// Send one framed request and return the parsed response.
+    fn request(&mut self, op: u32, session_id: u32, payload: &[u8]) -> io::Result<Response>;
+}
+
+impl<S: Read + Write> Transport for S {
+    fn request(&mut self, op: u32, session_id: u32, payload: &[u8]) -> io::Result<Response> {
+        let req = Request {
+            op,
+            session_id,
+            payload: payload.to_vec(),
+        };
+        write_request(self, &req)?;
+        read_response(self)
+    }
+}
+
+/// Parsed handle metadata from [`VhsmClient::get_handle_info`].
+#[derive(Debug, Clone)]
+pub struct HandleInfo {
+    pub handle: u32,
+    pub algorithm: u32,
+    pub permitted_ops: u32,
+    pub persistent: bool,
+    pub label: [u8; vhsm_proto::LABEL_LEN],
+}
+
+/// A transport chosen by the convenience constructors ([`VhsmClient::connect`],
+/// [`VhsmClient::connect_local`], …). The cross-node path constructs
+/// `VhsmClient::new(stream)` over a caller-supplied stream instead.
+pub enum OwnedTransport {
+    Tcp(std::net::TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+    #[cfg(target_os = "nto")]
+    Devctl(DevctlTransport),
+}
+
+impl Transport for OwnedTransport {
+    fn request(&mut self, op: u32, session_id: u32, payload: &[u8]) -> io::Result<Response> {
+        match self {
+            OwnedTransport::Tcp(s) => s.request(op, session_id, payload),
+            #[cfg(unix)]
+            OwnedTransport::Unix(s) => s.request(op, session_id, payload),
+            #[cfg(target_os = "nto")]
+            OwnedTransport::Devctl(d) => d.request(op, session_id, payload),
+        }
+    }
+}
+
+/// A synchronous vHSM client over a single connected [`Transport`].
 ///
 /// One request/response per op, strictly ordered — the daemon serves a
-/// connection sequentially, so the client mirrors that. Construct with an
-/// already-connected (and, for cross-node, already-authenticated) stream.
-pub struct VhsmClient<S> {
-    stream: S,
+/// connection sequentially, so the client mirrors that.
+pub struct VhsmClient<T> {
+    transport: T,
     next_session: u32,
 }
 
-impl<S: Read + Write> VhsmClient<S> {
-    /// Wrap a connected stream. The stream must already be open; for the
-    /// cross-node path it must already have completed the mTLS handshake.
-    pub fn new(stream: S) -> Self {
+impl<T: Transport> VhsmClient<T> {
+    /// Wrap a connected transport. For the cross-node path this is a stream that
+    /// has already completed the mTLS handshake; for the in-guest path use the
+    /// [`connect`](Self::connect) / [`connect_local`](Self::connect_local)
+    /// constructors which build an [`OwnedTransport`].
+    pub fn new(transport: T) -> Self {
         Self {
-            stream,
+            transport,
             next_session: 1,
         }
     }
 
-    /// Consume the client and return the underlying stream (e.g. to close it
-    /// explicitly or reclaim a TLS connection).
-    pub fn into_inner(self) -> S {
-        self.stream
+    /// Consume the client and return the underlying transport.
+    pub fn into_inner(self) -> T {
+        self.transport
     }
 
-    /// One request/response round-trip. Returns the OK payload, or maps a
-    /// non-OK status into [`ClientError::Status`]. Verifies the response's op
-    /// and session id match the request so a framing desync fails loud rather
-    /// than silently returning the wrong op's bytes.
+    /// One request/response round-trip. Verifies the response's op and session
+    /// id match the request so a framing desync fails loud.
     fn call(&mut self, op: Op, payload: Vec<u8>) -> Result<Vec<u8>> {
         let session_id = self.next_session;
         // Never reuse 0; wrap back to 1 so the id stays a tidy nonzero counter.
         self.next_session = self.next_session.wrapping_add(1).max(1);
 
-        let req = Request {
-            op: op as u32,
-            session_id,
-            payload,
-        };
-        write_request(&mut self.stream, &req)?;
-        let resp = read_response(&mut self.stream)?;
+        let resp = self.transport.request(op as u32, session_id, &payload)?;
 
         if resp.op != op as u32 {
             return Err(ClientError::Protocol(format!(
@@ -137,15 +198,14 @@ impl<S: Read + Write> VhsmClient<S> {
         }
     }
 
-    /// `GetRandom`: request `count` random bytes (the daemon caps this at
-    /// `vhsm_proto::MAX_RANDOM`).
+    /// `GetRandom`: request `count` random bytes (daemon caps at `MAX_RANDOM`).
     pub fn get_random(&mut self, count: usize) -> Result<Vec<u8>> {
         self.call(Op::GetRandom, (count as u32).to_le_bytes().to_vec())
     }
 
-    /// `Sign`: sign `message` with the key behind `handle`. Returns the
-    /// signature (DER `r || s` for P-256). The daemon hashes the message
-    /// internally (SHA-256 for P-256) — pass the message, not a digest.
+    /// `Sign`: sign `message` with the key behind `handle`. Returns the DER
+    /// `r || s` signature for P-256. The daemon hashes the message internally
+    /// (SHA-256 for P-256) — pass the message, not a digest.
     pub fn sign(&mut self, handle: u32, message: &[u8]) -> Result<Vec<u8>> {
         let mut payload = handle.to_le_bytes().to_vec();
         payload.extend_from_slice(message);
@@ -153,10 +213,8 @@ impl<S: Read + Write> VhsmClient<S> {
     }
 
     /// `Verify`: check `signature` over `message` against the key behind
-    /// `handle`. Returns `true` for a valid signature and `false` for a
-    /// cryptographic mismatch (the daemon's `CryptoError` for a bad sig is
-    /// surfaced as `Ok(false)`, not an `Err`). A missing handle or a denied
-    /// permission still returns `Err`.
+    /// `handle`. A cryptographic mismatch is `Ok(false)`, not `Err`; a missing
+    /// handle or denied permission is `Err`.
     pub fn verify(&mut self, handle: u32, message: &[u8], signature: &[u8]) -> Result<bool> {
         // payload: handle(4) + sig_len(4) + sig + msg_len(4) + msg
         let mut payload = Vec::with_capacity(12 + signature.len() + message.len());
@@ -166,6 +224,44 @@ impl<S: Read + Write> VhsmClient<S> {
         payload.extend_from_slice(&(message.len() as u32).to_le_bytes());
         payload.extend_from_slice(message);
         match self.call(Op::Verify, payload) {
+            Ok(_) => Ok(true),
+            Err(ClientError::Status(StatusCode::CryptoError)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `Encrypt`: AES-GCM `plaintext` under the key behind `handle`. Returns
+    /// `iv(12) || ciphertext || tag`.
+    pub fn encrypt(&mut self, handle: u32, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut payload = handle.to_le_bytes().to_vec();
+        payload.extend_from_slice(plaintext);
+        self.call(Op::Encrypt, payload)
+    }
+
+    /// `Decrypt`: inverse of [`encrypt`](Self::encrypt).
+    pub fn decrypt(&mut self, handle: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        let mut payload = handle.to_le_bytes().to_vec();
+        payload.extend_from_slice(ciphertext);
+        self.call(Op::Decrypt, payload)
+    }
+
+    /// `MacGenerate`: AES-CMAC tag over `data` under the key behind `handle`.
+    pub fn mac_generate(&mut self, handle: u32, data: &[u8]) -> Result<Vec<u8>> {
+        let mut payload = handle.to_le_bytes().to_vec();
+        payload.extend_from_slice(data);
+        self.call(Op::MacGenerate, payload)
+    }
+
+    /// `MacVerify`: check `mac` over `data`. Like [`verify`](Self::verify), a
+    /// cryptographic mismatch is `Ok(false)`.
+    pub fn mac_verify(&mut self, handle: u32, mac: &[u8], data: &[u8]) -> Result<bool> {
+        // payload: handle(4) + mac_len(4) + mac + data
+        let mut payload = Vec::with_capacity(8 + mac.len() + data.len());
+        payload.extend_from_slice(&handle.to_le_bytes());
+        payload.extend_from_slice(&(mac.len() as u32).to_le_bytes());
+        payload.extend_from_slice(mac);
+        payload.extend_from_slice(data);
+        match self.call(Op::MacVerify, payload) {
             Ok(_) => Ok(true),
             Err(ClientError::Status(StatusCode::CryptoError)) => Ok(false),
             Err(e) => Err(e),
@@ -184,20 +280,121 @@ impl<S: Read + Write> VhsmClient<S> {
         read_len_prefixed(&resp)
     }
 
-    /// `Encrypt`: AES-GCM `plaintext` under the key behind `handle`. Returns
-    /// `iv(12) || ciphertext || tag`.
-    pub fn encrypt(&mut self, handle: u32, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mut payload = handle.to_le_bytes().to_vec();
-        payload.extend_from_slice(plaintext);
-        self.call(Op::Encrypt, payload)
+    /// `GetHandleInfo`: metadata (algorithm, permitted ops, label) for `handle`.
+    pub fn get_handle_info(&mut self, handle: u32) -> Result<HandleInfo> {
+        let resp = self.call(Op::GetHandleInfo, handle.to_le_bytes().to_vec())?;
+        // Response: handle(4) algorithm(4) permitted_ops(4) persistent(1) pad(3) label(32) = 48
+        if resp.len() < 48 {
+            return Err(ClientError::Protocol(format!(
+                "GetHandleInfo response too short: {} bytes",
+                resp.len()
+            )));
+        }
+        let mut label = [0u8; vhsm_proto::LABEL_LEN];
+        label.copy_from_slice(&resp[16..16 + vhsm_proto::LABEL_LEN]);
+        Ok(HandleInfo {
+            handle: u32::from_le_bytes(resp[0..4].try_into().unwrap()),
+            algorithm: u32::from_le_bytes(resp[4..8].try_into().unwrap()),
+            permitted_ops: u32::from_le_bytes(resp[8..12].try_into().unwrap()),
+            persistent: resp[12] != 0,
+            label,
+        })
     }
 
-    /// `Decrypt`: inverse of [`encrypt`](Self::encrypt) — expects
-    /// `iv(12) || ciphertext || tag`.
-    pub fn decrypt(&mut self, handle: u32, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let mut payload = handle.to_le_bytes().to_vec();
-        payload.extend_from_slice(ciphertext);
-        self.call(Op::Decrypt, payload)
+    /// `KeyGenerate`: allocate a fresh key. Returns `(handle, public_key_der)`;
+    /// the pubkey is empty for symmetric algorithms. Note the daemon ALLOCATES
+    /// the handle (dynamic range) and returns it — this is the wire's
+    /// allocate-semantic, distinct from the handle-targeted
+    /// `HsmCryptoProvider::generate_key`.
+    pub fn key_generate(
+        &mut self,
+        algorithm: u32,
+        permitted_ops: u32,
+        persistent: bool,
+        label: &str,
+    ) -> Result<(u32, Vec<u8>)> {
+        // payload: algorithm(4) permitted_ops(4) persistent(1) pad(3) label(32) = 44
+        let mut payload = Vec::with_capacity(44);
+        payload.extend_from_slice(&algorithm.to_le_bytes());
+        payload.extend_from_slice(&permitted_ops.to_le_bytes());
+        payload.push(if persistent { 1 } else { 0 });
+        payload.extend_from_slice(&[0u8; 3]);
+        let mut lbl = [0u8; vhsm_proto::LABEL_LEN];
+        let bytes = label.as_bytes();
+        let copy_len = bytes.len().min(vhsm_proto::LABEL_LEN);
+        lbl[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        payload.extend_from_slice(&lbl);
+
+        let resp = self.call(Op::KeyGenerate, payload)?;
+        if resp.len() < 8 {
+            return Err(ClientError::Protocol(format!(
+                "KeyGenerate response too short: {} bytes",
+                resp.len()
+            )));
+        }
+        let handle = u32::from_le_bytes(resp[0..4].try_into().unwrap());
+        let pubkey_len = u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
+        let pubkey = resp.get(8..8 + pubkey_len).unwrap_or(&[]).to_vec();
+        Ok((handle, pubkey))
+    }
+
+    /// Send a raw op code with a verbatim payload, returning the daemon's status
+    /// + response payload without translating the status to a typed error. An
+    /// escape hatch for diagnostics (host-only ops, malformed-payload probes).
+    pub fn raw_request(&mut self, op: u32, payload: &[u8]) -> Result<(u32, Vec<u8>)> {
+        let session_id = self.next_session;
+        self.next_session = self.next_session.wrapping_add(1).max(1);
+        let resp = self.transport.request(op, session_id, payload)?;
+        Ok((resp.status, resp.payload))
+    }
+}
+
+impl VhsmClient<OwnedTransport> {
+    /// Connect via TCP to an explicit `host:port` (the unauthenticated bridge
+    /// path; the daemon's policy is the gate).
+    pub fn connect(addr: &str) -> Result<Self> {
+        let stream = std::net::TcpStream::connect(addr)?;
+        // Small request/response — latency matters. Best-effort.
+        let _ = stream.set_nodelay(true);
+        Ok(VhsmClient::new(OwnedTransport::Tcp(stream)))
+    }
+
+    /// Connect to the local guest vhsm-daemon over AF_UNIX (it SO_PEERCRED-gates
+    /// each accept before forwarding upstream).
+    #[cfg(unix)]
+    pub fn connect_uds<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let stream = std::os::unix::net::UnixStream::connect(path)?;
+        Ok(VhsmClient::new(OwnedTransport::Unix(stream)))
+    }
+
+    /// Connect via the OS-native privileged path: QNX `/dev/vhsm` devctl, Linux
+    /// AF_UNIX to the local daemon (falling back to `$VHSM_HOST` TCP), or plain
+    /// TCP elsewhere.
+    pub fn connect_local() -> Result<Self> {
+        #[cfg(target_os = "nto")]
+        {
+            let d = DevctlTransport::open(DEFAULT_DEVCTL_PATH)?;
+            Ok(VhsmClient::new(OwnedTransport::Devctl(d)))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(stream) = std::os::unix::net::UnixStream::connect(DEFAULT_UDS_PATH) {
+                return Ok(VhsmClient::new(OwnedTransport::Unix(stream)));
+            }
+            Self::open()
+        }
+        #[cfg(not(any(target_os = "nto", target_os = "linux")))]
+        {
+            Self::open()
+        }
+    }
+
+    /// Connect using `$VHSM_HOST` (falling back to [`DEFAULT_VHSM_HOST`]).
+    /// Always TCP — use [`connect_local`](Self::connect_local) for the
+    /// OS-native privileged path.
+    pub fn open() -> Result<Self> {
+        let addr = std::env::var("VHSM_HOST").unwrap_or_else(|_| DEFAULT_VHSM_HOST.to_string());
+        Self::connect(&addr)
     }
 }
 
@@ -242,7 +439,7 @@ mod tests {
     /// with a single EC-P256 signer registered at [`TEST_HANDLE`]. This is the
     /// genuine server dispatch (`handle_request`) over a real socket, so the
     /// client's framing is proven against the code it will talk to in
-    /// production — not a hand-rolled mock. Serves until the client hangs up.
+    /// production — not a hand-rolled mock.
     fn spawn_test_daemon() -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -260,9 +457,6 @@ mod tests {
                 PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY,
             );
 
-            // Cross-node principal: the calling node. Wildcard-allow for the
-            // test; in production the cert subject is the principal and IAM is
-            // per-node, per-op.
             let iam = IamPolicy::parse(
                 "version: 1\nstatements:\n  - principals: [\"*\"]\n    handles: [\"*\"]\n    ops: [\"*\"]\n",
             )
@@ -274,15 +468,12 @@ mod tests {
             };
 
             let (mut stream, _) = listener.accept().unwrap();
-            // Serve sequentially until the client hangs up (read_request errors).
             while let Ok(req) = read_request(&mut stream) {
                 let (resp, _) = handle_request(&req, &caller, &mut table, &iam, &hsm);
                 if write_response(&mut stream, &resp).is_err() {
                     break;
                 }
             }
-            // `tmp` stays alive for the whole connection — dropping it here
-            // removes the keystore only after the client is done.
             drop(tmp);
         });
         addr
@@ -293,12 +484,9 @@ mod tests {
         let addr = spawn_test_daemon();
         let mut client = VhsmClient::new(TcpStream::connect(addr).unwrap());
 
-        // GetRandom returns exactly the requested count.
         let rnd = client.get_random(16).unwrap();
         assert_eq!(rnd.len(), 16);
 
-        // Sign, then verify the SAME message — a real crypto round-trip
-        // through the daemon proves the framing is byte-exact end to end.
         let msg = b"cross-node attestation challenge";
         let sig = client.sign(TEST_HANDLE, msg).unwrap();
         assert!(!sig.is_empty(), "signature must be non-empty");
@@ -306,15 +494,11 @@ mod tests {
             client.verify(TEST_HANDLE, msg, &sig).unwrap(),
             "daemon must verify its own signature"
         );
-
-        // A signature over a DIFFERENT message must NOT verify — and that's an
-        // Ok(false), not an Err.
         assert!(
             !client.verify(TEST_HANDLE, b"tampered", &sig).unwrap(),
             "verify must reject a signature over a different message"
         );
 
-        // GetPubkey returns a DER SubjectPublicKeyInfo (SEQUENCE, 0x30).
         let spki = client.get_pubkey(TEST_HANDLE).unwrap();
         assert_eq!(spki[0], 0x30, "SPKI DER starts with a SEQUENCE tag");
     }
