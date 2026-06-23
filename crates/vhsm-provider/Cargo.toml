@@ -1,0 +1,18 @@
+[package]
+name = "vhsm-provider"
+version = "0.1.0"
+edition = "2021"
+description = "vHSM-backed HsmCryptoProvider for the guest — implements the handle-addressed contract by forwarding each op over the vhsm-client wire to the host vhsm-ssd"
+
+[dependencies]
+# The shared crypto contract this implements (KeyHandle-addressed).
+hsm-contract = { path = "../hsm-contract" }
+# The wire client it forwards over.
+vhsm-client = { path = "../vhsm-client" }
+# Slot registry (handle -> key_id alias) + ALG_* constants for get_key_info.
+vhsm-proto = { path = "../vhsm-proto" }
+# DER -> raw r||s for sign_raw_p256 (ES256 / COSE want the 64-byte form).
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+
+[dev-dependencies]
+rand = "0.8"
