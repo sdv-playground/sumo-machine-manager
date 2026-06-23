@@ -61,7 +61,7 @@
 //!   for QNX `shm_open` + IPC, a raw-partition or file-backed `BlockDevice`,
 //!   and a `NullCanBackend` stub so `vm-devices` compiles on QNX.
 //! - **QNX with real hardware** — abstractions in place but concrete impls
-//!   missing: `QnxHsm` is a stub, `HseEncryptor` for `SecstoreEncryptor`
+//!   missing: the NXP HSE crypto backend, `HseEncryptor` for `SecstoreEncryptor`
 //!   isn't written yet, real CAN adapter pending.
 
 pub mod bank_activator;

@@ -16,6 +16,8 @@ component-factory = { path = "../component-factory" }
 nv-store = { path = "../nv-store" }
 machine-mgr = { path = "../machine-mgr" }
 hsm = { path = "../hsm", features = ["crypto"] }
+# Guest gateway (--guest-vhsm): the vHSM-backed HsmCryptoProvider.
+vhsm-provider = { path = "../vhsm-provider" }
 host-os-mgr = { path = "../host-os-mgr" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }

@@ -3,7 +3,7 @@
 /// Performs crypto operations in software using RustCrypto crates.
 /// Keys are read from the file-based keystore (PEM for EC-P256,
 /// raw binary for AES-256). On production hardware, this would be
-/// replaced by a QnxHsm implementation that routes to HSM firmware.
+/// replaced by the NXP HSE backend; the guest reaches it via `VhsmProvider`.
 ///
 /// Key material never leaves this module — callers (vhsm-ssd) only
 /// see operation results (signatures, ciphertexts, etc.).
@@ -49,6 +49,37 @@ pub(crate) fn key_id_for_handle(handle: KeyHandle) -> Result<String, HsmError> {
             "no slot for handle {handle}"
         )))
     }
+}
+
+/// Convert a P-256 SubjectPublicKeyInfo DER public key into the COSE_Key (CBOR)
+/// trust-anchor encoding the Puller/Validator expects — byte-identical to what
+/// [`HsmProvider::get_public_key(KeyRole::SoftwareAuthority)`](crate::HsmProvider::get_public_key)
+/// produces. The host (`SimHsm`) and the guest (`VhsmProvider`, which only
+/// yields SPKI via the wire `get_pubkey`) both go through `get_public_key_der`
+/// + this converter, so they feed the manifest validator identically.
+pub fn cose_key_es256_from_spki_der(spki_der: &[u8]) -> Result<Vec<u8>, HsmError> {
+    use coset::CborSerializable;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::pkcs8::DecodePublicKey;
+
+    let pk = p256::PublicKey::from_public_key_der(spki_der)
+        .map_err(|e| HsmError::CryptoError(format!("bad SPKI DER public key: {e}")))?;
+    let pt = pk.to_encoded_point(false);
+    let x = pt
+        .x()
+        .ok_or_else(|| HsmError::CryptoError("SPKI public key has no x coordinate".into()))?;
+    let y = pt
+        .y()
+        .ok_or_else(|| HsmError::CryptoError("SPKI public key has no y coordinate".into()))?;
+    let key = coset::CoseKeyBuilder::new_ec2_pub_key(
+        coset::iana::EllipticCurve::P_256,
+        x.to_vec(),
+        y.to_vec(),
+    )
+    .algorithm(coset::iana::Algorithm::ES256)
+    .build();
+    key.to_vec()
+        .map_err(|e| HsmError::CryptoError(format!("COSE_Key encode failed: {e}")))
 }
 
 impl HsmCryptoProvider for SimHsm {

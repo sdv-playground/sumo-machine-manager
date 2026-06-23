@@ -9,7 +9,8 @@ pub mod sim;
 ///
 /// Implementations:
 /// - SimHsm: manages vhsm-ssd + file-based keystore (dev/test + QNX host)
-/// - QnxHsm: stub for real HSM hardware via QNX resource manager
+/// - the guest reaches the HSM via `VhsmProvider` (vhsm-provider crate),
+///   which forwards the crypto contract over the vHSM wire
 pub mod types;
 pub mod linux {
     //! Backward-compatible re-export. Prefer `hsm::sim::SimHsm`.
@@ -20,7 +21,6 @@ pub mod crypto;
 pub mod ivd;
 #[cfg(feature = "suit")]
 pub mod key_unwrap;
-pub mod qnx;
 
 #[cfg(feature = "suit")]
 pub use key_unwrap::HsmKeyUnwrap;
@@ -34,6 +34,12 @@ pub use hsm_contract::{HsmCryptoProvider, HsmError, KeyHandle, KeyInfo, KeyType}
 // Re-export the wire/slot-registry crate so consumers can map key_id ↔ handle
 // (e.g. component-mgr's CSR endpoint) without taking a separate dependency.
 pub use vhsm_proto;
+
+// SPKI DER → COSE_Key trust-anchor converter (RustCrypto-backed); lets the
+// gateway derive the manifest trust anchor from `get_public_key_der` on either
+// the host (SimHsm) or the guest (VhsmProvider).
+#[cfg(feature = "crypto")]
+pub use crypto::cose_key_es256_from_spki_der;
 
 /// HSM management provider.
 ///

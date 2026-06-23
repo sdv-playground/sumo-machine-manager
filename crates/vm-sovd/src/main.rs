@@ -49,6 +49,7 @@ async fn main() {
             "  --proxy-component <id>     [gateway] host-owned component id to proxy (repeatable)"
         );
         eprintln!("  --device-id <id>           [gateway] token audience (the device id); pins the onboard minter");
+        eprintln!("  --guest-vhsm               [gateway] source HSM crypto from the guest vHSM (VhsmProvider); else SimHsm");
         eprintln!("  --bind <addr>              Listen address (alt to the positional; default 0.0.0.0:4000)");
         eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
         eprintln!();
@@ -82,6 +83,9 @@ async fn main() {
     let mut host_sovd_url: Option<String> = None;
     let mut proxy_components: Vec<String> = Vec::new();
     let mut device_id: Option<String> = None;
+    // --guest-vhsm: in gateway mode, source HSM crypto from the guest vHSM
+    // (VhsmProvider over the wire) instead of a transient host SimHsm.
+    let mut guest_vhsm = false;
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--images-dir" && i + 1 < args.len() {
@@ -123,6 +127,9 @@ async fn main() {
         } else if args[i] == "--device-id" && i + 1 < args.len() {
             device_id = Some(args[i + 1].clone());
             i += 2;
+        } else if args[i] == "--guest-vhsm" {
+            guest_vhsm = true;
+            i += 1;
         } else if args[i] == "--bind" && i + 1 < args.len() {
             bind_addr = &args[i + 1];
             i += 2;
@@ -399,11 +406,26 @@ async fn main() {
     let router = if gateway_mode {
         // In-guest federating gateway: local onboard pull-update (route-scoped
         // Operational authz) + host-owned components proxied to the host SOVD.
+        // HSM crypto comes from the guest vHSM (VhsmProvider) with --guest-vhsm,
+        // else a transient host SimHsm over the on-disk keystore (sim/dev).
+        let gw_crypto: Arc<dyn hsm::HsmCryptoProvider> = if guest_vhsm {
+            Arc::new(
+                vhsm_provider::VhsmProvider::connect_local().unwrap_or_else(|e| {
+                    eprintln!("vm-sovd --gateway --guest-vhsm: connect to guest vHSM failed: {e}");
+                    std::process::exit(1);
+                }),
+            ) as Arc<dyn hsm::HsmCryptoProvider>
+        } else {
+            Arc::new(SimHsm::new(
+                PathBuf::from("unused"),
+                hsm_keystore_path.clone(),
+                hsm_port,
+            )) as Arc<dyn hsm::HsmCryptoProvider>
+        };
         build_gateway_router(
             machine.clone(),
             backends,
-            hsm_keystore_path.clone(),
-            hsm_port,
+            gw_crypto,
             device_id,
             host_sovd_url,
             &proxy_components,
@@ -463,16 +485,16 @@ async fn main() {
 /// host-owned component (forwarding to the host SOVD). See
 /// `component_mgr::sovd::gateway::gateway_router`.
 ///
-/// NOTE: the HSM here is whatever this binary configured (`SimHsm` today). On a
-/// real QNX guest the authorizer + trust anchor must come from the guest vHSM —
-/// a vhsm-client-backed `HsmProvider` (the `QnxHsm` impl, currently a stub) —
-/// which is the remaining runtime piece for the guest deploy.
+/// `crypto` is the HSM-crypto backend: on a real guest it is `VhsmProvider`
+/// (the guest vHSM, via `--guest-vhsm`); on a host/sim rig a `SimHsm`. Both
+/// satisfy the same handle-addressed `HsmCryptoProvider`, so this code is
+/// backend-agnostic — the issuer pubkeys and the sw-authority trust anchor are
+/// read via `get_public_key_der`, needing no lifecycle (`HsmProvider`) trait.
 #[allow(clippy::too_many_arguments)]
 async fn build_gateway_router<D>(
     machine: Arc<dyn Machine>,
     mut backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
-    hsm_keystore: PathBuf,
-    hsm_port: u16,
+    crypto: Arc<dyn hsm::HsmCryptoProvider>,
     device_id: Option<String>,
     host_sovd_url: Option<String>,
     proxy_components: &[String],
@@ -489,33 +511,34 @@ where
     let device_id = device_id.unwrap_or_else(|| fail("requires --device-id <id> (the token aud)"));
     let host_url = host_sovd_url.unwrap_or_else(|| fail("requires --host-sovd-url <url>"));
 
-    // A transient SimHsm over the on-disk keystore is the HsmCryptoProvider for
-    // the issuer pubkeys + the sw-authority key (mirrors component_adapter's CSR
-    // path). NOTE: on a real QNX guest this must instead be the guest vHSM — a
-    // vhsm-client-backed HsmProvider (the QnxHsm impl) — the remaining runtime piece.
-    use hsm::HsmCryptoProvider;
-    let crypto = SimHsm::new(PathBuf::from("unused"), hsm_keystore, hsm_port);
-
     // Authorizer pinned to the device's HSM issuer anchors — so the onboard
-    // minter's `jwt-signing` Operational tokens verify here.
+    // minter's `jwt-signing` Operational tokens verify here. Backend-agnostic:
+    // `crypto` is the guest vHSM (VhsmProvider) or a host SimHsm.
+    let c_pub = crypto.clone();
+    let c_anchor = crypto.clone();
     let authz = component_mgr::sovd::issuer_keys::authorizer_from_anchors(
         // The authorizer pins issuer keys by their JWT issuer-id (the wire
         // `kid`/`iss` string); map that to the slot handle for the HSM lookup.
-        |id| {
+        move |id| {
             hsm::vhsm_proto::handle_for_key_id(id)
-                .and_then(|h| crypto.get_public_key_der(hsm::KeyHandle(h)).ok())
+                .and_then(|h| c_pub.get_public_key_der(hsm::KeyHandle(h)).ok())
         },
         // Trust anchors are addressed by string anchor-id (not a slot handle).
-        |id| crypto.get_trust_anchor_der(id).ok(),
+        move |id| c_anchor.get_trust_anchor_der(id).ok(),
         &device_id,
     )
     .unwrap_or_else(|e| fail(&format!("authorizer: {e}")));
     let authorizer: Arc<dyn sovd_api::Authorizer> = Arc::new(authz);
 
-    // Pull-update trust anchor = the manifest-signing (sw-authority) key.
-    let trust_anchor = crypto
-        .get_public_key(KeyRole::SoftwareAuthority)
+    // Pull-update trust anchor = the manifest-signing (sw-authority) key, as the
+    // COSE_Key the Puller validates with. `get_public_key_der` yields SPKI on
+    // both the host (SimHsm) and the guest (VhsmProvider); convert to the same
+    // COSE_Key `HsmProvider::get_public_key(SoftwareAuthority)` produces.
+    let sw_spki = crypto
+        .get_public_key_der(KeyRole::SoftwareAuthority.handle())
         .unwrap_or_else(|_| fail("needs the sw-authority key (provision the HSM)"));
+    let trust_anchor = hsm::cose_key_es256_from_spki_der(&sw_spki)
+        .unwrap_or_else(|e| fail(&format!("sw-authority -> COSE_Key: {e}")));
 
     // Federate: each host-owned component becomes a proxy entry forwarding to the
     // host SOVD. Construction is async + queries the host, so it must be reachable.
