@@ -43,6 +43,13 @@ async fn main() {
         eprintln!("  --boot-device <path>       Boot partition block device for IFS activation (e.g. /dev/hd0t177)");
         eprintln!("  --boot-mount <path>        Boot partition mount point (default: /mnt/boot)");
         eprintln!("  --sw-authority <path>      Software authority COSE_Key file (bypasses HSM, dev/test only)");
+        eprintln!("  --gateway                  In-guest federating gateway mode (local /updates + proxy to host)");
+        eprintln!("  --host-sovd-url <url>      [gateway] host SOVD base URL to proxy host-owned components to");
+        eprintln!(
+            "  --proxy-component <id>     [gateway] host-owned component id to proxy (repeatable)"
+        );
+        eprintln!("  --device-id <id>           [gateway] token audience (the device id); pins the onboard minter");
+        eprintln!("  --bind <addr>              Listen address (alt to the positional; default 0.0.0.0:4000)");
         eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
         eprintln!();
         eprintln!("Provisioning authority: built-in factory signing key (P-256 generator G).");
@@ -68,6 +75,13 @@ async fn main() {
     let mut boot_mount = PathBuf::from("/mnt/boot");
     let mut sw_authority_path: Option<PathBuf> = None;
     let mut bind_addr = "0.0.0.0:4000";
+    // Gateway mode (--gateway): serve the in-guest federating SOVD surface — the
+    // local onboard pull-update route (route-scoped Operational authz) plus
+    // host-owned components proxied to --host-sovd-url. See component_mgr::sovd::gateway.
+    let mut gateway_mode = false;
+    let mut host_sovd_url: Option<String> = None;
+    let mut proxy_components: Vec<String> = Vec::new();
+    let mut device_id: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--images-dir" && i + 1 < args.len() {
@@ -96,6 +110,21 @@ async fn main() {
             i += 2;
         } else if args[i] == "--sw-authority" && i + 1 < args.len() {
             sw_authority_path = Some(PathBuf::from(&args[i + 1]));
+            i += 2;
+        } else if args[i] == "--gateway" {
+            gateway_mode = true;
+            i += 1;
+        } else if args[i] == "--host-sovd-url" && i + 1 < args.len() {
+            host_sovd_url = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--proxy-component" && i + 1 < args.len() {
+            proxy_components.push(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--device-id" && i + 1 < args.len() {
+            device_id = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--bind" && i + 1 < args.len() {
+            bind_addr = &args[i + 1];
             i += 2;
         } else {
             bind_addr = &args[i];
@@ -366,13 +395,30 @@ async fn main() {
 
     let machine: Arc<dyn Machine> = Arc::new(machine_builder.build());
 
-    let state = sovd_api::AppState::new(backends);
-    let router = sovd_api::create_router(state)
-        .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
-        .merge(component_mgr::sovd::routes::update_state_router(
+    let router = if gateway_mode {
+        // In-guest federating gateway: local onboard pull-update (route-scoped
+        // Operational authz) + host-owned components proxied to the host SOVD.
+        build_gateway_router(
+            machine.clone(),
+            backends,
+            hsm_keystore_path.clone(),
+            hsm_port,
+            device_id,
+            host_sovd_url,
+            &proxy_components,
             nv.clone(),
             node_coordinator.clone(),
-        ));
+        )
+        .await
+    } else {
+        let state = sovd_api::AppState::new(backends);
+        sovd_api::create_router(state)
+            .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
+            .merge(component_mgr::sovd::routes::update_state_router(
+                nv.clone(),
+                node_coordinator.clone(),
+            ))
+    };
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
@@ -407,4 +453,78 @@ async fn main() {
     tracing::info!("  try: curl http://{bind_addr}/vehicle/v1/components");
 
     axum::serve(listener, router).await.unwrap();
+}
+
+/// Build the in-guest federating gateway router (`--gateway` mode): the
+/// authorizer from the device's HSM issuer anchors (pins `jwt-signing`
+/// Operational, so the onboard minter's tokens verify), the pull-update trust
+/// anchor (the sw-authority manifest key), and a `SovdProxyBackend` per
+/// host-owned component (forwarding to the host SOVD). See
+/// `component_mgr::sovd::gateway::gateway_router`.
+///
+/// NOTE: the HSM here is whatever this binary configured (`SimHsm` today). On a
+/// real QNX guest the authorizer + trust anchor must come from the guest vHSM —
+/// a vhsm-client-backed `HsmProvider` (the `QnxHsm` impl, currently a stub) —
+/// which is the remaining runtime piece for the guest deploy.
+#[allow(clippy::too_many_arguments)]
+async fn build_gateway_router<D>(
+    machine: Arc<dyn Machine>,
+    mut backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
+    hsm_keystore: PathBuf,
+    hsm_port: u16,
+    device_id: Option<String>,
+    host_sovd_url: Option<String>,
+    proxy_components: &[String],
+    nv: Arc<Mutex<NvStore<D>>>,
+    node_coordinator: Arc<machine_mgr::node_update::NodeCoordinator>,
+) -> axum::Router
+where
+    D: nv_store::block::BlockDevice + Send + 'static,
+{
+    fn fail(msg: &str) -> ! {
+        eprintln!("vm-sovd --gateway: {msg}");
+        std::process::exit(1);
+    }
+    let device_id = device_id.unwrap_or_else(|| fail("requires --device-id <id> (the token aud)"));
+    let host_url = host_sovd_url.unwrap_or_else(|| fail("requires --host-sovd-url <url>"));
+
+    // A transient SimHsm over the on-disk keystore is the HsmCryptoProvider for
+    // the issuer pubkeys + the sw-authority key (mirrors component_adapter's CSR
+    // path). NOTE: on a real QNX guest this must instead be the guest vHSM — a
+    // vhsm-client-backed HsmProvider (the QnxHsm impl) — the remaining runtime piece.
+    use hsm::HsmCryptoProvider;
+    let crypto = SimHsm::new(PathBuf::from("unused"), hsm_keystore, hsm_port);
+
+    // Authorizer pinned to the device's HSM issuer anchors — so the onboard
+    // minter's `jwt-signing` Operational tokens verify here.
+    let authz = component_mgr::sovd::issuer_keys::authorizer_from_anchors(
+        |id| crypto.get_public_key_der(id).ok(),
+        |id| crypto.get_trust_anchor_der(id).ok(),
+        &device_id,
+    )
+    .unwrap_or_else(|e| fail(&format!("authorizer: {e}")));
+    let authorizer: Arc<dyn sovd_api::Authorizer> = Arc::new(authz);
+
+    // Pull-update trust anchor = the manifest-signing (sw-authority) key.
+    let trust_anchor = crypto
+        .get_public_key(KeyRole::SoftwareAuthority)
+        .unwrap_or_else(|_| fail("needs the sw-authority key (provision the HSM)"));
+
+    // Federate: each host-owned component becomes a proxy entry forwarding to the
+    // host SOVD. Construction is async + queries the host, so it must be reachable.
+    for comp in proxy_components {
+        match sovd_proxy::SovdProxyBackend::new(comp, &host_url, comp).await {
+            Ok(p) => {
+                backends.insert(comp.clone(), Arc::new(p) as Arc<dyn DiagnosticBackend>);
+            }
+            Err(e) => fail(&format!("proxy '{comp}' -> {host_url}: {e}")),
+        }
+    }
+
+    tracing::info!(
+        "vm-sovd GATEWAY: device={device_id}, host={host_url}, proxied={proxy_components:?}"
+    );
+    component_mgr::sovd::gateway::gateway_router(machine, backends, authorizer, trust_anchor).merge(
+        component_mgr::sovd::routes::update_state_router(nv, node_coordinator),
+    )
 }
