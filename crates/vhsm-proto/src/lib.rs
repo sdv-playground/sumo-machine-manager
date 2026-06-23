@@ -277,6 +277,15 @@ pub const HANDLE_STORAGE: u32 = 0x0007;
 pub const HANDLE_OPERATIONAL_ISSUER: u32 = 0x0008;
 pub const HANDLE_FACTORY_RESET_ISSUER: u32 = 0x0009;
 
+// Host-in-process-only slots. Their private halves are used host-side only and
+// NEVER cross the guest vHSM wire, so they carry sumo-core handles purely for
+// uniform in-process slot addressing (the handle-addressed HSM contract) and
+// are NOT registered as guest-addressable handles — see `guest_exposed` in
+// `SUMO_CORE_SLOTS`. Adding these does not change the guest wire.
+pub const HANDLE_IVD_SIGNING: u32 = 0x000A;
+pub const HANDLE_FRESHNESS_SIGNING: u32 = 0x000B;
+pub const HANDLE_TLS_IDENTITY: u32 = 0x000C;
+
 /// Lower boundary of the project-extension well-known range. Sumo owns
 /// the slots strictly below this; downstream projects own
 /// `HANDLE_PROJECT_BASE..HANDLE_DYNAMIC_BASE` for their own well-known
@@ -305,6 +314,136 @@ pub fn handle_is_sumo_core(h: u32) -> bool {
 /// same `register_well_known` API as the core set.
 pub fn handle_is_project(h: u32) -> bool {
     (HANDLE_PROJECT_BASE..HANDLE_DYNAMIC_BASE).contains(&h)
+}
+
+// ---- Slot registry ------------------------------------------------------
+//
+// The single source of truth binding a slot's NUMBER (handle — the canonical
+// wire / hardware-slot / ACL identity) to its derived alias (`key_id`), wire
+// algorithm (`ALG_*`), and default guest permission mask. `hsm::KeyRole` maps
+// each role to one of these handles and derives `key_id()` from here; `vhsm-ssd`
+// builds its guest handle table from the `guest_exposed` entries. Sumo owns
+// this core set (handles `< HANDLE_PROJECT_BASE`); downstream projects own the
+// project-extension range and register their own.
+
+/// One well-known sumo-core slot: the canonical handle plus its derived alias,
+/// wire algorithm, and default guest permissions.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotEntry {
+    /// The vHSM handle — the canonical slot number (sumo-core range).
+    pub handle: u32,
+    /// Stable lower-case slot name: the SimHsm filename + keystore CBOR id.
+    /// A DERIVED ALIAS of the handle, not a separate identity.
+    pub key_id: &'static str,
+    /// Wire algorithm for the slot (one of the `ALG_*` constants).
+    pub alg: u32,
+    /// Default permission mask `vhsm-ssd` registers for guest callers
+    /// (`PERM_*`). `0` for host-only slots (never guest-addressable).
+    pub default_perms: u32,
+    /// Whether `vhsm-ssd` exposes this slot as a guest-addressable handle.
+    /// Host-only slots (`iam`/`ivd`/`freshness`/`tls`) are present for uniform
+    /// in-process addressing but never registered on the guest wire.
+    pub guest_exposed: bool,
+}
+
+/// The sumo-core slot table (ordered by handle) — the one place binding
+/// `handle ↔ key_id ↔ alg ↔ default_perms` for every well-known slot.
+pub const SUMO_CORE_SLOTS: &[SlotEntry] = &[
+    SlotEntry {
+        handle: HANDLE_SW_AUTHORITY,
+        key_id: "sw-authority",
+        alg: ALG_ECC_P256,
+        default_perms: PERM_VERIFY,
+        guest_exposed: true,
+    },
+    SlotEntry {
+        handle: HANDLE_DEVICE_DECRYPT,
+        key_id: "device-decrypt",
+        alg: ALG_ECC_P256,
+        default_perms: PERM_DECRYPT | PERM_GET_PUBKEY,
+        guest_exposed: true,
+    },
+    // Daemon-internal IAM cert-issuer: has a handle for in-process use but is
+    // never guest-registered (CWT mint is the host-privileged sign_raw_p256 path).
+    SlotEntry {
+        handle: HANDLE_IAM_SIGNING,
+        key_id: "iam-signing",
+        alg: ALG_ECC_P256,
+        default_perms: 0,
+        guest_exposed: false,
+    },
+    SlotEntry {
+        handle: HANDLE_KEY_AUTHORITY,
+        key_id: "key-authority",
+        alg: ALG_ECC_P256,
+        default_perms: PERM_VERIFY,
+        guest_exposed: true,
+    },
+    SlotEntry {
+        handle: HANDLE_JWT_SIGNING,
+        key_id: "jwt-signing",
+        alg: ALG_ECC_P256,
+        default_perms: PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY,
+        guest_exposed: true,
+    },
+    SlotEntry {
+        handle: HANDLE_STORAGE,
+        key_id: "storage-key",
+        alg: ALG_AES_256,
+        default_perms: PERM_ENCRYPT | PERM_DECRYPT,
+        guest_exposed: true,
+    },
+    SlotEntry {
+        handle: HANDLE_OPERATIONAL_ISSUER,
+        key_id: "operational-issuer",
+        alg: ALG_ECC_P256,
+        default_perms: PERM_VERIFY | PERM_GET_PUBKEY,
+        guest_exposed: true,
+    },
+    SlotEntry {
+        handle: HANDLE_FACTORY_RESET_ISSUER,
+        key_id: "factory-reset-issuer",
+        alg: ALG_ECC_P256,
+        default_perms: PERM_VERIFY | PERM_GET_PUBKEY,
+        guest_exposed: true,
+    },
+    // Host-in-process-only signing / identity slots (private never on the wire).
+    SlotEntry {
+        handle: HANDLE_IVD_SIGNING,
+        key_id: "ivd-signing",
+        alg: ALG_ECC_P256,
+        default_perms: 0,
+        guest_exposed: false,
+    },
+    SlotEntry {
+        handle: HANDLE_FRESHNESS_SIGNING,
+        key_id: "freshness-signing",
+        alg: ALG_ECC_P256,
+        default_perms: 0,
+        guest_exposed: false,
+    },
+    SlotEntry {
+        handle: HANDLE_TLS_IDENTITY,
+        key_id: "tls-identity",
+        alg: ALG_ECC_P256,
+        default_perms: 0,
+        guest_exposed: false,
+    },
+];
+
+/// Look up a sumo-core slot by its canonical handle.
+pub fn slot_for_handle(handle: u32) -> Option<&'static SlotEntry> {
+    SUMO_CORE_SLOTS.iter().find(|s| s.handle == handle)
+}
+
+/// Look up a sumo-core slot by its `key_id` alias.
+pub fn slot_for_key_id(key_id: &str) -> Option<&'static SlotEntry> {
+    SUMO_CORE_SLOTS.iter().find(|s| s.key_id == key_id)
+}
+
+/// The canonical handle for a sumo-core `key_id` alias, if known.
+pub fn handle_for_key_id(key_id: &str) -> Option<u32> {
+    slot_for_key_id(key_id).map(|s| s.handle)
 }
 
 // ---- Wire format structures ---------------------------------------------
@@ -554,12 +693,58 @@ mod tests {
             HANDLE_STORAGE,
             HANDLE_OPERATIONAL_ISSUER,
             HANDLE_FACTORY_RESET_ISSUER,
+            HANDLE_IVD_SIGNING,
+            HANDLE_FRESHNESS_SIGNING,
+            HANDLE_TLS_IDENTITY,
         ];
         for (i, a) in hs.iter().enumerate() {
             for b in &hs[i + 1..] {
                 assert_ne!(a, b, "duplicate well-known handle 0x{a:04x}");
             }
         }
+    }
+
+    #[test]
+    fn slot_registry_is_well_formed() {
+        use std::collections::HashSet;
+        let mut handles = HashSet::new();
+        let mut ids = HashSet::new();
+        for s in SUMO_CORE_SLOTS {
+            assert!(
+                handle_is_sumo_core(s.handle),
+                "slot {} handle 0x{:04x} is not in the sumo-core range",
+                s.key_id,
+                s.handle
+            );
+            assert!(
+                handles.insert(s.handle),
+                "duplicate handle 0x{:04x}",
+                s.handle
+            );
+            assert!(ids.insert(s.key_id), "duplicate key_id {}", s.key_id);
+            // Guest-exposed slots carry permissions; host-only slots carry none.
+            if s.guest_exposed {
+                assert_ne!(
+                    s.default_perms, 0,
+                    "{} is guest-exposed but has no perms",
+                    s.key_id
+                );
+            } else {
+                assert_eq!(
+                    s.default_perms, 0,
+                    "{} is host-only but has perms",
+                    s.key_id
+                );
+            }
+        }
+        // Lookups round-trip; dynamic handles are not in the core registry.
+        assert_eq!(handle_for_key_id("jwt-signing"), Some(HANDLE_JWT_SIGNING));
+        assert_eq!(
+            slot_for_handle(HANDLE_STORAGE).unwrap().key_id,
+            "storage-key"
+        );
+        assert_eq!(slot_for_key_id("storage-key").unwrap().alg, ALG_AES_256);
+        assert!(slot_for_handle(HANDLE_DYNAMIC_BASE).is_none());
     }
 
     #[test]

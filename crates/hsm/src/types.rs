@@ -163,22 +163,33 @@ pub enum KeyRole {
 }
 
 impl KeyRole {
-    /// Stable lower-case identifier used as the slot's key_id in the
-    /// keystore CBOR schema and on-disk SimHsm filenames.
-    pub fn key_id(self) -> &'static str {
+    /// The canonical slot handle (the wire / hardware-slot / ACL number) for
+    /// this role. The single hsm-side role→number mapping; the `key_id` alias,
+    /// algorithm, and permissions all derive from the [`vhsm_proto`] slot
+    /// registry keyed off this handle.
+    pub fn handle(self) -> u32 {
         match self {
-            KeyRole::KeyAuthority => "key-authority",
-            KeyRole::SoftwareAuthority => "sw-authority",
-            KeyRole::DeviceDecryption => "device-decrypt",
-            KeyRole::IamSigning => "iam-signing",
-            KeyRole::IvdSigning => "ivd-signing",
-            KeyRole::JwtSigning => "jwt-signing",
-            KeyRole::OperationalIssuer => "operational-issuer",
-            KeyRole::FactoryResetIssuer => "factory-reset-issuer",
-            KeyRole::FreshnessSigning => "freshness-signing",
-            KeyRole::TlsIdentity => "tls-identity",
-            KeyRole::Storage => "storage-key",
+            KeyRole::KeyAuthority => vhsm_proto::HANDLE_KEY_AUTHORITY,
+            KeyRole::SoftwareAuthority => vhsm_proto::HANDLE_SW_AUTHORITY,
+            KeyRole::DeviceDecryption => vhsm_proto::HANDLE_DEVICE_DECRYPT,
+            KeyRole::IamSigning => vhsm_proto::HANDLE_IAM_SIGNING,
+            KeyRole::IvdSigning => vhsm_proto::HANDLE_IVD_SIGNING,
+            KeyRole::JwtSigning => vhsm_proto::HANDLE_JWT_SIGNING,
+            KeyRole::OperationalIssuer => vhsm_proto::HANDLE_OPERATIONAL_ISSUER,
+            KeyRole::FactoryResetIssuer => vhsm_proto::HANDLE_FACTORY_RESET_ISSUER,
+            KeyRole::FreshnessSigning => vhsm_proto::HANDLE_FRESHNESS_SIGNING,
+            KeyRole::TlsIdentity => vhsm_proto::HANDLE_TLS_IDENTITY,
+            KeyRole::Storage => vhsm_proto::HANDLE_STORAGE,
         }
+    }
+
+    /// Stable lower-case identifier used as the slot's key_id in the keystore
+    /// CBOR schema and on-disk SimHsm filenames. DERIVED from the slot registry
+    /// (the handle is canonical; the name is its alias).
+    pub fn key_id(self) -> &'static str {
+        vhsm_proto::slot_for_handle(self.handle())
+            .expect("every KeyRole handle is a registered sumo-core slot")
+            .key_id
     }
 
     /// The cryptographic key type for this role. Every role is EC-P256
@@ -402,6 +413,32 @@ mod tests {
         assert_eq!(KeyRole::FreshnessSigning.key_id(), "freshness-signing");
         assert_eq!(KeyRole::TlsIdentity.key_id(), "tls-identity");
         assert_eq!(KeyRole::Storage.key_id(), "storage-key");
+    }
+
+    #[test]
+    fn keyrole_maps_to_registry() {
+        // The handle is canonical; key_id + alg derive from the shared slot
+        // registry. Every role must resolve, and its derived name + key type
+        // must agree with the registry entry (catches role↔registry drift).
+        for &r in KeyRole::mandatory_roles() {
+            let slot = vhsm_proto::slot_for_handle(r.handle()).unwrap_or_else(|| {
+                panic!("{r:?} handle 0x{:04x} not in the slot registry", r.handle())
+            });
+            assert_eq!(
+                slot.key_id,
+                r.key_id(),
+                "{r:?} key_id must match the registry"
+            );
+            let expected_alg = match r.key_type() {
+                KeyType::EcP256 => vhsm_proto::ALG_ECC_P256,
+                KeyType::Aes256 => vhsm_proto::ALG_AES_256,
+                other => panic!("{r:?} has an unexpected key_type {other}"),
+            };
+            assert_eq!(
+                slot.alg, expected_alg,
+                "{r:?} key_type must match the registry alg"
+            );
+        }
     }
 
     #[test]

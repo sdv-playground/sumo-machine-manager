@@ -879,68 +879,23 @@ fn serve_one_cross_node(
 fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     let mut table = HandleTable::new();
 
-    // Map well-known handles to keystore key_ids.
-    // These match KeyRole in hsm/src/types.rs.
-    //
-    // `iam-signing` (HANDLE_IAM_SIGNING = 0x0004) is intentionally
-    // NOT registered: it's the daemon-internal cert-issuing key,
-    // never addressable by guest principals. CWT mint goes through
-    // the HsmIamSigner adapter (which calls sign_raw_p256 directly,
-    // host-privileged path bypassing the handle table).
-    let well_known = [
-        (
-            HANDLE_SW_AUTHORITY,
-            "sw-authority",
-            ALG_ECC_P256,
-            PERM_VERIFY,
-        ),
-        (
-            HANDLE_DEVICE_DECRYPT,
-            "device-decrypt",
-            ALG_ECC_P256,
-            PERM_DECRYPT | PERM_GET_PUBKEY,
-        ),
-        (
-            HANDLE_KEY_AUTHORITY,
-            "key-authority",
-            ALG_ECC_P256,
-            PERM_VERIFY,
-        ),
-        (
-            HANDLE_JWT_SIGNING,
-            "jwt-signing",
-            ALG_ECC_P256,
-            PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY,
-        ),
-        (
-            HANDLE_STORAGE,
-            "storage-key",
-            ALG_AES_256,
-            PERM_ENCRYPT | PERM_DECRYPT,
-        ),
-        // External SOVD-token issuer verify anchors (Tower-provisioned,
-        // public-only). Guests/authorizer verify JWT signatures and read
-        // the pubkey; they never sign with these. The reset issuer is slot
-        // `factory-reset-issuer` at wire handle HANDLE_FACTORY_RESET_ISSUER (0x0009 — the
-        // number is the wire contract, unchanged by the capability rename).
-        (
-            HANDLE_OPERATIONAL_ISSUER,
-            "operational-issuer",
-            ALG_ECC_P256,
-            PERM_VERIFY | PERM_GET_PUBKEY,
-        ),
-        (
-            HANDLE_FACTORY_RESET_ISSUER,
-            "factory-reset-issuer",
-            ALG_ECC_P256,
-            PERM_VERIFY | PERM_GET_PUBKEY,
-        ),
-    ];
-
-    for (handle, key_id, alg, perms) in &well_known {
-        if crypto.get_key_info(key_id).is_ok() {
-            table.register_well_known(*handle, key_id, *alg, *perms);
-            tracing::debug!(handle, key_id, "registered well-known handle");
+    // Register the guest-addressable well-known handles from the single slot
+    // registry (vhsm-proto `SUMO_CORE_SLOTS`). Host-only slots (iam-signing,
+    // ivd-signing, freshness-signing, tls-identity) are `guest_exposed: false`
+    // and skipped — e.g. `iam-signing` (HANDLE_IAM_SIGNING = 0x0004) is the
+    // daemon-internal cert-issuing key, never addressable by guest principals
+    // (CWT mint goes through the HsmIamSigner adapter, calling sign_raw_p256
+    // directly — host-privileged, bypassing the handle table). A slot is
+    // registered only if its key actually exists in the keystore (soft-missing
+    // keys are skipped).
+    for slot in SUMO_CORE_SLOTS.iter().filter(|s| s.guest_exposed) {
+        if crypto.get_key_info(slot.key_id).is_ok() {
+            table.register_well_known(slot.handle, slot.key_id, slot.alg, slot.default_perms);
+            tracing::debug!(
+                handle = slot.handle,
+                key_id = slot.key_id,
+                "registered well-known handle"
+            );
         }
     }
 
