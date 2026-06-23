@@ -32,6 +32,14 @@ members = [
     "crates/vm-sovd",
 ]
 
+[profile.release]
+# Strip the symbol table from release binaries — keeps the deployed binaries
+# (vm-sovd, vhsm-ssd, the t2-seed-cicd layer binaries) slim, which matters for
+# the qnx6 layer-image sizes + the device rootfs. Cargo runs the right
+# per-target strip via `rustc -Cstrip=symbols`. Mirrors guest-vm-sdk and
+# supernova-machine-manager (which also strip their release builds).
+strip = "symbols"
+
 # QNX (nto) cross-compile patch. vhsm-ssd's cross-node mTLS listener pulls in
 # rustls → ring, whose `SystemRandom` only implements `SecureRandom` on nto with
 # the upstream "add qnx support" commit (briansmith/ring#2740), not yet in a
