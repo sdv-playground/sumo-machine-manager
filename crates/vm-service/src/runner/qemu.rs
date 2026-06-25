@@ -191,43 +191,64 @@ impl QemuRunner {
         let is_qnx = def.os_type == crate::config::OsType::Qnx;
 
         if is_qnx {
-            // QNX: IFS boot disk + QNX6 root filesystem as separate drives.
-            // Boot disk (boot.img): BIOS+IPL wrapper — must be writable because
-            // SeaBIOS probes the disk with writes during early boot.
-            // Root filesystem: read-only (matches qvm/devb-loopback semantics).
+            // QNX (QEMU) boots a BIOS+IPL-wrapped disk (boot.img) and mounts its
+            // QNX6 rootfs (+ per-bank partitions + extra disks) as additional
+            // disks, laid out in order: boot(0), rootfs(1), partitions, disks.
+            //
+            // x86_64: attach every disk as `virtio-blk-pci` — the guest IFS runs
+            // `devb-virtio` (the same block stack as the rig), which has no port
+            // ceiling, so all bank partitions + persistent disks fit. SeaBIOS
+            // boots boot.img via `bootindex=0`; the guest enumerates the disks
+            // /dev/hd0.. in attach order (boot=hd0, rootfs=hd1, partitions hd2..).
+            //
+            // Non-x86 QNX/QEMU (currently unused — the arm64 QEMU guest boots via
+            // -kernel, not this disk path): keep the legacy bare-`-drive` path. It
+            // auto-targets q35's BUILT-IN AHCI (an explicit ich9-ahci controller
+            // makes devb-ahci miss the disks), whose 6 ports cap the disk count.
+            let mut qnx_disks: Vec<PathBuf> = Vec::new();
             if let Some(boot) = def.kernel_path() {
-                args.extend_from_slice(&[
-                    "-drive".into(),
-                    format!("file={},format=raw", boot.display()),
-                ]);
+                qnx_disks.push(boot);
             }
             if let Some(rootfs) = def.rootfs_path() {
-                args.extend_from_slice(&[
-                    "-drive".into(),
-                    format!("file={},format=raw", rootfs.display()),
-                ]);
+                qnx_disks.push(rootfs);
             }
-
-            // Per-bank read-only partitions (policy, ca-bundle, sumo-config,
-            // app images …) from the OTA-delivered vm-config.yaml. QNX uses
-            // bare -drive (IDE interface — no readonly=on on q35); the guest
-            // mounts each ro. A missing source is skipped.
             for part in &def.partitions {
                 let path = def.partition_path(part);
                 if path.exists() {
+                    qnx_disks.push(path);
+                }
+            }
+            for disk in &def.disks {
+                qnx_disks.push(disk.path.clone());
+            }
+            if arch == Arch::X86_64 {
+                for (i, path) in qnx_disks.iter().enumerate() {
+                    let id = format!("qnxd{i}");
+                    let bootidx = if i == 0 { ",bootindex=0" } else { "" };
+                    args.extend_from_slice(&[
+                        "-drive".into(),
+                        format!("file={},format=raw,if=none,id={id}", path.display()),
+                        "-device".into(),
+                        format!("virtio-blk-pci,drive={id}{bootidx}"),
+                    ]);
+                }
+            } else {
+                const MAX_QNX_DRIVES: usize = 6; // q35 built-in AHCI ports
+                if qnx_disks.len() > MAX_QNX_DRIVES {
+                    tracing::warn!(
+                        vm = name,
+                        drives = qnx_disks.len(),
+                        "QNX/QEMU (non-x86): q35's built-in AHCI has only \
+                         {MAX_QNX_DRIVES} ports; dropping the rest"
+                    );
+                    qnx_disks.truncate(MAX_QNX_DRIVES);
+                }
+                for path in &qnx_disks {
                     args.extend_from_slice(&[
                         "-drive".into(),
                         format!("file={},format=raw", path.display()),
                     ]);
                 }
-            }
-
-            // Extra disks (data partition, etc.)
-            for disk in &def.disks {
-                args.extend_from_slice(&[
-                    "-drive".into(),
-                    format!("file={},format=raw", disk.path.display()),
-                ]);
             }
         } else {
             // Linux: kernel + rootfs + cmdline
