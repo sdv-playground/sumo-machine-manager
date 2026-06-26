@@ -1,6 +1,6 @@
 //! vHSM Secure Storage Daemon (v3) — host-side crypto service for guest VMs.
 //!
-//! Listens on TCP on a private host bridge (`vbr-vhsm`, 192.168.99.0/24).
+//! Listens on TCP on a private host bridge (`vbr-vhsm`, 10.0.200.0/24).
 //! Identity is established by a cert-based handshake on each accepted
 //! connection (see [`vhsm_ssd::auth`]): HELLO → AUTH (or ENROLL on first
 //! boot). Authorisation is statement-based; see [`vhsm_ssd::iam`].

@@ -1,7 +1,7 @@
 //! vHSM SSD — host-side daemon terminating the handle-based vHSM v3 wire
 //! protocol spoken by the guest `/dev/vhsm` driver.
 //!
-//! Transport is TCP on a private host bridge (`vbr-vhsm`, 192.168.99.0/24)
+//! Transport is TCP on a private host bridge (`vbr-vhsm`, 10.0.200.0/24)
 //! provisioned by the orchestrator. Guest identity is established by a
 //! cert-based handshake at connection time (see [`auth`]): HELLO → AUTH (or
 //! ENROLL on first-boot), binding a [`auth::Principal`] to the connection.

@@ -1,4 +1,4 @@
-/// Binary frame encoding/decoding for the vHSM wire protocol (v2).
+/// Binary frame encoding/decoding for the vHSM wire protocol (v3).
 ///
 /// Request:  [3] magic + [1] version + [4] op + [4] session_id + [4] payload_len + [N] payload
 /// Response: [3] magic + [1] version + [4] op + [4] session_id + [4] payload_len + [4] status + [N] payload

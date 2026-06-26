@@ -1,4 +1,4 @@
-//! vHSM wire protocol types (v2) — matches `vhsm_proto.h` exactly.
+//! vHSM wire protocol types (v3) — matches `vhsm_proto.h` exactly.
 //!
 //! See `specs/vhsm/protocol.md` (VHSM-PROTO-002) for the full specification.
 //!

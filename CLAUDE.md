@@ -33,7 +33,7 @@ open question #1) — capability-only discrimination works today.
 
 ### Architecture
 
-Cargo workspace with 10 crates. Bottom-up:
+Cargo workspace with 29 crates. The load-bearing ones, bottom-up:
 
 - **nv-store** (lib): sector-rotated NV regions (boot state, factory,
   FW meta, runtime DIDs) with CRC-32 and monotonic `write_seq`, over a
@@ -44,10 +44,12 @@ Cargo workspace with 10 crates. Bottom-up:
   state, verifies image hashes, handles trial boot counting and auto-rollback.
 - **hsm** (lib): HSM management trait (`HsmProvider`, `HsmCryptoProvider`).
   `SimHsm` (dev/test: vhsm-ssd + file keystore) works; `QnxHsm` is a stub.
-- **vhsm-ssd** (lib+bin): host-side daemon terminating the v2 handle-based
+- **vhsm-ssd** (lib+bin): host-side daemon terminating the v3 handle-based
   vHSM wire protocol from guest `/dev/vhsm`. Transport is TCP on a
-  private host bridge (`vbr-vhsm`, 192.168.99.0/24); guest identity is
-  the source IP, pinned by the orchestrator via static MAC→IP lease.
+  private host bridge (`vbr-vhsm`, 10.0.200.0/24, default bind
+  `10.0.200.1:5100`); guest identity is established by a CWT/IAM handshake
+  at connect time, with the source IP (pinned via static MAC→IP lease) as a
+  static pre-gate.
 - **vm-devices** (lib): virtual CAN, health, and time simulators running
   on shared memory (ivshmem vs QNX native shm).
 - **vm-service** (lib+bin): QEMU / `qvm` lifecycle, per-bank VM config,
@@ -89,7 +91,7 @@ machine-mgr    — Abstract trait layer connecting them all
 
 ### Key Concepts
 
-- **Four bank sets**: host-os (A/B, IFS+rootfs atomic), vm1, vm2 (A/B), hsm (single-bank)
+- **Bank sets**: 10 slots (`NUM_BANK_SETS=10`), 6 named — Hsm (single-bank), Bootloader (reserved), Os/host-os (A/B, IFS+rootfs atomic), Rt (Cortex-M7), Vm1, Vm2 (A/B); slots 6–9 reserved headroom
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA)
 - **Per-bank VM config**: `vm-config.yaml` in bank directories, delivered alongside firmware
 - **Multi-payload SUIT**: host-os carries `#ifs` + `#rootfs` in one envelope; VMs carry kernel + rootfs + config
@@ -140,9 +142,9 @@ crates/hsm/src/
   qnx.rs                  — QnxHsm stub
 
 crates/vhsm-ssd/src/
-  proto.rs + codec.rs     — wire format (v2, handle-based)
+  proto.rs + codec.rs     — wire format (v3, handle-based)
   handle_table.rs         — dynamic handle allocator (0x0100+)
-  policy.rs               — IP allow-list (source IP → vm_id, perms)
+  auth.rs / iam.rs        — CWT handshake (Principal) + statement-based authz
   handler.rs              — op dispatch -> HsmCryptoProvider
   transport.rs            — TCP on `vbr-vhsm` private bridge
 

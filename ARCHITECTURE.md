@@ -182,8 +182,8 @@ the seams above are the supported extension points.
 - **hsm** (lib): `HsmProvider`/`HsmCryptoProvider`; `SimHsm` (vhsm-ssd + file keystore);
   `QnxHsm` stub; `ivd` (per-bank IVD manifest sign/verify with the `ivd-signing` key —
   the same key that signs the boot selector). 7 mandatory `KeyRole`s.
-- **vhsm-ssd** (lib + bin): host daemon terminating the guest `/dev/vhsm` v2/v3 handle
-  protocol over TCP on a private host bridge; guest identity = source IP.
+- **vhsm-ssd** (lib + bin): host daemon terminating the guest `/dev/vhsm` v3 handle
+  protocol over TCP on a private host bridge; identity = CWT/IAM handshake (source-IP pre-gate).
 - **secstore** (lib): encrypted key-metadata persistence (`SecstoreEncryptor` +
   `SecstoreBackend`).
 

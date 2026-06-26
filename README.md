@@ -40,7 +40,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  hsm             HSM management: SimHsm (dev) / QnxHsm     │
 │  (lib)           (stub); HsmCryptoProvider trait           │
 │                                                            │
-│  vhsm-ssd        vHSM v2 daemon (handle-based protocol)    │
+│  vhsm-ssd        vHSM v3 daemon (handle-based protocol)    │
 │  (lib+bin)       terminating guest /dev/vhsm               │
 │                                                            │
 │  vm-devices      Virtual CAN/health/time device simulators │
@@ -76,7 +76,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `secstore` | — | Encrypted key-metadata persistence, pluggable encryptor + backend |
 | `vm-boot` | `vm-boot` | Boot decisions, trial counting, auto-rollback (all bank sets) |
 | `hsm` | — | HSM management trait (`HsmProvider` / `HsmCryptoProvider`) |
-| `vhsm-ssd` | `vhsm-ssd` | Host-side vHSM v2 daemon — TCP on the private `vbr-vhsm` bridge, source-IP-based identity |
+| `vhsm-ssd` | `vhsm-ssd` | Host-side vHSM v3 daemon — TCP on the private `vbr-vhsm` bridge; identity = CWT/IAM handshake (source-IP static pre-gate) |
 | `vm-devices` | — | CAN / health / time simulators (host-side) |
 | `vm-service` | `vm-service` | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config, ivshmem |
 | `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic) |
@@ -158,7 +158,7 @@ Flash operations require programming session + security unlock:
 
 ## Key Concepts
 
-- **Four bank sets**: host-os (A/B, IFS+rootfs atomic), vm1, vm2 (A/B), hsm (single-bank)
+- **Bank sets**: 10 slots (`NUM_BANK_SETS=10`), 6 named — Hsm (single-bank), Bootloader (reserved), Os/host-os (A/B, IFS+rootfs atomic), Rt (Cortex-M7), Vm1, Vm2 (A/B); slots 6–9 reserved headroom
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA via SOVD)
 - **Per-bank VM config**: vm-config.yaml in bank directories, delivered alongside firmware via OTA
 - **Multi-payload SUIT**: host-os carries IFS + rootfs; VMs carry kernel + rootfs + config
@@ -180,7 +180,7 @@ platform-independent — only the trait implementations change per target.
 
 ## NV Store Layout
 
-Four bank sets (NUM_BANK_SETS=4):
+The NV store holds these record types (the per-bank-set `banks` array is sized `NUM_BANK_SETS=10`):
 
 ```
 Boot State     — active bank, committed flag, boot count (per bank set)
