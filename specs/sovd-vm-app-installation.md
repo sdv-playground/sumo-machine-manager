@@ -65,7 +65,7 @@ From current SOVDd repo implementation:
 - App-scoped updates at `/vehicle/v1/components/{id}/apps/{app_id}/updates` are not currently plumbed in this repo, though they are compatible with the SOVD standard model (see SOVD Standard Alignment section below).
 - App image delivery through the hypervisor-managed update route (component-scoped) is the current implementation.
 
-From `supernova-host-qnx/examples/gateway.toml`:
+On the host gateway side:
 
 - vm1 proxy is currently Phase 2 (commented). App image delivery through the hypervisor-managed update route is the starting assumption.
 
