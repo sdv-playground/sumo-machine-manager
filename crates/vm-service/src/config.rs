@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 pub struct VmServiceConfig {
     /// TCP bind address for the control API (e.g. "127.0.0.1:9101").
-    /// Localhost-only by default — clients (vm-mgr inside supernova,
+    /// Localhost-only by default — clients (component-mgr inside supernova,
     /// CLI tools on the host) reach it over loopback.
     ///
     /// Originally a Unix socket path (`socket: ...`); switched to TCP
@@ -248,7 +248,7 @@ pub enum BackendType {
 /// `nv_store::types::Bank` — vm-service has no nv-store dependency (it's the
 /// platform-agnostic lifecycle layer), so supernova maps `nv_store::Bank` →
 /// this enum when it hands a launch its selector-chosen bank. `bank_a` / `bank_b`
-/// match the on-disk dir names the OTA writes and `vm_mgr::bank_provider`'s
+/// match the on-disk dir names the OTA writes and `component_mgr::bank_provider`'s
 /// `bank_dir_name`.
 //
 // dead_code: the `A`/`B` variants are constructed by supernova-mm (which maps

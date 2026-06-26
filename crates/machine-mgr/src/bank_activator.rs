@@ -3,7 +3,7 @@
 //! RT-launcher reload, container image import).
 //!
 //! Lives in `machine-mgr` so that both `host-os-mgr` (the original IFS
-//! activator) and `vm-mgr` (RT launcher, future backends) can implement
+//! activator) and `component-mgr` (RT launcher, future backends) can implement
 //! the same trait without circular dependencies.
 
 use std::path::Path;

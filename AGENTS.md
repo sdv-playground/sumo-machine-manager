@@ -9,7 +9,7 @@ Rust workspace for platform-agnostic A/B bank management, VM lifecycle, SUIT OTA
 - `CLAUDE.md` — contributor map and command summary.
 - `Cargo.toml` — workspace members and dependency shape.
 - `crates/machine-mgr/` — `Component` trait and registry abstraction.
-- `crates/vm-mgr/` — SUIT validation, OTA engine, SOVD adapter.
+- `crates/component-mgr/` — SUIT validation, OTA engine, SOVD adapter.
 - `crates/vm-service/` — QEMU/qvm lifecycle and VM config.
 - `crates/nv-store/`, `crates/hsm/`, `crates/vhsm-ssd/` — persistence and crypto/HSM layers.
 - `example/` — local generated firmware/server smoke flow.
@@ -42,7 +42,7 @@ rg -n "Component trait|BankSet|SecurityProvider|SystemBankManager|ComponentBacke
 
 ## Guardrails
 
-- `machine-mgr::Component` is the update abstraction; do not treat `vm-mgr` as the base layer.
+- `machine-mgr::Component` is the update abstraction; do not treat `component-mgr` as the base layer.
 - Use `sovd-core` enums and typed models; do not hand-build JSON responses.
 - NV committed flags and bank selectors are source-of-truth after power cycle.
 - Keep platform-specific concrete implementations behind traits.

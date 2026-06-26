@@ -53,7 +53,7 @@
 //! ```
 //!
 //! The identity is stored as readable CBOR text strings. `read_did` (in
-//! vm-mgr) converts each field to the fixed-width UDS DID byte form on
+//! component-mgr) converts each field to the fixed-width UDS DID byte form on
 //! read (UTF-8, NUL-padded / truncated to the historical field width).
 //! Because the identity lives inside the signed manifest bytes, the HSM
 //! signature authenticates it for free — there is no second NV copy to
@@ -125,7 +125,7 @@ pub struct IvdManifest {
 
     /// Firmware SW identity — the single authoritative source for the
     /// UDS identification DIDs (F187-F19E). Inside the signed bytes, so
-    /// the HSM signature authenticates it; vm-mgr's `read_did` derives
+    /// the HSM signature authenticates it; component-mgr's `read_did` derives
     /// the per-DID byte form from these strings on read. Retires the
     /// duplicate identity copy that used to live in the FW Meta NV blob.
     #[serde(rename = "5")]
@@ -134,7 +134,7 @@ pub struct IvdManifest {
 
 /// Firmware SW identity carried inside the signed IVD manifest.
 ///
-/// Readable CBOR text strings; the consumer (`vm-mgr::did`) pads /
+/// Readable CBOR text strings; the consumer (`component_mgr::did`) pads /
 /// truncates each to the historical UDS DID field width on read. Every
 /// field is `String` (CBOR `tstr`) — empty string means "not provided"
 /// and reads back as an all-NUL DID value, matching the prior

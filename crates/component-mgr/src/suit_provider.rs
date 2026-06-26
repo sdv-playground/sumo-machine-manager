@@ -201,7 +201,7 @@ impl SuitProvider {
             "validating envelope"
         );
 
-        // No `add_device_key` here: in vm-mgr the streaming flow
+        // No `add_device_key` here: in component-mgr the streaming flow
         // (validate header + decrypt body separately) doesn't need the
         // raw device key inside the Validator — decryption uses the
         // HSM-backed `KeyUnwrap` via `key_unwrap_for_decryption()`.
@@ -329,7 +329,7 @@ impl ManifestProvider for SuitProvider {
         let manifest_type = peek_manifest_type(data)?;
         let trust_anchor = self.trust_anchor_for(manifest_type)?;
 
-        // No `add_device_key` here: in vm-mgr the streaming flow
+        // No `add_device_key` here: in component-mgr the streaming flow
         // (validate header + decrypt body separately) doesn't need the
         // raw device key inside the Validator — decryption uses the
         // HSM-backed `KeyUnwrap` via `key_unwrap_for_decryption()`.

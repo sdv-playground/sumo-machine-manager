@@ -187,7 +187,7 @@ pub trait Component: Send + Sync {
 
     /// The ECU's self-sovereign id — a thumbprint of its HSM device key, used as
     /// the token `aud`. `None` for non-HSM components or before the device key
-    /// exists. See `vm_mgr::sovd::identity`.
+    /// exists. See `component_mgr::sovd::identity`.
     async fn get_device_id(&self) -> MachineResult<Option<String>> {
         Ok(None)
     }

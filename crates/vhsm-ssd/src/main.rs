@@ -274,7 +274,7 @@ fn main() {
     // Daemon stays up even on an unprovisioned keystore so the listener is
     // always reachable. Key operations against an empty keystore will fail
     // naturally with KeyNotFound until provisioning lands; the host then
-    // restarts us (stop+start in vm-mgr's HSM provision path) so we reload
+    // restarts us (stop+start in component-mgr's HSM provision path) so we reload
     // with the freshly-written keystore.
     if !hsm.is_provisioned().unwrap_or(false) {
         tracing::info!(

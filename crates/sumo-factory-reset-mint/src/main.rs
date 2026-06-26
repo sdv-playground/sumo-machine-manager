@@ -8,7 +8,7 @@
 //! even if Tower 1's storage is lost. NOT for production: there the workshop /
 //! Tower-1 minter signs with a real, secret factory-reset-issuer root.
 //!
-//! Token shape matches `vm-mgr::sovd::authz::TieredAuthorizer`: ES256, header
+//! Token shape matches `component_mgr::sovd::authz::TieredAuthorizer`: ES256, header
 //! `kid` = `iss` = the issuer id, `aud` = the device id, and a space-delimited
 //! `scope` carrying the capability (default `factory-reset`, the string
 //! `authz::capability_scope(Capability::FactoryReset)` returns).

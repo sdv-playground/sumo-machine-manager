@@ -7,7 +7,7 @@ edition = "2021"
 name = "vm-sovd"
 path = "src/main.rs"
 
-# The simulated-ECU SOVD/OTA server. Lives ABOVE the engine (vm-mgr) and the
+# The simulated-ECU SOVD/OTA server. Lives ABOVE the engine (component-mgr) and the
 # component-factory so it can compose components through the SAME factory
 # supernova-mm uses — no hand-rolled, double-maintained composition.
 [dependencies]

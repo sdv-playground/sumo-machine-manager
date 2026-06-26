@@ -76,7 +76,7 @@ pub struct BootstrapState {
     /// (recorded here when consume_pending returns Accepted). The
     /// host's auto-arm path checks this and refuses to re-arm
     /// already-enrolled vm_ids; explicit operator intent (e.g.
-    /// re-flash via vm-mgr's commit_flash hook) bypasses by calling
+    /// re-flash via component-mgr's commit_flash hook) bypasses by calling
     /// arm_pending directly.
     enrolled: BTreeMap<String, EnrolledRecord>,
 }
@@ -106,7 +106,7 @@ pub struct TokenEntry {
 }
 
 /// In-band enrolment record. No secret bytes — just a "vm_id may
-/// enroll once" flag, set by the host (e.g. vm-mgr at OTA install
+/// enroll once" flag, set by the host (e.g. component-mgr at OTA install
 /// time via the HSM) and consumed by the next successful
 /// ENROLL_ASSISTED from that vm_id's pinned source IP.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,7 +187,7 @@ impl BootstrapState {
     }
 
     /// Re-read from disk. Used by the daemon when a `consume*` lookup
-    /// misses — handles the case where another process (e.g. vm-mgr
+    /// misses — handles the case where another process (e.g. component-mgr
     /// via `arm_enrollment`) wrote a fresh entry between the daemon's
     /// startup load and this lookup.
     pub fn reload(&mut self) -> io::Result<()> {
@@ -294,7 +294,7 @@ impl BootstrapState {
     }
 
     /// Arm an in-band enrolment for `vm_id`. Called by the host
-    /// (e.g. vm-mgr at OTA install time, via `HsmProvider::arm_enrollment`).
+    /// (e.g. component-mgr at OTA install time, via `HsmProvider::arm_enrollment`).
     /// Existing armed-but-not-consumed entries for the same `vm_id`
     /// are REPLACED — a re-install resets the clock.
     ///

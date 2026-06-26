@@ -16,7 +16,7 @@ use machine_mgr::BankActivator;
 pub struct HostOsComponent<D: BlockDevice> {
     nv: Arc<Mutex<NvStore<D>>>,
     // Kept as an owned Arc so the activator outlives any in-flight
-    // host-os work that vm-mgr's backend drives via its own copy.
+    // host-os work that component-mgr's backend drives via its own copy.
     // HostOsComponent itself doesn't call into it (yet).
     _bank_activator: Arc<dyn BankActivator>,
     capabilities: Capabilities,

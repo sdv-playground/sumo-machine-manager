@@ -58,7 +58,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  app-mgr         App/container updates via Component        │
 │  (lib)           container image import for local runtimes  │
 │                                                            │
-│  vm-mgr          SUIT validation, OTA engine, DID          │
+│  component-mgr          SUIT validation, OTA engine, DID          │
 │  (lib+bins)      resolution, SOVD wire adapter             │
 │       │                                                    │
 │       ├── sovd-core     (DiagnosticBackend trait)          │
@@ -82,14 +82,14 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic) |
 | `host-os-mgr` | — | Host OS Component: IFS activation, A/B partition, reboot |
 | `app-mgr` | — | App/container Component: local container image import for Docker, Podman, or containerd |
-| `vm-mgr` | `vm-sovd` | SUIT + SOVD: validation, OTA engine, DID resolution |
+| `component-mgr` | `vm-sovd` | SUIT + SOVD: validation, OTA engine, DID resolution |
 
 ### Separation of concerns
 
 ```
 vm-boot        — WHEN to boot which bank (runs once at startup)
 vm-service     — HOW to start/stop VMs (QEMU QMP, qvm lifecycle)
-vm-mgr         — WHAT to flash and verify (OTA engine, SUIT, SOVD wire)
+component-mgr         — WHAT to flash and verify (OTA engine, SUIT, SOVD wire)
 host-os-mgr    — Host-specific: IFS write, partition swap, reboot
 machine-mgr    — Abstract trait layer connecting them all
 ```
@@ -172,7 +172,7 @@ Flash operations require programming session + security unlock:
 | Target | Maturity | Notes |
 |--------|----------|-------|
 | Linux dev (QEMU + file-backed NV) | full | OTA + commit + rollback end-to-end, all tests pass |
-| QNX host (supernova-machine-manager) | working | Collapses vm-service + vm-mgr into single binary |
+| QNX host (supernova-machine-manager) | working | Collapses vm-service + component-mgr into single binary |
 | QNX + real HSE / CAN | trait-only | Needs platform `BlockDevice`, HSE backend, CAN adapter |
 
 Business logic (OTA engine, NV store, SUIT validation, DID resolution) is

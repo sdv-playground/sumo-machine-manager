@@ -145,7 +145,7 @@ pub trait HsmProvider: Send {
         Err(HsmError::NotSupported("HsmProvider::sign".into()))
     }
 
-    /// Arm an in-band ENROLL_ASSISTED for `vm_id`. Used by vm-mgr at
+    /// Arm an in-band ENROLL_ASSISTED for `vm_id`. Used by component-mgr at
     /// OTA install time: after staging a guest's firmware bank, the
     /// orchestrator calls this so the daemon will accept the guest's
     /// next HELLO → ENROLL_ASSISTED handshake. No secret bytes — the

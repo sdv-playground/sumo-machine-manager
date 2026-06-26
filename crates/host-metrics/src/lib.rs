@@ -3,7 +3,7 @@
 //!
 //! Lives at the workspace root so any host (vm-service, supernova, future
 //! orchestrators) can embed it without dragging vm-* dependencies. No deps
-//! on `vm-mgr`, `vm-service`, or `vm-devices`.
+//! on `component-mgr`, `vm-service`, or `vm-devices`.
 //!
 //! ## Architecture
 //!

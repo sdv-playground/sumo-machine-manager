@@ -1,5 +1,5 @@
 //! `IvdBankProvider` — the IVD/A-B implementation of
-//! [`machine_mgr::BankProvider`] for vm-mgr bank sets.
+//! [`machine_mgr::BankProvider`] for component-mgr bank sets.
 //!
 //! This is the default `BankProvider`: a signed CBOR IVD manifest living in
 //! a bank dir, an optional activator (IFS write / partition swap) for
@@ -791,7 +791,7 @@ mod tests {
     /// keystore path (to clean up). Mirrors hsm's own `provisioned_sim`.
     fn sign_bank_dir(name: &str, bank_dir: &Path, gen: u64) -> (hsm::sim::SimHsm, PathBuf) {
         use hsm::payload::*;
-        let keystore = std::env::temp_dir().join(format!("vm-mgr-readinstalled-ks-{name}"));
+        let keystore = std::env::temp_dir().join(format!("component-mgr-readinstalled-ks-{name}"));
         let _ = std::fs::remove_dir_all(&keystore);
         std::fs::create_dir_all(&keystore).unwrap();
 
@@ -845,7 +845,7 @@ mod tests {
 
     #[test]
     fn read_installed_reports_even_when_signature_would_not_verify_and_without_hsm() {
-        let images_dir = std::env::temp_dir().join("vm-mgr-readinstalled-tamper");
+        let images_dir = std::env::temp_dir().join("component-mgr-readinstalled-tamper");
         let _ = std::fs::remove_dir_all(&images_dir);
         let bank_dir = images_dir.join("vm1").join("bank_b");
         let (_hsm, keystore) = sign_bank_dir("tamper", &bank_dir, 7);
@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn read_installed_not_installed_when_manifest_absent() {
-        let images_dir = std::env::temp_dir().join("vm-mgr-readinstalled-absent");
+        let images_dir = std::env::temp_dir().join("component-mgr-readinstalled-absent");
         let _ = std::fs::remove_dir_all(&images_dir);
         // Create the bank dir + a payload file but NO signed manifest.
         let bank_dir = images_dir.join("vm1").join("bank_b");

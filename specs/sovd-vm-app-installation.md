@@ -50,7 +50,7 @@ From `disk-layout.md`:
 
 ### SUIT and Manifest Model
 
-From current vm-mgr anchors:
+From current component-mgr anchors:
 
 - YAML manifests are factory-only; OTA updates use SUIT envelopes (CBOR/COSE).
 - Envelopes carry signed authentication, encrypted firmware payloads, and detached or integrated dependencies.
@@ -80,7 +80,7 @@ App/dependency images are delivered through the existing VM update route:
 ```
 SOVD client
   → host gateway /vehicle/v1/components/{vm1|vm2}/updates
-  → host/hypervisor update authority (vm-mgr)
+  → host/hypervisor update authority (component-mgr)
   → compose target VM bank inventory (base OS + app images)
   → validate all artifacts
   → write to target bank
@@ -347,14 +347,14 @@ POST /vehicle/v1/components/vm1/updates
   → host/hypervisor validates request
   → opens SUIT envelope
   → peeks at component target (dispatcher)
-  → routes to vm-mgr OTA engine
+  → routes to component-mgr OTA engine
   → composes target bank (rootfs + app images)
   → validates all artifacts
   → writes to target bank
   → swaps on next boot
 ```
 
-This route is already defined in `sovd-api` and `vm-mgr`. No new endpoints. This is the current SOVDd repo implementation mapping.
+This route is already defined in `sovd-api` and `component-mgr`. No new endpoints. This is the current SOVDd repo implementation mapping.
 
 ### Future: App Sub-entity Route (Deferred)
 
@@ -697,7 +697,7 @@ SOVD Client
     |
     | POST /vehicle/v1/components/vm1/updates
     v
-Host Hypervisor (vm-mgr)
+Host Hypervisor (component-mgr)
     |
     +-- Validate SUIT envelope + signatures
     |
@@ -781,7 +781,7 @@ This design balances simplicity (reuses existing bank model), safety (host autho
 The sections above describe *what* is composed into a bank. A SW-mapping / update
 tool also needs to read *what is actually installed right now*, per VM, file by
 file. That inventory already exists on the device as the committed bank's **signed
-IVD manifest** (`ivd-manifest.cbor` + `ivd-signature.bin`, see §4.4). vm-mgr
+IVD manifest** (`ivd-manifest.cbor` + `ivd-signature.bin`, see §4.4). component-mgr
 exposes it, signature-verified, as a single vendor SOVD data read — no new route,
 no SOVDd change (SOVDd routes `/data` generically and stays spec-pure).
 
@@ -806,7 +806,7 @@ no SOVDd change (SOVDd routes `/data` generically and stays spec-pure).
   identData DIDs, so the manifest and the DIDs can never disagree.
 - **Signature-verified server-side** before return; **404** when the bank has no
   signed manifest (never flashed / no-HSM smoke path) — never fabricated.
-- **Vendor (`x-sumo-`)**: lives entirely in vm-mgr; SOVDd carries no vendor name.
+- **Vendor (`x-sumo-`)**: lives entirely in component-mgr; SOVDd carries no vendor name.
 - **Independent verification**: a consumer re-verifies `signature_b64` over
   `manifest_b64` with the **`ivd-signing` public key** (the key the device signs
   banks with at provision/flash time). `files[]` then proves the exact installed

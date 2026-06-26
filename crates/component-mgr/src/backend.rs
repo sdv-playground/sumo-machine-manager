@@ -1,4 +1,4 @@
-//! ComponentBackend — DiagnosticBackend implementation for vm-mgr bank sets.
+//! ComponentBackend — DiagnosticBackend implementation for component-mgr bank sets.
 //!
 //! Each instance manages one bank set (hypervisor, vm1, vm2, hsm) and provides:
 //!
@@ -39,7 +39,7 @@ use crate::sovd::security::SecurityProvider;
 /// Vendor SOVD data-parameter id for the committed bank's signed IVD
 /// manifest. `x-sumo-` prefix per ISO 17978-3 Table 70 vendor-extension
 /// namespacing — the route is plain `/data/{id}` (SOVDd stays spec-pure /
-/// format-agnostic); the vendor semantics live entirely here in vm-mgr.
+/// format-agnostic); the vendor semantics live entirely here in component-mgr.
 pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-sumo-installed-manifest";
 
 /// Vendor SOVD data-parameter id for this component's **update-mode** — how it
@@ -47,7 +47,7 @@ pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-sumo-installed-manifest";
 /// irreversible (the HSM keystore). A STABLE per-component config property,
 /// readable any time (even pre-flash), so an offboard twin can sync
 /// rollback-capability the same way it syncs firmware identity. Same `x-sumo-`
-/// vendor namespace (SOVDd stays spec-pure; the semantics live here in vm-mgr).
+/// vendor namespace (SOVDd stays spec-pure; the semantics live here in component-mgr).
 pub const UPDATE_MODE_PARAM_ID: &str = "x-sumo-update-mode";
 
 // ---------------------------------------------------------------------------
@@ -3997,7 +3997,7 @@ fn identity_to_did_bytes(identity: &FirmwareIdentity) -> Vec<(u16, Vec<u8>)> {
 ///
 /// IVD-specific scalar fields (`ivd_version`, `signed_at_unix`) aren't part
 /// of the kind-agnostic [`InstalledFirmware`], so they're decoded back out of
-/// the raw signed CBOR here — this is vm-mgr's IVD serving path, which is
+/// the raw signed CBOR here — this is component-mgr's IVD serving path, which is
 /// allowed to know the IVD wire (`fw.raw` is exactly those CBOR bytes).
 fn installed_manifest_json(fw: &InstalledFirmware) -> serde_json::Value {
     use base64::Engine;
@@ -4109,7 +4109,7 @@ pub trait HealthProbe: Send + Sync {
 /// Returns guest_state and hb_seq from the JSON response.
 /// Query vm-service's `/vms/<name>/health` endpoint over TCP loopback.
 ///
-/// **Async** intentionally: `vm-mgr` runs on the same tokio runtime as
+/// **Async** intentionally: `component-mgr` runs on the same tokio runtime as
 /// vm-service (supernova embeds both). A blocking `std::net::TcpStream`
 /// call inside an `async fn` parks an entire tokio worker for up to the
 /// 2-second read timeout, which is observable as "every other SOVD DID
@@ -4224,7 +4224,7 @@ mod identity_tests {
     /// (so `sign`/`verify` work). Mirrors `hsm::ivd` test setup.
     fn provisioned_hsm(tag: &str) -> (Arc<Mutex<dyn hsm::HsmProvider>>, PathBuf) {
         use hsm::payload::*;
-        let keystore = std::env::temp_dir().join(format!("vm-mgr-identity-ks-{tag}"));
+        let keystore = std::env::temp_dir().join(format!("component-mgr-identity-ks-{tag}"));
         let _ = std::fs::remove_dir_all(&keystore);
         std::fs::create_dir_all(&keystore).unwrap();
 
@@ -4273,7 +4273,7 @@ mod identity_tests {
         tag: &str,
         meta: ImageMeta,
     ) -> (ComponentBackend<MemBlockDevice>, PathBuf, PathBuf) {
-        let images_dir = std::env::temp_dir().join(format!("vm-mgr-identity-img-{tag}"));
+        let images_dir = std::env::temp_dir().join(format!("component-mgr-identity-img-{tag}"));
         let _ = std::fs::remove_dir_all(&images_dir);
         std::fs::create_dir_all(&images_dir).unwrap();
 
@@ -4749,7 +4749,7 @@ mod identity_tests {
     /// selector is sealed, so a failure leaves the activation un-recorded.
     #[tokio::test]
     async fn finalize_activation_failure_rolls_back() {
-        let images_dir = std::env::temp_dir().join("vm-mgr-activate-fail-img");
+        let images_dir = std::env::temp_dir().join("component-mgr-activate-fail-img");
         let _ = std::fs::remove_dir_all(&images_dir);
         std::fs::create_dir_all(&images_dir).unwrap();
 
@@ -4814,7 +4814,7 @@ mod identity_tests {
     /// bank (`active.other()`) and `prepare_target_bank_dir` wiped it.
     #[tokio::test]
     async fn legacy_upload_in_trial_is_refused_without_wiping_committed_bank() {
-        let images_dir = std::env::temp_dir().join("vm-mgr-b5-trial-legacy-img");
+        let images_dir = std::env::temp_dir().join("component-mgr-b5-trial-legacy-img");
         let _ = std::fs::remove_dir_all(&images_dir);
         std::fs::create_dir_all(&images_dir).unwrap();
 
@@ -4987,7 +4987,7 @@ mod bank_provider_injection_tests {
         // The step-3 durable marker: set/clear this component's node reboot-owed
         // bit and read it back via the same NvUpdateSession record the gate
         // consults. (The refuse-on-RebootPending decision is covered by
-        // machine-mgr's node_update tests; this proves the vm-mgr NV plumbing.)
+        // machine-mgr's node_update tests; this proves the component-mgr NV plumbing.)
         let b = backend(); // BankSet::Vm1
         assert!(b.node_reboot_owed().unwrap().reboot_owed.is_empty());
 

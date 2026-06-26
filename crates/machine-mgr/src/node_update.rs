@@ -6,7 +6,7 @@
 //! never get coalesced into one reboot.
 //!
 //! The phase/gate logic here is pure. [`NodeCoordinator`] holds the in-memory
-//! [`Staging`]; the caller (vm-mgr, which holds NV + the components) feeds it the
+//! [`Staging`]; the caller (component-mgr, which holds NV + the components) feeds it the
 //! durable facts (the NV reboot-owed record, per-component `committed`). See
 //! `docs/design/node-update-state.md`.
 
@@ -202,7 +202,7 @@ pub fn admit(
 /// the gate; built once and shared (`Arc`) into each component (for the
 /// `start_flash` gate) and the SOVD layer (reboot / verdict / the
 /// `x-sumo-update-state` report). The durable facts (`Durable` reboot-owed,
-/// `in_trial`) are supplied by the caller — vm-mgr, which holds NV + the
+/// `in_trial`) are supplied by the caller — component-mgr, which holds NV + the
 /// components. See `docs/design/node-update-state.md`.
 #[derive(Default)]
 pub struct NodeCoordinator {

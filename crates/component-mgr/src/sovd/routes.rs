@@ -97,8 +97,9 @@ pub fn update_state_router<D: BlockDevice + Send + 'static>(
 /// sumo-mm, not SOVDd, per the three-layer rule. The signed cert comes back via
 /// the SUIT keystore update (one channel — `feedback_hsm_one_channel_key_material.md`).
 ///
-/// NOTE: this is machine-level SOVD surface that happens to live in the
-/// `vm-mgr` crate — see `project_vm_mgr_outgrew_its_name` (rename pending).
+/// NOTE: this is machine-level SOVD surface served from the `component-mgr`
+/// crate — it spans all components, not just VMs (hence the rename from the
+/// old `vm-mgr` name).
 pub fn hsm_router(machine: Arc<dyn Machine>) -> Router {
     let csr = machine.clone();
     Router::new()

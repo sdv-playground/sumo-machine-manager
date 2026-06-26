@@ -53,7 +53,7 @@ use crate::proto::{AuthFailReason, Op, Request, Response, StatusCode};
 /// against an operator-configured table (e.g. `hsm.allow:` entries
 /// in supernova-mm's config.yaml). A reverse-DNS or kernel-side
 /// lookup is NOT appropriate — the daemon needs the same view of
-/// identity that vm-mgr's `arm_enrollment` used.
+/// identity that component-mgr's `arm_enrollment` used.
 pub trait IpResolver: Send + Sync {
     fn resolve(&self, ip: &IpAddr) -> Option<String>;
 }
@@ -484,7 +484,7 @@ fn handle_enroll_assisted(
     let thumbprint = sha256(&cwt_bytes);
 
     // Look up the pending flag. On miss, reload from disk once and
-    // retry — handles the case where vm-mgr armed this vm_id after
+    // retry — handles the case where component-mgr armed this vm_id after
     // the daemon's startup load.
     let outcome = match ctx.bootstrap.consume_pending(&vm_id, iat, &thumbprint) {
         PendingConsumeOutcome::Accepted => PendingConsumeOutcome::Accepted,
@@ -1516,7 +1516,7 @@ statements:
         let policy = sample_policy();
         let now = fixed_time(1_500_000);
         let (mut bootstrap, _tmp) = fresh_bootstrap();
-        // Host pre-arms vm9 (vm-mgr would have called arm_enrollment).
+        // Host pre-arms vm9 (component-mgr would have called arm_enrollment).
         bootstrap.arm_pending("vm9", Some(3600));
         bootstrap.save().unwrap();
 
@@ -1747,14 +1747,14 @@ statements:
     #[test]
     fn enroll_assisted_reloads_state_on_miss() {
         // Daemon's in-memory state is empty, but the on-disk file has
-        // an armed entry (written by vm-mgr after daemon startup).
+        // an armed entry (written by component-mgr after daemon startup).
         // The lookup must reload-from-disk and find it.
         let (signer, signer_pub, _principal, principal_pub) = fixture();
         let policy = sample_policy();
         let now = fixed_time(1_500_000);
         let (mut bootstrap, tmp) = fresh_bootstrap();
         // Bootstrap is empty in-memory; arm vm9 by writing the file
-        // directly (simulating an out-of-process write by vm-mgr).
+        // directly (simulating an out-of-process write by component-mgr).
         let mut other = BootstrapState::load(tmp.path().join("bootstrap.yaml")).unwrap();
         other.arm_pending("vm9", None);
         other.save().unwrap();

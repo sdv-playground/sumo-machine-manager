@@ -19,10 +19,10 @@ discriminated at runtime via `Capabilities`):
 
 | Shape | Lifecycle | Implementations |
 |---|---|---|
-| **Banked** — A/B + trial + commit/rollback | `start_install` → `upload_envelope` → `finalize_install` (flip pointer, reboot needed) → trial boot → `commit_install` OR auto-rollback | `ComponentAdapter` (vm-mgr), `HostOsComponent` (host-os-mgr), future RT-core component, A/B-style slave-ECU component |
+| **Banked** — A/B + trial + commit/rollback | `start_install` → `upload_envelope` → `finalize_install` (flip pointer, reboot needed) → trial boot → `commit_install` OR auto-rollback | `ComponentAdapter` (component-mgr), `HostOsComponent` (host-os-mgr), future RT-core component, A/B-style slave-ECU component |
 | **Singleshot** — write-through, no rollback | `start_install` → `upload_envelope` → `finalize_install` (write live) → `commit_install` (raise floor + audit) | HSM keystore (hsm crate), `ContainerImageComponent` (app-mgr) |
 
-`vm-mgr` is **the VM impl of `Component`**, not the base. Same for
+`component-mgr` is **the VM impl of `Component`**, not the base. Same for
 `host-os-mgr`, `app-mgr`, and `hsm`. They're siblings under the same
 trait; `MachineRegistry` (`crates/machine-mgr/src/machine.rs`) holds
 them as `dyn Component` and routes by `component_id`.
@@ -62,7 +62,7 @@ Cargo workspace with 10 crates. Bottom-up:
   `Component` lifecycle. `ContainerImageComponent` validates detached
   `#container-image` payloads and imports them into Docker, Podman, or
   containerd.
-- **vm-mgr** (lib+bins: `vm-sovd`): SUIT validation, encrypted firmware
+- **component-mgr** (lib+bins: `vm-sovd`): SUIT validation, encrypted firmware
   streaming pipeline, OTA engine (install/commit/rollback), DID resolution,
   and the SOVD wire adapter. `ComponentBackend` per-component state machine;
   `ComponentDiagBackend` routes SOVD calls through `Component` trait.
@@ -74,7 +74,7 @@ Cargo workspace with 10 crates. Bottom-up:
 ```
 vm-boot        — WHEN to boot which bank (runs once at startup, all bank sets)
 vm-service     — HOW to start/stop VMs (QEMU QMP, qvm lifecycle)
-vm-mgr         — WHAT to flash and verify (OTA engine, SUIT, SOVD wire)
+component-mgr         — WHAT to flash and verify (OTA engine, SUIT, SOVD wire)
 host-os-mgr    — Host-specific: IFS write, partition swap, reboot
 machine-mgr    — Abstract trait layer connecting them all
 ```
@@ -106,7 +106,7 @@ machine-mgr    — Abstract trait layer connecting them all
 ### Key Files
 
 ```
-crates/vm-mgr/src/
+crates/component-mgr/src/
   backend.rs              — ComponentBackend: per-component state machine
   component_adapter.rs    — ComponentAdapter: exposes ComponentBackend via Component
   diag_backend.rs         — ComponentDiagBackend: routes SOVD -> Component

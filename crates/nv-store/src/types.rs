@@ -382,7 +382,7 @@ impl NvRecord for NvFactory {
 /// tester serial) used to live here too. They were a hand-synced
 /// duplicate of the bank's signed IVD manifest and a drift risk, so
 /// they now live ONLY in the manifest (`hsm::ivd::IvdIdentity`) — the
-/// single signed source. `vm-mgr::did` derives the identification DIDs
+/// single signed source. `component_mgr::did` derives the identification DIDs
 /// from there on read. This record keeps only the fields the boot /
 /// OTA-install path needs.
 ///

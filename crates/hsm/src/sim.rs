@@ -772,7 +772,7 @@ impl SimHsm {
 
         // Internal SimHsm flow: extracting the bootstrap device key
         // here is fine because we own the keystore on disk and the
-        // file IS the key. Outside callers (vm-mgr, supernova) must
+        // file IS the key. Outside callers (component-mgr, supernova) must
         // use the operation-based unwrap_cek_*() trait methods.
         let unwrap = sumo_onboard::decryptor::InMemoryKeyUnwrap::new(&device_key, &crypto);
         let mut decryptor = StreamingDecryptor::new(&manifest, 0, &unwrap, &crypto)
@@ -1049,7 +1049,7 @@ impl HsmProvider for SimHsm {
         // Spawn the daemon regardless of provisioning state — the listener
         // must be reachable on a factory device too. vhsm-test-ssd will log
         // "not yet provisioned" and fail key ops until the keystore is
-        // populated; the post-provision restart in vm-mgr reloads it.
+        // populated; the post-provision restart in component-mgr reloads it.
 
         tracing::info!(
             bin = %self.daemon_bin.display(),

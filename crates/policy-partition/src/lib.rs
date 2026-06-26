@@ -4,7 +4,7 @@
 //! inside an existing bank-set rootfs rather than being its own
 //! SUIT-delivered bank: host-side policy lives in the host-os bank,
 //! per-VM policy lives in the respective VM bank. Either way the
-//! existing OTA pipeline (vm-mgr / host-os-mgr) delivers it with
+//! existing OTA pipeline (component-mgr / host-os-mgr) delivers it with
 //! the same trial-boot + auto-rollback + `security_version`
 //! anti-rollback semantics we already trust for firmware.
 //!

@@ -4,7 +4,7 @@
 //! the behaviors that used to be hard-coded in `match bank_set { … }`
 //! helpers — the on-disk directory name and the SUIT-payload-URI →
 //! filename layout. Each component supplies its own `BankSetSpec` at
-//! construction time; the bank-set machinery in vm-mgr stays generic.
+//! construction time; the bank-set machinery in component-mgr stays generic.
 //!
 //! Phase 2 of the deep refactor adds this module. Phase 3 makes the
 //! spec construction config-driven (via component-factory's

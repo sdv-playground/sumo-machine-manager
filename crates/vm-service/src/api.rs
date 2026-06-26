@@ -108,7 +108,7 @@ async fn stop_vm(State(mgr): State<SharedManager>, Path(name): Path<String>) -> 
 }
 
 /// Query params for [`ensure_vm_running`]. Optional `?bank=a|b` lets the
-/// caller (vm-mgr after an OTA flip) pin the A/B bank to relaunch from.
+/// caller (component-mgr after an OTA flip) pin the A/B bank to relaunch from.
 /// Absent ⇒ leave the VM's existing `def.bank` untouched (back-compat with
 /// manual callers and supernova's startup auto-start).
 #[derive(Debug, Default, Deserialize)]
@@ -123,7 +123,7 @@ struct EnsureParams {
 /// instead of returning AlreadyRunning.
 ///
 /// An optional `?bank=a|b` query pins which A/B bank to relaunch from: it's
-/// pushed via `set_vm_bank` right before `start_vm`. vm-mgr sends it with
+/// pushed via `set_vm_bank` right before `start_vm`. component-mgr sends it with
 /// the just-activated bank so the relaunch boots that bank instead of the
 /// stale boot-time `def.bank`. Absent ⇒ `def.bank` is
 /// left as-is.
@@ -132,7 +132,7 @@ struct EnsureParams {
 /// already-dead handle, cleanup + return no-op handle). The blocking
 /// stages (wait_for_exit, finalize_stop, start_vm) run in a background
 /// task after we've returned 200, matching the documented contract
-/// callers (vm-mgr's notify_vm_service) rely on: "returns 200 the moment
+/// callers (component-mgr's notify_vm_service) rely on: "returns 200 the moment
 /// the recycle is initiated (it does NOT wait for QEMU/qvm to fully boot)".
 async fn ensure_vm_running(
     State(mgr): State<SharedManager>,
@@ -307,7 +307,7 @@ vms:
     }
 
     /// Fire a raw `POST {path}` and read back the status line — mirrors how
-    /// vm-mgr's `notify_vm_service` talks to this route.
+    /// component-mgr's `notify_vm_service` talks to this route.
     async fn post(addr: std::net::SocketAddr, path: &str) -> String {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let req = format!(

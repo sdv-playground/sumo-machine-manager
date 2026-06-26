@@ -1,6 +1,6 @@
 //! machine-mgr — semantic API behind the SOVD diagnostic server.
 //!
-//! The SOVD-facing layer in `vm-mgr` holds an `Arc<dyn Machine>`.
+//! The SOVD-facing layer in `component-mgr` holds an `Arc<dyn Machine>`.
 //! Each `Machine` exposes a registry of [`Component`] objects — one per
 //! independently-updatable thing (hypervisor, vm1, vm2, hsm, ...). Components
 //! declare their [`Capabilities`] so an external orchestrator (in-vehicle
@@ -26,11 +26,11 @@
 //!             │               │               │              │
 //!             └───────────────┴───────────────┴──────────────┘
 //!                 each a ComponentAdapter<D: BlockDevice>
-//!                 (see vm-mgr::component_adapter)
+//!                 (see component_mgr::component_adapter)
 //! ```
 //!
 //! Every Component today is a thin `ComponentAdapter<D>` wrapper around
-//! a `vm_mgr::ComponentBackend<D>` bound to a specific `BankSet`. This is
+//! a `component_mgr::ComponentBackend<D>` bound to a specific `BankSet`. This is
 //! a migration layer: as more Component methods get wired end-to-end, the
 //! legacy `ComponentBackend` surface shrinks; once it's vestigial the adapter will
 //! implement `Component` directly.

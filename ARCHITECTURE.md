@@ -44,7 +44,7 @@ defaults). Two structural shapes, discriminated at runtime via `Capabilities`:
 
 | Shape | Lifecycle | Implementors |
 |---|---|---|
-| **Banked** — A/B + trial + commit/rollback | `start_install → upload_envelope → finalize_install (flip, reboot) → trial → commit_install OR auto-rollback` | `ComponentAdapter` (vm-mgr, over `ComponentBackend`), `HostOsComponent` (host-os-mgr), `AppComponent` (app-mgr), an RT-core component |
+| **Banked** — A/B + trial + commit/rollback | `start_install → upload_envelope → finalize_install (flip, reboot) → trial → commit_install OR auto-rollback` | `ComponentAdapter` (component-mgr, over `ComponentBackend`), `HostOsComponent` (host-os-mgr), `AppComponent` (app-mgr), an RT-core component |
 | **Singleshot** — write-through, no rollback | `start_install → upload_envelope → finalize_install (write live) → commit_install (raise floor)` | the HSM keystore (a single-bank `ComponentBackend`), `ContainerImageComponent` (app-mgr) |
 
 ```mermaid
@@ -116,12 +116,12 @@ classDiagram
         +get_public_key
     }
     class ManifestProvider {
-        <<trait, vm-mgr>>
+        <<trait, component-mgr>>
         +validate_envelope
         +extract_metadata
         +component_aliases
     }
-    Component <|.. ComponentAdapter : vm-mgr
+    Component <|.. ComponentAdapter : component-mgr
     Component <|.. HostOsComponent : host-os-mgr
     Component <|.. AppComponent : app-mgr
     Component <|.. ContainerImageComponent : app-mgr
@@ -129,7 +129,7 @@ classDiagram
     ComponentBackend --> BankProvider
     ComponentBackend --> ManifestProvider
     ComponentBackend --> HsmProvider
-    BankProvider <|.. IvdBankProvider : vm-mgr (default)
+    BankProvider <|.. IvdBankProvider : component-mgr (default)
     BankProvider --> BankActivator : optional, platform step
     BankActivator <|.. DevBankActivator : host-os-mgr
     BankActivator <|.. PartitionBankActivator : host-os-mgr
@@ -159,7 +159,7 @@ the seams above are the supported extension points.
   `Capabilities`/`FlashCaps`; the `BankActivator` seam; `system_bank_state`
   (`SystemBankManager` + `BootSelector` — the node boot-authority engine, re-exporting
   the nv-store selector primitives). Platform-independent.
-- **vm-mgr** (lib + `vm-sovd` bin): the OTA engine + SOVD wire. `ComponentBackend` (the
+- **component-mgr** (lib + `vm-sovd` bin): the OTA engine + SOVD wire. `ComponentBackend` (the
   per-component state machine — DIDs, faults, the full install/flash lifecycle, modes);
   `ComponentAdapter` (exposes it as a `Component`); `install_router_diag`
   (`InstallRouterDiag` — routes a VM's install methods to its container-vs-VM router,
@@ -202,7 +202,7 @@ graph BT
     hsm[hsm<br/>HsmProvider + ivd] --> nv
     vhsm[vhsm-ssd] --> hsm
     sec[secstore] --> hsm
-    vmgr[vm-mgr<br/>OTA engine + SOVD wire] --> mm
+    vmgr[component-mgr<br/>OTA engine + SOVD wire] --> mm
     vmgr --> hsm
     vmgr --> nv
     host[host-os-mgr] --> mm
@@ -263,7 +263,7 @@ flowchart LR
     end
 ```
 
-The `BankProvider` seam (`vm-mgr::bank_provider`) routes *every* bank touch (stage /
+The `BankProvider` seam (`component_mgr::bank_provider`) routes *every* bank touch (stage /
 activate / commit / rollback / selected-bank) through one trait per kind, so the boot
 selector + NV stay consistent. `IvdBankProvider` is the default (signed CBOR manifest in
 the bank dir + NV boot-state); alternative providers (e.g. raw-partition RT) plug in at
@@ -279,7 +279,7 @@ runs session → security unlock → upload envelope → finalize → activate �
 sequenceDiagram
     participant O as Driving client<br/>(campaign tool / tester)
     participant W as SOVD /updates wire
-    participant CB as ComponentBackend (vm-mgr)
+    participant CB as ComponentBackend (component-mgr)
     participant SP as SuitProvider + streaming
     participant BP as IvdBankProvider
     participant VS as vm-service
@@ -322,7 +322,7 @@ The engine steps (`ComponentBackend` + `ota.rs`):
 vendor data param **`x-sumo-installed-manifest`** (files+sha inventory + IVD identity +
 signature for re-verification), and each component's update-mode as
 **`x-sumo-update-mode`** (`{update_mode: banked|singleshot, supports_rollback, dual_bank,
-reset_kind}`, readable even pre-flash). Both are served from vm-mgr's `read_data` hook
+reset_kind}`, readable even pre-flash). Both are served from component-mgr's `read_data` hook
 over the SOVD server's generic vendor-parameter wire — **all `x-sumo-*` vendor surface
 is owned by this codebase**, keeping the SOVD server layer itself vendor-free.
 
