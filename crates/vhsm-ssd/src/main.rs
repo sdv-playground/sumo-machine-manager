@@ -10,6 +10,8 @@
 //!            (--policy-dir <dir> | --iam-policy <file>)
 //!            --bootstrap-state <path>
 //!            [--listen <ip:port>]
+//!            [--backend-cmd <path>]
+//!            [--backend-socket <path>]
 //!            [--cert-max-age <secs>]
 //!            [--persist-dir <dir>]
 //!            [--audit-log <path>]
@@ -33,11 +35,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use hsm::sim::SimHsm;
-use hsm::{HsmCryptoProvider, HsmProvider, KeyRole};
+use hsm::{HsmCryptoProvider, KeyRole};
 
 use vhsm_ssd::audit::AuditLogger;
 use vhsm_ssd::auth::{self, EnrollContext, HandshakeState, IpResolver, Principal};
+use vhsm_ssd::backend;
 use vhsm_ssd::bootstrap::BootstrapState;
 use vhsm_ssd::cert::EcuSigner;
 use vhsm_ssd::codec;
@@ -122,6 +124,8 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let mut keystore_path: Option<PathBuf> = None;
+    let mut backend_cmd: Option<PathBuf> = None;
+    let mut backend_socket: Option<PathBuf> = None;
     let mut listen_addr: Option<SocketAddr> = None;
     let mut policy_dir: Option<PathBuf> = None;
     let mut bootstrap_state_path: Option<PathBuf> = None;
@@ -141,6 +145,18 @@ fn main() {
         match args[i].as_str() {
             "--keystore" if i + 1 < args.len() => {
                 keystore_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--backend-cmd" if i + 1 < args.len() => {
+                // Override the link-B backend executable (default: the
+                // `hsm-sim-service` binary beside vhsm-ssd).
+                backend_cmd = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--backend-socket" if i + 1 < args.len() => {
+                // Override the link-B Unix socket path (default:
+                // <keystore>/hsm-backend.sock).
+                backend_socket = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--listen" if i + 1 < args.len() => {
@@ -264,26 +280,55 @@ fn main() {
     let listen_addr =
         listen_addr.unwrap_or_else(|| DEFAULT_LISTEN.parse().expect("DEFAULT_LISTEN parse"));
 
-    // Create HSM provider (reads keys from keystore)
-    let hsm = SimHsm::new(
-        PathBuf::from("unused"),
-        keystore_path.clone(),
-        listen_addr.port(),
+    // Crypto backend is an out-of-process link-B service (Stage 3 of the link-B
+    // HSM refactor). vhsm-ssd no longer owns an in-process SimHsm; it spawns the
+    // backend — `hsm-sim-service` in dev, a vendor HSM bridge in production — and
+    // talks to it through a LinkBClient over a Unix socket. vhsm-ssd is now a
+    // pure A→B proxy: it terminates the guest vHSM wire + IAM on side A and
+    // forwards every crypto op over link-B on side B.
+    let backend_cmd = match backend_cmd {
+        Some(p) => p,
+        None => backend::default_backend_cmd().unwrap_or_else(|e| {
+            eprintln!(
+                "error: cannot locate default link-B backend (hsm-sim-service beside vhsm-ssd): {e}"
+            );
+            std::process::exit(1);
+        }),
+    };
+    let backend_socket = backend_socket.unwrap_or_else(|| keystore_path.join("hsm-backend.sock"));
+
+    // The backend binds its socket and serves regardless of keystore state, so —
+    // as before — the daemon comes up even on an unprovisioned keystore: key ops
+    // fail naturally with KeyNotFound until provisioning lands, then the host
+    // restarts us (stop+start in component-mgr's HSM provision path) and the
+    // backend reloads the freshly-written keystore.
+    //
+    // `_backend_child` is held for the whole daemon lifetime (main's accept loop
+    // never returns) so the OS doesn't reap the backend. A leading underscore
+    // keeps it alive to end-of-scope while silencing the unused-binding warning;
+    // a bare `_` would drop — and NOT kill — it immediately.
+    //
+    // vhsm-ssd has no signal/shutdown handler yet, so we don't actively kill the
+    // backend on exit. A SIGKILL of vhsm-ssd would orphan it, but the backend
+    // (hsm-sim-service) removes its stale socket on the next restart, so the
+    // following spawn_and_connect recovers cleanly. A full orphan-kill — a
+    // SIGTERM handler that reaps the child, mirroring vhsm-ssd's own self-orphan
+    // mitigation — is a follow-up.
+    let (client, _backend_child) =
+        match backend::spawn_and_connect(&backend_cmd, &keystore_path, &backend_socket) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("error: failed to start link-B HSM backend: {e}");
+                std::process::exit(1);
+            }
+        };
+    tracing::info!(
+        backend_cmd = %backend_cmd.display(),
+        socket = %backend_socket.display(),
+        "link-B HSM backend started — vhsm-ssd serving as an A→B proxy"
     );
 
-    // Daemon stays up even on an unprovisioned keystore so the listener is
-    // always reachable. Key operations against an empty keystore will fail
-    // naturally with KeyNotFound until provisioning lands; the host then
-    // restarts us (stop+start in component-mgr's HSM provision path) so we reload
-    // with the freshly-written keystore.
-    if !hsm.is_provisioned().unwrap_or(false) {
-        tracing::info!(
-            keystore = %keystore_path.display(),
-            "keystore not yet provisioned — accepting connections, key ops will fail until provisioned"
-        );
-    }
-
-    let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(hsm);
+    let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(client);
 
     // Load IAM policy from the in-bank policy directory. Default-deny
     // if the file declares no statements — operator's intent. Refuse
@@ -956,6 +1001,12 @@ fn print_usage() {
     eprintln!("  --cert-max-age <secs>       Lifetime of CWTs minted via ENROLL (default {DEFAULT_CERT_LIFETIME_SECS})");
     eprintln!("  --issuer <string>           CWT `iss` claim value (default '{DEFAULT_ISSUER}')");
     eprintln!();
+    eprintln!("Crypto backend (out-of-process link-B service):");
+    eprintln!("  --backend-cmd <path>        Backend executable to spawn (default: the");
+    eprintln!("                              `hsm-sim-service` binary beside vhsm-ssd). Served over");
+    eprintln!("                              link-B; a vendor HSM bridge can replace it.");
+    eprintln!("  --backend-socket <path>     link-B Unix socket (default: <keystore>/hsm-backend.sock)");
+    eprintln!();
     eprintln!("Cross-node mTLS (off unless --cross-node-listen is set):");
     eprintln!("  --cross-node-listen <ip:port>  Second bind for node-to-node access; the peer is");
     eprintln!(
@@ -982,6 +1033,9 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // SimHsm is only needed by these cross-node config tests now that the
+    // daemon's crypto backend is an out-of-process link-B client (see backend.rs).
+    use hsm::sim::SimHsm;
 
     // Both cases fail at the identity-root PEM step, before any keystore/HSM
     // access, so the keystore path need not exist.

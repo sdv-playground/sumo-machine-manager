@@ -14,12 +14,16 @@
 //! Implemented ops: get_random, key_generate, key_delete, encrypt, decrypt,
 //! mac_generate/verify, sign, verify, get_handle_info, get_pubkey, get_cert.
 //!
-//! Crypto is delegated to an `HsmCryptoProvider` (see the `hsm` crate).
-//! Today that's `SimHsm` (RustCrypto + on-disk keys); production brings up
-//! a board-specific provider talking to HSE/TRNG hardware.
+//! Crypto is delegated to an `HsmCryptoProvider`. In the daemon that provider
+//! is a [`backend::spawn_and_connect`] `LinkBClient` to an out-of-process
+//! backend service over a link-B Unix socket (`hsm-sim-service` serving a
+//! `SimHsm` in dev; a vendor HSM bridge in production) — so vhsm-ssd is a pure
+//! A→B proxy: terminate the guest vHSM wire + IAM here, forward crypto over
+//! link-B.
 
 pub mod audit;
 pub mod auth;
+pub mod backend;
 pub mod bootstrap;
 pub mod cert;
 pub mod codec;
