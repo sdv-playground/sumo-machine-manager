@@ -1,0 +1,11 @@
+[package]
+name = "hsm-link-b"
+version = "0.1.0"
+edition = "2021"
+description = "Link-B: the host <-> physical-HSE service protocol (the vendor-facing HSM op contract)"
+
+# Pure protocol crate — no dependencies. Keys/algs/handles are caller-supplied
+# u32s on the wire; the status<->HsmError mapping lives in the client/service
+# (which depend on hsm-contract), not here. This keeps link-b a clean wire spec
+# a C team can mirror without any Rust-trait baggage (see include/hsm_link_b.h).
+[dependencies]
