@@ -1,0 +1,32 @@
+[package]
+name = "hsm-conformance"
+version = "0.1.0"
+edition = "2021"
+description = "Link-B HSM backend conformance battery — verify a vendor backend honours the host<->backend op contract"
+
+[dependencies]
+# LinkBClient (the host-side driver), the HsmCryptoProvider contract + its types
+# (KeyHandle/KeyType/HsmError), and the slot registry constants. The harness
+# drives any link-B backend through `&dyn HsmCryptoProvider`. `crypto` matches
+# vhsm-ssd (the other link-B consumer) so a standalone `-p hsm-conformance` build
+# compiles `hsm` in the same feature config the workspace/CI build uses.
+hsm = { path = "../hsm", features = ["crypto"] }
+# The frozen wire contract this battery exists to test. Pulled in directly so
+# the crate documents (and can address) the link-B layer it targets.
+hsm-link-b = { path = "../hsm-link-b" }
+# Well-known handle + algorithm identifiers (HANDLE_JWT_SIGNING / HANDLE_SW_AUTHORITY / ALG_ECC_P256).
+vhsm-proto = { path = "../vhsm-proto" }
+# INDEPENDENT signature verification for the real-crypto KAT (C2): the battery
+# re-verifies the backend's signature with its own RustCrypto stack, so a
+# backend that fakes crypto cannot pass by self-attesting.
+p256 = { version = "0.13", features = ["ecdsa"] }
+ecdsa = { version = "0.16", features = ["verifying", "der"] }
+
+[dev-dependencies]
+# Tests spawn the real `hsm-sim-service` over a tempdir keystore and compile the
+# C reference skeleton into a temp dir.
+tempfile = "3"
+
+[[bin]]
+name = "hsm-conformance"
+path = "src/main.rs"
