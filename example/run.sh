@@ -38,6 +38,17 @@ NO_INIT=false
 FRESH=false
 EXTRA_ARGS=()
 
+# HSM (out-of-process link-B backend) defaults. The backend (hsm-sim-service) is
+# the single source of HSM crypto + provisioning; vhsm-ssd (guest-facing) and
+# vm-sovd (host-facing) both CONNECT to its link-B Unix socket. Decision B: the
+# connectors own no backend lifecycle — the backend is spawned FIRST, separately.
+HSM_KEYSTORE="${VM_MGR_HSM_KEYSTORE:-/tmp/vm-mgr-vhsm-keys}"
+HSM_SOCK="${VM_MGR_HSM_SOCK:-$HSM_KEYSTORE/hsm-backend.sock}"
+HSM_PORT="${VM_MGR_HSM_PORT:-5100}"
+VHSM_RUNTIME="$ROOT_DIR/target/vhsm-runtime"
+VHSM_POLICY_DIR="$VHSM_RUNTIME/policy"
+VHSM_BOOTSTRAP="$VHSM_RUNTIME/bootstrap.yaml"
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-init)
@@ -86,6 +97,11 @@ cargo update --manifest-path "$ROOT_DIR/Cargo.toml" \
 # 2. Build workspace + examples
 echo "[vm-mgr] building workspace..."
 cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --quiet
+# hsm-sim-service (the link-B backend) has required-features = ["crypto"], so a
+# plain workspace build skips it — build it explicitly.
+echo "[vm-mgr] building link-B HSM backend (hsm-sim-service)..."
+cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --quiet \
+    -p hsm --features crypto --bin hsm-sim-service
 
 # 3. Generate SUIT keys and demo firmware (if keys don't exist)
 if [ ! -f "$TRUST_ANCHOR" ]; then
@@ -115,6 +131,8 @@ fi
 RUNNER="$ROOT_DIR/target/debug/vm-runner"
 DIAGSERVER="$ROOT_DIR/target/debug/vm-diagserver"
 SOVD="$ROOT_DIR/target/debug/vm-sovd"
+BACKEND="$ROOT_DIR/target/debug/hsm-sim-service"
+VHSM_SSD="$ROOT_DIR/target/debug/vhsm-ssd"
 
 # 5. Factory init (unless --no-init or NV already exists with data)
 if [ "$NO_INIT" = false ]; then
@@ -123,12 +141,17 @@ if [ "$NO_INIT" = false ]; then
     echo ""
 fi
 
-# 6. Cleanup handler
+# 6. Cleanup handler — reaps every process this script owns, including the
+#    externally-spawned link-B backend (the connectors never reap it themselves).
 HELPER_PID=""
 SOVD_PID=""
+BACKEND_PID=""
+VHSM_PID=""
 cleanup() {
-    [ -n "$HELPER_PID" ] && kill "$HELPER_PID" 2>/dev/null && wait "$HELPER_PID" 2>/dev/null
     [ -n "$SOVD_PID" ] && kill "$SOVD_PID" 2>/dev/null && wait "$SOVD_PID" 2>/dev/null
+    [ -n "$VHSM_PID" ] && kill "$VHSM_PID" 2>/dev/null && wait "$VHSM_PID" 2>/dev/null
+    [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null && wait "$BACKEND_PID" 2>/dev/null
+    [ -n "$HELPER_PID" ] && kill "$HELPER_PID" 2>/dev/null && wait "$HELPER_PID" 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -147,6 +170,8 @@ fi
 echo ""
 echo "[vm-mgr] NV store:         $NV_PATH"
 echo "[vm-mgr] Trust anchor:     $TRUST_ANCHOR"
+echo "[vm-mgr] HSM backend:      link-B @ $HSM_SOCK (hsm-sim-service)"
+echo "[vm-mgr] vHSM daemon:      127.0.0.1:$HSM_PORT (vhsm-ssd, connect-only)"
 echo "[vm-mgr] SOVD:             http://${SOVD_ADDR/0.0.0.0/localhost}"
 if [ -n "$HELPER_BIN" ]; then
 echo "[vm-mgr] Security helper:  http://localhost:$HELPER_PORT (token: $HELPER_TOKEN)"
@@ -160,11 +185,64 @@ echo ""
 echo "[vm-mgr] Flash flow: session → programming → security unlock → upload → commit"
 echo ""
 
-# 8. Start SOVD server
-if [ -z "$PROFILE" ]; then
-    exec "$SOVD" "$NV_PATH" "$TRUST_ANCHOR" "$SOVD_ADDR"
+# 8. Start the link-B HSM backend FIRST (the single source of HSM crypto +
+#    provisioning), then the connectors. Both vhsm-ssd and vm-sovd CONNECT to its
+#    socket; neither spawns nor reaps it (this script does, via cleanup()).
+echo "[vm-mgr] starting link-B HSM backend (hsm-sim-service) on $HSM_SOCK..."
+mkdir -p "$HSM_KEYSTORE"
+"$BACKEND" --keystore "$HSM_KEYSTORE" --listen "$HSM_SOCK" \
+    > /tmp/vm-mgr-hsm-backend.log 2>&1 &
+BACKEND_PID=$!
+# Wait for the backend to bind its link-B socket before starting any connector.
+for _ in $(seq 1 50); do [ -S "$HSM_SOCK" ] && break; sleep 0.1; done
+if [ ! -S "$HSM_SOCK" ]; then
+    echo "[vm-mgr] ERROR: link-B HSM backend never bound $HSM_SOCK — see /tmp/vm-mgr-hsm-backend.log" >&2
+    exit 1
+fi
+
+# 9. Start vhsm-ssd (guest-facing v3 vHSM daemon) in connect-only mode — it
+#    attaches to the pre-spawned backend over link-B and serves guests on loopback
+#    TCP. Its "link-A" inputs are a policy dir (guest IAM) + a bootstrap-state; a
+#    minimal policy is generated here for the dev rig (no guests run by default).
+mkdir -p "$VHSM_POLICY_DIR/roots"
+cat > "$VHSM_POLICY_DIR/policy.yaml" <<'YAML'
+version: 1
+statements:
+  - principals: [vm1]
+    handles: [system, jwt-signing]
+    ops: [get-random, key-generate, sign, verify, get-pubkey]
+YAML
+if [ -x "$VHSM_SSD" ]; then
+    echo "[vm-mgr] starting vhsm-ssd (connect-only) on 127.0.0.1:$HSM_PORT..."
+    "$VHSM_SSD" \
+        --keystore "$HSM_KEYSTORE" \
+        --policy-dir "$VHSM_POLICY_DIR" \
+        --bootstrap-state "$VHSM_BOOTSTRAP" \
+        --listen "127.0.0.1:$HSM_PORT" \
+        --backend-connect-only \
+        --backend-socket "$HSM_SOCK" \
+        > /tmp/vm-mgr-vhsm-ssd.log 2>&1 &
+    VHSM_PID=$!
+    sleep 0.5
+    if ! kill -0 "$VHSM_PID" 2>/dev/null; then
+        echo "[vm-mgr] WARNING: vhsm-ssd exited early — see /tmp/vm-mgr-vhsm-ssd.log (guests get no vHSM)" >&2
+        VHSM_PID=""
+    fi
 else
-    "$SOVD" "$NV_PATH" "$TRUST_ANCHOR" "$SOVD_ADDR" &
+    echo "[vm-mgr] WARNING: vhsm-ssd binary not found at $VHSM_SSD (guests get no vHSM)" >&2
+fi
+
+# 10. Start vm-sovd (host SOVD/OTA) — CONNECT-ONLY to the SAME link-B backend.
+#     Run it in the foreground (not exec) so the EXIT trap reaps the backend +
+#     vhsm-ssd when it stops.
+SOVD_ARGS=("$NV_PATH" --backend-socket "$HSM_SOCK" --hsm-keystore "$HSM_KEYSTORE" --hsm-port "$HSM_PORT" --bind "$SOVD_ADDR")
+if [ -z "$PROFILE" ]; then
+    "$SOVD" "${SOVD_ARGS[@]}" &
+    SOVD_PID=$!
+    wait "$SOVD_PID"
+else
+    "$SOVD" "${SOVD_ARGS[@]}" &
     SOVD_PID=$!
     "$RUNNER" "${EXTRA_ARGS[@]}" --nv "$NV_PATH" --init
+    wait "$SOVD_PID"
 fi

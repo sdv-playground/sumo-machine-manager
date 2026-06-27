@@ -15,8 +15,8 @@ use component_mgr::suit_provider::SuitProvider;
 use machine_mgr::{Machine, MachineRegistry};
 use sovd_core::EntityInfo;
 
-use hsm::sim::SimHsm;
-use hsm::{HsmProvider, KeyRole};
+use hsm::link_b::LinkBClient;
+use hsm::{HsmProvider, KeyRole, LinkBProvider};
 
 #[tokio::main]
 async fn main() {
@@ -37,7 +37,8 @@ async fn main() {
         eprintln!("Options:");
         eprintln!("  --images-dir <path>        Directory for A/B bank image files (enables real image OTA)");
         eprintln!("  --vm-service-socket <path> Unix socket / TCP address for vm-service lifecycle control");
-        eprintln!("  --hsm-daemon <path>        Path to vhsm-test-ssd binary");
+        eprintln!("  --backend-socket <path>    Unix socket of the PRE-SPAWNED link-B HSM backend");
+        eprintln!("                             (host crypto + provisioning; vm-sovd connects, never spawns)");
         eprintln!("  --hsm-keystore <path>      HSM keystore directory (default: /tmp/vhsm-keys)");
         eprintln!("  --hsm-port <port>          HSM TCP port (default: 5100)");
         eprintln!("  --boot-device <path>       Boot partition block device for IFS activation (e.g. /dev/hd0t177)");
@@ -49,7 +50,7 @@ async fn main() {
             "  --proxy-component <id>     [gateway] host-owned component id to proxy (repeatable)"
         );
         eprintln!("  --device-id <id>           [gateway] token audience (the device id); pins the onboard minter");
-        eprintln!("  --guest-vhsm               [gateway] source HSM crypto from the guest vHSM (VhsmProvider); else SimHsm");
+        eprintln!("  --guest-vhsm               [gateway] source HSM crypto from the guest vHSM (VhsmProvider); else the host link-B backend");
         eprintln!("  --bind <addr>              Listen address (alt to the positional; default 0.0.0.0:4000)");
         eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
         eprintln!();
@@ -69,7 +70,7 @@ async fn main() {
     // Parse remaining args
     let mut images_dir: Option<PathBuf> = None;
     let mut vm_service_addr: Option<String> = None;
-    let mut hsm_daemon_path: Option<PathBuf> = None;
+    let mut backend_socket: Option<PathBuf> = None;
     let mut hsm_keystore_path = PathBuf::from("/tmp/vhsm-keys");
     let mut hsm_port: u16 = 5100;
     let mut boot_device: Option<String> = None;
@@ -84,7 +85,7 @@ async fn main() {
     let mut proxy_components: Vec<String> = Vec::new();
     let mut device_id: Option<String> = None;
     // --guest-vhsm: in gateway mode, source HSM crypto from the guest vHSM
-    // (VhsmProvider over the wire) instead of a transient host SimHsm.
+    // (VhsmProvider over the wire) instead of the host link-B backend client.
     let mut guest_vhsm = false;
     let mut i = 2;
     while i < args.len() {
@@ -94,8 +95,8 @@ async fn main() {
         } else if args[i] == "--vm-service-socket" && i + 1 < args.len() {
             vm_service_addr = Some(args[i + 1].clone());
             i += 2;
-        } else if args[i] == "--hsm-daemon" && i + 1 < args.len() {
-            hsm_daemon_path = Some(PathBuf::from(&args[i + 1]));
+        } else if args[i] == "--backend-socket" && i + 1 < args.len() {
+            backend_socket = Some(PathBuf::from(&args[i + 1]));
             i += 2;
         } else if args[i] == "--hsm-keystore" && i + 1 < args.len() {
             hsm_keystore_path = PathBuf::from(&args[i + 1]);
@@ -160,29 +161,41 @@ async fn main() {
 
     let nv = Arc::new(Mutex::new(nv));
 
-    // Create HSM provider
-    let hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>> = {
-        let daemon_bin = hsm_daemon_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("vhsm-test-ssd"));
-        let provider = SimHsm::new(daemon_bin.clone(), hsm_keystore_path.clone(), hsm_port);
-
-        if hsm_daemon_path.is_some() {
+    // Connect to the PRE-SPAWNED link-B HSM backend (Decision B: this process
+    // owns no backend lifecycle — an external orchestrator spawns the backend
+    // (`hsm-sim-service` in dev, a vendor HSM bridge in production); vm-sovd only
+    // connects). The one client is the wire to the backend: it backs the full
+    // `HsmProvider` (`LinkBProvider`, for provisioning + OTA) and doubles as the
+    // `HsmCryptoProvider` for any direct crypto (the gateway authorizer). No HSM
+    // runs in this process; the backend self-bootstraps its device-side EC keys
+    // at startup, so the host performs no device-key bootstrap of its own.
+    let client: Option<Arc<LinkBClient>> = match backend_socket {
+        Some(ref sock) => {
+            let c = connect_backend(sock).unwrap_or_else(|e| {
+                eprintln!(
+                    "failed to connect link-B HSM backend at {}: {e}",
+                    sock.display()
+                );
+                std::process::exit(1);
+            });
             tracing::info!(
-                "HSM provider: daemon={}, keystore={}, port={}",
-                daemon_bin.display(),
-                hsm_keystore_path.display(),
-                hsm_port,
+                "link-B HSM backend connected at {} (connect-only; lifecycle owned externally)",
+                sock.display()
             );
-        } else {
-            tracing::info!(
-                "HSM provider: keystore={}, port={} (no daemon path, provision-only)",
-                hsm_keystore_path.display(),
-                hsm_port,
-            );
+            Some(Arc::new(c))
         }
+        None => None,
+    };
 
-        // If HSM is already provisioned, load keys
+    // Host HSM provider — a full `HsmProvider` over the link-B client. `None` when
+    // no `--backend-socket` was given (e.g. a `--gateway --guest-vhsm` guest, which
+    // sources crypto from the guest vHSM instead): HSM-backed provisioning/flash is
+    // then disabled until a backend is connected.
+    let hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>> = if let Some(ref client) = client {
+        let provider = LinkBProvider::new(Arc::clone(client));
+
+        // If the backend keystore is already provisioned, load the keys the
+        // manifest path needs (sw-authority + key-authority). Both cross link-B.
         let provisioned = provider.is_provisioned().unwrap_or(false);
         let sw_key = if provisioned {
             provider.get_public_key(KeyRole::SoftwareAuthority).ok()
@@ -194,11 +207,6 @@ async fn main() {
         } else {
             None
         };
-
-        // Ensure device-side EC keys exist (device-decrypt, ivd-signing, iam-signing)
-        if let Err(e) = provider.ensure_device_keys() {
-            tracing::warn!("failed to ensure device keys: {e}");
-        }
 
         let hsm_arc = Arc::new(Mutex::new(provider));
 
@@ -221,6 +229,12 @@ async fn main() {
         }
 
         Some(hsm_arc)
+    } else {
+        tracing::warn!(
+            "no --backend-socket: HSM features disabled (provisioning/flash unavailable \
+             until a link-B HSM backend is connected)"
+        );
+        None
     };
 
     // --sw-authority override: directly set software authority from file,
@@ -391,9 +405,11 @@ async fn main() {
         health_probes: HashMap::new(),
         boot_selector: None,
         node_coordinator: Some(node_coordinator.clone()),
-        // S2: link-B reload hook unused here (SimHsm in-process restart is the
-        // default path); a link-B deployment sets this to drive an external
-        // daemon reload instead of the provider's no-op stop/start.
+        // No reload hook needed: the external link-B backend serves crypto from
+        // its keystore on disk, so a keystore-provision lands without restarting
+        // it, and `LinkBProvider`'s stop/start are no-ops anyway (lifecycle owned
+        // externally). A deployment that DOES need an external daemon reload on
+        // provision sets this; here it stays inert.
         post_provision_reload: None,
     };
     for spec in &specs {
@@ -411,7 +427,8 @@ async fn main() {
         // In-guest federating gateway: local onboard pull-update (route-scoped
         // Operational authz) + host-owned components proxied to the host SOVD.
         // HSM crypto comes from the guest vHSM (VhsmProvider) with --guest-vhsm,
-        // else a transient host SimHsm over the on-disk keystore (sim/dev).
+        // else the host link-B backend client (the same backend the OTA provider
+        // uses). Without either there is no crypto source, so we fail loudly.
         let gw_crypto: Arc<dyn hsm::HsmCryptoProvider> = if guest_vhsm {
             Arc::new(
                 vhsm_provider::VhsmProvider::connect_local().unwrap_or_else(|e| {
@@ -419,12 +436,14 @@ async fn main() {
                     std::process::exit(1);
                 }),
             ) as Arc<dyn hsm::HsmCryptoProvider>
+        } else if let Some(ref client) = client {
+            Arc::clone(client) as Arc<dyn hsm::HsmCryptoProvider>
         } else {
-            Arc::new(SimHsm::new(
-                PathBuf::from("unused"),
-                hsm_keystore_path.clone(),
-                hsm_port,
-            )) as Arc<dyn hsm::HsmCryptoProvider>
+            eprintln!(
+                "vm-sovd --gateway without --guest-vhsm requires --backend-socket \
+                 (the host link-B HSM backend)"
+            );
+            std::process::exit(1);
         };
         build_gateway_router(
             machine.clone(),
@@ -482,6 +501,39 @@ async fn main() {
     axum::serve(listener, router).await.unwrap();
 }
 
+/// Connect a [`LinkBClient`] to the PRE-SPAWNED link-B HSM backend listening on
+/// the Unix socket `socket`, retrying while it finishes binding. vm-sovd never
+/// spawns the backend (Decision B — process lifecycle is owned externally); it
+/// only connects. Mirrors the connect-only retry budget vhsm-ssd uses
+/// (~5 s = 50 × 100 ms), so a just-spawned backend isn't missed on the first
+/// refused connect.
+fn connect_backend(socket: &std::path::Path) -> std::io::Result<LinkBClient> {
+    const ATTEMPTS: u32 = 50;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        match LinkBClient::connect(socket) {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                last_err = Some(e);
+                // Don't sleep after the final attempt — we're about to give up.
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(RETRY_DELAY);
+                }
+            }
+        }
+    }
+    let e = last_err.expect("ATTEMPTS >= 1 so at least one connect was tried");
+    Err(std::io::Error::new(
+        e.kind(),
+        format!(
+            "link-B HSM backend never accepted on {} after {ATTEMPTS} attempts: {e}",
+            socket.display()
+        ),
+    ))
+}
+
 /// Build the in-guest federating gateway router (`--gateway` mode): the
 /// authorizer from the device's HSM issuer anchors (pins `jwt-signing`
 /// Operational, so the onboard minter's tokens verify), the pull-update trust
@@ -490,8 +542,9 @@ async fn main() {
 /// `component_mgr::sovd::gateway::gateway_router`.
 ///
 /// `crypto` is the HSM-crypto backend: on a real guest it is `VhsmProvider`
-/// (the guest vHSM, via `--guest-vhsm`); on a host/sim rig a `SimHsm`. Both
-/// satisfy the same handle-addressed `HsmCryptoProvider`, so this code is
+/// (the guest vHSM, via `--guest-vhsm`); on a host/sim rig the link-B backend
+/// client (`LinkBClient`). Both satisfy the same handle-addressed
+/// `HsmCryptoProvider`, so this code is
 /// backend-agnostic — the issuer pubkeys and the sw-authority trust anchor are
 /// read via `get_public_key_der`, needing no lifecycle (`HsmProvider`) trait.
 #[allow(clippy::too_many_arguments)]
@@ -517,7 +570,7 @@ where
 
     // Authorizer pinned to the device's HSM issuer anchors — so the onboard
     // minter's `jwt-signing` Operational tokens verify here. Backend-agnostic:
-    // `crypto` is the guest vHSM (VhsmProvider) or a host SimHsm.
+    // `crypto` is the guest vHSM (VhsmProvider) or the host link-B client.
     let c_pub = crypto.clone();
     let c_anchor = crypto.clone();
     let authz = component_mgr::sovd::issuer_keys::authorizer_from_anchors(
@@ -536,7 +589,7 @@ where
 
     // Pull-update trust anchor = the manifest-signing (sw-authority) key, as the
     // COSE_Key the Puller validates with. `get_public_key_der` yields SPKI on
-    // both the host (SimHsm) and the guest (VhsmProvider); convert to the same
+    // both the host (link-B client) and the guest (VhsmProvider); convert to the same
     // COSE_Key `HsmProvider::get_public_key(SoftwareAuthority)` produces.
     let sw_spki = crypto
         .get_public_key_der(KeyRole::SoftwareAuthority.handle())
