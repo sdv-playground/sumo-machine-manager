@@ -36,6 +36,13 @@ use crate::{
     HsmError, HsmProvider, HsmStatus, KeyHandle, KeyInfo, KeyRole, KeyType, ProvisioningState,
 };
 
+/// Software HSM for **dev / test / CI — NOT for production**.
+///
+/// `SimHsm` is a file-keystore + RustCrypto implementation of `HsmProvider` /
+/// `HsmCryptoProvider`. It is **just another implementation of the HSM contract**,
+/// not a privileged one: production runs a real HSE (a vendor C link-B service
+/// implementing `hsm-link-b`). It is served over link-B by the `hsm-sim-service`
+/// bin; verify any backend with the `hsm-conformance` suite.
 pub struct SimHsm {
     /// Path to `vhsm-test-ssd` binary.
     daemon_bin: PathBuf,
