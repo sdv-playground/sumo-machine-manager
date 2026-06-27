@@ -349,12 +349,11 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// (component_id `["hsm", "keys"]`) are routed to this provider
     /// instead of being written as a disk image.
     hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
-    /// Optional crypto-only HSM handle (e.g. supernova's shared link-B
-    /// `LinkBClient`). When `Some`, the HSM-keys provision path builds the
-    /// CEK `HsmKeyUnwrap` via `from_crypto` (routing unwrap through
-    /// `HsmCryptoProvider`) instead of `new` over the lifecycle-bearing
-    /// `hsm_provider`. `None` (the default) keeps today's `dyn HsmProvider`
-    /// path. Threaded from `FactoryDeps::hsm_crypto` via
+    /// Crypto handle (e.g. supernova's shared link-B `LinkBClient`, or a SimHsm).
+    /// The HSM-keys provision path builds the CEK `HsmKeyUnwrap` via `from_crypto`
+    /// so device-decryption unwrap routes through `HsmCryptoProvider`. Required
+    /// once the HSM is provisioned — the provision path errors without it.
+    /// Threaded from `FactoryDeps::hsm_crypto` via
     /// [`with_hsm_crypto`](Self::with_hsm_crypto).
     hsm_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
     /// Synthetic health source — consulted by `read_data` for
@@ -409,15 +408,17 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// replace the whole provider — anything after `with_bank_provider` that
     /// would rebuild is intentionally ignored.
     bank_provider_override: bool,
-    /// Optional hook invoked INSTEAD OF `stop_service()` + `start_service()`
-    /// after a successful HSM keystore provision (the `finalize_flash` HSM
-    /// path). `None` (the default) keeps today's EXACT behaviour: the in-process
-    /// service is restarted so it reloads the freshly-written keystore (SimHsm
-    /// re-spawns vhsm-ssd; a no-op for HSE). `Some` — set for a link-B backend
-    /// whose daemon lifecycle is owned EXTERNALLY (its provider's stop/start are
-    /// themselves no-ops) — runs the orchestrator-supplied reload instead, e.g.
-    /// signalling the daemon to re-read its keystore. Threaded from
-    /// `FactoryDeps::post_provision_reload` via
+    /// The bank activator the (non-overridden) default `IvdBankProvider` is
+    /// rebuilt with. Stored so a later `with_hsm_crypto` rebuild (which threads
+    /// the crypto handle into the default provider) preserves the activator set
+    /// by an earlier `with_bank_activator`. `None` until `with_bank_activator`.
+    bank_activator: Option<Arc<dyn machine_mgr::BankActivator>>,
+    /// Optional hook invoked after a successful HSM keystore provision (the
+    /// `finalize_flash` HSM path) so the orchestrator reloads the backend against
+    /// the freshly-written keystore. The HSM daemon's lifecycle is owned
+    /// externally now (supernova spawns the link-B backend), so this is the only
+    /// reload path — there is no in-process daemon restart. `None` (the default)
+    /// skips the reload. Threaded from `FactoryDeps::post_provision_reload` via
     /// [`with_post_provision_reload`](Self::with_post_provision_reload).
     post_provision_reload: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -572,6 +573,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             verified_manifest_cache: Mutex::new(None),
             bank_provider,
             bank_provider_override: false,
+            bank_activator: None,
             node_coordinator: None,
             post_provision_reload: None,
         };
@@ -603,24 +605,27 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     }
 
     /// Set the post-provision reload hook. When set, the HSM provision path
-    /// (`finalize_flash`) calls this hook INSTEAD of `stop_service()` +
-    /// `start_service()` — for a link-B backend whose daemon lifecycle is owned
-    /// by the orchestrator, not the provider (whose own stop/start are no-ops).
-    /// Leaving it unset (the default) keeps the in-process SimHsm restart, byte
-    /// for byte. Threaded from `FactoryDeps::post_provision_reload`.
+    /// (`finalize_flash`) calls it after provisioning so the orchestrator reloads
+    /// the externally-owned HSM daemon (e.g. the link-B backend) against the new
+    /// keystore. Leaving it unset (the default) skips the reload — there is no
+    /// in-process daemon restart. Threaded from `FactoryDeps::post_provision_reload`.
     pub fn with_post_provision_reload(mut self, reload: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.post_provision_reload = Some(reload);
         self
     }
 
-    /// Inject a crypto-only HSM handle (e.g. supernova's shared link-B
-    /// `LinkBClient`). When set, the HSM-keys provision path builds the CEK
-    /// `HsmKeyUnwrap` via `from_crypto` so device-decryption unwrap routes
-    /// through `HsmCryptoProvider`; unset (the default) keeps the
-    /// `HsmProvider`-backed `HsmKeyUnwrap::new`. Threaded from
-    /// `FactoryDeps::hsm_crypto`. Additive — behaviour-preserving when unset.
+    /// Inject the crypto handle (e.g. supernova's shared link-B `LinkBClient`, or
+    /// a SimHsm). The HSM-keys provision path builds the CEK `HsmKeyUnwrap` via
+    /// `from_crypto` so device-decryption unwrap routes through
+    /// `HsmCryptoProvider`. Required once the HSM is provisioned — the provision
+    /// path errors without it. Threaded from `FactoryDeps::hsm_crypto`.
     pub fn with_hsm_crypto(mut self, crypto: Arc<dyn hsm::HsmCryptoProvider>) -> Self {
         self.hsm_crypto = Some(crypto);
+        // Thread the crypto handle into the (non-overridden) default bank
+        // provider so its IVD `seal` can sign — preserving any activator set by
+        // an earlier `with_bank_activator`. A `with_bank_provider` override
+        // already carries its own crypto handle, so this rebuild is skipped then.
+        self.rebuild_bank_provider();
         self
     }
 
@@ -631,51 +636,56 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     pub fn with_bank_spec(mut self, spec: crate::bank_spec::BankSetSpec) -> Self {
         self.bank_spec = spec;
         // The provider keys its on-disk layout off `bank_spec.dir_name`; rebuild
-        // it so a deployment-supplied dir name takes effect. No activator yet —
-        // `with_bank_spec` always precedes `with_bank_activator` (the
-        // component-factory / sovd_main builder order), so passing `None` here
-        // never drops an activator.
-        self.rebuild_bank_provider(None);
+        // it so a deployment-supplied dir name takes effect. `with_bank_spec`
+        // precedes `with_bank_activator` in the builder order, so no activator is
+        // stored yet (`self.bank_activator` is still `None`).
+        self.rebuild_bank_provider();
         self
     }
 
     /// Set a bank activator for post-install bank activation.
     pub fn with_bank_activator(mut self, activator: Arc<dyn machine_mgr::BankActivator>) -> Self {
-        // The provider owns the activator (used by `activate` + `reset_kind`);
-        // rebuild it so the just-set activator is the one it invokes. Must be
-        // called AFTER `with_bank_spec` (which rebuilds with `None`).
-        self.rebuild_bank_provider(Some(activator));
+        // The provider owns the activator (used by `activate` + `reset_kind`).
+        // Store it so later rebuilds (e.g. `with_hsm_crypto`) keep it, then
+        // rebuild so the just-set activator is the one the provider invokes.
+        // Must be called AFTER `with_bank_spec`.
+        self.bank_activator = Some(activator);
+        self.rebuild_bank_provider();
         self
     }
 
     /// Rebuild the bank provider from the backend's current bank-relevant state
-    /// (plus the optional `activator`, which the provider now owns) and re-point
-    /// the `dyn` handle at the new object. Called by the `with_bank_spec` /
-    /// `with_bank_activator` builders that change its inputs. `running_bank` is
-    /// re-seeded from NV inside the provider — same rule as the backend's own
-    /// copy, idempotent at construction.
-    fn rebuild_bank_provider(&mut self, activator: Option<Arc<dyn machine_mgr::BankActivator>>) {
+    /// (`bank_activator` + `hsm_crypto` included) and re-point the `dyn` handle at
+    /// the new object. Called by the `with_bank_spec` / `with_bank_activator` /
+    /// `with_hsm_crypto` builders that change its inputs. `running_bank` is
+    /// re-seeded from NV inside the provider — idempotent at construction.
+    fn rebuild_bank_provider(&mut self) {
         // An explicit provider injected via `with_bank_provider` wins: never
-        // rebuild over it. `with_bank_spec` / `with_bank_activator` calls that
-        // land after the override are silently no-ops on the provider (their
-        // other side effects, e.g. setting `bank_spec`, still apply).
+        // rebuild over it. `with_bank_spec` / `with_bank_activator` /
+        // `with_hsm_crypto` calls that land after the override are silently
+        // no-ops on the provider (their other side effects still apply).
         if self.bank_provider_override {
             return;
         }
-        self.bank_provider = Arc::new(IvdBankProvider::new(
+        let mut provider = IvdBankProvider::new(
             self.nv.clone(),
             self.bank_set,
             self.config.single_bank,
             self.images_dir.clone(),
             self.bank_spec.dir_name.clone(),
             self.hsm_provider.clone(),
-            activator,
+            self.bank_activator.clone(),
             // No boot selector on the rebuild path: a selector-aware provider
             // is injected wholesale via `with_bank_provider` (which sets the
             // override so this rebuild is skipped). Keeps the NV/symlink path
             // for the default in-backend provider + tests.
             None,
-        ));
+        );
+        // Thread the crypto handle so the default provider's IVD `seal` can sign.
+        if let Some(crypto) = self.hsm_crypto.clone() {
+            provider = provider.with_hsm_crypto(crypto);
+        }
+        self.bank_provider = Arc::new(provider);
     }
 
     /// Replace the default `IvdBankProvider` with an explicit `BankProvider`
@@ -1096,46 +1106,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
     pub fn has_hsm_provider(&self) -> bool {
         self.hsm_provider.is_some()
-    }
-
-    /// Bring up the HSM service (if this backend wraps one). No-op when
-    /// no provider is attached or when the backend's HsmProvider impl
-    /// reports the service was already running. Errors are surfaced so
-    /// the caller can log them; they should generally not be fatal.
-    pub fn start_hsm_service(&self) -> Result<(), String> {
-        let Some(ref hsm) = self.hsm_provider else {
-            return Ok(());
-        };
-        let mut h = hsm.lock().map_err(|_| "HSM lock poisoned".to_string())?;
-        match h.start_service() {
-            Ok(port) => {
-                tracing::info!(port, "HSM service started");
-                Ok(())
-            }
-            Err(hsm::HsmError::AlreadyRunning) => Ok(()),
-            Err(e) => Err(format!("start HSM service: {e}")),
-        }
-    }
-
-    /// Stop and re-spawn the HSM service. Used after provisioning so the
-    /// daemon picks up the freshly-written keystore. NotRunning on stop
-    /// is benign (we just spawn fresh).
-    pub fn restart_hsm_service(&self) -> Result<(), String> {
-        let Some(ref hsm) = self.hsm_provider else {
-            return Ok(());
-        };
-        let mut h = hsm.lock().map_err(|_| "HSM lock poisoned".to_string())?;
-        match h.stop_service() {
-            Ok(()) | Err(hsm::HsmError::NotRunning) => {}
-            Err(e) => tracing::warn!("stop HSM service before restart: {e}"),
-        }
-        match h.start_service() {
-            Ok(port) => {
-                tracing::info!(port, "HSM service restarted");
-                Ok(())
-            }
-            Err(e) => Err(format!("restart HSM service: {e}")),
-        }
     }
 
     pub fn running_bank(
@@ -2818,21 +2788,21 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     Ok(sw_key) => {
                         let ka = hsm_guard.get_public_key(hsm::KeyRole::KeyAuthority).ok();
                         drop(hsm_guard);
-                        // Prefer the crypto-only handle (link-B) when present so
-                        // the CEK unwrap routes through `HsmCryptoProvider`; else
-                        // keep the `HsmProvider`-locked path.
+                        // CEK unwrap routes through the crypto handle
+                        // (`HsmCryptoProvider`) — the device key never leaves the
+                        // HSM. A provisioned HSM with no crypto handle is a wiring
+                        // bug; surface it rather than silently skip unwrap.
+                        let Some(crypto) = self.hsm_crypto.as_ref() else {
+                            return Err(BackendError::Internal(
+                                "HSM provisioned but no HsmCryptoProvider attached — CEK unwrap requires crypto".into(),
+                            ));
+                        };
                         let unwrap: std::sync::Arc<
                             dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync,
-                        > = match &self.hsm_crypto {
-                            Some(crypto) => std::sync::Arc::new(hsm::HsmKeyUnwrap::from_crypto(
-                                crypto.clone(),
-                                hsm::KeyRole::DeviceDecryption.handle(),
-                            )),
-                            None => std::sync::Arc::new(hsm::HsmKeyUnwrap::new(
-                                hsm.clone(),
-                                hsm::KeyRole::DeviceDecryption.handle(),
-                            )),
-                        };
+                        > = std::sync::Arc::new(hsm::HsmKeyUnwrap::from_crypto(
+                            crypto.clone(),
+                            hsm::KeyRole::DeviceDecryption.handle(),
+                        ));
                         self.manifest_provider.update_keys(sw_key, Some(unwrap), ka);
                         tracing::info!(
                             "loaded sw-authority + key-authority; CEK unwrap routed through HSM"
@@ -3065,39 +3035,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                             })?;
 
                             // Reload the HSM so it picks up the freshly-written
-                            // keystore. The daemon was already running
-                            // (Component::start brought it up at boot) but holds
-                            // the old/empty keystore in memory until reloaded.
-                            //
-                            // Default (no reload hook): restart the in-process
-                            // service — stop+start re-spawns vhsm-ssd against the
-                            // new keystore (SimHsm); backend-agnostic, a no-op for
-                            // HSE. When a `post_provision_reload` hook IS set (a
-                            // link-B backend whose daemon lifecycle is owned
-                            // externally, so the provider's own stop/start are
-                            // no-ops), call it INSTEAD — the orchestrator owns the
-                            // reload.
+                            // keystore. The daemon's lifecycle is owned externally
+                            // now (supernova spawns the link-B backend); when a
+                            // `post_provision_reload` hook is set, call it so the
+                            // orchestrator reloads against the new keystore. There
+                            // is no in-process daemon restart anymore.
                             if let Some(ref reload) = self.post_provision_reload {
                                 reload();
                                 tracing::info!(
                                     "HSM reloaded via post-provision hook (external daemon lifecycle)"
                                 );
-                            } else {
-                                match hsm_guard.stop_service() {
-                                    Ok(()) | Err(hsm::HsmError::NotRunning) => {}
-                                    Err(e) => {
-                                        tracing::warn!("stop HSM service post-provision: {e}")
-                                    }
-                                }
-                                match hsm_guard.start_service() {
-                                    Ok(port) => {
-                                        tracing::info!(port, "HSM service restarted post-provision")
-                                    }
-                                    Err(hsm::HsmError::AlreadyRunning) => {}
-                                    Err(e) => {
-                                        tracing::warn!("start HSM service post-provision: {e}")
-                                    }
-                                }
                             }
 
                             // Load keys from HSM into manifest provider.
@@ -3108,24 +3055,21 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                             match hsm_guard.get_public_key(hsm::KeyRole::SoftwareAuthority) {
                                 Ok(sw_key) => {
                                     drop(hsm_guard);
-                                    // Prefer the crypto-only handle (link-B) when
-                                    // present so the CEK unwrap routes through
-                                    // `HsmCryptoProvider`; else keep the
-                                    // `HsmProvider`-locked path.
+                                    // CEK unwrap routes through the crypto handle
+                                    // (`HsmCryptoProvider`); the device key never
+                                    // leaves the HSM. No crypto handle while
+                                    // provisioned is a wiring bug.
+                                    let Some(crypto) = self.hsm_crypto.as_ref() else {
+                                        return Err(BackendError::Internal(
+                                            "HSM provisioned but no HsmCryptoProvider attached — CEK unwrap requires crypto".into(),
+                                        ));
+                                    };
                                     let unwrap: std::sync::Arc<
                                         dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync,
-                                    > = match &self.hsm_crypto {
-                                        Some(crypto) => {
-                                            std::sync::Arc::new(hsm::HsmKeyUnwrap::from_crypto(
-                                                crypto.clone(),
-                                                hsm::KeyRole::DeviceDecryption.handle(),
-                                            ))
-                                        }
-                                        None => std::sync::Arc::new(hsm::HsmKeyUnwrap::new(
-                                            hsm.clone(),
-                                            hsm::KeyRole::DeviceDecryption.handle(),
-                                        )),
-                                    };
+                                    > = std::sync::Arc::new(hsm::HsmKeyUnwrap::from_crypto(
+                                        crypto.clone(),
+                                        hsm::KeyRole::DeviceDecryption.handle(),
+                                    ));
                                     self.manifest_provider.update_keys(sw_key, Some(unwrap), ka);
                                     tracing::info!(
                                         "HSM keys provisioned; CEK unwrap routed through HSM"
@@ -4307,7 +4251,13 @@ mod identity_tests {
     /// Build a fully-provisioned SimHsm: keystore manifest present (so
     /// `is_provisioned()` is true) plus the device `ivd-signing` keypair
     /// (so `sign`/`verify` work). Mirrors `hsm::ivd` test setup.
-    fn provisioned_hsm(tag: &str) -> (Arc<Mutex<dyn hsm::HsmProvider>>, PathBuf) {
+    fn provisioned_hsm(
+        tag: &str,
+    ) -> (
+        Arc<Mutex<dyn hsm::HsmProvider>>,
+        Arc<dyn hsm::HsmCryptoProvider>,
+        PathBuf,
+    ) {
         use hsm::payload::*;
         let keystore = std::env::temp_dir().join(format!("component-mgr-identity-ks-{tag}"));
         let _ = std::fs::remove_dir_all(&keystore);
@@ -4333,7 +4283,14 @@ mod identity_tests {
         std::fs::write(keystore.join("provision_state"), b"1\n").unwrap();
         assert!(hsm.is_provisioned().unwrap());
 
-        (Arc::new(Mutex::new(hsm)), keystore)
+        // A second SimHsm over the same keystore is the crypto handle (IVD
+        // sign/verify); the first SimHsm is the provisioning-authority provider.
+        let crypto: Arc<dyn hsm::HsmCryptoProvider> = Arc::new(SimHsm::new(
+            PathBuf::from("/dev/null"),
+            keystore.clone(),
+            5400,
+        ));
+        (Arc::new(Mutex::new(hsm)), crypto, keystore)
     }
 
     fn sample_image_meta() -> ImageMeta {
@@ -4367,7 +4324,7 @@ mod identity_tests {
         nv.write_boot_state(&mut boot).unwrap();
         let nv = Arc::new(Mutex::new(nv));
 
-        let (hsm, keystore) = provisioned_hsm(tag);
+        let (hsm, crypto, keystore) = provisioned_hsm(tag);
 
         let backend = ComponentBackend::with_options(
             BankSet::Vm1,
@@ -4378,7 +4335,8 @@ mod identity_tests {
             None,
             Some(images_dir.clone()),
             Some(hsm),
-        );
+        )
+        .with_hsm_crypto(crypto);
 
         // Stage a payload file in the target (bank_b) so the bank isn't
         // payload-empty and signing actually runs.
@@ -4684,11 +4642,13 @@ mod identity_tests {
         .unwrap();
         assert_eq!(mbytes, on_disk);
         // Re-verify the signature over the manifest bytes via the HSM.
-        let ok = {
-            let hsm = backend.hsm_provider.as_ref().unwrap().lock().unwrap();
-            hsm.verify(hsm::KeyRole::IvdSigning.handle(), &mbytes, &sig)
-                .unwrap()
-        };
+        let ok = hsm::HsmCryptoProvider::verify(
+            &**backend.hsm_crypto.as_ref().unwrap(),
+            hsm::KeyRole::IvdSigning.handle(),
+            &mbytes,
+            &sig,
+        )
+        .unwrap();
         assert!(
             ok,
             "decoded signature must verify over decoded manifest bytes"
@@ -4802,11 +4762,13 @@ mod identity_tests {
         let sig = b64
             .decode(v["signature_b64"].as_str().unwrap())
             .expect("signature_b64 decodes");
-        let ok = {
-            let hsm = backend.hsm_provider.as_ref().unwrap().lock().unwrap();
-            hsm.verify(hsm::KeyRole::IvdSigning.handle(), &mbytes, &sig)
-                .unwrap()
-        };
+        let ok = hsm::HsmCryptoProvider::verify(
+            &**backend.hsm_crypto.as_ref().unwrap(),
+            hsm::KeyRole::IvdSigning.handle(),
+            &mbytes,
+            &sig,
+        )
+        .unwrap();
         assert!(
             !ok,
             "served (tampered) bytes must NOT verify — the client gate catches it"

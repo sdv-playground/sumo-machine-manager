@@ -223,7 +223,7 @@ fn run() -> ExitCode {
         expected_install_gen: args.expect_install_gen,
         min_committed_gen: args.min_committed_gen,
     };
-    let result = ivd::verify_bank(&hsm, &args.bank, pins);
+    let result = ivd::verify_bank_crypto(&hsm, &args.bank, pins);
 
     match result {
         Ok(manifest) => {

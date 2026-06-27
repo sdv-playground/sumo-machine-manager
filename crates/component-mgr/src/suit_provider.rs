@@ -127,7 +127,7 @@ impl SuitProvider {
     ///
     /// `key_unwrap` is the optional CEK unwrapper bound to the device
     /// key; typically constructed by the caller as
-    /// `HsmKeyUnwrap::new(hsm_provider, "device-decrypt")` so the
+    /// `HsmKeyUnwrap::from_crypto(hsm_crypto, DeviceDecryption)` so the
     /// streaming decryptor can unwrap CEKs without ever seeing the
     /// device's private key bytes.
     pub fn update_keys(

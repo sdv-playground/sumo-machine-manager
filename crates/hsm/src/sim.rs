@@ -1048,6 +1048,63 @@ impl HsmProvider for SimHsm {
         }
     }
 
+    fn get_public_key(&self, role: KeyRole) -> Result<Vec<u8>, HsmError> {
+        if !self.is_provisioned()? {
+            return Err(HsmError::NotProvisioned);
+        }
+        let pub_path = self.keys_dir().join(format!("{}.pub", role.key_id()));
+        if !pub_path.exists() {
+            return Err(HsmError::KeystoreError(format!(
+                "no public key for role {:?} at {}",
+                role,
+                pub_path.display()
+            )));
+        }
+        let pem = std::fs::read_to_string(&pub_path)
+            .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", pub_path.display())))?;
+        let (x, y) = extract_ec_public_from_pem(&pem)?;
+
+        // Signing / verification keys carry alg=ES256 so consumers
+        // know to use ECDSA-SHA256. The decrypt key is ECDH-only and
+        // has no COSE algorithm tag.
+        let alg = match role {
+            KeyRole::KeyAuthority
+            | KeyRole::SoftwareAuthority
+            | KeyRole::IamSigning
+            | KeyRole::IvdSigning
+            | KeyRole::JwtSigning
+            | KeyRole::OperationalIssuer
+            | KeyRole::FactoryResetIssuer
+            | KeyRole::FreshnessSigning
+            | KeyRole::TlsIdentity => Some(coset::iana::Algorithm::ES256),
+            KeyRole::DeviceDecryption => None,
+            // AES-256 — symmetric, no public COSE key (the pub_path read
+            // above already rejects a get_public_key on this slot).
+            KeyRole::Storage => None,
+        };
+        Ok(build_public_cose_key_with_alg(&x, &y, alg))
+    }
+
+    // get_private_key removed from the trait — even SimHsm doesn't
+    // expose its keystore files as bytes. Sign / unwrap_cek go through
+    // operation-based methods so production HSE works the same way.
+
+    fn provisioning_state(&self) -> Result<ProvisioningState, HsmError> {
+        if self.manifest_path().exists() {
+            Ok(ProvisioningState::Provisioned)
+        } else {
+            Ok(ProvisioningState::Unprovisioned)
+        }
+    }
+}
+
+/// Service lifecycle — inherent (NOT part of the narrowed `HsmProvider`
+/// trait). Dead in production: supernova spawns the link-B HSM daemon
+/// directly and nothing under component-mgr drives an in-process SimHsm
+/// service. Kept so the `Drop` impl can still reap a daemon a SimHsm
+/// spawned in a test; removed in S7b when SimHsm relocates to tools/.
+#[allow(dead_code)]
+impl SimHsm {
     fn start_service(&mut self) -> Result<u16, HsmError> {
         if self.is_running() {
             return Err(HsmError::AlreadyRunning);
@@ -1208,99 +1265,6 @@ impl HsmProvider for SimHsm {
             keystore_path: self.keystore_path.clone(),
             tcp_port: self.tcp_port,
         })
-    }
-
-    fn get_public_key(&self, role: KeyRole) -> Result<Vec<u8>, HsmError> {
-        if !self.is_provisioned()? {
-            return Err(HsmError::NotProvisioned);
-        }
-        let pub_path = self.keys_dir().join(format!("{}.pub", role.key_id()));
-        if !pub_path.exists() {
-            return Err(HsmError::KeystoreError(format!(
-                "no public key for role {:?} at {}",
-                role,
-                pub_path.display()
-            )));
-        }
-        let pem = std::fs::read_to_string(&pub_path)
-            .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", pub_path.display())))?;
-        let (x, y) = extract_ec_public_from_pem(&pem)?;
-
-        // Signing / verification keys carry alg=ES256 so consumers
-        // know to use ECDSA-SHA256. The decrypt key is ECDH-only and
-        // has no COSE algorithm tag.
-        let alg = match role {
-            KeyRole::KeyAuthority
-            | KeyRole::SoftwareAuthority
-            | KeyRole::IamSigning
-            | KeyRole::IvdSigning
-            | KeyRole::JwtSigning
-            | KeyRole::OperationalIssuer
-            | KeyRole::FactoryResetIssuer
-            | KeyRole::FreshnessSigning
-            | KeyRole::TlsIdentity => Some(coset::iana::Algorithm::ES256),
-            KeyRole::DeviceDecryption => None,
-            // AES-256 — symmetric, no public COSE key (the pub_path read
-            // above already rejects a get_public_key on this slot).
-            KeyRole::Storage => None,
-        };
-        Ok(build_public_cose_key_with_alg(&x, &y, alg))
-    }
-
-    // get_private_key removed from the trait — even SimHsm doesn't
-    // expose its keystore files as bytes. Sign / unwrap_cek go through
-    // operation-based methods so production HSE works the same way.
-
-    fn provisioning_state(&self) -> Result<ProvisioningState, HsmError> {
-        if self.manifest_path().exists() {
-            Ok(ProvisioningState::Provisioned)
-        } else {
-            Ok(ProvisioningState::Unprovisioned)
-        }
-    }
-
-    /// SimHsm exposes the unwrap ops by delegating to its
-    /// `HsmCryptoProvider` impl (same code, just routed through the
-    /// management trait so the OTA pipeline can call it via
-    /// `Arc<Mutex<dyn HsmProvider>>`).
-    #[cfg(feature = "crypto")]
-    fn unwrap_cek_a128kw(
-        &self,
-        handle: KeyHandle,
-        wrapped_cek: &[u8],
-    ) -> Result<Vec<u8>, HsmError> {
-        crate::HsmCryptoProvider::unwrap_cek_a128kw(self, handle, wrapped_cek)
-    }
-
-    #[cfg(feature = "crypto")]
-    fn unwrap_cek_ecdh_es(
-        &self,
-        handle: KeyHandle,
-        ephem_pub: &[u8],
-        wrapped_cek: &[u8],
-        recipient_protected: &[u8],
-    ) -> Result<Vec<u8>, HsmError> {
-        crate::HsmCryptoProvider::unwrap_cek_ecdh_es(
-            self,
-            handle,
-            ephem_pub,
-            wrapped_cek,
-            recipient_protected,
-        )
-    }
-
-    /// Same delegation pattern as `unwrap_cek_*` — sign/verify on the
-    /// management trait route through the crypto trait so the OTA
-    /// pipeline can self-sign banks (IVD) without needing two
-    /// trait-object views of the same SimHsm.
-    #[cfg(feature = "crypto")]
-    fn sign(&self, handle: KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        crate::HsmCryptoProvider::sign(self, handle, data)
-    }
-
-    #[cfg(feature = "crypto")]
-    fn verify(&self, handle: KeyHandle, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
-        crate::HsmCryptoProvider::verify(self, handle, data, signature)
     }
 }
 

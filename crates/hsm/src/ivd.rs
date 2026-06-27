@@ -71,11 +71,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{HsmError, HsmProvider, KeyRole};
-// The crypto-narrowed `*_crypto` variants take a `HsmCryptoProvider` and the
-// shared inner helpers name `KeyHandle` in their `sign`/`verify` closure bounds.
-// Both are only referenced from the `#[cfg(feature = "crypto")]` functions, so
-// the import is gated too (the whole sign/verify machinery already is).
+use crate::{HsmError, KeyRole};
+// The IVD entry points take a `HsmCryptoProvider`; the shared inner helpers name
+// `KeyHandle` in their `sign`/`verify` closure bounds. Both are referenced only
+// from the `#[cfg(feature = "crypto")]` functions, so the import is gated too.
 #[cfg(feature = "crypto")]
 use crate::{HsmCryptoProvider, KeyHandle};
 
@@ -410,38 +409,22 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<IvdManifest, IvdError> {
     Ok(manifest)
 }
 
-/// Build the manifest, sign it with the HSM's IVD signing key, and
-/// write both artefacts into `bank_dir`. Idempotent at the file
-/// level — if called twice the previous artefacts get overwritten.
+/// Build the manifest, sign it with the HSM's IVD signing key (over
+/// [`HsmCryptoProvider`]), and write both artefacts into `bank_dir`. Idempotent
+/// at the file level — if called twice the previous artefacts get overwritten.
 ///
-/// `gen` is the install-time generation counter — the caller assigns
-/// it as `nv.committed_gen + 1` and writes the same value into
-/// `NV.bank_install_gen[target_slot]` so the verify-time cross-check
-/// can pin "the manifest in this slot is the one we installed here".
+/// `gen` is the install-time generation counter — the caller assigns it as
+/// `nv.committed_gen + 1` and writes the same value into
+/// `NV.bank_install_gen[target_slot]` so the verify-time cross-check can pin
+/// "the manifest in this slot is the one we installed here".
 ///
-/// This variant walks `bank_dir` and hashes every file from scratch.
-/// Use `sign_bank_with_files` when the caller already has a verified
-/// file inventory (e.g. from the OTA streaming pipeline, which hashes
-/// each payload as it writes).
+/// This variant walks `bank_dir` and hashes every file from scratch. Use
+/// [`sign_bank_with_files_crypto`] when the caller already has a verified file
+/// inventory (e.g. from the OTA streaming pipeline, which hashes each payload as
+/// it writes).
 ///
-/// Returns the manifest that was signed (informational; the file on
-/// disk is the source of truth for verifiers).
-#[cfg(feature = "crypto")]
-pub fn sign_bank(
-    hsm: &dyn HsmProvider,
-    bank_dir: &Path,
-    gen: u64,
-    identity: IvdIdentity,
-) -> Result<IvdManifest, IvdError> {
-    let (files, hash_ms) = collect_with_timing(bank_dir)?;
-    sign_bank_with_files(hsm, bank_dir, gen, identity, files, Some(hash_ms))
-}
-
-/// Crypto-narrowed [`sign_bank`]: same behaviour, but takes a
-/// [`HsmCryptoProvider`] (the link-B client view) instead of the
-/// lifecycle-bearing [`HsmProvider`]. Both share one body via
-/// [`sign_bank_with_files_inner`] — only the trait the `sign` op comes from
-/// differs.
+/// Returns the manifest that was signed (informational; the file on disk is the
+/// source of truth for verifiers).
 #[cfg(feature = "crypto")]
 pub fn sign_bank_crypto(
     hsm: &dyn HsmCryptoProvider,
@@ -485,29 +468,9 @@ fn collect_with_timing(bank_dir: &Path) -> Result<(Vec<IvdFile>, u64), IvdError>
 /// `walk_hash_ms` is an optional timing breakdown for the caller's
 /// dir-walk step (None when files came from the streaming path with
 /// effectively zero walk cost). Logged as `hash_ms=0` either way; the
-/// distinction only matters to `sign_bank`.
-#[cfg(feature = "crypto")]
-pub fn sign_bank_with_files(
-    hsm: &dyn HsmProvider,
-    bank_dir: &Path,
-    gen: u64,
-    identity: IvdIdentity,
-    files: Vec<IvdFile>,
-    walk_hash_ms: Option<u64>,
-) -> Result<IvdManifest, IvdError> {
-    sign_bank_with_files_inner(
-        |handle, data| hsm.sign(handle, data),
-        bank_dir,
-        gen,
-        identity,
-        files,
-        walk_hash_ms,
-    )
-}
-
-/// Crypto-narrowed [`sign_bank_with_files`]: identical behaviour against a
-/// [`HsmCryptoProvider`] (the link-B client view). This is the OTA streaming
-/// path's crypto-only entry; shares the body via [`sign_bank_with_files_inner`].
+/// distinction only matters to `sign_bank_crypto`. Shares its body with
+/// [`sign_bank_crypto`] via [`sign_bank_with_files_inner`]; this is the OTA
+/// streaming path's entry point.
 #[cfg(feature = "crypto")]
 pub fn sign_bank_with_files_crypto(
     hsm: &dyn HsmCryptoProvider,
@@ -527,10 +490,10 @@ pub fn sign_bank_with_files_crypto(
     )
 }
 
-/// Shared body of [`sign_bank_with_files`] / [`sign_bank_with_files_crypto`]:
+/// Shared body behind [`sign_bank_crypto`] / [`sign_bank_with_files_crypto`]:
 /// build + encode the manifest, `sign` its bytes (the lone HSM op, supplied as a
-/// closure so the same code serves both the `HsmProvider` and the
-/// `HsmCryptoProvider` `sign`), and write the two artefacts into `bank_dir`.
+/// closure over [`HsmCryptoProvider::sign`]), and write the two artefacts into
+/// `bank_dir`.
 #[cfg(feature = "crypto")]
 fn sign_bank_with_files_inner(
     sign: impl FnOnce(KeyHandle, &[u8]) -> Result<Vec<u8>, HsmError>,
@@ -586,21 +549,10 @@ pub struct VerifyPins {
     pub min_committed_gen: Option<u64>,
 }
 
-/// Read manifest + signature from `bank_dir`, verify the sig using
-/// the HSM's IVD public key, then enforce the supplied [`VerifyPins`]
-/// and re-hash every file the manifest claims.
-#[cfg(feature = "crypto")]
-pub fn verify_bank(
-    hsm: &dyn HsmProvider,
-    bank_dir: &Path,
-    pins: VerifyPins,
-) -> Result<IvdManifest, IvdError> {
-    verify_bank_with(|h, d, s| hsm.verify(h, d, s), bank_dir, pins)
-}
-
-/// Crypto-narrowed [`verify_bank`]: identical behaviour against a
-/// [`HsmCryptoProvider`] (the link-B client view). Shares one body via
-/// [`verify_bank_with`] — only the trait the `verify` op comes from differs.
+/// Read manifest + signature from `bank_dir`, verify the sig using the HSM's IVD
+/// public key (over [`HsmCryptoProvider`]), then enforce the supplied
+/// [`VerifyPins`] and re-hash every file the manifest claims. This is the
+/// launch-time secure-boot gate; shares its body via [`verify_bank_with`].
 #[cfg(feature = "crypto")]
 pub fn verify_bank_crypto(
     hsm: &dyn HsmCryptoProvider,
@@ -610,10 +562,10 @@ pub fn verify_bank_crypto(
     verify_bank_with(|h, d, s| hsm.verify(h, d, s), bank_dir, pins)
 }
 
-/// Shared body of [`verify_bank`] / [`verify_bank_crypto`]: run the inner verify
-/// (signature check + pins + re-hash) under the supplied `verify` closure,
-/// logging a single operator-visible failure line on the error paths (the inner
-/// records its own per-phase timings on success).
+/// Shared body behind [`verify_bank_crypto`]: run the inner verify (signature
+/// check + pins + re-hash) under the supplied `verify` closure, logging a single
+/// operator-visible failure line on the error paths (the inner records its own
+/// per-phase timings on success).
 #[cfg(feature = "crypto")]
 fn verify_bank_with(
     verify: impl FnOnce(KeyHandle, &[u8], &[u8]) -> Result<bool, HsmError>,
@@ -808,47 +760,6 @@ pub struct VerifiedManifest {
     pub signature: Vec<u8>,
 }
 
-/// Read the bank's IVD manifest, **signature-verify** it against the
-/// HSM's IVD public key, and return the FULL verified manifest plus the
-/// raw bytes + signature for downstream re-verification.
-///
-/// This is the diagnostics read path that backs the vendor
-/// `x-sumo-installed-manifest` SOVD parameter — it surfaces the committed
-/// bank's signed per-file inventory + identity in one go. Like
-/// [`read_identity`] (which is now a thin wrapper over this), it verifies
-/// the signature over the exact on-disk bytes but does NOT re-hash the
-/// payload files or enforce the gen pins — those are launch-time
-/// secure-boot concerns handled by [`verify_bank`]. A tampered manifest
-/// (any flipped byte) fails the signature check and surfaces
-/// [`IvdError::SignatureInvalid`].
-#[cfg(feature = "crypto")]
-pub fn read_manifest(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<VerifiedManifest, IvdError> {
-    let manifest_path = bank_dir.join(IVD_MANIFEST_FILE);
-    let signature_path = bank_dir.join(IVD_SIGNATURE_FILE);
-
-    let manifest_bytes =
-        fs::read(&manifest_path).map_err(|e| IvdError::Io(e, manifest_path.clone()))?;
-    let sig = fs::read(&signature_path).map_err(|e| IvdError::Io(e, signature_path.clone()))?;
-
-    // Signature verification over the exact on-disk bytes — must pass
-    // before we trust anything the manifest claims.
-    let ok = hsm
-        .verify(KeyRole::IvdSigning.handle(), &manifest_bytes, &sig)
-        .map_err(IvdError::Hsm)?;
-    if !ok {
-        return Err(IvdError::SignatureInvalid);
-    }
-
-    // Decode (also re-checks the version) and hand back the whole manifest
-    // together with the bytes/signature the caller may want to re-verify.
-    let manifest = decode_manifest(&manifest_bytes)?;
-    Ok(VerifiedManifest {
-        manifest,
-        manifest_bytes,
-        signature: sig,
-    })
-}
-
 /// Read + CBOR-decode the bank's IVD manifest **without** any HSM
 /// signature check, returning the manifest plus the raw bytes + signature
 /// for the *caller/client* to verify independently.
@@ -864,10 +775,9 @@ pub fn read_manifest(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<VerifiedM
 /// `manifest_bytes` let a downstream consumer (a SW-mapping tool reading
 /// over SOVD with `--pubkey`) check the device signature itself.
 ///
-/// Takes no [`HsmProvider`] and needs no `crypto` feature — decode is pure
-/// CBOR. Use the strict [`read_manifest`] for any path that must enforce
-/// the HSM gate; the real install/boot/launch gate is [`verify_bank`],
-/// which is unchanged.
+/// Needs no HSM and no `crypto` feature — decode is pure CBOR. The real
+/// install/boot/launch signature gate is [`verify_bank_crypto`]; this
+/// report-only read deliberately does not verify.
 pub fn read_manifest_unverified(bank_dir: &Path) -> Result<VerifiedManifest, IvdError> {
     let manifest_path = bank_dir.join(IVD_MANIFEST_FILE);
     let signature_path = bank_dir.join(IVD_SIGNATURE_FILE);
@@ -885,23 +795,6 @@ pub fn read_manifest_unverified(bank_dir: &Path) -> Result<VerifiedManifest, Ivd
         manifest_bytes,
         signature: sig,
     })
-}
-
-/// Read the bank's IVD manifest, **signature-verify** it against the
-/// HSM's IVD public key, and return the firmware [`IvdIdentity`] it
-/// carries.
-///
-/// This is the single source for the UDS identification DIDs (F187-F19E)
-/// now that the FW Meta NV blob no longer copies them. It is a
-/// diagnostics-only read path (never on the boot hot path), so verifying
-/// the signature on every read is acceptable; callers cache the result
-/// per running bank and invalidate on install/commit.
-///
-/// A thin wrapper over [`read_manifest`] — same signature verification,
-/// returns only `.manifest.identity`.
-#[cfg(feature = "crypto")]
-pub fn read_identity(hsm: &dyn HsmProvider, bank_dir: &Path) -> Result<IvdIdentity, IvdError> {
-    Ok(read_manifest(hsm, bank_dir)?.manifest.identity)
 }
 
 /// One-shot in-memory SHA-256 throughput probe — hashes a fixed 64 MiB buffer
@@ -1128,7 +1021,7 @@ mod tests {
         write(&bank.join("nested/qvm.conf"), b"cmdline foo=bar");
 
         let (hsm, keystore) = provisioned_sim("sign-verify");
-        let manifest = sign_bank(&hsm, &bank, 7, sample_identity()).unwrap();
+        let manifest = sign_bank_crypto(&hsm, &bank, 7, sample_identity()).unwrap();
         assert_eq!(manifest.files.len(), 3);
         assert_eq!(manifest.gen, 7);
         assert!(bank.join(IVD_MANIFEST_FILE).exists());
@@ -1138,17 +1031,16 @@ mod tests {
             expected_install_gen: Some(7),
             min_committed_gen: Some(7),
         };
-        let back = verify_bank(&hsm, &bank, pins).unwrap();
+        let back = verify_bank_crypto(&hsm, &bank, pins).unwrap();
         assert_eq!(back.gen, 7);
 
         let _ = std::fs::remove_dir_all(&bank);
         let _ = std::fs::remove_dir_all(&keystore);
     }
 
-    /// The crypto-narrowed variants (`sign_bank_crypto` / `verify_bank_crypto`)
-    /// take `&dyn HsmCryptoProvider` and share the `HsmProvider` body — a SimHsm
-    /// (which impls both traits) signs through one and verifies through both,
-    /// proving the bodies don't drift and the two trait views agree.
+    /// `sign_bank_crypto` / `verify_bank_crypto` take `&dyn HsmCryptoProvider`;
+    /// a SimHsm (coerced to that trait object) signs then verifies through them,
+    /// proving the sign→verify round-trip over the crypto entry points.
     #[test]
     fn sign_then_verify_roundtrips_crypto_variant() {
         let bank = temp_bank("sign-verify-crypto");
@@ -1156,7 +1048,7 @@ mod tests {
         write(&bank.join("rootfs.img"), &vec![0xCD; 4096]);
 
         let (hsm, keystore) = provisioned_sim("sign-verify-crypto");
-        // &SimHsm coerces to &dyn HsmCryptoProvider here (it impls both traits).
+        // &SimHsm coerces to &dyn HsmCryptoProvider here.
         let crypto: &dyn HsmCryptoProvider = &hsm;
         let manifest = sign_bank_crypto(crypto, &bank, 9, sample_identity()).unwrap();
         assert_eq!(manifest.gen, 9);
@@ -1166,13 +1058,9 @@ mod tests {
             expected_install_gen: Some(9),
             min_committed_gen: Some(9),
         };
-        // Signed via the crypto variant → verifiable via the crypto variant...
+        // Signed via the crypto variant → verifiable via the crypto variant.
         let back = verify_bank_crypto(crypto, &bank, pins).unwrap();
         assert_eq!(back.gen, 9);
-        // ...and ALSO via the HsmProvider variant — same artefacts, same
-        // signature, no drift between the two entry points.
-        let back2 = verify_bank(&hsm, &bank, pins).unwrap();
-        assert_eq!(back2.gen, 9);
 
         let _ = std::fs::remove_dir_all(&bank);
         let _ = std::fs::remove_dir_all(&keystore);
@@ -1187,11 +1075,11 @@ mod tests {
         write(&bank.join("kernel"), b"original kernel");
 
         let (hsm, keystore) = provisioned_sim("tamper");
-        sign_bank(&hsm, &bank, 1, sample_identity()).unwrap();
+        sign_bank_crypto(&hsm, &bank, 1, sample_identity()).unwrap();
 
         std::fs::write(bank.join("kernel"), b"tampered kernel").unwrap();
 
-        match verify_bank(&hsm, &bank, VerifyPins::default()) {
+        match verify_bank_crypto(&hsm, &bank, VerifyPins::default()) {
             Err(IvdError::HashMismatch { path, .. }) => assert_eq!(path, "kernel"),
             other => panic!("expected HashMismatch, got {other:?}"),
         }
@@ -1206,13 +1094,13 @@ mod tests {
         write(&bank.join("kernel"), b"k");
 
         let (hsm, keystore) = provisioned_sim("extra");
-        sign_bank(&hsm, &bank, 1, sample_identity()).unwrap();
+        sign_bank_crypto(&hsm, &bank, 1, sample_identity()).unwrap();
 
         // Drop an extra file AFTER signing — bank shouldn't have
         // anything the manifest didn't authorize.
         std::fs::write(bank.join("evil-file"), b"unauthorised").unwrap();
 
-        match verify_bank(&hsm, &bank, VerifyPins::default()) {
+        match verify_bank_crypto(&hsm, &bank, VerifyPins::default()) {
             Err(IvdError::UnexpectedFile(p)) => assert_eq!(p, "evil-file"),
             other => panic!("expected UnexpectedFile, got {other:?}"),
         }
@@ -1227,7 +1115,7 @@ mod tests {
         write(&bank.join("f"), b"x");
 
         let (hsm, keystore) = provisioned_sim("genmm");
-        sign_bank(&hsm, &bank, 5, sample_identity()).unwrap();
+        sign_bank_crypto(&hsm, &bank, 5, sample_identity()).unwrap();
 
         // NV says this slot should have gen=6 (e.g. someone swapped
         // a gen=5 manifest into a slot the device installed gen=6 to)
@@ -1235,7 +1123,7 @@ mod tests {
             expected_install_gen: Some(6),
             ..Default::default()
         };
-        match verify_bank(&hsm, &bank, pins) {
+        match verify_bank_crypto(&hsm, &bank, pins) {
             Err(IvdError::GenMismatch { expected, claimed }) => {
                 assert_eq!(expected, 6);
                 assert_eq!(claimed, 5);
@@ -1254,14 +1142,14 @@ mod tests {
 
         let (hsm, keystore) = provisioned_sim("genfloor");
         // Sign at gen=3
-        sign_bank(&hsm, &bank, 3, sample_identity()).unwrap();
+        sign_bank_crypto(&hsm, &bank, 3, sample_identity()).unwrap();
 
         // Run-floor says we've committed gen=5 elsewhere — refuse.
         let pins = VerifyPins {
             min_committed_gen: Some(5),
             ..Default::default()
         };
-        match verify_bank(&hsm, &bank, pins) {
+        match verify_bank_crypto(&hsm, &bank, pins) {
             Err(IvdError::GenBelowFloor { manifest, floor }) => {
                 assert_eq!(manifest, 3);
                 assert_eq!(floor, 5);
@@ -1281,13 +1169,13 @@ mod tests {
         write(&bank.join("f"), b"trial-bank");
 
         let (hsm, keystore) = provisioned_sim("trial");
-        sign_bank(&hsm, &bank, 6, sample_identity()).unwrap();
+        sign_bank_crypto(&hsm, &bank, 6, sample_identity()).unwrap();
 
         let pins = VerifyPins {
             expected_install_gen: Some(6),
             min_committed_gen: Some(5),
         };
-        let back = verify_bank(&hsm, &bank, pins).unwrap();
+        let back = verify_bank_crypto(&hsm, &bank, pins).unwrap();
         assert_eq!(back.gen, 6);
 
         let _ = std::fs::remove_dir_all(&bank);
@@ -1328,7 +1216,7 @@ mod tests {
 
         let (hsm, keystore) = provisioned_sim("sign-with-files");
         let manifest =
-            sign_bank_with_files(&hsm, &bank, 42, sample_identity(), files, None).unwrap();
+            sign_bank_with_files_crypto(&hsm, &bank, 42, sample_identity(), files, None).unwrap();
         assert_eq!(manifest.gen, 42);
         assert_eq!(manifest.files.len(), 2);
         // Sorted result.
@@ -1344,7 +1232,7 @@ mod tests {
             expected_install_gen: Some(42),
             min_committed_gen: Some(42),
         };
-        let back = verify_bank(&hsm, &bank, pins).unwrap();
+        let back = verify_bank_crypto(&hsm, &bank, pins).unwrap();
         assert_eq!(back.gen, 42);
 
         let _ = std::fs::remove_dir_all(&bank);
@@ -1364,134 +1252,16 @@ mod tests {
     }
 
     #[test]
-    fn read_identity_returns_signed_identity() {
-        let bank = temp_bank("read-identity");
-        write(&bank.join("kernel"), b"kernel bytes");
-
-        let (hsm, keystore) = provisioned_sim("read-identity");
-        sign_bank(&hsm, &bank, 3, sample_identity()).unwrap();
-
-        let id = read_identity(&hsm, &bank).unwrap();
-        assert_eq!(id, sample_identity());
-        assert_eq!(id.version, "1.2.0");
-        assert_eq!(id.ecu_sw_number, "ECU-SW-001");
-
-        let _ = std::fs::remove_dir_all(&bank);
-        let _ = std::fs::remove_dir_all(&keystore);
-    }
-
-    #[test]
-    fn read_identity_rejects_tampered_manifest() {
-        let bank = temp_bank("read-identity-tamper");
-        write(&bank.join("kernel"), b"kernel bytes");
-
-        let (hsm, keystore) = provisioned_sim("read-identity-tamper");
-        sign_bank(&hsm, &bank, 3, sample_identity()).unwrap();
-
-        // Flip one byte of the signed manifest CBOR — the signature no
-        // longer matches, so read_identity must refuse it.
-        let mpath = bank.join(IVD_MANIFEST_FILE);
-        let mut bytes = std::fs::read(&mpath).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0x01;
-        std::fs::write(&mpath, &bytes).unwrap();
-
-        match read_identity(&hsm, &bank) {
-            Err(IvdError::SignatureInvalid) => {}
-            other => panic!("expected SignatureInvalid, got {other:?}"),
-        }
-
-        let _ = std::fs::remove_dir_all(&bank);
-        let _ = std::fs::remove_dir_all(&keystore);
-    }
-
-    #[test]
-    fn read_manifest_returns_full_verified_manifest() {
-        let bank = temp_bank("read-manifest");
-        write(&bank.join("kernel"), b"kernel bytes");
-        write(&bank.join("rootfs.img"), &[0xCD; 64]);
-        write(&bank.join("nested/qvm.conf"), b"cmdline foo=bar");
-
-        let (hsm, keystore) = provisioned_sim("read-manifest");
-        sign_bank(&hsm, &bank, 4, sample_identity()).unwrap();
-
-        let vm = read_manifest(&hsm, &bank).unwrap();
-
-        // Identity + gen survive.
-        assert_eq!(vm.manifest.identity, sample_identity());
-        assert_eq!(vm.manifest.gen, 4);
-        assert_eq!(vm.manifest.ivd_version, IVD_MANIFEST_VERSION);
-
-        // The full sorted file inventory is present with name + 32-byte sha.
-        let paths: Vec<&str> = vm
-            .manifest
-            .files
-            .iter()
-            .map(|f| f.relative_path.as_str())
-            .collect();
-        assert_eq!(paths, vec!["kernel", "nested/qvm.conf", "rootfs.img"]);
-        for f in &vm.manifest.files {
-            assert_eq!(f.sha256.len(), 32, "{}", f.relative_path);
-        }
-
-        // The raw bytes are exactly what the signature covers — re-verify
-        // them directly to prove the artefacts are usable downstream.
-        let on_disk = std::fs::read(bank.join(IVD_MANIFEST_FILE)).unwrap();
-        assert_eq!(vm.manifest_bytes, on_disk);
-        assert_eq!(
-            vm.signature,
-            std::fs::read(bank.join(IVD_SIGNATURE_FILE)).unwrap()
-        );
-        // `HsmCryptoProvider` is now in scope here too (the crypto variants),
-        // so disambiguate this concrete-SimHsm call to the HsmProvider verify.
-        assert!(HsmProvider::verify(
-            &hsm,
-            KeyRole::IvdSigning.handle(),
-            &vm.manifest_bytes,
-            &vm.signature
-        )
-        .unwrap());
-
-        let _ = std::fs::remove_dir_all(&bank);
-        let _ = std::fs::remove_dir_all(&keystore);
-    }
-
-    #[test]
-    fn read_manifest_rejects_tampered_manifest() {
-        let bank = temp_bank("read-manifest-tamper");
-        write(&bank.join("kernel"), b"kernel bytes");
-
-        let (hsm, keystore) = provisioned_sim("read-manifest-tamper");
-        sign_bank(&hsm, &bank, 3, sample_identity()).unwrap();
-
-        // Flip one byte of the signed manifest CBOR — the signature no
-        // longer matches, so read_manifest must refuse it.
-        let mpath = bank.join(IVD_MANIFEST_FILE);
-        let mut bytes = std::fs::read(&mpath).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0x01;
-        std::fs::write(&mpath, &bytes).unwrap();
-
-        match read_manifest(&hsm, &bank) {
-            Err(IvdError::SignatureInvalid) => {}
-            other => panic!("expected SignatureInvalid, got {other:?}"),
-        }
-
-        let _ = std::fs::remove_dir_all(&bank);
-        let _ = std::fs::remove_dir_all(&keystore);
-    }
-
-    #[test]
     fn read_manifest_unverified_reports_without_hsm_even_with_bad_signature() {
         let bank = temp_bank("read-manifest-unverified");
         write(&bank.join("kernel"), b"kernel bytes");
         write(&bank.join("rootfs.img"), &[0xCD; 64]);
 
         let (hsm, keystore) = provisioned_sim("read-manifest-unverified");
-        sign_bank(&hsm, &bank, 9, sample_identity()).unwrap();
+        sign_bank_crypto(&hsm, &bank, 9, sample_identity()).unwrap();
 
         // Baseline: report-only read decodes the manifest + hands back the
-        // exact on-disk bytes + signature. Takes NO HsmProvider.
+        // exact on-disk bytes + signature. Takes no HSM.
         let vm = read_manifest_unverified(&bank).unwrap();
         assert_eq!(vm.manifest.gen, 9);
         assert_eq!(vm.manifest.identity, sample_identity());
@@ -1504,19 +1274,15 @@ mod tests {
             std::fs::read(bank.join(IVD_SIGNATURE_FILE)).unwrap()
         );
 
-        // Tamper a byte: still structurally decodable, but the signature no
-        // longer matches. The strict HSM-gated read rejects it...
+        // Tamper a byte: still structurally decodable, and the report-only read
+        // still reports it, surfacing the raw (tampered) bytes for the
+        // caller/client to verify independently. (The strict signature gate is
+        // `verify_bank_crypto`, exercised elsewhere.)
         let mpath = bank.join(IVD_MANIFEST_FILE);
         let mut bytes = std::fs::read(&mpath).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
         std::fs::write(&mpath, &bytes).unwrap();
-        match read_manifest(&hsm, &bank) {
-            Err(IvdError::SignatureInvalid) => {}
-            other => panic!("strict read must still reject tamper, got {other:?}"),
-        }
-        // ...but the report-only read still reports it, surfacing the raw
-        // (tampered) bytes for the caller/client to verify independently.
         let vm = read_manifest_unverified(&bank).unwrap();
         assert_eq!(
             vm.manifest_bytes, bytes,

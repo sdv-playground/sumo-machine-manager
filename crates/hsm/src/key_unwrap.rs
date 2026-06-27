@@ -1,81 +1,42 @@
 //! HSM-backed implementation of [`sumo_onboard::decryptor::KeyUnwrap`].
 //!
-//! Lets callers (component-mgr, supernova) plug an `HsmProvider` straight into
-//! a `StreamingDecryptor` without ever extracting the device private
-//! key. On real HSE this is the only viable path — the EC scalar lives
-//! inside the secure element. On SimHsm the work still happens in the
-//! host process but routes through the provider trait so the call site
-//! is identical.
+//! Lets callers (component-mgr, supernova) plug an `HsmCryptoProvider` straight
+//! into a `StreamingDecryptor` without ever extracting the device private key.
+//! On real HSE this is the only viable path — the EC scalar lives inside the
+//! secure element. On SimHsm the work still happens in the host process but
+//! routes through the crypto trait so the call site is identical.
 //!
-//! Two backings (same `KeyUnwrap` behaviour):
-//! - [`HsmKeyUnwrap::new`] holds the same `Arc<Mutex<dyn HsmProvider>>` the OTA
-//!   pipeline already owns — no second trait-object view is required. Each
-//!   unwrap call locks the mutex briefly to invoke `HsmProvider::unwrap_cek_*`;
-//!   the lock is dropped before returning.
-//! - [`HsmKeyUnwrap::from_crypto`] holds an `Arc<dyn HsmCryptoProvider>` (e.g. a
-//!   link-B client) and invokes it directly — no mutex, since the crypto trait
-//!   takes `&self`.
+//! [`HsmKeyUnwrap::from_crypto`] holds an `Arc<dyn HsmCryptoProvider>` (a link-B
+//! client, or a SimHsm) and invokes it directly — no mutex, since the crypto
+//! trait takes `&self`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use sumo_onboard::decryptor::KeyUnwrap;
 use sumo_onboard::error::Sum2Error;
 
-use crate::{HsmCryptoProvider, HsmProvider, KeyHandle};
-
-/// The HSM backing for [`HsmKeyUnwrap`] — either the lifecycle-bearing
-/// [`HsmProvider`] the OTA pipeline already owns (locked per call), or a
-/// crypto-only [`HsmCryptoProvider`] (e.g. a link-B client), which needs no lock
-/// because the trait takes `&self`.
-enum UnwrapSource {
-    /// The `Arc<Mutex<dyn HsmProvider>>` the OTA pipeline holds for lifecycle
-    /// ops; each unwrap briefly locks it to invoke `HsmProvider::unwrap_cek_*`.
-    Provider(Arc<Mutex<dyn HsmProvider>>),
-    /// A crypto-only provider, invoked directly (no mutex — `&self`).
-    Crypto(Arc<dyn HsmCryptoProvider>),
-}
+use crate::{HsmCryptoProvider, KeyHandle};
 
 pub struct HsmKeyUnwrap {
-    source: UnwrapSource,
+    crypto: Arc<dyn HsmCryptoProvider>,
     handle: KeyHandle,
 }
 
 impl HsmKeyUnwrap {
-    /// Back the unwrap with the `Arc<Mutex<dyn HsmProvider>>` the OTA pipeline
-    /// already owns. Behaviour is unchanged: each call locks the mutex, invokes
-    /// `HsmProvider::unwrap_cek_*`, and drops the lock before returning.
-    pub fn new(provider: Arc<Mutex<dyn HsmProvider>>, handle: KeyHandle) -> Self {
-        Self {
-            source: UnwrapSource::Provider(provider),
-            handle,
-        }
-    }
-
-    /// Back the unwrap with a crypto-only [`HsmCryptoProvider`] (e.g. a link-B
-    /// client). No mutex: the trait takes `&self`, so the `Arc` is shared
-    /// directly. Use this when the caller holds an `HsmCryptoProvider` view
-    /// rather than the lifecycle-bearing `HsmProvider`.
+    /// Back the unwrap with a crypto-only [`HsmCryptoProvider`] (a link-B client,
+    /// or a SimHsm). No mutex: the trait takes `&self`, so the `Arc` is shared
+    /// directly. `handle` selects the device key the unwrap runs against (e.g.
+    /// [`crate::KeyRole::DeviceDecryption`]).
     pub fn from_crypto(crypto: Arc<dyn HsmCryptoProvider>, handle: KeyHandle) -> Self {
-        Self {
-            source: UnwrapSource::Crypto(crypto),
-            handle,
-        }
+        Self { crypto, handle }
     }
 }
 
 impl KeyUnwrap for HsmKeyUnwrap {
     fn unwrap_cek_a128kw(&self, wrapped_cek: &[u8]) -> Result<Vec<u8>, Sum2Error> {
-        match &self.source {
-            UnwrapSource::Provider(p) => {
-                let guard = p.lock().map_err(|_| Sum2Error::DecryptFailed)?;
-                guard
-                    .unwrap_cek_a128kw(self.handle, wrapped_cek)
-                    .map_err(|_| Sum2Error::DecryptFailed)
-            }
-            UnwrapSource::Crypto(c) => c
-                .unwrap_cek_a128kw(self.handle, wrapped_cek)
-                .map_err(|_| Sum2Error::DecryptFailed),
-        }
+        self.crypto
+            .unwrap_cek_a128kw(self.handle, wrapped_cek)
+            .map_err(|_| Sum2Error::DecryptFailed)
     }
 
     fn unwrap_cek_ecdh_es(
@@ -84,17 +45,9 @@ impl KeyUnwrap for HsmKeyUnwrap {
         wrapped_cek: &[u8],
         recipient_protected: &[u8],
     ) -> Result<Vec<u8>, Sum2Error> {
-        match &self.source {
-            UnwrapSource::Provider(p) => {
-                let guard = p.lock().map_err(|_| Sum2Error::DecryptFailed)?;
-                guard
-                    .unwrap_cek_ecdh_es(self.handle, ephem_pub, wrapped_cek, recipient_protected)
-                    .map_err(|_| Sum2Error::DecryptFailed)
-            }
-            UnwrapSource::Crypto(c) => c
-                .unwrap_cek_ecdh_es(self.handle, ephem_pub, wrapped_cek, recipient_protected)
-                .map_err(|_| Sum2Error::DecryptFailed),
-        }
+        self.crypto
+            .unwrap_cek_ecdh_es(self.handle, ephem_pub, wrapped_cek, recipient_protected)
+            .map_err(|_| Sum2Error::DecryptFailed)
     }
 }
 

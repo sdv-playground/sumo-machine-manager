@@ -49,10 +49,11 @@ pub use crypto::cose_key_es256_from_spki_der;
 
 /// HSM management provider.
 ///
-/// Implementors manage the HSM keystore and service lifecycle.
-/// The crypto wire protocol (TCP on the private `vbr-vhsm` bridge) is
-/// handled by the underlying service — this trait only covers
-/// provisioning and process management.
+/// Implementors manage the HSM keystore: provisioning and the
+/// keystore/enrolment queries built on it. The crypto wire protocol
+/// (sign / verify / unwrap / … on the private `vbr-vhsm` bridge) is the
+/// separate [`HsmCryptoProvider`] trait, served by the underlying HSM
+/// service — this trait carries NO crypto or service-lifecycle ops.
 ///
 /// # Provisioning model
 ///
@@ -66,9 +67,8 @@ pub use crypto::cose_key_es256_from_spki_der;
 ///
 /// # For QNX implementors
 ///
-/// On QNX, the "service" is the HSM firmware itself (always running).
-/// `start_service`/`stop_service` may be no-ops. Provisioning writes
-/// key material to the real secure storage via the QNX resource manager.
+/// Provisioning writes key material to the real secure storage via the
+/// QNX resource manager.
 pub trait HsmProvider: Send {
     /// Check if the keystore has been provisioned.
     fn is_provisioned(&self) -> Result<bool, HsmError>;
@@ -86,70 +86,17 @@ pub trait HsmProvider: Send {
     /// List keys currently in the keystore.
     fn list_keys(&self) -> Result<Vec<KeyInfo>, HsmError>;
 
-    /// Start the HSM service so guests can connect via TCP.
-    /// Returns the TCP port the service is listening on.
-    fn start_service(&mut self) -> Result<u16, HsmError>;
-
-    /// Stop the HSM service.
-    fn stop_service(&mut self) -> Result<(), HsmError>;
-
-    /// Check health/status of the HSM subsystem.
-    fn status(&self) -> Result<HsmStatus, HsmError>;
-
     /// Retrieve a public key by role, as COSE_Key CBOR bytes.
     fn get_public_key(&self, role: KeyRole) -> Result<Vec<u8>, HsmError>;
 
     // get_private_key intentionally removed — private keys never leave
-    // the HSM.  Decrypt via unwrap_cek_a128kw / unwrap_cek_ecdh_es;
-    // sign via HsmCryptoProvider::sign; CSR-gen via generate_csr (key
-    // stays in-HSM).  If you reach for "give me the bytes" you're
+    // the HSM.  Crypto (sign / verify / unwrap_cek_* / CSR-gen) lives on
+    // the separate `HsmCryptoProvider` trait, keyed by handle; the key
+    // stays in-HSM.  If you reach for "give me the bytes" you're
     // designing against the HSE model.
 
     /// Get the current provisioning lifecycle state.
     fn provisioning_state(&self) -> Result<ProvisioningState, HsmError>;
-
-    /// AES-KW unwrap delegated to the HSM. Same semantics as
-    /// [`HsmCryptoProvider::unwrap_cek_a128kw`] — exposed on
-    /// `HsmProvider` too so the OTA pipeline (which holds the HSM
-    /// as `Arc<Mutex<dyn HsmProvider>>` for lifecycle ops) can route
-    /// unwrap requests without needing a second trait-object view.
-    ///
-    /// Default impl returns `NotSupported`; concrete providers override.
-    fn unwrap_cek_a128kw(
-        &self,
-        handle: KeyHandle,
-        wrapped_cek: &[u8],
-    ) -> Result<Vec<u8>, HsmError> {
-        let _ = (handle, wrapped_cek);
-        Err(HsmError::NotSupported(
-            "HsmProvider::unwrap_cek_a128kw".into(),
-        ))
-    }
-
-    /// ECDH-ES+A128KW unwrap delegated to the HSM. See
-    /// [`HsmCryptoProvider::unwrap_cek_ecdh_es`] for parameter docs.
-    fn unwrap_cek_ecdh_es(
-        &self,
-        handle: KeyHandle,
-        ephem_pub: &[u8],
-        wrapped_cek: &[u8],
-        recipient_protected: &[u8],
-    ) -> Result<Vec<u8>, HsmError> {
-        let _ = (handle, ephem_pub, wrapped_cek, recipient_protected);
-        Err(HsmError::NotSupported(
-            "HsmProvider::unwrap_cek_ecdh_es".into(),
-        ))
-    }
-
-    /// ECDSA-SHA256 sign delegated to the HSM. Same semantics as
-    /// [`HsmCryptoProvider::sign`] — exposed on `HsmProvider` so the
-    /// OTA pipeline (which holds the HSM as
-    /// `Arc<Mutex<dyn HsmProvider>>`) can self-sign bank dirs via the
-    /// IVD machinery without needing a second trait-object view.
-    fn sign(&self, handle: KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        let _ = (handle, data);
-        Err(HsmError::NotSupported("HsmProvider::sign".into()))
-    }
 
     /// Arm an in-band ENROLL_ASSISTED for `vm_id`. Used by component-mgr at
     /// OTA install time: after staging a guest's firmware bank, the
@@ -196,13 +143,6 @@ pub trait HsmProvider: Send {
     fn clear_enrolled(&mut self, vm_id: &str) -> Result<bool, HsmError> {
         let _ = vm_id;
         Err(HsmError::NotSupported("HsmProvider::clear_enrolled".into()))
-    }
-
-    /// ECDSA-SHA256 verify delegated to the HSM. Mirror of `sign`,
-    /// used by `sumo-verify` on the management path.
-    fn verify(&self, handle: KeyHandle, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
-        let _ = (handle, data, signature);
-        Err(HsmError::NotSupported("HsmProvider::verify".into()))
     }
 }
 

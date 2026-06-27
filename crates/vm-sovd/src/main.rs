@@ -211,11 +211,11 @@ async fn main() {
         let hsm_arc = Arc::new(Mutex::new(provider));
 
         if let Some(sw_key) = sw_key {
-            // CEK unwrap routed through the HSM, never extracts the
-            // device decryption private key. Same Arc backs the
-            // lifecycle ops below — no second view of the provider.
+            // CEK unwrap routed through the HSM crypto handle (the link-B client),
+            // never extracting the device decryption private key.
+            let crypto: Arc<dyn hsm::HsmCryptoProvider> = client.clone();
             let unwrap: Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync> = Arc::new(
-                hsm::HsmKeyUnwrap::new(hsm_arc.clone(), hsm::KeyRole::DeviceDecryption.handle()),
+                hsm::HsmKeyUnwrap::from_crypto(crypto, hsm::KeyRole::DeviceDecryption.handle()),
             );
             manifest_provider.update_keys(sw_key, Some(unwrap), ka);
             tracing::info!("loaded sw-authority from HSM keystore; CEK unwrap routed through HSM");

@@ -149,12 +149,10 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
     }
 
     async fn start(&self) -> MachineResult<()> {
-        // For HSM-bearing components this spawns vhsm-test-ssd (Sim) or
-        // is a no-op (HSE / hardware backends). For VMs without an HSM
-        // provider attached this is a no-op. Idempotent.
-        self.inner
-            .start_hsm_service()
-            .map_err(MachineError::Internal)
+        // No-op: the HSM daemon's lifecycle is owned externally now (supernova
+        // spawns the link-B backend; vhsm-ssd is a separate process), so a
+        // component no longer starts an in-process HSM service here. Idempotent.
+        Ok(())
     }
 
     async fn list_dids(&self, _filter: &DidFilter) -> MachineResult<Vec<DidEntry>> {

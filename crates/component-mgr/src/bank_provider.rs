@@ -48,14 +48,14 @@ pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     /// On-disk dir name for this set (`vm1`, `host-os`, ...), from the
     /// backend's `BankSetSpec`.
     dir_name: String,
-    /// HSM provider used to sign / signature-verify the IVD manifest.
+    /// HSM provider — the provisioning authority `seal` gates on
+    /// (`is_provisioned()`); IVD signing itself goes through `hsm_crypto`.
     hsm: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
-    /// Optional crypto-only HSM handle (e.g. supernova's shared link-B
-    /// `LinkBClient`). When `Some`, `seal` signs the IVD manifest via
-    /// `ivd::sign_bank_crypto` over `HsmCryptoProvider` instead of
-    /// `ivd::sign_bank` over the lifecycle-bearing `hsm`. The `is_provisioned()`
-    /// pre-sign guard always stays on `hsm`. `None` keeps today's `hsm` path.
-    /// Set via [`with_hsm_crypto`](Self::with_hsm_crypto).
+    /// Crypto handle (e.g. supernova's shared link-B `LinkBClient`, or a SimHsm)
+    /// `seal` uses to sign the IVD manifest via `ivd::sign_bank_crypto`. Required
+    /// for sealing a real bank — `seal` errors when it's `None`. The
+    /// `is_provisioned()` pre-sign guard stays on `hsm`. Set via
+    /// [`with_hsm_crypto`](Self::with_hsm_crypto).
     hsm_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
     /// Activator invoked by `activate()` (RT launcher, IFS write, ...) — runs
     /// before the boot selector is sealed so a failure leaves NV/selector
@@ -131,13 +131,12 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         }
     }
 
-    /// Inject a crypto-only HSM handle (e.g. supernova's shared link-B
-    /// `LinkBClient`). When set, [`seal`](Self::seal) signs the IVD manifest via
-    /// `ivd::sign_bank_crypto` (its lone `sign` op over `HsmCryptoProvider`)
-    /// instead of `ivd::sign_bank` over the lifecycle-bearing `hsm`; the
-    /// `is_provisioned()` pre-sign guard stays on `hsm`. Unset (the default)
-    /// keeps today's `hsm` path. Threaded from `FactoryDeps::hsm_crypto` by the
-    /// component factory. Additive — behaviour-preserving when unset.
+    /// Inject the crypto handle (e.g. supernova's shared link-B `LinkBClient`, or
+    /// a SimHsm) [`seal`](Self::seal) signs the IVD manifest with, via
+    /// `ivd::sign_bank_crypto` (its lone `sign` op over `HsmCryptoProvider`); the
+    /// `is_provisioned()` pre-sign guard stays on `hsm`. Required for sealing a
+    /// real bank — `seal` errors when this is unset. Threaded from
+    /// `FactoryDeps::hsm_crypto` by the component factory.
     pub fn with_hsm_crypto(mut self, crypto: Arc<dyn hsm::HsmCryptoProvider>) -> Self {
         self.hsm_crypto = Some(crypto);
         self
@@ -479,14 +478,17 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // computed) re-wires through the `open_payload_writer` seam once the
         // generic engine owns streaming; for now the dir walk produces an
         // identical signed manifest.
-        // Sign over the crypto-only handle (link-B) when present — the `sign` op
-        // narrows to `HsmCryptoProvider`; the `hsm` guard above stays the
-        // provisioning authority. `None` keeps the `HsmProvider` sign path.
-        match &self.hsm_crypto {
-            Some(crypto) => hsm::ivd::sign_bank_crypto(crypto.as_ref(), &bank_dir, gen, identity),
-            None => hsm::ivd::sign_bank(&*hsm, &bank_dir, gen, identity),
-        }
-        .map_err(|e| BankError::Failed(format!("ivd sign {bank_id}: {e}")))?;
+        // Sign over the crypto handle (`HsmCryptoProvider`); the `hsm` guard
+        // above stays the provisioning authority (the `is_provisioned()` gate).
+        // The crypto handle is the only signing path now — `None` while the HSM
+        // is provisioned is a wiring bug, surfaced as a clear error.
+        let crypto = self.hsm_crypto.as_ref().ok_or_else(|| {
+            BankError::Failed(format!(
+                "ivd sign {bank_id}: no HSM crypto handle attached — IVD signing needs an HsmCryptoProvider (wiring bug)"
+            ))
+        })?;
+        hsm::ivd::sign_bank_crypto(crypto.as_ref(), &bank_dir, gen, identity)
+            .map_err(|e| BankError::Failed(format!("ivd sign {bank_id}: {e}")))?;
         tracing::info!(
             bank_id = %bank_id,
             bank_dir = %bank_dir.display(),
@@ -849,7 +851,7 @@ mod tests {
             tester_serial: "SOVD-OTA".into(),
             ..Default::default()
         };
-        hsm::ivd::sign_bank(&hsm, bank_dir, gen, identity).unwrap();
+        hsm::ivd::sign_bank_crypto(&hsm, bank_dir, gen, identity).unwrap();
         (hsm, keystore)
     }
 

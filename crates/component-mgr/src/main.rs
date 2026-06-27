@@ -397,7 +397,7 @@ fn main() {
                         std::process::exit(1);
                     }
                     let identity = meta.to_ivd_identity();
-                    match hsm::ivd::sign_bank(hsm, &bank_dir, 0, identity) {
+                    match hsm::ivd::sign_bank_crypto(hsm, &bank_dir, 0, identity) {
                         Ok(_) => println!(
                             "[factory] {name}: signed IVD identity manifest in {}",
                             bank_dir.display()

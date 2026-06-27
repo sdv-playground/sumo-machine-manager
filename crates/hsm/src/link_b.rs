@@ -281,11 +281,10 @@ impl LinkBClient {
     // ── Provisioning / key-management half (inherent, not a trait impl) ────────
     //
     // These mirror the eight `HsmProvider` methods that cross link-B. They are
-    // inherent rather than an `impl HsmProvider` because `HsmProvider` also
-    // carries lifecycle ops (`start_service`/`stop_service`/`status`) with no
-    // link-B representation — the proxy *spawns* the backend, it doesn't ask it
-    // to start over the wire — and its `&mut self` receivers don't fit a shared
-    // client (the mutation happens on the backend, not in the proxy).
+    // inherent rather than an `impl HsmProvider` because some of those methods
+    // take `&mut self` (`provision`, `arm_enrollment`, `clear_enrolled`), which
+    // doesn't fit a shared `&self` client — the mutation happens on the backend,
+    // reached over the wire, not in the proxy.
 
     /// `OP_IS_PROVISIONED` — has the backend keystore been provisioned?
     pub fn is_provisioned(&self) -> Result<bool, HsmError> {
@@ -518,19 +517,13 @@ impl HsmCryptoProvider for LinkBClient {
 /// provisioning machinery holds (as `Arc<Mutex<dyn HsmProvider>>`) once the
 /// backend is a link-B daemon rather than an in-process [`crate::sim::SimHsm`].
 ///
-/// Delegation map:
-/// - keystore / provisioning (`is_provisioned`, `provision`, `list_keys`,
-///   `provisioning_state`, `arm_enrollment`, `is_enrolled`, `clear_enrolled`,
-///   `get_public_key`) → the client's inherent link-B methods.
-/// - crypto-dup ops (`sign`, `verify`, `unwrap_cek_a128kw`, `unwrap_cek_ecdh_es`)
-///   → the client's [`HsmCryptoProvider`] impl (same wire, the crypto op space).
-/// - lifecycle (`start_service`, `stop_service`, `status`) → **no-ops**. A
-///   link-B daemon's lifecycle is owned **externally**: the orchestrator spawns
-///   and reaps it (see [`spawn_and_connect`]); the provider never starts or stops
-///   it over the wire. `start_service` reports a benign port `0` (link-B is a
-///   Unix socket, not TCP), `stop_service` is `Ok(())`, and `status` reports a
-///   "running" default (with a best-effort `provisioned` flag read from the
-///   client).
+/// Delegation map: every [`HsmProvider`] method (`is_provisioned`, `provision`,
+/// `list_keys`, `provisioning_state`, `arm_enrollment`, `is_enrolled`,
+/// `clear_enrolled`, `get_public_key`) → the client's inherent link-B methods.
+/// Crypto (sign / verify / unwrap_cek_*) is NOT on this trait — a caller that
+/// needs it holds the [`LinkBClient`] directly as an [`HsmCryptoProvider`] (see
+/// [`Self::client`]); the daemon's service lifecycle is owned externally (the
+/// orchestrator spawns + reaps it via [`spawn_and_connect`]).
 ///
 /// The client is held behind an `Arc` (not a `Mutex`): [`LinkBClient`] already
 /// serialises each request/response exchange with its own internal stream mutex,
@@ -567,34 +560,6 @@ impl HsmProvider for LinkBProvider {
         self.client.list_keys()
     }
 
-    /// No-op: the link-B daemon's lifecycle is owned externally (the orchestrator
-    /// spawns + reaps it), so there is nothing to start over the wire. Returns
-    /// port `0` — link-B is a Unix socket, so there is no TCP port to report.
-    fn start_service(&mut self) -> Result<u16, HsmError> {
-        Ok(0)
-    }
-
-    /// No-op: see [`start_service`](Self::start_service) — the daemon's lifecycle
-    /// is owned externally, so the provider never stops it over the wire.
-    fn stop_service(&mut self) -> Result<(), HsmError> {
-        Ok(())
-    }
-
-    /// Best-effort status. The daemon is reported running (its lifecycle is owned
-    /// externally, so the provider can't authoritatively stop/start it);
-    /// `provisioned` is read from the client, defaulting to `false` if that wire
-    /// query fails. `keystore_path` / `tcp_port` / `service_pid` are not
-    /// meaningful for a link-B backend reached over a Unix socket.
-    fn status(&self) -> Result<crate::HsmStatus, HsmError> {
-        Ok(crate::HsmStatus {
-            provisioned: self.client.is_provisioned().unwrap_or(false),
-            service_running: true,
-            service_pid: None,
-            keystore_path: std::path::PathBuf::new(),
-            tcp_port: 0,
-        })
-    }
-
     fn get_public_key(&self, role: crate::KeyRole) -> Result<Vec<u8>, HsmError> {
         // The wire carries SPKI DER; the client rebuilds the COSE_Key. That
         // SPKI→COSE conversion needs the `crypto` feature (RustCrypto), so a
@@ -619,35 +584,6 @@ impl HsmProvider for LinkBProvider {
         self.client.provisioning_state()
     }
 
-    fn unwrap_cek_a128kw(
-        &self,
-        handle: KeyHandle,
-        wrapped_cek: &[u8],
-    ) -> Result<Vec<u8>, HsmError> {
-        // Crypto-dup op: route to the client's HsmCryptoProvider half.
-        HsmCryptoProvider::unwrap_cek_a128kw(&*self.client, handle, wrapped_cek)
-    }
-
-    fn unwrap_cek_ecdh_es(
-        &self,
-        handle: KeyHandle,
-        ephem_pub: &[u8],
-        wrapped_cek: &[u8],
-        recipient_protected: &[u8],
-    ) -> Result<Vec<u8>, HsmError> {
-        HsmCryptoProvider::unwrap_cek_ecdh_es(
-            &*self.client,
-            handle,
-            ephem_pub,
-            wrapped_cek,
-            recipient_protected,
-        )
-    }
-
-    fn sign(&self, handle: KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        HsmCryptoProvider::sign(&*self.client, handle, data)
-    }
-
     fn arm_enrollment(&mut self, vm_id: &str, ttl_secs: Option<u64>) -> Result<(), HsmError> {
         self.client.arm_enrollment(vm_id, ttl_secs)
     }
@@ -658,10 +594,6 @@ impl HsmProvider for LinkBProvider {
 
     fn clear_enrolled(&mut self, vm_id: &str) -> Result<bool, HsmError> {
         self.client.clear_enrolled(vm_id)
-    }
-
-    fn verify(&self, handle: KeyHandle, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
-        HsmCryptoProvider::verify(&*self.client, handle, data, signature)
     }
 }
 
@@ -1356,14 +1288,6 @@ mod tests {
         // client — coerce to the trait object to PROVE it satisfies the trait.
         let mut provider: Box<dyn HsmProvider> = Box::new(LinkBProvider::new(Arc::new(client)));
 
-        // Lifecycle no-ops: an external daemon owns lifecycle, so start/stop
-        // succeed without touching the wire and status reports "running".
-        assert_eq!(provider.start_service().unwrap(), 0);
-        provider.stop_service().unwrap();
-        let st = provider.status().unwrap();
-        assert!(st.service_running);
-        assert!(!st.provisioned, "unprovisioned backend reports provisioned=false");
-
         // Unprovisioned: provisioning/keystore delegation reaches the real sim.
         assert!(!provider.is_provisioned().unwrap());
         assert_eq!(
@@ -1432,19 +1356,6 @@ mod tests {
 
         // list_keys delegates: the two slots are present.
         assert_eq!(provider.list_keys().unwrap().len(), 2);
-
-        // Crypto-dup delegation: sign via HsmProvider::sign (→ the client's
-        // HsmCryptoProvider) then verify via HsmProvider::verify round-trips,
-        // and a tampered message fails.
-        let sig = provider
-            .sign(KeyRole::JwtSigning.handle(), b"provider-signs")
-            .unwrap();
-        assert!(provider
-            .verify(KeyRole::JwtSigning.handle(), b"provider-signs", &sig)
-            .unwrap());
-        assert!(!provider
-            .verify(KeyRole::JwtSigning.handle(), b"tampered", &sig)
-            .unwrap());
 
         // Enrolment trio over the provider (bools both directions). arm puts vm7
         // in `pending`, not `enrolled`, so is_enrolled stays false and
