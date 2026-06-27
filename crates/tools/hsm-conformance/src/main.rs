@@ -16,6 +16,7 @@
 //! `hsm_conformance::spawn_and_connect`; that helper exists to bring up a local
 //! test double, not as a CLI mode for launching arbitrary vendor backends.)
 
+use std::io::Write;
 use std::path::Path;
 
 use hsm::link_b::LinkBClient;
@@ -34,7 +35,7 @@ fn main() {
 
     let socket = match &args[1..] {
         [a] if a == "-h" || a == "--help" => {
-            println!("{USAGE}");
+            let _ = writeln!(std::io::stdout(), "{USAGE}");
             std::process::exit(0);
         }
         // The backend socket as a positional path …
@@ -42,18 +43,27 @@ fn main() {
         // … or via the explicit flag form.
         [flag, sock] if flag == "--backend-socket" => sock.clone(),
         _ => {
-            eprintln!("{USAGE}");
+            let _ = writeln!(std::io::stderr(), "{USAGE}");
             std::process::exit(2);
         }
     };
 
     let client = LinkBClient::connect(Path::new(&socket)).unwrap_or_else(|e| {
-        eprintln!("error: could not connect to link-B backend at {socket}: {e}");
+        let _ = writeln!(
+            std::io::stderr(),
+            "error: could not connect to link-B backend at {socket}: {e}"
+        );
         std::process::exit(2);
     });
 
     let report = run_conformance(&client);
-    print!("{report}");
+
+    // Write the report, then exit with the verdict. Through a locked handle with
+    // I/O errors ignored, so a broken stdout pipe (e.g. `hsm-conformance … | head`)
+    // can't turn this tool's machine-readable verdict exit code into a panic (101).
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "{report}");
+    let _ = out.flush();
 
     std::process::exit(if report.all_passed() { 0 } else { 1 });
 }
