@@ -5,7 +5,7 @@
 //! It is the *only* thing a hardware/HSE vendor implements. It is deliberately
 //! **decoupled** from the guest-facing vHSM wire (`vhsm-proto`, "link A"): link A
 //! evolves for guests, link B evolves for backends, and neither breaks the other.
-//! See `docs/design/hsm-backend-architecture.md`.
+//! See `docs/hsm-backend-architecture.md`.
 //!
 //! ## What link B carries
 //!

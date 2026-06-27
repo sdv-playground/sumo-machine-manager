@@ -21,7 +21,7 @@
  *
  * On an error response status != ST_OK and result is a UTF-8 message.
  * The per-op payload table lives in the Rust crate docs and
- * docs/design/hsm-backend-architecture.md.
+ * docs/hsm-backend-architecture.md.
  */
 #ifndef HSM_LINK_B_H
 #define HSM_LINK_B_H

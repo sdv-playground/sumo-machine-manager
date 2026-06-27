@@ -2,7 +2,7 @@
 //!
 //! Stage 1 of making the HSM backend a uniform out-of-process **link-B**
 //! service (see `crates/hsm-link-b` for the frozen wire contract and
-//! `docs/design/hsm-backend-architecture.md`). This module is the Rust glue on
+//! `docs/hsm-backend-architecture.md`). This module is the Rust glue on
 //! both ends of that wire:
 //!
 //! - [`LinkBClient`] implements [`HsmCryptoProvider`] by encoding each op per

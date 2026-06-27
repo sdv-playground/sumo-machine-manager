@@ -74,14 +74,19 @@ fn sim_hsm_conforms() {
 
 #[test]
 fn stub_example_does_not_conform() {
-    // Compile the reference C skeleton (STUBBED crypto) at runtime. Absolute
-    // paths off this crate's manifest dir (`<repo>/crates/hsm-conformance`).
-    let crates_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate dir has a parent (the crates/ dir)")
+    // Locate the in-repo C skeleton by walking up from this crate's manifest dir
+    // to the workspace root — the first ancestor that actually holds it. Robust to
+    // where this tool crate lives (crates/, tools/crates/, …); a wrong path must
+    // FAIL here, not silently skip the whole stub proof.
+    let rel = "crates/hsm-link-b/reference/hse_service_skeleton.c";
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest
+        .ancestors()
+        .find(|d| d.join(rel).is_file())
+        .unwrap_or_else(|| panic!("could not find {rel} above {}", manifest.display()))
         .to_path_buf();
-    let include = crates_dir.join("hsm-link-b/include");
-    let source = crates_dir.join("hsm-link-b/reference/hse_service_skeleton.c");
+    let include = root.join("crates/hsm-link-b/include");
+    let source = root.join(rel);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let stub_bin = tmp.path().join("hse_service");
@@ -96,10 +101,9 @@ fn stub_example_does_not_conform() {
         .status();
     match compile {
         Ok(s) if s.success() => {}
-        Ok(s) => {
-            eprintln!("SKIP: C skeleton failed to compile with `{cc}` ({s})");
-            return;
-        }
+        // A real compile error of the in-repo skeleton is a bug — fail, don't skip.
+        Ok(s) => panic!("the in-repo C skeleton must compile, but `{cc}` failed ({s})"),
+        // A genuinely-absent C compiler is the one legitimate skip.
         Err(e) => {
             eprintln!("SKIP: no C compiler `{cc}` to build the reference skeleton: {e}");
             return;
