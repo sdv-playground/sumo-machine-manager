@@ -85,4 +85,8 @@
 #define KEYTYPE_AES256      4u
 #define KEYTYPE_HMAC_SHA256 5u
 
+/* ProvisioningState wire constants — PROVISIONING_STATE result state:u32. */
+#define PROV_STATE_UNPROVISIONED 0u
+#define PROV_STATE_PROVISIONED   1u
+
 #endif /* HSM_LINK_B_H */

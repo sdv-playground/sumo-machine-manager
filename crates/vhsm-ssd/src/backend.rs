@@ -12,16 +12,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::time::Duration;
+use std::process::Child;
 
-use hsm::link_b::LinkBClient;
-
-/// Retry budget for the post-spawn link-B connect. The backend binds its socket
-/// early in startup, but process spawn + bind isn't instant; ~5 s (50 × 100 ms)
-/// covers a cold start without hanging the daemon forever on a slow backend.
-const CONNECT_ATTEMPTS: u32 = 50;
-const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
+use hsm::link_b::{self, LinkBClient};
 
 /// Default backend command: the `hsm-sim-service` binary sitting beside our own
 /// executable. In a normal install vhsm-ssd and its dev backend ship in the same
@@ -40,15 +33,10 @@ pub fn default_backend_cmd() -> io::Result<PathBuf> {
 /// Spawn the link-B backend `backend_cmd` (serving `keystore` on the Unix socket
 /// `socket`) and connect a [`LinkBClient`] to it.
 ///
-/// Removes any stale `socket` file first — a crashed prior backend leaves the
-/// path behind, which would EADDRINUSE the backend's own `bind()` (and a connect
-/// to a dead path can't succeed anyway). Spawns
-/// `backend_cmd --keystore <keystore> --listen <socket>`, then retries the
-/// connect for the [`CONNECT_ATTEMPTS`] budget while the child binds. If the
-/// child exits early (bad args / crash) it is detected at once via `try_wait`;
-/// if it stays up but never binds, the budget runs out. Either failure kills +
-/// reaps the child and returns an error, so a broken backend surfaces at startup
-/// rather than as mystery `KeyNotFound` errors later.
+/// Thin wrapper over the single shared [`hsm::link_b::spawn_and_connect`],
+/// pinning `keystore` to `Some(..)` — vhsm-ssd's dev backend (`hsm-sim-service`)
+/// always needs a keystore. See that function for the stale-socket cleanup,
+/// retry-while-binding, and early-exit detection.
 ///
 /// Returns `(client, child)`. The caller MUST keep `child` alive for the
 /// daemon's lifetime: dropping the handle does not kill the process, but losing
@@ -58,67 +46,7 @@ pub fn spawn_and_connect(
     keystore: &Path,
     socket: &Path,
 ) -> io::Result<(LinkBClient, Child)> {
-    // Clear a stale socket from a previous run so the backend's bind() and our
-    // connect() both see a fresh path (mirrors hsm-sim-service's own cleanup).
-    if socket.exists() {
-        std::fs::remove_file(socket).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("remove stale backend socket {}: {e}", socket.display()),
-            )
-        })?;
-    }
-
-    let mut child = Command::new(backend_cmd)
-        .arg("--keystore")
-        .arg(keystore)
-        .arg("--listen")
-        .arg(socket)
-        .spawn()
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("spawn link-B backend {}: {e}", backend_cmd.display()),
-            )
-        })?;
-
-    let mut last_err: Option<io::Error> = None;
-    for attempt in 0..CONNECT_ATTEMPTS {
-        // Fast-fail if the backend already exited (bad args, crash, keystore
-        // perms) instead of waiting out the whole retry budget. `try_wait` reaps
-        // it, so no kill is needed on this branch.
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(io::Error::other(format!(
-                "link-B backend {} exited before binding {} ({status})",
-                backend_cmd.display(),
-                socket.display(),
-            )));
-        }
-
-        match LinkBClient::connect(socket) {
-            Ok(client) => return Ok((client, child)),
-            Err(e) => {
-                last_err = Some(e);
-                // Don't sleep after the final attempt — we're about to give up.
-                if attempt + 1 < CONNECT_ATTEMPTS {
-                    std::thread::sleep(CONNECT_RETRY_DELAY);
-                }
-            }
-        }
-    }
-
-    // Budget exhausted: the backend is alive but never accepted. Don't orphan it.
-    let _ = child.kill();
-    let _ = child.wait();
-    let e = last_err.expect("CONNECT_ATTEMPTS >= 1 so at least one connect was tried");
-    Err(io::Error::new(
-        e.kind(),
-        format!(
-            "link-B backend {} never accepted on {} after {CONNECT_ATTEMPTS} attempts: {e}",
-            backend_cmd.display(),
-            socket.display(),
-        ),
-    ))
+    link_b::spawn_and_connect(backend_cmd, Some(keystore), socket)
 }
 
 #[cfg(test)]

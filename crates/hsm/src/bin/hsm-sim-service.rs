@@ -16,9 +16,10 @@
 //! link-B client (next stage: vhsm-ssd's) connects over the Unix socket and
 //! drives crypto through `HsmCryptoProvider` without sharing a process.
 //!
-//! Crypto is served **directly** via [`hsm::link_b::serve_crypto`] — NOT through
-//! `SimHsm::start_service` (the v3 vHSM TCP daemon). The `daemon_bin` and
-//! `tcp_port` constructor arguments are therefore irrelevant on this path.
+//! Crypto **and** provisioning are served **directly** via [`hsm::link_b::serve`]
+//! (the full backend surface) — NOT through `SimHsm::start_service` (the v3 vHSM
+//! TCP daemon). The `daemon_bin` and `tcp_port` constructor arguments are
+//! therefore irrelevant on this path.
 //!
 //! Usage:
 //!   hsm-sim-service --keystore <path> --listen <unix-socket-path>
@@ -26,10 +27,10 @@
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use hsm::link_b::serve_crypto;
+use hsm::link_b;
 use hsm::sim::SimHsm;
 
 fn print_usage() {
@@ -68,21 +69,23 @@ fn parse_args(args: &[String]) -> Result<(PathBuf, PathBuf), String> {
 }
 
 /// Accept connections on `listener` forever, serving each on its own thread
-/// against the shared `SimHsm` over the link-B crypto protocol. Factored out of
-/// `main` so a test can bind a temp socket and drive the real accept loop
-/// in-process.
+/// against the shared `SimHsm` over the full link-B protocol (crypto +
+/// provisioning). Factored out of `main` so a test can bind a temp socket and
+/// drive the real accept loop in-process.
 ///
-/// One thread per connection: `serve_crypto` blocks reading frames until its
-/// peer drops, so a slow/long-lived client must not stall others. The `Arc`
-/// keeps the single `SimHsm` (and its one keystore on disk) shared across them.
-fn serve(listener: UnixListener, hsm: Arc<SimHsm>) {
+/// One thread per connection: `hsm::link_b::serve` blocks reading frames until
+/// its peer drops, so a slow/long-lived client must not stall others. The
+/// `Arc<Mutex<…>>` shares the single `SimHsm` (and its one keystore on disk):
+/// `serve` takes the lock per op (the provisioning half needs `&mut self`), so
+/// an idle client never holds it.
+fn serve(listener: UnixListener, hsm: Arc<Mutex<SimHsm>>) {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 tracing::debug!("hsm-sim-service: link-b connection accepted");
                 let hsm = Arc::clone(&hsm);
                 thread::spawn(move || {
-                    serve_crypto(stream, &*hsm);
+                    link_b::serve(stream, &*hsm);
                     tracing::debug!("hsm-sim-service: link-b connection closed");
                 });
             }
@@ -123,13 +126,20 @@ fn main() {
         process::exit(1);
     });
 
-    // tcp_port (0) and daemon_bin ("unused") are inert here: we serve crypto
-    // directly via serve_crypto, not through SimHsm::start_service's TCP daemon.
-    let hsm = Arc::new(SimHsm::new(
-        PathBuf::from("unused"),
-        keystore_path.clone(),
-        0,
-    ));
+    // tcp_port (0) and daemon_bin ("unused") are inert here: we serve crypto +
+    // provisioning directly via link_b::serve, not through SimHsm::start_service's
+    // TCP daemon.
+    let hsm = SimHsm::new(PathBuf::from("unused"), keystore_path.clone(), 0);
+
+    // Self-bootstrap the device-side key pairs before serving (idempotent): a
+    // fresh keystore must have its device-generated slots before the first key
+    // op, the same way the supernova/host startup paths call ensure_device_keys.
+    if let Err(e) = hsm.ensure_device_keys() {
+        eprintln!("failed to bootstrap device keys in {}: {e}", keystore_path.display());
+        process::exit(1);
+    }
+
+    let hsm = Arc::new(Mutex::new(hsm));
 
     tracing::info!(
         keystore = %keystore_path.display(),
@@ -165,7 +175,7 @@ mod tests {
         let keystore = dir.path().to_path_buf();
         let sock = dir.path().join("hsm-sim.sock");
 
-        let hsm = Arc::new(SimHsm::new(PathBuf::from("unused"), keystore, 0));
+        let hsm = Arc::new(Mutex::new(SimHsm::new(PathBuf::from("unused"), keystore, 0)));
 
         // Bind BEFORE spawning/connecting so the connect below can't race the
         // listener. The detached `serve` thread loops forever; the test process

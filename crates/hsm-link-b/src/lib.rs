@@ -63,12 +63,23 @@
 //! | `ARM_ENROLLMENT` | ttl_present:u8, ttl:u64, vm_id:tail (utf-8) | — |
 //! | `IS_ENROLLED` | vm_id:tail (utf-8) | u8 (0/1) |
 //! | `CLEAR_ENROLLED` | vm_id:tail (utf-8) | u8 (0/1) |
-//! | `GET_PUBLIC_KEY` | role:u32 | COSE_Key CBOR |
+//! | `GET_PUBLIC_KEY` | role:u32 (slot handle) | SPKI DER |
 //!
 //! `KeyInfo` = `handle:u32, key_type:u32, has_certificate:u8, key_id:bytes(utf-8),
 //! allowed_guests:optlist, allowed_ops:optlist`, where
 //! `optlist = present:u8, [count:u32, item:bytes(utf-8) × count]` (present=0 ⇒ None).
 //! `key_type` is one of the `KEYTYPE_*` constants below.
+//!
+//! `LIST_KEYS` returns `count:u32` followed by `count` back-to-back `KeyInfo`
+//! records (no per-record length prefix — each is self-delimiting).
+//!
+//! `PROVISIONING_STATE`'s `state` is one of the `PROV_STATE_*` constants below.
+//!
+//! `GET_PUBLIC_KEY` carries the role's **slot handle** (`role.handle()`) and
+//! returns its public key as SubjectPublicKeyInfo DER — the same bytes
+//! `GET_PUBLIC_KEY_DER` yields for that handle. The host reconstructs whatever
+//! encoding it ultimately wants (e.g. a COSE_Key) from the SPKI DER; a vendor
+//! backend emits SPKI DER directly rather than building COSE on-device.
 
 use std::io::{self, Read, Write};
 
@@ -132,6 +143,10 @@ pub const KEYTYPE_ED25519: u32 = 2;
 pub const KEYTYPE_AES128: u32 = 3;
 pub const KEYTYPE_AES256: u32 = 4;
 pub const KEYTYPE_HMAC_SHA256: u32 = 5;
+
+// ── ProvisioningState wire constants — `PROVISIONING_STATE` result `state:u32` ─
+pub const PROV_STATE_UNPROVISIONED: u32 = 0;
+pub const PROV_STATE_PROVISIONED: u32 = 1;
 
 /// A decode error: the payload didn't match the op's expected layout.
 #[derive(Debug, PartialEq, Eq)]
