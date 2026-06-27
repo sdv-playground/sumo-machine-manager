@@ -134,8 +134,8 @@ classDiagram
     BankActivator <|.. DevBankActivator : host-os-mgr
     BankActivator <|.. PartitionBankActivator : host-os-mgr
     HsmProvider <|.. SimHsm : dev/test
-    HsmProvider <|.. HseHsmProvider : supernova (S32G3 HSE)
     HsmCryptoProvider <|.. SimHsm
+    HsmCryptoProvider <|.. LinkBClient : link-B -> backend service
     ManifestProvider <|.. SuitProvider
 ```
 
@@ -180,7 +180,8 @@ the seams above are the supported extension points.
   `load kernel` resolves there (no `current` symlink).
 - **vm-devices** (lib): host-side virtual CAN / health / time simulators (ivshmem vs QNX shm).
 - **hsm** (lib): `HsmProvider`/`HsmCryptoProvider`; `SimHsm` (vhsm-ssd + file keystore);
-  the hardware backend (`HseHsmProvider`, S32G3) lives in supernova; `ivd` (per-bank IVD
+  `LinkBClient` + `serve_crypto` (the link-B bridge to an out-of-process backend — the sim
+  or a vendor C HSE implementing `hsm-link-b`); `ivd` (per-bank IVD
   manifest sign/verify with the `ivd-signing` key —
   the same key that signs the boot selector). 7 mandatory `KeyRole`s.
 - **vhsm-ssd** (lib + bin): host daemon terminating the guest `/dev/vhsm` v3 handle

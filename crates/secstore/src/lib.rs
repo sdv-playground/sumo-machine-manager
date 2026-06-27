@@ -5,7 +5,7 @@
 //! - [`SecstoreBackend`]: where blobs live (filesystem, NOR flash, etc.)
 //!
 //! The generic [`FileBackend`] + any encryptor works on any POSIX system.
-//! Board-specific crates (e.g. `hse-s32g3`) provide hardware encryptors.
+//! A production deployment plugs in a hardware (HSE-backed) encryptor.
 //!
 //! # What's Stored
 //!
