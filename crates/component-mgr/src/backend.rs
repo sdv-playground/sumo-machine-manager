@@ -349,6 +349,14 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// (component_id `["hsm", "keys"]`) are routed to this provider
     /// instead of being written as a disk image.
     hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
+    /// Optional crypto-only HSM handle (e.g. supernova's shared link-B
+    /// `LinkBClient`). When `Some`, the HSM-keys provision path builds the
+    /// CEK `HsmKeyUnwrap` via `from_crypto` (routing unwrap through
+    /// `HsmCryptoProvider`) instead of `new` over the lifecycle-bearing
+    /// `hsm_provider`. `None` (the default) keeps today's `dyn HsmProvider`
+    /// path. Threaded from `FactoryDeps::hsm_crypto` via
+    /// [`with_hsm_crypto`](Self::with_hsm_crypto).
+    hsm_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
     /// Synthetic health source — consulted by `read_data` for
     /// `guest_state` / `heartbeat_seq` when `vm_service_addr` is None.
     /// Set via `with_health_probe` (typically by supernova-mm for the
@@ -555,6 +563,9 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             images_dir,
             upload_phase: Mutex::new(None),
             hsm_provider,
+            // Defaults to the `dyn HsmProvider` path; component-factory injects a
+            // crypto-only handle via `with_hsm_crypto` when link-B is configured.
+            hsm_crypto: None,
             health_probe: None,
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             manifest_describe: Mutex::new(HashMap::new()),
@@ -599,6 +610,17 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// for byte. Threaded from `FactoryDeps::post_provision_reload`.
     pub fn with_post_provision_reload(mut self, reload: Arc<dyn Fn() + Send + Sync>) -> Self {
         self.post_provision_reload = Some(reload);
+        self
+    }
+
+    /// Inject a crypto-only HSM handle (e.g. supernova's shared link-B
+    /// `LinkBClient`). When set, the HSM-keys provision path builds the CEK
+    /// `HsmKeyUnwrap` via `from_crypto` so device-decryption unwrap routes
+    /// through `HsmCryptoProvider`; unset (the default) keeps the
+    /// `HsmProvider`-backed `HsmKeyUnwrap::new`. Threaded from
+    /// `FactoryDeps::hsm_crypto`. Additive — behaviour-preserving when unset.
+    pub fn with_hsm_crypto(mut self, crypto: Arc<dyn hsm::HsmCryptoProvider>) -> Self {
+        self.hsm_crypto = Some(crypto);
         self
     }
 
@@ -2796,12 +2818,21 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     Ok(sw_key) => {
                         let ka = hsm_guard.get_public_key(hsm::KeyRole::KeyAuthority).ok();
                         drop(hsm_guard);
+                        // Prefer the crypto-only handle (link-B) when present so
+                        // the CEK unwrap routes through `HsmCryptoProvider`; else
+                        // keep the `HsmProvider`-locked path.
                         let unwrap: std::sync::Arc<
                             dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync,
-                        > = std::sync::Arc::new(hsm::HsmKeyUnwrap::new(
-                            hsm.clone(),
-                            hsm::KeyRole::DeviceDecryption.handle(),
-                        ));
+                        > = match &self.hsm_crypto {
+                            Some(crypto) => std::sync::Arc::new(hsm::HsmKeyUnwrap::from_crypto(
+                                crypto.clone(),
+                                hsm::KeyRole::DeviceDecryption.handle(),
+                            )),
+                            None => std::sync::Arc::new(hsm::HsmKeyUnwrap::new(
+                                hsm.clone(),
+                                hsm::KeyRole::DeviceDecryption.handle(),
+                            )),
+                        };
                         self.manifest_provider.update_keys(sw_key, Some(unwrap), ka);
                         tracing::info!(
                             "loaded sw-authority + key-authority; CEK unwrap routed through HSM"
@@ -3077,12 +3108,24 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                             match hsm_guard.get_public_key(hsm::KeyRole::SoftwareAuthority) {
                                 Ok(sw_key) => {
                                     drop(hsm_guard);
+                                    // Prefer the crypto-only handle (link-B) when
+                                    // present so the CEK unwrap routes through
+                                    // `HsmCryptoProvider`; else keep the
+                                    // `HsmProvider`-locked path.
                                     let unwrap: std::sync::Arc<
                                         dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync,
-                                    > = std::sync::Arc::new(hsm::HsmKeyUnwrap::new(
-                                        hsm.clone(),
-                                        hsm::KeyRole::DeviceDecryption.handle(),
-                                    ));
+                                    > = match &self.hsm_crypto {
+                                        Some(crypto) => {
+                                            std::sync::Arc::new(hsm::HsmKeyUnwrap::from_crypto(
+                                                crypto.clone(),
+                                                hsm::KeyRole::DeviceDecryption.handle(),
+                                            ))
+                                        }
+                                        None => std::sync::Arc::new(hsm::HsmKeyUnwrap::new(
+                                            hsm.clone(),
+                                            hsm::KeyRole::DeviceDecryption.handle(),
+                                        )),
+                                    };
                                     self.manifest_provider.update_keys(sw_key, Some(unwrap), ka);
                                     tracing::info!(
                                         "HSM keys provisioned; CEK unwrap routed through HSM"

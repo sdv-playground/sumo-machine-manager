@@ -107,6 +107,14 @@ pub struct FactoryDeps<D: BlockDevice> {
     pub security_provider: Arc<dyn SecurityProvider>,
     pub vm_service_addr: Option<String>,
     pub hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
+    /// Optional crypto-only HSM handle (e.g. supernova's shared link-B
+    /// `LinkBClient`). When `Some`, the built `ComponentBackend` (HSM-keys
+    /// provision → `HsmKeyUnwrap`), the selector-aware `IvdBankProvider`
+    /// (IVD `seal`), and the HSM component's CSR adapter prefer this
+    /// `HsmCryptoProvider` over the lifecycle-bearing `hsm_provider`; `None`
+    /// keeps today's `dyn HsmProvider` path. Additive — defaults preserve
+    /// behaviour.
+    pub hsm_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
     pub hsm_keystore: Option<PathBuf>,
     pub hsm_port: u16,
     /// Per-component bank activators, keyed by component id.
@@ -220,18 +228,24 @@ fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
     activator: Option<Arc<dyn machine_mgr::BankActivator>>,
 ) -> Option<Arc<dyn machine_mgr::BankProvider>> {
     let selector = deps.boot_selector.clone()?;
-    Some(Arc::new(
-        component_mgr::bank_provider::IvdBankProvider::new(
-            deps.nv.clone(),
-            bank_set,
-            single_bank,
-            images_dir,
-            dir_name,
-            deps.hsm_provider.clone(),
-            activator,
-            Some(selector),
-        ),
-    ))
+    let provider = component_mgr::bank_provider::IvdBankProvider::new(
+        deps.nv.clone(),
+        bank_set,
+        single_bank,
+        images_dir,
+        dir_name,
+        deps.hsm_provider.clone(),
+        activator,
+        Some(selector),
+    );
+    // When a crypto-only HSM handle is configured (supernova's link-B client),
+    // the IVD `seal` runs its lone `sign` over `HsmCryptoProvider` instead of the
+    // lifecycle-bearing `dyn HsmProvider`. `None` keeps the `hsm_provider` path.
+    let provider = match deps.hsm_crypto.clone() {
+        Some(crypto) => provider.with_hsm_crypto(crypto),
+        None => provider,
+    };
+    Some(Arc::new(provider))
 }
 
 /// Build a single component from its spec and shared dependencies.
@@ -299,6 +313,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             }
             if let Some(reload) = &deps.post_provision_reload {
                 backend = backend.with_post_provision_reload(reload.clone());
+            }
+            if let Some(crypto) = &deps.hsm_crypto {
+                backend = backend.with_hsm_crypto(crypto.clone());
             }
             let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
             let component: Arc<dyn Component> = Arc::new(comp);
@@ -400,6 +417,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             if let Some(reload) = &deps.post_provision_reload {
                 backend = backend.with_post_provision_reload(reload.clone());
             }
+            if let Some(crypto) = &deps.hsm_crypto {
+                backend = backend.with_hsm_crypto(crypto.clone());
+            }
             let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
             let mut component_inner = ComponentAdapter::new(backend_arc.clone());
 
@@ -407,6 +427,13 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 if let Some(ref keystore) = deps.hsm_keystore {
                     component_inner =
                         component_inner.with_csr_keystore(keystore.clone(), deps.hsm_port);
+                }
+                // Prefer the crypto-only link-B handle for CSR / list-keys /
+                // device-id when configured; `with_csr_crypto` wins over the
+                // keystore fallback inside the adapter. `None` keeps the
+                // keystore-only path (dev / no link-B).
+                if let Some(ref crypto) = deps.hsm_crypto {
+                    component_inner = component_inner.with_csr_crypto(crypto.clone());
                 }
             }
 

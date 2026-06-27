@@ -368,9 +368,12 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
         let der = if let Some(ref crypto) = self.csr_crypto {
             crypto.generate_csr(handle, key_id)
         } else {
-            let keystore = self.csr_keystore.as_ref().ok_or(MachineError::NotSupported(
-                "get_csr (no keystore configured)",
-            ))?;
+            let keystore = self
+                .csr_keystore
+                .as_ref()
+                .ok_or(MachineError::NotSupported(
+                    "get_csr (no keystore configured)",
+                ))?;
             let tmp =
                 hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
             tmp.generate_csr(handle, key_id)
@@ -419,9 +422,12 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                 })
                 .collect()
         } else {
-            let keystore = self.csr_keystore.as_ref().ok_or(MachineError::NotSupported(
-                "list_keys (no keystore configured)",
-            ))?;
+            let keystore = self
+                .csr_keystore
+                .as_ref()
+                .ok_or(MachineError::NotSupported(
+                    "list_keys (no keystore configured)",
+                ))?;
             let tmp =
                 hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
             tmp.list_keys()

@@ -399,6 +399,9 @@ async fn main() {
         security_provider: security_provider.clone(),
         vm_service_addr: vm_service_addr.clone(),
         hsm_provider: hsm_provider.clone(),
+        // No crypto-only handle in the dev vm-sovd binary — keeps the
+        // `dyn HsmProvider` path for seal / unwrap / CSR.
+        hsm_crypto: None,
         hsm_keystore: Some(hsm_keystore_path.clone()),
         hsm_port,
         bank_activators,
