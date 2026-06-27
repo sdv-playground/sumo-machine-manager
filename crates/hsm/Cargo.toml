@@ -6,6 +6,9 @@ description = "HSM provider trait and Linux simulation backend"
 
 [dependencies]
 tracing = "0.1"
+# Subscriber for the `hsm-sim-service` bin (link-B sim backend). Workspace
+# convention (vhsm-ssd, vm-service, …): fmt + env-filter, default `info`.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -57,3 +60,10 @@ tempfile = "3"
 default = ["suit"]
 suit = ["dep:sumo-onboard", "dep:sumo-crypto", "dep:sumo-codec"]
 crypto = ["dep:p256", "dep:ecdsa", "dep:ed25519-dalek", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:hmac", "dep:rand", "dep:cmac", "dep:aes", "dep:x509-cert", "dep:const-oid"]
+
+# Serve a SimHsm as an out-of-process link-B crypto backend. Needs the `crypto`
+# feature for `SimHsm: HsmCryptoProvider` (serve_crypto's backend bound).
+[[bin]]
+name = "hsm-sim-service"
+path = "src/bin/hsm-sim-service.rs"
+required-features = ["crypto"]
