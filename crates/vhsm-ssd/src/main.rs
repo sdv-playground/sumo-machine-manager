@@ -12,6 +12,7 @@
 //!            [--listen <ip:port>]
 //!            [--backend-cmd <path>]
 //!            [--backend-socket <path>]
+//!            [--backend-connect-only]
 //!            [--cert-max-age <secs>]
 //!            [--persist-dir <dir>]
 //!            [--audit-log <path>]
@@ -139,6 +140,7 @@ fn main() {
     let mut ip_map: Vec<(IpAddr, String)> = Vec::new();
     let mut cross_node_listen: Option<SocketAddr> = None;
     let mut identity_root: Option<PathBuf> = None;
+    let mut backend_connect_only = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -158,6 +160,15 @@ fn main() {
                 // <keystore>/hsm-backend.sock).
                 backend_socket = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
+            }
+            "--backend-connect-only" => {
+                // Connect to a PRE-SPAWNED link-B backend instead of spawning
+                // one. The backend's lifecycle is owned externally (an
+                // orchestrator); vhsm-ssd connects, serves, and on signal exits
+                // WITHOUT killing it. Requires --backend-socket; --backend-cmd is
+                // ignored. Opt-in; the default remains spawn-and-reap.
+                backend_connect_only = true;
+                i += 1;
             }
             "--listen" if i + 1 < args.len() => {
                 listen_addr = Some(args[i + 1].parse().unwrap_or_else(|e| {
@@ -281,53 +292,92 @@ fn main() {
         listen_addr.unwrap_or_else(|| DEFAULT_LISTEN.parse().expect("DEFAULT_LISTEN parse"));
 
     // Crypto backend is an out-of-process link-B service (Stage 3 of the link-B
-    // HSM refactor). vhsm-ssd no longer owns an in-process SimHsm; it spawns the
-    // backend — `hsm-sim-service` in dev, a vendor HSM bridge in production — and
-    // talks to it through a LinkBClient over a Unix socket. vhsm-ssd is now a
-    // pure A→B proxy: it terminates the guest vHSM wire + IAM on side A and
-    // forwards every crypto op over link-B on side B.
-    let backend_cmd = match backend_cmd {
-        Some(p) => p,
-        None => backend::default_backend_cmd().unwrap_or_else(|e| {
-            eprintln!(
-                "error: cannot locate default link-B backend (hsm-sim-service beside vhsm-ssd): {e}"
-            );
+    // HSM refactor). vhsm-ssd no longer owns an in-process SimHsm; it reaches the
+    // backend — `hsm-sim-service` in dev, a vendor HSM bridge in production —
+    // through a LinkBClient over a Unix socket, serving as a pure A→B proxy: it
+    // terminates the guest vHSM wire + IAM on side A and forwards every crypto op
+    // over link-B on side B.
+    //
+    // Two backend-ownership modes:
+    //   * default (spawn): vhsm-ssd spawns the backend and a SIGTERM/SIGINT reaper
+    //     kills + reaps it before exit, so a clean stop doesn't orphan it.
+    //   * --backend-connect-only: the backend is pre-spawned and owned by an
+    //     external orchestrator; vhsm-ssd only connects, and on signal exits
+    //     cleanly WITHOUT touching the backend. --backend-socket is required;
+    //     --backend-cmd is ignored.
+    let crypto: Arc<dyn HsmCryptoProvider> = if backend_connect_only {
+        // Connect-only: attach to the pre-spawned backend's link-B socket.
+        let backend_socket = backend_socket.unwrap_or_else(|| {
+            eprintln!("error: --backend-socket is required with --backend-connect-only");
             std::process::exit(1);
-        }),
-    };
-    let backend_socket = backend_socket.unwrap_or_else(|| keystore_path.join("hsm-backend.sock"));
-
-    // The backend binds its socket and serves regardless of keystore state, so —
-    // as before — the daemon comes up even on an unprovisioned keystore: key ops
-    // fail naturally with KeyNotFound until provisioning lands, then the host
-    // restarts us (stop+start in component-mgr's HSM provision path) and the
-    // backend reloads the freshly-written keystore.
-    let (client, backend_child) =
-        match backend::spawn_and_connect(&backend_cmd, &keystore_path, &backend_socket) {
-            Ok(pair) => pair,
+        });
+        let client = match backend::connect_only(&backend_socket) {
+            Ok(c) => c,
             Err(e) => {
-                eprintln!("error: failed to start link-B HSM backend: {e}");
+                eprintln!("error: failed to connect to pre-spawned link-B HSM backend: {e}");
                 std::process::exit(1);
             }
         };
-    tracing::info!(
-        backend_cmd = %backend_cmd.display(),
-        socket = %backend_socket.display(),
-        "link-B HSM backend started — vhsm-ssd serving as an A→B proxy"
-    );
+        tracing::info!(
+            socket = %backend_socket.display(),
+            "link-B HSM backend connected (connect-only) — vhsm-ssd serving as an A→B proxy; \
+             backend lifecycle owned externally"
+        );
 
-    // Hand the backend child to a SIGTERM/SIGINT reaper that kills it before we
-    // exit, so a clean `systemctl stop` (SIGTERM) or an operator Ctrl-C (SIGINT)
-    // doesn't orphan the backend process. (A SIGKILL of vhsm-ssd still orphans
-    // it — uncatchable — but the backend removes its stale socket on the next
-    // start, so the following spawn_and_connect recovers cleanly.) The reaper
-    // OWNS the child and runs in its own thread; main keeps serving its accept
-    // loop. Installed HERE — after the backend is spawned, before any daemon
-    // worker thread — so the signal block propagates to every worker and only
-    // the reaper acts on the signal.
-    spawn_backend_reaper(backend_child);
+        // No child to reap — the orchestrator owns the backend. Install the
+        // child-less signal path so a clean stop (SIGTERM) / Ctrl-C (SIGINT) still
+        // exits vhsm-ssd cleanly WITHOUT killing the externally-owned backend.
+        // Installed HERE — before any worker thread — so the signal block
+        // propagates to every worker and only this thread acts on the signal.
+        spawn_signal_exit();
 
-    let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(client);
+        Arc::new(client)
+    } else {
+        // Default (spawn): own the backend's lifecycle.
+        let backend_cmd = match backend_cmd {
+            Some(p) => p,
+            None => backend::default_backend_cmd().unwrap_or_else(|e| {
+                eprintln!(
+                    "error: cannot locate default link-B backend (hsm-sim-service beside vhsm-ssd): {e}"
+                );
+                std::process::exit(1);
+            }),
+        };
+        let backend_socket =
+            backend_socket.unwrap_or_else(|| keystore_path.join("hsm-backend.sock"));
+
+        // The backend binds its socket and serves regardless of keystore state, so
+        // — as before — the daemon comes up even on an unprovisioned keystore: key
+        // ops fail naturally with KeyNotFound until provisioning lands, then the
+        // host restarts us (stop+start in component-mgr's HSM provision path) and
+        // the backend reloads the freshly-written keystore.
+        let (client, backend_child) =
+            match backend::spawn_and_connect(&backend_cmd, &keystore_path, &backend_socket) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("error: failed to start link-B HSM backend: {e}");
+                    std::process::exit(1);
+                }
+            };
+        tracing::info!(
+            backend_cmd = %backend_cmd.display(),
+            socket = %backend_socket.display(),
+            "link-B HSM backend started — vhsm-ssd serving as an A→B proxy"
+        );
+
+        // Hand the backend child to a SIGTERM/SIGINT reaper that kills it before
+        // we exit, so a clean `systemctl stop` (SIGTERM) or an operator Ctrl-C
+        // (SIGINT) doesn't orphan the backend process. (A SIGKILL of vhsm-ssd
+        // still orphans it — uncatchable — but the backend removes its stale
+        // socket on the next start, so the following spawn_and_connect recovers
+        // cleanly.) The reaper OWNS the child and runs in its own thread; main
+        // keeps serving its accept loop. Installed HERE — after the backend is
+        // spawned, before any daemon worker thread — so the signal block
+        // propagates to every worker and only the reaper acts on the signal.
+        spawn_backend_reaper(backend_child);
+
+        Arc::new(client)
+    };
 
     // Load IAM policy from the in-bank policy directory. Default-deny
     // if the file declares no statements — operator's intent. Refuse
@@ -625,50 +675,67 @@ fn main() {
     }
 }
 
-/// Install a SIGTERM/SIGINT reaper that OWNS the spawned link-B backend
-/// `child` and kills + reaps it before the daemon exits (see the call site in
-/// `main` for the rationale).
-///
-/// Mechanism — `libc`, the lightest in-tree option: block SIGTERM/SIGINT in the
-/// calling (main) thread so every later-spawned worker inherits the mask, then
-/// a dedicated thread `sigwait`s for one of them. `sigwait` returns OUTSIDE
-/// signal-handler context, so the reaper can safely run arbitrary code — kill +
-/// wait the child, then `exit(0)`. Must be called AFTER the backend is spawned
-/// (so the backend keeps the default signal disposition) and BEFORE the
-/// cross-node-listener / accept-loop worker threads are created.
+/// Build the SIGTERM/SIGINT signal set both signal paths reap on. A no-capture
+/// free fn so the main-thread mask install and each waiter-thread `sigwait` use a
+/// byte-identical set.
 #[cfg(unix)]
-fn spawn_backend_reaper(mut child: std::process::Child) {
-    // The signal set we reap on. A no-capture nested fn so the main-thread
-    // mask and the reaper-thread wait use a byte-identical set.
-    fn term_int_set() -> libc::sigset_t {
-        // SAFETY: a zeroed `sigset_t` is a valid (empty) set on Linux/QNX;
-        // sigemptyset + sigaddset then populate it via the libc contract.
-        unsafe {
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            libc::sigaddset(&mut set, libc::SIGTERM);
-            libc::sigaddset(&mut set, libc::SIGINT);
-            set
-        }
+fn term_int_set() -> libc::sigset_t {
+    // SAFETY: a zeroed `sigset_t` is a valid (empty) set on Linux/QNX;
+    // sigemptyset + sigaddset then populate it via the libc contract.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        set
     }
+}
 
+/// Block SIGTERM/SIGINT in the CURRENT (main) thread so every later-spawned
+/// worker inherits the mask — the signals then stay pending until a dedicated
+/// waiter thread `sigwait`s them. Shared by both signal paths
+/// ([`spawn_backend_reaper`] + [`spawn_signal_exit`]); must be called AFTER the
+/// backend is wired (so the backend keeps the default signal disposition) and
+/// BEFORE the cross-node-listener / accept-loop worker threads are created.
+#[cfg(unix)]
+fn block_term_int_in_main_thread() {
     let set = term_int_set();
-    // Block in the current thread; later-spawned threads inherit this mask, so
-    // SIGTERM/SIGINT stay pending until the reaper's `sigwait` dequeues them.
     // SAFETY: a standard POSIX sigmask call with a valid set pointer.
     unsafe {
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
+}
+
+/// Block the calling thread until SIGTERM/SIGINT arrives, returning the signal
+/// number. A nonzero `sigwait` return is an error (e.g. EINTR) — wait again
+/// rather than returning spuriously. `sigwait` returns OUTSIDE signal-handler
+/// context, so the caller can safely run arbitrary code afterward.
+#[cfg(unix)]
+fn wait_for_term_int() -> libc::c_int {
+    let set = term_int_set();
+    let mut sig: libc::c_int = 0;
+    // SAFETY: `set` and `sig` are valid, suitably-aligned locals.
+    while unsafe { libc::sigwait(&set, &mut sig) } != 0 {}
+    sig
+}
+
+/// Install a SIGTERM/SIGINT reaper that OWNS the spawned link-B backend `child`
+/// and kills + reaps it before the daemon exits (see the spawn-mode call site in
+/// `main` for the rationale). The connect-only counterpart is
+/// [`spawn_signal_exit`], which shares the same mask install + wait but skips the
+/// kill (the backend is externally owned there).
+///
+/// Mechanism — `libc`, the lightest in-tree option: [`block_term_int_in_main_thread`]
+/// blocks the signals so every later-spawned worker inherits the mask, then a
+/// dedicated thread [`wait_for_term_int`]s for one of them and reaps the child.
+#[cfg(unix)]
+fn spawn_backend_reaper(mut child: std::process::Child) {
+    block_term_int_in_main_thread();
 
     let spawned = std::thread::Builder::new()
         .name("vhsm-backend-reaper".to_string())
         .spawn(move || {
-            let set = term_int_set();
-            let mut sig: libc::c_int = 0;
-            // Blocks until SIGTERM/SIGINT arrives. A nonzero return is an error
-            // (e.g. EINTR) — wait again rather than reaping spuriously.
-            // SAFETY: `set` and `sig` are valid, suitably-aligned locals.
-            while unsafe { libc::sigwait(&set, &mut sig) } != 0 {}
+            let sig = wait_for_term_int();
             tracing::info!(
                 signal = sig,
                 "signal received — killing link-B backend before exit"
@@ -688,6 +755,37 @@ fn spawn_backend_reaper(mut child: std::process::Child) {
     }
 }
 
+/// Connect-only counterpart to [`spawn_backend_reaper`]: install a child-less
+/// SIGTERM/SIGINT path that exits the daemon cleanly WITHOUT touching the backend
+/// — used when the backend is pre-spawned and owned by an external orchestrator.
+///
+/// Identical mask install + wait as the reaper (shared via
+/// [`block_term_int_in_main_thread`] / [`wait_for_term_int`]); the ONLY difference
+/// is that the waiter thread just `exit(0)`s instead of killing a child. Must be
+/// called BEFORE any worker thread so the signal block propagates to every worker.
+#[cfg(unix)]
+fn spawn_signal_exit() {
+    block_term_int_in_main_thread();
+
+    let spawned = std::thread::Builder::new()
+        .name("vhsm-signal-exit".to_string())
+        .spawn(move || {
+            let sig = wait_for_term_int();
+            tracing::info!(
+                signal = sig,
+                "signal received — exiting (connect-only: externally-owned backend left running)"
+            );
+            std::process::exit(0);
+        });
+    if let Err(e) = spawned {
+        // Same rare failure mode as the reaper (thread-resource exhaustion): the
+        // signals stay blocked but unwaited, so vhsm-ssd won't exit on SIGTERM — an
+        // operator falls back to SIGKILL. The externally-owned backend is untouched
+        // either way.
+        tracing::error!(error = %e, "failed to spawn signal-exit thread; vhsm-ssd will not exit cleanly on signal");
+    }
+}
+
 /// Non-unix fallback: no POSIX signals, so just keep the backend child alive
 /// for the process lifetime (the pre-reaper behaviour). vhsm-ssd is effectively
 /// unix-only (link-B is an `AF_UNIX` socket), so this never compiles in
@@ -696,6 +794,12 @@ fn spawn_backend_reaper(mut child: std::process::Child) {
 fn spawn_backend_reaper(child: std::process::Child) {
     std::mem::forget(child);
 }
+
+/// Non-unix fallback for the connect-only signal path: no POSIX signals, nothing
+/// to install. Like [`spawn_backend_reaper`]'s non-unix form, exists only to keep
+/// `main` single-form (vhsm-ssd is effectively unix-only).
+#[cfg(not(unix))]
+fn spawn_signal_exit() {}
 
 /// Per-connection request loop. First runs the v3 handshake to bind a
 /// principal, then dispatches subsequent ops through `handler::handle_request`.
@@ -1081,6 +1185,12 @@ fn print_usage() {
     eprintln!(
         "  --backend-socket <path>     link-B Unix socket (default: <keystore>/hsm-backend.sock)"
     );
+    eprintln!("  --backend-connect-only      Connect to a PRE-SPAWNED backend instead of spawning");
+    eprintln!(
+        "                              one; its lifecycle is owned externally (vhsm-ssd does NOT"
+    );
+    eprintln!("                              reap it on exit). Requires --backend-socket; ignores");
+    eprintln!("                              --backend-cmd.");
     eprintln!();
     eprintln!("Cross-node mTLS (off unless --cross-node-listen is set):");
     eprintln!("  --cross-node-listen <ip:port>  Second bind for node-to-node access; the peer is");

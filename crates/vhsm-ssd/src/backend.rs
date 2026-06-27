@@ -13,6 +13,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::time::Duration;
 
 use hsm::link_b::{self, LinkBClient};
 
@@ -47,6 +48,49 @@ pub fn spawn_and_connect(
     socket: &Path,
 ) -> io::Result<(LinkBClient, Child)> {
     link_b::spawn_and_connect(backend_cmd, Some(keystore), socket)
+}
+
+/// Retry budget for the connect-only path. Mirrors the post-spawn budget baked
+/// into [`hsm::link_b::spawn_and_connect`] (~5 s = 50 × 100 ms) — those constants
+/// are private to that module, so they are restated here. A pre-spawned backend
+/// may still be binding its socket when vhsm-ssd starts, so the connect retries
+/// over the same budget rather than failing on the first refused connect.
+const CONNECT_ONLY_ATTEMPTS: u32 = 50;
+const CONNECT_ONLY_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Connect a [`LinkBClient`] to a PRE-SPAWNED link-B backend already listening on
+/// the Unix socket `socket`, retrying while it finishes binding.
+///
+/// This is the connect-only counterpart to [`spawn_and_connect`]: it neither
+/// spawns nor owns the backend process — an external orchestrator owns its
+/// lifecycle — so it returns just the client, with no `Child` to reap. It also
+/// does NOT touch the socket file (no stale-socket cleanup): the backend, not
+/// vhsm-ssd, owns that path. Used by vhsm-ssd's `--backend-connect-only` mode.
+///
+/// Retries the connect for the [`CONNECT_ONLY_ATTEMPTS`] budget; if the socket
+/// never accepts in time, returns the last connect error.
+pub fn connect_only(socket: &Path) -> io::Result<LinkBClient> {
+    let mut last_err: Option<io::Error> = None;
+    for attempt in 0..CONNECT_ONLY_ATTEMPTS {
+        match LinkBClient::connect(socket) {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                last_err = Some(e);
+                // Don't sleep after the final attempt — we're about to give up.
+                if attempt + 1 < CONNECT_ONLY_ATTEMPTS {
+                    std::thread::sleep(CONNECT_ONLY_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    let e = last_err.expect("CONNECT_ONLY_ATTEMPTS >= 1 so at least one connect was tried");
+    Err(io::Error::new(
+        e.kind(),
+        format!(
+            "pre-spawned link-B backend never accepted on {} after {CONNECT_ONLY_ATTEMPTS} attempts: {e}",
+            socket.display(),
+        ),
+    ))
 }
 
 #[cfg(test)]
