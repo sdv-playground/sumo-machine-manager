@@ -78,4 +78,11 @@
 #define ST_KEY_NOT_FOUND        14u
 #define ST_PROTOCOL_ERROR       15u /* malformed frame/payload */
 
+/* KeyType wire constants — KeyInfo.key_type (GET_KEY_INFO / LIST_KEYS). */
+#define KEYTYPE_EC_P256     1u
+#define KEYTYPE_ED25519     2u
+#define KEYTYPE_AES128      3u
+#define KEYTYPE_AES256      4u
+#define KEYTYPE_HMAC_SHA256 5u
+
 #endif /* HSM_LINK_B_H */

@@ -21,6 +21,8 @@ pub mod crypto;
 pub mod ivd;
 #[cfg(feature = "suit")]
 pub mod key_unwrap;
+/// Link-B bridge: `HsmCryptoProvider` over the out-of-process link-B service.
+pub mod link_b;
 
 #[cfg(feature = "suit")]
 pub use key_unwrap::HsmKeyUnwrap;

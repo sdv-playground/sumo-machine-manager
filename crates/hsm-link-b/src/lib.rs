@@ -68,6 +68,7 @@
 //! `KeyInfo` = `handle:u32, key_type:u32, has_certificate:u8, key_id:bytes(utf-8),
 //! allowed_guests:optlist, allowed_ops:optlist`, where
 //! `optlist = present:u8, [count:u32, item:bytes(utf-8) × count]` (present=0 ⇒ None).
+//! `key_type` is one of the `KEYTYPE_*` constants below.
 
 use std::io::{self, Read, Write};
 
@@ -124,6 +125,13 @@ pub const ST_CRYPTO_ERROR: u32 = 13;
 pub const ST_KEY_NOT_FOUND: u32 = 14;
 /// Malformed frame / payload didn't match the op's layout.
 pub const ST_PROTOCOL_ERROR: u32 = 15;
+
+// ── KeyType wire constants — `KeyInfo.key_type` (GET_KEY_INFO / LIST_KEYS) ─────
+pub const KEYTYPE_EC_P256: u32 = 1;
+pub const KEYTYPE_ED25519: u32 = 2;
+pub const KEYTYPE_AES128: u32 = 3;
+pub const KEYTYPE_AES256: u32 = 4;
+pub const KEYTYPE_HMAC_SHA256: u32 = 5;
 
 /// A decode error: the payload didn't match the op's expected layout.
 #[derive(Debug, PartialEq, Eq)]
@@ -214,8 +222,14 @@ impl<'a> Reader<'a> {
         Self { buf, pos: 0 }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8], ProtoError> {
-        let end = self.pos.checked_add(n).ok_or(ProtoError("length overflow"))?;
-        let s = self.buf.get(self.pos..end).ok_or(ProtoError("short payload"))?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(ProtoError("length overflow"))?;
+        let s = self
+            .buf
+            .get(self.pos..end)
+            .ok_or(ProtoError("short payload"))?;
         self.pos = end;
         Ok(s)
     }
@@ -250,7 +264,10 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, OP_SIGN, FLAGS_NONE, b"hello").unwrap();
         let (op, flags, payload) = read_frame(&mut &buf[..]).unwrap();
-        assert_eq!((op, flags, payload.as_slice()), (OP_SIGN, FLAGS_NONE, b"hello".as_slice()));
+        assert_eq!(
+            (op, flags, payload.as_slice()),
+            (OP_SIGN, FLAGS_NONE, b"hello".as_slice())
+        );
 
         let mut rbuf = Vec::new();
         write_frame(&mut rbuf, ST_OK, FLAGS_NONE, &[1]).unwrap();
@@ -281,7 +298,10 @@ mod tests {
     #[test]
     fn op_spaces_are_disjoint_crypto_below_provisioning() {
         assert!(OP_UNWRAP_CEK_ECDH_ES < 0x20, "crypto ops live below 0x20");
-        assert!(OP_IS_PROVISIONED >= 0x20, "provisioning ops live at/above 0x20");
+        assert!(
+            OP_IS_PROVISIONED >= 0x20,
+            "provisioning ops live at/above 0x20"
+        );
         assert_ne!(ST_OK, ST_NOT_SUPPORTED);
     }
 }

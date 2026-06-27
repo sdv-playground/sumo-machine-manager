@@ -19,6 +19,9 @@ vhsm-proto = { path = "../vhsm-proto" }
 # HsmError/KeyInfo/KeyType/KeyHandle types). hsm re-exports these and SimHsm
 # implements the trait.
 hsm-contract = { path = "../hsm-contract" }
+# Link-B wire contract (frame codec + OP_*/ST_*/KEYTYPE_* constants). The
+# `link_b` module bridges HsmCryptoProvider <-> the link-B service over it.
+hsm-link-b = { path = "../hsm-link-b" }
 
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
 sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
