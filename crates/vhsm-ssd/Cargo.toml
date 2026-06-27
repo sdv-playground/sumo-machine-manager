@@ -27,6 +27,11 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 ciborium = "0.2"
 coset = "0.3"
 sha2 = "0.10"
+# SIGTERM/SIGINT backend reaper (main.rs): block the signals, then `sigwait`
+# in a dedicated thread that owns the spawned link-B backend `Child` and
+# kills + reaps it before exit so a clean stop doesn't orphan it. Already in
+# the dependency tree transitively; named directly so main can call it.
+libc = "0.2"
 # Cross-node mTLS transport (tls.rs): HSM-backed server identity via hsm-rustls,
 # sync rustls (ring) to match the std::net accept loop.
 hsm-rustls = { path = "../hsm-rustls" }
@@ -46,6 +51,12 @@ tempfile = "3"
 x509-cert = { version = "0.2", features = ["std", "pem", "builder"] }
 const-oid = { version = "0.9", features = ["db"] }
 sha2 = { version = "0.10", features = ["oid"] }
+# Full-daemon e2e (tests/full_daemon_e2e.rs): drive the REAL vhsm-ssd binary
+# the way a guest does — the v3 CWT handshake (enroll → authenticate) plus
+# crypto ops — through the actual guest wire client. `guest-auth` pulls in the
+# HELLO/AUTH/ENROLL layer. (The dev-dependency cycle vhsm-ssd <-> vhsm-client
+# is permitted by Cargo since the normal dependency graph stays acyclic.)
+vhsm-client = { path = "../vhsm-client", features = ["guest-auth"] }
 
 [[bin]]
 name = "vhsm-ssd"

@@ -74,7 +74,9 @@ fn spawn_and_connect_drives_real_crypto_over_link_b() {
     // into the backend's SimHsm.
     let sig = client.sign(handle, msg).expect("sign over link-b");
     assert!(
-        client.verify(handle, msg, &sig).expect("verify over link-b"),
+        client
+            .verify(handle, msg, &sig)
+            .expect("verify over link-b"),
         "a genuine signature must verify"
     );
 
