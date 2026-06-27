@@ -111,7 +111,6 @@ machine-mgr    — Abstract trait layer connecting them all
 crates/component-mgr/src/
   backend.rs              — ComponentBackend: per-component state machine
   component_adapter.rs    — ComponentAdapter: exposes ComponentBackend via Component
-  diag_backend.rs         — ComponentDiagBackend: routes SOVD -> Component
   dispatcher.rs           — F.D3 SUIT-aware target resolver (peek_target_bank_set / check_target)
   suit_provider.rs        — SUIT envelope validation
   manifest_provider.rs    — ManifestProvider trait
@@ -119,7 +118,7 @@ crates/component-mgr/src/
   streaming.rs            — upload pipeline (decrypt + decompress + hash)
   did.rs                  — UDS DID resolution (F187-F19E + custom)
   sovd/security.rs        — SecurityProvider trait + TestSecurityProvider
-  sovd_main.rs            — vm-sovd binary entry point
+  main.rs                 — vm-diagserver binary entry point (SOVD/OTA server)
 
 crates/host-os-mgr/src/
   component.rs            — HostOsComponent (implements machine_mgr::Component)
@@ -139,7 +138,6 @@ crates/hsm/src/
   crypto.rs               — SimHsm HsmCryptoProvider (RustCrypto)
   sim.rs                  — SimHsm lifecycle (spawns vhsm-ssd + file keys)
   payload.rs              — HsmKeystore CBOR schema
-  qnx.rs                  — QnxHsm stub
 
 crates/vhsm-ssd/src/
   proto.rs + codec.rs     — wire format (v3, handle-based)
