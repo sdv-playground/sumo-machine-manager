@@ -28,9 +28,9 @@
 //! ENROLL flow consumes. The full path is therefore both viable and strictly
 //! more faithful, so it is used here.
 //!
-//! `hsm-sim-service` is a bin of the SIBLING `hsm` crate (not exposed via
+//! `hsm-sim-service` is a bin of the SIBLING `hsm-sim-backend` crate (not exposed via
 //! `CARGO_BIN_EXE_*`), so it must be built FIRST:
-//!     cargo build -p hsm --features crypto --bin hsm-sim-service
+//!     cargo build -p hsm-sim-backend --bin hsm-sim-service
 //! If it isn't found the tests SKIP (loudly) rather than fail spuriously —
 //! mirroring `backend_link_b.rs`.
 
@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use hsm::sim::SimHsm;
+use hsm_sim_backend::SimHsm;
 use hsm::{HsmCryptoProvider, KeyRole};
 
 use vhsm_client::auth::{authenticate, enroll, AuthConfig};
@@ -50,7 +50,7 @@ use vhsm_ssd::bootstrap::BootstrapState;
 use vhsm_ssd::proto::{ALG_ECC_P256, HANDLE_JWT_SIGNING, PERM_GET_PUBKEY, PERM_SIGN, PERM_VERIFY};
 
 /// Locate the `hsm-sim-service` binary built into `target/<profile>/` — a bin of
-/// the sibling `hsm` crate, so `env!("CARGO_BIN_EXE_…")` can't name it. Walk our
+/// the sibling `hsm-sim-backend` crate, so `env!("CARGO_BIN_EXE_…")` can't name it. Walk our
 /// own test-exe ancestors and return the first dir that holds it. (Same shape as
 /// `backend_link_b.rs::locate_hsm_sim_service`.)
 fn locate_hsm_sim_service() -> Option<PathBuf> {
@@ -73,7 +73,7 @@ fn locate_hsm_sim_service() -> Option<PathBuf> {
 ///   - `jwt-signing`: a guest-exposed EC slot the daemon registers in its handle
 ///     table (our well-known `get_pubkey` target).
 fn provision_keystore(dir: &Path) {
-    let hsm = SimHsm::new(PathBuf::from("unused"), dir.to_path_buf(), 0);
+    let hsm = SimHsm::new(dir.to_path_buf());
     hsm.generate_key(KeyRole::IamSigning.handle(), ALG_ECC_P256)
         .expect("generate iam-signing key");
     hsm.generate_key(KeyRole::JwtSigning.handle(), ALG_ECC_P256)
@@ -219,7 +219,7 @@ fn full_daemon_guest_handshake_and_real_crypto() {
     let Some(backend_bin) = locate_hsm_sim_service() else {
         eprintln!(
             "SKIP: hsm-sim-service not built — run \
-             `cargo build -p hsm --features crypto --bin hsm-sim-service` first"
+             `cargo build -p hsm-sim-backend --bin hsm-sim-service` first"
         );
         return;
     };
@@ -355,7 +355,7 @@ fn sigterm_reaper_kills_backend_no_orphan() {
     let Some(backend_bin) = locate_hsm_sim_service() else {
         eprintln!(
             "SKIP: hsm-sim-service not built — run \
-             `cargo build -p hsm --features crypto --bin hsm-sim-service` first"
+             `cargo build -p hsm-sim-backend --bin hsm-sim-service` first"
         );
         return;
     };

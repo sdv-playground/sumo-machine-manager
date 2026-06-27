@@ -41,6 +41,44 @@ use crate::{
     HsmCryptoProvider, HsmError, HsmProvider, KeyHandle, KeyInfo, KeyType, ProvisioningState,
 };
 
+// ── SPKI DER → COSE_Key trust-anchor converter ────────────────────────────────
+
+/// Convert a P-256 SubjectPublicKeyInfo DER public key into the COSE_Key (CBOR)
+/// trust-anchor encoding the Puller/Validator expects — byte-identical to what
+/// [`HsmProvider::get_public_key`](crate::HsmProvider::get_public_key) produces.
+/// The host (the sim/HSE backend) and the guest (`VhsmProvider`, which only
+/// yields SPKI via the wire `get_pubkey`) both go through `get_public_key_der` +
+/// this converter, so they feed the manifest validator identically.
+///
+/// A contract-level helper, used by [`LinkBClient::get_public_key`]; it is NOT
+/// tied to any one backend, which is why it lives here in the core `hsm` crate
+/// rather than in a (non-production) sim backend.
+#[cfg(feature = "crypto")]
+pub fn cose_key_es256_from_spki_der(spki_der: &[u8]) -> Result<Vec<u8>, HsmError> {
+    use coset::CborSerializable;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::pkcs8::DecodePublicKey;
+
+    let pk = p256::PublicKey::from_public_key_der(spki_der)
+        .map_err(|e| HsmError::CryptoError(format!("bad SPKI DER public key: {e}")))?;
+    let pt = pk.to_encoded_point(false);
+    let x = pt
+        .x()
+        .ok_or_else(|| HsmError::CryptoError("SPKI public key has no x coordinate".into()))?;
+    let y = pt
+        .y()
+        .ok_or_else(|| HsmError::CryptoError("SPKI public key has no y coordinate".into()))?;
+    let key = coset::CoseKeyBuilder::new_ec2_pub_key(
+        coset::iana::EllipticCurve::P_256,
+        x.to_vec(),
+        y.to_vec(),
+    )
+    .algorithm(coset::iana::Algorithm::ES256)
+    .build();
+    key.to_vec()
+        .map_err(|e| HsmError::CryptoError(format!("COSE_Key encode failed: {e}")))
+}
+
 // ── HsmError <-> status mapping ───────────────────────────────────────────────
 
 /// Map an [`HsmError`] to its link-B `ST_*` status code.
@@ -354,14 +392,14 @@ impl LinkBClient {
     /// `OP_GET_PUBLIC_KEY` — the public key for `role`, as the COSE_Key CBOR
     /// [`HsmProvider::get_public_key`] yields. The wire carries SubjectPublicKeyInfo
     /// DER (keyed by `role.handle()`); the SPKI→COSE_Key conversion happens here
-    /// via [`crate::cose_key_es256_from_spki_der`], so a backend never builds COSE.
+    /// via [`cose_key_es256_from_spki_der`], so a backend never builds COSE.
     #[cfg(feature = "crypto")]
     pub fn get_public_key(&self, role: crate::KeyRole) -> Result<Vec<u8>, HsmError> {
         let spki = self.call(
             OP_GET_PUBLIC_KEY,
             Writer::new().u32(role.handle().get()).finish(),
         )?;
-        crate::cose_key_es256_from_spki_der(&spki)
+        cose_key_es256_from_spki_der(&spki)
     }
 }
 
@@ -1111,262 +1149,6 @@ mod tests {
 
         // Drop the client → server's read hits EOF → serve_crypto returns.
         drop(client);
-        server.join().unwrap();
-    }
-
-    /// Provisioning-half round trip — mirror of `link_b_round_trips_every_crypto_op`
-    /// for the `0x20..=0x27` ops, but against a REAL `SimHsm` over a temp keystore
-    /// (served through the same combined [`serve`] loop `hsm-sim-service` runs),
-    /// not a mock. Drives a `LinkBClient` through is_provisioned → provision →
-    /// get_public_key → list_keys (+ provisioning_state and the enrolment trio).
-    ///
-    /// `provision` over the wire is exercised against a garbage envelope (it must
-    /// route to `HsmProvider::provision` and the error category must round-trip);
-    /// a *valid* factory provision needs a signed+encrypted SUIT envelope built
-    /// from `sumo-offboard`, which is not a dependency of this crate. The
-    /// provisioned state the read ops need is therefore established via the
-    /// suit-less `write_keystore` core that `provision` ultimately calls — the
-    /// same shortcut the sim's own provisioning tests use.
-    #[test]
-    #[cfg(feature = "crypto")]
-    fn link_b_round_trips_provisioning_ops_against_real_sim_hsm() {
-        use crate::payload::{
-            HsmKeystore, KeySlot, KEY_TYPE_AES_256, KEY_TYPE_EC_P256, SCHEMA_VERSION,
-        };
-        use crate::sim::SimHsm;
-        use crate::KeyRole;
-        use std::path::PathBuf;
-        use std::sync::Arc;
-
-        let dir = tempfile::tempdir().unwrap();
-        let keystore = dir.path().to_path_buf();
-        let sock = dir.path().join("hsm-sim-prov.sock");
-
-        // Shared Arc<Mutex<…>>: the serve thread drives wire ops; the test side
-        // provisions in-process. `serve` locks per op, so an idle peer never
-        // holds the lock the test needs.
-        let hsm = Arc::new(Mutex::new(SimHsm::new(PathBuf::from("unused"), keystore, 0)));
-
-        let listener = UnixListener::bind(&sock).unwrap();
-        let hsm_for_server = Arc::clone(&hsm);
-        let server = thread::spawn(move || {
-            let (stream, _addr) = listener.accept().unwrap();
-            serve(stream, &*hsm_for_server);
-        });
-
-        let client = LinkBClient::connect(&sock).unwrap();
-
-        // 1. Unprovisioned: the state ops report it; the inventory is empty.
-        assert!(!client.is_provisioned().unwrap());
-        assert_eq!(
-            client.provisioning_state().unwrap(),
-            ProvisioningState::Unprovisioned
-        );
-        assert!(client.list_keys().unwrap().is_empty());
-
-        // 2. provision routes to HsmProvider::provision — a garbage envelope is
-        //    rejected and the error category survives the wire round-trip.
-        let err = client.provision(b"not a suit envelope").unwrap_err();
-        assert!(
-            matches!(
-                err,
-                HsmError::EnvelopeInvalid(_)
-                    | HsmError::PayloadInvalid(_)
-                    | HsmError::DecryptionFailed(_)
-            ),
-            "garbage envelope must be rejected with a provisioning error, got {err:?}"
-        );
-        assert!(
-            !client.is_provisioned().unwrap(),
-            "a rejected provision must leave the keystore unprovisioned"
-        );
-
-        // Establish the real provisioned state (suit-less write_keystore core).
-        // A signing EC slot (has a public half → get_public_key) + the AES slot.
-        let ks = HsmKeystore {
-            schema_version: SCHEMA_VERSION,
-            security_version: 1,
-            identities: Vec::new(),
-            slots: vec![
-                KeySlot {
-                    key_id: KeyRole::JwtSigning.key_id().to_string(),
-                    key_kind: KEY_TYPE_EC_P256,
-                    anchor_public_key: None,
-                    allowed_guests: None,
-                    allowed_ops: None,
-                },
-                KeySlot {
-                    key_id: KeyRole::Storage.key_id().to_string(),
-                    key_kind: KEY_TYPE_AES_256,
-                    anchor_public_key: None,
-                    allowed_guests: None,
-                    allowed_ops: None,
-                },
-            ],
-            certificates: Vec::new(),
-            trust_anchors: Vec::new(),
-        };
-        hsm.lock().unwrap().write_keystore(&ks).unwrap();
-
-        // 3. Provisioned: the state ops flip over the wire.
-        assert!(client.is_provisioned().unwrap());
-        assert_eq!(
-            client.provisioning_state().unwrap(),
-            ProvisioningState::Provisioned
-        );
-
-        // 4. get_public_key over the wire == the backend's own COSE_Key. The wire
-        //    carries SPKI DER; the client rebuilds the COSE_Key. For a signing
-        //    role both encodings tag ES256, so the bytes match exactly.
-        let wire_cose = client.get_public_key(KeyRole::JwtSigning).unwrap();
-        let direct_cose = hsm.lock().unwrap().get_public_key(KeyRole::JwtSigning).unwrap();
-        assert_eq!(
-            wire_cose, direct_cose,
-            "wire-reconstructed COSE_Key must equal the backend's get_public_key"
-        );
-        assert!(!wire_cose.is_empty());
-
-        // 5. list_keys over the wire == the backend's inventory, field-by-field
-        //    (KeyInfo has no PartialEq).
-        let wire_keys = client.list_keys().unwrap();
-        let direct_keys = hsm.lock().unwrap().list_keys().unwrap();
-        assert_eq!(wire_keys.len(), 2);
-        assert_eq!(wire_keys.len(), direct_keys.len());
-        for (w, d) in wire_keys.iter().zip(direct_keys.iter()) {
-            assert_eq!(w.handle, d.handle);
-            assert_eq!(w.key_id, d.key_id);
-            assert_eq!(w.key_type, d.key_type);
-            assert_eq!(w.has_certificate, d.has_certificate);
-        }
-        assert!(wire_keys
-            .iter()
-            .any(|k| k.key_id == KeyRole::JwtSigning.key_id()));
-
-        // 6. Enrolment trio over the wire (bools both directions). arm puts vm9 in
-        //    `pending`, not `enrolled`, so is_enrolled is still false and
-        //    clear_enrolled finds nothing to remove.
-        client.arm_enrollment("vm9", Some(3600)).unwrap();
-        assert!(!client.is_enrolled("vm9").unwrap());
-        assert!(!client.clear_enrolled("vm9").unwrap());
-
-        drop(client);
-        server.join().unwrap();
-    }
-
-    /// [`LinkBProvider`] satisfies `dyn HsmProvider` and delegates each half to
-    /// the underlying [`LinkBClient`]: provisioning/keystore ops to the client's
-    /// inherent link-B methods, crypto-dup ops (`sign`/`verify`) to its
-    /// [`HsmCryptoProvider`], and lifecycle to no-ops. Driven against a REAL
-    /// `SimHsm` over the same combined [`serve`] loop `hsm-sim-service` runs —
-    /// the provider-level mirror of `link_b_round_trips_provisioning_ops_*`.
-    #[test]
-    #[cfg(feature = "crypto")]
-    fn link_b_provider_satisfies_hsm_provider_and_delegates() {
-        use crate::payload::{
-            HsmKeystore, KeySlot, KEY_TYPE_AES_256, KEY_TYPE_EC_P256, SCHEMA_VERSION,
-        };
-        use crate::sim::SimHsm;
-        use crate::KeyRole;
-        use std::path::PathBuf;
-        use std::sync::Arc;
-
-        let dir = tempfile::tempdir().unwrap();
-        let keystore = dir.path().to_path_buf();
-        let sock = dir.path().join("hsm-sim-provider.sock");
-
-        let hsm = Arc::new(Mutex::new(SimHsm::new(PathBuf::from("unused"), keystore, 0)));
-
-        let listener = UnixListener::bind(&sock).unwrap();
-        let hsm_for_server = Arc::clone(&hsm);
-        let server = thread::spawn(move || {
-            let (stream, _addr) = listener.accept().unwrap();
-            serve(stream, &*hsm_for_server);
-        });
-
-        let client = LinkBClient::connect(&sock).unwrap();
-        // The provider IS the host-side `dyn HsmProvider` view of the link-B
-        // client — coerce to the trait object to PROVE it satisfies the trait.
-        let mut provider: Box<dyn HsmProvider> = Box::new(LinkBProvider::new(Arc::new(client)));
-
-        // Unprovisioned: provisioning/keystore delegation reaches the real sim.
-        assert!(!provider.is_provisioned().unwrap());
-        assert_eq!(
-            provider.provisioning_state().unwrap(),
-            ProvisioningState::Unprovisioned
-        );
-        assert!(provider.list_keys().unwrap().is_empty());
-
-        // provision routes to HsmProvider::provision on the backend; a garbage
-        // envelope is rejected and the error category survives the wire.
-        let err = provider.provision(b"not a suit envelope").unwrap_err();
-        assert!(
-            matches!(
-                err,
-                HsmError::EnvelopeInvalid(_)
-                    | HsmError::PayloadInvalid(_)
-                    | HsmError::DecryptionFailed(_)
-            ),
-            "garbage envelope must be a provisioning error, got {err:?}"
-        );
-        assert!(!provider.is_provisioned().unwrap());
-
-        // Establish the provisioned state via the suit-less write_keystore core
-        // (same shortcut the S1 round-trip uses): a signing EC slot + the AES
-        // storage slot.
-        let ks = HsmKeystore {
-            schema_version: SCHEMA_VERSION,
-            security_version: 1,
-            identities: Vec::new(),
-            slots: vec![
-                KeySlot {
-                    key_id: KeyRole::JwtSigning.key_id().to_string(),
-                    key_kind: KEY_TYPE_EC_P256,
-                    anchor_public_key: None,
-                    allowed_guests: None,
-                    allowed_ops: None,
-                },
-                KeySlot {
-                    key_id: KeyRole::Storage.key_id().to_string(),
-                    key_kind: KEY_TYPE_AES_256,
-                    anchor_public_key: None,
-                    allowed_guests: None,
-                    allowed_ops: None,
-                },
-            ],
-            certificates: Vec::new(),
-            trust_anchors: Vec::new(),
-        };
-        hsm.lock().unwrap().write_keystore(&ks).unwrap();
-
-        // Provisioned: state flips through the provider; get_public_key delegates
-        // (the wire-reconstructed COSE_Key equals the backend's own).
-        assert!(provider.is_provisioned().unwrap());
-        assert_eq!(
-            provider.provisioning_state().unwrap(),
-            ProvisioningState::Provisioned
-        );
-        let provider_cose = provider.get_public_key(KeyRole::JwtSigning).unwrap();
-        let direct_cose = hsm
-            .lock()
-            .unwrap()
-            .get_public_key(KeyRole::JwtSigning)
-            .unwrap();
-        assert_eq!(provider_cose, direct_cose);
-        assert!(!provider_cose.is_empty());
-
-        // list_keys delegates: the two slots are present.
-        assert_eq!(provider.list_keys().unwrap().len(), 2);
-
-        // Enrolment trio over the provider (bools both directions). arm puts vm7
-        // in `pending`, not `enrolled`, so is_enrolled stays false and
-        // clear_enrolled finds nothing to remove.
-        provider.arm_enrollment("vm7", Some(1800)).unwrap();
-        assert!(!provider.is_enrolled("vm7").unwrap());
-        assert!(!provider.clear_enrolled("vm7").unwrap());
-
-        // Drop the provider → its sole Arc<LinkBClient> drops → stream EOF →
-        // serve returns.
-        drop(provider);
         server.join().unwrap();
     }
 

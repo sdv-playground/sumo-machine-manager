@@ -425,8 +425,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
 
             if bank_set == BankSet::Hsm {
                 if let Some(ref keystore) = deps.hsm_keystore {
-                    component_inner =
-                        component_inner.with_csr_keystore(keystore.clone(), deps.hsm_port);
+                    component_inner = component_inner.with_csr_keystore(keystore.clone());
                 }
                 // Prefer the crypto-only link-B handle for CSR / list-keys /
                 // device-id when configured; `with_csr_crypto` wins over the

@@ -150,14 +150,13 @@ pub fn serve_crossnode_connection<S: Read + Write>(
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, TcpListener, TcpStream};
-    use std::path::PathBuf;
     use std::str::FromStr;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
     use const_oid::db::rfc5280::{ID_KP_CLIENT_AUTH, ID_KP_SERVER_AUTH};
-    use hsm::sim::SimHsm;
+    use hsm_sim_backend::SimHsm;
     use hsm::{HsmCryptoProvider, KeyRole};
     use p256::ecdsa::{DerSignature, SigningKey};
     use rand::rngs::OsRng;
@@ -261,7 +260,7 @@ mod tests {
         // --- Server node ("node-b"): HSM holds the TLS identity key AND the EC
         // signer that handle sw-authority points at.
         let server_dir = tempfile::tempdir().unwrap();
-        let server_hsm = SimHsm::new(PathBuf::from("unused"), server_dir.path().to_path_buf(), 0);
+        let server_hsm = SimHsm::new(server_dir.path().to_path_buf());
         let tls_kid = KeyRole::TlsIdentity.handle();
         let server_spki = server_hsm.generate_key(tls_kid, ALG_ECC_P256).unwrap();
         // The signer behind handle sw-authority. The well-known handle resolves
@@ -329,7 +328,7 @@ mod tests {
 
         // --- Client node ("node-a" / client_cn): HSM-backed client identity.
         let client_dir = tempfile::tempdir().unwrap();
-        let client_hsm = SimHsm::new(PathBuf::from("unused"), client_dir.path().to_path_buf(), 0);
+        let client_hsm = SimHsm::new(client_dir.path().to_path_buf());
         let client_kid = KeyRole::TlsIdentity.handle();
         let client_spki = client_hsm.generate_key(client_kid, ALG_ECC_P256).unwrap();
         let client_leaf = issue_leaf(

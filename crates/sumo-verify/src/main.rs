@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use hsm::ivd::{self, VerifyPins};
-use hsm::sim::SimHsm;
+use hsm_sim_backend::SimHsm;
 
 const EXIT_OK: u8 = 0;
 const EXIT_VERIFY_FAIL: u8 = 1;
@@ -168,10 +168,9 @@ fn parse_args(argv: Vec<String>) -> Result<Args, ExitCode> {
     })
 }
 
-/// Construct a SimHsm pointing at `keystore` without spawning any
-/// child process. We only need the synchronous `sign`/`verify`/`get_*`
-/// methods of `HsmProvider`, which read directly from the on-disk
-/// keystore — no daemon required.
+/// Construct a SimHsm pointing at `keystore`. We only need the synchronous
+/// `sign`/`verify`/`get_*` crypto methods, which read directly from the on-disk
+/// keystore — no daemon, no service lifecycle.
 fn open_keystore(keystore: &Path) -> Result<SimHsm, String> {
     if !keystore.exists() {
         return Err(format!(
@@ -179,14 +178,7 @@ fn open_keystore(keystore: &Path) -> Result<SimHsm, String> {
             keystore.display(),
         ));
     }
-    // The `service_bin` path argument is only used to launch
-    // vhsm-test-ssd when `start_service` is called. sumo-verify never
-    // calls start_service, so a placeholder path is fine.
-    Ok(SimHsm::new(
-        PathBuf::from("/dev/null"),
-        keystore.to_path_buf(),
-        0,
-    ))
+    Ok(SimHsm::new(keystore.to_path_buf()))
 }
 
 fn run() -> ExitCode {

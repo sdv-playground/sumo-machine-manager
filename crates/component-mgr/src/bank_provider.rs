@@ -817,13 +817,13 @@ mod tests {
 
     /// Provision a `SimHsm`, sign `gen` into `bank_dir`, and return the HSM +
     /// keystore path (to clean up). Mirrors hsm's own `provisioned_sim`.
-    fn sign_bank_dir(name: &str, bank_dir: &Path, gen: u64) -> (hsm::sim::SimHsm, PathBuf) {
+    fn sign_bank_dir(name: &str, bank_dir: &Path, gen: u64) -> (hsm_sim_backend::SimHsm, PathBuf) {
         use hsm::payload::*;
         let keystore = std::env::temp_dir().join(format!("component-mgr-readinstalled-ks-{name}"));
         let _ = std::fs::remove_dir_all(&keystore);
         std::fs::create_dir_all(&keystore).unwrap();
 
-        let hsm = hsm::sim::SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 5300);
+        let hsm = hsm_sim_backend::SimHsm::new(keystore.clone());
         let ks = HsmKeystore {
             schema_version: SCHEMA_VERSION,
             security_version: 1,

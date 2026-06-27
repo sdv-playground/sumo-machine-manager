@@ -1,0 +1,55 @@
+[package]
+name = "hsm-sim-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Non-production software HSM backend (SimHsm): file keystore + RustCrypto, served over link-B by the hsm-sim-service bin. A dev/test/CI reference backend, NOT for production."
+
+[dependencies]
+tracing = "0.1"
+# Subscriber for the `hsm-sim-service` bin (link-B sim backend). Workspace
+# convention (vhsm-ssd, vm-service, …): fmt + env-filter, default `info`.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+coset = { version = "0.3", default-features = false }
+# bootstrap.yaml read-modify-write for arm/clear-enrollment.
+serde_yaml = "0.9"
+# Slot registry (handle ↔ key_id ↔ alg ↔ perms): SimHsm maps key_id ↔ handle.
+vhsm-proto = { path = "../../../crates/vhsm-proto" }
+# The HSM contract this backend implements: HsmProvider / HsmCryptoProvider
+# traits + the shared types + KeyRole + the keystore `payload` schema + the
+# `link_b::serve` harness the bin uses. `crypto` matches the other link-B
+# consumers (vhsm-ssd, hsm-conformance) so the workspace builds one feature set.
+hsm = { path = "../../../crates/hsm", features = ["crypto"] }
+
+# SUIT envelope decrypt/decompress for SimHsm::provision (suit feature).
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
+sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
+
+# RustCrypto — the software crypto SimHsm performs (crypto feature).
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem", "std"], optional = true }
+ecdsa = { version = "0.16", features = ["signing", "verifying", "der"], optional = true }
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"], optional = true }
+aes-gcm = { version = "0.10", optional = true }
+hkdf = { version = "0.12", optional = true }
+sha2 = { version = "0.10", features = ["asm", "oid"], optional = true }
+hmac = { version = "0.12", optional = true }
+rand = { version = "0.8", optional = true }
+cmac = { version = "0.7", optional = true }
+aes = { version = "0.8", optional = true }
+x509-cert = { version = "0.2", features = ["std", "pem", "builder"], optional = true }
+const-oid = { version = "0.9", features = ["db"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["crypto", "suit"]
+suit = ["dep:sumo-onboard", "dep:sumo-crypto", "dep:sumo-codec"]
+crypto = ["dep:p256", "dep:ecdsa", "dep:ed25519-dalek", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:hmac", "dep:rand", "dep:cmac", "dep:aes", "dep:x509-cert", "dep:const-oid"]
+
+# Serve a SimHsm as an out-of-process link-B crypto backend. Needs the `crypto`
+# feature for `SimHsm: HsmCryptoProvider` (link_b::serve's backend bound).
+[[bin]]
+name = "hsm-sim-service"
+path = "src/bin/hsm-sim-service.rs"
+required-features = ["crypto"]

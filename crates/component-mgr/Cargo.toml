@@ -32,6 +32,9 @@ sumo-processor = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = 
 sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
 sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
 hsm = { path = "../hsm", features = ["crypto"] }
+# The dev/test SimHsm CSR/IVD fallback in component_adapter.rs + factory-init's
+# `--hsm-keystore` bring-up (main.rs). Production reaches the HSM over link-B.
+hsm-sim-backend = { path = "../../tools/crates/hsm-sim-backend" }
 host-os-mgr = { path = "../host-os-mgr" }
 app-mgr = { path = "../app-mgr" }
 # Content-addressed fleet-repo pull (onboard/fleet PULL payload fetch).

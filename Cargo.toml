@@ -37,6 +37,9 @@ members = [
     # (Candidate siblings to move here next, pending review: ca-bundle-build,
     # policy-build, sumo-verify, sumo-factory-reset-mint.)
     "tools/crates/hsm-conformance",
+    # Non-production SimHsm backend + the `hsm-sim-service` link-B bin (was the
+    # sim half of the `hsm` crate; S7b relocated it here).
+    "tools/crates/hsm-sim-backend",
 ]
 
 [profile.release]

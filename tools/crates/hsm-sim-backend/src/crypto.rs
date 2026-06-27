@@ -14,7 +14,7 @@
 /// named deterministically by their handle, so `generate_key` and every later
 /// op agree on the filename with no shared state.
 use crate::sim::{decode_pem, extract_ec_scalar_from_pem, SimHsm};
-use crate::{HsmCryptoProvider, HsmError, HsmProvider, KeyHandle, KeyInfo, KeyType};
+use hsm::{HsmCryptoProvider, HsmError, HsmProvider, KeyHandle, KeyInfo, KeyType};
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
@@ -49,37 +49,6 @@ pub(crate) fn key_id_for_handle(handle: KeyHandle) -> Result<String, HsmError> {
             "no slot for handle {handle}"
         )))
     }
-}
-
-/// Convert a P-256 SubjectPublicKeyInfo DER public key into the COSE_Key (CBOR)
-/// trust-anchor encoding the Puller/Validator expects — byte-identical to what
-/// [`HsmProvider::get_public_key(KeyRole::SoftwareAuthority)`](crate::HsmProvider::get_public_key)
-/// produces. The host (`SimHsm`) and the guest (`VhsmProvider`, which only
-/// yields SPKI via the wire `get_pubkey`) both go through `get_public_key_der`
-/// + this converter, so they feed the manifest validator identically.
-pub fn cose_key_es256_from_spki_der(spki_der: &[u8]) -> Result<Vec<u8>, HsmError> {
-    use coset::CborSerializable;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
-    use p256::pkcs8::DecodePublicKey;
-
-    let pk = p256::PublicKey::from_public_key_der(spki_der)
-        .map_err(|e| HsmError::CryptoError(format!("bad SPKI DER public key: {e}")))?;
-    let pt = pk.to_encoded_point(false);
-    let x = pt
-        .x()
-        .ok_or_else(|| HsmError::CryptoError("SPKI public key has no x coordinate".into()))?;
-    let y = pt
-        .y()
-        .ok_or_else(|| HsmError::CryptoError("SPKI public key has no y coordinate".into()))?;
-    let key = coset::CoseKeyBuilder::new_ec2_pub_key(
-        coset::iana::EllipticCurve::P_256,
-        x.to_vec(),
-        y.to_vec(),
-    )
-    .algorithm(coset::iana::Algorithm::ES256)
-    .build();
-    key.to_vec()
-        .map_err(|e| HsmError::CryptoError(format!("COSE_Key encode failed: {e}")))
 }
 
 impl HsmCryptoProvider for SimHsm {
@@ -705,7 +674,7 @@ fn load_ed25519_verifying_key(
 mod tests {
     use super::*;
     use crate::sim::SimHsm;
-    use crate::{HsmCryptoProvider, KeyHandle};
+    use hsm::{HsmCryptoProvider, KeyHandle};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -722,7 +691,7 @@ mod tests {
     fn new_hsm() -> (SimHsm, TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let keystore = PathBuf::from(tmp.path());
-        let hsm = SimHsm::new(PathBuf::from("unused"), keystore, 0);
+        let hsm = SimHsm::new(keystore);
         (hsm, tmp)
     }
 
@@ -785,7 +754,7 @@ mod tests {
     fn generate_csr_produces_a_ca_consumable_pkcs10() {
         let (hsm, _tmp) = new_hsm();
         // A well-known slot: resolves to its registry key_id ("tls-identity").
-        let kid = crate::KeyRole::TlsIdentity.handle();
+        let kid = hsm::KeyRole::TlsIdentity.handle();
         hsm.generate_key(kid, ALG_ECC_P256).unwrap();
         let csr_der = hsm.generate_csr(kid, "node-7").unwrap();
 

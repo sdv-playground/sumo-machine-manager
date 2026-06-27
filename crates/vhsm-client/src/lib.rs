@@ -421,10 +421,9 @@ fn read_len_prefixed(buf: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-    use std::path::PathBuf;
     use std::thread;
 
-    use hsm::sim::SimHsm;
+    use hsm_sim_backend::SimHsm;
     use hsm::HsmCryptoProvider;
     use vhsm_proto::codec::{read_request, write_response};
     use vhsm_proto::{ALG_ECC_P256, PERM_GET_PUBKEY, PERM_SIGN, PERM_VERIFY};
@@ -445,7 +444,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
             let tmp = tempfile::tempdir().unwrap();
-            let hsm = SimHsm::new(PathBuf::from("unused"), tmp.path().to_path_buf(), 0);
+            let hsm = SimHsm::new(tmp.path().to_path_buf());
             HsmCryptoProvider::generate_key(&hsm, hsm::KeyHandle(TEST_HANDLE), ALG_ECC_P256)
                 .unwrap();
 

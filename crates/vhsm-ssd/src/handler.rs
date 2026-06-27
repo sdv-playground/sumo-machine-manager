@@ -557,7 +557,7 @@ fn handle_get_cert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hsm::sim::SimHsm;
+    use hsm_sim_backend::SimHsm;
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
 
@@ -566,7 +566,7 @@ mod tests {
         let keystore = PathBuf::from(tmp.path());
         // Matches SimHsm's internal keys_dir() — keystore_path/keys.
         let keys_dir = keystore.join("keys");
-        let hsm = SimHsm::new(PathBuf::from("unused"), keystore, 0);
+        let hsm = SimHsm::new(keystore);
         (hsm, keys_dir, tmp)
     }
 

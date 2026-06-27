@@ -1,7 +1,8 @@
 /// Simulation HSM provider (portable: Linux + QNX).
 ///
-/// Wraps `vhsm-ssd` / `vhsm-test-ssd` (file-based keystore + TCP service)
-/// for dev/test and QNX hypervisor host deployments.
+/// A file-based keystore + RustCrypto implementation of the HSM contract,
+/// for dev/test and QNX hypervisor host deployments. Served over link-B by
+/// the `hsm-sim-service` bin; it owns no service lifecycle of its own.
 ///
 /// # Provisioning
 ///
@@ -27,14 +28,10 @@
 ///     {key_id}.bin       — AES-256 raw key (32 bytes)
 /// ```
 use std::io::Write;
-use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 
-use crate::payload::{self, HsmKeystore, KeySlot, KEY_TYPE_AES_256, KEY_TYPE_EC_P256};
-use crate::{
-    HsmError, HsmProvider, HsmStatus, KeyHandle, KeyInfo, KeyRole, KeyType, ProvisioningState,
-};
+use hsm::payload::{self, HsmKeystore, KeySlot, KEY_TYPE_AES_256, KEY_TYPE_EC_P256};
+use hsm::{HsmError, HsmProvider, KeyHandle, KeyInfo, KeyRole, KeyType, ProvisioningState};
 
 /// Software HSM for **dev / test / CI — NOT for production**.
 ///
@@ -43,142 +40,20 @@ use crate::{
 /// not a privileged one: production runs a real HSE (a vendor C link-B service
 /// implementing `hsm-link-b`). It is served over link-B by the `hsm-sim-service`
 /// bin; verify any backend with the `hsm-conformance` suite.
+///
+/// It is purely a keystore + crypto over `keystore_path` — it owns no service
+/// lifecycle. The link-B service (`hsm-sim-service`) and the host's daemon
+/// supervision (supernova) live outside it.
 pub struct SimHsm {
-    /// Path to `vhsm-test-ssd` binary.
-    daemon_bin: PathBuf,
     /// Keystore directory (e.g. /tmp/vhsm-keys).
     keystore_path: PathBuf,
-    /// TCP listen address. Defaults to `127.0.0.1` for tests/dev; in
-    /// production on the CVC host this is the host-side IP of one of
-    /// the vp* vdevpeers (e.g. `10.0.200.1` for VM2), or `0.0.0.0` when
-    /// the daemon serves multiple guests on different /30 subnets and
-    /// `allow_list` enumerates them all.
-    ///
-    /// NOTE: this whole identity scheme is temporary — virtio-vsock on
-    /// QNX 8 will replace TCP-on-private-bridge with CID-based identity,
-    /// at which point `bind_ip` and `allow_list` both go away.
-    bind_ip: IpAddr,
-    /// Per-guest allow-list: each `(source-IP, vm-id)` becomes one
-    /// `--allow-ip` arg to vhsm-test-ssd. When empty, falls back to the
-    /// `bind_ip+1` heuristic (the historical single-VM behaviour).
-    allow_list: Vec<(IpAddr, String)>,
-    /// TCP port the daemon listens on.
-    tcp_port: u16,
-    /// Optional path for the per-op audit log. When Some, the
-    /// spawned daemon receives `--audit-log <path>` and emits one
-    /// fsync'd JSON line per dispatched op there. When None, audit
-    /// logging is off (dev rigs / loopback tests).
-    audit_log: Option<PathBuf>,
-    /// Policy directory passed to vhsm-ssd via `--policy-dir`.  Must
-    /// contain `policy.yaml` (+ optional `roots/`, `crl.yaml`,
-    /// `launcher-policy.yaml`).  Set via [`Self::with_policy_dir`]
-    /// before [`start_service`]; required — `start_service` errors
-    /// out when None.  The legacy `--iam-policy` single-file path +
-    /// synthetic wildcard generator was retired once the in-bank
-    /// policy partition proved out on managed-cvc (AUTH-ARCH-001 §4).
-    policy_dir: Option<PathBuf>,
-    /// Optional second bind for node-to-node ("cross-node") mTLS access.
-    /// When `Some`, the spawned daemon gets `--cross-node-listen <addr>` — a
-    /// SECOND bind, distinct from the guest TCP listener — and serves peer
-    /// nodes over mTLS (identity = the peer's client cert), verifying them
-    /// against the identity root the daemon defaults to inside `--policy-dir`
-    /// (`roots/device-identity-root.pem`). Off by default. Set via
-    /// [`Self::with_cross_node_listen`]. This configures the vHSM *service*,
-    /// so it is backend-agnostic — the real NXP HSE path sets it the same way.
-    cross_node_listen: Option<SocketAddr>,
-    /// Running daemon process handle.
-    child: Option<Child>,
 }
 
 impl SimHsm {
-    /// Construct with the default `127.0.0.1` bind — suitable for
-    /// tests and dev workstations where the daemon and clients all
-    /// run in the same network namespace.
-    pub fn new(daemon_bin: PathBuf, keystore_path: PathBuf, tcp_port: u16) -> Self {
-        Self::with_bind(
-            daemon_bin,
-            keystore_path,
-            "127.0.0.1".parse().expect("loopback parse"),
-            tcp_port,
-        )
-    }
-
-    /// Construct with an explicit bind IP — used by supernova in
-    /// production to bind to the host-side vp2 endpoint (e.g.
-    /// `10.0.200.1`). Single-guest path: peer is derived as `bind_ip+1`
-    /// (the /30 convention).
-    pub fn with_bind(
-        daemon_bin: PathBuf,
-        keystore_path: PathBuf,
-        bind_ip: IpAddr,
-        tcp_port: u16,
-    ) -> Self {
-        Self::with_allow_list(daemon_bin, keystore_path, bind_ip, tcp_port, Vec::new())
-    }
-
-    /// Multi-guest constructor. `allow_list` enumerates `(source-IP,
-    /// vm-id)` pairs; when non-empty, `bind_ip` becomes the listen IP
-    /// (typically `0.0.0.0` so both /30 bridges can reach it) and the
-    /// `bind_ip+1` heuristic is bypassed. Each entry generates one
-    /// `--allow-ip` arg to `vhsm-test-ssd`.
-    ///
-    /// vsock note: when QNX 8's virtio-vsock lands on the host, this
-    /// IP-based allow-list goes away — vsock's CID is the identity.
-    /// `Vec<(IpAddr, String)>` becomes `Vec<(VsockCid, String)>` and
-    /// the bind/listen split collapses to a single CID port.
-    pub fn with_allow_list(
-        daemon_bin: PathBuf,
-        keystore_path: PathBuf,
-        bind_ip: IpAddr,
-        tcp_port: u16,
-        allow_list: Vec<(IpAddr, String)>,
-    ) -> Self {
-        Self {
-            daemon_bin,
-            keystore_path,
-            bind_ip,
-            allow_list,
-            tcp_port,
-            audit_log: None,
-            policy_dir: None,
-            cross_node_listen: None,
-            child: None,
-        }
-    }
-
-    /// Builder-style: set the policy directory the spawned vhsm-ssd
-    /// should consult (`--policy-dir`). Required before `start_service`;
-    /// `start_service` returns an error if this isn't set. The dir must
-    /// contain at minimum a `policy.yaml`; production deployments
-    /// ship it via OTA (managed-cvc: `/etc/sumo/policy/` from the
-    /// per-VM ca-bundle-adjacent policy partition).
-    pub fn with_policy_dir(mut self, path: impl Into<PathBuf>) -> Self {
-        self.policy_dir = Some(path.into());
-        self
-    }
-
-    /// Builder-style: enable per-op audit logging at the given path.
-    /// Spawned daemon receives `--audit-log <path>`; defaults
-    /// (64 MiB cap × 4 rotated copies) apply unless the deployer
-    /// also overrides via direct CLI args to vhsm-ssd.
-    ///
-    /// Call before `start_service()`. Has no effect on a running
-    /// daemon — kill + relaunch to change.
-    pub fn with_audit_log(mut self, path: impl Into<PathBuf>) -> Self {
-        self.audit_log = Some(path.into());
-        self
-    }
-
-    /// Builder-style: enable the node-to-node ("cross-node") mTLS listener at
-    /// `addr`. The spawned daemon receives `--cross-node-listen <addr>` — a
-    /// SECOND bind, distinct from the guest TCP listener — and verifies a peer
-    /// node's client cert against the identity root the daemon defaults to
-    /// inside `--policy-dir` (`roots/device-identity-root.pem`). Off unless
-    /// set; call before `start_service()`. Backend-agnostic: the same wiring
-    /// applies when the real NXP HSE backend replaces this sim impl.
-    pub fn with_cross_node_listen(mut self, addr: SocketAddr) -> Self {
-        self.cross_node_listen = Some(addr);
-        self
+    /// Construct a SimHsm over `keystore_path`. No daemon, no port — crypto and
+    /// keystore ops read/write the directory directly.
+    pub fn new(keystore_path: PathBuf) -> Self {
+        Self { keystore_path }
     }
 
     /// Factory signing public key as COSE_Key CBOR — the built-in provisioning authority.
@@ -338,7 +213,7 @@ impl SimHsm {
     /// checked each names an EC-P256 slot in this keystore.
     fn write_leaf_certs(
         &self,
-        certs: &[crate::payload::LeafCert],
+        certs: &[hsm::payload::LeafCert],
         keys_dir: &Path,
     ) -> Result<(), HsmError> {
         for c in certs {
@@ -356,7 +231,7 @@ impl SimHsm {
     /// checked each is a DER X.509 cert.
     fn write_trust_anchors(
         &self,
-        anchors: &[crate::payload::TrustAnchorCert],
+        anchors: &[hsm::payload::TrustAnchorCert],
         keys_dir: &Path,
     ) -> Result<(), HsmError> {
         if anchors.is_empty() {
@@ -629,87 +504,6 @@ impl SimHsm {
         }
         keys.sort_by(|a, b| a.key_id.cmp(&b.key_id));
         Ok(keys)
-    }
-
-    /// Check if the daemon process is still alive.
-    fn is_running(&mut self) -> bool {
-        let Some(child) = self.child.as_mut() else {
-            return false;
-        };
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                self.child = None;
-                false
-            }
-            Ok(None) => true,
-            Err(_) => false,
-        }
-    }
-
-    /// Best-effort cleanup of any stale `vhsm-test-ssd` process still
-    /// holding our intended listen port. Run before spawning the real
-    /// daemon to recover from a previous supernova lifetime that was
-    /// `slay`'d (SIGKILL bypasses Rust's Drop, leaving the child
-    /// reparented to init and still bound).
-    ///
-    /// Cross-platform: tries `pkill` (Linux/glibc) then `slay` (QNX
-    /// native). Both are no-ops when no matching process exists. If
-    /// neither tool is available the subsequent `spawn()`'s bind will
-    /// fail loudly — a better outcome than silent staleness.
-    fn kill_stale_daemon_if_port_busy(&self, listen: &str) {
-        use std::process::Stdio;
-
-        // Probe: can we bind ourselves? If yes, no orphan, nothing to do.
-        match std::net::TcpListener::bind(listen) {
-            Ok(l) => {
-                drop(l);
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    addr = listen, error = %e,
-                    "listen port busy — assuming stale vhsm-test-ssd orphan"
-                );
-            }
-        }
-
-        // Match on the daemon's basename. pkill -f / slay -f match
-        // anywhere in argv0; we don't want to whack random processes,
-        // so use the executable basename which should be uniquely
-        // ours.
-        let bin_name = self
-            .daemon_bin
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("vhsm-test-ssd");
-
-        let attempts: &[(&str, &[&str])] = &[
-            ("pkill", &["-TERM", "-x", bin_name]),
-            ("slay", &["-T1", bin_name]),
-            // Final fallback if the running daemon ignored SIGTERM.
-            ("pkill", &["-KILL", "-x", bin_name]),
-            ("slay", &["-9", bin_name]),
-        ];
-        for (cmd, args) in attempts {
-            let _ = Command::new(cmd)
-                .args(*args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            // Poll up to ~500ms for the port to free up.
-            for _ in 0..5 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if std::net::TcpListener::bind(listen).is_ok() {
-                    tracing::info!(via = %cmd, "stale vhsm-test-ssd killed; port free");
-                    return;
-                }
-            }
-        }
-        tracing::warn!(
-            addr = listen,
-            "could not reclaim listen port — spawn will likely fail"
-        );
     }
 
     /// Extract the CBOR payload from a SUIT envelope.
@@ -1098,186 +892,6 @@ impl HsmProvider for SimHsm {
     }
 }
 
-/// Service lifecycle — inherent (NOT part of the narrowed `HsmProvider`
-/// trait). Dead in production: supernova spawns the link-B HSM daemon
-/// directly and nothing under component-mgr drives an in-process SimHsm
-/// service. Kept so the `Drop` impl can still reap a daemon a SimHsm
-/// spawned in a test; removed in S7b when SimHsm relocates to tools/.
-#[allow(dead_code)]
-impl SimHsm {
-    fn start_service(&mut self) -> Result<u16, HsmError> {
-        if self.is_running() {
-            return Err(HsmError::AlreadyRunning);
-        }
-
-        // Spawn the daemon regardless of provisioning state — the listener
-        // must be reachable on a factory device too. vhsm-test-ssd will log
-        // "not yet provisioned" and fail key ops until the keystore is
-        // populated; the post-provision restart in component-mgr reloads it.
-
-        tracing::info!(
-            bin = %self.daemon_bin.display(),
-            keystore = %self.keystore_path.display(),
-            port = self.tcp_port,
-            "starting vhsm-test-ssd"
-        );
-
-        // Listen address. Single-VM legacy path uses `bind_ip:port`
-        // exactly. Multi-VM path (allow_list non-empty) should bind on
-        // an address reachable from every guest's vhsm bridge — usually
-        // `0.0.0.0` — but we don't override `bind_ip` here: the caller
-        // is expected to set it to whatever it wants the listener on.
-        let listen = format!("{}:{}", self.bind_ip, self.tcp_port);
-
-        // Defensive: kill any stale orphan from a prior supernova lifetime.
-        // When supernova is `slay`'d (SIGKILL), Rust's Drop chain never
-        // runs and the vhsm-ssd child is reparented to init, keeping the
-        // listen port bound with its old --allow-ip args. A new supernova
-        // then fails to bind silently and the old daemon keeps serving
-        // requests with the stale policy. This probe-bind detects the
-        // case and kills the orphan before we proceed.
-        self.kill_stale_daemon_if_port_busy(&listen);
-
-        // Policy directory is operator-managed (shipped via OTA to
-        // /etc/sumo/policy on managed-cvc). No synthetic fallback —
-        // the daemon errors out at startup if policy.yaml is missing
-        // from the directory.
-        let policy_dir = self.policy_dir.as_ref().ok_or_else(|| {
-            HsmError::ProcessError(
-                "policy_dir is required (call SimHsm::with_policy_dir before start_service)".into(),
-            )
-        })?;
-
-        // Bootstrap state — still synthesized lazily because it's
-        // per-deployment runtime state, not authored content. Empty
-        // file is meaningful (no ENROLL tokens issued yet); operator
-        // populates via the orchestrator's enrolment flow.
-        let bootstrap_path = self.keystore_path.join("bootstrap.yaml");
-        if !bootstrap_path.exists() {
-            if let Err(e) = std::fs::write(&bootstrap_path, "tokens: {}\n") {
-                return Err(HsmError::ProcessError(format!(
-                    "failed to write empty bootstrap state at {}: {e}",
-                    bootstrap_path.display()
-                )));
-            }
-            tracing::info!(path = %bootstrap_path.display(), "wrote empty bootstrap state");
-        }
-
-        let mut cmd = Command::new(&self.daemon_bin);
-        cmd.arg("--keystore")
-            .arg(&self.keystore_path)
-            .arg("--listen")
-            .arg(&listen)
-            .arg("--policy-dir")
-            .arg(policy_dir)
-            .arg("--bootstrap-state")
-            .arg(&bootstrap_path);
-        // Pass the (ip, vm_id) pairs the orchestrator already has
-        // through to the daemon's ENROLL_ASSISTED resolver. Same
-        // entries that get baked into the default IAM policy above.
-        // Each becomes one `--ip-map <ip>=<vm_id>` arg.
-        for (ip, vm) in &self.allow_list {
-            cmd.arg("--ip-map").arg(format!("{ip}={vm}"));
-        }
-        if let Some(ref audit_path) = self.audit_log {
-            cmd.arg("--audit-log").arg(audit_path);
-            tracing::info!(
-                path = %audit_path.display(),
-                "vhsm-ssd audit log enabled"
-            );
-        }
-        // Optional node-to-node mTLS bind. The daemon defaults its trust anchor
-        // (--identity-root) to `<policy-dir>/roots/device-identity-root.pem`, so
-        // passing the address is enough — no second path to wire here.
-        if let Some(addr) = self.cross_node_listen {
-            cmd.arg("--cross-node-listen").arg(addr.to_string());
-            tracing::info!(%addr, "vhsm-ssd cross-node mTLS listener enabled");
-        }
-        let child = cmd
-            .spawn()
-            .map_err(|e| HsmError::ProcessError(format!("spawn vhsm-test-ssd: {e}")))?;
-
-        let pid = child.id();
-        self.child = Some(child);
-
-        // Brief wait + liveness check
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if !self.is_running() {
-            return Err(HsmError::ProcessError(
-                "vhsm-test-ssd exited immediately".into(),
-            ));
-        }
-
-        tracing::info!(pid, port = self.tcp_port, "vhsm-test-ssd started");
-        Ok(self.tcp_port)
-    }
-
-    fn stop_service(&mut self) -> Result<(), HsmError> {
-        let Some(mut child) = self.child.take() else {
-            return Err(HsmError::NotRunning);
-        };
-
-        let pid = child.id();
-        tracing::info!(pid, "stopping vhsm-test-ssd");
-
-        #[cfg(unix)]
-        {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-        }
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    tracing::info!(pid, "vhsm-test-ssd stopped");
-                    return Ok(());
-                }
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                _ => break,
-            }
-        }
-
-        tracing::warn!(pid, "vhsm-test-ssd did not exit, sending SIGKILL");
-        let _ = child.kill();
-        let _ = child.wait();
-        Ok(())
-    }
-
-    fn status(&self) -> Result<HsmStatus, HsmError> {
-        let provisioned = self.manifest_path().exists();
-
-        let (service_running, service_pid) = if let Some(child) = &self.child {
-            let pid = child.id();
-            let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-            (alive, Some(pid))
-        } else {
-            (false, None)
-        };
-
-        Ok(HsmStatus {
-            provisioned,
-            service_running,
-            service_pid,
-            keystore_path: self.keystore_path.clone(),
-            tcp_port: self.tcp_port,
-        })
-    }
-}
-
-impl Drop for SimHsm {
-    fn drop(&mut self) {
-        if self.is_running() {
-            if let Err(e) = self.stop_service() {
-                tracing::warn!("failed to stop vhsm-test-ssd on drop: {e}");
-            }
-        }
-    }
-}
-
 // --- Zstd decompression ---
 
 /// Decompress a zstd-compressed payload.
@@ -1602,9 +1216,9 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payload::*;
+    use hsm::payload::*;
     #[cfg(feature = "crypto")]
-    use crate::HsmCryptoProvider;
+    use hsm::HsmCryptoProvider;
 
     /// Sample keystore — every slot enumeration-only. The schema
     /// itself no longer has a `private_key` field, so the keystore
@@ -1652,11 +1266,11 @@ mod tests {
     #[test]
     #[cfg(feature = "crypto")]
     fn provisions_and_reads_back_a_trust_anchor() {
-        use crate::payload::{TrustAnchorCert, DELEGATION_ROOT_ANCHOR_ID};
-        use crate::HsmCryptoProvider;
+        use hsm::payload::{TrustAnchorCert, DELEGATION_ROOT_ANCHOR_ID};
+        use hsm::HsmCryptoProvider;
         let tmp = std::env::temp_dir().join("hsm-test-trust-anchor");
         let _ = std::fs::remove_dir_all(&tmp);
-        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
+        let hsm = SimHsm::new(tmp.clone());
 
         // Stand-in DER (round-trips through the PEM enclosure byte-for-byte).
         let der = vec![0x30u8, 0x82, 0x01, 0x00, 0xAB, 0xCD];
@@ -1683,7 +1297,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("hsm-test-provision");
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
+        let hsm = SimHsm::new(tmp.clone());
 
         let ks = sample_keystore();
         let _cbor = payload::encode(&ks).unwrap();
@@ -1745,7 +1359,7 @@ mod tests {
     fn reprovision_installs_leaf_certificate() {
         let tmp = std::env::temp_dir().join("hsm-test-leaf-cert");
         let _ = std::fs::remove_dir_all(&tmp);
-        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
+        let hsm = SimHsm::new(tmp.clone());
 
         // First provision generates the EC key for "jwt-signing"; no cert yet
         // (the leaf can only be issued from the CSR that key emits).
@@ -1770,9 +1384,9 @@ mod tests {
         assert!(tmp.join("keys/jwt-signing.cert").exists());
         let manifest = std::fs::read_to_string(tmp.join("manifest")).unwrap();
         assert!(manifest.contains("keys/jwt-signing.cert"));
-        let got = crate::HsmCryptoProvider::get_certificate_der(
+        let got = hsm::HsmCryptoProvider::get_certificate_der(
             &hsm,
-            crate::KeyRole::JwtSigning.handle(),
+            hsm::KeyRole::JwtSigning.handle(),
         )
         .unwrap();
         assert_eq!(got, leaf_der);
@@ -1788,7 +1402,7 @@ mod tests {
     fn list_keys_lists_device_keys_pre_provision() {
         let tmp = std::env::temp_dir().join("hsm-test-list-preprov");
         let _ = std::fs::remove_dir_all(&tmp);
-        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
+        let hsm = SimHsm::new(tmp.clone());
         // Device-generated keys exist at first boot, but the device is NOT
         // provisioned (no manifest). list_keys used to error here; now it
         // disk-lists the device keys so the inventory is available either way.
@@ -1814,7 +1428,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
+        let hsm = SimHsm::new(tmp.clone());
 
         // No state file → version 0
         assert_eq!(hsm.load_security_version().unwrap(), 0);
@@ -1862,7 +1476,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("hsm-test-ensure-device-keys");
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let hsm = SimHsm::new(PathBuf::from("/dev/null"), tmp.clone(), 5100);
+        let hsm = SimHsm::new(tmp.clone());
         hsm.ensure_device_keys().unwrap();
 
         // Every device-generated role must have a {priv, pub} pair on disk
@@ -1940,7 +1554,7 @@ mod tests {
         // expects.
         let tmp = tempfile::tempdir().unwrap();
         let keystore = tmp.path().to_path_buf();
-        let mut sim = SimHsm::new(PathBuf::from("unused"), keystore.clone(), 0);
+        let mut sim = SimHsm::new(keystore.clone());
         sim.arm_enrollment("vm9", Some(3600)).unwrap();
 
         let yaml = std::fs::read_to_string(keystore.join("bootstrap.yaml")).unwrap();
@@ -1967,7 +1581,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut sim = SimHsm::new(PathBuf::from("unused"), keystore.clone(), 0);
+        let mut sim = SimHsm::new(keystore.clone());
         sim.arm_enrollment("vm9", None).unwrap();
 
         let yaml = std::fs::read_to_string(&path).unwrap();
@@ -1981,7 +1595,7 @@ mod tests {
     fn arm_enrollment_replaces_existing_pending_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let keystore = tmp.path().to_path_buf();
-        let mut sim = SimHsm::new(PathBuf::from("unused"), keystore.clone(), 0);
+        let mut sim = SimHsm::new(keystore.clone());
         sim.arm_enrollment("vm9", Some(1)).unwrap();
         // Re-arm with a different TTL — entry should be replaced.
         sim.arm_enrollment("vm9", Some(9999)).unwrap();

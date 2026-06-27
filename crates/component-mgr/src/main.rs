@@ -239,7 +239,7 @@ fn main() {
             if args.len() < 4 {
                 eprintln!(
                     "Usage: factory-init <manifest-dir> [--runner-path <path>] \
-                     [--images-dir <dir>] [--hsm-keystore <dir>] [--hsm-port <port>]"
+                     [--images-dir <dir>] [--hsm-keystore <dir>]"
                 );
                 std::process::exit(1);
             }
@@ -247,7 +247,6 @@ fn main() {
             let mut runner_path: Option<PathBuf> = None;
             let mut images_dir: Option<PathBuf> = None;
             let mut hsm_keystore: Option<PathBuf> = None;
-            let mut hsm_port: u16 = 5100;
             let mut i = 4;
             while i < args.len() {
                 if args[i] == "--runner-path" && i + 1 < args.len() {
@@ -258,9 +257,6 @@ fn main() {
                     i += 2;
                 } else if args[i] == "--hsm-keystore" && i + 1 < args.len() {
                     hsm_keystore = Some(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else if args[i] == "--hsm-port" && i + 1 < args.len() {
-                    hsm_port = args[i + 1].parse().unwrap_or(5100);
                     i += 2;
                 } else {
                     i += 1;
@@ -277,8 +273,7 @@ fn main() {
             // signed manifest at the first OTA flash instead).
             let factory_hsm = match (&images_dir, &hsm_keystore) {
                 (Some(_), Some(ks)) => {
-                    let hsm =
-                        hsm::sim::SimHsm::new(PathBuf::from("vhsm-test-ssd"), ks.clone(), hsm_port);
+                    let hsm = hsm_sim_backend::SimHsm::new(ks.clone());
                     if let Err(e) = hsm.ensure_device_keys() {
                         eprintln!("[factory] failed to ensure HSM device keys: {e}");
                         std::process::exit(1);

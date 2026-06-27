@@ -14,5 +14,7 @@ path = "src/main.rs"
 # verify_bank directly — no vhsm-ssd hop needed for the host-side
 # verifier.
 hsm = { path = "../hsm", features = ["crypto"] }
+# The host-side verifier opens a SimHsm over the on-disk keystore (no daemon).
+hsm-sim-backend = { path = "../../tools/crates/hsm-sim-backend" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

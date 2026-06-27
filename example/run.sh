@@ -101,7 +101,7 @@ cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --quiet
 # plain workspace build skips it — build it explicitly.
 echo "[vm-mgr] building link-B HSM backend (hsm-sim-service)..."
 cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --quiet \
-    -p hsm --features crypto --bin hsm-sim-service
+    -p hsm-sim-backend --bin hsm-sim-service
 
 # 3. Generate SUIT keys and demo firmware (if keys don't exist)
 if [ ! -f "$TRUST_ANCHOR" ]; then

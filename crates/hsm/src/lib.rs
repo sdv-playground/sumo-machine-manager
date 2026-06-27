@@ -1,23 +1,18 @@
 pub mod payload;
-pub mod sim;
-/// HSM provider trait and implementations.
+/// HSM provider/crypto contract.
 ///
-/// Defines the management interface for Hardware Security Modules.
-/// The trait covers lifecycle and provisioning — not the crypto wire
-/// protocol (REGISTER, SIGN, VERIFY, etc.), which is handled by the
-/// guest-facing HSM service.
+/// This crate is the platform-agnostic CONTRACT: the [`HsmProvider`] /
+/// [`HsmCryptoProvider`] traits, the shared types, [`KeyRole`], the keystore
+/// `payload` schema, the IVD signing logic (`ivd`), and the `link_b` bridge.
+/// It carries NO concrete backend.
 ///
 /// Implementations:
-/// - SimHsm: manages vhsm-ssd + file-based keystore (dev/test + QNX host)
+/// - `hsm_sim_backend::SimHsm` — a file-keystore + RustCrypto backend for
+///   dev/test/CI (the `hsm-sim-backend` crate under `tools/`), served over
+///   link-B by `hsm-sim-service`; production runs a vendor HSE link-B service.
 /// - the guest reaches the HSM via `VhsmProvider` (vhsm-provider crate),
 ///   which forwards the crypto contract over the vHSM wire
 pub mod types;
-pub mod linux {
-    //! Backward-compatible re-export. Prefer `hsm::sim::SimHsm`.
-    pub use crate::sim::*;
-}
-#[cfg(feature = "crypto")]
-pub mod crypto;
 pub mod ivd;
 #[cfg(feature = "suit")]
 pub mod key_unwrap;
@@ -43,9 +38,11 @@ pub use vhsm_proto;
 
 // SPKI DER → COSE_Key trust-anchor converter (RustCrypto-backed); lets the
 // gateway derive the manifest trust anchor from `get_public_key_der` on either
-// the host (SimHsm) or the guest (VhsmProvider).
+// the host (the sim/HSE backend) or the guest (VhsmProvider). Lives in `link_b`
+// — a contract-level helper used by `LinkBClient::get_public_key`, NOT tied to
+// any one backend.
 #[cfg(feature = "crypto")]
-pub use crypto::cose_key_es256_from_spki_der;
+pub use link_b::cose_key_es256_from_spki_der;
 
 /// HSM management provider.
 ///

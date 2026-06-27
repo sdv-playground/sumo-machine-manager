@@ -252,10 +252,10 @@ async fn get_csr_generates_csr_when_keystore_configured() {
 
     // Pre-generate the device key as the real flow does, so CSR signing has
     // something to sign with.
-    let setup = hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), 5100);
+    let setup = hsm_sim_backend::SimHsm::new(keystore.clone());
     setup.ensure_device_keys().expect("device keys created");
 
-    let comp = ComponentAdapter::new(vm).with_csr_keystore(keystore, 5100);
+    let comp = ComponentAdapter::new(vm).with_csr_keystore(keystore);
 
     // Capability should reflect CSR support.
     assert!(comp.capabilities().hsm.as_ref().unwrap().supports_csr);
@@ -283,9 +283,9 @@ async fn get_device_id_returns_a_stable_device_key_thumbprint() {
     );
     let tmp = tempfile::tempdir().expect("tempdir");
     let keystore = PathBuf::from(tmp.path());
-    let setup = hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), 5102);
+    let setup = hsm_sim_backend::SimHsm::new(keystore.clone());
     setup.ensure_device_keys().expect("device keys created");
-    let comp = ComponentAdapter::new(vm).with_csr_keystore(keystore, 5102);
+    let comp = ComponentAdapter::new(vm).with_csr_keystore(keystore);
 
     let id = comp
         .get_device_id()

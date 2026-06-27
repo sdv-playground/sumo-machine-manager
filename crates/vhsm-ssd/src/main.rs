@@ -1220,16 +1220,12 @@ mod tests {
     use super::*;
     // SimHsm is only needed by these cross-node config tests now that the
     // daemon's crypto backend is an out-of-process link-B client (see backend.rs).
-    use hsm::sim::SimHsm;
+    use hsm_sim_backend::SimHsm;
 
     // Both cases fail at the identity-root PEM step, before any keystore/HSM
     // access, so the keystore path need not exist.
     fn unprovisioned_crypto() -> Arc<dyn HsmCryptoProvider> {
-        Arc::new(SimHsm::new(
-            PathBuf::from("unused"),
-            PathBuf::from("/nonexistent-keystore"),
-            0,
-        ))
+        Arc::new(SimHsm::new(PathBuf::from("/nonexistent-keystore")))
     }
 
     // The startup path turns these Errs into a warn-and-disable (a fresh device

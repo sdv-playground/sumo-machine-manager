@@ -28,4 +28,5 @@ guest-auth = ["dep:p256", "dep:sha2", "dep:rand"]
 # so the client's framing is proven byte-exact against the server it talks to.
 vhsm-ssd = { path = "../vhsm-ssd" }
 hsm = { path = "../hsm", features = ["crypto"] }
+hsm-sim-backend = { path = "../../tools/crates/hsm-sim-backend" }
 tempfile = "3"

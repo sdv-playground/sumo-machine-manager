@@ -8,7 +8,7 @@ use std::process::Command;
 
 use hsm::ivd;
 use hsm::payload;
-use hsm::sim::SimHsm;
+use hsm_sim_backend::SimHsm;
 
 /// Per-test scratch root under `temp_dir()`. Removed on drop.
 struct Scratch {
@@ -41,7 +41,7 @@ fn provisioned_keystore(scratch: &Scratch) -> PathBuf {
     let keystore = scratch.path("keystore");
     std::fs::create_dir_all(&keystore).unwrap();
 
-    let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
+    let hsm = SimHsm::new(keystore.clone());
 
     let ks = payload::HsmKeystore {
         schema_version: payload::SCHEMA_VERSION,
@@ -86,7 +86,7 @@ fn verifies_a_signed_bank() {
     // Sign with the HSM the CLI will use. `gen=7` here is the
     // per-install generation counter the NV layer would assign; the
     // CLI's `--expect-install-gen` pins it on read.
-    let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
+    let hsm = SimHsm::new(keystore.clone());
     ivd::sign_bank_crypto(&hsm, &bank, 7, ivd::IvdIdentity::default()).unwrap();
 
     let out = Command::new(binary())
@@ -122,7 +122,7 @@ fn rejects_tampered_file() {
     std::fs::write(bank.join("kernel"), b"original\0\0\0\0").unwrap();
     std::fs::write(bank.join("rootfs.img"), vec![0u8; 2048]).unwrap();
 
-    let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
+    let hsm = SimHsm::new(keystore.clone());
     ivd::sign_bank_crypto(&hsm, &bank, 11, ivd::IvdIdentity::default()).unwrap();
 
     // Tamper post-sign.
@@ -150,7 +150,7 @@ fn rejects_unexpected_extra_file() {
     std::fs::create_dir_all(&bank).unwrap();
     std::fs::write(bank.join("kernel"), b"k").unwrap();
 
-    let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
+    let hsm = SimHsm::new(keystore.clone());
     ivd::sign_bank_crypto(&hsm, &bank, 1, ivd::IvdIdentity::default()).unwrap();
 
     // Drop an extra file the manifest never authorised.
@@ -184,7 +184,7 @@ fn rejects_install_gen_mismatch() {
     // Sign with gen=5; verifier pins gen=6 → must reject (the
     // between-slot swap detection case that motivated the v2
     // manifest format).
-    let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
+    let hsm = SimHsm::new(keystore.clone());
     ivd::sign_bank_crypto(&hsm, &bank, 5, ivd::IvdIdentity::default()).unwrap();
 
     let out = Command::new(binary())
@@ -261,7 +261,7 @@ fn quiet_suppresses_stdout_on_success() {
     std::fs::create_dir_all(&bank).unwrap();
     std::fs::write(bank.join("kernel"), b"k").unwrap();
 
-    let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 0);
+    let hsm = SimHsm::new(keystore.clone());
     ivd::sign_bank_crypto(&hsm, &bank, 3, ivd::IvdIdentity::default()).unwrap();
 
     let out = Command::new(binary())

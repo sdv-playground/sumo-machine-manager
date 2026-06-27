@@ -31,9 +31,6 @@ pub struct ComponentAdapter<D: BlockDevice + Send + 'static> {
     /// HSM keystore directory used by `get_csr` to spin up a transient
     /// `SimHsm` for CSR signing. `None` means CSR is not supported.
     csr_keystore: Option<PathBuf>,
-    /// TCP port the HSM service listens on. Required by `SimHsm::new` even
-    /// when only used for CSR signing.
-    csr_hsm_port: u16,
     /// Optional crypto provider for the HSM read/CSR ops (`get_csr`,
     /// `list_keys`, `get_device_id`). When `Some` (e.g. a link-B client), those
     /// ops route through it IN PREFERENCE to spinning up a transient `SimHsm`
@@ -49,16 +46,14 @@ impl<D: BlockDevice + Send + Sync + 'static> ComponentAdapter<D> {
             inner,
             capabilities,
             csr_keystore: None,
-            csr_hsm_port: 0,
             csr_crypto: None,
         }
     }
 
     /// Configure HSM CSR signing. Sets `Capabilities.hsm.supports_csr = true`
     /// and points `get_csr` at the keystore.
-    pub fn with_csr_keystore(mut self, keystore: PathBuf, hsm_port: u16) -> Self {
+    pub fn with_csr_keystore(mut self, keystore: PathBuf) -> Self {
         self.csr_keystore = Some(keystore);
-        self.csr_hsm_port = hsm_port;
         // Reflect the new capability.
         if let Some(ref mut caps) = self.capabilities.hsm {
             caps.supports_csr = true;
@@ -373,7 +368,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                     "get_csr (no keystore configured)",
                 ))?;
             let tmp =
-                hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
+                hsm_sim_backend::SimHsm::new(keystore.clone());
             tmp.generate_csr(handle, key_id)
         }
         .map_err(|e| MachineError::Internal(format!("csr generation failed: {e}")))?;
@@ -427,7 +422,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                     "list_keys (no keystore configured)",
                 ))?;
             let tmp =
-                hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
+                hsm_sim_backend::SimHsm::new(keystore.clone());
             tmp.list_keys()
                 .map_err(|e| MachineError::Internal(format!("list keys failed: {e}")))?
                 .into_iter()
@@ -458,7 +453,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                 return Ok(None);
             };
             let tmp =
-                hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
+                hsm_sim_backend::SimHsm::new(keystore.clone());
             tmp.get_public_key_der(handle)
         };
         match der {

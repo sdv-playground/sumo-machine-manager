@@ -162,7 +162,7 @@ mod tests {
     use std::time::Duration;
 
     use const_oid::db::rfc5280::{ID_KP_CLIENT_AUTH, ID_KP_SERVER_AUTH};
-    use hsm::sim::SimHsm;
+    use hsm_sim_backend::SimHsm;
     use hsm::{HsmCryptoProvider, KeyRole};
     use p256::ecdsa::{DerSignature, SigningKey};
     use p256::pkcs8::EncodePrivateKey;
@@ -292,11 +292,7 @@ mod tests {
 
         // Client identity: the HSM `TlsIdentity` key + a CA-signed clientAuth leaf.
         let dir = tempfile::tempdir().unwrap();
-        let hsm = SimHsm::new(
-            std::path::PathBuf::from("unused"),
-            dir.path().to_path_buf(),
-            0,
-        );
+        let hsm = SimHsm::new(dir.path().to_path_buf());
         let kid = KeyRole::TlsIdentity.handle();
         hsm.generate_key(kid, ALG_ECC_P256).unwrap();
         let client_leaf = issue_leaf(

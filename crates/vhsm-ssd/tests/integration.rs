@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use hsm::sim::SimHsm;
+use hsm_sim_backend::SimHsm;
 use hsm::HsmCryptoProvider;
 
 use vhsm_ssd::handle_table::HandleTable;
@@ -52,7 +52,7 @@ impl TestFixture {
 
         Self::build_keystore(&keystore_path);
 
-        let hsm = SimHsm::new(PathBuf::from("unused"), keystore_path.clone(), 5100);
+        let hsm = SimHsm::new(keystore_path.clone());
         let crypto: Arc<dyn HsmCryptoProvider> = Arc::new(hsm);
 
         // Init handle table with well-known handles
@@ -207,7 +207,7 @@ statements:
             -----END CERTIFICATE-----\n";
         std::fs::write(path.join("keys").join("iam-signing.cert"), cert_pem).unwrap();
 
-        let hsm = SimHsm::new(PathBuf::from("unused"), path.to_path_buf(), 5100);
+        let hsm = SimHsm::new(path.to_path_buf());
         hsm.write_keystore(&ks).unwrap();
         std::fs::write(path.join("provision_state"), b"1\n").unwrap();
     }

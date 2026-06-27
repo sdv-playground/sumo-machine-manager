@@ -4224,7 +4224,7 @@ mod identity_tests {
     use super::*;
     use crate::manifest_provider::ManifestError;
     use crate::ota::ImageMeta;
-    use hsm::sim::SimHsm;
+    use hsm_sim_backend::SimHsm;
     use hsm::HsmProvider;
     use nv_store::block::MemBlockDevice;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
@@ -4263,7 +4263,7 @@ mod identity_tests {
         let _ = std::fs::remove_dir_all(&keystore);
         std::fs::create_dir_all(&keystore).unwrap();
 
-        let hsm = SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 5400);
+        let hsm = SimHsm::new(keystore.clone());
         let ks = HsmKeystore {
             schema_version: SCHEMA_VERSION,
             security_version: 1,
@@ -4285,11 +4285,7 @@ mod identity_tests {
 
         // A second SimHsm over the same keystore is the crypto handle (IVD
         // sign/verify); the first SimHsm is the provisioning-authority provider.
-        let crypto: Arc<dyn hsm::HsmCryptoProvider> = Arc::new(SimHsm::new(
-            PathBuf::from("/dev/null"),
-            keystore.clone(),
-            5400,
-        ));
+        let crypto: Arc<dyn hsm::HsmCryptoProvider> = Arc::new(SimHsm::new(keystore.clone()));
         (Arc::new(Mutex::new(hsm)), crypto, keystore)
     }
 

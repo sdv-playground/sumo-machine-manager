@@ -981,36 +981,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bank);
     }
 
-    fn provisioned_sim(name: &str) -> (crate::sim::SimHsm, PathBuf) {
-        use crate::payload::*;
+    /// A minimal [`HsmCryptoProvider`](crate::HsmCryptoProvider) for the IVD
+    /// sign/verify tests: one in-memory EC-P256 key, real DER ECDSA
+    /// `sign`/`verify` (the only two ops `sign_bank_crypto` /
+    /// `verify_bank_crypto` call), everything else `NotSupported`. Stands in for
+    /// the dev/test `SimHsm` here so `hsm` keeps its IVD round-trip coverage
+    /// without depending on the (relocated, non-production) `hsm-sim-backend` —
+    /// which would be a dependency cycle.
+    struct MockIvdHsm {
+        signing: p256::ecdsa::SigningKey,
+    }
 
+    impl crate::HsmCryptoProvider for MockIvdHsm {
+        fn sign(&self, _handle: crate::KeyHandle, data: &[u8]) -> Result<Vec<u8>, crate::HsmError> {
+            use ecdsa::signature::Signer;
+            let sig: ecdsa::der::Signature<p256::NistP256> = self.signing.sign(data);
+            Ok(sig.to_bytes().to_vec())
+        }
+        fn verify(
+            &self,
+            _handle: crate::KeyHandle,
+            data: &[u8],
+            signature: &[u8],
+        ) -> Result<bool, crate::HsmError> {
+            use ecdsa::signature::Verifier;
+            let sig = ecdsa::der::Signature::<p256::NistP256>::from_bytes(signature)
+                .map_err(|e| crate::HsmError::CryptoError(format!("bad signature: {e}")))?;
+            Ok(self.signing.verifying_key().verify(data, &sig).is_ok())
+        }
+        fn encrypt(&self, _h: crate::KeyHandle, _p: &[u8]) -> Result<Vec<u8>, crate::HsmError> {
+            Err(crate::HsmError::NotSupported("MockIvdHsm::encrypt".into()))
+        }
+        fn decrypt(&self, _h: crate::KeyHandle, _c: &[u8]) -> Result<Vec<u8>, crate::HsmError> {
+            Err(crate::HsmError::NotSupported("MockIvdHsm::decrypt".into()))
+        }
+        fn mac_generate(&self, _h: crate::KeyHandle, _d: &[u8]) -> Result<Vec<u8>, crate::HsmError> {
+            Err(crate::HsmError::NotSupported("MockIvdHsm::mac_generate".into()))
+        }
+        fn mac_verify(
+            &self,
+            _h: crate::KeyHandle,
+            _d: &[u8],
+            _m: &[u8],
+        ) -> Result<bool, crate::HsmError> {
+            Err(crate::HsmError::NotSupported("MockIvdHsm::mac_verify".into()))
+        }
+        fn derive(
+            &self,
+            _h: crate::KeyHandle,
+            _c: &[u8],
+            _l: usize,
+        ) -> Result<Vec<u8>, crate::HsmError> {
+            Err(crate::HsmError::NotSupported("MockIvdHsm::derive".into()))
+        }
+        fn random(&self, _l: usize) -> Result<Vec<u8>, crate::HsmError> {
+            Err(crate::HsmError::NotSupported("MockIvdHsm::random".into()))
+        }
+        fn get_certificate_der(&self, _h: crate::KeyHandle) -> Result<Vec<u8>, crate::HsmError> {
+            Err(crate::HsmError::NotSupported(
+                "MockIvdHsm::get_certificate_der".into(),
+            ))
+        }
+        fn get_public_key_der(&self, _h: crate::KeyHandle) -> Result<Vec<u8>, crate::HsmError> {
+            Err(crate::HsmError::NotSupported(
+                "MockIvdHsm::get_public_key_der".into(),
+            ))
+        }
+        fn get_key_info(&self, _h: crate::KeyHandle) -> Result<crate::KeyInfo, crate::HsmError> {
+            Err(crate::HsmError::NotSupported("MockIvdHsm::get_key_info".into()))
+        }
+    }
+
+    /// IVD sign/verify tests need only an `HsmCryptoProvider` with a working
+    /// `sign`/`verify`. The returned `PathBuf` is a throwaway temp dir kept for
+    /// call-site symmetry (the tests clean it up); the mock holds its key in
+    /// memory, so nothing is written there.
+    fn provisioned_sim(name: &str) -> (MockIvdHsm, PathBuf) {
         let keystore = std::env::temp_dir().join(format!("hsm-ivd-keystore-{}", name));
         let _ = std::fs::remove_dir_all(&keystore);
         std::fs::create_dir_all(&keystore).unwrap();
-
-        let hsm = crate::sim::SimHsm::new(PathBuf::from("/dev/null"), keystore.clone(), 5100);
-
-        // Minimal v2 keystore: just `ivd-signing` as a device-
-        // generated EC slot. generate_missing_local_keys produces the
-        // keypair on disk.
-        let ks = HsmKeystore {
-            schema_version: SCHEMA_VERSION,
-            security_version: 1,
-            identities: vec![],
-            slots: vec![KeySlot {
-                key_id: IVD_KEY_ID.to_string(),
-                key_kind: KEY_TYPE_EC_P256,
-                anchor_public_key: None,
-                allowed_guests: None,
-                allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
-            }],
-            certificates: Vec::new(),
-            trust_anchors: Vec::new(),
-        };
-        hsm.write_keystore(&ks).unwrap();
-        std::fs::write(keystore.join("provision_state"), b"1\n").unwrap();
-
-        (hsm, keystore)
+        let signing = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        (MockIvdHsm { signing }, keystore)
     }
 
     #[test]

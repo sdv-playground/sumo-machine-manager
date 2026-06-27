@@ -7,11 +7,11 @@
 //! to an out-of-process backend), through a spawned process + Unix socket —
 //! complementing backend.rs's in-crate unit test of the failure path.
 //!
-//! `hsm-sim-service` is a bin of the SIBLING `hsm` crate, so it is NOT exposed
+//! `hsm-sim-service` is a bin of the SIBLING `hsm-sim-backend` crate, so it is NOT exposed
 //! via `CARGO_BIN_EXE_*`. We locate the already-built binary by walking this
 //! test executable's ancestors to `target/<profile>/hsm-sim-service`. The bin
 //! must therefore be built FIRST:
-//!     cargo build -p hsm --features crypto --bin hsm-sim-service
+//!     cargo build -p hsm-sim-backend --bin hsm-sim-service
 //! (the documented VERIFY order; CI must mirror it — there is no Cargo way to
 //! express a cross-crate bin build-dep for a test). If the bin isn't found, the
 //! test SKIPS with a loud message rather than failing spuriously.
@@ -24,7 +24,7 @@ use hsm::{HsmCryptoProvider, KeyHandle};
 use vhsm_ssd::backend;
 
 /// Locate the `hsm-sim-service` binary built into `target/<profile>/`. It's a
-/// bin of the sibling `hsm` crate, so `env!("CARGO_BIN_EXE_…")` can't name it;
+/// bin of the sibling `hsm-sim-backend` crate, so `env!("CARGO_BIN_EXE_…")` can't name it;
 /// walk our own test-exe ancestors and return the first dir that holds it.
 fn locate_hsm_sim_service() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -44,7 +44,7 @@ fn spawn_and_connect_drives_real_crypto_over_link_b() {
         None => {
             eprintln!(
                 "SKIP: hsm-sim-service not built — run \
-                 `cargo build -p hsm --features crypto --bin hsm-sim-service` first"
+                 `cargo build -p hsm-sim-backend --bin hsm-sim-service` first"
             );
             return;
         }

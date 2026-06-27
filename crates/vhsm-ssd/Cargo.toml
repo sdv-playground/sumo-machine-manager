@@ -57,6 +57,9 @@ sha2 = { version = "0.10", features = ["oid"] }
 # HELLO/AUTH/ENROLL layer. (The dev-dependency cycle vhsm-ssd <-> vhsm-client
 # is permitted by Cargo since the normal dependency graph stays acyclic.)
 vhsm-client = { path = "../vhsm-client", features = ["guest-auth"] }
+# SimHsm backend for the in-process tests + the full-daemon e2e (which also
+# spawns the `hsm-sim-service` bin from this crate).
+hsm-sim-backend = { path = "../../tools/crates/hsm-sim-backend" }
 
 [[bin]]
 name = "vhsm-ssd"

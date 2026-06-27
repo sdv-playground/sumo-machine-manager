@@ -2,68 +2,41 @@
 name = "hsm"
 version = "0.1.0"
 edition = "2021"
-description = "HSM provider trait and Linux simulation backend"
+description = "HSM provider/crypto contract: traits, types, KeyRole, keystore schema, IVD signing, and the link-B bridge"
 
 [dependencies]
 tracing = "0.1"
-# Subscriber for the `hsm-sim-service` bin (link-B sim backend). Workspace
-# convention (vhsm-ssd, vm-service, …): fmt + env-filter, default `info`.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-libc = "0.2"
 ciborium = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
-serde_yaml = "0.9"
 coset = { version = "0.3", default-features = false }
 # The slot registry (handle ↔ key_id ↔ alg ↔ perms) is single-sourced here;
 # KeyRole maps each role to a handle and derives key_id() from the registry.
 vhsm-proto = { path = "../vhsm-proto" }
 # The shared HSM crypto contract (handle-addressed HsmCryptoProvider + the
-# HsmError/KeyInfo/KeyType/KeyHandle types). hsm re-exports these and SimHsm
-# implements the trait.
+# HsmError/KeyInfo/KeyType/KeyHandle types). hsm re-exports these; concrete
+# backends (hsm-sim-backend's SimHsm, the vendor HSE) implement them.
 hsm-contract = { path = "../hsm-contract" }
 # Link-B wire contract (frame codec + OP_*/ST_*/KEYTYPE_* constants). The
 # `link_b` module bridges HsmCryptoProvider <-> the link-B service over it.
 hsm-link-b = { path = "../hsm-link-b" }
 
+# SUIT manifest validation for the `key_unwrap` HSM-backed KeyUnwrap adapter.
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
-sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
-sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
 
-# RustCrypto — used by HsmCryptoProvider for software crypto (simulation)
+# RustCrypto — `ivd` (SHA-256 bank hashing) and the SPKI→COSE_Key converter
+# (`link_b::cose_key_es256_from_spki_der`). `asm` enables the hardware-
+# accelerated SHA-256 backend (what the IVD bank verify is bound by); on QNX it
+# also needs `-C target-feature=+sha2` at build time.
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem", "std"], optional = true }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "der"], optional = true }
-ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"], optional = true }
-aes-gcm = { version = "0.10", optional = true }
-hkdf = { version = "0.12", optional = true }
-# `asm` enables the hardware-accelerated SHA-256 backend. On the aarch64 device
-# (S32G3 A53 — confirmed to carry the Arm crypto extension: aes/pmull/sha1/sha2)
-# this hashes ~10x faster than the pure-software fallback, which is what the IVD
-# bank verify is bound by. On QNX it also needs `-C target-feature=+sha2` at
-# build time (cpufeatures has no runtime detection there). x86 host builds use
-# sha2-asm's x86 path.
 sha2 = { version = "0.10", features = ["asm", "oid"], optional = true }
-hmac = { version = "0.12", optional = true }
 rand = { version = "0.8", optional = true }
-cmac = { version = "0.7", optional = true }
-aes = { version = "0.8", optional = true }
-# X.509: build the device TLS-identity CSR (PKCS#10) on the same der/spki/p256
-# stack the Tower CA parses with, so the request round-trips exactly. Pure-Rust,
-# cross-compiles to QNX. `oid` on sha2 lets x509-cert emit ecdsa-with-SHA256.
-x509-cert = { version = "0.2", features = ["std", "pem", "builder"], optional = true }
-const-oid = { version = "0.9", features = ["db"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
 default = ["suit"]
-suit = ["dep:sumo-onboard", "dep:sumo-crypto", "dep:sumo-codec"]
-crypto = ["dep:p256", "dep:ecdsa", "dep:ed25519-dalek", "dep:aes-gcm", "dep:hkdf", "dep:sha2", "dep:hmac", "dep:rand", "dep:cmac", "dep:aes", "dep:x509-cert", "dep:const-oid"]
-
-# Serve a SimHsm as an out-of-process link-B crypto backend. Needs the `crypto`
-# feature for `SimHsm: HsmCryptoProvider` (serve_crypto's backend bound).
-[[bin]]
-name = "hsm-sim-service"
-path = "src/bin/hsm-sim-service.rs"
-required-features = ["crypto"]
+suit = ["dep:sumo-onboard"]
+crypto = ["dep:p256", "dep:ecdsa", "dep:sha2", "dep:rand"]

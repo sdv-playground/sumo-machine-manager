@@ -17,9 +17,9 @@
 //! drives crypto through `HsmCryptoProvider` without sharing a process.
 //!
 //! Crypto **and** provisioning are served **directly** via [`hsm::link_b::serve`]
-//! (the full backend surface) — NOT through `SimHsm::start_service` (the v3 vHSM
-//! TCP daemon). The `daemon_bin` and `tcp_port` constructor arguments are
-//! therefore irrelevant on this path.
+//! (the full backend surface): the bin owns a [`SimHsm`] over `--keystore` and
+//! answers link-B frames against it. `SimHsm` carries no service lifecycle of
+//! its own — it is a pure keystore + crypto backend.
 //!
 //! Usage:
 //!   hsm-sim-service --keystore <path> --listen <unix-socket-path>
@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use hsm::link_b;
-use hsm::sim::SimHsm;
+use hsm_sim_backend::SimHsm;
 
 fn print_usage() {
     eprintln!("usage: hsm-sim-service --keystore <path> --listen <unix-socket-path>");
@@ -126,10 +126,9 @@ fn main() {
         process::exit(1);
     });
 
-    // tcp_port (0) and daemon_bin ("unused") are inert here: we serve crypto +
-    // provisioning directly via link_b::serve, not through SimHsm::start_service's
-    // TCP daemon.
-    let hsm = SimHsm::new(PathBuf::from("unused"), keystore_path.clone(), 0);
+    // SimHsm is a pure keystore + crypto backend over `--keystore`; we serve
+    // crypto + provisioning directly via link_b::serve.
+    let hsm = SimHsm::new(keystore_path.clone());
 
     // Self-bootstrap the device-side key pairs before serving (idempotent): a
     // fresh keystore must have its device-generated slots before the first key
@@ -165,7 +164,7 @@ mod tests {
     /// genuine SimHsm crypto (Stage 1's own test used a mock backend).
     ///
     /// Keystore/SimHsm construction mirrors `crypto.rs`'s `new_hsm()` helper:
-    /// `SimHsm::new(<unused daemon_bin>, <tempdir>, 0)`. No provisioning is
+    /// `SimHsm::new(<tempdir>)`. No provisioning is
     /// needed — `jwt-signing` is a well-known slot, so `generate_key` writes
     /// `keys/jwt-signing.{priv,pub}` and the later `get_key_info`/`sign`/
     /// `get_public_key_der` resolve those on-disk files via the disk fallback.
@@ -175,7 +174,7 @@ mod tests {
         let keystore = dir.path().to_path_buf();
         let sock = dir.path().join("hsm-sim.sock");
 
-        let hsm = Arc::new(Mutex::new(SimHsm::new(PathBuf::from("unused"), keystore, 0)));
+        let hsm = Arc::new(Mutex::new(SimHsm::new(keystore)));
 
         // Bind BEFORE spawning/connecting so the connect below can't race the
         // listener. The detached `serve` thread loops forever; the test process

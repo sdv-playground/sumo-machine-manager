@@ -13,10 +13,10 @@ use std::process::Command;
 use hsm_conformance::{run_conformance, spawn_and_connect, Outcome};
 
 /// Locate the `hsm-sim-service` binary built into `target/<profile>/`. It is a
-/// bin of the sibling `hsm` crate, so `env!("CARGO_BIN_EXE_…")` cannot name it;
+/// bin of the sibling `hsm-sim-backend` crate, so `env!("CARGO_BIN_EXE_…")` cannot name it;
 /// walk this test exe's ancestors and return the first dir that holds it. Mirror
 /// of `vhsm-ssd/tests/backend_link_b.rs`. The bin must be built FIRST:
-///     cargo build -p hsm --features crypto --bin hsm-sim-service
+///     cargo build -p hsm-sim-backend --bin hsm-sim-service
 fn locate_hsm_sim_service() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     for ancestor in exe.ancestors() {
@@ -35,7 +35,7 @@ fn sim_hsm_conforms() {
         None => {
             eprintln!(
                 "SKIP: hsm-sim-service not built — run \
-                 `cargo build -p hsm --features crypto --bin hsm-sim-service` first"
+                 `cargo build -p hsm-sim-backend --bin hsm-sim-service` first"
             );
             return;
         }
