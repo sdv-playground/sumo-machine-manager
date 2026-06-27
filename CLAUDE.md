@@ -43,7 +43,8 @@ Cargo workspace with 29 crates. The load-bearing ones, bottom-up:
 - **vm-boot** (lib+bin): boot-time logic for ALL bank sets. Reads NV boot
   state, verifies image hashes, handles trial boot counting and auto-rollback.
 - **hsm** (lib): HSM management trait (`HsmProvider`, `HsmCryptoProvider`).
-  `SimHsm` (dev/test: vhsm-ssd + file keystore) works; `QnxHsm` is a stub.
+  `SimHsm` (dev/test: vhsm-ssd + file keystore) works; the hardware `HsmProvider`
+  (`HseHsmProvider`, S32G3 HSE) lives in `supernova-machine-manager`.
 - **vhsm-ssd** (lib+bin): host-side daemon terminating the v3 handle-based
   vHSM wire protocol from guest `/dev/vhsm`. Transport is TCP on a
   private host bridge (`vbr-vhsm`, 10.0.200.0/24, default bind

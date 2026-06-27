@@ -37,7 +37,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  vm-boot         Boot decisions, trial count, hash verify, │
 │  (lib+bin)       auto-rollback (all bank sets)             │
 │                                                            │
-│  hsm             HSM management: SimHsm (dev) / QnxHsm     │
+│  hsm             HSM management: SimHsm (dev) / HSE (hw)   │
 │  (lib)           (stub); HsmCryptoProvider trait           │
 │                                                            │
 │  vhsm-ssd        vHSM v3 daemon (handle-based protocol)    │
