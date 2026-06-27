@@ -24,6 +24,10 @@ pub mod key_unwrap;
 /// Link-B bridge: `HsmCryptoProvider` over the out-of-process link-B service.
 pub mod link_b;
 
+// The host-side full-`HsmProvider` adapter over a link-B client. Re-exported as
+// `hsm::LinkBProvider` (the client itself stays `hsm::link_b::LinkBClient`).
+pub use link_b::LinkBProvider;
+
 #[cfg(feature = "suit")]
 pub use key_unwrap::HsmKeyUnwrap;
 pub use types::*;

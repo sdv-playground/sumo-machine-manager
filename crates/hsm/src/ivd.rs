@@ -72,6 +72,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::{HsmError, HsmProvider, KeyRole};
+// The crypto-narrowed `*_crypto` variants take a `HsmCryptoProvider` and the
+// shared inner helpers name `KeyHandle` in their `sign`/`verify` closure bounds.
+// Both are only referenced from the `#[cfg(feature = "crypto")]` functions, so
+// the import is gated too (the whole sign/verify machinery already is).
+#[cfg(feature = "crypto")]
+use crate::{HsmCryptoProvider, KeyHandle};
 
 /// Slot key_id used by `hsm.sign(...)` / `hsm.verify(...)`. Mirrors
 /// `KeyRole::IvdSigning.key_id()`.
@@ -427,11 +433,36 @@ pub fn sign_bank(
     gen: u64,
     identity: IvdIdentity,
 ) -> Result<IvdManifest, IvdError> {
+    let (files, hash_ms) = collect_with_timing(bank_dir)?;
+    sign_bank_with_files(hsm, bank_dir, gen, identity, files, Some(hash_ms))
+}
+
+/// Crypto-narrowed [`sign_bank`]: same behaviour, but takes a
+/// [`HsmCryptoProvider`] (the link-B client view) instead of the
+/// lifecycle-bearing [`HsmProvider`]. Both share one body via
+/// [`sign_bank_with_files_inner`] — only the trait the `sign` op comes from
+/// differs.
+#[cfg(feature = "crypto")]
+pub fn sign_bank_crypto(
+    hsm: &dyn HsmCryptoProvider,
+    bank_dir: &Path,
+    gen: u64,
+    identity: IvdIdentity,
+) -> Result<IvdManifest, IvdError> {
+    let (files, hash_ms) = collect_with_timing(bank_dir)?;
+    sign_bank_with_files_crypto(hsm, bank_dir, gen, identity, files, Some(hash_ms))
+}
+
+/// Walk `bank_dir` hashing every file, returning the inventory plus the elapsed
+/// walk+hash time in ms — the shared dir-walk step of [`sign_bank`] /
+/// [`sign_bank_crypto`].
+#[cfg(feature = "crypto")]
+fn collect_with_timing(bank_dir: &Path) -> Result<(Vec<IvdFile>, u64), IvdError> {
     let hash_start = std::time::Instant::now();
     let mut files = Vec::new();
     collect_files(bank_dir, bank_dir, &mut files, true)?;
     let hash_ms = hash_start.elapsed().as_millis() as u64;
-    sign_bank_with_files(hsm, bank_dir, gen, identity, files, Some(hash_ms))
+    Ok((files, hash_ms))
 }
 
 /// Sign a bank using a pre-computed file inventory.
@@ -464,6 +495,51 @@ pub fn sign_bank_with_files(
     files: Vec<IvdFile>,
     walk_hash_ms: Option<u64>,
 ) -> Result<IvdManifest, IvdError> {
+    sign_bank_with_files_inner(
+        |handle, data| hsm.sign(handle, data),
+        bank_dir,
+        gen,
+        identity,
+        files,
+        walk_hash_ms,
+    )
+}
+
+/// Crypto-narrowed [`sign_bank_with_files`]: identical behaviour against a
+/// [`HsmCryptoProvider`] (the link-B client view). This is the OTA streaming
+/// path's crypto-only entry; shares the body via [`sign_bank_with_files_inner`].
+#[cfg(feature = "crypto")]
+pub fn sign_bank_with_files_crypto(
+    hsm: &dyn HsmCryptoProvider,
+    bank_dir: &Path,
+    gen: u64,
+    identity: IvdIdentity,
+    files: Vec<IvdFile>,
+    walk_hash_ms: Option<u64>,
+) -> Result<IvdManifest, IvdError> {
+    sign_bank_with_files_inner(
+        |handle, data| hsm.sign(handle, data),
+        bank_dir,
+        gen,
+        identity,
+        files,
+        walk_hash_ms,
+    )
+}
+
+/// Shared body of [`sign_bank_with_files`] / [`sign_bank_with_files_crypto`]:
+/// build + encode the manifest, `sign` its bytes (the lone HSM op, supplied as a
+/// closure so the same code serves both the `HsmProvider` and the
+/// `HsmCryptoProvider` `sign`), and write the two artefacts into `bank_dir`.
+#[cfg(feature = "crypto")]
+fn sign_bank_with_files_inner(
+    sign: impl FnOnce(KeyHandle, &[u8]) -> Result<Vec<u8>, HsmError>,
+    bank_dir: &Path,
+    gen: u64,
+    identity: IvdIdentity,
+    files: Vec<IvdFile>,
+    walk_hash_ms: Option<u64>,
+) -> Result<IvdManifest, IvdError> {
     let started = std::time::Instant::now();
 
     let manifest = build_manifest_from_files(files, gen, identity);
@@ -471,7 +547,7 @@ pub fn sign_bank_with_files(
     let hash_ms = walk_hash_ms.unwrap_or(0);
 
     let sig_start = std::time::Instant::now();
-    let sig = hsm.sign(KeyRole::IvdSigning.handle(), &manifest_bytes)?;
+    let sig = sign(KeyRole::IvdSigning.handle(), &manifest_bytes)?;
     let sig_ms = sig_start.elapsed().as_millis() as u64;
 
     fs::write(bank_dir.join(IVD_MANIFEST_FILE), &manifest_bytes)
@@ -519,8 +595,33 @@ pub fn verify_bank(
     bank_dir: &Path,
     pins: VerifyPins,
 ) -> Result<IvdManifest, IvdError> {
+    verify_bank_with(|h, d, s| hsm.verify(h, d, s), bank_dir, pins)
+}
+
+/// Crypto-narrowed [`verify_bank`]: identical behaviour against a
+/// [`HsmCryptoProvider`] (the link-B client view). Shares one body via
+/// [`verify_bank_with`] — only the trait the `verify` op comes from differs.
+#[cfg(feature = "crypto")]
+pub fn verify_bank_crypto(
+    hsm: &dyn HsmCryptoProvider,
+    bank_dir: &Path,
+    pins: VerifyPins,
+) -> Result<IvdManifest, IvdError> {
+    verify_bank_with(|h, d, s| hsm.verify(h, d, s), bank_dir, pins)
+}
+
+/// Shared body of [`verify_bank`] / [`verify_bank_crypto`]: run the inner verify
+/// (signature check + pins + re-hash) under the supplied `verify` closure,
+/// logging a single operator-visible failure line on the error paths (the inner
+/// records its own per-phase timings on success).
+#[cfg(feature = "crypto")]
+fn verify_bank_with(
+    verify: impl FnOnce(KeyHandle, &[u8], &[u8]) -> Result<bool, HsmError>,
+    bank_dir: &Path,
+    pins: VerifyPins,
+) -> Result<IvdManifest, IvdError> {
     let started = std::time::Instant::now();
-    let result = verify_bank_inner(hsm, bank_dir, pins, started);
+    let result = verify_bank_inner(verify, bank_dir, pins, started);
     if let Err(ref e) = result {
         // Inner records its own per-phase timings on success; on the
         // pre-signature error paths (file IO etc.) we still want a
@@ -539,7 +640,7 @@ pub fn verify_bank(
 
 #[cfg(feature = "crypto")]
 fn verify_bank_inner(
-    hsm: &dyn HsmProvider,
+    verify: impl FnOnce(KeyHandle, &[u8], &[u8]) -> Result<bool, HsmError>,
     bank_dir: &Path,
     pins: VerifyPins,
     started: std::time::Instant,
@@ -553,9 +654,7 @@ fn verify_bank_inner(
 
     // ---- Phase 1: signature verification ----
     let sig_start = std::time::Instant::now();
-    let ok = hsm
-        .verify(KeyRole::IvdSigning.handle(), &manifest_bytes, &sig)
-        .map_err(IvdError::Hsm)?;
+    let ok = verify(KeyRole::IvdSigning.handle(), &manifest_bytes, &sig).map_err(IvdError::Hsm)?;
     let sig_verify_ms = sig_start.elapsed().as_millis() as u64;
     if !ok {
         return Err(IvdError::SignatureInvalid);
@@ -1046,6 +1145,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&keystore);
     }
 
+    /// The crypto-narrowed variants (`sign_bank_crypto` / `verify_bank_crypto`)
+    /// take `&dyn HsmCryptoProvider` and share the `HsmProvider` body — a SimHsm
+    /// (which impls both traits) signs through one and verifies through both,
+    /// proving the bodies don't drift and the two trait views agree.
+    #[test]
+    fn sign_then_verify_roundtrips_crypto_variant() {
+        let bank = temp_bank("sign-verify-crypto");
+        write(&bank.join("kernel"), b"kernel bytes");
+        write(&bank.join("rootfs.img"), &vec![0xCD; 4096]);
+
+        let (hsm, keystore) = provisioned_sim("sign-verify-crypto");
+        // &SimHsm coerces to &dyn HsmCryptoProvider here (it impls both traits).
+        let crypto: &dyn HsmCryptoProvider = &hsm;
+        let manifest = sign_bank_crypto(crypto, &bank, 9, sample_identity()).unwrap();
+        assert_eq!(manifest.gen, 9);
+        assert!(bank.join(IVD_MANIFEST_FILE).exists());
+
+        let pins = VerifyPins {
+            expected_install_gen: Some(9),
+            min_committed_gen: Some(9),
+        };
+        // Signed via the crypto variant → verifiable via the crypto variant...
+        let back = verify_bank_crypto(crypto, &bank, pins).unwrap();
+        assert_eq!(back.gen, 9);
+        // ...and ALSO via the HsmProvider variant — same artefacts, same
+        // signature, no drift between the two entry points.
+        let back2 = verify_bank(&hsm, &bank, pins).unwrap();
+        assert_eq!(back2.gen, 9);
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
     #[test]
     fn verify_rejects_tampered_file() {
         let bank = temp_bank("tamper");
@@ -1310,13 +1442,15 @@ mod tests {
             vm.signature,
             std::fs::read(bank.join(IVD_SIGNATURE_FILE)).unwrap()
         );
-        assert!(hsm
-            .verify(
-                KeyRole::IvdSigning.handle(),
-                &vm.manifest_bytes,
-                &vm.signature
-            )
-            .unwrap());
+        // `HsmCryptoProvider` is now in scope here too (the crypto variants),
+        // so disambiguate this concrete-SimHsm call to the HsmProvider verify.
+        assert!(HsmProvider::verify(
+            &hsm,
+            KeyRole::IvdSigning.handle(),
+            &vm.manifest_bytes,
+            &vm.signature
+        )
+        .unwrap());
 
         let _ = std::fs::remove_dir_all(&bank);
         let _ = std::fs::remove_dir_all(&keystore);

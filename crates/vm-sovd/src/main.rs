@@ -391,6 +391,10 @@ async fn main() {
         health_probes: HashMap::new(),
         boot_selector: None,
         node_coordinator: Some(node_coordinator.clone()),
+        // S2: link-B reload hook unused here (SimHsm in-process restart is the
+        // default path); a link-B deployment sets this to drive an external
+        // daemon reload instead of the provider's no-op stop/start.
+        post_provision_reload: None,
     };
     for spec in &specs {
         if let Some(built) = build_component(spec, &deps) {

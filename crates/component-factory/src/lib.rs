@@ -130,6 +130,13 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// gate). When `Some`, each built component gets it via `with_node_coordinator`
     /// so its `start_flash` consults the node-wide gate; `None` leaves it inert.
     pub node_coordinator: Option<Arc<machine_mgr::node_update::NodeCoordinator>>,
+    /// Optional post-provision reload hook, passed to each built component's
+    /// `ComponentBackend` via `with_post_provision_reload`. When `Some`, the HSM
+    /// keystore-provision path calls it INSTEAD of the provider's `stop_service()`
+    /// then `start_service()` — for a link-B backend whose daemon lifecycle is
+    /// owned externally. `None` (the default) keeps today's in-process SimHsm
+    /// restart.
+    pub post_provision_reload: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
@@ -290,6 +297,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             if let Some(coord) = &deps.node_coordinator {
                 backend = backend.with_node_coordinator(coord.clone());
             }
+            if let Some(reload) = &deps.post_provision_reload {
+                backend = backend.with_post_provision_reload(reload.clone());
+            }
             let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
             let component: Arc<dyn Component> = Arc::new(comp);
 
@@ -386,6 +396,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             }
             if let Some(coord) = &deps.node_coordinator {
                 backend = backend.with_node_coordinator(coord.clone());
+            }
+            if let Some(reload) = &deps.post_provision_reload {
+                backend = backend.with_post_provision_reload(reload.clone());
             }
             let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
             let mut component_inner = ComponentAdapter::new(backend_arc.clone());

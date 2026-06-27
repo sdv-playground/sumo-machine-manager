@@ -401,6 +401,17 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// replace the whole provider — anything after `with_bank_provider` that
     /// would rebuild is intentionally ignored.
     bank_provider_override: bool,
+    /// Optional hook invoked INSTEAD OF `stop_service()` + `start_service()`
+    /// after a successful HSM keystore provision (the `finalize_flash` HSM
+    /// path). `None` (the default) keeps today's EXACT behaviour: the in-process
+    /// service is restarted so it reloads the freshly-written keystore (SimHsm
+    /// re-spawns vhsm-ssd; a no-op for HSE). `Some` — set for a link-B backend
+    /// whose daemon lifecycle is owned EXTERNALLY (its provider's stop/start are
+    /// themselves no-ops) — runs the orchestrator-supplied reload instead, e.g.
+    /// signalling the daemon to re-read its keystore. Threaded from
+    /// `FactoryDeps::post_provision_reload` via
+    /// [`with_post_provision_reload`](Self::with_post_provision_reload).
+    post_provision_reload: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
@@ -551,6 +562,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             bank_provider,
             bank_provider_override: false,
             node_coordinator: None,
+            post_provision_reload: None,
         };
         // Populate DID cache from NV once at construction time. After this,
         // SOVD reads of NV-backed DIDs hit RAM only — see refresh_did_cache.
@@ -576,6 +588,17 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         coordinator: Arc<machine_mgr::node_update::NodeCoordinator>,
     ) -> Self {
         self.node_coordinator = Some(coordinator);
+        self
+    }
+
+    /// Set the post-provision reload hook. When set, the HSM provision path
+    /// (`finalize_flash`) calls this hook INSTEAD of `stop_service()` +
+    /// `start_service()` — for a link-B backend whose daemon lifecycle is owned
+    /// by the orchestrator, not the provider (whose own stop/start are no-ops).
+    /// Leaving it unset (the default) keeps the in-process SimHsm restart, byte
+    /// for byte. Threaded from `FactoryDeps::post_provision_reload`.
+    pub fn with_post_provision_reload(mut self, reload: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.post_provision_reload = Some(reload);
         self
     }
 
@@ -3010,21 +3033,40 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                                 BackendError::Internal(format!("HSM provision: {e}"))
                             })?;
 
-                            // Restart the HSM service so it reloads with the
-                            // freshly-written keystore. The daemon was already
-                            // running (Component::start brought it up at boot)
-                            // but holds the old/empty keystore in memory until
-                            // re-spawned. Backend-agnostic — no-op for HSE.
-                            match hsm_guard.stop_service() {
-                                Ok(()) | Err(hsm::HsmError::NotRunning) => {}
-                                Err(e) => tracing::warn!("stop HSM service post-provision: {e}"),
-                            }
-                            match hsm_guard.start_service() {
-                                Ok(port) => {
-                                    tracing::info!(port, "HSM service restarted post-provision")
+                            // Reload the HSM so it picks up the freshly-written
+                            // keystore. The daemon was already running
+                            // (Component::start brought it up at boot) but holds
+                            // the old/empty keystore in memory until reloaded.
+                            //
+                            // Default (no reload hook): restart the in-process
+                            // service — stop+start re-spawns vhsm-ssd against the
+                            // new keystore (SimHsm); backend-agnostic, a no-op for
+                            // HSE. When a `post_provision_reload` hook IS set (a
+                            // link-B backend whose daemon lifecycle is owned
+                            // externally, so the provider's own stop/start are
+                            // no-ops), call it INSTEAD — the orchestrator owns the
+                            // reload.
+                            if let Some(ref reload) = self.post_provision_reload {
+                                reload();
+                                tracing::info!(
+                                    "HSM reloaded via post-provision hook (external daemon lifecycle)"
+                                );
+                            } else {
+                                match hsm_guard.stop_service() {
+                                    Ok(()) | Err(hsm::HsmError::NotRunning) => {}
+                                    Err(e) => {
+                                        tracing::warn!("stop HSM service post-provision: {e}")
+                                    }
                                 }
-                                Err(hsm::HsmError::AlreadyRunning) => {}
-                                Err(e) => tracing::warn!("start HSM service post-provision: {e}"),
+                                match hsm_guard.start_service() {
+                                    Ok(port) => {
+                                        tracing::info!(port, "HSM service restarted post-provision")
+                                    }
+                                    Err(hsm::HsmError::AlreadyRunning) => {}
+                                    Err(e) => {
+                                        tracing::warn!("start HSM service post-provision: {e}")
+                                    }
+                                }
                             }
 
                             // Load keys from HSM into manifest provider.

@@ -34,6 +34,12 @@ pub struct ComponentAdapter<D: BlockDevice + Send + 'static> {
     /// TCP port the HSM service listens on. Required by `SimHsm::new` even
     /// when only used for CSR signing.
     csr_hsm_port: u16,
+    /// Optional crypto provider for the HSM read/CSR ops (`get_csr`,
+    /// `list_keys`, `get_device_id`). When `Some` (e.g. a link-B client), those
+    /// ops route through it IN PREFERENCE to spinning up a transient `SimHsm`
+    /// over `csr_keystore`; when `None` the keystore-backed path runs exactly as
+    /// before. Set via [`Self::with_csr_crypto`].
+    csr_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
 }
 
 impl<D: BlockDevice + Send + Sync + 'static> ComponentAdapter<D> {
@@ -44,6 +50,7 @@ impl<D: BlockDevice + Send + Sync + 'static> ComponentAdapter<D> {
             capabilities,
             csr_keystore: None,
             csr_hsm_port: 0,
+            csr_crypto: None,
         }
     }
 
@@ -53,6 +60,25 @@ impl<D: BlockDevice + Send + Sync + 'static> ComponentAdapter<D> {
         self.csr_keystore = Some(keystore);
         self.csr_hsm_port = hsm_port;
         // Reflect the new capability.
+        if let Some(ref mut caps) = self.capabilities.hsm {
+            caps.supports_csr = true;
+        } else {
+            self.capabilities.hsm = Some(HsmCaps {
+                supports_csr: true,
+                supports_key_install: false,
+            });
+        }
+        self
+    }
+
+    /// Inject a crypto provider (e.g. a link-B-backed `LinkBClient` /
+    /// `LinkBProvider`) used by `get_csr` / `list_keys` / `get_device_id` IN
+    /// PREFERENCE to a transient `SimHsm` over `csr_keystore`. Also flips
+    /// `Capabilities.hsm.supports_csr` (like [`Self::with_csr_keystore`]) so the
+    /// capability stays honest even without a keystore. `None` (the default)
+    /// keeps the keystore-backed path.
+    pub fn with_csr_crypto(mut self, crypto: Arc<dyn hsm::HsmCryptoProvider>) -> Self {
+        self.csr_crypto = Some(crypto);
         if let Some(ref mut caps) = self.capabilities.hsm {
             caps.supports_csr = true;
         } else {
@@ -322,72 +348,93 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
     // ---------------------------------------------------------------
 
     async fn get_csr(&self, key_id: &str) -> MachineResult<Csr> {
-        let keystore = self
-            .csr_keystore
-            .as_ref()
-            .ok_or(MachineError::NotSupported(
-                "get_csr (no keystore configured)",
-            ))?;
+        use hsm::HsmCryptoProvider;
 
         // No provisioning-state gate: a device may re-provision with fresh certs
         // whenever it wants, and identity keys generated DURING provisioning
-        // (e.g. tls-identity) can only be CSR'd afterwards. The key must exist in
-        // the keystore — generate_csr fails with KeyNotFound otherwise.
-        //
-        // Transient SimHsm just for CSR signing; the keystore on disk is the
-        // authoritative state. The CSR subject CN is the key_id (self-describing);
-        // the issuing CA sets the real cert subject to the device id regardless.
-        let tmp =
-            hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
-        use hsm::HsmCryptoProvider;
+        // (e.g. tls-identity) can only be CSR'd afterwards. The key must exist —
+        // generate_csr fails with KeyNotFound otherwise. The CSR subject CN is
+        // the key_id (self-describing); the issuing CA sets the real cert subject
+        // to the device id regardless.
         let handle = hsm::vhsm_proto::handle_for_key_id(key_id)
             .map(hsm::KeyHandle)
             .ok_or_else(|| {
                 MachineError::Internal(format!("CSR for unknown key slot '{key_id}'"))
             })?;
-        let der = tmp
-            .generate_csr(handle, key_id)
-            .map_err(|e| MachineError::Internal(format!("csr generation failed: {e}")))?;
+
+        // Prefer the injected crypto provider (e.g. link-B); else spin up a
+        // transient SimHsm over the on-disk keystore (the authoritative state
+        // for that fallback path).
+        let der = if let Some(ref crypto) = self.csr_crypto {
+            crypto.generate_csr(handle, key_id)
+        } else {
+            let keystore = self.csr_keystore.as_ref().ok_or(MachineError::NotSupported(
+                "get_csr (no keystore configured)",
+            ))?;
+            let tmp =
+                hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
+            tmp.generate_csr(handle, key_id)
+        }
+        .map_err(|e| MachineError::Internal(format!("csr generation failed: {e}")))?;
         Ok(Csr::from_bytes(der))
     }
 
     async fn list_keys(&self) -> MachineResult<KeyInventory> {
-        let keystore = self
-            .csr_keystore
-            .as_ref()
-            .ok_or(MachineError::NotSupported(
-                "list_keys (no keystore configured)",
-            ))?;
+        use hsm::{HsmCryptoProvider, HsmProvider};
+
         // The device reports its own provisioning state — no inference.
         let provisioned = matches!(
             self.inner.hsm_provisioning_state(),
             Some(Ok(hsm::ProvisioningState::Provisioned))
         );
-        let tmp =
-            hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
-        use hsm::{HsmCryptoProvider, HsmProvider};
-        let keys = tmp
-            .list_keys()
-            .map_err(|e| MachineError::Internal(format!("list keys failed: {e}")))?
-            .into_iter()
-            .map(|k| {
-                // Public-only: the SPKI for asymmetric slots (safe to return),
-                // never any private bytes; None for symmetric keys.
-                let public_key = match k.key_type {
-                    hsm::KeyType::EcP256 | hsm::KeyType::Ed25519 => {
-                        tmp.get_public_key_der(k.handle).ok()
-                    }
-                    _ => None,
-                };
-                KeyDescriptor {
-                    key_id: k.key_id,
-                    key_type: key_type_label(k.key_type).to_string(),
-                    has_certificate: k.has_certificate,
-                    allowed_ops: k.allowed_ops,
-                    public_key,
-                }
-            })
-            .collect();
+
+        // Shared KeyInfo → public-only KeyDescriptor mapping; `public_key` is the
+        // already-resolved SPKI for asymmetric slots (safe to return), never any
+        // private bytes.
+        let to_descriptor = |k: hsm::KeyInfo, public_key: Option<Vec<u8>>| KeyDescriptor {
+            key_id: k.key_id,
+            key_type: key_type_label(k.key_type).to_string(),
+            has_certificate: k.has_certificate,
+            allowed_ops: k.allowed_ops,
+            public_key,
+        };
+        let wants_pubkey =
+            |t: hsm::KeyType| matches!(t, hsm::KeyType::EcP256 | hsm::KeyType::Ed25519);
+
+        // Prefer the injected crypto provider. HsmCryptoProvider has no
+        // list_keys, so enumerate the well-known sumo-core slot registry and
+        // keep the slots the backend actually has (get_key_info → KeyNotFound
+        // for absent ones). Else fall back to the transient SimHsm, which reads
+        // the on-disk keystore's slots directly.
+        let keys: Vec<KeyDescriptor> = if let Some(ref crypto) = self.csr_crypto {
+            hsm::vhsm_proto::SUMO_CORE_SLOTS
+                .iter()
+                .filter_map(|slot| {
+                    let handle = hsm::KeyHandle(slot.handle);
+                    let info = crypto.get_key_info(handle).ok()?;
+                    let public_key = wants_pubkey(info.key_type)
+                        .then(|| crypto.get_public_key_der(handle).ok())
+                        .flatten();
+                    Some(to_descriptor(info, public_key))
+                })
+                .collect()
+        } else {
+            let keystore = self.csr_keystore.as_ref().ok_or(MachineError::NotSupported(
+                "list_keys (no keystore configured)",
+            ))?;
+            let tmp =
+                hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
+            tmp.list_keys()
+                .map_err(|e| MachineError::Internal(format!("list keys failed: {e}")))?
+                .into_iter()
+                .map(|k| {
+                    let public_key = wants_pubkey(k.key_type)
+                        .then(|| tmp.get_public_key_der(k.handle).ok())
+                        .flatten();
+                    to_descriptor(k, public_key)
+                })
+                .collect()
+        };
         Ok(KeyInventory { provisioned, keys })
     }
 
@@ -395,13 +442,22 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
     /// token `aud`). Read-only identity, served whether or not the device is
     /// provisioned — the device key exists from first boot, so no CSR-style gate.
     async fn get_device_id(&self) -> MachineResult<Option<String>> {
-        let Some(keystore) = self.csr_keystore.as_ref() else {
-            return Ok(None);
-        };
-        let tmp =
-            hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
         use hsm::HsmCryptoProvider;
-        match tmp.get_public_key_der(hsm::KeyRole::DeviceDecryption.handle()) {
+        let handle = hsm::KeyRole::DeviceDecryption.handle();
+
+        // Prefer the injected crypto provider; else a transient SimHsm over the
+        // keystore. With neither configured there's no device key to read.
+        let der = if let Some(ref crypto) = self.csr_crypto {
+            crypto.get_public_key_der(handle)
+        } else {
+            let Some(keystore) = self.csr_keystore.as_ref() else {
+                return Ok(None);
+            };
+            let tmp =
+                hsm::sim::SimHsm::new(PathBuf::from("unused"), keystore.clone(), self.csr_hsm_port);
+            tmp.get_public_key_der(handle)
+        };
+        match der {
             Ok(der) => Ok(Some(crate::sovd::identity::ecu_id_from_spki_der(&der))),
             Err(_) => Ok(None),
         }
