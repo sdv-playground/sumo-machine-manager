@@ -390,12 +390,8 @@ impl HsmCryptoProvider for LinkBClient {
 /// unknown ops answer `ST_NOT_SUPPORTED`. A request whose payload doesn't match
 /// the op's layout answers `ST_PROTOCOL_ERROR`.
 pub fn serve_crypto(mut stream: UnixStream, backend: &dyn HsmCryptoProvider) {
-    loop {
-        let (op, _flags, payload) = match read_frame(&mut stream) {
-            Ok(frame) => frame,
-            // Clean EOF (peer dropped) or a transport error: stop serving.
-            Err(_) => break,
-        };
+    // Read frames until the peer drops (clean EOF) or a transport error.
+    while let Ok((op, _flags, payload)) = read_frame(&mut stream) {
         let (status, result) = match run_crypto_op(op, &payload, backend) {
             Ok(Ok(result)) => (ST_OK, result),
             Ok(Err(e)) => (status_from_error(&e), error_message_bytes(&e)),
