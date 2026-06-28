@@ -1,6 +1,6 @@
 //! vHSM wire protocol types (v3) — matches `vhsm_proto.h` exactly.
 //!
-//! See `specs/vhsm/protocol.md` (VHSM-PROTO-002) for the full specification.
+//! See `specs/vhsm/protocol.md` (VHSM-PROTO-003) for the full specification.
 //!
 //! This is the **authoritative** Rust wire definition, shared by the host daemon
 //! (`vhsm-ssd`) and clients (`vhsm-client`); mirrored in `vhsm_proto.h` (C) and
