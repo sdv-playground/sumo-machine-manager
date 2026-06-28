@@ -6,10 +6,10 @@
 The in-process Path-1 driver (`hse-s32g3`) is **retired** — a hardware HSM is now an
 out-of-process C service.
 **Audience:** hardware-HSM implementers — including the C-side HSE author — and reviewers.
-**Companions:** `hsm-contents.md` (the slot *inventory* — what keys the HSM holds) and
-`authorization.md` (the link-A guest auth) — both in the workspace `docs/design/` — and
-[`vhsm-integration-path.md`](./vhsm-integration-path.md) (the end-to-end guest→host→device
-path + how to verify a backend). The frozen wire, the C contract, and the vendor skeleton
+**Companions** (alongside): [`hsm-contents.md`](./hsm-contents.md) (the slot *inventory* — what
+keys the HSM holds) and [`vhsm-integration-path.md`](./vhsm-integration-path.md) (the end-to-end
+guest→host→device path + how to verify a backend); plus `authorization.md` (the link-A guest
+auth) in the workspace `docs/design/`. The frozen wire, the C contract, and the vendor skeleton
 live in `crates/hsm-link-b` (`src/lib.rs`, `include/hsm_link_b.h`, `reference/`); the
 conformance suite is `tools/crates/hsm-conformance`.
 
