@@ -84,7 +84,8 @@ command runs, and nothing above link B can tell them apart. Both must pass `hsm-
 the sim does, the *stub* C skeleton does not (its crypto is unimplemented) — which is how the
 suite proves it checks crypto, not just framing.
 
-**Production ownership:** the **orchestrator** (e.g. supernova, or `example/run.sh`) spawns
+**Production ownership:** the **orchestrator** (`example/run.sh` in dev; the production host
+machine manager otherwise) spawns
 and owns the backend service, and `vhsm-ssd` runs **connect-only** (`--backend-connect-only`
 + `--backend-socket`) against that pre-spawned socket — it never spawns or kills the backend.
 As a dev/standalone convenience `vhsm-ssd` can instead spawn the backend itself

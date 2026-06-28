@@ -20,7 +20,7 @@ Across the whole workspace the deployed SOVD-API servers are:
 |---|---|---|---|---|---|
 | 1 | `vm-sovd` (default mode) | sumo-mm | host (dev/sim) | `0.0.0.0:4000` | host-owned components (host-os, vm1, vm2, hsm) + OTA |
 | 2 | `vm-sovd --gateway` | sumo-mm | in-VM **or** on-host | `0.0.0.0:9300` (example) | guest components + onboard pull-update + proxy of host components |
-| 3 | `supernova` (`supernova-machine-manager`) | sibling | host (production) | `0.0.0.0:4000` | production counterpart of #1 (same routes, real HSM, auth) |
+| 3 | the production host server | vendor-private sibling | host (production) | `0.0.0.0:4000` | production counterpart of #1 — same routes, real HSM, auth |
 | 4 | `sovdd` | SOVDd | standalone | `0.0.0.0:18081` (mock) | reference SOVD server (UDS↔REST, gateway, proxy) |
 | 5 | `example-app` | SOVDd | standalone | `0.0.0.0:4001` | reference app-entity (tier-1 supplier) server |
 
@@ -61,9 +61,9 @@ repo — that serve the **same** wire from the **same** route library.
   (bind `:4001`) by `examples/campaign/start-ecus.sh`, the `tests/` e2e harness,
   and the workspace-root `compose.yaml`.
 
-### `supernova` (production) — `components/supernova-machine-manager` (sibling repo)
+### The production host server — a vendor-private sibling repo (not in this tree)
 
-- **Crate / bin:** `supernova-machine-manager` / bin `supernova`.
+- **Crate / bin:** a vendor-private machine-manager (sibling repo; not in this tree).
 - **Runs on:** the production host (real platform; HSE HSM backend, embedded
   `vm-service` lifecycle API + `host-metrics`).
 - **Serves:** the production counterpart of `vm-sovd` — the same
@@ -78,8 +78,8 @@ repo — that serve the **same** wire from the **same** route library.
   `axum::serve` at `src/main.rs:2200`.
 - **Launched by:** a respawn loop with a TOML config — the `qemu-cvc` Docker
   entrypoint (`examples/qemu-cvc/entrypoint.sh`) for the emulated device, and
-  `managed-qnx71/start.sh` → `bank_a/start.sh` on the rig (deployed by
-  `examples/tower-provision/build-and-deploy-supernova.sh`).
+  `managed-qnx71/start.sh` → `bank_a/start.sh` on the rig (deployed by the
+  `tower-provision` example).
 
 ---
 
@@ -217,9 +217,9 @@ diagnostic API — they back the diagnostic flow.
 
 Listed to prevent confusion — these bind ports but are **not** SOVD:
 
-- `vm-service` (this repo; also embedded in `supernova`) — QEMU/qvm lifecycle
+- `vm-service` (this repo; also embedded in the production host server) — QEMU/qvm lifecycle
   control API (`/start`, `/restart`).
-- `host-metrics` (this repo; also embedded in `supernova`) — Prometheus
+- `host-metrics` (this repo; also embedded in the production host server) — Prometheus
   `GET /metrics`.
 - `vhsm-ssd` (this repo) — the vHSM v3 wire daemon (TCP `:5100` on the `vbr-vhsm`
   bridge).
