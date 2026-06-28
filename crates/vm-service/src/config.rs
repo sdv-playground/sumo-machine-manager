@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Deserialize)]
 pub struct VmServiceConfig {
     /// TCP bind address for the control API (e.g. "127.0.0.1:9101").
-    /// Localhost-only by default — clients (component-mgr inside supernova,
+    /// Localhost-only by default — clients (component-mgr inside the host,
     /// CLI tools on the host) reach it over loopback.
     ///
     /// Originally a Unix socket path (`socket: ...`); switched to TCP
@@ -41,9 +41,9 @@ pub struct VmServiceConfig {
 /// One transport per vm-service instance. All VMs share it; channels are
 /// keyed by `(vm, device, channel)` so namespace collisions can't happen.
 //
-// dead_code: `QvmShmem` is constructed by supernova-mm (which links
+// dead_code: `QvmShmem` is constructed by the host machine manager (which links
 // libhyp), not by vm-service's own build path. The vm-service binary's
-// dead-code pass doesn't see those fields read; supernova-mm does.
+// dead-code pass doesn't see those fields read; the host machine manager does.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 #[allow(dead_code)]
@@ -63,7 +63,7 @@ pub enum DeviceTransportConfig {
     Http { bind: String },
     /// QNX hypervisor `vdev shmem` — zero-copy cross-VM transport via
     /// libhyp on the host side and qvm-shmem.ko (Linux guest) or
-    /// vm-guest-pci (QNX guest). Construction lives in supernova-mm
+    /// vm-guest-pci (QNX guest). Construction lives in the host machine manager
     /// because it links the proprietary `libhyp.a`; vm-service's
     /// `build_device_transport` returns `None` for this variant and
     /// expects the embedding binary to construct the transport itself
@@ -93,7 +93,7 @@ pub enum DeviceTransportConfig {
 }
 
 /// Per-VM slot pair for qvm-shmem regions. Mirrors
-/// `qnx_devices::qvm_transport::VmSlots` shape so the supernova-mm
+/// `qnx_devices::qvm_transport::VmSlots` shape so the host machine manager
 /// translation is field-for-field.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 pub struct VmSlots {
@@ -168,13 +168,13 @@ pub struct VmDefinition {
     /// live under.
     ///
     /// The actual bank dir launched is resolved from [`Self::bank`] —
-    /// `base/bank_a` or `base/bank_b`. The boot selector (via supernova)
+    /// `base/bank_a` or `base/bank_b`. The boot selector (via the host)
     /// is the authority for which bank; `start_vm` rewrites `image_dir`
     /// to the resolved bank dir before the runner spawns, so
     /// `kernel_path` / `rootfs_path` / `partition_path` all resolve
     /// against the right bank.
     pub image_dir: PathBuf,
-    /// Which A/B bank this VM launches from. Runtime-set by supernova
+    /// Which A/B bank this VM launches from. Runtime-set by the host
     /// (from the boot selector) via [`crate::manager::VmManager::set_vm_bank`]
     /// right before `start_vm`; never present in YAML (`#[serde(skip)]`).
     /// `None` means "no active bank for this VM" — `start_vm` skips the
@@ -246,15 +246,15 @@ pub enum BackendType {
 
 /// Which A/B bank a VM launches from. vm-service's own minimal mirror of
 /// `nv_store::types::Bank` — vm-service has no nv-store dependency (it's the
-/// platform-agnostic lifecycle layer), so supernova maps `nv_store::Bank` →
+/// platform-agnostic lifecycle layer), so the host maps `nv_store::Bank` →
 /// this enum when it hands a launch its selector-chosen bank. `bank_a` / `bank_b`
 /// match the on-disk dir names the OTA writes and `component_mgr::bank_provider`'s
 /// `bank_dir_name`.
 //
-// dead_code: the `A`/`B` variants are constructed by supernova-mm (which maps
+// dead_code: the `A`/`B` variants are constructed by the host machine manager (which maps
 // `nv_store::Bank` into them before `set_vm_bank`), not by vm-service's own
 // `bin` path. The bin's dead-code pass doesn't see those constructions; the
-// lib tests + supernova-mm do. Same posture as `BackendType` /
+// lib tests + the host machine manager do. Same posture as `BackendType` /
 // `DeviceTransportConfig::QvmShmem` above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]

@@ -46,7 +46,7 @@ pub struct MachineRegistry {
     /// signer are chosen at construction (see
     /// [`with_selector_store`](MachineRegistryBuilder::with_selector_store)):
     /// the default is the loud production stubs
-    /// ([`StubSelectorStore`] / [`StubSigner`]); supernova-mm swaps in a
+    /// ([`StubSelectorStore`] / [`StubSigner`]); the host machine manager swaps in a
     /// file-backed store on the host/sim.
     ///
     /// TODO: wire component activate()->stage() and campaign commit->seal()/

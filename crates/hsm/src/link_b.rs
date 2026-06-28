@@ -553,7 +553,7 @@ impl HsmCryptoProvider for LinkBClient {
 /// A full [`HsmProvider`] backed by a [`LinkBClient`] — i.e. the out-of-process
 /// link-B service IS the HSM. This is the host-side handle the OTA /
 /// provisioning machinery holds (as `Arc<Mutex<dyn HsmProvider>>`) once the
-/// backend is a link-B daemon rather than an in-process [`crate::sim::SimHsm`].
+/// backend is a link-B daemon rather than an in-process `SimHsm`.
 ///
 /// Delegation map: every [`HsmProvider`] method (`is_provisioned`, `provision`,
 /// `list_keys`, `provisioning_state`, `arm_enrollment`, `is_enrolled`,

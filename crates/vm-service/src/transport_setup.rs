@@ -2,7 +2,7 @@
 //! its accompanying server if any.
 //!
 //! Lives here (in vm-service's lib) so both the `vm-service` binary and
-//! `supernova-machine-manager` (which embeds `VmManager` in-process) can
+//! the host machine manager (which embeds `VmManager` in-process) can
 //! share one code path. Without this, we'd duplicate the match-on-config
 //! logic across both call sites and drift over time.
 //!
@@ -10,7 +10,7 @@
 //! `VmManager::new`. The transport's HTTP server (when applicable) runs
 //! on a tokio task tied to the current runtime — drop the runtime to
 //! shut it down. There's deliberately no graceful shutdown handle today;
-//! vm-service / supernova are long-lived processes and the OS reaps the
+//! vm-service / the host are long-lived processes and the OS reaps the
 //! listener when the process exits.
 
 use std::sync::Arc;
@@ -71,7 +71,7 @@ pub async fn build_device_transport(
         }
         Some(DeviceTransportConfig::QvmShmem { .. }) => {
             // QvmShmemTransport links libhyp.a (proprietary QNX SDP) and
-            // therefore lives in supernova-machine-manager / qnx-devices,
+            // therefore lives in the host machine manager / qnx-devices,
             // not here. The embedding binary detects this variant in its
             // own startup, constructs the transport, and passes it to
             // VmManager::with_device_transport(...) instead of going

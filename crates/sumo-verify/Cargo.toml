@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 # All the IVD wire format + sig verify lives in hsm::ivd. We construct
-# a SimHsm pointing at the same keystore supernova uses and call
+# a SimHsm pointing at the same keystore the host uses and call
 # verify_bank directly — no vhsm-ssd hop needed for the host-side
 # verifier.
 hsm = { path = "../hsm", features = ["crypto"] }

@@ -51,7 +51,7 @@ pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     /// HSM provider — the provisioning authority `seal` gates on
     /// (`is_provisioned()`); IVD signing itself goes through `hsm_crypto`.
     hsm: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
-    /// Crypto handle (e.g. supernova's shared link-B `LinkBClient`, or a SimHsm)
+    /// Crypto handle (e.g. the host's shared link-B `LinkBClient`, or a SimHsm)
     /// `seal` uses to sign the IVD manifest via `ivd::sign_bank_crypto`. Required
     /// for sealing a real bank — `seal` errors when it's `None`. The
     /// `is_provisioned()` pre-sign guard stays on `hsm`. Set via
@@ -131,7 +131,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         }
     }
 
-    /// Inject the crypto handle (e.g. supernova's shared link-B `LinkBClient`, or
+    /// Inject the crypto handle (e.g. the host's shared link-B `LinkBClient`, or
     /// a SimHsm) [`seal`](Self::seal) signs the IVD manifest with, via
     /// `ivd::sign_bank_crypto` (its lone `sign` op over `HsmCryptoProvider`); the
     /// `is_provisioned()` pre-sign guard stays on `hsm`. Required for sealing a

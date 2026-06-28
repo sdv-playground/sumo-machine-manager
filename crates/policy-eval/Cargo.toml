@@ -2,7 +2,7 @@
 name = "policy-eval"
 version = "0.1.0"
 edition = "2021"
-description = "Shared policy schema + evaluator for sumo / supernova services"
+description = "Shared policy schema + evaluator for sumo / host services"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

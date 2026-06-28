@@ -79,7 +79,7 @@ async fn main() {
     tracing::info!("loaded config: {} VMs, bind: {}", vm_count, bind_addr,);
 
     // VmManager builds the device-transport from `config.device_transport`
-    // internally. supernova-machine-manager (which embeds VmManager
+    // internally. The host machine manager (which embeds VmManager
     // in-process) goes through the same constructor, so transport setup
     // is consistent across both binaries.
     let manager = Arc::new(Mutex::new(manager::VmManager::new(config).await));

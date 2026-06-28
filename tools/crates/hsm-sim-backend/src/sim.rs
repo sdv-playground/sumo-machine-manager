@@ -43,7 +43,7 @@ use hsm::{HsmError, HsmProvider, KeyHandle, KeyInfo, KeyRole, KeyType, Provision
 ///
 /// It is purely a keystore + crypto over `keystore_path` — it owns no service
 /// lifecycle. The link-B service (`hsm-sim-service`) and the host's daemon
-/// supervision (supernova) live outside it.
+/// supervision (the host) live outside it.
 pub struct SimHsm {
     /// Keystore directory (e.g. /tmp/vhsm-keys).
     keystore_path: PathBuf,
@@ -573,7 +573,7 @@ impl SimHsm {
 
         // Internal SimHsm flow: extracting the bootstrap device key
         // here is fine because we own the keystore on disk and the
-        // file IS the key. Outside callers (component-mgr, supernova) must
+        // file IS the key. Outside callers (component-mgr, the host) must
         // use the operation-based unwrap_cek_*() trait methods.
         let unwrap = sumo_onboard::decryptor::InMemoryKeyUnwrap::new(&device_key, &crypto);
         let mut decryptor = StreamingDecryptor::new(&manifest, 0, &unwrap, &crypto)

@@ -51,7 +51,7 @@ use crate::proto::{AuthFailReason, Op, Request, Response, StatusCode};
 ///
 /// Implementations are expected to be small, in-memory lookups
 /// against an operator-configured table (e.g. `hsm.allow:` entries
-/// in supernova-mm's config.yaml). A reverse-DNS or kernel-side
+/// in the host machine manager's config.yaml). A reverse-DNS or kernel-side
 /// lookup is NOT appropriate — the daemon needs the same view of
 /// identity that component-mgr's `arm_enrollment` used.
 pub trait IpResolver: Send + Sync {

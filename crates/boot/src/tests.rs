@@ -753,7 +753,7 @@ fn selector_global_rollback_reverts_every_trialed_set_at_once() {
 fn selector_absent_primary_falls_back_to_nv() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // Selector attached but NOT seeded — PRIMARY absent (first boot before
-    // supernova seeds it). Must behave exactly like the NV path.
+    // the host seeds it). Must behave exactly like the NV path.
     assert!(store.read_primary().is_none());
 
     let actions = mgr.process_boot().unwrap();

@@ -2,7 +2,7 @@
 //!
 //! Picked by `host_metrics::default_reader()` based on `target_os`.
 //! Production hardware readers (board-specific, like NXP S32G3) live
-//! outside this crate — in `supernova-machine-manager` — and implement
+//! outside this crate — in the host machine manager — and implement
 //! the same trait. They typically wrap the platform default and add
 //! board-specific metrics on top.
 

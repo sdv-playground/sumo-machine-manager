@@ -13,10 +13,10 @@
 //!
 //! - **`IvdBankProvider`** (component-mgr, the default): signed CBOR manifest in a bank
 //!   dir + NV boot-state; the boot selector is the bank authority. VMs / host-os / hsm.
-//! - **`RtBankProvider`** (supernova-mm): a raw partition — one sector for the
+//! - **`RtBankProvider`** (the host machine manager): a raw partition — one sector for the
 //!   bank selector, one for the SHA, `m7loader` to activate.
 //!
-//! Lives in `machine-mgr` so host-os-mgr, component-mgr and supernova-mm can all
+//! Lives in `machine-mgr` so host-os-mgr, component-mgr and the host machine manager can all
 //! implement it without circular deps. The implementor holds its own NV / HSM /
 //! disk handles, so these signatures stay free of those crates.
 

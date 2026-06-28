@@ -27,7 +27,7 @@
 //!         The verifier couldn't run; treat as launch-blocking.
 //!
 //! On managed-cvc (no real secure boot), `start-managed.sh` runs this
-//! after `supernova` comes up, once per VM bank; only the banks that
+//! after the host comes up, once per VM bank; only the banks that
 //! exit 0 get a corresponding `POST /vm/<id>/start`. See
 //! `tasks/qnx-sumo-ctl-resmgr-backend.md` follow-up for the integration.
 
@@ -56,7 +56,7 @@ Arguments:
   --bank <dir>                Bank directory to verify (contains
                               ivd-manifest.cbor + ivd-signature.bin
                               and the payload files they cover).
-  --keystore <dir>            HSM keystore root — same path supernova
+  --keystore <dir>            HSM keystore root — same path the host
                               uses. SimHsm reads the ivd-signing
                               public half from
                               <keystore>/keys/ivd-signing.pub.

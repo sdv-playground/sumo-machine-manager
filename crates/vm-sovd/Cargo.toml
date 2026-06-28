@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 # The simulated-ECU SOVD/OTA server. Lives ABOVE the engine (component-mgr) and the
 # component-factory so it can compose components through the SAME factory
-# supernova-mm uses — no hand-rolled, double-maintained composition.
+# the host machine manager uses — no hand-rolled, double-maintained composition.
 [dependencies]
 component-mgr = { path = "../component-mgr" }
 component-factory = { path = "../component-factory" }

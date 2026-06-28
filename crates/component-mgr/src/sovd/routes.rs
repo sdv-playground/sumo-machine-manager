@@ -4,8 +4,8 @@
 //! These vendor extensions live in sumo-mm (not SOVDd) per the
 //! three-layer rule in `tasks/iso-17978-compliance.md` §1 — SOVDd stays
 //! ISO 17978-3 spec-pure and replaceable.  Binaries (the `vm-sovd` bin
-//! shipped here, plus closed-source variants like
-//! supernova-machine-manager) merge these routes into their own router
+//! shipped here, plus closed-source production variants) merge these
+//! routes into their own router
 //! to expose the same wire.
 
 use std::sync::{Arc, Mutex};

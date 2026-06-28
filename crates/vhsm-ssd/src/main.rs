@@ -94,7 +94,7 @@ impl EcuSigner for HsmIamSigner {
 
 /// In-process IP→vm_id resolver. Populated from `--ip-map` CLI args
 /// (or, when SimHsm is the spawner, from `hsm.allow:` entries in the
-/// supernova-mm config that already enumerate the same `(ip, vm_id)`
+/// the host machine manager config that already enumerate the same `(ip, vm_id)`
 /// pairs). Used ONLY by ENROLL_ASSISTED — every other op derives
 /// identity from the cert.
 struct StaticIpResolver {

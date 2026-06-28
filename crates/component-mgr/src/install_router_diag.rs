@@ -12,7 +12,7 @@
 //!
 //! * **vm2** — a SUIT envelope on its `/updates` wire may target the VM bank
 //!   set OR the in-VM container image; `AppInstallRouterComponent` makes the
-//!   container-vs-VM routing decision (`sovd_main` / supernova vm2 path).
+//!   container-vs-VM routing decision (`sovd_main` / the host's vm2 path).
 //! * **the self-updating `app` slot** — `app_mgr::AppComponent` has its own A/B
 //!   symlink-flip lifecycle, distinct from the VM bank flow (component-factory
 //!   `app` branch).

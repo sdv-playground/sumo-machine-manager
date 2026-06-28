@@ -2,7 +2,7 @@
 //! device's HSM-provisioned token-issuer anchors — the deployment-side bridge
 //! that lets [`super::authz`] stay HSM-agnostic.
 //!
-//! A deployment (e.g. supernova) supplies each issuer anchor's SPKI-DER public
+//! A deployment supplies each issuer anchor's SPKI-DER public
 //! key (`|id| hsm.get_public_key_der(id).ok()`) and each pinned CA root's DER
 //! (`|id| hsm.get_trust_anchor_der(id).ok()`) plus the device's own id (its cert
 //! CN), and gets back an authorizer that pins each issuer to its tier ceiling and

@@ -24,7 +24,7 @@
 //!
 //! When a [`SelectorStore`] is attached (via [`BootManager::with_selector`])
 //! **and** its PRIMARY slot exists, the selector drives the bank decision.
-//! Otherwise — no store, or PRIMARY absent (first boot: supernova seeds the
+//! Otherwise — no store, or PRIMARY absent (first boot: the host seeds the
 //! selector only *after* `vm-boot` has run once) — the original NV path runs
 //! unchanged.
 //!
@@ -142,7 +142,7 @@ impl<D: BlockDevice> BootManager<D> {
     ///
     /// Selector-driven when a [`SelectorStore`] is attached *and* its PRIMARY
     /// slot exists (see module docs); otherwise the NV path runs unchanged. An
-    /// absent PRIMARY is first boot — supernova seeds the selector only after
+    /// absent PRIMARY is first boot — the host seeds the selector only after
     /// `vm-boot` has run once — so it falls through to NV.
     pub fn process_boot(&mut self) -> Result<[BootAction; NUM_BANK_SETS], BootError> {
         if let Some(selector) = self.selector.as_ref() {

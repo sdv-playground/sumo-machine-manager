@@ -1,7 +1,7 @@
 //! Host hardware metrics — Prometheus exposition with pluggable
 //! `SensorReader` per platform.
 //!
-//! Lives at the workspace root so any host (vm-service, supernova, future
+//! Lives at the workspace root so any host (vm-service, the production deployment, future
 //! orchestrators) can embed it without dragging vm-* dependencies. No deps
 //! on `component-mgr`, `vm-service`, or `vm-devices`.
 //!
@@ -24,7 +24,7 @@
 //!   plus QNX-specific syscalls; thin until a target SoC ships hardware
 //!   driver bindings.
 //! - Production hardware readers (e.g. `S32g3SensorReader`) live **outside
-//!   this crate**, in `supernova-machine-manager`. They implement the same
+//!   this crate**, in the production deployment. They implement the same
 //!   trait and produce richer metric sets specific to the target board.
 //!
 //! ## Naming convention

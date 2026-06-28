@@ -47,17 +47,17 @@ members = [
 # (vm-sovd, vhsm-ssd, the t2-seed-cicd layer binaries) slim, which matters for
 # the qnx6 layer-image sizes + the device rootfs. Cargo runs the right
 # per-target strip via `rustc -Cstrip=symbols`. Mirrors guest-vm-sdk and
-# supernova-machine-manager (which also strip their release builds).
+# the host machine manager (which also strip their release builds).
 strip = "symbols"
 
 # QNX (nto) cross-compile patch. vhsm-ssd's cross-node mTLS listener pulls in
 # rustls → ring, whose `SystemRandom` only implements `SecureRandom` on nto with
 # the upstream "add qnx support" commit (briansmith/ring#2740), not yet in a
-# tagged release. vhsm-ssd is built FROM THIS workspace for QNX (supernova-
-# machine-manager/examples/managed-qnx71/build.sh runs `cd sumo-machine-manager
+# tagged release. vhsm-ssd is built FROM THIS workspace for QNX (the host
+# machine manager's QNX example build runs `cd sumo-machine-manager
 # && cargo build -p vhsm-ssd --target aarch64-unknown-nto-qnx710`), and a
 # [patch] only applies to its own workspace root — so it must live here too, not
-# only in supernova's Cargo.toml. It is ring 0.17.14 + the nto cfg line, so it is
+# only in the host's Cargo.toml. It is ring 0.17.14 + the nto cfg line, so it is
 # byte-for-byte the released crate on non-nto targets (the new code is cfg-gated
 # to target_os = "nto").
 [patch.crates-io]

@@ -1239,7 +1239,7 @@ pub async fn fetch_and_install_component(
 
 /// Resolve every dependency's L2 envelope from a **pre-validated** L1 campaign
 /// manifest — the pull-aware analog of the dependency loop in
-/// `sumo-onboard::process_campaign`, adapted for the supernova path.
+/// `sumo-onboard::process_campaign`, adapted for the host path.
 ///
 /// Integrated (`#`) dependencies come from the L1's embedded payloads. Remote
 /// dependencies are fetched by their content-addressed URI:

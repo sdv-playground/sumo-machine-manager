@@ -22,7 +22,7 @@ pub enum BankLayout {
     /// Used by qvm guest VMs (vm1, vm2 today).
     Vm,
     /// Bootable IFS: `#kernel` → `boot.ifs`, `#qvm-config` → `qvm.conf`.
-    /// Used by the host OS image, the HSM keystore, and the supernova
+    /// Used by the host OS image, the HSM keystore, and the host
     /// self-update slot. (The `qvm.conf` part is meaningless for HSM
     /// but harmless — that slot never delivers a `#qvm-config` URI.)
     BootIfs,

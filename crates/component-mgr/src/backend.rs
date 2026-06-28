@@ -349,7 +349,7 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// (component_id `["hsm", "keys"]`) are routed to this provider
     /// instead of being written as a disk image.
     hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
-    /// Crypto handle (e.g. supernova's shared link-B `LinkBClient`, or a SimHsm).
+    /// Crypto handle (e.g. the host's shared link-B `LinkBClient`, or a SimHsm).
     /// The HSM-keys provision path builds the CEK `HsmKeyUnwrap` via `from_crypto`
     /// so device-decryption unwrap routes through `HsmCryptoProvider`. Required
     /// once the HSM is provisioned — the provision path errors without it.
@@ -358,7 +358,7 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     hsm_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
     /// Synthetic health source — consulted by `read_data` for
     /// `guest_state` / `heartbeat_seq` when `vm_service_addr` is None.
-    /// Set via `with_health_probe` (typically by supernova-mm for the
+    /// Set via `with_health_probe` (typically by the host machine manager for the
     /// RT component, wrapping `m7loader -q`). VMs leave this as None
     /// and use the vm-service HTTP path instead.
     health_probe: Option<Arc<dyn HealthProbe>>,
@@ -416,7 +416,7 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// Optional hook invoked after a successful HSM keystore provision (the
     /// `finalize_flash` HSM path) so the orchestrator reloads the backend against
     /// the freshly-written keystore. The HSM daemon's lifecycle is owned
-    /// externally now (supernova spawns the link-B backend), so this is the only
+    /// externally now (the host spawns the link-B backend), so this is the only
     /// reload path — there is no in-process daemon restart. `None` (the default)
     /// skips the reload. Threaded from `FactoryDeps::post_provision_reload` via
     /// [`with_post_provision_reload`](Self::with_post_provision_reload).
@@ -614,7 +614,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         self
     }
 
-    /// Inject the crypto handle (e.g. supernova's shared link-B `LinkBClient`, or
+    /// Inject the crypto handle (e.g. the host's shared link-B `LinkBClient`, or
     /// a SimHsm). The HSM-keys provision path builds the CEK `HsmKeyUnwrap` via
     /// `from_crypto` so device-decryption unwrap routes through
     /// `HsmCryptoProvider`. Required once the HSM is provisioned — the provision
@@ -689,7 +689,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     }
 
     /// Replace the default `IvdBankProvider` with an explicit `BankProvider`
-    /// (e.g. supernova-mm's RT raw-partition provider). Sets the override flag
+    /// (e.g. the host machine manager's RT raw-partition provider). Sets the override flag
     /// so a subsequent `rebuild_bank_provider` (triggered by `with_bank_spec` /
     /// `with_bank_activator`) does NOT clobber it.
     ///
@@ -1774,7 +1774,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
     /// Authorization gate for privileged flash operations.
     ///
-    /// supernova is a **native SOVD server**, not a UDS ECU front, so privileged
+    /// The host is a **native SOVD server**, not a UDS ECU front, so privileged
     /// `/updates` is authorized by the **bearer token** (ISO 17978-3 §5.4.4), not
     /// a UDS programming session. The legacy UDS session/security dance has been
     /// dropped from this path — it leaked the UDS model into a native server, and
@@ -3036,7 +3036,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
 
                             // Reload the HSM so it picks up the freshly-written
                             // keystore. The daemon's lifecycle is owned externally
-                            // now (supernova spawns the link-B backend); when a
+                            // now (the host spawns the link-B backend); when a
                             // `post_provision_reload` hook is set, call it so the
                             // orchestrator reloads against the new keystore. There
                             // is no in-process daemon restart anymore.
@@ -4139,7 +4139,7 @@ pub trait HealthProbe: Send + Sync {
 /// Query vm-service's `/vms/<name>/health` endpoint over TCP loopback.
 ///
 /// **Async** intentionally: `component-mgr` runs on the same tokio runtime as
-/// vm-service (supernova embeds both). A blocking `std::net::TcpStream`
+/// vm-service (the host embeds both). A blocking `std::net::TcpStream`
 /// call inside an `async fn` parks an entire tokio worker for up to the
 /// 2-second read timeout, which is observable as "every other SOVD DID
 /// read takes 2s" when workers are scarce (e.g. the 2-core S32G3).

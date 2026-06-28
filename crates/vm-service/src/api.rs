@@ -41,9 +41,9 @@ async fn log_request(
 ) -> axum::response::Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    // Demoted from INFO to DEBUG — supernova polls /vms/<vm>/health for
+    // Demoted from INFO to DEBUG — the host polls /vms/<vm>/health for
     // every component every second, so logging both the request and
-    // response at INFO floods supernova.log at ~16 lines/sec (≈ 14 MB/day
+    // response at INFO floods the host's main log at ~16 lines/sec (≈ 14 MB/day
     // per running VM). Errors and 4xx/5xx still show via tracing in the
     // route handlers; this trace is only useful for development.
     tracing::debug!(target: "vm_service::api", %method, %uri, "vm-service request");
@@ -110,7 +110,7 @@ async fn stop_vm(State(mgr): State<SharedManager>, Path(name): Path<String>) -> 
 /// Query params for [`ensure_vm_running`]. Optional `?bank=a|b` lets the
 /// caller (component-mgr after an OTA flip) pin the A/B bank to relaunch from.
 /// Absent ⇒ leave the VM's existing `def.bank` untouched (back-compat with
-/// manual callers and supernova's startup auto-start).
+/// manual callers and the host's startup auto-start).
 #[derive(Debug, Default, Deserialize)]
 struct EnsureParams {
     bank: Option<String>,

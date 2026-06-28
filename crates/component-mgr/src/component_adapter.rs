@@ -144,7 +144,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
     }
 
     async fn start(&self) -> MachineResult<()> {
-        // No-op: the HSM daemon's lifecycle is owned externally now (supernova
+        // No-op: the HSM daemon's lifecycle is owned externally now (the host
         // spawns the link-B backend; vhsm-ssd is a separate process), so a
         // component no longer starts an in-process HSM service here. Idempotent.
         Ok(())

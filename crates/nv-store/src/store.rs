@@ -341,7 +341,7 @@ impl<D: BlockDevice> NvStore<D> {
 /// migration.
 ///
 /// On-device NV files smaller than this are re-created (wiped) at next
-/// supernova start — the existing bootstrap path handles this via
+/// host start — the existing bootstrap path handles this via
 /// `tracing::warn!("NV store too small, recreating")`. Operators
 /// re-provision via the factory_reset / provisioning flow.
 pub const MIN_NV_DEVICE_SIZE: u64 = 0x100000; // 1 MiB (10 slots × 96 KiB + 64 KiB header)

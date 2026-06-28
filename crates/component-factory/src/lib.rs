@@ -107,7 +107,7 @@ pub struct FactoryDeps<D: BlockDevice> {
     pub security_provider: Arc<dyn SecurityProvider>,
     pub vm_service_addr: Option<String>,
     pub hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
-    /// Optional crypto-only HSM handle (e.g. supernova's shared link-B
+    /// Optional crypto-only HSM handle (e.g. the host's shared link-B
     /// `LinkBClient`). When `Some`, the built `ComponentBackend` (HSM-keys
     /// provision → `HsmKeyUnwrap`), the selector-aware `IvdBankProvider`
     /// (IVD `seal`), and the HSM component's CSR adapter prefer this
@@ -142,7 +142,7 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// `ComponentBackend` via `with_post_provision_reload`. When `Some`, the HSM
     /// keystore-provision path calls it INSTEAD of the provider's `stop_service()`
     /// then `start_service()` — for a link-B backend whose daemon lifecycle is
-    /// owned externally. `None` (the default) keeps today's in-process SimHsm
+    /// owned externally. `None` (the default) keeps today's in-process provider
     /// restart.
     pub post_provision_reload: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -238,7 +238,7 @@ fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
         activator,
         Some(selector),
     );
-    // When a crypto-only HSM handle is configured (supernova's link-B client),
+    // When a crypto-only HSM handle is configured (the host's link-B client),
     // the IVD `seal` runs its lone `sign` over `HsmCryptoProvider` instead of the
     // lifecycle-bearing `dyn HsmProvider`. `None` keeps the `hsm_provider` path.
     let provider = match deps.hsm_crypto.clone() {

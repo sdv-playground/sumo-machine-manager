@@ -17,7 +17,7 @@
 //! runtime dependency on it would also be a non-starter on QNX. The
 //! daemon needs to own rotation itself. This is the single
 //! implementation; both `vhsm-ssd::audit` and
-//! `supernova-machine-manager`'s main log writer use it.
+//! the host machine manager's main log writer use it.
 //!
 //! ## Threading
 //!

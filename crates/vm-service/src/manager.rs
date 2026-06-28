@@ -103,7 +103,7 @@ pub struct VmManager {
     device_transport: Option<Arc<dyn DeviceTransport>>,
     /// Time source published into per-VM TimeDevice channels. Defaults to
     /// `SystemClock` (host CLOCK_MONOTONIC + CLOCK_REALTIME). Override
-    /// via `with_clock` — supernova selects gPTP / simulation per its
+    /// via `with_clock` — the host selects gPTP / simulation per its
     /// startup config.
     clock_source: Arc<dyn Clock>,
     /// Optional pre-launch verification hook. Called from `start_vm`
@@ -114,7 +114,7 @@ pub struct VmManager {
     /// so the gate verifies the exact content about to boot — and verify
     /// + launch agree on the bank by construction.
     ///
-    /// Owned by supernova because the verify itself needs NV +
+    /// Owned by the host because the verify itself needs NV +
     /// HsmProvider, which vm-service doesn't depend on. Default is
     /// `None` (no gate; same behavior as before this was added).
     pre_launch_verify: Option<PreLaunchVerify>,
@@ -177,14 +177,14 @@ impl From<RunnerError> for ManagerError {
     }
 }
 
-// `with_clock` and `with_pre_launch_verify` are called by supernova-mm
+// `with_clock` and `with_pre_launch_verify` are called by the host machine manager
 // at startup; vm-service's own binary doesn't invoke them, so its
 // dead-code pass flags them. Suppress here rather than on each method.
 #[allow(dead_code)]
 impl VmManager {
     /// Construct a manager from config alone. Builds the configured
     /// `DeviceTransport` internally (via `transport_setup::build_device_transport`)
-    /// so callers — vm-service's main, supernova's embedding — don't have
+    /// so callers — vm-service's main, the host's embedding — don't have
     /// to plumb transport details through their own argument lists.
     /// Async because the HTTP transport variant binds + spawns its server
     /// during construction.
@@ -252,7 +252,7 @@ impl VmManager {
     }
 
     /// Override the clock source used when publishing vtime registers.
-    /// Default is `SystemClock`. Supernova calls this with `GptpClock`
+    /// Default is `SystemClock`. The host calls this with `GptpClock`
     /// or `SimulationClock` based on its startup `time:` config.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock_source = clock;
@@ -261,19 +261,19 @@ impl VmManager {
 
     /// Install a closure called from `start_vm` after the per-bank
     /// config is loaded but before the runner spawns anything. Lets
-    /// supernova plug in IVD verify (NV + HSM live in supernova, not
+    /// the host plug in IVD verify (NV + HSM live in the host, not
     /// here) without vm-service taking a crypto dependency.
     pub fn with_pre_launch_verify(mut self, hook: PreLaunchVerify) -> Self {
         self.pre_launch_verify = Some(hook);
         self
     }
 
-    /// Set which A/B bank a VM launches from. Supernova calls this with the
+    /// Set which A/B bank a VM launches from. The host calls this with the
     /// boot selector's `active_bank` for the VM's set right before `start_vm`,
     /// so the launch resolves `base/bank_{a,b}` by enum instead of following
     /// the `current` symlink. `Some(bank)` selects; `None` marks the VM as
     /// having no active bank (`start_vm` then skips the launch). Unknown VM
-    /// names are a no-op `NotFound` — supernova logs and moves on.
+    /// names are a no-op `NotFound` — the host logs and moves on.
     pub fn set_vm_bank(&mut self, name: &str, bank: Option<Bank>) -> Result<(), ManagerError> {
         let vm = self
             .vms
@@ -323,7 +323,7 @@ impl VmManager {
         // Reset liveness so a stale-from-prior-boot reading doesn't carry over.
         vm.liveness = HeartbeatLiveness::new();
 
-        // Resolve the bank to launch from the explicit `bank` enum supernova
+        // Resolve the bank to launch from the explicit `bank` enum the host
         // set from the boot selector — NOT by following the `current` symlink.
         // `None` means this VM has no active bank (unprovisioned / nothing
         // selected); skip the launch loudly rather than crashing or guessing.
@@ -366,7 +366,7 @@ impl VmManager {
         // host-side state; QnxRunner slays orphan qvm + loopback here.
         vm.runner.prepare_for_launch(name, &effective_def);
 
-        // Pre-launch verify gate — supernova installs this to run IVD
+        // Pre-launch verify gate — the host installs this to run IVD
         // verify against the selector-chosen bank dir (now in
         // `effective_def.image_dir`). The hook owns its own per-call
         // logging (timing, gen, sig status).

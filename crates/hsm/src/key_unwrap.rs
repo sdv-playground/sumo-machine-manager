@@ -1,6 +1,6 @@
 //! HSM-backed implementation of [`sumo_onboard::decryptor::KeyUnwrap`].
 //!
-//! Lets callers (component-mgr, supernova) plug an `HsmCryptoProvider` straight
+//! Lets callers (component-mgr, the host) plug an `HsmCryptoProvider` straight
 //! into a `StreamingDecryptor` without ever extracting the device private key.
 //! On real HSE this is the only viable path — the EC scalar lives inside the
 //! secure element. On SimHsm the work still happens in the host process but

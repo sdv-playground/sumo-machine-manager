@@ -198,9 +198,9 @@ impl QnxRunner {
     /// SIGTERM-then-SIGKILL every qvm running against this VM's config.
     ///
     /// Defense in depth at start() for orphan qvms that the tracked
-    /// `qvm_child` handle can't reach — e.g. a previous supernova
-    /// lifetime spawned qvm, then supernova got slayed; start-managed.sh
-    /// kicks off the next supernova with a global `slay qvm` but that's
+    /// `qvm_child` handle can't reach — e.g. a previous host
+    /// lifetime spawned qvm, then the host got slayed; start-managed.sh
+    /// kicks off the next host with a global `slay qvm` but that's
     /// best-effort with no exit-wait, so the new vm-service can race a
     /// dying qvm and end up with a fresh VmManager (qvm_child=None)
     /// while an orphan qvm still holds /dev/qvm/<sys>, vdevpeer

@@ -481,7 +481,7 @@ async fn session_change_resets_security() {
 
 #[tokio::test]
 async fn flash_accepted_without_uds_session() {
-    // supernova is a native SOVD server: privileged /updates is authorized by
+    // The host is a native SOVD server: privileged /updates is authorized by
     // the bearer token (ISO 17978-3 §5.4.4), NOT a UDS programming session. With
     // the legacy UDS session/security gate dropped (and auth not yet enforced), a
     // flash in the default, locked session is accepted — no programming/unlock

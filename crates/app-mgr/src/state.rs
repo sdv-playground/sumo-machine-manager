@@ -6,9 +6,9 @@ use nv_store::types::Bank;
 
 /// Configuration for an AppComponent.
 pub struct AppConfig {
-    /// Component id (e.g. "supernova").
+    /// Component id (e.g. "app").
     pub id: String,
-    /// Base path containing A/, B/, current symlink (e.g. /data/supernova/).
+    /// Base path containing A/, B/, current symlink (e.g. /data/app/).
     pub base_path: PathBuf,
 }
 
@@ -65,7 +65,7 @@ pub fn flip_current_symlink(base_path: &Path, bank: Bank) -> MachineResult<()> {
 /// Ensure the base_path directory structure exists (A/, B/, current→A).
 ///
 /// Called by integration tests and by manual bootstrap on a fresh
-/// machine; not yet wired into supernova's normal startup path,
+/// machine; not yet wired into the host's normal startup path,
 /// which currently relies on the bank dirs existing from device
 /// imaging. Kept as part of the public surface so the bootstrap
 /// route stays accessible.

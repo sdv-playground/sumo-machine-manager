@@ -291,7 +291,7 @@ async fn main() {
     };
 
     // One backend per bank set, built through the shared component-factory — the
-    // same path supernova-mm uses, no hand-rolled composition. vm2 is a plain bank:
+    // same path the host machine manager uses, no hand-rolled composition. vm2 is a plain bank:
     // installing containers *inside* vm2 is the guest's own SOVD server's job, not
     // the host vm-manager's. `entity_type` is pinned to vm-sovd's historical values
     // (the factory would otherwise report the routing key).

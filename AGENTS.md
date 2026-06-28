@@ -51,7 +51,7 @@ rg -n "Component trait|BankSet|SecurityProvider|SystemBankManager|ComponentBacke
 
 - Example fresh runs wipe local NV store state.
 - Flash requires programming session plus security unlock before upload/commit paths.
-- QNX support is via traits/stubs unless using supernova platform crates.
+- QNX support is via traits/stubs unless using the host's platform crates.
 
 ## Missing docs/specs to watch
 

@@ -322,7 +322,7 @@ fn writer_loop(
     // Wrap the iteration loop in catch_unwind so a panic inside the
     // body (channel.write, clock.now_mono_ns, …) doesn't silently
     // kill the writer with no diagnostic. On the CVC we hit a freeze
-    // where mono_ns stopped advancing with zero supernova-side
+    // where mono_ns stopped advancing with zero host-side
     // evidence; this surfaces the cause next time. Thread still
     // exits on panic — vm-service has to rebuild the TimeDevice
     // (stop_vm + start_vm) to recover. We deliberately don't

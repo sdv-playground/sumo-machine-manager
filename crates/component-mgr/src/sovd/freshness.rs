@@ -2,7 +2,7 @@
 //! and the monotonic-adoption safety core.
 //!
 //! HSM-agnostic by design (like [`super::authz`]): signing and verifying are
-//! done through caller-supplied closures — supernova wires the HSM
+//! done through caller-supplied closures — the host wires the HSM
 //! `FreshnessSigning` key; a peer ECU wires its *pinned* master key — so this
 //! module holds no key material and makes no trust decision itself.
 //!
@@ -48,7 +48,7 @@ impl FreshnessAssertion {
         out
     }
 
-    /// Sign with a caller-supplied signer (supernova: the HSM `FreshnessSigning`
+    /// Sign with a caller-supplied signer (the host: the HSM `FreshnessSigning`
     /// key) and wrap into the distributable form. `signing_key_der` is the
     /// signer's SPKI public-key DER — see [`SignedFreshness::signing_key_hex`].
     pub fn sign<E>(

@@ -1,6 +1,6 @@
 //! Standalone `host-metrics` binary — serves Prometheus `/metrics`.
 //!
-//! For dev / standalone deployments. In production, supernova-machine-manager
+//! For dev / standalone deployments. In production, the host machine manager
 //! embeds the same library and serves on its own bind with its
 //! board-specific reader. Either way the wire format on `/metrics` is
 //! identical — Prometheus / OTel collectors don't see a difference.

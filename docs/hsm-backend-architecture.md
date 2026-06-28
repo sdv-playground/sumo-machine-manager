@@ -31,7 +31,7 @@ flowchart TB
     subgraph GUEST["guest VM"]
         DV["/dev/vhsm (C)"]
     end
-    subgraph HOST["host — Supernova"]
+    subgraph HOST["the host"]
         SSD["vhsm-ssd — A→B proxy<br/>terminates link A · guest identity + IAM"]
         LBC{{"LinkBClient (HsmCryptoProvider)<br/>forwards link-B, no guest concerns"}}
         SSD -->|"after auth"| LBC

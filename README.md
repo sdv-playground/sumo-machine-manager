@@ -172,7 +172,7 @@ Flash operations require programming session + security unlock:
 | Target | Maturity | Notes |
 |--------|----------|-------|
 | Linux dev (QEMU + file-backed NV) | full | OTA + commit + rollback end-to-end, all tests pass |
-| QNX host (supernova-machine-manager) | working | Collapses vm-service + component-mgr into single binary |
+| QNX host (production machine manager) | working | Collapses vm-service + component-mgr into single binary |
 | QNX + real HSE / CAN | trait-only | Needs platform `BlockDevice`, HSE backend, CAN adapter |
 
 Business logic (OTA engine, NV store, SUIT validation, DID resolution) is

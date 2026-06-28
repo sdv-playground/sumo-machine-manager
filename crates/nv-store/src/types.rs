@@ -5,7 +5,7 @@
 //!
 //! - Hsm (Hardware Security Module — single-banked, non-rollbackable) — slot 0
 //! - Bootloader (reserved, unused) — slot 1
-//! - Os (host OS: IFS + rootfs, updated atomically; supernova rides here) — slot 2
+//! - Os (host OS: IFS + rootfs, updated atomically; the host rides here) — slot 2
 //! - Rt (realtime / Cortex-M7 core) — slot 3
 //! - Vm1 (Linux or QNX VM) — slot 4
 //! - Vm2 (Linux or QNX VM) — slot 5

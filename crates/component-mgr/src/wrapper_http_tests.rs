@@ -1,4 +1,4 @@
-//! End-to-end HTTP smoke tests through the path that `vm-sovd` / supernova
+//! End-to-end HTTP smoke tests through the path that `vm-sovd` / the host
 //! actually use in production: SOVD HTTP → `sovd-api` router →
 //! `ComponentBackend` (the engine, wired directly).
 //!

@@ -20,7 +20,7 @@
 //!
 //! Hardware-specific things (eMMC SMART wear, board-specific i2c sensors,
 //! per-rail current monitors) live outside this crate, in
-//! `supernova-machine-manager`'s production reader. The default here is
+//! the host machine manager's production reader. The default here is
 //! deliberately generic.
 
 use std::path::{Path, PathBuf};

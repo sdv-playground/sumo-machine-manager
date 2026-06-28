@@ -116,7 +116,7 @@ pub trait HsmProvider: Send {
 
     /// True if `vm_id` has completed an ENROLL_ASSISTED at least once
     /// (the daemon recorded an `EnrolledRecord` in bootstrap.yaml).
-    /// Host-side auto-arm paths (supernova startup, recovery scripts)
+    /// Host-side auto-arm paths (host startup, recovery scripts)
     /// gate on this to avoid re-arming cert-bound vm_ids — re-arming
     /// re-opens an IP-spoof rotation window for a vm that's already
     /// happily running with a valid cert.
