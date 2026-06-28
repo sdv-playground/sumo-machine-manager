@@ -16,7 +16,7 @@ use machine_mgr::{Machine, MachineRegistry};
 use sovd_core::EntityInfo;
 
 use hsm::link_b::LinkBClient;
-use hsm::{HsmProvider, KeyRole, LinkBProvider};
+use hsm::{HsmCryptoProvider, HsmProvider, KeyRole, LinkBProvider};
 
 #[tokio::main]
 async fn main() {
@@ -87,6 +87,9 @@ async fn main() {
     // --guest-vhsm: in gateway mode, source HSM crypto from the guest vHSM
     // (VhsmProvider over the wire) instead of the host link-B backend client.
     let mut guest_vhsm = false;
+    // --tls: serve HTTPS using the HSM-held tls-identity (host SOVD over TLS;
+    // server-only — the client still authenticates with an operator token).
+    let mut tls_enabled = false;
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--images-dir" && i + 1 < args.len() {
@@ -130,6 +133,9 @@ async fn main() {
             i += 2;
         } else if args[i] == "--guest-vhsm" {
             guest_vhsm = true;
+            i += 1;
+        } else if args[i] == "--tls" {
+            tls_enabled = true;
             i += 1;
         } else if args[i] == "--bind" && i + 1 < args.len() {
             bind_addr = &args[i + 1];
@@ -469,14 +475,57 @@ async fn main() {
             ))
     };
 
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("failed to bind to {bind_addr}: {e}");
+    // --tls: serve HTTPS with the HSM-held tls-identity (server-only TLS — the
+    // client authenticates with an operator token, not a client cert). The link-B
+    // backend signs the handshake; the private key never leaves the HSM.
+    let tls_config: Option<axum_server::tls_rustls::RustlsConfig> = if tls_enabled {
+        let crypto = client.clone().unwrap_or_else(|| {
+            eprintln!("--tls requires --backend-socket (the HSM holds the tls-identity key)");
             std::process::exit(1);
         });
+        let leaf = crypto
+            .get_certificate_der(KeyRole::TlsIdentity.handle())
+            .unwrap_or_else(|e| {
+                eprintln!("--tls: tls-identity leaf cert not provisioned: {e}");
+                std::process::exit(1);
+            });
+        let signer = crypto.clone();
+        let sign_fn = move |msg: &[u8]| {
+            signer
+                .sign(KeyRole::TlsIdentity.handle(), msg)
+                .map_err(|e| e.to_string())
+        };
+        let cfg = hsm_rustls::server_config_no_client_auth(leaf, sign_fn);
+        Some(axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(
+            cfg,
+        )))
+    } else {
+        None
+    };
 
-    tracing::info!("vm-sovd listening on {bind_addr}");
+    // Plain-HTTP listener only when TLS is off — axum_server binds the TLS socket
+    // itself, so a pre-bound TcpListener would collide on the port.
+    let listener = if tls_config.is_none() {
+        Some(
+            tokio::net::TcpListener::bind(bind_addr)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("failed to bind to {bind_addr}: {e}");
+                    std::process::exit(1);
+                }),
+        )
+    } else {
+        None
+    };
+
+    tracing::info!(
+        "vm-sovd listening on {bind_addr}{}",
+        if tls_config.is_some() {
+            " (HTTPS, HSM tls-identity)"
+        } else {
+            ""
+        }
+    );
     tracing::info!("  NV store: {}", nv_path.display());
     tracing::info!("  provisioning authority: built-in factory signing key");
     tracing::info!(
@@ -501,7 +550,20 @@ async fn main() {
     tracing::info!("  components: hypervisor, vm1, vm2, hsm, boot");
     tracing::info!("  try: curl http://{bind_addr}/vehicle/v1/components");
 
-    axum::serve(listener, router).await.unwrap();
+    match (listener, tls_config) {
+        (Some(listener), None) => axum::serve(listener, router).await.unwrap(),
+        (None, Some(tls_config)) => {
+            let addr: std::net::SocketAddr = bind_addr.parse().unwrap_or_else(|e| {
+                eprintln!("--tls: --bind {bind_addr} must be ip:port: {e}");
+                std::process::exit(1);
+            });
+            axum_server::bind_rustls(addr, tls_config)
+                .serve(router.into_make_service())
+                .await
+                .unwrap();
+        }
+        _ => unreachable!("listener and tls_config are set together"),
+    }
 }
 
 /// Connect a [`LinkBClient`] to the PRE-SPAWNED link-B HSM backend listening on

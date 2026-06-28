@@ -17,7 +17,7 @@ use rustls::client::ResolvesClientCert;
 use rustls::pki_types::CertificateDer;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::{CertifiedKey, Signer, SigningKey};
-use rustls::{RootCertStore, SignatureAlgorithm, SignatureScheme};
+use rustls::{RootCertStore, ServerConfig, SignatureAlgorithm, SignatureScheme};
 
 /// Signs `message` with the device's mTLS private key — ECDSA-P256 over
 /// SHA-256(message), DER-encoded. The private key stays in the HSM; only this
@@ -153,6 +153,24 @@ impl ResolvesServerCert for HsmServerIdentity {
     fn resolve(&self, _client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
         Some(self.certified.clone())
     }
+}
+
+/// Build a **server-only** TLS [`ServerConfig`] (no client-cert verification) that
+/// presents `leaf_der` (this node's `tls-identity` leaf, leaf-only) and signs the
+/// handshake with `sign_fn` — the HSM key, whose private half never leaves. For the
+/// SOVD server the client authenticates with an operator token, not a cert, so
+/// server-only TLS is the model (contrast `vhsm-ssd::tls::server_config`, the
+/// cross-node mTLS builder that *also* verifies the peer's client cert).
+pub fn server_config_no_client_auth(
+    leaf_der: Vec<u8>,
+    sign_fn: impl Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync + 'static,
+) -> ServerConfig {
+    // Idempotent — first caller installs the ring provider, the rest no-op.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = hsm_certified_key(vec![CertificateDer::from(leaf_der)], sign_fn);
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(HsmServerIdentity::new(certified)))
 }
 
 #[cfg(test)]
