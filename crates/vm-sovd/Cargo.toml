@@ -17,9 +17,12 @@ nv-store = { path = "../nv-store" }
 machine-mgr = { path = "../machine-mgr" }
 hsm = { path = "../hsm", features = ["crypto"] }
 # --tls: HSM-backed rustls server identity (the tls-identity key never leaves the
-# HSM) + the TLS-terminating axum server.
+# HSM) + the TLS-terminating axum server. `tls-rustls-no-provider` (not
+# `tls-rustls`): the latter pulls rustls's aws-lc-rs default → aws-lc-sys (C/asm),
+# which doesn't cross-build to QNX (only ring is patched there) and is dead weight —
+# hsm-rustls installs the ring provider, so axum-server needs none.
 hsm-rustls = { path = "../hsm-rustls" }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 # Guest gateway (--guest-vhsm): the vHSM-backed HsmCryptoProvider.
 vhsm-provider = { path = "../vhsm-provider" }
 host-os-mgr = { path = "../host-os-mgr" }
