@@ -31,6 +31,7 @@ members = [
     "crates/vhsm-provider",
     "crates/vhsm-crossnode-client",
     "crates/vm-sovd",
+    "crates/sovd-mdns",
 
     # Dev / test tooling (run by developers, not shipped to the device). Grouped
     # under tools/crates/ to keep it separate from the runtime crates/ above.

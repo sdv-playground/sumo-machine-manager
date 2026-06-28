@@ -52,6 +52,8 @@ async fn main() {
         eprintln!("  --device-id <id>           [gateway] token audience (the device id); pins the onboard minter");
         eprintln!("  --guest-vhsm               [gateway] source HSM crypto from the guest vHSM (VhsmProvider); else the host link-B backend");
         eprintln!("  --bind <addr>              Listen address (alt to the positional; default 0.0.0.0:4000)");
+        eprintln!("  --tls                      Serve HTTPS using the HSM-held tls-identity leaf (server-only TLS)");
+        eprintln!("  --no-mdns                  Disable mDNS/DNS-SD advertising of the SOVD endpoint (on by default once HTTPS is live)");
         eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
         eprintln!();
         eprintln!("Provisioning authority: built-in factory signing key (P-256 generator G).");
@@ -90,6 +92,9 @@ async fn main() {
     // --tls: serve HTTPS using the HSM-held tls-identity (host SOVD over TLS;
     // server-only — the client still authenticates with an operator token).
     let mut tls_enabled = false;
+    // mDNS/DNS-SD advertising of the SOVD endpoint (ISO 17978-3 §5.11) — on by
+    // default, only takes effect on the provisioned HTTPS path. --no-mdns opts out.
+    let mut mdns_enabled = true;
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--images-dir" && i + 1 < args.len() {
@@ -136,6 +141,9 @@ async fn main() {
             i += 1;
         } else if args[i] == "--tls" {
             tls_enabled = true;
+            i += 1;
+        } else if args[i] == "--no-mdns" {
+            mdns_enabled = false;
             i += 1;
         } else if args[i] == "--bind" && i + 1 < args.len() {
             bind_addr = &args[i + 1];
@@ -483,6 +491,10 @@ async fn main() {
     // leaf (CSR enrollment + keystore install) runs over this SOVD path, so it
     // can't require the cert it's about to deliver. A restart after provisioning
     // lights up HTTPS. Mirrors the cross-node listener's graceful degradation.
+    // mDNS/DNS-SD advertiser guard — held for the server's lifetime, unregisters
+    // on drop. Only started on the provisioned HTTPS path (below); an
+    // unprovisioned device is not a discoverable SOVD server.
+    let mut _mdns_guard: Option<sovd_mdns::AdvertiserGuard> = None;
     let tls_config: Option<axum_server::tls_rustls::RustlsConfig> = if tls_enabled {
         match client.as_ref() {
             None => {
@@ -499,6 +511,20 @@ async fn main() {
                     None
                 }
                 Ok(leaf) => {
+                    // Advertise the SOVD endpoint over mDNS (ISO 17978-3 §5.11):
+                    // instance/hostname come from this leaf's `<id>.local` SAN, so
+                    // a discovery client dialing `<id>.local` verifies this cert.
+                    if mdns_enabled {
+                        _mdns_guard =
+                            sovd_mdns::SovdAdvertiser::from_leaf_and_bind(&leaf, bind_addr)
+                                .and_then(|adv| match adv.start() {
+                                    Ok(g) => Some(g),
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "SOVD mDNS advertise failed");
+                                        None
+                                    }
+                                });
+                    }
                     let signer = crypto.clone();
                     let sign_fn = move |msg: &[u8]| {
                         signer

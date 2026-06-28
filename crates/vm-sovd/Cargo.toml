@@ -22,6 +22,10 @@ hsm = { path = "../hsm", features = ["crypto"] }
 # which doesn't cross-build to QNX (only ring is patched there) and is dead weight —
 # hsm-rustls installs the ring provider, so axum-server needs none.
 hsm-rustls = { path = "../hsm-rustls" }
+# mDNS / DNS-SD advertiser for the SOVD endpoint (ISO 17978-3 §5.11). Active on
+# the provisioned HTTPS path; advertises `<id>.local` derived from the tls-identity
+# leaf so discovery clients verify the cert by hostname.
+sovd-mdns = { path = "../sovd-mdns" }
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 # Guest gateway (--guest-vhsm): the vHSM-backed HsmCryptoProvider.
 vhsm-provider = { path = "../vhsm-provider" }

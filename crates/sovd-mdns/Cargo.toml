@@ -1,0 +1,26 @@
+[package]
+name = "sovd-mdns"
+version = "0.1.0"
+edition = "2021"
+description = "Conformant mDNS / DNS-SD advertiser for the SOVD server (ISO 17978-3 §5.11): registers _sovd._tcp.local. with the cert-derived <id>.local hostname plus identification/accessurl TXT records. QNX (nto) compiles to an inert stub."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Derive the DNS-SD instance id from the TLS leaf certificate (pure-Rust DER
+# parser). Same crates vhsm-ssd already uses to read a cert CN/SAN; both build
+# on every target including the QNX (nto) cross-build.
+x509-cert = { version = "0.2", features = ["std"] }
+const-oid = { version = "0.9", features = ["db"] }
+tracing = "0.1"
+
+# Pure-Rust DNS-SD advertiser — pulled on every target EXCEPT QNX (nto).
+# mdns-sd's event loop (mio) + interface enumeration (if-addrs) + socket-pktinfo
+# have no `target_os = "nto"` support, and the supernova QNX cross-build only
+# patches libc/socket2/tokio/ring. Rather than break that build, on nto this
+# crate falls back to an inert stub (src/advertiser_stub.rs) with the identical
+# API. See the module docs in src/lib.rs.
+[target.'cfg(not(target_os = "nto"))'.dependencies]
+mdns-sd = "0.20"
