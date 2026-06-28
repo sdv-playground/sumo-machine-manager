@@ -118,7 +118,7 @@ address dead-end). So a hardware HSM is a **C service behind link B**, uniform a
   (`hsm-link-b/reference/hse_service_skeleton.c`) is the worked reference a real integrator
   replaces for their silicon (keep the logical handles, substitute physical slots).
 
-(The slot *inventory* — what each role *is* — lives in the workspace `docs/design/hsm-contents.md`; this is the
+(The slot *inventory* — what each role *is* — lives in [`hsm-contents.md`](hsm-contents.md); this is the
 *mapping* onto physical slots.)
 
 ## 5. The cross-hardware invariant

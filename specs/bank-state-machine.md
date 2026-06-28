@@ -139,15 +139,19 @@ orchestrator may need multiple boot cycles to:
 A threshold of 10 gives ample room for normal operation while still catching
 fundamentally broken updates.
 
-## Independence
+## Per-bank flash, machine-wide commit
 
-Each A/B bank set has its own state machine. Updating vm1 does not affect vm2
-or the host-os. They can be:
-- Updated independently
-- At different states (one committed, another in trial)
-- Committed/rolled back independently
+Each A/B bank set has its own state machine and is **flashed** independently — writing vm1's
+inactive bank doesn't touch vm2's or the host-os's, and the banks can sit at different *flash*
+states at once.
 
-This allows staged rollouts: update vm1, verify, commit, then update vm2.
+But activation and commit are **one machine-wide update session**, not per-bank. The set of
+banks a session staged — the trial **boot vector** — activates together, trial-boots together,
+and is **committed together** as the new state or **rolled back together** on any failure; the
+node advances its boot vector atomically (the node-level `x-sumo-commit-trials` / rollback
+verdict fans out across the component registry to the banks in trial). There is no per-bank
+independent commit. *Future:* the session widens to the whole vehicle — one update session
+spanning multiple machines/ECUs, where staged per-ECU rollouts do apply.
 
 The HSM component uses a single bank and does not participate in A/B switching
 or trial boot. HSM updates are applied directly without rollback support.
