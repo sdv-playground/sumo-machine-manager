@@ -33,7 +33,8 @@ open question #1) — capability-only discrimination works today.
 
 ### Architecture
 
-Cargo workspace with 29 crates. The load-bearing ones, bottom-up:
+Cargo workspace with 30 runtime crates (+ 2 tools crates under `tools/crates/`).
+The load-bearing ones, bottom-up:
 
 - **nv-store** (lib): sector-rotated NV regions (boot state, factory,
   FW meta, runtime DIDs) with CRC-32 and monotonic `write_seq`, over a
@@ -42,9 +43,11 @@ Cargo workspace with 29 crates. The load-bearing ones, bottom-up:
   `SecstoreEncryptor` + `SecstoreBackend`.
 - **vm-boot** (lib+bin): boot-time logic for ALL bank sets. Reads NV boot
   state, verifies image hashes, handles trial boot counting and auto-rollback.
-- **hsm** (lib): HSM management trait (`HsmProvider`, `HsmCryptoProvider`).
-  `SimHsm` (dev/test: vhsm-ssd + file keystore) works; the hardware backend is now an
-  out-of-process link-B service (`hsm-link-b`), reached via `LinkBClient` — not an
+- **hsm** (lib): the HSM contract — `HsmProvider` / `HsmCryptoProvider` traits, the
+  `link_b` client (`LinkBClient`), IVD-manifest verification, and the keystore-payload
+  schema. Contract-only: the dev/test `SimHsm` now lives in
+  `tools/crates/hsm-sim-backend` (`hsm_sim_backend::SimHsm`), and the hardware backend
+  is an out-of-process link-B service (`hsm-link-b`), reached via `LinkBClient` — not an
   in-process Rust provider.
 - **vhsm-ssd** (lib+bin): host-side daemon terminating the v3 handle-based
   vHSM wire protocol from guest `/dev/vhsm`. Transport is TCP on a
@@ -66,12 +69,17 @@ Cargo workspace with 29 crates. The load-bearing ones, bottom-up:
   `Component` lifecycle. `ContainerImageComponent` validates detached
   `#container-image` payloads and imports them into Docker, Podman, or
   containerd.
-- **component-mgr** (lib+bins: `vm-sovd`): SUIT validation, encrypted firmware
+- **component-mgr** (lib + `vm-diagserver` bin): SUIT validation, encrypted firmware
   streaming pipeline, OTA engine (install/commit/rollback), DID resolution,
-  and the SOVD wire adapter. `ComponentBackend` per-component state machine;
-  `ComponentDiagBackend` routes SOVD calls through `Component` trait.
+  and the SOVD wire adapter. `ComponentBackend` is the per-component state machine
+  and *is* the `DiagnosticBackend` — wired straight into SOVD (the old
+  `ComponentDiagBackend` indirection was deleted).
   `dispatcher.rs` resolves a SUIT envelope's target `BankSet` (used by the
   /updates wire to reject mismatches with HTTP 415 before opening a session).
+
+Design docs: `docs/hsm-backend-architecture.md` (the HSM contract + the link-B C
+vendor handoff) and `docs/vhsm-integration-path.md`. HSM tooling under
+`tools/crates/`: `hsm-conformance` (verify a backend), `hsm-sim-backend` (the sim).
 
 ### Separation of Concerns
 
@@ -137,9 +145,11 @@ crates/machine-mgr/src/
   types.rs                — Capabilities, RuntimeState, FlashId, ...
 
 crates/hsm/src/
-  crypto.rs               — SimHsm HsmCryptoProvider (RustCrypto)
-  sim.rs                  — SimHsm lifecycle (spawns vhsm-ssd + file keys)
   payload.rs              — HsmKeystore CBOR schema
+
+tools/crates/hsm-sim-backend/src/
+  crypto.rs               — SimHsm HsmCryptoProvider (RustCrypto)
+  sim.rs                  — SimHsm backend (orchestrator spawns/owns it + vhsm-ssd)
 
 crates/vhsm-ssd/src/
   proto.rs + codec.rs     — wire format (v3, handle-based)
@@ -149,7 +159,7 @@ crates/vhsm-ssd/src/
   transport.rs            — TCP on `vbr-vhsm` private bridge
 
 example/
-  build.rs                — Generate keys, encrypted firmware, CRL manifests
+  build_hsm_keys.rs       — Generate keys, encrypted firmware, CRL manifests
   run.sh                  — Start SOVD server + security helper
   factory/                — Factory provisioning YAML manifests
   config/secrets.toml     — Security helper ECU secrets
@@ -160,7 +170,7 @@ example/
 ```bash
 cargo build
 cargo test              # 425+ tests
-cargo run --example build   # Generate SUIT artifacts
+cargo run -p component-mgr --example build_hsm_keys   # Generate SUIT artifacts
 ./example/run.sh --fresh    # Start server
 ```
 

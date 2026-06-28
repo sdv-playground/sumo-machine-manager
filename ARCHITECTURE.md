@@ -105,9 +105,9 @@ classDiagram
     }
     class HsmProvider {
         <<trait, hsm>>
-        +is_provisioned / provision
-        +start_service / stop_service
-        +get_crypto_provider()
+        +is_provisioned / provision / provisioning_state
+        +list_keys / get_public_key
+        +arm_enrollment / is_enrolled / clear_enrolled
     }
     class HsmCryptoProvider {
         <<trait, hsm>>
@@ -133,9 +133,19 @@ classDiagram
     BankProvider --> BankActivator : optional, platform step
     BankActivator <|.. DevBankActivator : host-os-mgr
     BankActivator <|.. PartitionBankActivator : host-os-mgr
-    HsmProvider <|.. SimHsm : dev/test
-    HsmCryptoProvider <|.. SimHsm
+    HsmProvider <|.. LinkBProvider : host proxy over link-B
     HsmCryptoProvider <|.. LinkBClient : link-B -> backend service
+    LinkBProvider ..> SimHsm : link-B -> hsm-sim-service (sim)
+    LinkBClient ..> SimHsm : link-B -> hsm-sim-service (sim)
+    LinkBClient ..> VendorHse : link-B -> vendor C HSE
+    class SimHsm {
+        <<link-B backend, dev>>
+        +hsm-sim-service
+    }
+    class VendorHse {
+        <<link-B backend, prod>>
+        +implements hsm-link-b in C
+    }
     ManifestProvider <|.. SuitProvider
 ```
 
@@ -145,7 +155,7 @@ the seams above are the supported extension points.
 
 ## Workspace crates
 
-21 crates. The core update/diagnostics path:
+30 runtime crates (+ 2 tools crates under `tools/crates/`). The core update/diagnostics path:
 
 - **nv-store** (lib): sector-rotated NV regions (boot state, factory, FW meta, runtime
   DIDs) with CRC-32 + monotonic `write_seq`, over a pluggable `BlockDevice`. Also owns
@@ -159,7 +169,8 @@ the seams above are the supported extension points.
   `Capabilities`/`FlashCaps`; the `BankActivator` seam; `system_bank_state`
   (`SystemBankManager` + `BootSelector` — the node boot-authority engine, re-exporting
   the nv-store selector primitives). Platform-independent.
-- **component-mgr** (lib + `vm-sovd` bin): the OTA engine + SOVD wire. `ComponentBackend` (the
+- **component-mgr** (lib + the `vm-diagserver` CLI bin; the SOVD/OTA **server** bin `vm-sovd` is
+  its own crate): the OTA engine + SOVD wire. `ComponentBackend` (the
   per-component state machine — DIDs, faults, the full install/flash lifecycle, modes);
   `ComponentAdapter` (exposes it as a `Component`); `install_router_diag`
   (`InstallRouterDiag` — routes a VM's install methods to its container-vs-VM router,
@@ -179,11 +190,14 @@ the seams above are the supported extension points.
   selector-chosen bank dir** (cwd=bank_dir) so the per-bank qvm.conf's relative
   `load kernel` resolves there (no `current` symlink).
 - **vm-devices** (lib): host-side virtual CAN / health / time simulators (ivshmem vs QNX shm).
-- **hsm** (lib): `HsmProvider`/`HsmCryptoProvider`; `SimHsm` (vhsm-ssd + file keystore);
-  `LinkBClient` + `serve_crypto` (the link-B bridge to an out-of-process backend — the sim
-  or a vendor C HSE implementing `hsm-link-b`); `ivd` (per-bank IVD
-  manifest sign/verify with the `ivd-signing` key —
-  the same key that signs the boot selector). 7 mandatory `KeyRole`s.
+- **hsm** (lib): the HSM **contract** — `HsmProvider` (keystore/provisioning, 8 methods) +
+  `HsmCryptoProvider` (re-exported from `hsm-contract`); `LinkBClient` + `serve_crypto` (the
+  link-B bridge to an **out-of-process** backend — the sim `hsm-sim-service` in
+  `tools/crates/hsm-sim-backend`, or a vendor C HSE implementing `hsm-link-b`, with the C
+  vendor skeleton at `crates/hsm-link-b/reference/` and the conformance suite at
+  `tools/crates/hsm-conformance`); `ivd` (per-bank IVD manifest sign/verify with the
+  `ivd-signing` key — the same key that signs the boot selector). 11 mandatory `KeyRole`s.
+  Contract-only — no in-process HSM lives here; see `docs/hsm-backend-architecture.md`.
 - **vhsm-ssd** (lib + bin): host daemon terminating the guest `/dev/vhsm` v3 handle
   protocol over TCP on a private host bridge; identity = CWT/IAM handshake (source-IP pre-gate).
 - **secstore** (lib): encrypted key-metadata persistence (`SecstoreEncryptor` +
@@ -384,13 +398,13 @@ committed manifest (list↔read agree).
 ```bash
 cargo build
 cargo test              # 425+ tests
-cargo run --example build   # generate SUIT artifacts
+cargo run -p component-mgr --example build_hsm_keys   # generate SUIT artifacts
 ./example/run.sh --fresh    # start the SOVD server
 ```
 
 Unit tests use `MemBlockDevice` (zero I/O). SOVD integration tests drive the real router
 via `tower::ServiceExt::oneshot()` (no live server) covering session/security/upload/
-verify/transfer/commit + the install-router + the vendor data params. HSM/vhsm-ssd tests
+prepare/execute/commit + the install-router + the vendor data params. HSM/vhsm-ssd tests
 cover sign/verify/encrypt/derive + handle/policy + SUIT key provisioning.
 
 ## Recent architecture changes (2026-06)

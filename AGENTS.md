@@ -14,6 +14,9 @@ Rust workspace for platform-agnostic A/B bank management, VM lifecycle, SUIT OTA
 - `crates/nv-store/`, `crates/hsm/`, `crates/vhsm-ssd/` — persistence and crypto/HSM layers.
 - `example/` — local generated firmware/server smoke flow.
 - `specs/` — bank state, disk layout, nv-store and app-installation specs.
+- `docs/` — design docs, incl. `hsm-backend-architecture.md` (the HSM link-B contract + the C vendor handoff) and `vhsm-integration-path.md`.
+- `crates/hsm-link-b/` — the frozen HSM link-B wire + C header (`include/`) + `reference/` C skeleton.
+- `tools/crates/` — `hsm-conformance` (backend conformance suite) and `hsm-sim-backend` (the `SimHsm` backend).
 
 ## Essential commands
 
@@ -24,15 +27,15 @@ cargo build
 cargo test
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo run --example build
+cargo run -p component-mgr --example build_hsm_keys
 ./example/run.sh --fresh
 ```
 
 Finding commands:
 
 ```bash
-rg --files -g 'Cargo.toml' -g 'README*' -g 'ARCHITECTURE.md' -g 'CLAUDE.md' -g 'specs/**'
-rg -n "Component trait|BankSet|SecurityProvider|SystemBankManager|ComponentBackend|OTA|SUIT|HSM|NV" crates example specs README.md ARCHITECTURE.md CLAUDE.md
+rg --files -g 'Cargo.toml' -g 'README*' -g 'ARCHITECTURE.md' -g 'CLAUDE.md' -g 'specs/**' -g 'docs/**'
+rg -n "Component trait|BankSet|SecurityProvider|SystemBankManager|ComponentBackend|OTA|SUIT|HSM|NV" crates tools docs example specs README.md ARCHITECTURE.md CLAUDE.md
 ```
 
 ## Stack

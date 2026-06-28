@@ -817,7 +817,7 @@ no SOVDd change (SOVDd routes `/data` generically and stays spec-pure).
 - `hsm::ivd::read_manifest(hsm, bank_dir) -> VerifiedManifest` — verifies the
   signature, decodes, and returns the full manifest + the raw signed bytes + the
   signature. `read_identity` is now a thin projection over it.
-- `VmBackend::verified_bank_manifest(bank)` — the running bank, memoised and
+- `ComponentBackend::verified_bank_manifest(bank)` — the running bank, memoised and
   invalidated on every NV write (the same funnel as the identity-DID cache).
 - Advertised in `list_parameters` (only when a committed manifest exists) and
   served in `read_data`; id const `INSTALLED_MANIFEST_PARAM_ID =

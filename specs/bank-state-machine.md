@@ -2,7 +2,7 @@
 
 ## Overview
 
-Each A/B bank set (hypervisor, vm1, vm2) has an independent state machine
+Each A/B bank set (host-os, vm1, vm2) has an independent state machine
 managing its update lifecycle. The HSM component uses a single bank (no A/B,
 no rollback). The state machine ensures atomic updates with automatic rollback
 on failure.
@@ -50,7 +50,7 @@ On every boot, the boot manager executes:
 
 ```
 1. Read NV Boot State
-2. For each A/B bank set (hypervisor, vm1, vm2):
+2. For each A/B bank set (host-os, vm1, vm2):
    a. If committed == true:
       - Boot from active_bank (normal path)
    b. If committed == false (trial mode):
@@ -66,11 +66,11 @@ On every boot, the boot manager executes:
 4. If hash verification fails:
    - If trial: immediate rollback (don't count, just swap)
    - If committed: FATAL — both banks may be corrupted
-5. Start hypervisor from hypervisor active bank
+5. Start host-os from host-os active bank
 6. Start VMs from vm1/vm2 active banks
 ```
 
-## OTA Update Flow (hypervisor-mgr)
+## OTA Update Flow (component-mgr)
 
 ```
 1. Receive OTA image for a bank set (e.g., vm1)
@@ -142,7 +142,7 @@ fundamentally broken updates.
 ## Independence
 
 Each A/B bank set has its own state machine. Updating vm1 does not affect vm2
-or the hypervisor. They can be:
+or the host-os. They can be:
 - Updated independently
 - At different states (one committed, another in trial)
 - Committed/rolled back independently

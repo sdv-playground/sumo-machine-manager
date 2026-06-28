@@ -175,14 +175,14 @@ The socket is created automatically. Connect after QEMU starts.
 
 To control a VM from an external simulation tool:
 
-1. **Start the vehicle stack** with `start-ecus.sh`
+1. **Start the vehicle stack** — `vm-service` launches each VM's QEMU with its QMP socket
 2. **Connect QMP**: `QmpClient::connect("/tmp/vm-svc-vm1-qmp.sock")`
 3. **Create SimController** with the desired step size
 4. **Replace device clocks**: pass `controller.clock()` to TimeSim, HealthSim, CanBridge
 5. **Drive the loop**: call `step()` at the simulation tick rate
 6. **For debug sessions**: `pause()` / `resume(0)`
 
-The vm-devices crate is open source: `github.com/sdv-playground/sumo-machine-manager`
+The vm-devices crate is open source: `github.com/skarlsson/sumo-machine-manager`
 
 ## Test Coverage
 

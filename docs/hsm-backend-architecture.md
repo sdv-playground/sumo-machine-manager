@@ -78,15 +78,20 @@ crypto itself; the backend (sim or vendor C) does.
 | **`hsm-sim-service`** | `SimHsm` (software) served over link-B (`serve_crypto`) | **non-production** dev/test backend + the runnable reference of a *conforming* impl — **just another link-B implementation, not privileged** |
 | **vendor C HSE service** | a C process implementing `hsm-link-b` (skeleton: `hsm-link-b/reference/hse_service_skeleton.c`) | the production path, per silicon |
 
-`hsm-sim-service` and a vendor HSE are *peers* behind link B — `vhsm-ssd` selects between them
-purely by `--backend-cmd` and cannot tell them apart. Both must pass `hsm-conformance` (§6);
+`hsm-sim-service` and a vendor HSE are *peers* behind link B — whoever launches the backend
+(the orchestrator in production, vhsm-ssd in dev) selects between them purely by which backend
+command runs, and nothing above link B can tell them apart. Both must pass `hsm-conformance` (§6);
 the sim does, the *stub* C skeleton does not (its crypto is unimplemented) — which is how the
 suite proves it checks crypto, not just framing.
 
-`vhsm-ssd` spawns one per config (`--backend-cmd`, default the sibling `hsm-sim-service`;
-`--backend-socket` / default `<keystore>/hsm-backend.sock`) and connects a `LinkBClient`. New
-silicon = a new C service implementing the same contract — nothing above link B changes.
-(The old `QnxHsm` and in-process `HseHsmProvider`/`hse-s32g3` are retired.)
+**Production ownership:** the **orchestrator** (e.g. supernova, or `example/run.sh`) spawns
+and owns the backend service, and `vhsm-ssd` runs **connect-only** (`--backend-connect-only`
++ `--backend-socket`) against that pre-spawned socket — it never spawns or kills the backend.
+As a dev/standalone convenience `vhsm-ssd` can instead spawn the backend itself
+(`--backend-cmd`, default the sibling `hsm-sim-service`; `--backend-socket` / default
+`<keystore>/hsm-backend.sock`); either way it connects a `LinkBClient`. New silicon = a new C
+service implementing the same contract — nothing above link B changes. (The old `QnxHsm` and
+in-process `HseHsmProvider`/`hse-s32g3` are retired.)
 
 ## 3. One integration path (the ADR, resolved)
 

@@ -3,10 +3,10 @@
 Generate demo artifacts (signing keys + signed SUIT envelopes with 1MB dummy firmware):
 
 ```bash
-cargo run --example build
+cargo run -p component-mgr --example build_hsm_keys
 ```
 
-This creates (names reflect the current `cargo run --example build` output —
+This creates (names reflect the current `cargo run -p component-mgr --example build_hsm_keys` output —
 check `output/` if the versioning scheme drifts):
 
 | File | Component | Use case |
@@ -31,8 +31,8 @@ Then open SOVD Explorer and connect to `http://localhost:4000`.
 
 ## Simulate upgrade flow
 
-1. Upload `vm1-v1.suit` via the Software tab → verify → transfer → commit
-2. Upload `vm1-v2.suit` → verify → transfer → commit (upgrade)
-3. Try uploading `vm1-v1.suit` again → should be rejected (anti-rollback)
+1. Upload `vm1-v1.0.0.suit` via the Software tab → finalize → activate → commit
+2. Upload `vm1-v1.2.0.suit` → finalize → activate → commit (upgrade, secver 2)
+3. Try uploading `vm1-v1.0.0.suit` again → should be rejected (anti-rollback)
 
 Same flow works for vm2 independently.
