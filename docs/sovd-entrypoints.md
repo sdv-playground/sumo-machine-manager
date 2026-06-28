@@ -125,7 +125,7 @@ the pull-update trust anchor (the sw-authority key). The mode is chosen by
 
   ```sh
   exec ./vm-sovd "$NV" --gateway \
-      --host-sovd-url http://10.0.101.1:9200 \
+      --host-sovd-url http://10.0.101.1:4000 \
       --proxy-component host-os \
       --device-id "$DEVICE_ID" \
       --guest-vhsm \
