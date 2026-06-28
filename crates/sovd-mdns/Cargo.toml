@@ -2,7 +2,7 @@
 name = "sovd-mdns"
 version = "0.1.0"
 edition = "2021"
-description = "Conformant mDNS / DNS-SD advertiser for the SOVD server (ISO 17978-3 §5.11): registers _sovd._tcp.local. with the cert-derived <id>.local hostname plus identification/accessurl TXT records. QNX (nto) compiles to an inert stub."
+description = "Conformant mDNS / DNS-SD advertiser for the SOVD server (ISO 17978-3 §5.11): registers _sovd._tcp.local. with the cert-derived <id>.local hostname plus identification/accessurl TXT records. Off-QNX it uses mdns-sd; on QNX (nto) a hand-rolled pure-Rust responder (simple-dns + socket2)."
 license = "MIT"
 
 [lib]
@@ -16,11 +16,26 @@ x509-cert = { version = "0.2", features = ["std"] }
 const-oid = { version = "0.9", features = ["db"] }
 tracing = "0.1"
 
-# Pure-Rust DNS-SD advertiser — pulled on every target EXCEPT QNX (nto).
-# mdns-sd's event loop (mio) + interface enumeration (if-addrs) + socket-pktinfo
-# have no `target_os = "nto"` support, and the supernova QNX cross-build only
-# patches libc/socket2/tokio/ring. Rather than break that build, on nto this
-# crate falls back to an inert stub (src/advertiser_stub.rs) with the identical
-# API. See the module docs in src/lib.rs.
+# Hand-rolled pure-Rust DNS-SD responder (src/responder.rs) — the live backend
+# on QNX (nto), and compiled + exercised on every host so it stays testable on
+# Linux. `simple-dns` is a pure-Rust DNS wire codec (no mio / if-addrs /
+# socket-pktinfo / build-script C); `socket2` is the thin libc UDP-socket
+# wrapper the supernova QNX cross-build already carries (same 0.6 line). Both
+# cross-compile cleanly to aarch64-unknown-nto-qnx710 — verify with
+# `cargo tree -p sovd-mdns --target aarch64-unknown-nto-qnx710`.
+simple-dns = "0.11"
+socket2 = "0.6"
+
+# Off-QNX only: enable socket2's `all` feature (for SO_REUSEPORT) and pull the
+# mature `mdns-sd` stack as the live backend.
+#
+# - `socket2 [all]` lets the responder co-bind UDP :5353 alongside a host mDNS
+#   daemon (e.g. avahi) during Linux testing. It is held OFF the nto build so
+#   that target keeps the minimal default-feature socket2 it already compiles
+#   (set_reuse_port isn't needed on the device — nothing else holds :5353).
+# - `mdns-sd`'s transitive deps (mio / if-addrs / socket-pktinfo) have no
+#   `target_os = "nto"` path, so on QNX the hand-rolled responder above is
+#   selected instead (see src/lib.rs).
 [target.'cfg(not(target_os = "nto"))'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }
 mdns-sd = "0.20"

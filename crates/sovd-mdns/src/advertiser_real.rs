@@ -1,8 +1,8 @@
 //! Real mDNS / DNS-SD advertiser, backed by the pure-Rust `mdns-sd` crate.
 //!
-//! Compiled on every target except QNX (`target_os = "nto"`), where
-//! `advertiser_stub.rs` takes over. See the crate-level docs for the QNX
-//! rationale.
+//! Compiled and selected on every target except QNX (`target_os = "nto"`),
+//! where the hand-rolled [`responder`](crate::responder) takes over (`mdns-sd`'s
+//! deps have no `nto` support). See the crate-level docs for the rationale.
 
 use crate::{AdvertiseError, SovdAdvertiser, SERVICE_TYPE};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
@@ -41,8 +41,8 @@ pub(crate) fn start(adv: SovdAdvertiser) -> Result<AdvertiserGuard, AdvertiseErr
         SERVICE_TYPE,
         &adv.instance, // instance name -> fullname `<instance>._sovd._tcp.local.`
         &hostname,
-        (),        // no explicit addresses; auto-detected below
-        adv.port,  // SRV port = the SOVD server's actual bind port
+        (),       // no explicit addresses; auto-detected below
+        adv.port, // SRV port = the SOVD server's actual bind port
         &txt[..],
     )
     .map_err(|e| AdvertiseError(e.to_string()))?

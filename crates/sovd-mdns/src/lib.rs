@@ -38,19 +38,31 @@
 //! ```
 //!
 //! ## Portability
-//! The wire/event-loop backend is [`mdns-sd`](https://crates.io/crates/mdns-sd),
-//! a pure-Rust DNS-SD stack (no C deps). Its transitive deps (`mio`, `if-addrs`,
-//! `socket-pktinfo`) have no `target_os = "nto"` support, and the supernova QNX
-//! cross-build only patches `libc`/`socket2`/`tokio`/`ring`. So on QNX (`nto`)
-//! this crate compiles to an inert stub (`advertiser_stub.rs`) exposing the
-//! identical API: registration logs a warning and is a no-op. The cert parse
-//! ([`instance_from_cert_der`]) stays available on every target. Real QNX
-//! advertising is a follow-up (see `advertiser_stub.rs`).
+//! There are two wire backends behind one identical API:
+//! - off-QNX, [`mdns-sd`](https://crates.io/crates/mdns-sd) — a mature pure-Rust
+//!   DNS-SD stack ([`advertiser_real`]);
+//! - on QNX (`target_os = "nto"`), a hand-rolled pure-Rust responder
+//!   ([`responder`]) built on `simple-dns` (DNS wire codec) + `socket2` (UDP).
+//!
+//! The split exists because `mdns-sd`'s transitive deps (`mio`, `if-addrs`,
+//! `socket-pktinfo`) have no `nto` support, whereas `simple-dns` (only dep:
+//! `bitflags`) and `socket2` (only dep: `libc`, the line the supernova QNX
+//! cross-build already carries) both cross-compile to
+//! `aarch64-unknown-nto-qnx710`. The [`responder`] is compiled on every target
+//! (so it stays testable on Linux) but is only *selected* as the live backend on
+//! `nto`. The cert parse ([`instance_from_cert_der`]) is target-independent.
 
 use std::fmt;
 
+// Hand-rolled pure-Rust DNS-SD responder. The live backend on QNX (`nto`);
+// elsewhere it is still compiled and exercised by tests/examples (the public
+// API uses `mdns-sd` off-`nto`). `#[doc(hidden)] pub` is a deliberate test seam
+// — the stable entry point is `SovdAdvertiser::start`.
+#[doc(hidden)]
+pub mod responder;
+
 #[cfg_attr(not(target_os = "nto"), path = "advertiser_real.rs")]
-#[cfg_attr(target_os = "nto", path = "advertiser_stub.rs")]
+#[cfg_attr(target_os = "nto", path = "advertiser_nto.rs")]
 mod advertiser;
 
 pub use advertiser::AdvertiserGuard;
@@ -186,8 +198,10 @@ mod tests {
     // A leaf mirroring the identity-tower CA shape: CN=cvc-host-rig1 with SAN
     // dNSNames [cvc-host-rig1, cvc-host-rig1.local] (see
     // sumo-provision/crates/identity-tower/src/ca.rs).
-    const LEAF_DER: &[u8] =
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/leaf-cvc-host-rig1.der"));
+    const LEAF_DER: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/leaf-cvc-host-rig1.der"
+    ));
 
     #[test]
     fn instance_parsed_from_local_san() {
