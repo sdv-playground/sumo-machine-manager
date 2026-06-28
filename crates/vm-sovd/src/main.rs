@@ -478,27 +478,40 @@ async fn main() {
     // --tls: serve HTTPS with the HSM-held tls-identity (server-only TLS — the
     // client authenticates with an operator token, not a client cert). The link-B
     // backend signs the handshake; the private key never leaves the HSM.
+    // Best-effort: serve HTTPS once the tls-identity leaf is provisioned; until
+    // then (first-boot provisioning) serve HTTP — the very flow that installs the
+    // leaf (CSR enrollment + keystore install) runs over this SOVD path, so it
+    // can't require the cert it's about to deliver. A restart after provisioning
+    // lights up HTTPS. Mirrors the cross-node listener's graceful degradation.
     let tls_config: Option<axum_server::tls_rustls::RustlsConfig> = if tls_enabled {
-        let crypto = client.clone().unwrap_or_else(|| {
-            eprintln!("--tls requires --backend-socket (the HSM holds the tls-identity key)");
-            std::process::exit(1);
-        });
-        let leaf = crypto
-            .get_certificate_der(KeyRole::TlsIdentity.handle())
-            .unwrap_or_else(|e| {
-                eprintln!("--tls: tls-identity leaf cert not provisioned: {e}");
-                std::process::exit(1);
-            });
-        let signer = crypto.clone();
-        let sign_fn = move |msg: &[u8]| {
-            signer
-                .sign(KeyRole::TlsIdentity.handle(), msg)
-                .map_err(|e| e.to_string())
-        };
-        let cfg = hsm_rustls::server_config_no_client_auth(leaf, sign_fn);
-        Some(axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(
-            cfg,
-        )))
+        match client.as_ref() {
+            None => {
+                tracing::warn!("--tls set but no --backend-socket (no HSM) — serving HTTP");
+                None
+            }
+            Some(crypto) => match crypto.get_certificate_der(KeyRole::TlsIdentity.handle()) {
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "--tls set but the tls-identity leaf isn't provisioned yet — serving HTTP \
+                         (provisioning runs over the SOVD path; restart once it lands for HTTPS)"
+                    );
+                    None
+                }
+                Ok(leaf) => {
+                    let signer = crypto.clone();
+                    let sign_fn = move |msg: &[u8]| {
+                        signer
+                            .sign(KeyRole::TlsIdentity.handle(), msg)
+                            .map_err(|e| e.to_string())
+                    };
+                    let cfg = hsm_rustls::server_config_no_client_auth(leaf, sign_fn);
+                    Some(axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(
+                        cfg,
+                    )))
+                }
+            },
+        }
     } else {
         None
     };
