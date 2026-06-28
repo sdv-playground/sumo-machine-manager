@@ -78,7 +78,9 @@ The load-bearing ones, bottom-up:
   /updates wire to reject mismatches with HTTP 415 before opening a session).
 
 Design docs: `docs/hsm-backend-architecture.md` (the HSM contract + the link-B C
-vendor handoff) and `docs/vhsm-integration-path.md`. HSM tooling under
+vendor handoff) and `docs/vhsm-integration-path.md`; the SOVD server entrypoints
+(host machine-manager, in-VM/on-host vehicle gateway, reference servers) are
+inventoried in `docs/sovd-entrypoints.md`. HSM tooling under
 `tools/crates/`: `hsm-conformance` (verify a backend), `hsm-sim-backend` (the sim).
 
 ### Separation of Concerns
@@ -128,7 +130,7 @@ crates/component-mgr/src/
   streaming.rs            — upload pipeline (decrypt + decompress + hash)
   did.rs                  — UDS DID resolution (F187-F19E + custom)
   sovd/security.rs        — SecurityProvider trait + TestSecurityProvider
-  main.rs                 — vm-diagserver binary entry point (SOVD/OTA server)
+  main.rs                 — vm-diagserver CLI (NV/bank + factory ops; NOT an HTTP server — the SOVD/OTA server is the vm-sovd crate)
 
 crates/host-os-mgr/src/
   component.rs            — HostOsComponent (implements machine_mgr::Component)

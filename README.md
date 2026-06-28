@@ -27,6 +27,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 - **[HSM backend architecture](docs/hsm-backend-architecture.md)** — the open-core HSM contract: the three seams (transport · link-A vHSM wire · link-B backend) and how a vendor integrates a hardware HSM. **Start here for the HSM.**
 - **[vHSM integration path](docs/vhsm-integration-path.md)** — the end-to-end guest → host → device crypto path + how to verify a backend.
 - **[Simulation stepping](docs/simulation-stepping.md)** — deterministic VM time / sim clock control.
+- **[SOVD server entrypoints](docs/sovd-entrypoints.md)** — every SOVD server in the workspace, classified: the host machine-manager (`vm-sovd`), the in-VM/on-host vehicle gateway (`vm-sovd --gateway`), the production `supernova` server, the SOVDd reference servers, and the library-vs-clients distinction.
 - **Link-B contract** — `crates/hsm-link-b/` (frozen wire + C header) with the C vendor skeleton at [`crates/hsm-link-b/reference/`](crates/hsm-link-b/reference/) — the hardware-HSM integration example.
 - **HSM tooling** — `tools/crates/hsm-conformance` (the suite a vendor backend must pass) · `tools/crates/hsm-sim-backend` (the non-production reference backend).
 - **Deeper** — [CLAUDE.md](CLAUDE.md) · [ARCHITECTURE.md](ARCHITECTURE.md) · [AGENTS.md](AGENTS.md)

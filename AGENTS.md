@@ -14,7 +14,7 @@ Rust workspace for platform-agnostic A/B bank management, VM lifecycle, SUIT OTA
 - `crates/nv-store/`, `crates/hsm/`, `crates/vhsm-ssd/` — persistence and crypto/HSM layers.
 - `example/` — local generated firmware/server smoke flow.
 - `specs/` — bank state, disk layout, nv-store and app-installation specs.
-- `docs/` — design docs, incl. `hsm-backend-architecture.md` (the HSM link-B contract + the C vendor handoff) and `vhsm-integration-path.md`.
+- `docs/` — design docs, incl. `sovd-entrypoints.md` (every SOVD server entrypoint in the workspace, classified), `hsm-backend-architecture.md` (the HSM link-B contract + the C vendor handoff) and `vhsm-integration-path.md`.
 - `crates/hsm-link-b/` — the frozen HSM link-B wire + C header (`include/`) + `reference/` C skeleton.
 - `tools/crates/` — `hsm-conformance` (backend conformance suite) and `hsm-sim-backend` (the `SimHsm` backend).
 
