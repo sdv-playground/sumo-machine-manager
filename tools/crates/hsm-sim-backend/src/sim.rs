@@ -83,6 +83,30 @@ impl SimHsm {
         self.keystore_path.join("provision_state")
     }
 
+    /// Path to the safe-time-floor file (UNIX seconds, decimal). Kept separate
+    /// from `provision_state` so the floor's write path is independent of
+    /// keystore provisioning — a re-provision must never disturb it, and a
+    /// floor ratchet must never rewrite provisioning state. On real hardware
+    /// this is the HSM's secure-NV; here it's a file in the keystore dir.
+    fn time_floor_path(&self) -> PathBuf {
+        self.keystore_path.join("time_floor")
+    }
+
+    /// Ratchet the safe-time floor to `max(current, new_floor_secs)`; return the
+    /// resulting floor. Monotonic — a value at or below the stored floor is a
+    /// no-op (never rewinds; the anti-rollback safety core, mirroring
+    /// `security_version` / `adopt_monotonic`). `&self` (file-backed), so the
+    /// provisioning-time harvest in `write_leaf_certs` can call it too.
+    fn ratchet_time_floor(&self, new_floor_secs: u64) -> Result<u64, HsmError> {
+        let current = self.read_time_floor()?;
+        let raised = current.max(new_floor_secs);
+        if raised != current {
+            std::fs::write(self.time_floor_path(), raised.to_string().as_bytes())
+                .map_err(|e| HsmError::KeystoreError(format!("write time_floor: {e}")))?;
+        }
+        Ok(raised)
+    }
+
     /// Keys subdirectory.
     pub(crate) fn keys_dir(&self) -> PathBuf {
         self.keystore_path.join("keys")
@@ -220,6 +244,26 @@ impl SimHsm {
             let cert_path = keys_dir.join(format!("{}.cert", c.key_id));
             write_pem_certificate(&cert_path, &c.certificate)?;
             tracing::info!(key_id = %c.key_id, "installed leaf certificate");
+
+            // Safe-time-floor seed (docs/design/safe-time-floor.md): this leaf
+            // was minted by our own CA (the payload signature was verified by
+            // `provision` before we got here), so its `not_before` is a
+            // trustworthy lower bound on real time — real-now >= not_before.
+            // Ratchet the HSM floor to it. On a device booted at the Unix epoch
+            // this jumps the floor to ~provisioning time, so the delegated-cert
+            // validity check (max(now, floor)) stops rejecting real-dated leaves
+            // as "not valid yet". Monotonic, so this can only move it forward.
+            #[cfg(feature = "crypto")]
+            if let Some(nb) = leaf_not_before_secs(&c.certificate) {
+                match self.ratchet_time_floor(nb) {
+                    Ok(f) => tracing::info!(
+                        key_id = %c.key_id, not_before = nb, floor = f,
+                        "safe-time floor ratcheted from installed leaf not_before"
+                    ),
+                    Err(e) => tracing::warn!(key_id = %c.key_id, error = %e,
+                        "could not ratchet safe-time floor"),
+                }
+            }
         }
         Ok(())
     }
@@ -890,6 +934,23 @@ impl HsmProvider for SimHsm {
             Ok(ProvisioningState::Unprovisioned)
         }
     }
+
+    fn read_time_floor(&self) -> Result<u64, HsmError> {
+        let path = self.time_floor_path();
+        if !path.exists() {
+            return Ok(0);
+        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| HsmError::KeystoreError(format!("read time_floor: {e}")))?;
+        content
+            .trim()
+            .parse()
+            .map_err(|e| HsmError::KeystoreError(format!("corrupt time_floor: {e}")))
+    }
+
+    fn raise_time_floor(&mut self, new_floor_secs: u64) -> Result<u64, HsmError> {
+        self.ratchet_time_floor(new_floor_secs)
+    }
 }
 
 // --- Zstd decompression ---
@@ -1114,6 +1175,22 @@ pub(crate) fn write_pem_ec_public(path: &Path, uncompressed: &[u8]) -> Result<()
 /// alongside the key it certifies. `get_certificate_der` reads it back.
 fn write_pem_certificate(path: &Path, der: &[u8]) -> Result<(), HsmError> {
     write_pem_file(path, "CERTIFICATE", der)
+}
+
+/// Parse a DER X.509 cert and return its `notBefore` as UNIX seconds, or `None`
+/// if it doesn't parse. Used to seed the safe-time floor from a just-installed,
+/// CA-signed identity leaf (`write_leaf_certs`); see safe-time-floor.md.
+#[cfg(feature = "crypto")]
+fn leaf_not_before_secs(der: &[u8]) -> Option<u64> {
+    use x509_cert::der::Decode;
+    let cert = x509_cert::Certificate::from_der(der).ok()?;
+    Some(
+        cert.tbs_certificate
+            .validity
+            .not_before
+            .to_unix_duration()
+            .as_secs(),
+    )
 }
 
 /// Base64-encode DER data and write as PEM with the given label.
@@ -1545,6 +1622,35 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn time_floor_ratchets_monotonically_and_survives_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keystore = tmp.path().to_path_buf();
+        let mut sim = SimHsm::new(keystore.clone());
+
+        // Unset floor reads as 0.
+        assert_eq!(sim.read_time_floor().unwrap(), 0);
+
+        // First raise sets it.
+        assert_eq!(sim.raise_time_floor(1_000).unwrap(), 1_000);
+        assert_eq!(sim.read_time_floor().unwrap(), 1_000);
+
+        // A higher value advances.
+        assert_eq!(sim.raise_time_floor(2_000).unwrap(), 2_000);
+
+        // A lower value is a no-op — never rewinds.
+        assert_eq!(sim.raise_time_floor(1_500).unwrap(), 2_000);
+        assert_eq!(sim.raise_time_floor(0).unwrap(), 2_000);
+        assert_eq!(sim.read_time_floor().unwrap(), 2_000);
+
+        // Equal value is a no-op that returns the floor.
+        assert_eq!(sim.raise_time_floor(2_000).unwrap(), 2_000);
+
+        // Survives a fresh handle over the same keystore (persisted, not in-mem).
+        let reloaded = SimHsm::new(keystore.clone());
+        assert_eq!(reloaded.read_time_floor().unwrap(), 2_000);
     }
 
     #[test]

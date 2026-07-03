@@ -15,6 +15,9 @@
 //! supplied at construction (a deployment reads them from its `HsmProvider` /
 //! pinned roots); this type stays HSM-agnostic.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Header, Validation};
 use serde::Deserialize;
@@ -114,6 +117,16 @@ pub struct TieredAuthorizer {
     /// writes and destructive ops always require a token. `false` = every route
     /// needs a token (the destructive-route default).
     read_open: bool,
+    /// The safe-time floor (`docs/design/safe-time-floor.md`): a monotonic lower
+    /// bound on real UNIX time (seconds), shared live with the ratchet path via
+    /// an atomic cell. The delegated (`x5c`) path evaluates certificate validity
+    /// against `max(wall_clock_now, floor)` so a device booted at the Unix epoch
+    /// (no RTC) still accepts a workshop delegate leaf whose `not_before` is
+    /// after the floor was seeded at provisioning. Read live per request (a cheap
+    /// atomic load) — NOT a build-time snapshot — because the floor ratchets up
+    /// at runtime while this authorizer is a cached build. `None` = no floor
+    /// (behaviour identical to raw `now`).
+    time_floor_secs: Option<Arc<AtomicU64>>,
 }
 
 impl TieredAuthorizer {
@@ -132,6 +145,7 @@ impl TieredAuthorizer {
             pinned_root_pem: None,
             aud,
             read_open: false,
+            time_floor_secs: None,
         }
     }
 
@@ -181,6 +195,35 @@ impl TieredAuthorizer {
     pub fn with_epoch(mut self, epoch: u64) -> Self {
         self.expected_epoch = Some(epoch);
         self
+    }
+
+    /// Share the live safe-time floor cell (`docs/design/safe-time-floor.md`).
+    /// The delegated (`x5c`) path then verifies certificate validity against
+    /// `max(wall_clock_now, floor)`, so a clockless (epoch-booted) device can
+    /// still accept a delegate leaf whose validity window is in the real-time
+    /// future. The `Arc<AtomicU64>` is read live per request (the floor ratchets
+    /// up at runtime); omit for no floor. Seconds since the Unix epoch.
+    pub fn with_time_floor(mut self, floor: Arc<AtomicU64>) -> Self {
+        self.time_floor_secs = Some(floor);
+        self
+    }
+
+    /// `max(wall_clock_now, floor)` as a rustls [`UnixTime`] — the time the
+    /// delegated path judges certificate validity against. With no floor set,
+    /// this is just wall-clock now.
+    fn effective_now(&self) -> rustls::pki_types::UnixTime {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let floor = self
+            .time_floor_secs
+            .as_ref()
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+            now_secs.max(floor),
+        ))
     }
 
     /// Freshness gate shared by both verification paths (pinned-issuer and
@@ -396,12 +439,18 @@ impl TieredAuthorizer {
             .collect::<Result<_, _>>()
             .map_err(|e| format!("malformed `x5c` (not standard-base64 DER): {e}"))?;
 
-        // (b) Delegation is the *cable-connected workshop* path: an operator is
-        // physically present, so a usable wall clock is a reasonable assumption
-        // and we verify the chain's validity window against `now`. The
-        // OTA/clockless paths never use delegation — they go through pinned
-        // issuers above, whose freshness comes from boot_id/epoch, not a clock.
-        let now = rustls::pki_types::UnixTime::now();
+        // (b) Delegation is the *cable-connected workshop* path. We verify the
+        // chain's validity window against `max(wall_clock_now, safe-time floor)`
+        // (`effective_now`) — NOT raw wall clock. A CVC has no RTC and boots at
+        // the Unix epoch, so raw `now` would reject a workshop delegate leaf
+        // whose `not_before` is a real-world date ("certificate not valid yet").
+        // The floor, seeded from our own CA-signed material at provisioning and
+        // only ever ratcheted upward, is a rollback-proof lower bound on real
+        // time — using `max(now, floor)` can only *tighten* an expiry check,
+        // never loosen it (see docs/design/safe-time-floor.md). The OTA/clockless
+        // paths never use delegation — they go through pinned issuers above,
+        // whose freshness comes from boot_id/epoch, not a clock.
+        let now = self.effective_now();
 
         // (c) THE chain trust decision: root-pinning + path building + signature
         // + validity, plus the leaf's granted scopes. We do not re-implement any
@@ -484,6 +533,33 @@ impl TieredAuthorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_now_is_the_floor_when_it_exceeds_wall_clock() {
+        // The clockless-device case (docs/design/safe-time-floor.md): a floor far
+        // in the future must win over the wall clock, so the delegated path judges
+        // cert validity against the floor, not epoch-1970. Floor ~2286 (10^10 s) —
+        // safely above any real test-runner clock.
+        let far_future: u64 = 10_000_000_000;
+        let floored = TieredAuthorizer::new(Vec::new())
+            .with_time_floor(Arc::new(AtomicU64::new(far_future)));
+        let expected = rustls::pki_types::UnixTime::since_unix_epoch(
+            std::time::Duration::from_secs(far_future),
+        );
+        assert_eq!(
+            floored.effective_now(),
+            expected,
+            "a floor above the wall clock must dominate effective_now"
+        );
+
+        // With no floor, effective_now is strictly below the far-future floor
+        // (it's the real wall clock).
+        let unfloored = TieredAuthorizer::new(Vec::new());
+        assert!(
+            unfloored.effective_now() < expected,
+            "with no floor, effective_now must track the wall clock"
+        );
+    }
 
     #[test]
     fn reboot_is_operational_factory_reset_is_high_consequence() {

@@ -389,6 +389,24 @@ impl LinkBClient {
         Ok(result.first() == Some(&1))
     }
 
+    /// `OP_READ_TIME_FLOOR` — the monotonic safe-time floor (UNIX seconds, 0 if
+    /// never set).
+    pub fn read_time_floor(&self) -> Result<u64, HsmError> {
+        let result = self.call(OP_READ_TIME_FLOOR, Vec::new())?;
+        Reader::new(&result).u64().map_err(proto_err)
+    }
+
+    /// `OP_RAISE_TIME_FLOOR` — ratchet the floor to `max(current, new_floor_secs)`;
+    /// returns the resulting floor. Monotonic on the backend (a lower value is a
+    /// no-op).
+    pub fn raise_time_floor(&self, new_floor_secs: u64) -> Result<u64, HsmError> {
+        let result = self.call(
+            OP_RAISE_TIME_FLOOR,
+            Writer::new().u64(new_floor_secs).finish(),
+        )?;
+        Reader::new(&result).u64().map_err(proto_err)
+    }
+
     /// `OP_GET_PUBLIC_KEY` — the public key for `role`, as the COSE_Key CBOR
     /// [`HsmProvider::get_public_key`] yields. The wire carries SubjectPublicKeyInfo
     /// DER (keyed by `role.handle()`); the SPKI→COSE_Key conversion happens here
@@ -632,6 +650,14 @@ impl HsmProvider for LinkBProvider {
 
     fn clear_enrolled(&mut self, vm_id: &str) -> Result<bool, HsmError> {
         self.client.clear_enrolled(vm_id)
+    }
+
+    fn read_time_floor(&self) -> Result<u64, HsmError> {
+        self.client.read_time_floor()
+    }
+
+    fn raise_time_floor(&mut self, new_floor_secs: u64) -> Result<u64, HsmError> {
+        self.client.raise_time_floor(new_floor_secs)
     }
 }
 
@@ -926,6 +952,15 @@ where
             // traits in scope); it returns the SPKI DER the host wants.
             let handle = KeyHandle(r.u32()?);
             backend.get_public_key_der(handle)
+        }
+        OP_READ_TIME_FLOOR => backend
+            .read_time_floor()
+            .map(|f| Writer::new().u64(f).finish()),
+        OP_RAISE_TIME_FLOOR => {
+            let new_floor = r.u64()?;
+            backend
+                .raise_time_floor(new_floor)
+                .map(|f| Writer::new().u64(f).finish())
         }
         _ => return Ok(Err(HsmError::NotSupported(format!("link-b op {op:#06x}")))),
     };

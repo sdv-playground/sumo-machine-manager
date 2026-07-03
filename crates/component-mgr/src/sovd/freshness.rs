@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 
 /// Domain-separation tag for the signed bytes. Bump the version suffix if the
 /// canonical encoding below ever changes, so an old verifier can never be
-/// tricked into accepting a new-format blob (or vice versa).
-const DOMAIN_TAG: &[u8] = b"sumo-freshness-v1\0";
+/// tricked into accepting a new-format blob (or vice versa). v2: the safe-time
+/// floor is now UNIX **seconds** (was ns) — matching the HSM-resident floor's
+/// unit (docs/design/safe-time-floor.md).
+const DOMAIN_TAG: &[u8] = b"sumo-freshness-v2\0";
 
 /// The vehicle-level freshness statement a master coordinator signs (§7.2):
 /// the current monotonic epoch and safe-time-floor, scoped to one vehicle.
@@ -28,9 +30,11 @@ pub struct FreshnessAssertion {
     /// Monotonic freshness epoch — bumped at power-on / online-sync. A
     /// vehicle-wide token is fresh only against the current epoch (§7.3).
     pub vehicle_epoch: u64,
-    /// Safe-time-floor, ns since the Unix epoch; 0 until a trustworthy source
-    /// (Roughtime, §6.5) lands. Monotonic upper-ratchet.
-    pub safe_time_floor_ns: u64,
+    /// Safe-time-floor, **seconds** since the Unix epoch; 0 until a trustworthy
+    /// source (the provisioning identity leaf, a signed SUIT timestamp,
+    /// Roughtime) lands. Monotonic upper-ratchet, HSM-resident
+    /// (docs/design/safe-time-floor.md).
+    pub safe_time_floor_seconds: u64,
 }
 
 impl FreshnessAssertion {
@@ -44,7 +48,7 @@ impl FreshnessAssertion {
         out.extend_from_slice(&(id.len() as u32).to_le_bytes());
         out.extend_from_slice(id);
         out.extend_from_slice(&self.vehicle_epoch.to_le_bytes());
-        out.extend_from_slice(&self.safe_time_floor_ns.to_le_bytes());
+        out.extend_from_slice(&self.safe_time_floor_seconds.to_le_bytes());
         out
     }
 
@@ -130,7 +134,7 @@ mod tests {
         FreshnessAssertion {
             vehicle_id: "ecu-thumbprint".to_string(),
             vehicle_epoch: epoch,
-            safe_time_floor_ns: 42,
+            safe_time_floor_seconds: 42,
         }
     }
 
@@ -167,7 +171,7 @@ mod tests {
 
         let tampers: [fn(&mut SignedFreshness); 3] = [
             |s| s.assertion.vehicle_epoch += 1,
-            |s| s.assertion.safe_time_floor_ns += 1,
+            |s| s.assertion.safe_time_floor_seconds += 1,
             |s| s.assertion.vehicle_id.push('x'),
         ];
         for tamper in tampers {
@@ -189,12 +193,12 @@ mod tests {
         let a = FreshnessAssertion {
             vehicle_id: "a".into(),
             vehicle_epoch: 0,
-            safe_time_floor_ns: 0,
+            safe_time_floor_seconds: 0,
         };
         let b = FreshnessAssertion {
             vehicle_id: "ab".into(),
             vehicle_epoch: 0,
-            safe_time_floor_ns: 0,
+            safe_time_floor_seconds: 0,
         };
         assert_ne!(a.signing_bytes(), b.signing_bytes());
     }

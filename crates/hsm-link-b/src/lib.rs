@@ -117,6 +117,10 @@ pub const OP_ARM_ENROLLMENT: u32 = 0x24;
 pub const OP_IS_ENROLLED: u32 = 0x25;
 pub const OP_CLEAR_ENROLLED: u32 = 0x26;
 pub const OP_GET_PUBLIC_KEY: u32 = 0x27;
+/// Read the monotonic safe-time floor (UNIX seconds, u64; 0 if never set).
+pub const OP_READ_TIME_FLOOR: u32 = 0x28;
+/// Ratchet the safe-time floor to max(current, arg); returns the resulting floor.
+pub const OP_RAISE_TIME_FLOOR: u32 = 0x29;
 
 // ── Status codes (mirror the HsmError categories) ─────────────────────────────
 pub const ST_OK: u32 = 0;

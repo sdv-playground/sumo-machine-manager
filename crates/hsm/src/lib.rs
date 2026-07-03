@@ -141,6 +141,38 @@ pub trait HsmProvider: Send {
         let _ = vm_id;
         Err(HsmError::NotSupported("HsmProvider::clear_enrolled".into()))
     }
+
+    /// Read the persistent monotonic **safe-time floor** — a lower bound on real
+    /// UNIX time (seconds), 0 if never set.
+    ///
+    /// The floor is the device's rollback-proof answer to "what time is it at
+    /// least?" on hardware with no trusted clock (no RTC/GPS; boots at the Unix
+    /// epoch). It is stored in the HSM's secure NV — the same tamper/rollback
+    /// domain as the keystore `security_version` anti-rollback counter — so an
+    /// attacker with only filesystem/SOVD access cannot rewind it. Validity
+    /// checks evaluate against `max(wall_clock_now, floor)`; see
+    /// `docs/design/safe-time-floor.md`.
+    ///
+    /// Default impl returns `NotSupported`; concrete providers override.
+    fn read_time_floor(&self) -> Result<u64, HsmError> {
+        Err(HsmError::NotSupported("HsmProvider::read_time_floor".into()))
+    }
+
+    /// Ratchet the safe-time floor to `max(current, new_floor_secs)` and return
+    /// the resulting floor.
+    ///
+    /// Monotonic **in the backend**: a `new_floor_secs` at or below the stored
+    /// value is a no-op that returns the unchanged floor. This is the safety
+    /// core — a buggy or hostile caller can only *stall* the floor, never *rewind*
+    /// it (mirrors `security_version` / `adopt_monotonic`). Callers harvest
+    /// `new_floor_secs` only from material accepted on signature grounds (a
+    /// verified cert's `not_before`, a signed SUIT timestamp) — never raw input.
+    ///
+    /// Default impl returns `NotSupported`; concrete providers override.
+    fn raise_time_floor(&mut self, new_floor_secs: u64) -> Result<u64, HsmError> {
+        let _ = new_floor_secs;
+        Err(HsmError::NotSupported("HsmProvider::raise_time_floor".into()))
+    }
 }
 
 // `HsmCryptoProvider` (the handle-addressed crypto trait) now lives in the

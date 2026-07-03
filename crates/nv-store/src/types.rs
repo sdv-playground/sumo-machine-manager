@@ -667,23 +667,25 @@ impl NvRecord for NvApp {
 /// freshness but never replay an old epoch into validity. Vehicle-wide
 /// (not per-bank) and distinct from the write-once VIN in [`NvFactory`].
 ///
-/// `safe_time_floor_ns` is the §6.5/§7.2 monotonic time floor (ns since
-/// the Unix epoch); 0 until a trustworthy source (Roughtime) lands. The
-/// field is persisted now so the floor survives reboots once sourced —
-/// no on-device format bump needed when it goes live.
+/// The safe-time-floor is NOT stored here. It moved to the HSM's secure NV —
+/// the same tamper/rollback domain as the keystore `security_version`
+/// anti-rollback counter — reached via `HsmProvider::{read,raise}_time_floor`
+/// (docs/design/safe-time-floor.md). Keeping one monotonic floor in one place
+/// avoids the split-source anti-pattern a rollback defense must not have. The
+/// `[16..24]` bytes that once held it are reserved (kept in the layout so the
+/// record size and sector rotation are unchanged; no format bump).
 ///
 /// Wire format (24 bytes):
 /// ```text
 /// [0..4]    magic (NVV1)
 /// [4..8]    write_seq
 /// [8..16]   vehicle_epoch (u64)
-/// [16..24]  safe_time_floor_ns (u64)
+/// [16..24]  reserved (was safe_time_floor_ns; now HSM-resident)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NvVehicle {
     pub write_seq: u32,
     pub vehicle_epoch: u64,
-    pub safe_time_floor_ns: u64,
 }
 
 impl NvRecord for NvVehicle {
@@ -705,7 +707,7 @@ impl NvRecord for NvVehicle {
         put_u32_le(buf, 0, Self::MAGIC);
         put_u32_le(buf, 4, self.write_seq);
         put_u64_le(buf, 8, self.vehicle_epoch);
-        put_u64_le(buf, 16, self.safe_time_floor_ns);
+        // [16..24] reserved (was safe_time_floor_ns) — leave zeroed.
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
@@ -715,7 +717,7 @@ impl NvRecord for NvVehicle {
         Some(Self {
             write_seq: get_u32_le(buf, 4),
             vehicle_epoch: get_u64_le(buf, 8),
-            safe_time_floor_ns: get_u64_le(buf, 16),
+            // [16..24] reserved — ignored on read.
         })
     }
 }
