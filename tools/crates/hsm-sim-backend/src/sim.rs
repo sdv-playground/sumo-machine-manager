@@ -83,26 +83,42 @@ impl SimHsm {
         self.keystore_path.join("provision_state")
     }
 
-    /// Path to the monotonic-counter file (a decimal `u64`). Kept separate from
-    /// `provision_state` so the counter's write path is independent of keystore
-    /// provisioning — a re-provision must never disturb it, and a counter ratchet
-    /// must never rewrite provisioning state. On real hardware this is the HSM's
-    /// secure-NV; here it's a file in the keystore dir.
-    fn monotonic_path(&self) -> PathBuf {
-        self.keystore_path.join("monotonic_counter")
+    /// Path to a named monotonic-counter slot's file (a decimal `u64`) — one file
+    /// PER handle (e.g. `monotonic_0000000d` for the time-floor slot). Kept
+    /// separate from `provision_state` so a counter's write path is independent of
+    /// keystore provisioning — a re-provision must never disturb it, and a counter
+    /// ratchet must never rewrite provisioning state. On real hardware each is a
+    /// slot in the HSM's secure-NV; here it's a file in the keystore dir.
+    fn monotonic_path(&self, handle: u32) -> PathBuf {
+        self.keystore_path.join(format!("monotonic_{handle:08x}"))
     }
 
-    /// Ratchet the monotonic counter to `max(current, new_value)`; return the
-    /// resulting value. Monotonic — a value at or below the stored one is a no-op
-    /// (never rewinds; the anti-rollback safety core, mirroring
-    /// `security_version` / `adopt_monotonic`). `&self` (file-backed), so the
-    /// provisioning-time seed in `write_leaf_certs` can call it too.
-    fn ratchet_monotonic(&self, new_value: u64) -> Result<u64, HsmError> {
-        let current = self.read_monotonic()?;
+    /// Read the named monotonic-counter slot `handle`'s file (decimal `u64`);
+    /// 0 if absent. The per-handle read shared by the trait `read_monotonic` and
+    /// `ratchet_monotonic`.
+    fn read_monotonic_at(&self, handle: u32) -> Result<u64, HsmError> {
+        let path = self.monotonic_path(handle);
+        if !path.exists() {
+            return Ok(0);
+        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| HsmError::KeystoreError(format!("read {}: {e}", path.display())))?;
+        content.trim().parse().map_err(|e| {
+            HsmError::KeystoreError(format!("corrupt monotonic counter {}: {e}", path.display()))
+        })
+    }
+
+    /// Ratchet the named monotonic-counter slot `handle` to `max(current,
+    /// new_value)`; return the resulting value. Monotonic — a value at or below
+    /// the stored one is a no-op (never rewinds; the anti-rollback safety core,
+    /// mirroring `security_version` / `adopt_monotonic`). `&self` (file-backed),
+    /// so the provisioning-time seed in `write_leaf_certs` can call it too.
+    fn ratchet_monotonic(&self, handle: u32, new_value: u64) -> Result<u64, HsmError> {
+        let current = self.read_monotonic_at(handle)?;
         let raised = current.max(new_value);
         if raised != current {
-            std::fs::write(self.monotonic_path(), raised.to_string().as_bytes())
-                .map_err(|e| HsmError::KeystoreError(format!("write monotonic_counter: {e}")))?;
+            std::fs::write(self.monotonic_path(handle), raised.to_string().as_bytes())
+                .map_err(|e| HsmError::KeystoreError(format!("write monotonic counter: {e}")))?;
         }
         Ok(raised)
     }
@@ -245,22 +261,22 @@ impl SimHsm {
             write_pem_certificate(&cert_path, &c.certificate)?;
             tracing::info!(key_id = %c.key_id, "installed leaf certificate");
 
-            // Monotonic-counter seed: this leaf was minted by our own CA (the
-            // payload signature was verified by `provision` before we got here),
-            // so its `notBefore` is a signature-anchored, rollback-proof lower
-            // bound we can safely ratchet the counter to. The HSM ascribes no
+            // Time-floor seed: this leaf was minted by our own CA (the payload
+            // signature was verified by `provision` before we got here), so its
+            // `notBefore` is a signature-anchored, rollback-proof lower bound we
+            // can safely ratchet the time-floor slot to. The HSM ascribes no
             // meaning to the value; a caller interprets it (see the caller-side
-            // seed/share). Seeding at provisioning makes the counter non-zero
-            // from first boot. Monotonic, so this can only move it forward.
+            // seed/share). Seeding at provisioning makes the floor non-zero from
+            // first boot. Monotonic, so this can only move it forward.
             #[cfg(feature = "crypto")]
             if let Some(nb) = leaf_not_before_secs(&c.certificate) {
-                match self.ratchet_monotonic(nb) {
+                match self.ratchet_monotonic(vhsm_proto::HANDLE_TIME_FLOOR, nb) {
                     Ok(v) => tracing::info!(
                         key_id = %c.key_id, not_before = nb, monotonic = v,
-                        "monotonic counter ratcheted from installed leaf notBefore"
+                        "time-floor slot ratcheted from installed leaf notBefore"
                     ),
                     Err(e) => tracing::warn!(key_id = %c.key_id, error = %e,
-                        "could not ratchet monotonic counter"),
+                        "could not ratchet time-floor slot"),
                 }
             }
         }
@@ -912,7 +928,6 @@ impl HsmProvider for SimHsm {
             | KeyRole::JwtSigning
             | KeyRole::OperationalIssuer
             | KeyRole::FactoryResetIssuer
-            | KeyRole::FreshnessSigning
             | KeyRole::TlsIdentity => Some(coset::iana::Algorithm::ES256),
             KeyRole::DeviceDecryption => None,
             // AES-256 — symmetric, no public COSE key (the pub_path read
@@ -934,21 +949,12 @@ impl HsmProvider for SimHsm {
         }
     }
 
-    fn read_monotonic(&self) -> Result<u64, HsmError> {
-        let path = self.monotonic_path();
-        if !path.exists() {
-            return Ok(0);
-        }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| HsmError::KeystoreError(format!("read monotonic_counter: {e}")))?;
-        content
-            .trim()
-            .parse()
-            .map_err(|e| HsmError::KeystoreError(format!("corrupt monotonic_counter: {e}")))
+    fn read_monotonic(&self, handle: KeyHandle) -> Result<u64, HsmError> {
+        self.read_monotonic_at(handle.get())
     }
 
-    fn raise_monotonic(&mut self, new_value: u64) -> Result<u64, HsmError> {
-        self.ratchet_monotonic(new_value)
+    fn raise_monotonic(&mut self, handle: KeyHandle, new_value: u64) -> Result<u64, HsmError> {
+        self.ratchet_monotonic(handle.get(), new_value)
     }
 }
 
@@ -1624,32 +1630,43 @@ mod tests {
     }
 
     #[test]
-    fn monotonic_counter_ratchets_and_survives_reload() {
+    fn monotonic_slot_ratchets_per_handle_and_survives_reload() {
         let tmp = tempfile::tempdir().unwrap();
         let keystore = tmp.path().to_path_buf();
         let mut sim = SimHsm::new(keystore.clone());
 
-        // Unset counter reads as 0.
-        assert_eq!(sim.read_monotonic().unwrap(), 0);
+        // The named time-floor slot is addressed by handle.
+        let floor = KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR);
+
+        // Unset slot reads as 0.
+        assert_eq!(sim.read_monotonic(floor).unwrap(), 0);
 
         // First raise sets it.
-        assert_eq!(sim.raise_monotonic(1_000).unwrap(), 1_000);
-        assert_eq!(sim.read_monotonic().unwrap(), 1_000);
+        assert_eq!(sim.raise_monotonic(floor, 1_000).unwrap(), 1_000);
+        assert_eq!(sim.read_monotonic(floor).unwrap(), 1_000);
 
         // A higher value advances.
-        assert_eq!(sim.raise_monotonic(2_000).unwrap(), 2_000);
+        assert_eq!(sim.raise_monotonic(floor, 2_000).unwrap(), 2_000);
 
         // A lower value is a no-op — never rewinds.
-        assert_eq!(sim.raise_monotonic(1_500).unwrap(), 2_000);
-        assert_eq!(sim.raise_monotonic(0).unwrap(), 2_000);
-        assert_eq!(sim.read_monotonic().unwrap(), 2_000);
+        assert_eq!(sim.raise_monotonic(floor, 1_500).unwrap(), 2_000);
+        assert_eq!(sim.raise_monotonic(floor, 0).unwrap(), 2_000);
+        assert_eq!(sim.read_monotonic(floor).unwrap(), 2_000);
 
         // Equal value is a no-op that returns the counter.
-        assert_eq!(sim.raise_monotonic(2_000).unwrap(), 2_000);
+        assert_eq!(sim.raise_monotonic(floor, 2_000).unwrap(), 2_000);
 
-        // Survives a fresh handle over the same keystore (persisted, not in-mem).
+        // A DIFFERENT handle is an independent counter (per-slot store): raising
+        // it must not disturb the time-floor slot.
+        let other = KeyHandle(vhsm_proto::HANDLE_IVD_SIGNING);
+        assert_eq!(sim.read_monotonic(other).unwrap(), 0);
+        assert_eq!(sim.raise_monotonic(other, 7).unwrap(), 7);
+        assert_eq!(sim.read_monotonic(floor).unwrap(), 2_000);
+
+        // Both survive a fresh handle over the same keystore (persisted, not in-mem).
         let reloaded = SimHsm::new(keystore.clone());
-        assert_eq!(reloaded.read_monotonic().unwrap(), 2_000);
+        assert_eq!(reloaded.read_monotonic(floor).unwrap(), 2_000);
+        assert_eq!(reloaded.read_monotonic(other).unwrap(), 7);
     }
 
     #[test]

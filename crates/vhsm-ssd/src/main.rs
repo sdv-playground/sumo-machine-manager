@@ -1109,7 +1109,7 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
 
     // Register the guest-addressable well-known handles from the single slot
     // registry (vhsm-proto `SUMO_CORE_SLOTS`). Host-only slots (iam-signing,
-    // ivd-signing, freshness-signing, tls-identity) are `guest_exposed: false`
+    // ivd-signing, tls-identity, time-floor) are `guest_exposed: false`
     // and skipped — e.g. `iam-signing` (HANDLE_IAM_SIGNING = 0x0004) is the
     // daemon-internal cert-issuing key, never addressable by guest principals
     // (CWT mint goes through the HsmIamSigner adapter, calling sign_raw_p256

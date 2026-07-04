@@ -67,12 +67,12 @@ pub mod sovd {
     pub mod authz;
     pub mod delegated_rights;
     pub mod delegation;
-    pub mod freshness;
     pub mod gateway;
     pub mod identity;
     pub mod issuer_keys;
     pub mod routes;
     pub mod security;
+    pub mod time_floor;
 }
 
 #[cfg(test)]

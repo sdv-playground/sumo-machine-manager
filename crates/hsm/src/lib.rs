@@ -142,23 +142,26 @@ pub trait HsmProvider: Send {
         Err(HsmError::NotSupported("HsmProvider::clear_enrolled".into()))
     }
 
-    /// Read the persistent, rollback-proof **monotonic counter** — an opaque
-    /// `u64` that only ever ratchets upward; 0 if never raised.
+    /// Read the persistent, rollback-proof **monotonic counter** held in the
+    /// named monotonic-counter slot `handle` — an opaque `u64` that only ever
+    /// ratchets upward; 0 if never raised.
     ///
     /// The HSM ascribes no meaning to the value: it is just a number that cannot
     /// go down. It lives in the HSM's secure NV — the same tamper/rollback domain
     /// as the keystore `security_version` anti-rollback counter — so an attacker
     /// with only filesystem/SOVD access cannot rewind it. Any interpretation of
     /// the number (e.g. a lower bound on some quantity) belongs entirely to the
-    /// caller.
+    /// caller; the SLOT (e.g. `vhsm_proto::HANDLE_TIME_FLOOR`) carries the meaning,
+    /// exactly as a named key slot carries the meaning of a generic `sign`.
     ///
     /// Default impl returns `NotSupported`; concrete providers override.
-    fn read_monotonic(&self) -> Result<u64, HsmError> {
+    fn read_monotonic(&self, handle: KeyHandle) -> Result<u64, HsmError> {
+        let _ = handle;
         Err(HsmError::NotSupported("HsmProvider::read_monotonic".into()))
     }
 
-    /// Ratchet the monotonic counter to `max(current, new_value)` and return the
-    /// resulting value.
+    /// Ratchet the named monotonic-counter slot `handle` to
+    /// `max(current, new_value)` and return the resulting value.
     ///
     /// Monotonic **in the backend**: a `new_value` at or below the stored value
     /// is a no-op that returns the unchanged value. This is the safety core — a
@@ -168,8 +171,8 @@ pub trait HsmProvider: Send {
     /// filesystem / SOVD tampering.
     ///
     /// Default impl returns `NotSupported`; concrete providers override.
-    fn raise_monotonic(&mut self, new_value: u64) -> Result<u64, HsmError> {
-        let _ = new_value;
+    fn raise_monotonic(&mut self, handle: KeyHandle, new_value: u64) -> Result<u64, HsmError> {
+        let _ = (handle, new_value);
         Err(HsmError::NotSupported("HsmProvider::raise_monotonic".into()))
     }
 }

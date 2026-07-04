@@ -88,17 +88,6 @@ pub enum KeyRole {
     /// `HANDLE_FACTORY_RESET_ISSUER` = 0x0009, the number unchanged by the rename.
     FactoryResetIssuer,
 
-    // --------------------- freshness coordinator --------------------
-    //
-    /// EC-P256 signing key generated **inside the HSM at provisioning
-    /// time, private NEVER leaves** — the master freshness coordinator's
-    /// assertion signer (§7.2). Signs the vehicle's `{safe-time-floor,
-    /// vehicle-epoch}` freshness assertion; peer ECUs verify it against
-    /// this key's pinned public half. Host-in-process only (like
-    /// `IvdSigning`): deliberately NOT addressable on the guest vHSM wire
-    /// — a guest must never be able to forge a freshness assertion.
-    FreshnessSigning,
-
     // --------------------- device TLS identity ---------------------
     //
     /// EC-P256 signing key generated **inside the HSM at provisioning
@@ -137,7 +126,6 @@ impl KeyRole {
             KeyRole::JwtSigning => vhsm_proto::HANDLE_JWT_SIGNING,
             KeyRole::OperationalIssuer => vhsm_proto::HANDLE_OPERATIONAL_ISSUER,
             KeyRole::FactoryResetIssuer => vhsm_proto::HANDLE_FACTORY_RESET_ISSUER,
-            KeyRole::FreshnessSigning => vhsm_proto::HANDLE_FRESHNESS_SIGNING,
             KeyRole::TlsIdentity => vhsm_proto::HANDLE_TLS_IDENTITY,
             KeyRole::Storage => vhsm_proto::HANDLE_STORAGE,
         })
@@ -175,7 +163,6 @@ impl KeyRole {
             KeyRole::JwtSigning,
             KeyRole::OperationalIssuer,
             KeyRole::FactoryResetIssuer,
-            KeyRole::FreshnessSigning,
             KeyRole::TlsIdentity,
             KeyRole::Storage,
         ]
@@ -201,7 +188,6 @@ impl KeyRole {
                 | KeyRole::IamSigning
                 | KeyRole::IvdSigning
                 | KeyRole::JwtSigning
-                | KeyRole::FreshnessSigning
                 | KeyRole::TlsIdentity
                 | KeyRole::Storage,
         )
@@ -245,7 +231,6 @@ mod tests {
             KeyRole::JwtSigning,
             KeyRole::OperationalIssuer,
             KeyRole::FactoryResetIssuer,
-            KeyRole::FreshnessSigning,
             KeyRole::TlsIdentity,
             KeyRole::Storage,
         ];
@@ -263,7 +248,6 @@ mod tests {
         assert_eq!(KeyRole::JwtSigning.key_id(), "jwt-signing");
         assert_eq!(KeyRole::OperationalIssuer.key_id(), "operational-issuer");
         assert_eq!(KeyRole::FactoryResetIssuer.key_id(), "factory-reset-issuer");
-        assert_eq!(KeyRole::FreshnessSigning.key_id(), "freshness-signing");
         assert_eq!(KeyRole::TlsIdentity.key_id(), "tls-identity");
         assert_eq!(KeyRole::Storage.key_id(), "storage-key");
     }
@@ -300,7 +284,7 @@ mod tests {
         // should be either mandatory or explicitly opted out (and
         // there are no opt-outs today).
         let mandatory = KeyRole::mandatory_roles();
-        assert_eq!(mandatory.len(), 11);
+        assert_eq!(mandatory.len(), 10);
 
         // Sanity: every entry is distinct.
         use std::collections::HashSet;
@@ -318,7 +302,6 @@ mod tests {
             KeyRole::IamSigning,
             KeyRole::IvdSigning,
             KeyRole::JwtSigning,
-            KeyRole::FreshnessSigning,
             KeyRole::TlsIdentity,
             KeyRole::Storage,
         ];

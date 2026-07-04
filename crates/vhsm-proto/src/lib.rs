@@ -241,6 +241,14 @@ pub const ALG_HMAC_SHA256: u32 = 0x0010;
 pub const ALG_ED25519: u32 = 0x0020;
 pub const ALG_ECC_P256: u32 = 0x0021;
 
+/// Sentinel "algorithm" for a rollback-proof monotonic **counter** slot — a
+/// `u64` that only ratchets upward, with NO key material and NO cryptographic
+/// operation behind it. It is NOT a crypto algorithm: it labels a slot (e.g.
+/// `time-floor`) whose contract is `read_monotonic` / `raise_monotonic`, never
+/// sign/verify/encrypt. Kept in the `ALG_*` space only so `SlotEntry.alg` can
+/// name every slot uniformly.
+pub const ALG_MONOTONIC: u32 = 0x0022;
+
 // ---- Permission bitmask (uint32) ----------------------------------------
 
 pub const PERM_ENCRYPT: u32 = 1 << 0;
@@ -283,8 +291,16 @@ pub const HANDLE_FACTORY_RESET_ISSUER: u32 = 0x0009;
 // are NOT registered as guest-addressable handles — see `guest_exposed` in
 // `SUMO_CORE_SLOTS`. Adding these does not change the guest wire.
 pub const HANDLE_IVD_SIGNING: u32 = 0x000A;
-pub const HANDLE_FRESHNESS_SIGNING: u32 = 0x000B;
+// 0x000B is a RETIRED gap (was the freshness-signing slot); do NOT reuse it.
 pub const HANDLE_TLS_IDENTITY: u32 = 0x000C;
+
+/// Named rollback-proof monotonic-counter slot (`time-floor`) — NOT a key: it
+/// holds no key material, just a `u64` that only ratchets upward (the
+/// `read_monotonic` / `raise_monotonic` contract). Host-only: only trusted host
+/// code reads/ratchets it. It carries a sumo-core handle purely for uniform,
+/// handle-addressed slot access (like the host-in-process key slots above) and
+/// is never registered on the guest wire.
+pub const HANDLE_TIME_FLOOR: u32 = 0x000D;
 
 /// Lower boundary of the project-extension well-known range. Sumo owns
 /// the slots strictly below this; downstream projects own
@@ -341,7 +357,7 @@ pub struct SlotEntry {
     /// (`PERM_*`). `0` for host-only slots (never guest-addressable).
     pub default_perms: u32,
     /// Whether `vhsm-ssd` exposes this slot as a guest-addressable handle.
-    /// Host-only slots (`iam`/`ivd`/`freshness`/`tls`) are present for uniform
+    /// Host-only slots (`iam`/`ivd`/`tls`/`time-floor`) are present for uniform
     /// in-process addressing but never registered on the guest wire.
     pub guest_exposed: bool,
 }
@@ -416,16 +432,18 @@ pub const SUMO_CORE_SLOTS: &[SlotEntry] = &[
         guest_exposed: false,
     },
     SlotEntry {
-        handle: HANDLE_FRESHNESS_SIGNING,
-        key_id: "freshness-signing",
+        handle: HANDLE_TLS_IDENTITY,
+        key_id: "tls-identity",
         alg: ALG_ECC_P256,
         default_perms: 0,
         guest_exposed: false,
     },
+    // Named rollback-proof monotonic-counter slot (NOT a key — no key material,
+    // ALG_MONOTONIC sentinel). Host-only: only trusted host code ratchets/reads it.
     SlotEntry {
-        handle: HANDLE_TLS_IDENTITY,
-        key_id: "tls-identity",
-        alg: ALG_ECC_P256,
+        handle: HANDLE_TIME_FLOOR,
+        key_id: "time-floor",
+        alg: ALG_MONOTONIC,
         default_perms: 0,
         guest_exposed: false,
     },
@@ -694,8 +712,8 @@ mod tests {
             HANDLE_OPERATIONAL_ISSUER,
             HANDLE_FACTORY_RESET_ISSUER,
             HANDLE_IVD_SIGNING,
-            HANDLE_FRESHNESS_SIGNING,
             HANDLE_TLS_IDENTITY,
+            HANDLE_TIME_FLOOR,
         ];
         for (i, a) in hs.iter().enumerate() {
             for b in &hs[i + 1..] {

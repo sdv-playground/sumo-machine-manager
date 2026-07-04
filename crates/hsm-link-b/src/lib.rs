@@ -64,6 +64,8 @@
 //! | `IS_ENROLLED` | vm_id:tail (utf-8) | u8 (0/1) |
 //! | `CLEAR_ENROLLED` | vm_id:tail (utf-8) | u8 (0/1) |
 //! | `GET_PUBLIC_KEY` | role:u32 (slot handle) | SPKI DER |
+//! | `READ_MONOTONIC` | handle:u32 | value:u64 |
+//! | `RAISE_MONOTONIC` | handle:u32, value:u64 | value:u64 |
 //!
 //! `KeyInfo` = `handle:u32, key_type:u32, has_certificate:u8, key_id:bytes(utf-8),
 //! allowed_guests:optlist, allowed_ops:optlist`, where
@@ -117,9 +119,13 @@ pub const OP_ARM_ENROLLMENT: u32 = 0x24;
 pub const OP_IS_ENROLLED: u32 = 0x25;
 pub const OP_CLEAR_ENROLLED: u32 = 0x26;
 pub const OP_GET_PUBLIC_KEY: u32 = 0x27;
-/// Read the rollback-proof monotonic counter (u64; 0 if never raised).
+/// Read a **named** rollback-proof monotonic-counter slot, addressed by `handle`
+/// (`u64`; 0 if never raised). The slot carries the meaning (e.g. `time-floor`);
+/// the op stays a generic counter read.
 pub const OP_READ_MONOTONIC: u32 = 0x28;
-/// Ratchet the monotonic counter to max(current, arg); returns the resulting value.
+/// Ratchet a **named** monotonic-counter slot (addressed by `handle`) to
+/// `max(current, arg)`; returns the resulting value. Backend-monotonic: a lower
+/// arg is a no-op.
 pub const OP_RAISE_MONOTONIC: u32 = 0x29;
 
 // ── Status codes (mirror the HsmError categories) ─────────────────────────────

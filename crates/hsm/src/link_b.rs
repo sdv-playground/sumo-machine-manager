@@ -389,18 +389,21 @@ impl LinkBClient {
         Ok(result.first() == Some(&1))
     }
 
-    /// `OP_READ_MONOTONIC` — the rollback-proof monotonic counter (0 if never
-    /// raised).
-    pub fn read_monotonic(&self) -> Result<u64, HsmError> {
-        let result = self.call(OP_READ_MONOTONIC, Vec::new())?;
+    /// `OP_READ_MONOTONIC` — read the named monotonic-counter slot `handle`
+    /// (0 if never raised).
+    pub fn read_monotonic(&self, handle: KeyHandle) -> Result<u64, HsmError> {
+        let result = self.call(OP_READ_MONOTONIC, Writer::new().u32(handle.get()).finish())?;
         Reader::new(&result).u64().map_err(proto_err)
     }
 
-    /// `OP_RAISE_MONOTONIC` — ratchet the counter to `max(current, new_value)`;
-    /// returns the resulting value. Monotonic on the backend (a lower value is a
-    /// no-op).
-    pub fn raise_monotonic(&self, new_value: u64) -> Result<u64, HsmError> {
-        let result = self.call(OP_RAISE_MONOTONIC, Writer::new().u64(new_value).finish())?;
+    /// `OP_RAISE_MONOTONIC` — ratchet the named monotonic-counter slot `handle`
+    /// to `max(current, new_value)`; returns the resulting value. Monotonic on
+    /// the backend (a lower value is a no-op).
+    pub fn raise_monotonic(&self, handle: KeyHandle, new_value: u64) -> Result<u64, HsmError> {
+        let result = self.call(
+            OP_RAISE_MONOTONIC,
+            Writer::new().u32(handle.get()).u64(new_value).finish(),
+        )?;
         Reader::new(&result).u64().map_err(proto_err)
     }
 
@@ -649,12 +652,12 @@ impl HsmProvider for LinkBProvider {
         self.client.clear_enrolled(vm_id)
     }
 
-    fn read_monotonic(&self) -> Result<u64, HsmError> {
-        self.client.read_monotonic()
+    fn read_monotonic(&self, handle: KeyHandle) -> Result<u64, HsmError> {
+        self.client.read_monotonic(handle)
     }
 
-    fn raise_monotonic(&mut self, new_value: u64) -> Result<u64, HsmError> {
-        self.client.raise_monotonic(new_value)
+    fn raise_monotonic(&mut self, handle: KeyHandle, new_value: u64) -> Result<u64, HsmError> {
+        self.client.raise_monotonic(handle, new_value)
     }
 }
 
@@ -951,12 +954,13 @@ where
             backend.get_public_key_der(handle)
         }
         OP_READ_MONOTONIC => backend
-            .read_monotonic()
+            .read_monotonic(KeyHandle(r.u32()?))
             .map(|v| Writer::new().u64(v).finish()),
         OP_RAISE_MONOTONIC => {
+            let handle = KeyHandle(r.u32()?);
             let new_value = r.u64()?;
             backend
-                .raise_monotonic(new_value)
+                .raise_monotonic(handle, new_value)
                 .map(|v| Writer::new().u64(v).finish())
         }
         _ => return Ok(Err(HsmError::NotSupported(format!("link-b op {op:#06x}")))),

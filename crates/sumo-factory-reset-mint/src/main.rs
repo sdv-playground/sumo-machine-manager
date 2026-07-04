@@ -57,7 +57,8 @@ struct Cli {
     #[arg(long)]
     boot_id: Option<String>,
     /// `epoch` claim — binds a VEHICLE-WIDE token to the vehicle-epoch (§7.3
-    /// freshness). Omit for no binding; read the live value from x-sumo-freshness.
+    /// freshness). Omit for no binding; the live-epoch read path is deferred with
+    /// the cross-ECU (mTLS) work (the signed x-sumo-freshness endpoint was removed).
     #[arg(long)]
     epoch: Option<u64>,
 }

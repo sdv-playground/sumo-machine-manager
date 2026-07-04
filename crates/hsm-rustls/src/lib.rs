@@ -1,8 +1,7 @@
 //! An HSM-backed rustls client identity: a [`rustls::sign::SigningKey`] whose
 //! private key never leaves the HSM. The ECDSA-P256/SHA-256 signature (DER) is
 //! performed by a caller-supplied `sign_fn` — the host wires the HSM
-//! `TlsIdentity` key; the seam itself is HSM-agnostic (just a sign closure),
-//! mirroring `component_mgr::sovd::freshness`.
+//! `TlsIdentity` key; the seam itself is HSM-agnostic (just a sign closure).
 //!
 //! On the hashing: rustls hands [`Signer::sign`] the **message** to be signed
 //! (the CertificateVerify transcript), and a signer hashes it per its scheme —
