@@ -389,21 +389,18 @@ impl LinkBClient {
         Ok(result.first() == Some(&1))
     }
 
-    /// `OP_READ_TIME_FLOOR` — the monotonic safe-time floor (UNIX seconds, 0 if
-    /// never set).
-    pub fn read_time_floor(&self) -> Result<u64, HsmError> {
-        let result = self.call(OP_READ_TIME_FLOOR, Vec::new())?;
+    /// `OP_READ_MONOTONIC` — the rollback-proof monotonic counter (0 if never
+    /// raised).
+    pub fn read_monotonic(&self) -> Result<u64, HsmError> {
+        let result = self.call(OP_READ_MONOTONIC, Vec::new())?;
         Reader::new(&result).u64().map_err(proto_err)
     }
 
-    /// `OP_RAISE_TIME_FLOOR` — ratchet the floor to `max(current, new_floor_secs)`;
-    /// returns the resulting floor. Monotonic on the backend (a lower value is a
+    /// `OP_RAISE_MONOTONIC` — ratchet the counter to `max(current, new_value)`;
+    /// returns the resulting value. Monotonic on the backend (a lower value is a
     /// no-op).
-    pub fn raise_time_floor(&self, new_floor_secs: u64) -> Result<u64, HsmError> {
-        let result = self.call(
-            OP_RAISE_TIME_FLOOR,
-            Writer::new().u64(new_floor_secs).finish(),
-        )?;
+    pub fn raise_monotonic(&self, new_value: u64) -> Result<u64, HsmError> {
+        let result = self.call(OP_RAISE_MONOTONIC, Writer::new().u64(new_value).finish())?;
         Reader::new(&result).u64().map_err(proto_err)
     }
 
@@ -652,12 +649,12 @@ impl HsmProvider for LinkBProvider {
         self.client.clear_enrolled(vm_id)
     }
 
-    fn read_time_floor(&self) -> Result<u64, HsmError> {
-        self.client.read_time_floor()
+    fn read_monotonic(&self) -> Result<u64, HsmError> {
+        self.client.read_monotonic()
     }
 
-    fn raise_time_floor(&mut self, new_floor_secs: u64) -> Result<u64, HsmError> {
-        self.client.raise_time_floor(new_floor_secs)
+    fn raise_monotonic(&mut self, new_value: u64) -> Result<u64, HsmError> {
+        self.client.raise_monotonic(new_value)
     }
 }
 
@@ -953,14 +950,14 @@ where
             let handle = KeyHandle(r.u32()?);
             backend.get_public_key_der(handle)
         }
-        OP_READ_TIME_FLOOR => backend
-            .read_time_floor()
-            .map(|f| Writer::new().u64(f).finish()),
-        OP_RAISE_TIME_FLOOR => {
-            let new_floor = r.u64()?;
+        OP_READ_MONOTONIC => backend
+            .read_monotonic()
+            .map(|v| Writer::new().u64(v).finish()),
+        OP_RAISE_MONOTONIC => {
+            let new_value = r.u64()?;
             backend
-                .raise_time_floor(new_floor)
-                .map(|f| Writer::new().u64(f).finish())
+                .raise_monotonic(new_value)
+                .map(|v| Writer::new().u64(v).finish())
         }
         _ => return Ok(Err(HsmError::NotSupported(format!("link-b op {op:#06x}")))),
     };

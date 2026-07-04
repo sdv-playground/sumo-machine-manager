@@ -83,26 +83,26 @@ impl SimHsm {
         self.keystore_path.join("provision_state")
     }
 
-    /// Path to the safe-time-floor file (UNIX seconds, decimal). Kept separate
-    /// from `provision_state` so the floor's write path is independent of
-    /// keystore provisioning — a re-provision must never disturb it, and a
-    /// floor ratchet must never rewrite provisioning state. On real hardware
-    /// this is the HSM's secure-NV; here it's a file in the keystore dir.
-    fn time_floor_path(&self) -> PathBuf {
-        self.keystore_path.join("time_floor")
+    /// Path to the monotonic-counter file (a decimal `u64`). Kept separate from
+    /// `provision_state` so the counter's write path is independent of keystore
+    /// provisioning — a re-provision must never disturb it, and a counter ratchet
+    /// must never rewrite provisioning state. On real hardware this is the HSM's
+    /// secure-NV; here it's a file in the keystore dir.
+    fn monotonic_path(&self) -> PathBuf {
+        self.keystore_path.join("monotonic_counter")
     }
 
-    /// Ratchet the safe-time floor to `max(current, new_floor_secs)`; return the
-    /// resulting floor. Monotonic — a value at or below the stored floor is a
-    /// no-op (never rewinds; the anti-rollback safety core, mirroring
+    /// Ratchet the monotonic counter to `max(current, new_value)`; return the
+    /// resulting value. Monotonic — a value at or below the stored one is a no-op
+    /// (never rewinds; the anti-rollback safety core, mirroring
     /// `security_version` / `adopt_monotonic`). `&self` (file-backed), so the
-    /// provisioning-time harvest in `write_leaf_certs` can call it too.
-    fn ratchet_time_floor(&self, new_floor_secs: u64) -> Result<u64, HsmError> {
-        let current = self.read_time_floor()?;
-        let raised = current.max(new_floor_secs);
+    /// provisioning-time seed in `write_leaf_certs` can call it too.
+    fn ratchet_monotonic(&self, new_value: u64) -> Result<u64, HsmError> {
+        let current = self.read_monotonic()?;
+        let raised = current.max(new_value);
         if raised != current {
-            std::fs::write(self.time_floor_path(), raised.to_string().as_bytes())
-                .map_err(|e| HsmError::KeystoreError(format!("write time_floor: {e}")))?;
+            std::fs::write(self.monotonic_path(), raised.to_string().as_bytes())
+                .map_err(|e| HsmError::KeystoreError(format!("write monotonic_counter: {e}")))?;
         }
         Ok(raised)
     }
@@ -245,23 +245,22 @@ impl SimHsm {
             write_pem_certificate(&cert_path, &c.certificate)?;
             tracing::info!(key_id = %c.key_id, "installed leaf certificate");
 
-            // Safe-time-floor seed (docs/design/safe-time-floor.md): this leaf
-            // was minted by our own CA (the payload signature was verified by
-            // `provision` before we got here), so its `not_before` is a
-            // trustworthy lower bound on real time — real-now >= not_before.
-            // Ratchet the HSM floor to it. On a device booted at the Unix epoch
-            // this jumps the floor to ~provisioning time, so the delegated-cert
-            // validity check (max(now, floor)) stops rejecting real-dated leaves
-            // as "not valid yet". Monotonic, so this can only move it forward.
+            // Monotonic-counter seed: this leaf was minted by our own CA (the
+            // payload signature was verified by `provision` before we got here),
+            // so its `notBefore` is a signature-anchored, rollback-proof lower
+            // bound we can safely ratchet the counter to. The HSM ascribes no
+            // meaning to the value; a caller interprets it (see the caller-side
+            // seed/share). Seeding at provisioning makes the counter non-zero
+            // from first boot. Monotonic, so this can only move it forward.
             #[cfg(feature = "crypto")]
             if let Some(nb) = leaf_not_before_secs(&c.certificate) {
-                match self.ratchet_time_floor(nb) {
-                    Ok(f) => tracing::info!(
-                        key_id = %c.key_id, not_before = nb, floor = f,
-                        "safe-time floor ratcheted from installed leaf not_before"
+                match self.ratchet_monotonic(nb) {
+                    Ok(v) => tracing::info!(
+                        key_id = %c.key_id, not_before = nb, monotonic = v,
+                        "monotonic counter ratcheted from installed leaf notBefore"
                     ),
                     Err(e) => tracing::warn!(key_id = %c.key_id, error = %e,
-                        "could not ratchet safe-time floor"),
+                        "could not ratchet monotonic counter"),
                 }
             }
         }
@@ -935,21 +934,21 @@ impl HsmProvider for SimHsm {
         }
     }
 
-    fn read_time_floor(&self) -> Result<u64, HsmError> {
-        let path = self.time_floor_path();
+    fn read_monotonic(&self) -> Result<u64, HsmError> {
+        let path = self.monotonic_path();
         if !path.exists() {
             return Ok(0);
         }
         let content = std::fs::read_to_string(&path)
-            .map_err(|e| HsmError::KeystoreError(format!("read time_floor: {e}")))?;
+            .map_err(|e| HsmError::KeystoreError(format!("read monotonic_counter: {e}")))?;
         content
             .trim()
             .parse()
-            .map_err(|e| HsmError::KeystoreError(format!("corrupt time_floor: {e}")))
+            .map_err(|e| HsmError::KeystoreError(format!("corrupt monotonic_counter: {e}")))
     }
 
-    fn raise_time_floor(&mut self, new_floor_secs: u64) -> Result<u64, HsmError> {
-        self.ratchet_time_floor(new_floor_secs)
+    fn raise_monotonic(&mut self, new_value: u64) -> Result<u64, HsmError> {
+        self.ratchet_monotonic(new_value)
     }
 }
 
@@ -1177,9 +1176,9 @@ fn write_pem_certificate(path: &Path, der: &[u8]) -> Result<(), HsmError> {
     write_pem_file(path, "CERTIFICATE", der)
 }
 
-/// Parse a DER X.509 cert and return its `notBefore` as UNIX seconds, or `None`
-/// if it doesn't parse. Used to seed the safe-time floor from a just-installed,
-/// CA-signed identity leaf (`write_leaf_certs`); see safe-time-floor.md.
+/// Parse a DER X.509 cert and return its `notBefore` as seconds since the epoch,
+/// or `None` if it doesn't parse. Used to seed the monotonic counter from a
+/// just-installed, CA-signed identity leaf (`write_leaf_certs`).
 #[cfg(feature = "crypto")]
 fn leaf_not_before_secs(der: &[u8]) -> Option<u64> {
     use x509_cert::der::Decode;
@@ -1625,32 +1624,32 @@ mod tests {
     }
 
     #[test]
-    fn time_floor_ratchets_monotonically_and_survives_reload() {
+    fn monotonic_counter_ratchets_and_survives_reload() {
         let tmp = tempfile::tempdir().unwrap();
         let keystore = tmp.path().to_path_buf();
         let mut sim = SimHsm::new(keystore.clone());
 
-        // Unset floor reads as 0.
-        assert_eq!(sim.read_time_floor().unwrap(), 0);
+        // Unset counter reads as 0.
+        assert_eq!(sim.read_monotonic().unwrap(), 0);
 
         // First raise sets it.
-        assert_eq!(sim.raise_time_floor(1_000).unwrap(), 1_000);
-        assert_eq!(sim.read_time_floor().unwrap(), 1_000);
+        assert_eq!(sim.raise_monotonic(1_000).unwrap(), 1_000);
+        assert_eq!(sim.read_monotonic().unwrap(), 1_000);
 
         // A higher value advances.
-        assert_eq!(sim.raise_time_floor(2_000).unwrap(), 2_000);
+        assert_eq!(sim.raise_monotonic(2_000).unwrap(), 2_000);
 
         // A lower value is a no-op — never rewinds.
-        assert_eq!(sim.raise_time_floor(1_500).unwrap(), 2_000);
-        assert_eq!(sim.raise_time_floor(0).unwrap(), 2_000);
-        assert_eq!(sim.read_time_floor().unwrap(), 2_000);
+        assert_eq!(sim.raise_monotonic(1_500).unwrap(), 2_000);
+        assert_eq!(sim.raise_monotonic(0).unwrap(), 2_000);
+        assert_eq!(sim.read_monotonic().unwrap(), 2_000);
 
-        // Equal value is a no-op that returns the floor.
-        assert_eq!(sim.raise_time_floor(2_000).unwrap(), 2_000);
+        // Equal value is a no-op that returns the counter.
+        assert_eq!(sim.raise_monotonic(2_000).unwrap(), 2_000);
 
         // Survives a fresh handle over the same keystore (persisted, not in-mem).
         let reloaded = SimHsm::new(keystore.clone());
-        assert_eq!(reloaded.read_time_floor().unwrap(), 2_000);
+        assert_eq!(reloaded.read_monotonic().unwrap(), 2_000);
     }
 
     #[test]

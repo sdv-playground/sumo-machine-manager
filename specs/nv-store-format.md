@@ -182,17 +182,16 @@ Offset  Size   Field
 
 ## Vehicle
 
-Vehicle-level mutable coordinator state — the §7.2 freshness epoch (and,
-once a trustworthy time source lands, the safe-time-floor). Vehicle-wide,
-persists across all bank switches; distinct from the write-once VIN in
-Factory.
+Vehicle-level mutable coordinator state — the §7.2 freshness epoch.
+Vehicle-wide, persists across all bank switches; distinct from the
+write-once VIN in Factory.
 
 ```
 Offset  Size   Field
 0x00    4      magic (NVV1)
 0x04    4      write_seq
 0x08    8      vehicle_epoch (u64, monotonic — bumped each power-on/online-sync)
-0x10    8      safe_time_floor_ns (u64, ns since Unix epoch; 0 until sourced)
+0x10    8      reserved (retired u64 field; role now HSM-resident)
 0x18    4      crc32
 ```
 

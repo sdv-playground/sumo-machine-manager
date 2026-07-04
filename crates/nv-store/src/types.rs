@@ -658,8 +658,7 @@ impl NvRecord for NvApp {
     }
 }
 
-/// Vehicle-level mutable coordinator state — the §7.2 freshness epoch
-/// (and, once sourced, the safe-time-floor).
+/// Vehicle-level mutable coordinator state — the §7.2 freshness epoch.
 ///
 /// `vehicle_epoch` is a monotonic counter the master freshness
 /// coordinator bumps at each power-on / online-sync; peer ECUs adopt
@@ -667,20 +666,20 @@ impl NvRecord for NvApp {
 /// freshness but never replay an old epoch into validity. Vehicle-wide
 /// (not per-bank) and distinct from the write-once VIN in [`NvFactory`].
 ///
-/// The safe-time-floor is NOT stored here. It moved to the HSM's secure NV —
-/// the same tamper/rollback domain as the keystore `security_version`
-/// anti-rollback counter — reached via `HsmProvider::{read,raise}_time_floor`
-/// (docs/design/safe-time-floor.md). Keeping one monotonic floor in one place
-/// avoids the split-source anti-pattern a rollback defense must not have. The
-/// `[16..24]` bytes that once held it are reserved (kept in the layout so the
-/// record size and sector rotation are unchanged; no format bump).
+/// A `[16..24]` u64 field once lived here but was retired: its role is now
+/// served by the HSM's rollback-proof monotonic counter
+/// (`HsmProvider::{read,raise}_monotonic`) — one anti-rollback value in one
+/// place, in the same tamper domain as the keystore `security_version` counter,
+/// instead of the split-source anti-pattern a rollback defense must not have.
+/// Those bytes stay reserved (kept in the layout so the record size and sector
+/// rotation are unchanged; no format bump).
 ///
 /// Wire format (24 bytes):
 /// ```text
 /// [0..4]    magic (NVV1)
 /// [4..8]    write_seq
 /// [8..16]   vehicle_epoch (u64)
-/// [16..24]  reserved (was safe_time_floor_ns; now HSM-resident)
+/// [16..24]  reserved (retired field; role now HSM-resident)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NvVehicle {
@@ -707,7 +706,7 @@ impl NvRecord for NvVehicle {
         put_u32_le(buf, 0, Self::MAGIC);
         put_u32_le(buf, 4, self.write_seq);
         put_u64_le(buf, 8, self.vehicle_epoch);
-        // [16..24] reserved (was safe_time_floor_ns) — leave zeroed.
+        // [16..24] reserved (retired field) — leave zeroed.
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
