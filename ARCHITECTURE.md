@@ -106,7 +106,7 @@ classDiagram
     class HsmProvider {
         <<trait, hsm>>
         +is_provisioned / provision / provisioning_state
-        +list_keys / get_public_key
+        +list_slots / get_public_key
         +arm_enrollment / is_enrolled / clear_enrolled
     }
     class HsmCryptoProvider {

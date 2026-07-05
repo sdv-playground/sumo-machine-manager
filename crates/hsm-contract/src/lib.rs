@@ -126,18 +126,50 @@ impl std::fmt::Display for KeyType {
     }
 }
 
-/// Information about a key in the keystore.
+/// What a keystore slot holds: a cryptographic key, or the non-key monotonic
+/// counter.
+///
+/// A slot is either a KEY (of some [`KeyType`], addressed for
+/// sign/verify/encrypt/…) or a rollback-proof MONOTONIC-COUNTER (e.g. the
+/// time-floor — a `u64` that only ratchets upward via
+/// `read_monotonic`/`raise_monotonic`, holding NO key material). Modelling both
+/// under one `kind` lets the slot inventory enumerate EVERY slot uniformly,
+/// exactly as the [`vhsm_proto`] slot registry names every slot (keys +
+/// `ALG_MONOTONIC`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotKind {
+    /// A cryptographic key slot of this type.
+    Key(KeyType),
+    /// A rollback-proof monotonic-counter slot (holds no key material).
+    Monotonic,
+}
+
+impl std::fmt::Display for SlotKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlotKind::Key(kt) => write!(f, "{kt}"),
+            SlotKind::Monotonic => write!(f, "monotonic-counter"),
+        }
+    }
+}
+
+/// Information about one slot in the keystore inventory (never any key material).
+///
+/// A slot is either a key (`kind = Key(..)`) or the monotonic counter
+/// (`kind = Monotonic`); [`SlotKind`] discriminates. Everything else is common
+/// slot metadata.
 #[derive(Debug, Clone)]
-pub struct KeyInfo {
+pub struct SlotInfo {
     /// The slot handle — the canonical identity.
     pub handle: KeyHandle,
     /// The derived alias (keystore CBOR id / SimHsm filename).
     pub key_id: String,
-    pub key_type: KeyType,
+    /// Whether this slot is a key (and of what type) or the monotonic counter.
+    pub kind: SlotKind,
     pub has_certificate: bool,
-    /// Guest IDs allowed to use this key. None = all guests.
+    /// Guest IDs allowed to use this slot. None = all guests.
     pub allowed_guests: Option<Vec<String>>,
-    /// Operations allowed on this key. None = all ops.
+    /// Operations allowed on this slot. None = all ops.
     pub allowed_ops: Option<Vec<String>>,
 }
 
@@ -212,8 +244,10 @@ pub trait HsmCryptoProvider: Send + Sync {
         ))
     }
 
-    /// Get key metadata including ACL information.
-    fn get_key_info(&self, handle: KeyHandle) -> Result<KeyInfo, HsmError>;
+    /// Get slot metadata including ACL information. Every slot has one —
+    /// a key slot reports `kind = Key(..)`, the monotonic counter `kind =
+    /// Monotonic`.
+    fn get_slot_info(&self, handle: KeyHandle) -> Result<SlotInfo, HsmError>;
 
     /// Generate a new key in the keystore, bound to `handle`.
     ///

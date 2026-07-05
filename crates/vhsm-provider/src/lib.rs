@@ -23,7 +23,7 @@
 
 use std::sync::Mutex;
 
-use hsm_contract::{HsmCryptoProvider, HsmError, KeyHandle, KeyInfo, KeyType};
+use hsm_contract::{HsmCryptoProvider, HsmError, KeyHandle, KeyType, SlotInfo, SlotKind};
 pub use vhsm_client::OwnedTransport;
 use vhsm_client::{ClientError, Transport, VhsmClient};
 
@@ -184,17 +184,25 @@ impl<T: Transport + Send> HsmCryptoProvider for VhsmProvider<T> {
             .map_err(map_err)
     }
 
-    fn get_key_info(&self, handle: KeyHandle) -> Result<KeyInfo, HsmError> {
+    fn get_slot_info(&self, handle: KeyHandle) -> Result<SlotInfo, HsmError> {
         let info = self
             .client
             .lock()
             .unwrap()
             .get_handle_info(handle.get())
             .map_err(map_err)?;
-        Ok(KeyInfo {
+        // The guest wire only ever exposes key slots (the monotonic-counter slot
+        // is host-only, never guest-registered), but map ALG_MONOTONIC honestly
+        // anyway rather than defaulting it to a key type.
+        let kind = if info.algorithm == vhsm_proto::ALG_MONOTONIC {
+            SlotKind::Monotonic
+        } else {
+            SlotKind::Key(key_type_for_alg(info.algorithm))
+        };
+        Ok(SlotInfo {
             handle: KeyHandle(info.handle),
             key_id: key_id_for_handle(info.handle),
-            key_type: key_type_for_alg(info.algorithm),
+            kind,
             // The wire's GetHandleInfo doesn't report cert presence; callers
             // that need the cert call get_certificate_der directly.
             has_certificate: false,

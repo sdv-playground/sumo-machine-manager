@@ -54,7 +54,7 @@ impl KeyUnwrap for HsmKeyUnwrap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HsmError, KeyInfo};
+    use crate::{HsmError, SlotInfo};
 
     /// A crypto provider that returns recognizable sentinels (derived from the
     /// handle + inputs) for the two unwrap ops and `NotSupported` for everything
@@ -93,8 +93,8 @@ mod tests {
         fn get_public_key_der(&self, _h: KeyHandle) -> Result<Vec<u8>, HsmError> {
             Err(HsmError::NotSupported("get_public_key_der".into()))
         }
-        fn get_key_info(&self, _h: KeyHandle) -> Result<KeyInfo, HsmError> {
-            Err(HsmError::NotSupported("get_key_info".into()))
+        fn get_slot_info(&self, _h: KeyHandle) -> Result<SlotInfo, HsmError> {
+            Err(HsmError::NotSupported("get_slot_info".into()))
         }
         fn unwrap_cek_a128kw(
             &self,

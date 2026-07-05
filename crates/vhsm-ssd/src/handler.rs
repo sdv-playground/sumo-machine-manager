@@ -725,7 +725,7 @@ mod tests {
     fn key_generate_then_mac_generate_roundtrip() {
         // End-to-end integration test: without the fix, the dynamic handle
         // pointed at a non-existent key_id and `mac_generate` failed with
-        // `CRYPTO_ERROR` because `get_key_info` couldn't find the key.
+        // `CRYPTO_ERROR` because `get_slot_info` couldn't find the key.
         use hsm::HsmCryptoProvider;
         let (hsm, _keys_dir, _tmp) = new_hsm();
         let mut table = HandleTable::new();

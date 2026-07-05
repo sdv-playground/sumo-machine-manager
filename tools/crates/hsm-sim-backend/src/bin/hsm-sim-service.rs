@@ -166,7 +166,7 @@ mod tests {
     /// Keystore/SimHsm construction mirrors `crypto.rs`'s `new_hsm()` helper:
     /// `SimHsm::new(<tempdir>)`. No provisioning is
     /// needed — `jwt-signing` is a well-known slot, so `generate_key` writes
-    /// `keys/jwt-signing.{priv,pub}` and the later `get_key_info`/`sign`/
+    /// `keys/jwt-signing.{priv,pub}` and the later `get_slot_info`/`sign`/
     /// `get_public_key_der` resolve those on-disk files via the disk fallback.
     #[test]
     fn sim_hsm_real_crypto_round_trips_over_link_b() {

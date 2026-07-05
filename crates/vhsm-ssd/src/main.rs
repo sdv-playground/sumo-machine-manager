@@ -1117,7 +1117,7 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     // registered only if its key actually exists in the keystore (soft-missing
     // keys are skipped).
     for slot in SUMO_CORE_SLOTS.iter().filter(|s| s.guest_exposed) {
-        if crypto.get_key_info(hsm::KeyHandle(slot.handle)).is_ok() {
+        if crypto.get_slot_info(hsm::KeyHandle(slot.handle)).is_ok() {
             table.register_well_known(slot.handle, slot.key_id, slot.alg, slot.default_perms);
             tracing::debug!(
                 handle = slot.handle,

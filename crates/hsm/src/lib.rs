@@ -29,9 +29,9 @@ pub use types::*;
 
 // The crypto contract (the handle-addressed trait + the shared types) lives in
 // the `hsm-contract` crate; re-export so existing `hsm::HsmCryptoProvider` /
-// `hsm::HsmError` / `hsm::KeyInfo` / `hsm::KeyType` / `hsm::KeyHandle` paths
-// keep resolving.
-pub use hsm_contract::{HsmCryptoProvider, HsmError, KeyHandle, KeyInfo, KeyType};
+// `hsm::HsmError` / `hsm::SlotInfo` / `hsm::SlotKind` / `hsm::KeyType` /
+// `hsm::KeyHandle` paths keep resolving.
+pub use hsm_contract::{HsmCryptoProvider, HsmError, KeyHandle, KeyType, SlotInfo, SlotKind};
 // Re-export the wire/slot-registry crate so consumers can map key_id ↔ handle
 // (e.g. component-mgr's CSR endpoint) without taking a separate dependency.
 pub use vhsm_proto;
@@ -80,8 +80,11 @@ pub trait HsmProvider: Send {
     /// the current value. This prevents rollback to old key sets.
     fn provision(&mut self, suit_envelope: &[u8]) -> Result<(), HsmError>;
 
-    /// List keys currently in the keystore.
-    fn list_keys(&self) -> Result<Vec<KeyInfo>, HsmError>;
+    /// List every slot currently in the keystore inventory — key slots AND the
+    /// non-key monotonic-counter slot(s) (see [`SlotKind`]). The counter is
+    /// reported structurally (its handle/kind), never its value; inventory is
+    /// structure, not state.
+    fn list_slots(&self) -> Result<Vec<SlotInfo>, HsmError>;
 
     /// Retrieve a public key by role, as COSE_Key CBOR bytes.
     fn get_public_key(&self, role: KeyRole) -> Result<Vec<u8>, HsmError>;

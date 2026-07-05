@@ -227,8 +227,8 @@ static void wr_fill(wtr_t *w, uint8_t fill, uint32_t n) {
 /* factory-reset-issuer = 0x0002 / 0x0005 / 0x0008 / 0x0009 — hold NO    */
 /* private key on this device and are marked VIRTUAL; a private-key op   */
 /* against one returns ST_VIRTUAL. The time-floor slot (0x000D) is NOT a */
-/* key: it is a rollback-proof MONOTONIC COUNTER (read/raise only) and   */
-/* never appears in the key catalogue (LIST_KEYS / GET_KEY_INFO).        */
+/* key: it is a rollback-proof MONOTONIC COUNTER (read/raise only). It   */
+/* DOES appear in the inventory (LIST_SLOTS / GET_SLOT_INFO), 0xFF.      */
 /*                                                                       */
 /* A real integrator REPLACES this whole table for their silicon: the    */
 /* logical handles stay identical, the physical slot numbers / key banks */
@@ -245,22 +245,21 @@ static void wr_fill(wtr_t *w, uint8_t fill, uint32_t n) {
 #define HSM_MONOTONIC_SLOT(n) (((uint32_t)HSM_MONOTONIC_BANK << 8) | (uint32_t)(n)) /* n: 0.. */
 
 /*
- * A LOCAL row marker — NOT a Link-B wire KEYTYPE_* (those are 1..5). It tags a
- * slot that holds no key material: a rollback-proof MONOTONIC COUNTER (the
- * time-floor). It never crosses the wire as a KeyInfo.key_type — the key
- * catalogue (LIST_KEYS / GET_KEY_INFO) skips counter rows — so it only has to be
- * distinct from the real KEYTYPE_* set. Mirrors the host-side ALG_MONOTONIC
+ * KEYTYPE_MONOTONIC (defined in hsm_link_b.h) is the wire `kind` for a slot that
+ * holds no key material: a rollback-proof MONOTONIC COUNTER (the time-floor). It
+ * now crosses the wire as SlotInfo.kind exactly like a real KEYTYPE_* — the slot
+ * inventory (LIST_SLOTS / GET_SLOT_INFO) enumerates counter rows too. It stays
+ * clear of the real key-type range (1..5). Mirrors the host-side ALG_MONOTONIC
  * sentinel that labels this slot in the sumo-core registry.
  */
-#define KEYTYPE_MONOTONIC 0xFFu
 
 typedef struct {
     uint32_t    handle;     /* logical sumo-core vHSM handle (the wire identity) */
     int         is_virtual; /* 1 = public-only anchor: no private slot here      */
     uint32_t    slot;       /* physical slot id (valid only when !is_virtual)    */
-    uint32_t    key_type;   /* KEYTYPE_* (hsm_link_b.h) — reported by GET_KEY_INFO */
+    uint32_t    key_type;   /* SlotInfo.kind: KEYTYPE_* or KEYTYPE_MONOTONIC     */
     int         has_cert;   /* 1 = an X.509 cert is stored alongside this key     */
-    const char *key_id;     /* stable key_id (GET_KEY_INFO / LIST_KEYS)           */
+    const char *key_id;     /* stable key_id (GET_SLOT_INFO / LIST_SLOTS)         */
 } binding_t;
 
 static const binding_t SLOT_MAP[] = {
@@ -328,14 +327,16 @@ static counter_cell_t *counter_cell(uint32_t handle) {
 }
 
 /*
- * Encode one KeyInfo per the frozen layout:
- *   handle:u32, key_type:u32, has_certificate:u8, key_id:bytes(utf-8),
+ * Encode one SlotInfo per the frozen layout:
+ *   handle:u32, kind:u32, has_certificate:u8, key_id:bytes(utf-8),
  *   allowed_guests:optlist, allowed_ops:optlist
  * where optlist = present:u8, [count:u32, item:bytes(utf-8) x count]
- * (present = 0 => None). This skeleton reports both optlists as None — guest
- * ACLs are the host proxy's concern (link A), never the backend's.
+ * (present = 0 => None). `kind` is a KEYTYPE_* for a key slot or
+ * KEYTYPE_MONOTONIC for the monotonic-counter slot. This skeleton reports both
+ * optlists as None — guest ACLs are the host proxy's concern (link A), never
+ * the backend's.
  */
-static void wr_key_info(wtr_t *w, const binding_t *b) {
+static void wr_slot_info(wtr_t *w, const binding_t *b) {
     wr_u32(w, b->handle);
     wr_u32(w, b->key_type);
     wr_u8(w, (uint8_t)(b->has_cert ? 1 : 0));
@@ -532,16 +533,15 @@ static uint32_t handle_op(uint32_t op, const uint8_t *payload, uint32_t plen,
         *out_len = w.len;
         return ST_OK;
     }
-    case OP_GET_KEY_INFO: {
+    case OP_GET_SLOT_INFO: {
         uint32_t handle = rd_u32(&r);
         const binding_t *b;
         if (!r.ok) return ST_PROTOCOL_ERROR;
         b = resolve(handle);
         if (!b) return ST_KEY_NOT_FOUND;
-        /* A counter slot is not a key — it has no KeyInfo (no wire key_type). */
-        if (is_counter(b->key_type)) return ST_KEY_NOT_FOUND;
-        /* Metadata read — valid for virtual anchors too. */
-        wr_key_info(&w, b);
+        /* Metadata read — valid for EVERY slot: key slots, virtual anchors, AND
+         * the monotonic counter (reported with kind KEYTYPE_MONOTONIC). */
+        wr_slot_info(&w, b);
         *out_len = w.len;
         return ST_OK;
     }
@@ -627,16 +627,15 @@ static uint32_t handle_op(uint32_t op, const uint8_t *payload, uint32_t plen,
         g_provisioned = 1;
         return ST_OK; /* empty result */
     }
-    case OP_LIST_KEYS: {
+    case OP_LIST_SLOTS: {
         size_t i;
-        uint32_t n = 0;
-        /* TODO(vendor): enumerate provisioned KEYS. A counter slot (time-floor)
-         * is not a key and never appears in the catalogue (mirrors the sim). */
+        /* TODO(vendor): enumerate EVERY slot — the key slots AND the non-key
+         * monotonic-counter slot (the time-floor, reported with kind
+         * KEYTYPE_MONOTONIC). The inventory is STRUCTURE, not state: the counter
+         * VALUE is never reported here (read it via READ_MONOTONIC). */
+        wr_u32(&w, (uint32_t)SLOT_MAP_LEN);
         for (i = 0; i < SLOT_MAP_LEN; i++)
-            if (!is_counter(SLOT_MAP[i].key_type)) n++;
-        wr_u32(&w, n);
-        for (i = 0; i < SLOT_MAP_LEN; i++)
-            if (!is_counter(SLOT_MAP[i].key_type)) wr_key_info(&w, &SLOT_MAP[i]);
+            wr_slot_info(&w, &SLOT_MAP[i]);
         *out_len = w.len;
         return ST_OK;
     }

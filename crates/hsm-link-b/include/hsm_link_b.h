@@ -44,7 +44,7 @@
 #define OP_GET_CERTIFICATE_DER  0x0Au
 #define OP_GET_PUBLIC_KEY_DER   0x0Bu
 #define OP_GET_TRUST_ANCHOR_DER 0x0Cu
-#define OP_GET_KEY_INFO         0x0Du
+#define OP_GET_SLOT_INFO        0x0Du
 #define OP_GENERATE_KEY         0x0Eu
 #define OP_GENERATE_CSR         0x0Fu
 #define OP_UNWRAP_CEK_A128KW    0x10u
@@ -53,7 +53,7 @@
 /* Op codes — provisioning / key management (0x20..0x3F). */
 #define OP_IS_PROVISIONED       0x20u
 #define OP_PROVISION            0x21u
-#define OP_LIST_KEYS            0x22u
+#define OP_LIST_SLOTS           0x22u
 #define OP_PROVISIONING_STATE   0x23u
 #define OP_ARM_ENROLLMENT       0x24u
 #define OP_IS_ENROLLED          0x25u
@@ -82,12 +82,16 @@
 #define ST_KEY_NOT_FOUND        14u
 #define ST_PROTOCOL_ERROR       15u /* malformed frame/payload */
 
-/* KeyType wire constants — KeyInfo.key_type (GET_KEY_INFO / LIST_KEYS). */
+/* Slot-kind wire constants — SlotInfo.kind (GET_SLOT_INFO / LIST_SLOTS).
+ * Values 1..5 name a KEY slot's key type; KEYTYPE_MONOTONIC names the non-key
+ * monotonic-counter slot (e.g. the time-floor). All share the one kind:u32 wire
+ * field so the slot inventory enumerates every slot uniformly. */
 #define KEYTYPE_EC_P256     1u
 #define KEYTYPE_ED25519     2u
 #define KEYTYPE_AES128      3u
 #define KEYTYPE_AES256      4u
 #define KEYTYPE_HMAC_SHA256 5u
+#define KEYTYPE_MONOTONIC   0xFFu
 
 /* ProvisioningState wire constants — PROVISIONING_STATE result state:u32. */
 #define PROV_STATE_UNPROVISIONED 0u

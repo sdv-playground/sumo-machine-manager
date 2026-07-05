@@ -51,14 +51,14 @@
 //! | `GET_CERTIFICATE_DER` | handle:u32 | DER |
 //! | `GET_PUBLIC_KEY_DER` | handle:u32 | SPKI DER |
 //! | `GET_TRUST_ANCHOR_DER` | anchor_id:tail (utf-8) | DER |
-//! | `GET_KEY_INFO` | handle:u32 | KeyInfo (below) |
+//! | `GET_SLOT_INFO` | handle:u32 | SlotInfo (below) |
 //! | `GENERATE_KEY` | handle:u32, alg:u32 | pubkey DER (empty for symmetric) |
 //! | `GENERATE_CSR` | handle:u32, subject_cn:tail (utf-8) | CSR DER |
 //! | `UNWRAP_CEK_A128KW` | handle:u32, wrapped_cek:tail | 16-byte CEK |
 //! | `UNWRAP_CEK_ECDH_ES` | handle:u32, ephem_pub:bytes, wrapped_cek:bytes, recipient_protected:tail | 16-byte CEK |
 //! | `IS_PROVISIONED` | — | u8 (0/1) |
 //! | `PROVISION` | suit_envelope:tail | — |
-//! | `LIST_KEYS` | — | count:u32, KeyInfo* |
+//! | `LIST_SLOTS` | — | count:u32, SlotInfo* |
 //! | `PROVISIONING_STATE` | — | state:u32 |
 //! | `ARM_ENROLLMENT` | ttl_present:u8, ttl:u64, vm_id:tail (utf-8) | — |
 //! | `IS_ENROLLED` | vm_id:tail (utf-8) | u8 (0/1) |
@@ -67,13 +67,15 @@
 //! | `READ_MONOTONIC` | handle:u32 | value:u64 |
 //! | `RAISE_MONOTONIC` | handle:u32, value:u64 | value:u64 |
 //!
-//! `KeyInfo` = `handle:u32, key_type:u32, has_certificate:u8, key_id:bytes(utf-8),
+//! `SlotInfo` = `handle:u32, kind:u32, has_certificate:u8, key_id:bytes(utf-8),
 //! allowed_guests:optlist, allowed_ops:optlist`, where
 //! `optlist = present:u8, [count:u32, item:bytes(utf-8) × count]` (present=0 ⇒ None).
-//! `key_type` is one of the `KEYTYPE_*` constants below.
+//! `kind` is one of the `KEYTYPE_*` constants below for a key slot, or
+//! `KEYTYPE_MONOTONIC` for a non-key monotonic-counter slot (e.g. the time-floor).
 //!
-//! `LIST_KEYS` returns `count:u32` followed by `count` back-to-back `KeyInfo`
-//! records (no per-record length prefix — each is self-delimiting).
+//! `LIST_SLOTS` returns `count:u32` followed by `count` back-to-back `SlotInfo`
+//! records (no per-record length prefix — each is self-delimiting). Every slot is
+//! reported — key slots AND the monotonic counter.
 //!
 //! `PROVISIONING_STATE`'s `state` is one of the `PROV_STATE_*` constants below.
 //!
@@ -104,7 +106,7 @@ pub const OP_RANDOM: u32 = 0x09;
 pub const OP_GET_CERTIFICATE_DER: u32 = 0x0A;
 pub const OP_GET_PUBLIC_KEY_DER: u32 = 0x0B;
 pub const OP_GET_TRUST_ANCHOR_DER: u32 = 0x0C;
-pub const OP_GET_KEY_INFO: u32 = 0x0D;
+pub const OP_GET_SLOT_INFO: u32 = 0x0D;
 pub const OP_GENERATE_KEY: u32 = 0x0E;
 pub const OP_GENERATE_CSR: u32 = 0x0F;
 pub const OP_UNWRAP_CEK_A128KW: u32 = 0x10;
@@ -113,7 +115,7 @@ pub const OP_UNWRAP_CEK_ECDH_ES: u32 = 0x11;
 // ── Op codes — provisioning / key management (0x20..0x3F) ─────────────────────
 pub const OP_IS_PROVISIONED: u32 = 0x20;
 pub const OP_PROVISION: u32 = 0x21;
-pub const OP_LIST_KEYS: u32 = 0x22;
+pub const OP_LIST_SLOTS: u32 = 0x22;
 pub const OP_PROVISIONING_STATE: u32 = 0x23;
 pub const OP_ARM_ENROLLMENT: u32 = 0x24;
 pub const OP_IS_ENROLLED: u32 = 0x25;
@@ -147,12 +149,20 @@ pub const ST_KEY_NOT_FOUND: u32 = 14;
 /// Malformed frame / payload didn't match the op's layout.
 pub const ST_PROTOCOL_ERROR: u32 = 15;
 
-// ── KeyType wire constants — `KeyInfo.key_type` (GET_KEY_INFO / LIST_KEYS) ─────
+// ── Slot-kind wire constants — `SlotInfo.kind` (GET_SLOT_INFO / LIST_SLOTS) ────
+// Values 1..5 name a KEY slot's key type; `KEYTYPE_MONOTONIC` names the non-key
+// monotonic-counter slot. All share the one `kind:u32` wire field so the slot
+// inventory enumerates every slot uniformly.
 pub const KEYTYPE_EC_P256: u32 = 1;
 pub const KEYTYPE_ED25519: u32 = 2;
 pub const KEYTYPE_AES128: u32 = 3;
 pub const KEYTYPE_AES256: u32 = 4;
 pub const KEYTYPE_HMAC_SHA256: u32 = 5;
+/// A non-key **monotonic-counter** slot (e.g. the time-floor): holds no key
+/// material, only a `u64` that ratchets upward (`READ`/`RAISE_MONOTONIC`). Kept
+/// clear of the real key-type range (1..5) with wide headroom; this is the
+/// on-wire promotion of the marker the C reference formerly kept process-local.
+pub const KEYTYPE_MONOTONIC: u32 = 0xFF;
 
 // ── ProvisioningState wire constants — `PROVISIONING_STATE` result `state:u32` ─
 pub const PROV_STATE_UNPROVISIONED: u32 = 0;

@@ -21,7 +21,7 @@ when the guest wire changes.
 The frozen contract is the `hsm-link-b` crate, **not** this file:
 
 - `../src/lib.rs` — authoritative: the per-op payload table, the field codec, the
-  `OP_*` / `ST_*` / `KEYTYPE_*` constants, the `KeyInfo` layout.
+  `OP_*` / `ST_*` / `KEYTYPE_*` constants, the `SlotInfo` layout.
 - `../include/hsm_link_b.h` — the C mirror of those constants (this skeleton
   `#include`s it). Rust is authoritative; if the two ever disagree, Rust wins.
 
@@ -61,12 +61,13 @@ Handle handling, already wired:
 - A **virtual** handle (a public-only trust anchor) on a **private-key** op
   returns `ST_VIRTUAL`. Link B has no dedicated virtual-handle status, so that
   name is a local alias for the frozen `ST_NOT_SUPPORTED` — do not add a new
-  wire code. Public-half ops (`VERIFY`, `GET_PUBLIC_KEY_DER`, `GET_KEY_INFO`)
+  wire code. Public-half ops (`VERIFY`, `GET_PUBLIC_KEY_DER`, `GET_SLOT_INFO`)
   work on virtual anchors.
 - A **counter** handle (the `time-floor` monotonic slot) answers only
-  `READ_MONOTONIC` / `RAISE_MONOTONIC`. Those ops on a non-counter handle — and
-  the key catalogue (`LIST_KEYS` / `GET_KEY_INFO`) on the counter — return
-  `ST_KEY_NOT_FOUND`, because a counter is not a key.
+  `READ_MONOTONIC` / `RAISE_MONOTONIC` for its value; those ops on a non-counter
+  handle return `ST_KEY_NOT_FOUND`. It holds no key, so a **crypto** op on it is
+  rejected — but it DOES appear in the slot inventory (`LIST_SLOTS` /
+  `GET_SLOT_INFO`) with kind `KEYTYPE_MONOTONIC`, alongside the key slots.
 
 ## What you replace: the slot map (the per-silicon part)
 
@@ -78,8 +79,10 @@ and marks the four public-only trust anchors
 (`sw` / `key` / `operational` / `factory-reset-issuer` = 0x0002 / 0x0005 / 0x0008
 / 0x0009) as `VIRTUAL`. The `time-floor` slot (0x000D) is not a key at all: it is
 a rollback-proof **monotonic counter** answering `READ_MONOTONIC` /
-`RAISE_MONOTONIC`, so it never appears in the key catalogue (`LIST_KEYS` /
-`GET_KEY_INFO`). Handle 0x000B is a retired gap (was `freshness-signing`).
+`RAISE_MONOTONIC`. It carries no key material, but it IS part of the slot
+inventory — `LIST_SLOTS` / `GET_SLOT_INFO` report it with kind
+`KEYTYPE_MONOTONIC` (its structure, never its value). Handle 0x000B is a retired
+gap (was `freshness-signing`).
 
 This is the **one table a real integrator replaces** for their silicon: keep the
 logical handles identical, substitute your own physical slot numbers / key

@@ -14,7 +14,7 @@
 /// named deterministically by their handle, so `generate_key` and every later
 /// op agree on the filename with no shared state.
 use crate::sim::{decode_pem, extract_ec_scalar_from_pem, SimHsm};
-use hsm::{HsmCryptoProvider, HsmError, HsmProvider, KeyHandle, KeyInfo, KeyType};
+use hsm::{HsmCryptoProvider, HsmError, HsmProvider, KeyHandle, KeyType, SlotInfo, SlotKind};
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
@@ -51,11 +51,26 @@ pub(crate) fn key_id_for_handle(handle: KeyHandle) -> Result<String, HsmError> {
     }
 }
 
+impl SimHsm {
+    /// Resolve a handle to `(key_id, key_type)` for a crypto op. A
+    /// monotonic-counter slot (e.g. the time-floor) holds no key material, so a
+    /// crypto op on it is a `CryptoError` — crypto never runs on a counter.
+    fn key_slot(&self, handle: KeyHandle) -> Result<(String, KeyType), HsmError> {
+        let info = self.get_slot_info(handle)?;
+        match info.kind {
+            SlotKind::Key(kt) => Ok((info.key_id, kt)),
+            SlotKind::Monotonic => Err(HsmError::CryptoError(format!(
+                "handle {handle} names a monotonic-counter slot, not a key"
+            ))),
+        }
+    }
+}
+
 impl HsmCryptoProvider for SimHsm {
     fn sign(&self, handle: KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        let key_info = self.get_key_info(handle)?;
-        let key_id = &key_info.key_id;
-        match key_info.key_type {
+        let (key_id, key_type) = self.key_slot(handle)?;
+        let key_id = key_id.as_str();
+        match key_type {
             KeyType::EcP256 => {
                 let scalar = load_ec_private_scalar(self, key_id)?;
                 let signing_key = SigningKey::from_bytes((&scalar[..]).into())
@@ -74,15 +89,14 @@ impl HsmCryptoProvider for SimHsm {
     }
 
     fn sign_raw_p256(&self, handle: KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        let key_info = self.get_key_info(handle)?;
-        if key_info.key_type != KeyType::EcP256 {
+        let (key_id, key_type) = self.key_slot(handle)?;
+        if key_type != KeyType::EcP256 {
             return Err(HsmError::CryptoError(format!(
-                "sign_raw_p256 requires EC-P256 key, got {}",
-                key_info.key_type
+                "sign_raw_p256 requires EC-P256 key, got {key_type}"
             )));
         }
 
-        let scalar = load_ec_private_scalar(self, &key_info.key_id)?;
+        let scalar = load_ec_private_scalar(self, &key_id)?;
         let signing_key = SigningKey::from_bytes((&scalar[..]).into())
             .map_err(|e| HsmError::CryptoError(format!("invalid signing key: {e}")))?;
 
@@ -92,9 +106,9 @@ impl HsmCryptoProvider for SimHsm {
     }
 
     fn verify(&self, handle: KeyHandle, data: &[u8], signature: &[u8]) -> Result<bool, HsmError> {
-        let key_info = self.get_key_info(handle)?;
-        let key_id = &key_info.key_id;
-        match key_info.key_type {
+        let (key_id, key_type) = self.key_slot(handle)?;
+        let key_id = key_id.as_str();
+        match key_type {
             KeyType::EcP256 => {
                 let verifying_key = load_ec_verifying_key(self, key_id)?;
                 let sig = ecdsa::der::Signature::<p256::NistP256>::from_bytes(signature)
@@ -122,9 +136,9 @@ impl HsmCryptoProvider for SimHsm {
     }
 
     fn encrypt(&self, handle: KeyHandle, plaintext: &[u8]) -> Result<Vec<u8>, HsmError> {
-        let key_info = self.get_key_info(handle)?;
-        let key_id = &key_info.key_id;
-        let (raw_key, expected_len) = match key_info.key_type {
+        let (key_id, key_type) = self.key_slot(handle)?;
+        let key_id = key_id.as_str();
+        let (raw_key, expected_len) = match key_type {
             KeyType::Aes256 => (load_aes_key_bytes(self, key_id, 32)?, 32),
             KeyType::Aes128 => (load_aes_key_bytes(self, key_id, 16)?, 16),
             other => {
@@ -159,9 +173,9 @@ impl HsmCryptoProvider for SimHsm {
     }
 
     fn decrypt(&self, handle: KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
-        let key_info = self.get_key_info(handle)?;
-        let key_id = &key_info.key_id;
-        let (raw_key, expected_len) = match key_info.key_type {
+        let (key_id, key_type) = self.key_slot(handle)?;
+        let key_id = key_id.as_str();
+        let (raw_key, expected_len) = match key_type {
             KeyType::Aes256 => (load_aes_key_bytes(self, key_id, 32)?, 32),
             KeyType::Aes128 => (load_aes_key_bytes(self, key_id, 16)?, 16),
             other => {
@@ -197,9 +211,9 @@ impl HsmCryptoProvider for SimHsm {
     fn mac_generate(&self, handle: KeyHandle, data: &[u8]) -> Result<Vec<u8>, HsmError> {
         use cmac::{Cmac, Mac};
 
-        let key_info = self.get_key_info(handle)?;
-        let key_id = &key_info.key_id;
-        match key_info.key_type {
+        let (key_id, key_type) = self.key_slot(handle)?;
+        let key_id = key_id.as_str();
+        match key_type {
             KeyType::Aes256 => {
                 let raw_key = load_aes_key_bytes(self, key_id, 32)?;
                 let mut mac =
@@ -234,9 +248,9 @@ impl HsmCryptoProvider for SimHsm {
     fn mac_verify(&self, handle: KeyHandle, data: &[u8], tag: &[u8]) -> Result<bool, HsmError> {
         use cmac::{Cmac, Mac};
 
-        let key_info = self.get_key_info(handle)?;
-        let key_id = &key_info.key_id;
-        match key_info.key_type {
+        let (key_id, key_type) = self.key_slot(handle)?;
+        let key_id = key_id.as_str();
+        match key_type {
             KeyType::Aes256 => {
                 let raw_key = load_aes_key_bytes(self, key_id, 32)?;
                 let mut mac =
@@ -269,9 +283,9 @@ impl HsmCryptoProvider for SimHsm {
     }
 
     fn derive(&self, handle: KeyHandle, context: &[u8], len: usize) -> Result<Vec<u8>, HsmError> {
-        let key_info = self.get_key_info(handle)?;
-        let key_id = &key_info.key_id;
-        let raw_key = match key_info.key_type {
+        let (key_id, key_type) = self.key_slot(handle)?;
+        let key_id = key_id.as_str();
+        let raw_key = match key_type {
             KeyType::Aes256 => load_aes_key_bytes(self, key_id, 32)?,
             KeyType::Aes128 => load_aes_key_bytes(self, key_id, 16)?,
             KeyType::HmacSha256 => load_hmac_key(self, key_id)?,
@@ -301,9 +315,9 @@ impl HsmCryptoProvider for SimHsm {
     }
 
     fn get_certificate_der(&self, handle: KeyHandle) -> Result<Vec<u8>, HsmError> {
-        let key_info = self.get_key_info(handle)?;
-        let key_id = &key_info.key_id;
-        if !key_info.has_certificate {
+        let slot_info = self.get_slot_info(handle)?;
+        let key_id = &slot_info.key_id;
+        if !slot_info.has_certificate {
             return Err(HsmError::KeyNotFound(format!(
                 "no certificate for key '{key_id}'"
             )));
@@ -316,9 +330,9 @@ impl HsmCryptoProvider for SimHsm {
     }
 
     fn get_public_key_der(&self, handle: KeyHandle) -> Result<Vec<u8>, HsmError> {
-        let key_info = self.get_key_info(handle)?;
-        let key_id = &key_info.key_id;
-        match key_info.key_type {
+        let (key_id, key_type) = self.key_slot(handle)?;
+        let key_id = key_id.as_str();
+        match key_type {
             KeyType::EcP256 => {
                 let pub_path = self.keys_dir().join(format!("{key_id}.pub"));
                 let pem = std::fs::read_to_string(&pub_path).map_err(|e| {
@@ -342,7 +356,7 @@ impl HsmCryptoProvider for SimHsm {
     fn get_trust_anchor_der(&self, anchor_id: &str) -> Result<Vec<u8>, HsmError> {
         // Pinned CA roots live under keys/roots/{anchor_id}.cert (PEM), kept
         // apart from device-key files. Not a slot — addressed by string id, no
-        // handle, no get_key_info gate.
+        // handle, no get_slot_info gate.
         let path = self
             .keys_dir()
             .join("roots")
@@ -357,13 +371,30 @@ impl HsmCryptoProvider for SimHsm {
         decode_pem(&pem, "CERTIFICATE")
     }
 
-    fn get_key_info(&self, handle: KeyHandle) -> Result<KeyInfo, HsmError> {
+    fn get_slot_info(&self, handle: KeyHandle) -> Result<SlotInfo, HsmError> {
+        // A monotonic-counter slot (e.g. the time-floor) holds no key material —
+        // report it structurally as a `Monotonic` slot rather than probing for a
+        // key file. This is what surfaces the counter through get_slot_info /
+        // list_slots at every layer, safe to expose.
+        if let Some(slot) = vhsm_proto::slot_for_handle(handle.0) {
+            if slot.alg == vhsm_proto::ALG_MONOTONIC {
+                return Ok(SlotInfo {
+                    handle,
+                    key_id: slot.key_id.to_string(),
+                    kind: SlotKind::Monotonic,
+                    has_certificate: false,
+                    allowed_guests: None,
+                    allowed_ops: None,
+                });
+            }
+        }
+
         let key_id = key_id_for_handle(handle)?;
 
         // Manifest lookup (provisioned well-known keys)
         if self.is_provisioned().unwrap_or(false) {
-            let keys = self.parse_manifest()?;
-            if let Some(mut info) = keys.into_iter().find(|k| k.key_id == key_id) {
+            let slots = self.parse_manifest()?;
+            if let Some(mut info) = slots.into_iter().find(|k| k.key_id == key_id) {
                 info.handle = handle;
                 return Ok(info);
             }
@@ -386,10 +417,10 @@ impl HsmCryptoProvider for SimHsm {
         ];
         for (ext, kt) in probes {
             if kd.join(format!("{key_id}.{ext}")).exists() {
-                return Ok(KeyInfo {
+                return Ok(SlotInfo {
                     handle,
                     key_id,
-                    key_type: kt,
+                    kind: SlotKind::Key(kt),
                     has_certificate: false,
                     allowed_guests: None,
                     allowed_ops: None,
@@ -604,7 +635,7 @@ fn load_ec_verifying_key(hsm: &SimHsm, key_id: &str) -> Result<VerifyingKey, Hsm
 ///   * 32 → `{key_id}.bin`            (AES-256 — legacy/default symmetric)
 ///
 /// Use `load_hmac_key` for HMAC-SHA256 (also 32 bytes but a different
-/// extension to disambiguate from AES-256 at the `get_key_info` layer).
+/// extension to disambiguate from AES-256 at the `get_slot_info` layer).
 fn load_aes_key_bytes(
     hsm: &SimHsm,
     key_id: &str,
@@ -702,9 +733,9 @@ mod tests {
         let pk = hsm.generate_key(H_A, ALG_AES_256).unwrap();
         assert!(pk.is_empty(), "AES is symmetric, no public key");
 
-        // get_key_info must find it via disk fallback (no manifest entry)
-        let info = hsm.get_key_info(H_A).unwrap();
-        assert_eq!(info.key_type, KeyType::Aes256);
+        // get_slot_info must find it via disk fallback (no manifest entry)
+        let info = hsm.get_slot_info(H_A).unwrap();
+        assert_eq!(info.kind, SlotKind::Key(KeyType::Aes256));
 
         // encrypt+decrypt round-trip
         let pt = b"hello generate_key";
@@ -727,8 +758,8 @@ mod tests {
         // SubjectPublicKeyInfo starts with SEQUENCE (0x30)
         assert_eq!(spki[0], 0x30, "SPKI should be ASN.1 SEQUENCE");
 
-        let info = hsm.get_key_info(H_A).unwrap();
-        assert_eq!(info.key_type, KeyType::EcP256);
+        let info = hsm.get_slot_info(H_A).unwrap();
+        assert_eq!(info.kind, SlotKind::Key(KeyType::EcP256));
 
         // get_public_key_der returns the same SPKI bytes
         let spki_via_getter = hsm.get_public_key_der(H_A).unwrap();
@@ -796,8 +827,8 @@ mod tests {
         assert!(!spki.is_empty(), "Ed25519 must return public key DER");
         assert_eq!(spki[0], 0x30, "SPKI should be ASN.1 SEQUENCE");
 
-        let info = hsm.get_key_info(H_A).unwrap();
-        assert_eq!(info.key_type, KeyType::Ed25519);
+        let info = hsm.get_slot_info(H_A).unwrap();
+        assert_eq!(info.kind, SlotKind::Key(KeyType::Ed25519));
 
         // get_public_key_der returns the same SPKI bytes
         let spki_via_getter = hsm.get_public_key_der(H_A).unwrap();
@@ -820,8 +851,8 @@ mod tests {
         let pk = hsm.generate_key(H_A, ALG_AES_128).unwrap();
         assert!(pk.is_empty(), "symmetric — no public material");
 
-        let info = hsm.get_key_info(H_A).unwrap();
-        assert_eq!(info.key_type, KeyType::Aes128);
+        let info = hsm.get_slot_info(H_A).unwrap();
+        assert_eq!(info.kind, SlotKind::Key(KeyType::Aes128));
 
         let pt = b"AES-128 round trip";
         let ct = hsm.encrypt(H_A, pt).unwrap();
@@ -840,8 +871,8 @@ mod tests {
         let pk = hsm.generate_key(H_A, ALG_HMAC_SHA256).unwrap();
         assert!(pk.is_empty(), "symmetric — no public material");
 
-        let info = hsm.get_key_info(H_A).unwrap();
-        assert_eq!(info.key_type, KeyType::HmacSha256);
+        let info = hsm.get_slot_info(H_A).unwrap();
+        assert_eq!(info.kind, SlotKind::Key(KeyType::HmacSha256));
 
         let data = b"hmac-sha256 round trip";
         let tag = hsm.mac_generate(H_A, data).unwrap();
@@ -1049,22 +1080,22 @@ mod tests {
     }
 
     #[test]
-    fn get_key_info_falls_back_to_disk_when_not_provisioned() {
+    fn get_slot_info_falls_back_to_disk_when_not_provisioned() {
         let (hsm, _tmp) = new_hsm();
         // HSM is not provisioned — but generate_key still creates disk files.
         assert!(!hsm.is_provisioned().unwrap());
         hsm.generate_key(H_A, ALG_AES_256).unwrap();
 
-        let info = hsm.get_key_info(H_A).unwrap();
+        let info = hsm.get_slot_info(H_A).unwrap();
         assert_eq!(info.handle, H_A);
         assert_eq!(info.key_id, "dyn-00000100");
-        assert_eq!(info.key_type, KeyType::Aes256);
+        assert_eq!(info.kind, SlotKind::Key(KeyType::Aes256));
     }
 
     #[test]
-    fn get_key_info_key_not_found_still_errors() {
+    fn get_slot_info_key_not_found_still_errors() {
         let (hsm, _tmp) = new_hsm();
-        let err = hsm.get_key_info(H_A).unwrap_err();
+        let err = hsm.get_slot_info(H_A).unwrap_err();
         // Not provisioned and key not on disk
         assert!(
             matches!(err, HsmError::NotProvisioned | HsmError::KeyNotFound(_)),

@@ -178,7 +178,7 @@ pub fn apply(
 ) -> usize {
     let mut registered = 0;
     for e in entries {
-        if crypto.get_key_info(hsm::KeyHandle(e.handle)).is_err() {
+        if crypto.get_slot_info(hsm::KeyHandle(e.handle)).is_err() {
             tracing::debug!(
                 handle = e.handle,
                 key_id = %e.key_id,

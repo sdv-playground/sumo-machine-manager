@@ -19,7 +19,7 @@ use machine_mgr::{
     ActivationState, Capabilities, ClearFaultsResult, Component, Csr, DidFilter, DidKind,
     DtcFilter, EnvelopeStream, Fault, FlashCaps, FlashId, FlashSession, FlashStatus, HsmCaps,
     KeyDescriptor, KeyInventory, LifecycleCaps, MachineError, MachineResult, RuntimeState,
-    RuntimeStatus,
+    RuntimeStatus, SlotKind,
 };
 
 use crate::backend::{ComponentBackend, DID_REGISTRY};
@@ -384,31 +384,44 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
             Some(Ok(hsm::ProvisioningState::Provisioned))
         );
 
-        // Shared KeyInfo → public-only KeyDescriptor mapping; `public_key` is the
-        // already-resolved SPKI for asymmetric slots (safe to return), never any
-        // private bytes.
-        let to_descriptor = |k: hsm::KeyInfo, public_key: Option<Vec<u8>>| KeyDescriptor {
-            key_id: k.key_id,
-            key_type: key_type_label(k.key_type).to_string(),
-            has_certificate: k.has_certificate,
-            allowed_ops: k.allowed_ops,
+        // Shared SlotInfo → public-only KeyDescriptor mapping. EVERY slot is
+        // mapped through — key slots AND the monotonic-counter slot (the
+        // time-floor). The counter is deliberately surfaced (it is safe to
+        // expose: structure, not the counter value); it is NOT filtered out.
+        // `public_key` is the already-resolved SPKI for asymmetric key slots
+        // (safe to return), never any private bytes; the counter has none.
+        let to_descriptor = |s: hsm::SlotInfo, public_key: Option<Vec<u8>>| KeyDescriptor {
+            key_id: s.key_id,
+            kind: match s.kind {
+                hsm::SlotKind::Key(kt) => SlotKind::Key(key_type_label(kt).to_string()),
+                hsm::SlotKind::Monotonic => SlotKind::Monotonic,
+            },
+            has_certificate: s.has_certificate,
+            allowed_ops: s.allowed_ops,
             public_key,
         };
-        let wants_pubkey =
-            |t: hsm::KeyType| matches!(t, hsm::KeyType::EcP256 | hsm::KeyType::Ed25519);
+        // Asymmetric KEY slots have a public half worth returning; symmetric keys
+        // and the monotonic counter do not.
+        let wants_pubkey = |kind: &hsm::SlotKind| {
+            matches!(
+                kind,
+                hsm::SlotKind::Key(hsm::KeyType::EcP256 | hsm::KeyType::Ed25519)
+            )
+        };
 
         // Prefer the injected crypto provider. HsmCryptoProvider has no
-        // list_keys, so enumerate the well-known sumo-core slot registry and
-        // keep the slots the backend actually has (get_key_info → KeyNotFound
-        // for absent ones). Else fall back to the transient SimHsm, which reads
-        // the on-disk keystore's slots directly.
+        // list_slots, so enumerate the well-known sumo-core slot registry
+        // (which includes the time-floor counter) and keep the slots the backend
+        // actually has (get_slot_info → KeyNotFound for absent ones). Else fall
+        // back to the transient SimHsm, which lists the on-disk keystore's slots
+        // plus the counter directly.
         let keys: Vec<KeyDescriptor> = if let Some(ref crypto) = self.csr_crypto {
             hsm::vhsm_proto::SUMO_CORE_SLOTS
                 .iter()
                 .filter_map(|slot| {
                     let handle = hsm::KeyHandle(slot.handle);
-                    let info = crypto.get_key_info(handle).ok()?;
-                    let public_key = wants_pubkey(info.key_type)
+                    let info = crypto.get_slot_info(handle).ok()?;
+                    let public_key = wants_pubkey(&info.kind)
                         .then(|| crypto.get_public_key_der(handle).ok())
                         .flatten();
                     Some(to_descriptor(info, public_key))
@@ -423,11 +436,11 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                 ))?;
             let tmp =
                 hsm_sim_backend::SimHsm::new(keystore.clone());
-            tmp.list_keys()
-                .map_err(|e| MachineError::Internal(format!("list keys failed: {e}")))?
+            tmp.list_slots()
+                .map_err(|e| MachineError::Internal(format!("list slots failed: {e}")))?
                 .into_iter()
                 .map(|k| {
-                    let public_key = wants_pubkey(k.key_type)
+                    let public_key = wants_pubkey(&k.kind)
                         .then(|| tmp.get_public_key_der(k.handle).ok())
                         .flatten();
                     to_descriptor(k, public_key)

@@ -78,12 +78,14 @@ pub fn update_state_router<D: BlockDevice + Send + 'static>(
 /// Wire:
 ///
 ///   `GET  /vehicle/v1/components/hsm/data/keys`
-///        → 200 JSON `{ "provisioned": bool, "items": [ { id, key_type,
+///        → 200 JSON `{ "provisioned": bool, "items": [ { id, kind,
 ///          has_certificate, allowed_ops, public_key_der_base64 } ] }` — ALWAYS
 ///          served (device-generated keys exist from first boot); `provisioned`
 ///          is the device's own state, so callers read it instead of inferring
-///          from a status code. Public-only; `public_key_der_base64` is the SPKI
-///          for asymmetric slots, `null` for symmetric.
+///          from a status code. Every slot is listed — key slots (`kind` =
+///          `EC-P256`/`AES-256`/…) AND the monotonic counter (`kind` =
+///          `monotonic`). Public-only; `public_key_der_base64` is the SPKI for
+///          asymmetric key slots, `null` for symmetric keys and the counter.
 ///   `POST /vehicle/v1/components/hsm/operations/x-sumo-csr/executions`
 ///        body `{ "key_id": "<slot>" }` → 200 ISO 17978-3 §7.14 operation
 ///        execution; `result.csr_der_base64` is the PKCS#10 CSR.
@@ -141,7 +143,7 @@ async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
                         .map(|der| base64::engine::general_purpose::STANDARD.encode(der));
                     serde_json::json!({
                         "id": k.key_id,
-                        "key_type": k.key_type,
+                        "kind": k.kind.label(),
                         "has_certificate": k.has_certificate,
                         "allowed_ops": k.allowed_ops,
                         "public_key_der_base64": public_key_der_base64,

@@ -56,9 +56,9 @@ Carries the **guest-facing** protocol: the `Hello/Auth/Enroll` handshake, **gues
 
 ### Link B — host-HSM ↔ backend service (the op contract)
 The `hsm-link-b` crate: the frozen wire (a uniform 3-field LE frame, the per-op payload table,
-the `OP_*`/`ST_*`/`KEYTYPE_*` constants, the `KeyInfo` layout) carrying the `HsmCryptoProvider`
+the `OP_*`/`ST_*`/`KEYTYPE_*` constants, the `SlotInfo` layout) carrying the `HsmCryptoProvider`
 op surface — `sign / verify / encrypt / decrypt / mac_* / derive / get_public_key_der /
-get_key_info / generate_key / unwrap_cek_* / …`, **all by `KeyHandle`**, plus the provisioning
+get_slot_info / generate_key / unwrap_cek_* / …`, **all by `KeyHandle`**, plus the provisioning
 ops. **No** handshake, **no** guest identity, **no** per-guest perms — the host already
 authenticated the guest on link A. **This — and only this — is what a hardware-HSE vendor
 implements**, and it is *decoupled* from link A so the two evolve independently.

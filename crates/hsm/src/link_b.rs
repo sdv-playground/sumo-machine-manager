@@ -8,7 +8,7 @@
 //! - [`LinkBClient`] implements [`HsmCryptoProvider`] by encoding each crypto op
 //!   per the frozen payload table, sending it over a `UnixStream`, and decoding
 //!   the response. It also carries the provisioning / key-management half
-//!   (`is_provisioned`, `provision`, `list_keys`, `provisioning_state`,
+//!   (`is_provisioned`, `provision`, `list_slots`, `provisioning_state`,
 //!   `get_public_key`, `arm_enrollment`, `is_enrolled`, `clear_enrolled`) as
 //!   inherent methods. It is what the host proxy uses to reach the backend.
 //! - [`serve_crypto`] is the inverse harness for a **crypto-only** backend: it
@@ -24,7 +24,7 @@
 //! Both the crypto ops (`OP_*` `< 0x20`) and the provisioning ops
 //! (`0x20..=0x27`) are wired; an unknown op answers `ST_NOT_SUPPORTED`.
 //!
-//! The [`KeyInfo`] struct and the `HsmError <-> status` mapping are encoded here
+//! The [`SlotInfo`] struct and the `HsmError <-> status` mapping are encoded here
 //! (the `hsm-link-b` crate is intentionally dep-free and carries only the
 //! frame codec + numeric constants).
 
@@ -38,7 +38,8 @@ use std::time::Duration;
 use hsm_link_b::*;
 
 use crate::{
-    HsmCryptoProvider, HsmError, HsmProvider, KeyHandle, KeyInfo, KeyType, ProvisioningState,
+    HsmCryptoProvider, HsmError, HsmProvider, KeyHandle, KeyType, ProvisioningState, SlotInfo,
+    SlotKind,
 };
 
 // ── SPKI DER → COSE_Key trust-anchor converter ────────────────────────────────
@@ -154,27 +155,34 @@ fn error_message_bytes(e: &HsmError) -> Vec<u8> {
     }
 }
 
-// ── KeyType <-> KEYTYPE_* mapping ─────────────────────────────────────────────
+// ── SlotKind <-> KEYTYPE_* mapping ────────────────────────────────────────────
+//
+// The `kind:u32` wire field carries a key slot's key type (values 1..5) OR the
+// `KEYTYPE_MONOTONIC` marker for the non-key monotonic-counter slot. The decoder
+// ACCEPTS the monotonic marker (→ `SlotKind::Monotonic`) — it is a real on-wire
+// value now, not the process-local marker the C reference formerly used.
 
-fn keytype_to_wire(kt: KeyType) -> u32 {
-    match kt {
-        KeyType::EcP256 => KEYTYPE_EC_P256,
-        KeyType::Ed25519 => KEYTYPE_ED25519,
-        KeyType::Aes128 => KEYTYPE_AES128,
-        KeyType::Aes256 => KEYTYPE_AES256,
-        KeyType::HmacSha256 => KEYTYPE_HMAC_SHA256,
+fn kind_to_wire(kind: SlotKind) -> u32 {
+    match kind {
+        SlotKind::Key(KeyType::EcP256) => KEYTYPE_EC_P256,
+        SlotKind::Key(KeyType::Ed25519) => KEYTYPE_ED25519,
+        SlotKind::Key(KeyType::Aes128) => KEYTYPE_AES128,
+        SlotKind::Key(KeyType::Aes256) => KEYTYPE_AES256,
+        SlotKind::Key(KeyType::HmacSha256) => KEYTYPE_HMAC_SHA256,
+        SlotKind::Monotonic => KEYTYPE_MONOTONIC,
     }
 }
 
-fn keytype_from_wire(v: u32) -> Result<KeyType, HsmError> {
+fn kind_from_wire(v: u32) -> Result<SlotKind, HsmError> {
     match v {
-        KEYTYPE_EC_P256 => Ok(KeyType::EcP256),
-        KEYTYPE_ED25519 => Ok(KeyType::Ed25519),
-        KEYTYPE_AES128 => Ok(KeyType::Aes128),
-        KEYTYPE_AES256 => Ok(KeyType::Aes256),
-        KEYTYPE_HMAC_SHA256 => Ok(KeyType::HmacSha256),
+        KEYTYPE_EC_P256 => Ok(SlotKind::Key(KeyType::EcP256)),
+        KEYTYPE_ED25519 => Ok(SlotKind::Key(KeyType::Ed25519)),
+        KEYTYPE_AES128 => Ok(SlotKind::Key(KeyType::Aes128)),
+        KEYTYPE_AES256 => Ok(SlotKind::Key(KeyType::Aes256)),
+        KEYTYPE_HMAC_SHA256 => Ok(SlotKind::Key(KeyType::HmacSha256)),
+        KEYTYPE_MONOTONIC => Ok(SlotKind::Monotonic),
         other => Err(HsmError::CryptoError(format!(
-            "link-b: unknown key_type {other}"
+            "link-b: unknown slot kind {other}"
         ))),
     }
 }
@@ -198,50 +206,50 @@ fn provisioning_state_from_wire(v: u32) -> Result<ProvisioningState, HsmError> {
     }
 }
 
-// ── KeyInfo codec ─────────────────────────────────────────────────────────────
+// ── SlotInfo codec ────────────────────────────────────────────────────────────
 
-/// Append a [`KeyInfo`] to `w` per the frozen layout:
-/// `handle:u32, key_type:u32, has_certificate:u8, key_id:bytes,
+/// Append a [`SlotInfo`] to `w` per the frozen layout:
+/// `handle:u32, kind:u32, has_certificate:u8, key_id:bytes,
 /// allowed_guests:optlist, allowed_ops:optlist`. Each record is self-delimiting,
-/// so a sequence (the `LIST_KEYS` result) is just `count:u32` then N of these
-/// back-to-back — see [`write_key_info`]/[`read_key_info`].
-fn write_key_info(w: Writer, ki: &KeyInfo) -> Writer {
+/// so a sequence (the `LIST_SLOTS` result) is just `count:u32` then N of these
+/// back-to-back — see [`write_slot_info`]/[`read_slot_info`].
+fn write_slot_info(w: Writer, si: &SlotInfo) -> Writer {
     let w = w
-        .u32(ki.handle.get())
-        .u32(keytype_to_wire(ki.key_type))
-        .u8(ki.has_certificate as u8)
-        .bytes(ki.key_id.as_bytes());
-    let w = write_optlist(w, ki.allowed_guests.as_deref());
-    write_optlist(w, ki.allowed_ops.as_deref())
+        .u32(si.handle.get())
+        .u32(kind_to_wire(si.kind))
+        .u8(si.has_certificate as u8)
+        .bytes(si.key_id.as_bytes());
+    let w = write_optlist(w, si.allowed_guests.as_deref());
+    write_optlist(w, si.allowed_ops.as_deref())
 }
 
-/// Read one [`KeyInfo`] from `r` (the inverse of [`write_key_info`]), advancing
+/// Read one [`SlotInfo`] from `r` (the inverse of [`write_slot_info`]), advancing
 /// `r` past it so consecutive records can be read from one [`Reader`].
-fn read_key_info(r: &mut Reader<'_>) -> Result<KeyInfo, HsmError> {
+fn read_slot_info(r: &mut Reader<'_>) -> Result<SlotInfo, HsmError> {
     let handle = KeyHandle(r.u32().map_err(proto_err)?);
-    let key_type = keytype_from_wire(r.u32().map_err(proto_err)?)?;
+    let kind = kind_from_wire(r.u32().map_err(proto_err)?)?;
     let has_certificate = r.u8().map_err(proto_err)? != 0;
     let key_id = String::from_utf8_lossy(r.bytes().map_err(proto_err)?).into_owned();
     let allowed_guests = read_optlist(r)?;
     let allowed_ops = read_optlist(r)?;
-    Ok(KeyInfo {
+    Ok(SlotInfo {
         handle,
         key_id,
-        key_type,
+        kind,
         has_certificate,
         allowed_guests,
         allowed_ops,
     })
 }
 
-/// Encode a single [`KeyInfo`] to its own buffer (the `GET_KEY_INFO` result).
-pub fn encode_key_info(ki: &KeyInfo) -> Vec<u8> {
-    write_key_info(Writer::new(), ki).finish()
+/// Encode a single [`SlotInfo`] to its own buffer (the `GET_SLOT_INFO` result).
+pub fn encode_slot_info(si: &SlotInfo) -> Vec<u8> {
+    write_slot_info(Writer::new(), si).finish()
 }
 
-/// Decode a [`KeyInfo`] written by [`encode_key_info`].
-pub fn decode_key_info(buf: &[u8]) -> Result<KeyInfo, HsmError> {
-    read_key_info(&mut Reader::new(buf))
+/// Decode a [`SlotInfo`] written by [`encode_slot_info`].
+pub fn decode_slot_info(buf: &[u8]) -> Result<SlotInfo, HsmError> {
+    read_slot_info(&mut Reader::new(buf))
 }
 
 /// `optlist = present:u8, [count:u32, item:bytes × count]` (present=0 ⇒ None).
@@ -336,16 +344,17 @@ impl LinkBClient {
         Ok(())
     }
 
-    /// `OP_LIST_KEYS` — inventory of the keystore's slots.
-    pub fn list_keys(&self) -> Result<Vec<KeyInfo>, HsmError> {
-        let result = self.call(OP_LIST_KEYS, Vec::new())?;
+    /// `OP_LIST_SLOTS` — inventory of every keystore slot (keys + the monotonic
+    /// counter).
+    pub fn list_slots(&self) -> Result<Vec<SlotInfo>, HsmError> {
+        let result = self.call(OP_LIST_SLOTS, Vec::new())?;
         let mut r = Reader::new(&result);
         let count = r.u32().map_err(proto_err)?;
-        let mut keys = Vec::with_capacity(count as usize);
+        let mut slots = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            keys.push(read_key_info(&mut r)?);
+            slots.push(read_slot_info(&mut r)?);
         }
-        Ok(keys)
+        Ok(slots)
     }
 
     /// `OP_PROVISIONING_STATE` — the provisioning lifecycle state.
@@ -514,9 +523,9 @@ impl HsmCryptoProvider for LinkBClient {
         )
     }
 
-    fn get_key_info(&self, handle: KeyHandle) -> Result<KeyInfo, HsmError> {
-        let result = self.call(OP_GET_KEY_INFO, Writer::new().u32(handle.get()).finish())?;
-        decode_key_info(&result)
+    fn get_slot_info(&self, handle: KeyHandle) -> Result<SlotInfo, HsmError> {
+        let result = self.call(OP_GET_SLOT_INFO, Writer::new().u32(handle.get()).finish())?;
+        decode_slot_info(&result)
     }
 
     fn generate_key(&self, handle: KeyHandle, alg: u32) -> Result<Vec<u8>, HsmError> {
@@ -574,7 +583,7 @@ impl HsmCryptoProvider for LinkBClient {
 /// backend is a link-B daemon rather than an in-process `SimHsm`.
 ///
 /// Delegation map: every [`HsmProvider`] method (`is_provisioned`, `provision`,
-/// `list_keys`, `provisioning_state`, `arm_enrollment`, `is_enrolled`,
+/// `list_slots`, `provisioning_state`, `arm_enrollment`, `is_enrolled`,
 /// `clear_enrolled`, `get_public_key`) → the client's inherent link-B methods.
 /// Crypto (sign / verify / unwrap_cek_*) is NOT on this trait — a caller that
 /// needs it holds the [`LinkBClient`] directly as an [`HsmCryptoProvider`] (see
@@ -612,8 +621,8 @@ impl HsmProvider for LinkBProvider {
         self.client.provision(suit_envelope)
     }
 
-    fn list_keys(&self) -> Result<Vec<KeyInfo>, HsmError> {
-        self.client.list_keys()
+    fn list_slots(&self) -> Result<Vec<SlotInfo>, HsmError> {
+        self.client.list_slots()
     }
 
     fn get_public_key(&self, role: crate::KeyRole) -> Result<Vec<u8>, HsmError> {
@@ -827,9 +836,9 @@ fn run_crypto_op(
             let anchor_id = String::from_utf8_lossy(r.tail()).into_owned();
             backend.get_trust_anchor_der(&anchor_id)
         }
-        OP_GET_KEY_INFO => backend
-            .get_key_info(KeyHandle(r.u32()?))
-            .map(|ki| encode_key_info(&ki)),
+        OP_GET_SLOT_INFO => backend
+            .get_slot_info(KeyHandle(r.u32()?))
+            .map(|si| encode_slot_info(&si)),
         OP_GENERATE_KEY => {
             let handle = KeyHandle(r.u32()?);
             let alg = r.u32()?;
@@ -922,10 +931,10 @@ where
     let out: Result<Vec<u8>, HsmError> = match op {
         OP_IS_PROVISIONED => backend.is_provisioned().map(|b| vec![b as u8]),
         OP_PROVISION => backend.provision(r.tail()).map(|()| Vec::new()),
-        OP_LIST_KEYS => backend.list_keys().map(|keys| {
-            let mut w = Writer::new().u32(keys.len() as u32);
-            for ki in &keys {
-                w = write_key_info(w, ki);
+        OP_LIST_SLOTS => backend.list_slots().map(|slots| {
+            let mut w = Writer::new().u32(slots.len() as u32);
+            for si in &slots {
+                w = write_slot_info(w, si);
             }
             w.finish()
         }),
@@ -1041,13 +1050,13 @@ mod tests {
         fn get_trust_anchor_der(&self, anchor_id: &str) -> Result<Vec<u8>, HsmError> {
             Ok(format!("anchor:{anchor_id}").into_bytes())
         }
-        fn get_key_info(&self, _handle: KeyHandle) -> Result<KeyInfo, HsmError> {
-            // A fixed KeyInfo with its OWN handle (distinct from the request) →
-            // proves the KeyInfo struct encodes/decodes independently.
-            Ok(KeyInfo {
+        fn get_slot_info(&self, _handle: KeyHandle) -> Result<SlotInfo, HsmError> {
+            // A fixed SlotInfo with its OWN handle (distinct from the request) →
+            // proves the SlotInfo struct encodes/decodes independently.
+            Ok(SlotInfo {
                 handle: KeyHandle(0x42),
                 key_id: "test-key".to_string(),
-                key_type: KeyType::EcP256,
+                kind: SlotKind::Key(KeyType::EcP256),
                 has_certificate: true,
                 allowed_guests: Some(vec!["g1".to_string()]),
                 allowed_ops: None,
@@ -1150,14 +1159,14 @@ mod tests {
             client.get_trust_anchor_der("delegation-root").unwrap(),
             b"anchor:delegation-root".to_vec()
         );
-        // 13. get_key_info — full struct round-trips (incl. optlists)
-        let ki = client.get_key_info(KeyHandle(0x99)).unwrap();
-        assert_eq!(ki.handle, KeyHandle(0x42));
-        assert_eq!(ki.key_id, "test-key");
-        assert_eq!(ki.key_type, KeyType::EcP256);
-        assert!(ki.has_certificate);
-        assert_eq!(ki.allowed_guests, Some(vec!["g1".to_string()]));
-        assert_eq!(ki.allowed_ops, None);
+        // 13. get_slot_info — full struct round-trips (incl. optlists)
+        let si = client.get_slot_info(KeyHandle(0x99)).unwrap();
+        assert_eq!(si.handle, KeyHandle(0x42));
+        assert_eq!(si.key_id, "test-key");
+        assert_eq!(si.kind, SlotKind::Key(KeyType::EcP256));
+        assert!(si.has_certificate);
+        assert_eq!(si.allowed_guests, Some(vec!["g1".to_string()]));
+        assert_eq!(si.allowed_ops, None);
         // 14. generate_key — alg echoed (0x21 == 33)
         assert_eq!(
             client.generate_key(KeyHandle(0x0E), 0x21).unwrap(),
@@ -1189,25 +1198,44 @@ mod tests {
     }
 
     #[test]
-    fn key_info_codec_round_trips_with_none_and_some_optlists() {
-        let ki = KeyInfo {
+    fn slot_info_codec_round_trips_with_none_and_some_optlists() {
+        let si = SlotInfo {
             handle: KeyHandle(0x1234),
             key_id: "alias".to_string(),
-            key_type: KeyType::Aes256,
+            kind: SlotKind::Key(KeyType::Aes256),
             has_certificate: false,
             allowed_guests: None,
             allowed_ops: Some(vec!["sign".to_string(), "verify".to_string()]),
         };
-        let decoded = decode_key_info(&encode_key_info(&ki)).unwrap();
-        assert_eq!(decoded.handle, ki.handle);
-        assert_eq!(decoded.key_id, ki.key_id);
-        assert_eq!(decoded.key_type, ki.key_type);
-        assert_eq!(decoded.has_certificate, ki.has_certificate);
+        let decoded = decode_slot_info(&encode_slot_info(&si)).unwrap();
+        assert_eq!(decoded.handle, si.handle);
+        assert_eq!(decoded.key_id, si.key_id);
+        assert_eq!(decoded.kind, si.kind);
+        assert_eq!(decoded.has_certificate, si.has_certificate);
         assert_eq!(decoded.allowed_guests, None);
         assert_eq!(
             decoded.allowed_ops,
             Some(vec!["sign".to_string(), "verify".to_string()])
         );
+    }
+
+    #[test]
+    fn slot_info_codec_round_trips_the_monotonic_counter_kind() {
+        // The non-key monotonic-counter slot rides the same wire as a key slot;
+        // its `kind` uses the KEYTYPE_MONOTONIC marker, which the decoder ACCEPTS
+        // (→ SlotKind::Monotonic) rather than rejecting as an unknown key type.
+        let si = SlotInfo {
+            handle: KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR),
+            key_id: "time-floor".to_string(),
+            kind: SlotKind::Monotonic,
+            has_certificate: false,
+            allowed_guests: None,
+            allowed_ops: None,
+        };
+        let decoded = decode_slot_info(&encode_slot_info(&si)).unwrap();
+        assert_eq!(decoded.kind, SlotKind::Monotonic);
+        assert_eq!(decoded.key_id, "time-floor");
+        assert_eq!(decoded.handle, KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR));
     }
 
     #[test]

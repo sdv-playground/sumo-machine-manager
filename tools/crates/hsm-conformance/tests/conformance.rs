@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use hsm_conformance::{check_monotonic, run_conformance, spawn_and_connect, Outcome};
+use hsm_conformance::{check_inventory, check_monotonic, run_conformance, spawn_and_connect, Outcome};
 
 /// Locate the `hsm-sim-service` binary built into `target/<profile>/`. It is a
 /// bin of the sibling `hsm-sim-backend` crate, so `env!("CARGO_BIN_EXE_…")` cannot name it;
@@ -76,6 +76,26 @@ fn sim_hsm_conforms() {
     assert!(
         matches!(mono.outcome("M3"), Some(Outcome::Pass)),
         "M3 (never rewinds) must pass for the sim:\n{mono}"
+    );
+
+    // The slot-inventory section requires the full mandatory sumo-core set.
+    // run_conformance only generated jwt-signing, so generate the rest of the
+    // sumo-core KEY slots over the wire (the time-floor counter is structural —
+    // the sim lists it unconditionally). Then the inventory must conform, and
+    // most importantly I4 — the counter now appears as Monotonic.
+    for slot in vhsm_proto::SUMO_CORE_SLOTS
+        .iter()
+        .filter(|s| s.alg != vhsm_proto::ALG_MONOTONIC)
+    {
+        hsm::HsmCryptoProvider::generate_key(&client, hsm::KeyHandle(slot.handle), slot.alg)
+            .expect("generate mandatory sumo-core key");
+    }
+    let inv = check_inventory(&client);
+    eprintln!("{inv}");
+    assert!(inv.all_passed(), "SimHsm slot inventory must conform:\n{inv}");
+    assert!(
+        matches!(inv.outcome("I4"), Some(Outcome::Pass)),
+        "I4 (time-floor counter present as Monotonic) must pass for the sim:\n{inv}"
     );
 
     drop(client);
@@ -173,6 +193,22 @@ fn stub_example_does_not_conform() {
     assert!(
         mono.all_passed(),
         "the stub's monotonic counter is real and must conform:\n{mono}"
+    );
+
+    // The stub lists its full (hypothetical) slot map — now INCLUDING the
+    // time-floor counter (the exclusion guard was removed). So it CONFORMS on the
+    // slot-inventory section: the mandatory set is present and the counter appears
+    // as Monotonic. Its keys are fake, but the inventory STRUCTURE is honest —
+    // exactly what this section tests (a genuine inventory can still be a fake HSM).
+    let inv = check_inventory(&client);
+    eprintln!("{inv}");
+    assert!(
+        inv.all_passed(),
+        "the stub lists its full slot map incl. the counter, so inventory conforms:\n{inv}"
+    );
+    assert!(
+        matches!(inv.outcome("I4"), Some(Outcome::Pass)),
+        "I4 (counter present) must pass — the stub now lists the time-floor:\n{inv}"
     );
 
     drop(client);

@@ -1,6 +1,6 @@
 // HSM key-slot roles + provisioning lifecycle types. The crypto contract types
-// (`HsmError`, `KeyInfo`, `KeyType`, `KeyHandle`, `HsmCryptoProvider`) live in
-// the shared `hsm-contract` crate and are re-exported from the crate root; this
+// (`HsmError`, `SlotInfo`, `SlotKind`, `KeyType`, `KeyHandle`, `HsmCryptoProvider`)
+// live in the shared `hsm-contract` crate and are re-exported from the crate root; this
 // module owns the device's `KeyRole` taxonomy, which maps each role to a slot
 // handle in the `vhsm_proto` registry.
 use hsm_contract::{KeyHandle, KeyType};

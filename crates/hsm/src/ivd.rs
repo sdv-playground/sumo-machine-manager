@@ -1047,8 +1047,10 @@ mod tests {
                 "MockIvdHsm::get_public_key_der".into(),
             ))
         }
-        fn get_key_info(&self, _h: crate::KeyHandle) -> Result<crate::KeyInfo, crate::HsmError> {
-            Err(crate::HsmError::NotSupported("MockIvdHsm::get_key_info".into()))
+        fn get_slot_info(&self, _h: crate::KeyHandle) -> Result<crate::SlotInfo, crate::HsmError> {
+            Err(crate::HsmError::NotSupported(
+                "MockIvdHsm::get_slot_info".into(),
+            ))
         }
     }
 

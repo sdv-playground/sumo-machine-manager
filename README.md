@@ -95,7 +95,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `component-mgr` | `vm-diagserver` | SUIT + SOVD: validation, OTA engine, DID resolution, `/updates` wire (lib); `vm-diagserver` is the NV/bank + factory CLI |
 | `vm-sovd` | `vm-sovd` | The SOVD/OTA server process — wires the machine registry, components, and the `/updates` wire |
 | `component-factory` | — | `build_component(ComponentSpec, FactoryDeps)` — per-kind backend + adapter builder |
-| `hsm-contract` | — | Shared handle-addressed HSM crypto contract (`HsmCryptoProvider`, `KeyHandle` / `KeyInfo` / `KeyType`) |
+| `hsm-contract` | — | Shared handle-addressed HSM crypto contract (`HsmCryptoProvider`, `KeyHandle` / `SlotInfo` / `SlotKind` / `KeyType`) |
 | `hsm-link-b` | — | Frozen link-B wire + C header: the host↔backend service protocol a hardware-HSE vendor implements; C skeleton in `reference/` |
 | `tools/crates/hsm-sim-backend` | `hsm-sim-service` | `SimHsm` — the non-production reference HSM backend, served behind link-B |
 | `tools/crates/hsm-conformance` | `hsm-conformance` | Conformance suite a vendor HSM backend must pass |

@@ -31,7 +31,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use hsm::payload::{self, HsmKeystore, KeySlot, KEY_TYPE_AES_256, KEY_TYPE_EC_P256};
-use hsm::{HsmError, HsmProvider, KeyHandle, KeyInfo, KeyRole, KeyType, ProvisioningState};
+use hsm::{HsmError, HsmProvider, KeyHandle, KeyRole, KeyType, ProvisioningState, SlotInfo, SlotKind};
 
 /// Software HSM for **dev / test / CI — NOT for production**.
 ///
@@ -475,8 +475,8 @@ impl SimHsm {
         Ok(())
     }
 
-    /// Parse the manifest file to extract key information.
-    pub(crate) fn parse_manifest(&self) -> Result<Vec<KeyInfo>, HsmError> {
+    /// Parse the manifest file to extract key-slot information.
+    pub(crate) fn parse_manifest(&self) -> Result<Vec<SlotInfo>, HsmError> {
         let manifest = std::fs::read_to_string(self.manifest_path())
             .map_err(|e| HsmError::KeystoreError(format!("read manifest: {e}")))?;
 
@@ -515,10 +515,10 @@ impl SimHsm {
             let handle = vhsm_proto::handle_for_key_id(&key_id)
                 .map(KeyHandle)
                 .unwrap_or(KeyHandle(vhsm_proto::HANDLE_INVALID));
-            keys.push(KeyInfo {
+            keys.push(SlotInfo {
                 handle,
                 key_id,
-                key_type,
+                kind: SlotKind::Key(key_type),
                 has_certificate,
                 allowed_guests,
                 allowed_ops,
@@ -531,7 +531,7 @@ impl SimHsm {
     /// where no manifest exists yet. EC keys appear as `{id}.priv`, AES as
     /// `{id}.bin`; trust anchors (`.pub`-only) don't exist until provisioning.
     /// No ACL metadata (the manifest carries that), so `allowed_*` are `None`.
-    fn list_device_keys_from_disk(&self) -> Result<Vec<KeyInfo>, HsmError> {
+    fn list_device_keys_from_disk(&self) -> Result<Vec<SlotInfo>, HsmError> {
         let keys_dir = self.keys_dir();
         let mut keys = Vec::new();
         let entries = match std::fs::read_dir(&keys_dir) {
@@ -552,10 +552,10 @@ impl SimHsm {
             let handle = vhsm_proto::handle_for_key_id(&key_id)
                 .map(KeyHandle)
                 .unwrap_or(KeyHandle(vhsm_proto::HANDLE_INVALID));
-            keys.push(KeyInfo {
+            keys.push(SlotInfo {
                 handle,
                 key_id,
-                key_type,
+                kind: SlotKind::Key(key_type),
                 has_certificate,
                 allowed_guests: None,
                 allowed_ops: None,
@@ -889,16 +889,36 @@ impl HsmProvider for SimHsm {
         Ok(removed)
     }
 
-    fn list_keys(&self) -> Result<Vec<KeyInfo>, HsmError> {
-        if self.is_provisioned()? {
-            self.parse_manifest()
+    fn list_slots(&self) -> Result<Vec<SlotInfo>, HsmError> {
+        let mut slots = if self.is_provisioned()? {
+            self.parse_manifest()?
         } else {
             // Pre-provision there is no manifest, but the device-generated keys
             // exist on disk (ensure_device_keys at first boot). List them so the
-            // key inventory is available whether or not the device is provisioned
+            // slot inventory is available whether or not the device is provisioned
             // — the caller reports the provisioning state separately.
-            self.list_device_keys_from_disk()
-        }
+            self.list_device_keys_from_disk()?
+        };
+
+        // The named monotonic-counter slot (time-floor) is a STRUCTURAL slot that
+        // exists from first boot, exactly like a device-generated key. Surface it
+        // in the inventory alongside the keys — mirroring the C reference's
+        // always-present slot map. Inventory is STRUCTURE, not state: report the
+        // slot (handle + kind), never its counter VALUE.
+        let floor = KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR);
+        let floor_key_id = vhsm_proto::slot_for_handle(floor.get())
+            .map(|s| s.key_id.to_string())
+            .unwrap_or_else(|| "time-floor".to_string());
+        slots.push(SlotInfo {
+            handle: floor,
+            key_id: floor_key_id,
+            kind: SlotKind::Monotonic,
+            has_certificate: false,
+            allowed_guests: None,
+            allowed_ops: None,
+        });
+
+        Ok(slots)
     }
 
     fn get_public_key(&self, role: KeyRole) -> Result<Vec<u8>, HsmError> {
@@ -1426,12 +1446,16 @@ mod tests {
         let state = std::fs::read_to_string(tmp.join("provision_state")).unwrap();
         assert!(state.starts_with("1"));
 
-        let keys = hsm.list_keys().unwrap();
-        assert_eq!(keys.len(), 2);
+        let keys = hsm.list_slots().unwrap();
+        // The two provisioned keys, plus the always-present monotonic-counter
+        // (time-floor) slot that list_slots appends.
+        assert_eq!(keys.len(), 3);
         assert_eq!(keys[0].key_id, "jwt-signing");
-        assert_eq!(keys[0].key_type, KeyType::EcP256);
+        assert_eq!(keys[0].kind, SlotKind::Key(KeyType::EcP256));
         assert_eq!(keys[1].key_id, "storage-key");
-        assert_eq!(keys[1].key_type, KeyType::Aes256);
+        assert_eq!(keys[1].kind, SlotKind::Key(KeyType::Aes256));
+        assert_eq!(keys[2].key_id, "time-floor");
+        assert_eq!(keys[2].kind, SlotKind::Monotonic);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1481,21 +1505,28 @@ mod tests {
 
     #[test]
     #[cfg(feature = "crypto")]
-    fn list_keys_lists_device_keys_pre_provision() {
+    fn list_slots_lists_device_keys_pre_provision() {
         let tmp = std::env::temp_dir().join("hsm-test-list-preprov");
         let _ = std::fs::remove_dir_all(&tmp);
         let hsm = SimHsm::new(tmp.clone());
         // Device-generated keys exist at first boot, but the device is NOT
-        // provisioned (no manifest). list_keys used to error here; now it
+        // provisioned (no manifest). list_slots used to error here; now it
         // disk-lists the device keys so the inventory is available either way.
         hsm.ensure_device_keys().unwrap();
         assert!(!hsm.is_provisioned().unwrap(), "not provisioned yet");
-        let keys = HsmProvider::list_keys(&hsm).unwrap();
+        let keys = HsmProvider::list_slots(&hsm).unwrap();
         assert!(
             keys.iter().any(|k| k.key_id == "tls-identity"),
             "tls-identity device key listed pre-provision"
         );
         assert!(keys.iter().any(|k| k.key_id == "device-decrypt"));
+        // The monotonic-counter (time-floor) slot is always present, even
+        // pre-provision — it is structural, not provisioned key material.
+        assert!(
+            keys.iter()
+                .any(|k| k.key_id == "time-floor" && k.kind == SlotKind::Monotonic),
+            "time-floor counter slot listed as Monotonic"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1586,11 +1617,11 @@ mod tests {
             }
         }
 
-        // get_key_info MUST resolve ivd-signing via the disk fallback path
+        // get_slot_info MUST resolve ivd-signing via the disk fallback path
         // — that's the chain that lets sign() work pre-provision.
-        let info = <SimHsm as HsmCryptoProvider>::get_key_info(&hsm, KeyRole::IvdSigning.handle())
+        let info = <SimHsm as HsmCryptoProvider>::get_slot_info(&hsm, KeyRole::IvdSigning.handle())
             .unwrap();
-        assert_eq!(info.key_type, KeyType::EcP256);
+        assert_eq!(info.kind, SlotKind::Key(KeyType::EcP256));
 
         // sign() with the bootstrap IVD key must succeed without a
         // populated manifest. This is the bootstrap escape for the very

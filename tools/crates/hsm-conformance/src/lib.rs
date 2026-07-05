@@ -45,7 +45,7 @@ pub use spawn::spawn_and_connect;
 use std::fmt;
 
 use hsm::link_b::LinkBClient;
-use hsm::{HsmCryptoProvider, KeyHandle, KeyType};
+use hsm::{HsmCryptoProvider, KeyHandle, KeyType, SlotKind};
 
 /// The result of a single conformance check.
 #[derive(Debug)]
@@ -309,17 +309,17 @@ pub fn run_conformance(c: &dyn HsmCryptoProvider) -> ConformanceReport {
         c5,
     ));
 
-    // ── C6: key metadata reports EC-P256. ─────────────────────────────────────
-    let c6 = match c.get_key_info(jwt) {
-        Ok(info) if info.key_type == KeyType::EcP256 => Ok(()),
+    // ── C6: slot metadata reports a Key(EC-P256). ─────────────────────────────
+    let c6 = match c.get_slot_info(jwt) {
+        Ok(info) if info.kind == SlotKind::Key(KeyType::EcP256) => Ok(()),
         Ok(info) => Err(format!(
-            "get_key_info reported key_type {}, expected EC-P256",
-            info.key_type
+            "get_slot_info reported kind {}, expected EC-P256",
+            info.kind
         )),
-        Err(e) => Err(format!("get_key_info failed: {e}")),
+        Err(e) => Err(format!("get_slot_info failed: {e}")),
     };
     checks.push(Check::from_result(
-        "C6 key info — get_key_info(JWT_SIGNING) reports EC-P256",
+        "C6 slot info — get_slot_info(JWT_SIGNING) reports Key(EC-P256)",
         c6,
     ));
 
@@ -473,6 +473,116 @@ pub fn check_monotonic(client: &LinkBClient) -> ConformanceReport {
     ));
 
     ConformanceReport::new("monotonic-counter / time-floor (M1–M4)", checks)
+}
+
+/// Run the **slot-inventory** conformance section against a link-B backend,
+/// returning a peer [`ConformanceReport`].
+///
+/// `list_slots` (the renamed `list_keys`) must enumerate EVERY slot — the key
+/// slots AND the non-key monotonic-counter slot (the time-floor). This section
+/// asserts the full mandatory sumo-core slot set is present and correctly
+/// **kinded**: key slots as `Key(..)`, the time-floor as `Monotonic` and
+/// host-only (`guest_exposed = false` in the registry).
+///
+/// The load-bearing property is **I4**: the monotonic counter now APPEARS in the
+/// inventory (a backend that silently drops non-key slots — as the pre-rename
+/// contract did — fails it). `list_slots` is an inherent [`LinkBClient`] method
+/// (not on [`HsmCryptoProvider`]), so this takes the concrete client, like
+/// [`check_monotonic`].
+///
+/// Every check catches its own errors into [`Outcome::Fail`]; a misbehaving
+/// backend can never panic this section.
+pub fn check_inventory(client: &LinkBClient) -> ConformanceReport {
+    let mut checks: Vec<Check> = Vec::with_capacity(4);
+
+    let slots = match client.list_slots() {
+        Ok(s) => {
+            checks.push(Check::pass(
+                "I1 list_slots — enumerates the slot inventory",
+            ));
+            s
+        }
+        Err(e) => {
+            checks.push(Check::fail(
+                "I1 list_slots — enumerates the slot inventory",
+                format!("list_slots failed: {e}"),
+            ));
+            // Nothing more to check without an inventory.
+            return ConformanceReport::new("slot inventory (I1–I4)", checks);
+        }
+    };
+
+    // ── I2: every mandatory sumo-core slot is present. ────────────────────────
+    let i2 = (|| -> Result<(), String> {
+        for slot in vhsm_proto::SUMO_CORE_SLOTS {
+            if !slots.iter().any(|s| s.handle.get() == slot.handle) {
+                return Err(format!(
+                    "mandatory slot '{}' (handle {:#06x}) missing from list_slots",
+                    slot.key_id, slot.handle
+                ));
+            }
+        }
+        Ok(())
+    })();
+    checks.push(Check::from_result(
+        "I2 mandatory set — every sumo-core slot is enumerated",
+        i2,
+    ));
+
+    // ── I3: each enumerated well-known slot is correctly kinded. ──────────────
+    // Key slots report `Key(..)`, the monotonic counter reports `Monotonic`;
+    // nothing is miskinded (a key dressed as a counter, or vice-versa).
+    let i3 = (|| -> Result<(), String> {
+        for s in &slots {
+            let Some(reg) = vhsm_proto::slot_for_handle(s.handle.get()) else {
+                continue; // dynamic / non-core slot: no registry expectation
+            };
+            let reg_is_counter = reg.alg == vhsm_proto::ALG_MONOTONIC;
+            match (&s.kind, reg_is_counter) {
+                (SlotKind::Monotonic, true) | (SlotKind::Key(_), false) => {}
+                (kind, _) => {
+                    return Err(format!(
+                        "slot '{}' reported kind {kind} but the registry says \
+                         counter={reg_is_counter}",
+                        s.key_id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })();
+    checks.push(Check::from_result(
+        "I3 kinds honest — key slots are Key(..), the counter is Monotonic",
+        i3,
+    ));
+
+    // ── I4 (load-bearing): the time-floor counter is present as Monotonic. ────
+    // The whole point of the rename: the non-key monotonic-counter slot now
+    // appears in the inventory (it was excluded before). It is host-only.
+    let i4 = (|| -> Result<(), String> {
+        let floor = slots
+            .iter()
+            .find(|s| s.handle.get() == vhsm_proto::HANDLE_TIME_FLOOR)
+            .ok_or("time-floor counter slot missing from list_slots")?;
+        if floor.kind != SlotKind::Monotonic {
+            return Err(format!(
+                "time-floor reported kind {}, expected Monotonic",
+                floor.kind
+            ));
+        }
+        let reg = vhsm_proto::slot_for_handle(vhsm_proto::HANDLE_TIME_FLOOR)
+            .ok_or("time-floor not in the sumo-core registry")?;
+        if reg.guest_exposed {
+            return Err("time-floor is guest_exposed in the registry (must be host-only)".into());
+        }
+        Ok(())
+    })();
+    checks.push(Check::from_result(
+        "I4 counter present — time-floor is Monotonic and host-only (guest_exposed=false)",
+        i4,
+    ));
+
+    ConformanceReport::new("slot inventory (I1–I4)", checks)
 }
 
 /// Independently verify an ECDSA-P256 signature with `p256`, against a public key

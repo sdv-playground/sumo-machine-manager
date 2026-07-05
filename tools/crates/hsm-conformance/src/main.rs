@@ -4,10 +4,11 @@
 //!
 //!     hsm-conformance <socket-path>
 //!
-//! It runs two sections — the `run_conformance` crypto battery and the
-//! `check_monotonic` monotonic-counter (time-floor) section — prints both
+//! It runs three sections — the `run_conformance` crypto battery, the
+//! `check_monotonic` monotonic-counter (time-floor) section, and the
+//! `check_inventory` slot-inventory section — prints all three
 //! [`ConformanceReport`](hsm_conformance::ConformanceReport) tables, and exits
-//! `0` iff the backend conforms on both (every non-informational check passed),
+//! `0` iff the backend conforms on all (every non-informational check passed),
 //! else `1`. A connect failure exits `2`.
 //!
 //! How the backend got started — a vendor HSE bridge, a hardware service, a
@@ -22,7 +23,7 @@ use std::io::Write;
 use std::path::Path;
 
 use hsm::link_b::LinkBClient;
-use hsm_conformance::{check_monotonic, run_conformance};
+use hsm_conformance::{check_inventory, check_monotonic, run_conformance};
 
 const USAGE: &str = "\
 usage: hsm-conformance <socket-path>
@@ -60,8 +61,9 @@ fn main() {
 
     let report = run_conformance(&client);
     let monotonic = check_monotonic(&client);
+    let inventory = check_inventory(&client);
 
-    // Write both report sections, then exit with the combined verdict. Through a
+    // Write all report sections, then exit with the combined verdict. Through a
     // locked handle with I/O errors ignored, so a broken stdout pipe (e.g.
     // `hsm-conformance … | head`) can't turn this tool's machine-readable verdict
     // exit code into a panic (101).
@@ -69,12 +71,17 @@ fn main() {
     let _ = write!(out, "{report}");
     let _ = writeln!(out);
     let _ = write!(out, "{monotonic}");
+    let _ = writeln!(out);
+    let _ = write!(out, "{inventory}");
     let _ = out.flush();
 
-    // Conforms iff BOTH the crypto battery and the monotonic-counter section pass.
-    std::process::exit(if report.all_passed() && monotonic.all_passed() {
-        0
-    } else {
-        1
-    });
+    // Conforms iff the crypto battery, the monotonic-counter, AND the slot
+    // inventory sections all pass.
+    std::process::exit(
+        if report.all_passed() && monotonic.all_passed() && inventory.all_passed() {
+            0
+        } else {
+            1
+        },
+    );
 }

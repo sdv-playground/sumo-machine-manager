@@ -60,7 +60,7 @@ impl TimeFloor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hsm::{KeyInfo, KeyRole, ProvisioningState};
+    use hsm::{KeyRole, ProvisioningState, SlotInfo};
 
     #[test]
     fn adopt_monotonic_never_rewinds() {
@@ -83,7 +83,7 @@ mod tests {
         fn provision(&mut self, _envelope: &[u8]) -> Result<(), HsmError> {
             Ok(())
         }
-        fn list_keys(&self) -> Result<Vec<KeyInfo>, HsmError> {
+        fn list_slots(&self) -> Result<Vec<SlotInfo>, HsmError> {
             Ok(Vec::new())
         }
         fn get_public_key(&self, _role: KeyRole) -> Result<Vec<u8>, HsmError> {

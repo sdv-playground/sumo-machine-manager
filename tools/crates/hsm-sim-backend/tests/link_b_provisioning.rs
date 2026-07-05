@@ -14,7 +14,7 @@ use std::thread;
 
 use hsm::link_b::{serve, LinkBClient, LinkBProvider};
 use hsm::payload::{HsmKeystore, KeySlot, KEY_TYPE_AES_256, KEY_TYPE_EC_P256, SCHEMA_VERSION};
-use hsm::{HsmError, HsmProvider, KeyRole, ProvisioningState};
+use hsm::{HsmError, HsmProvider, KeyRole, ProvisioningState, SlotKind};
 use hsm_sim_backend::SimHsm;
 
 /// A signing EC slot (has a public half → get_public_key) + the AES storage slot
@@ -51,7 +51,7 @@ fn provisioned_keystore() -> HsmKeystore {
 /// `0x20..=0x27` ops, but against a REAL `SimHsm` over a temp keystore (served
 /// through the same combined [`serve`] loop `hsm-sim-service` runs), not a mock.
 /// Drives a `LinkBClient` through is_provisioned → provision → get_public_key →
-/// list_keys (+ provisioning_state and the enrolment trio).
+/// list_slots (+ provisioning_state and the enrolment trio).
 ///
 /// `provision` over the wire is exercised against a garbage envelope (it must
 /// route to `HsmProvider::provision` and the error category must round-trip); a
@@ -79,13 +79,17 @@ fn link_b_round_trips_provisioning_ops_against_real_sim_hsm() {
 
     let client = LinkBClient::connect(&sock).unwrap();
 
-    // 1. Unprovisioned: the state ops report it; the inventory is empty.
+    // 1. Unprovisioned: the state ops report it; the inventory holds ONLY the
+    //    always-present monotonic-counter (time-floor) slot — no keys yet.
     assert!(!client.is_provisioned().unwrap());
     assert_eq!(
         client.provisioning_state().unwrap(),
         ProvisioningState::Unprovisioned
     );
-    assert!(client.list_keys().unwrap().is_empty());
+    let slots = client.list_slots().unwrap();
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].key_id, "time-floor");
+    assert_eq!(slots[0].kind, SlotKind::Monotonic);
 
     // 2. provision routes to HsmProvider::provision — a garbage envelope is
     //    rejected and the error category survives the wire round-trip.
@@ -123,21 +127,26 @@ fn link_b_round_trips_provisioning_ops_against_real_sim_hsm() {
     );
     assert!(!wire_cose.is_empty());
 
-    // 5. list_keys over the wire == the backend's inventory, field-by-field
-    //    (KeyInfo has no PartialEq).
-    let wire_keys = client.list_keys().unwrap();
-    let direct_keys = hsm.lock().unwrap().list_keys().unwrap();
-    assert_eq!(wire_keys.len(), 2);
+    // 5. list_slots over the wire == the backend's inventory, field-by-field
+    //    (SlotInfo has no PartialEq). Two provisioned keys + the time-floor
+    //    monotonic-counter row.
+    let wire_keys = client.list_slots().unwrap();
+    let direct_keys = hsm.lock().unwrap().list_slots().unwrap();
+    assert_eq!(wire_keys.len(), 3);
     assert_eq!(wire_keys.len(), direct_keys.len());
     for (w, d) in wire_keys.iter().zip(direct_keys.iter()) {
         assert_eq!(w.handle, d.handle);
         assert_eq!(w.key_id, d.key_id);
-        assert_eq!(w.key_type, d.key_type);
+        assert_eq!(w.kind, d.kind);
         assert_eq!(w.has_certificate, d.has_certificate);
     }
     assert!(wire_keys
         .iter()
         .any(|k| k.key_id == KeyRole::JwtSigning.key_id()));
+    // The counter row round-trips too — the Monotonic kind survives the wire.
+    assert!(wire_keys
+        .iter()
+        .any(|k| k.kind == SlotKind::Monotonic && k.key_id == "time-floor"));
 
     // 6. Enrolment trio over the wire (bools both directions). arm puts vm9 in
     //    `pending`, not `enrolled`, so is_enrolled is still false and
@@ -181,7 +190,8 @@ fn link_b_provider_satisfies_hsm_provider_and_delegates() {
         provider.provisioning_state().unwrap(),
         ProvisioningState::Unprovisioned
     );
-    assert!(provider.list_keys().unwrap().is_empty());
+    // Only the always-present monotonic-counter (time-floor) slot pre-provision.
+    assert_eq!(provider.list_slots().unwrap().len(), 1);
 
     // provision routes to HsmProvider::provision on the backend; a garbage
     // envelope is rejected and the error category survives the wire.
@@ -214,8 +224,8 @@ fn link_b_provider_satisfies_hsm_provider_and_delegates() {
     assert_eq!(provider_cose, direct_cose);
     assert!(!provider_cose.is_empty());
 
-    // list_keys delegates: the two slots are present.
-    assert_eq!(provider.list_keys().unwrap().len(), 2);
+    // list_slots delegates: the two keys + the time-floor counter row.
+    assert_eq!(provider.list_slots().unwrap().len(), 3);
 
     // Enrolment trio over the provider (bools both directions). arm puts vm7
     // in `pending`, not `enrolled`, so is_enrolled stays false and
