@@ -134,7 +134,10 @@ fn main() {
     // fresh keystore must have its device-generated slots before the first key
     // op, the same way the host startup paths call ensure_device_keys.
     if let Err(e) = hsm.ensure_device_keys() {
-        eprintln!("failed to bootstrap device keys in {}: {e}", keystore_path.display());
+        eprintln!(
+            "failed to bootstrap device keys in {}: {e}",
+            keystore_path.display()
+        );
         process::exit(1);
     }
 

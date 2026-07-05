@@ -31,7 +31,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use hsm::payload::{self, HsmKeystore, KeySlot, KEY_TYPE_AES_256, KEY_TYPE_EC_P256};
-use hsm::{HsmError, HsmProvider, KeyHandle, KeyRole, KeyType, ProvisioningState, SlotInfo, SlotKind};
+use hsm::{
+    HsmError, HsmProvider, KeyHandle, KeyRole, KeyType, ProvisioningState, SlotInfo, SlotKind,
+};
 
 /// Software HSM for **dev / test / CI — NOT for production**.
 ///
@@ -1490,11 +1492,9 @@ mod tests {
         assert!(tmp.join("keys/jwt-signing.cert").exists());
         let manifest = std::fs::read_to_string(tmp.join("manifest")).unwrap();
         assert!(manifest.contains("keys/jwt-signing.cert"));
-        let got = hsm::HsmCryptoProvider::get_certificate_der(
-            &hsm,
-            hsm::KeyRole::JwtSigning.handle(),
-        )
-        .unwrap();
+        let got =
+            hsm::HsmCryptoProvider::get_certificate_der(&hsm, hsm::KeyRole::JwtSigning.handle())
+                .unwrap();
         assert_eq!(got, leaf_der);
 
         // The re-provision kept the original keypair the leaf certifies.

@@ -423,8 +423,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
     use std::thread;
 
-    use hsm_sim_backend::SimHsm;
     use hsm::HsmCryptoProvider;
+    use hsm_sim_backend::SimHsm;
     use vhsm_proto::codec::{read_request, write_response};
     use vhsm_proto::{ALG_ECC_P256, PERM_GET_PUBKEY, PERM_SIGN, PERM_VERIFY};
     use vhsm_ssd::handle_table::HandleTable;

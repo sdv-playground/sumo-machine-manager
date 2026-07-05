@@ -10,7 +10,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use hsm_conformance::{check_inventory, check_monotonic, run_conformance, spawn_and_connect, Outcome};
+use hsm_conformance::{
+    check_inventory, check_monotonic, run_conformance, spawn_and_connect, Outcome,
+};
 
 /// Locate the `hsm-sim-service` binary built into `target/<profile>/`. It is a
 /// bin of the sibling `hsm-sim-backend` crate, so `env!("CARGO_BIN_EXE_…")` cannot name it;
@@ -65,14 +67,20 @@ fn sim_hsm_conforms() {
         .iter()
         .filter(|c| !c.informational && matches!(c.outcome, Outcome::Fail(_)))
         .count();
-    assert_eq!(hard_fails, 0, "no conformance check may fail for the sim:\n{report}");
+    assert_eq!(
+        hard_fails, 0,
+        "no conformance check may fail for the sim:\n{report}"
+    );
 
     // The monotonic-counter (time-floor) section is a separate axis: the sim
     // implements read/raise_monotonic for real, so it conforms here too — most
     // importantly M3, that a below-current raise never rewinds the counter.
     let mono = check_monotonic(&client);
     eprintln!("{mono}");
-    assert!(mono.all_passed(), "SimHsm monotonic section must conform:\n{mono}");
+    assert!(
+        mono.all_passed(),
+        "SimHsm monotonic section must conform:\n{mono}"
+    );
     assert!(
         matches!(mono.outcome("M3"), Some(Outcome::Pass)),
         "M3 (never rewinds) must pass for the sim:\n{mono}"
@@ -92,7 +100,10 @@ fn sim_hsm_conforms() {
     }
     let inv = check_inventory(&client);
     eprintln!("{inv}");
-    assert!(inv.all_passed(), "SimHsm slot inventory must conform:\n{inv}");
+    assert!(
+        inv.all_passed(),
+        "SimHsm slot inventory must conform:\n{inv}"
+    );
     assert!(
         matches!(inv.outcome("I4"), Some(Outcome::Pass)),
         "I4 (time-floor counter present as Monotonic) must pass for the sim:\n{inv}"

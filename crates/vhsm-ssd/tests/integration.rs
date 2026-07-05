@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use hsm_sim_backend::SimHsm;
 use hsm::HsmCryptoProvider;
+use hsm_sim_backend::SimHsm;
 
 use vhsm_ssd::handle_table::HandleTable;
 use vhsm_ssd::handler::{self, CallerId};

@@ -1,3 +1,8 @@
+pub mod ivd;
+#[cfg(feature = "suit")]
+pub mod key_unwrap;
+/// Link-B bridge: `HsmCryptoProvider` over the out-of-process link-B service.
+pub mod link_b;
 pub mod payload;
 /// HSM provider/crypto contract.
 ///
@@ -13,11 +18,6 @@ pub mod payload;
 /// - the guest reaches the HSM via `VhsmProvider` (vhsm-provider crate),
 ///   which forwards the crypto contract over the vHSM wire
 pub mod types;
-pub mod ivd;
-#[cfg(feature = "suit")]
-pub mod key_unwrap;
-/// Link-B bridge: `HsmCryptoProvider` over the out-of-process link-B service.
-pub mod link_b;
 
 // The host-side full-`HsmProvider` adapter over a link-B client. Re-exported as
 // `hsm::LinkBProvider` (the client itself stays `hsm::link_b::LinkBClient`).
@@ -176,7 +176,9 @@ pub trait HsmProvider: Send {
     /// Default impl returns `NotSupported`; concrete providers override.
     fn raise_monotonic(&mut self, handle: KeyHandle, new_value: u64) -> Result<u64, HsmError> {
         let _ = (handle, new_value);
-        Err(HsmError::NotSupported("HsmProvider::raise_monotonic".into()))
+        Err(HsmError::NotSupported(
+            "HsmProvider::raise_monotonic".into(),
+        ))
     }
 }
 

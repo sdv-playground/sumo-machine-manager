@@ -541,8 +541,8 @@ mod tests {
         // cert validity against the floor, not epoch-1970. Floor ~2286 (10^10 s) —
         // safely above any real test-runner clock.
         let far_future: u64 = 10_000_000_000;
-        let floored = TieredAuthorizer::new(Vec::new())
-            .with_time_floor(Arc::new(AtomicU64::new(far_future)));
+        let floored =
+            TieredAuthorizer::new(Vec::new()).with_time_floor(Arc::new(AtomicU64::new(far_future)));
         let expected = rustls::pki_types::UnixTime::since_unix_epoch(
             std::time::Duration::from_secs(far_future),
         );

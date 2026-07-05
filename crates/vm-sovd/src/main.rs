@@ -532,9 +532,9 @@ async fn main() {
                             .map_err(|e| e.to_string())
                     };
                     let cfg = hsm_rustls::server_config_no_client_auth(leaf, sign_fn);
-                    Some(axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(
-                        cfg,
-                    )))
+                    Some(axum_server::tls_rustls::RustlsConfig::from_config(
+                        Arc::new(cfg),
+                    ))
                 }
             },
         }

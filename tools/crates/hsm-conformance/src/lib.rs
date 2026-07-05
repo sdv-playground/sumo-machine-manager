@@ -135,9 +135,7 @@ impl ConformanceReport {
     /// check passed. C9 (random) is informational — a backend MAY decline it
     /// without forfeiting conformance.
     pub fn all_passed(&self) -> bool {
-        self.checks
-            .iter()
-            .all(|c| c.informational || c.passed())
+        self.checks.iter().all(|c| c.informational || c.passed())
     }
 
     /// Look up a check's outcome by its id prefix (e.g. `"C2"`). Handy in tests
@@ -352,7 +350,10 @@ pub fn run_conformance(c: &dyn HsmCryptoProvider) -> ConformanceReport {
     // ── C9: random (informational — a backend MAY decline). ───────────────────
     let c9 = match c.random(32) {
         Ok(b) if b.len() == 32 => Ok(()),
-        Ok(b) => Err(format!("random(32) returned {} bytes, expected 32", b.len())),
+        Ok(b) => Err(format!(
+            "random(32) returned {} bytes, expected 32",
+            b.len()
+        )),
         Err(e) => Err(format!("random(32) declined/failed: {e}")),
     };
     checks.push(Check::info_from_result(
@@ -497,9 +498,7 @@ pub fn check_inventory(client: &LinkBClient) -> ConformanceReport {
 
     let slots = match client.list_slots() {
         Ok(s) => {
-            checks.push(Check::pass(
-                "I1 list_slots — enumerates the slot inventory",
-            ));
+            checks.push(Check::pass("I1 list_slots — enumerates the slot inventory"));
             s
         }
         Err(e) => {

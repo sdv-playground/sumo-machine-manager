@@ -384,7 +384,10 @@ impl LinkBClient {
 
     /// `OP_IS_ENROLLED` — has `vm_id` completed an ENROLL_ASSISTED at least once?
     pub fn is_enrolled(&self, vm_id: &str) -> Result<bool, HsmError> {
-        let result = self.call(OP_IS_ENROLLED, Writer::new().tail(vm_id.as_bytes()).finish())?;
+        let result = self.call(
+            OP_IS_ENROLLED,
+            Writer::new().tail(vm_id.as_bytes()).finish(),
+        )?;
         Ok(result.first() == Some(&1))
     }
 
@@ -946,7 +949,9 @@ where
             let ttl = r.u64()?;
             let vm_id = String::from_utf8_lossy(r.tail()).into_owned();
             let ttl_secs = if present != 0 { Some(ttl) } else { None };
-            backend.arm_enrollment(&vm_id, ttl_secs).map(|()| Vec::new())
+            backend
+                .arm_enrollment(&vm_id, ttl_secs)
+                .map(|()| Vec::new())
         }
         OP_IS_ENROLLED => {
             let vm_id = String::from_utf8_lossy(r.tail()).into_owned();

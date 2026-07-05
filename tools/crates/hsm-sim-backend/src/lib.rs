@@ -15,8 +15,8 @@
 //! `ivd` signing logic, and the `link_b` bridge all live in the core `hsm`
 //! contract crate; this crate is only the sim *implementation* of that contract.
 
-pub mod sim;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+pub mod sim;
 
 pub use sim::SimHsm;

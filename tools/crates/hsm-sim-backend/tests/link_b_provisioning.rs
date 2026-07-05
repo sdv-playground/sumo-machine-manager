@@ -97,7 +97,9 @@ fn link_b_round_trips_provisioning_ops_against_real_sim_hsm() {
     assert!(
         matches!(
             err,
-            HsmError::EnvelopeInvalid(_) | HsmError::PayloadInvalid(_) | HsmError::DecryptionFailed(_)
+            HsmError::EnvelopeInvalid(_)
+                | HsmError::PayloadInvalid(_)
+                | HsmError::DecryptionFailed(_)
         ),
         "garbage envelope must be rejected with a provisioning error, got {err:?}"
     );
@@ -107,7 +109,10 @@ fn link_b_round_trips_provisioning_ops_against_real_sim_hsm() {
     );
 
     // Establish the real provisioned state (suit-less write_keystore core).
-    hsm.lock().unwrap().write_keystore(&provisioned_keystore()).unwrap();
+    hsm.lock()
+        .unwrap()
+        .write_keystore(&provisioned_keystore())
+        .unwrap();
 
     // 3. Provisioned: the state ops flip over the wire.
     assert!(client.is_provisioned().unwrap());
@@ -120,7 +125,11 @@ fn link_b_round_trips_provisioning_ops_against_real_sim_hsm() {
     //    carries SPKI DER; the client rebuilds the COSE_Key. For a signing
     //    role both encodings tag ES256, so the bytes match exactly.
     let wire_cose = client.get_public_key(KeyRole::JwtSigning).unwrap();
-    let direct_cose = hsm.lock().unwrap().get_public_key(KeyRole::JwtSigning).unwrap();
+    let direct_cose = hsm
+        .lock()
+        .unwrap()
+        .get_public_key(KeyRole::JwtSigning)
+        .unwrap();
     assert_eq!(
         wire_cose, direct_cose,
         "wire-reconstructed COSE_Key must equal the backend's get_public_key"
@@ -199,14 +208,19 @@ fn link_b_provider_satisfies_hsm_provider_and_delegates() {
     assert!(
         matches!(
             err,
-            HsmError::EnvelopeInvalid(_) | HsmError::PayloadInvalid(_) | HsmError::DecryptionFailed(_)
+            HsmError::EnvelopeInvalid(_)
+                | HsmError::PayloadInvalid(_)
+                | HsmError::DecryptionFailed(_)
         ),
         "garbage envelope must be a provisioning error, got {err:?}"
     );
     assert!(!provider.is_provisioned().unwrap());
 
     // Establish the provisioned state via the suit-less write_keystore core.
-    hsm.lock().unwrap().write_keystore(&provisioned_keystore()).unwrap();
+    hsm.lock()
+        .unwrap()
+        .write_keystore(&provisioned_keystore())
+        .unwrap();
 
     // Provisioned: state flips through the provider; get_public_key delegates
     // (the wire-reconstructed COSE_Key equals the backend's own).

@@ -77,8 +77,8 @@ mod tests {
     use std::time::Duration;
 
     use const_oid::db::rfc5280::{ID_KP_CLIENT_AUTH, ID_KP_SERVER_AUTH};
-    use hsm_sim_backend::SimHsm;
     use hsm::{HsmCryptoProvider, KeyRole};
+    use hsm_sim_backend::SimHsm;
     use p256::ecdsa::{DerSignature, SigningKey};
     use rand::rngs::OsRng;
     use rustls::ServerConnection;

@@ -367,8 +367,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                 .ok_or(MachineError::NotSupported(
                     "get_csr (no keystore configured)",
                 ))?;
-            let tmp =
-                hsm_sim_backend::SimHsm::new(keystore.clone());
+            let tmp = hsm_sim_backend::SimHsm::new(keystore.clone());
             tmp.generate_csr(handle, key_id)
         }
         .map_err(|e| MachineError::Internal(format!("csr generation failed: {e}")))?;
@@ -434,8 +433,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                 .ok_or(MachineError::NotSupported(
                     "list_keys (no keystore configured)",
                 ))?;
-            let tmp =
-                hsm_sim_backend::SimHsm::new(keystore.clone());
+            let tmp = hsm_sim_backend::SimHsm::new(keystore.clone());
             tmp.list_slots()
                 .map_err(|e| MachineError::Internal(format!("list slots failed: {e}")))?
                 .into_iter()
@@ -465,8 +463,7 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
             let Some(keystore) = self.csr_keystore.as_ref() else {
                 return Ok(None);
             };
-            let tmp =
-                hsm_sim_backend::SimHsm::new(keystore.clone());
+            let tmp = hsm_sim_backend::SimHsm::new(keystore.clone());
             tmp.get_public_key_der(handle)
         };
         match der {

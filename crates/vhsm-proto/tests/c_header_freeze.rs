@@ -39,7 +39,11 @@ struct Frozen {
 }
 
 const fn f(c: &'static str, rust: u64, expect: u64) -> Frozen {
-    Frozen { c: Some(c), rust, expect }
+    Frozen {
+        c: Some(c),
+        rust,
+        expect,
+    }
 }
 
 /// The frozen vHSM v3 guest-wire snapshot. Every entry is `(C macro, Rust value,
@@ -61,8 +65,16 @@ fn snapshot() -> Vec<Frozen> {
         f("VHSM_MAX_HANDLES", MAX_HANDLES as u64, 64),
         f("VHSM_LABEL_LEN", LABEL_LEN as u64, 32),
         // ---- header sizes (C side is `sizeof`, so no macro to scrape) --------
-        Frozen { c: None, rust: REQUEST_HEADER_SIZE as u64, expect: 16 },
-        Frozen { c: None, rust: RESPONSE_HEADER_SIZE as u64, expect: 20 },
+        Frozen {
+            c: None,
+            rust: REQUEST_HEADER_SIZE as u64,
+            expect: 16,
+        },
+        Frozen {
+            c: None,
+            rust: RESPONSE_HEADER_SIZE as u64,
+            expect: 20,
+        },
         // ---- operation codes ------------------------------------------------
         f("VHSM_OP_GET_RANDOM", Op::GetRandom as u64, 0x0001),
         f("VHSM_OP_KEY_GENERATE", Op::KeyGenerate as u64, 0x0010),
@@ -80,14 +92,38 @@ fn snapshot() -> Vec<Frozen> {
         f("VHSM_OP_GET_CERT", Op::GetCert as u64, 0x0052),
         // ---- status codes ---------------------------------------------------
         f("VHSM_STATUS_OK", StatusCode::Ok as u64, 0),
-        f("VHSM_STATUS_INVALID_HANDLE", StatusCode::InvalidHandle as u64, 1),
-        f("VHSM_STATUS_PERMISSION_DENY", StatusCode::PermissionDeny as u64, 2),
-        f("VHSM_STATUS_POLICY_REJECT", StatusCode::PolicyReject as u64, 3),
+        f(
+            "VHSM_STATUS_INVALID_HANDLE",
+            StatusCode::InvalidHandle as u64,
+            1,
+        ),
+        f(
+            "VHSM_STATUS_PERMISSION_DENY",
+            StatusCode::PermissionDeny as u64,
+            2,
+        ),
+        f(
+            "VHSM_STATUS_POLICY_REJECT",
+            StatusCode::PolicyReject as u64,
+            3,
+        ),
         f("VHSM_STATUS_HSE_ERROR", StatusCode::HseError as u64, 4),
-        f("VHSM_STATUS_INVALID_PARAM", StatusCode::InvalidParam as u64, 5),
+        f(
+            "VHSM_STATUS_INVALID_PARAM",
+            StatusCode::InvalidParam as u64,
+            5,
+        ),
         f("VHSM_STATUS_NO_RESOURCE", StatusCode::NoResource as u64, 6),
-        f("VHSM_STATUS_STORAGE_ERROR", StatusCode::StorageError as u64, 7),
-        f("VHSM_STATUS_CRYPTO_ERROR", StatusCode::CryptoError as u64, 8),
+        f(
+            "VHSM_STATUS_STORAGE_ERROR",
+            StatusCode::StorageError as u64,
+            7,
+        ),
+        f(
+            "VHSM_STATUS_CRYPTO_ERROR",
+            StatusCode::CryptoError as u64,
+            8,
+        ),
         f("VHSM_STATUS_INTERNAL", StatusCode::Internal as u64, 9),
         // ---- algorithm identifiers ------------------------------------------
         f("VHSM_ALG_AES_128", ALG_AES_128 as u64, 0x0001),
@@ -109,16 +145,44 @@ fn snapshot() -> Vec<Frozen> {
         f("VHSM_PERM_KEY_GENERATE", PERM_KEY_GENERATE as u64, 1 << 10),
         // ---- well-known handles (guest-visible sumo-core band + boundaries) --
         f("VHSM_HANDLE_INVALID", HANDLE_INVALID as u64, 0x0000),
-        f("VHSM_HANDLE_SW_AUTHORITY", HANDLE_SW_AUTHORITY as u64, 0x0002),
-        f("VHSM_HANDLE_DEVICE_DECRYPT", HANDLE_DEVICE_DECRYPT as u64, 0x0003),
+        f(
+            "VHSM_HANDLE_SW_AUTHORITY",
+            HANDLE_SW_AUTHORITY as u64,
+            0x0002,
+        ),
+        f(
+            "VHSM_HANDLE_DEVICE_DECRYPT",
+            HANDLE_DEVICE_DECRYPT as u64,
+            0x0003,
+        ),
         f("VHSM_HANDLE_IAM_SIGNING", HANDLE_IAM_SIGNING as u64, 0x0004),
-        f("VHSM_HANDLE_KEY_AUTHORITY", HANDLE_KEY_AUTHORITY as u64, 0x0005),
+        f(
+            "VHSM_HANDLE_KEY_AUTHORITY",
+            HANDLE_KEY_AUTHORITY as u64,
+            0x0005,
+        ),
         f("VHSM_HANDLE_JWT_SIGNING", HANDLE_JWT_SIGNING as u64, 0x0006),
         f("VHSM_HANDLE_STORAGE", HANDLE_STORAGE as u64, 0x0007),
-        f("VHSM_HANDLE_OPERATIONAL_ISSUER", HANDLE_OPERATIONAL_ISSUER as u64, 0x0008),
-        f("VHSM_HANDLE_FACTORY_RESET_ISSUER", HANDLE_FACTORY_RESET_ISSUER as u64, 0x0009),
-        f("VHSM_HANDLE_PROJECT_BASE", HANDLE_PROJECT_BASE as u64, 0x0080),
-        f("VHSM_HANDLE_DYNAMIC_BASE", HANDLE_DYNAMIC_BASE as u64, 0x0100),
+        f(
+            "VHSM_HANDLE_OPERATIONAL_ISSUER",
+            HANDLE_OPERATIONAL_ISSUER as u64,
+            0x0008,
+        ),
+        f(
+            "VHSM_HANDLE_FACTORY_RESET_ISSUER",
+            HANDLE_FACTORY_RESET_ISSUER as u64,
+            0x0009,
+        ),
+        f(
+            "VHSM_HANDLE_PROJECT_BASE",
+            HANDLE_PROJECT_BASE as u64,
+            0x0080,
+        ),
+        f(
+            "VHSM_HANDLE_DYNAMIC_BASE",
+            HANDLE_DYNAMIC_BASE as u64,
+            0x0100,
+        ),
     ]
 }
 
@@ -154,7 +218,11 @@ fn locate_header() -> Option<PathBuf> {
 /// the scraper isn't meant to handle (`sizeof(...)`, brace lists, …).
 fn eval_c_int(expr: &str) -> Option<u64> {
     let s = expr.trim();
-    let s = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(s).trim();
+    let s = s
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .unwrap_or(s)
+        .trim();
     if let Some((lhs, rhs)) = s.split_once("<<") {
         return Some(parse_scalar(lhs)? << parse_scalar(rhs)?);
     }
@@ -179,7 +247,9 @@ fn parse_defines(src: &str) -> HashMap<String, u64> {
         let rest = rest.trim_start();
         let mut parts = rest.splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or_default().trim();
-        let Some(mut value) = parts.next() else { continue };
+        let Some(mut value) = parts.next() else {
+            continue;
+        };
         // Drop a trailing `/* … */` or `// …` comment.
         if let Some(i) = value.find("/*") {
             value = &value[..i];
@@ -231,14 +301,17 @@ fn c_header_mirrors_rust() {
             HEADER_CANDIDATES,
         );
         for fr in &snap {
-            assert_eq!(fr.rust, fr.expect, "Rust wire constant drifted from snapshot");
+            assert_eq!(
+                fr.rust, fr.expect,
+                "Rust wire constant drifted from snapshot"
+            );
         }
         return;
     };
 
     eprintln!("vhsm_proto.h located at {}", path.display());
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let defs = parse_defines(&src);
 
     // The header must define VHSM_VERSION at all, and it must be v3 — the headline
@@ -259,7 +332,8 @@ fn c_header_mirrors_rust() {
             )
         });
         assert_eq!(
-            *got, fr.expect,
+            *got,
+            fr.expect,
             "WIRE DRIFT: {name} = {got:#x} in {} but the frozen Rust wire is {:#x}",
             path.display(),
             fr.expect,

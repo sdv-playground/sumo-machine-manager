@@ -40,8 +40,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use hsm_sim_backend::SimHsm;
 use hsm::{HsmCryptoProvider, KeyRole};
+use hsm_sim_backend::SimHsm;
 
 use vhsm_client::auth::{authenticate, enroll, AuthConfig};
 use vhsm_client::VhsmClient;

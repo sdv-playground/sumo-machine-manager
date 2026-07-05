@@ -4224,8 +4224,8 @@ mod identity_tests {
     use super::*;
     use crate::manifest_provider::ManifestError;
     use crate::ota::ImageMeta;
-    use hsm_sim_backend::SimHsm;
     use hsm::HsmProvider;
+    use hsm_sim_backend::SimHsm;
     use nv_store::block::MemBlockDevice;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
     use std::path::Path;

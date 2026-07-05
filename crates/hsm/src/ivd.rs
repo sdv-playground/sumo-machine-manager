@@ -1015,8 +1015,14 @@ mod tests {
         fn decrypt(&self, _h: crate::KeyHandle, _c: &[u8]) -> Result<Vec<u8>, crate::HsmError> {
             Err(crate::HsmError::NotSupported("MockIvdHsm::decrypt".into()))
         }
-        fn mac_generate(&self, _h: crate::KeyHandle, _d: &[u8]) -> Result<Vec<u8>, crate::HsmError> {
-            Err(crate::HsmError::NotSupported("MockIvdHsm::mac_generate".into()))
+        fn mac_generate(
+            &self,
+            _h: crate::KeyHandle,
+            _d: &[u8],
+        ) -> Result<Vec<u8>, crate::HsmError> {
+            Err(crate::HsmError::NotSupported(
+                "MockIvdHsm::mac_generate".into(),
+            ))
         }
         fn mac_verify(
             &self,
@@ -1024,7 +1030,9 @@ mod tests {
             _d: &[u8],
             _m: &[u8],
         ) -> Result<bool, crate::HsmError> {
-            Err(crate::HsmError::NotSupported("MockIvdHsm::mac_verify".into()))
+            Err(crate::HsmError::NotSupported(
+                "MockIvdHsm::mac_verify".into(),
+            ))
         }
         fn derive(
             &self,
