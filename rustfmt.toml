@@ -1,0 +1,4 @@
+# Rust formatting rules for this repo. rustfmt defaults, with the edition
+# pinned so a bare `rustfmt` run matches `cargo fmt`. Kept intentionally
+# minimal; customize only with a documented reason.
+edition = "2021"

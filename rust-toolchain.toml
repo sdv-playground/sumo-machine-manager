@@ -1,0 +1,5 @@
+# Pin the host toolchain so two machines' cargos can't rewrite Cargo.lock
+# differently (lockfile format / resolver drift).
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
