@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use hsm_conformance::{run_conformance, spawn_and_connect, Outcome};
+use hsm_conformance::{check_monotonic, run_conformance, spawn_and_connect, Outcome};
 
 /// Locate the `hsm-sim-service` binary built into `target/<profile>/`. It is a
 /// bin of the sibling `hsm-sim-backend` crate, so `env!("CARGO_BIN_EXE_…")` cannot name it;
@@ -66,6 +66,17 @@ fn sim_hsm_conforms() {
         .filter(|c| !c.informational && matches!(c.outcome, Outcome::Fail(_)))
         .count();
     assert_eq!(hard_fails, 0, "no conformance check may fail for the sim:\n{report}");
+
+    // The monotonic-counter (time-floor) section is a separate axis: the sim
+    // implements read/raise_monotonic for real, so it conforms here too — most
+    // importantly M3, that a below-current raise never rewinds the counter.
+    let mono = check_monotonic(&client);
+    eprintln!("{mono}");
+    assert!(mono.all_passed(), "SimHsm monotonic section must conform:\n{mono}");
+    assert!(
+        matches!(mono.outcome("M3"), Some(Outcome::Pass)),
+        "M3 (never rewinds) must pass for the sim:\n{mono}"
+    );
 
     drop(client);
     let _ = child.kill();
@@ -151,6 +162,17 @@ fn stub_example_does_not_conform() {
     assert!(
         !report.all_passed(),
         "the stubbed-crypto example must NOT conform:\n{report}"
+    );
+
+    // The monotonic counter is REAL even in this stub (a per-handle max()/read
+    // cell is not crypto to fake), so — unlike the faked signatures — the stub
+    // CONFORMS on the monotonic-counter section. That proves the section tests
+    // behaviour, not signatures: a genuine counter can still be a fake HSM.
+    let mono = check_monotonic(&client);
+    eprintln!("{mono}");
+    assert!(
+        mono.all_passed(),
+        "the stub's monotonic counter is real and must conform:\n{mono}"
     );
 
     drop(client);

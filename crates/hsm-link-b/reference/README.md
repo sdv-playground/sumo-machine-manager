@@ -63,15 +63,23 @@ Handle handling, already wired:
   name is a local alias for the frozen `ST_NOT_SUPPORTED` — do not add a new
   wire code. Public-half ops (`VERIFY`, `GET_PUBLIC_KEY_DER`, `GET_KEY_INFO`)
   work on virtual anchors.
+- A **counter** handle (the `time-floor` monotonic slot) answers only
+  `READ_MONOTONIC` / `RAISE_MONOTONIC`. Those ops on a non-counter handle — and
+  the key catalogue (`LIST_KEYS` / `GET_KEY_INFO`) on the counter — return
+  `ST_KEY_NOT_FOUND`, because a counter is not a key.
 
 ## What you replace: the slot map (the per-silicon part)
 
 The `SLOT_MAP` table near the top of the file is a **hypothetical** device — a
-made-up HSM with 16 NVM ECC slots and 4 NVM symmetric slots. It binds each
-well-known sumo-core handle (`sw-authority` 0x0002 … `tls-identity` 0x000C) to a
-physical slot, and marks the four public-only trust anchors
+made-up HSM with 16 NVM ECC slots, 4 NVM symmetric slots, and a monotonic-counter
+bank. It binds each well-known sumo-core handle (`sw-authority` 0x0002 …
+`tls-identity` 0x000C, plus the `time-floor` counter 0x000D) to a physical slot,
+and marks the four public-only trust anchors
 (`sw` / `key` / `operational` / `factory-reset-issuer` = 0x0002 / 0x0005 / 0x0008
-/ 0x0009) as `VIRTUAL`.
+/ 0x0009) as `VIRTUAL`. The `time-floor` slot (0x000D) is not a key at all: it is
+a rollback-proof **monotonic counter** answering `READ_MONOTONIC` /
+`RAISE_MONOTONIC`, so it never appears in the key catalogue (`LIST_KEYS` /
+`GET_KEY_INFO`). Handle 0x000B is a retired gap (was `freshness-signing`).
 
 This is the **one table a real integrator replaces** for their silicon: keep the
 logical handles identical, substitute your own physical slot numbers / key

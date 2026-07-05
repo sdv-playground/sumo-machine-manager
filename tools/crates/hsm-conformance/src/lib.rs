@@ -44,6 +44,7 @@ pub use spawn::spawn_and_connect;
 
 use std::fmt;
 
+use hsm::link_b::LinkBClient;
 use hsm::{HsmCryptoProvider, KeyHandle, KeyType};
 
 /// The result of a single conformance check.
@@ -107,7 +108,10 @@ impl Check {
 
 /// The full result of a conformance run.
 pub struct ConformanceReport {
-    /// Every check, in id order (C1 … C9).
+    /// What this report covers (e.g. `"crypto battery (C1–C9)"`), shown in the
+    /// header — so several sections (crypto, monotonic) print as peer reports.
+    pub title: &'static str,
+    /// Every check, in id order.
     pub checks: Vec<Check>,
     /// Number of checks that passed (informational included, for transparency).
     pub passed: usize,
@@ -116,10 +120,11 @@ pub struct ConformanceReport {
 }
 
 impl ConformanceReport {
-    fn new(checks: Vec<Check>) -> Self {
+    fn new(title: &'static str, checks: Vec<Check>) -> Self {
         let passed = checks.iter().filter(|c| c.passed()).count();
         let failed = checks.len() - passed;
         Self {
+            title,
             checks,
             passed,
             failed,
@@ -147,7 +152,7 @@ impl ConformanceReport {
 
 impl fmt::Display for ConformanceReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "link-B HSM conformance report")?;
+        writeln!(f, "link-B HSM conformance — {}", self.title)?;
         writeln!(f, "─────────────────────────────")?;
         for c in &self.checks {
             let tag = match (&c.outcome, c.informational) {
@@ -164,7 +169,7 @@ impl fmt::Display for ConformanceReport {
         }
         writeln!(
             f,
-            "─────────────────────────────\n{} passed, {} failed (C9 is informational and excluded from the verdict)",
+            "─────────────────────────────\n{} passed, {} failed (informational checks are excluded from the verdict)",
             self.passed, self.failed
         )?;
         writeln!(
@@ -355,7 +360,119 @@ pub fn run_conformance(c: &dyn HsmCryptoProvider) -> ConformanceReport {
         c9,
     ));
 
-    ConformanceReport::new(checks)
+    ConformanceReport::new("crypto battery (C1–C9)", checks)
+}
+
+/// Run the **monotonic-counter (time-floor)** conformance section against a
+/// link-B backend, returning a peer [`ConformanceReport`] the `hsm-conformance`
+/// bin prints alongside [`run_conformance`].
+///
+/// `read_monotonic` / `raise_monotonic` are NOT on [`HsmCryptoProvider`] — they
+/// are the inherent [`LinkBClient`] methods — so this section takes the concrete
+/// client rather than the crypto trait (which is why it is a separate report, not
+/// another `C*` check on the trait battery).
+///
+/// The load-bearing property is **M3**: a raise *below* the current value is a
+/// NO-OP — the counter never rewinds. That is the whole point of a rollback-proof
+/// monotonic slot (the time-floor's safety core); a backend whose "raise" merely
+/// stores its argument would let an old value replay into validity, and fails M3.
+///
+/// Like [`run_conformance`] every check catches its own errors into
+/// [`Outcome::Fail`], and the `B+offset` arithmetic saturates, so a misbehaving
+/// backend can never panic this section.
+pub fn check_monotonic(client: &LinkBClient) -> ConformanceReport {
+    // The named rollback-proof monotonic-counter slot that holds the time-floor.
+    let floor = KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR);
+
+    let mut checks: Vec<Check> = Vec::with_capacity(4);
+
+    // ── M1: read establishes a baseline B (0 if never raised). ────────────────
+    // Captured once; M2–M4 derive their expected values from it. If the read
+    // fails there is no baseline, so the later checks fail with that reason
+    // rather than papering over it.
+    let baseline: Option<u64> = match client.read_monotonic(floor) {
+        Ok(b) => {
+            checks.push(Check::pass(
+                "M1 read — read_monotonic(TIME_FLOOR) returns a baseline",
+            ));
+            Some(b)
+        }
+        Err(e) => {
+            checks.push(Check::fail(
+                "M1 read — read_monotonic(TIME_FLOOR) returns a baseline",
+                format!("read_monotonic failed: {e}"),
+            ));
+            None
+        }
+    };
+
+    // ── M2: raise(B+100) advances the counter to exactly B+100. ───────────────
+    let m2 = (|| -> Result<(), String> {
+        let b = baseline.ok_or("no baseline — M1 read failed")?;
+        let want = b.saturating_add(100);
+        let got = client
+            .raise_monotonic(floor, want)
+            .map_err(|e| format!("raise_monotonic(B+100) failed: {e}"))?;
+        if got == want {
+            Ok(())
+        } else {
+            Err(format!("raise(B+100) returned {got}, expected {want}"))
+        }
+    })();
+    checks.push(Check::from_result(
+        "M2 raise advances — raise_monotonic(B+100) returns B+100",
+        m2,
+    ));
+
+    // ── M3: raise(B+50) is BELOW current — a NO-OP that must never rewind. ────
+    // The load-bearing property: the counter can only stall, never move backward.
+    let m3 = (|| -> Result<(), String> {
+        let b = baseline.ok_or("no baseline — M1 read failed")?;
+        let current = b.saturating_add(100);
+        let got = client
+            .raise_monotonic(floor, b.saturating_add(50))
+            .map_err(|e| format!("raise_monotonic(B+50) failed: {e}"))?;
+        if got == current {
+            Ok(())
+        } else {
+            Err(format!(
+                "raise(B+50) below the current {current} returned {got} — the counter \
+                 REWOUND (not rollback-proof); expected it unchanged at {current}"
+            ))
+        }
+    })();
+    checks.push(Check::from_result(
+        "M3 never rewinds — raise_monotonic below current is a no-op (stays B+100)",
+        m3,
+    ));
+
+    // ── M4: raise(B+200) advances again; a follow-up read reflects it. ────────
+    let m4 = (|| -> Result<(), String> {
+        let b = baseline.ok_or("no baseline — M1 read failed")?;
+        let want = b.saturating_add(200);
+        let raised = client
+            .raise_monotonic(floor, want)
+            .map_err(|e| format!("raise_monotonic(B+200) failed: {e}"))?;
+        if raised != want {
+            return Err(format!("raise(B+200) returned {raised}, expected {want}"));
+        }
+        let read_back = client
+            .read_monotonic(floor)
+            .map_err(|e| format!("read_monotonic after raise failed: {e}"))?;
+        if read_back == want {
+            Ok(())
+        } else {
+            Err(format!(
+                "read after raise(B+200) returned {read_back}, expected {want}"
+            ))
+        }
+    })();
+    checks.push(Check::from_result(
+        "M4 raise + read coherent — raise_monotonic(B+200) then read both report B+200",
+        m4,
+    ));
+
+    ConformanceReport::new("monotonic-counter / time-floor (M1–M4)", checks)
 }
 
 /// Independently verify an ECDSA-P256 signature with `p256`, against a public key

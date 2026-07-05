@@ -59,6 +59,10 @@
 #define OP_IS_ENROLLED          0x25u
 #define OP_CLEAR_ENROLLED       0x26u
 #define OP_GET_PUBLIC_KEY       0x27u
+/* Named rollback-proof monotonic-counter slots (addressed by handle; the slot
+ * holds no key material — a u64 that only ever ratchets upward). */
+#define OP_READ_MONOTONIC       0x28u
+#define OP_RAISE_MONOTONIC      0x29u
 
 /* Status codes (mirror the Rust HsmError categories). */
 #define ST_OK                   0u

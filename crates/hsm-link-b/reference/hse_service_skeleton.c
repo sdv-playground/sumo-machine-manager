@@ -215,16 +215,20 @@ static void wr_fill(wtr_t *w, uint8_t fill, uint32_t n) {
 /* ===================================================================== */
 /* The HYPOTHETICAL slot map — the per-silicon binding (REPLACE THIS).    */
 /*                                                                       */
-/* This skeleton models a made-up HSM with two key banks:                */
+/* This skeleton models a made-up HSM with two key banks plus a counter: */
 /*   - 16 NVM ECC slots        (asymmetric P-256 keys)                   */
 /*   -  4 NVM symmetric slots  (AES / HMAC secret keys)                  */
+/*   -  a monotonic-counter bank (rollback-proof u64 counters, no keys)  */
 /* deliberately more than the sumo-core inventory needs (headroom).      */
 /*                                                                       */
-/* It binds each well-known sumo-core handle (sw-authority 0x0002 ..      */
-/* tls-identity 0x000C) to a physical slot. The four public-only trust   */
-/* anchors — sw / key / operational / factory-reset-issuer = 0x0002 /    */
-/* 0x0005 / 0x0008 / 0x0009 — hold NO private key on this device and are  */
-/* marked VIRTUAL; a private-key op against one returns ST_VIRTUAL.       */
+/* It binds each well-known sumo-core handle (sw-authority 0x0002 ..     */
+/* tls-identity 0x000C, plus the time-floor counter 0x000D) to a slot.   */
+/* The four public-only trust anchors — sw / key / operational /         */
+/* factory-reset-issuer = 0x0002 / 0x0005 / 0x0008 / 0x0009 — hold NO    */
+/* private key on this device and are marked VIRTUAL; a private-key op   */
+/* against one returns ST_VIRTUAL. The time-floor slot (0x000D) is NOT a */
+/* key: it is a rollback-proof MONOTONIC COUNTER (read/raise only) and   */
+/* never appears in the key catalogue (LIST_KEYS / GET_KEY_INFO).        */
 /*                                                                       */
 /* A real integrator REPLACES this whole table for their silicon: the    */
 /* logical handles stay identical, the physical slot numbers / key banks */
@@ -237,6 +241,18 @@ static void wr_fill(wtr_t *w, uint8_t fill, uint32_t n) {
 #define HSM_SYM_BANK 0x02u  /*  4 symmetric AES / HMAC slots */
 #define HSM_ECC_SLOT(n) (((uint32_t)HSM_ECC_BANK << 8) | (uint32_t)(n)) /* n: 0..15 */
 #define HSM_SYM_SLOT(n) (((uint32_t)HSM_SYM_BANK << 8) | (uint32_t)(n)) /* n: 0..3  */
+#define HSM_MONOTONIC_BANK 0x03u  /* rollback-proof monotonic counters (no keys) */
+#define HSM_MONOTONIC_SLOT(n) (((uint32_t)HSM_MONOTONIC_BANK << 8) | (uint32_t)(n)) /* n: 0.. */
+
+/*
+ * A LOCAL row marker — NOT a Link-B wire KEYTYPE_* (those are 1..5). It tags a
+ * slot that holds no key material: a rollback-proof MONOTONIC COUNTER (the
+ * time-floor). It never crosses the wire as a KeyInfo.key_type — the key
+ * catalogue (LIST_KEYS / GET_KEY_INFO) skips counter rows — so it only has to be
+ * distinct from the real KEYTYPE_* set. Mirrors the host-side ALG_MONOTONIC
+ * sentinel that labels this slot in the sumo-core registry.
+ */
+#define KEYTYPE_MONOTONIC 0xFFu
 
 typedef struct {
     uint32_t    handle;     /* logical sumo-core vHSM handle (the wire identity) */
@@ -258,8 +274,10 @@ static const binding_t SLOT_MAP[] = {
     { 0x0008,  1, 0,               KEYTYPE_EC_P256,  0, "operational-issuer"   }, /* VIRTUAL anchor */
     { 0x0009,  1, 0,               KEYTYPE_EC_P256,  0, "factory-reset-issuer" }, /* VIRTUAL anchor */
     { 0x000A,  0, HSM_ECC_SLOT(3), KEYTYPE_EC_P256,  0, "ivd-signing"          },
-    { 0x000B,  0, HSM_ECC_SLOT(4), KEYTYPE_EC_P256,  0, "freshness-signing"    },
+    /* 0x000B RETIRED (was "freshness-signing") — do NOT reuse this handle. */
     { 0x000C,  0, HSM_ECC_SLOT(5), KEYTYPE_EC_P256,  1, "tls-identity"         }, /* mTLS leaf: has a cert */
+    /* Not a key: a rollback-proof monotonic COUNTER (host-only time-floor). */
+    { 0x000D,  0, HSM_MONOTONIC_SLOT(0), KEYTYPE_MONOTONIC, 0, "time-floor"   },
 };
 static const size_t SLOT_MAP_LEN = sizeof(SLOT_MAP) / sizeof(SLOT_MAP[0]);
 
@@ -276,8 +294,38 @@ static int is_symmetric(uint32_t key_type) {
            key_type == KEYTYPE_HMAC_SHA256;
 }
 
-/* The ONE bit of skeleton state — a real HSE tracks provisioning in silicon. */
+/* A counter row (KEYTYPE_MONOTONIC) is NOT a key: it holds no key material and
+ * answers only READ/RAISE_MONOTONIC, never a crypto op or the key catalogue. */
+static int is_counter(uint32_t key_type) {
+    return key_type == KEYTYPE_MONOTONIC;
+}
+
+/* Skeleton state — a real HSE tracks this in silicon (secure NV). */
 static int g_provisioned = 0;
+
+/*
+ * Per-handle rollback-proof monotonic counters (the time-floor lives here). A
+ * tiny table keyed by logical handle; each cell reads 0 until first raised.
+ * This is a REFERENCE store in process RAM so the host side can be exercised.
+ * TODO(vendor): back each counter with tamper-resistant, rollback-proof
+ * monotonic NV (HSE secure counters) — process RAM is neither persistent nor
+ * rollback-proof, so it does NOT provide the anti-rollback guarantee.
+ */
+typedef struct { uint32_t handle; uint64_t value; } counter_cell_t;
+static counter_cell_t g_counters[4];
+static size_t g_counter_len = 0;
+
+/* The counter cell for `handle`, lazily created (0-initialised) on first use;
+ * NULL only if the fixed table is full (cannot happen for the mapped set). */
+static counter_cell_t *counter_cell(uint32_t handle) {
+    size_t i;
+    for (i = 0; i < g_counter_len; i++)
+        if (g_counters[i].handle == handle) return &g_counters[i];
+    if (g_counter_len >= sizeof(g_counters) / sizeof(g_counters[0])) return NULL;
+    g_counters[g_counter_len].handle = handle;
+    g_counters[g_counter_len].value = 0;
+    return &g_counters[g_counter_len++];
+}
 
 /*
  * Encode one KeyInfo per the frozen layout:
@@ -297,7 +345,8 @@ static void wr_key_info(wtr_t *w, const binding_t *b) {
 }
 
 /* ===================================================================== */
-/* Link-B dispatch — every op (crypto 0x01..0x11, provisioning 0x20..0x27). */
+/* Link-B dispatch — every op: crypto (0x01..0x11), provisioning         */
+/* (0x20..0x27), and the monotonic-counter ops (0x28..0x29).             */
 /*                                                                       */
 /* Pattern per handle-addressed op: decode the request fields per the     */
 /* frozen table, resolve the logical handle through the slot map (unknown */
@@ -489,6 +538,8 @@ static uint32_t handle_op(uint32_t op, const uint8_t *payload, uint32_t plen,
         if (!r.ok) return ST_PROTOCOL_ERROR;
         b = resolve(handle);
         if (!b) return ST_KEY_NOT_FOUND;
+        /* A counter slot is not a key — it has no KeyInfo (no wire key_type). */
+        if (is_counter(b->key_type)) return ST_KEY_NOT_FOUND;
         /* Metadata read — valid for virtual anchors too. */
         wr_key_info(&w, b);
         *out_len = w.len;
@@ -578,9 +629,14 @@ static uint32_t handle_op(uint32_t op, const uint8_t *payload, uint32_t plen,
     }
     case OP_LIST_KEYS: {
         size_t i;
-        /* TODO(vendor): enumerate provisioned keys. Here: the whole slot map. */
-        wr_u32(&w, (uint32_t)SLOT_MAP_LEN);
-        for (i = 0; i < SLOT_MAP_LEN; i++) wr_key_info(&w, &SLOT_MAP[i]);
+        uint32_t n = 0;
+        /* TODO(vendor): enumerate provisioned KEYS. A counter slot (time-floor)
+         * is not a key and never appears in the catalogue (mirrors the sim). */
+        for (i = 0; i < SLOT_MAP_LEN; i++)
+            if (!is_counter(SLOT_MAP[i].key_type)) n++;
+        wr_u32(&w, n);
+        for (i = 0; i < SLOT_MAP_LEN; i++)
+            if (!is_counter(SLOT_MAP[i].key_type)) wr_key_info(&w, &SLOT_MAP[i]);
         *out_len = w.len;
         return ST_OK;
     }
@@ -630,6 +686,43 @@ static uint32_t handle_op(uint32_t op, const uint8_t *payload, uint32_t plen,
         wr_u8(&w, 0x20); wr_u8(&w, 0x01); /* -1 : 1  */
         wr_u8(&w, 0x21); wr_u8(&w, 0x58); wr_u8(&w, 0x20); wr_fill(&w, 0x27, 32u); /* -2 : x */
         wr_u8(&w, 0x22); wr_u8(&w, 0x58); wr_u8(&w, 0x20); wr_fill(&w, 0x27, 32u); /* -3 : y */
+        *out_len = w.len;
+        return ST_OK;
+    }
+
+    /* ---- monotonic counters (rollback-proof, addressed by handle) ----- */
+    case OP_READ_MONOTONIC: {
+        uint32_t handle = rd_u32(&r);
+        const binding_t *b;
+        const counter_cell_t *c;
+        if (!r.ok) return ST_PROTOCOL_ERROR;
+        b = resolve(handle);
+        if (!b) return ST_KEY_NOT_FOUND;
+        if (!is_counter(b->key_type)) return ST_KEY_NOT_FOUND; /* not a counter slot */
+        /* TODO(vendor): read the tamper-resistant monotonic NV counter for
+         * b->slot. Here: the per-handle RAM cell (0 if never raised). */
+        c = counter_cell(handle);
+        wr_u64(&w, c ? c->value : 0u);
+        *out_len = w.len;
+        return ST_OK;
+    }
+    case OP_RAISE_MONOTONIC: {
+        uint32_t handle    = rd_u32(&r);
+        uint64_t new_value = rd_u64(&r);
+        const binding_t *b;
+        counter_cell_t *c;
+        if (!r.ok) return ST_PROTOCOL_ERROR;
+        b = resolve(handle);
+        if (!b) return ST_KEY_NOT_FOUND;
+        if (!is_counter(b->key_type)) return ST_KEY_NOT_FOUND; /* not a counter slot */
+        c = counter_cell(handle);
+        if (!c) return ST_KEYSTORE_ERROR; /* counter table full — unreachable here */
+        /* Ratchet to max(current, new_value): a lower value is a NO-OP, so the
+         * counter can only move forward, never rewind. This is the safety core.
+         * TODO(vendor): ratchet the tamper-resistant, rollback-proof monotonic
+         * NV counter for b->slot instead of this RAM cell. */
+        if (new_value > c->value) c->value = new_value;
+        wr_u64(&w, c->value);
         *out_len = w.len;
         return ST_OK;
     }
