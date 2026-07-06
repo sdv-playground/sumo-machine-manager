@@ -46,6 +46,7 @@ fn make_test_suit_envelope(keys: &TestKeys, component: &str, seq: u64, image: &[
     let crypto = RustCryptoBackend::new();
     let digest = crypto.sha256(image);
     ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec![component.to_string()])
         .sequence_number(seq)
         .payload_digest(&digest, image.len() as u64)
@@ -70,6 +71,7 @@ fn make_test_suit_envelope_with_text(
     let crypto = RustCryptoBackend::new();
     let digest = crypto.sha256(image);
     ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec![component.to_string()])
         .sequence_number(seq)
         .payload_digest(&digest, image.len() as u64)

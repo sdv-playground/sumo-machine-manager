@@ -21,9 +21,9 @@ vhsm-proto = { path = "../../../crates/vhsm-proto" }
 hsm = { path = "../../../crates/hsm", features = ["crypto"] }
 
 # SUIT envelope decrypt/decompress for SimHsm::provision (suit feature).
-sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
-sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
-sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0", optional = true }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1", optional = true }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1", optional = true }
+sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1", optional = true }
 
 # RustCrypto — the software crypto SimHsm performs (crypto feature).
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem", "std"], optional = true }

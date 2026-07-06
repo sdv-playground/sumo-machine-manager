@@ -608,6 +608,7 @@ fn build_encrypted_envelope(
 
     // Build SUIT envelope
     ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["hsm".to_string(), "keys".to_string()])
         .sequence_number(seq)
         .security_version(security_version)

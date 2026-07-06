@@ -193,6 +193,7 @@ fn build_fixture() -> Fixture {
     let blob_sha: [u8; 32] = digest.as_slice().try_into().expect("sha256 digest length");
 
     let manifest_bytes = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".to_string()])
         .sequence_number(7)
         .payload_digest(&digest, blob.len() as u64)

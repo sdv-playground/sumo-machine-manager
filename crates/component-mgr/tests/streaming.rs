@@ -177,6 +177,7 @@ async fn single_component_unencrypted() {
     let digest = crypto.sha256(&payload);
 
     let envelope = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
@@ -220,6 +221,7 @@ async fn single_component_encrypted() {
     let encrypted = encrypt_payload(&plaintext, &device_key);
 
     let envelope = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
@@ -271,6 +273,7 @@ fn multi_component_separate_uploads() {
 
     // Build manifest (no integrated payloads — just metadata)
     let manifest = MultiComponentBuilder::new()
+        .signing_time(1_700_000_000)
         .sequence_number(1)
         .security_version(1)
         .text_version("1.0.0")
@@ -352,6 +355,7 @@ fn multi_component_encrypted_separate() {
     let rootfs_enc = encrypt_payload(&rootfs, &device_key);
 
     let manifest = MultiComponentBuilder::new()
+        .signing_time(1_700_000_000)
         .sequence_number(1)
         .security_version(1)
         .add_component(ComponentSpec {
@@ -426,6 +430,7 @@ fn raw_payload_corrupt_fails() {
     let digest = crypto.sha256(&payload);
 
     let manifest = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".into()])
         .sequence_number(1)
         .payload_digest(&digest, payload.len() as u64)
@@ -463,6 +468,7 @@ async fn chunked_delivery() {
     let digest = crypto.sha256(&payload);
 
     let envelope = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
@@ -511,6 +517,7 @@ async fn corrupted_payload_digest_mismatch() {
     corrupted[100] ^= 0xFF;
 
     let envelope = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
@@ -551,6 +558,7 @@ async fn truncated_transfer() {
     let digest = crypto.sha256(&payload);
 
     let envelope = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
@@ -589,6 +597,7 @@ async fn wrong_device_key() {
     let encrypted = encrypt_payload(&plaintext, &device_key);
 
     let envelope = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
@@ -634,6 +643,7 @@ async fn anti_rollback_rejects_old_security_version() {
     let digest = crypto.sha256(&payload);
 
     let envelope = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1) // manifest says secver=1
@@ -674,6 +684,7 @@ async fn stream_error_mid_transfer() {
     let digest = crypto.sha256(&payload);
 
     let envelope = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
@@ -765,6 +776,7 @@ fn pull_manifest(
     encryption_info: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut b = ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm1".to_string()])
         .sequence_number(1)
         .security_version(1)
@@ -950,6 +962,7 @@ fn l2_envelope(signing_key: &CoseKey, component: &str, payload: &[u8]) -> Vec<u8
     let crypto = RustCryptoBackend::new();
     let digest = crypto.sha256(payload);
     ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec![component.to_string()])
         .sequence_number(1)
         .security_version(1)
@@ -971,6 +984,7 @@ async fn campaign_resolves_integrated_and_remote_deps() {
     let l2_b_uri = format!("manifests/{}", hex::encode(crypto.sha256(&l2_b)));
 
     let l1 = CampaignBuilder::new()
+        .signing_time(1_700_000_000)
         .sequence_number(1)
         .add_integrated_image("dep-a".to_string(), &l2_a)
         .add_image(l2_b_uri, &l2_b)
@@ -1010,6 +1024,7 @@ async fn campaign_rejects_content_address_mismatch() {
     let puller = Puller::new(&base, &signing_key.public_key_bytes()).unwrap();
 
     let l1 = CampaignBuilder::new()
+        .signing_time(1_700_000_000)
         .sequence_number(1)
         .add_image(l2_b_uri, &l2_b)
         .build(&signing_key)
@@ -1030,6 +1045,7 @@ async fn campaign_rejects_non_content_addressed_dep() {
     let l2_b = l2_envelope(&signing_key, "vm2", &[0x22u8; 256]);
 
     let l1 = CampaignBuilder::new()
+        .signing_time(1_700_000_000)
         .sequence_number(1)
         .add_image("manifests/latest".to_string(), &l2_b) // NOT content-addressed
         .build(&signing_key)
@@ -1170,6 +1186,7 @@ async fn campaign_fixture() -> (Vec<u8>, String, Vec<u8>) {
     let l2_b = l2_envelope(&signing_key, "vm1", &[0x22u8; 256]);
     let l2_b_uri = format!("manifests/{}", hex::encode(crypto.sha256(&l2_b)));
     let l1 = CampaignBuilder::new()
+        .signing_time(1_700_000_000)
         .sequence_number(1)
         .add_integrated_image("dep-a".to_string(), &l2_a)
         .add_image(l2_b_uri, &l2_b)

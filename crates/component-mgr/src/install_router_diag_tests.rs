@@ -166,6 +166,7 @@ fn engine_backend() -> Arc<ComponentBackend<MemBlockDevice>> {
 fn container_image_manifest() -> Vec<u8> {
     let signing_key = keygen::generate_signing_key(ES256).unwrap();
     ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         .component_id(vec!["vm2".into(), "container_image".into()])
         .sequence_number(1)
         .payload_digest(&[0u8; 32], 0)
@@ -178,6 +179,7 @@ fn container_image_manifest() -> Vec<u8> {
 fn vm_manifest() -> Vec<u8> {
     let signing_key = keygen::generate_signing_key(ES256).unwrap();
     ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
         // A plain VM component id (not [vm2, container_image]) → VM path.
         .component_id(vec!["vm2".into()])
         .sequence_number(1)
