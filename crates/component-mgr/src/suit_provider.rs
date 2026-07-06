@@ -313,6 +313,9 @@ impl SuitProvider {
             image_size: None,
             raw_envelope: None,
             streamed_files: Vec::new(),
+            // Signed lower bound on real time — the device ratchets its HSM
+            // safe-time floor from this at install (see backend install path).
+            signing_time_secs: manifest.signing_time(),
         })
     }
 }

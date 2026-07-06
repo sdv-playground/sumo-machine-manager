@@ -264,6 +264,8 @@ pub async fn process_envelope_stream(
         image_size: Some(last_image_size as u64),
         raw_envelope: None,
         streamed_files,
+        // Carry the verified manifest's signing time through the streaming path.
+        signing_time_secs: validated.signing_time_secs,
     })
 }
 

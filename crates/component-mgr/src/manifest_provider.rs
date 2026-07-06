@@ -41,6 +41,12 @@ pub struct ValidatedFirmware {
     /// bank dir from disk. Empty for non-streaming (in-memory or
     /// header-only) paths — `sign_bank` falls back to a directory walk.
     pub streamed_files: Vec<IvdFile>,
+    /// The manifest's signed signing time (`iat`, UNIX seconds), read from the
+    /// verified COSE header. A trustworthy lower bound on real time: the device
+    /// ratchets its HSM safe-time floor to `max(floor, iat)` on install, so every
+    /// accepted update advances the floor even fully offline
+    /// (docs/design/safe-time-floor.md). `None` if the manifest carried none.
+    pub signing_time_secs: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -190,6 +196,7 @@ mod tests {
                 image_size: None,
                 raw_envelope: None,
                 streamed_files: Vec::new(),
+                signing_time_secs: None,
             })
         }
     }

@@ -106,6 +106,11 @@ pub struct VmManager {
     /// via `with_clock` — the host selects gPTP / simulation per its
     /// startup config.
     clock_source: Arc<dyn Clock>,
+    /// Optional live safe-time floor (UNIX seconds), published into each VM's
+    /// vtime `min_wall_ns` so guests discipline their clock to the host's proven
+    /// lower bound on real time (docs/design/safe-time-floor.md). `None` publishes
+    /// 0 (no floor). Shared cell — the host ratchets it as it accepts signed material.
+    time_floor: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Optional pre-launch verification hook. Called from `start_vm`
     /// with `(vm_name, bank_dir)` AFTER per-bank config is loaded but
     /// BEFORE the runner spawns devb-loopback / qvm. Returning `Err`
@@ -247,6 +252,7 @@ impl VmManager {
             vms,
             device_transport,
             clock_source: Arc::new(SystemClock::new()),
+            time_floor: None,
             pre_launch_verify: None,
         }
     }
@@ -256,6 +262,13 @@ impl VmManager {
     /// or `SimulationClock` based on its startup `time:` config.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock_source = clock;
+        self
+    }
+
+    /// Share the live safe-time floor cell — published into each VM's vtime
+    /// `min_wall_ns` so guests inherit the host's proven lower bound on real time.
+    pub fn with_time_floor(mut self, floor: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.time_floor = Some(floor);
         self
     }
 
@@ -477,11 +490,12 @@ impl VmManager {
                 let adjust_ch = tx.open_channel(name, "time", "adjust", vtime_regs::REGION_SIZE);
                 match (regs_ch, adjust_ch) {
                     (Ok(regs), Ok(adjust)) => {
-                        vm.time = Some(TimeDevice::with_split_channels(
+                        vm.time = Some(TimeDevice::with_split_channels_and_floor(
                             regs,
                             adjust,
                             self.clock_source.clone(),
                             TIME_DEFAULT_INTERVAL,
+                            self.time_floor.clone(),
                         ));
                         tracing::info!("VM {name}: vtime publisher started");
                     }

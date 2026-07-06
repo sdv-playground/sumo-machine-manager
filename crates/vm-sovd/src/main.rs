@@ -428,6 +428,8 @@ async fn main() {
         // externally). A deployment that DOES need an external daemon reload on
         // provision sets this; here it stays inert.
         post_provision_reload: None,
+        // vm-sovd doesn't own the host clock — leave the no-op default.
+        wall_clock_floor: None,
     };
     for spec in &specs {
         if let Some(built) = build_component(spec, &deps) {

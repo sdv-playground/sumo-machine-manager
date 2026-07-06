@@ -238,6 +238,21 @@ impl TimeDevice {
         Self::with_split_channels(channel.clone(), channel, clock, interval)
     }
 
+    /// Like [`with_split_channels`](Self::with_split_channels) but publishes a
+    /// live **safe-time floor** into each tick's `min_wall_ns`. `floor_secs` is a
+    /// shared cell (UNIX seconds) the host ratchets as it accepts signed material;
+    /// the guest reads `min_wall_ns` and refuses to set its clock below it — so a
+    /// clockless guest inherits the host's proven lower bound on real time
+    /// (docs/design/safe-time-floor.md). `None` publishes 0 (no floor).
+    pub fn with_floor(
+        channel: Arc<dyn DeviceChannel>,
+        clock: Arc<dyn Clock>,
+        interval: Duration,
+        floor_secs: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Self {
+        Self::with_split_channels_and_floor(channel.clone(), channel, clock, interval, floor_secs)
+    }
+
     /// Two-channel constructor — host→guest regs on one channel,
     /// bidirectional adjust on a second. Used by transports that don't
     /// natively split direction (HTTP today). The two channels each
@@ -249,11 +264,32 @@ impl TimeDevice {
         clock: Arc<dyn Clock>,
         interval: Duration,
     ) -> Self {
+        Self::with_split_channels_and_floor(regs_channel, adjust_channel, clock, interval, None)
+    }
+
+    /// Two-channel constructor that also publishes a live safe-time floor into
+    /// `min_wall_ns` (see [`with_floor`](Self::with_floor)).
+    pub fn with_split_channels_and_floor(
+        regs_channel: Arc<dyn DeviceChannel>,
+        adjust_channel: Arc<dyn DeviceChannel>,
+        clock: Arc<dyn Clock>,
+        interval: Duration,
+        floor_secs: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
         let writer = thread::Builder::new()
             .name("vtime-writer".into())
-            .spawn(move || writer_loop(regs_channel, adjust_channel, clock, interval, cancel_clone))
+            .spawn(move || {
+                writer_loop(
+                    regs_channel,
+                    adjust_channel,
+                    clock,
+                    interval,
+                    cancel_clone,
+                    floor_secs,
+                )
+            })
             .expect("spawn vtime-writer thread");
 
         Self {
@@ -318,6 +354,7 @@ fn writer_loop(
     clock: Arc<dyn Clock>,
     interval: Duration,
     cancel: Arc<AtomicBool>,
+    floor_secs: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) {
     // Wrap the iteration loop in catch_unwind so a panic inside the
     // body (channel.write, clock.now_mono_ns, …) doesn't silently
@@ -328,7 +365,14 @@ fn writer_loop(
     // (stop_vm + start_vm) to recover. We deliberately don't
     // auto-restart the loop until we know what's panicking.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        writer_loop_inner(regs_channel, adjust_channel, clock, interval, cancel);
+        writer_loop_inner(
+            regs_channel,
+            adjust_channel,
+            clock,
+            interval,
+            cancel,
+            floor_secs,
+        );
     }));
     if let Err(payload) = result {
         let msg = payload
@@ -352,6 +396,7 @@ fn writer_loop_inner(
     clock: Arc<dyn Clock>,
     interval: Duration,
     cancel: Arc<AtomicBool>,
+    floor_secs: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) {
     use vm_wire::{VtimeCmd, VtimeRegs, VTIME_FLAG_SYNC_VALID, VTIME_REGS_SIZE, VTIME_WIRE_SIZE};
 
@@ -439,13 +484,23 @@ fn writer_loop_inner(
         //    (status field at the same offset as in a request).
         st.update_seq = st.update_seq.wrapping_add(2);
 
+        // Publish the live safe-time floor (seconds → ns) as the guest's
+        // anti-rollback wall floor. The guest refuses to set its clock below it,
+        // so a clockless guest inherits the host's proven lower bound on real
+        // time. Read live each tick — the host ratchets it as it accepts signed
+        // material (docs/design/safe-time-floor.md).
+        let min_wall_ns = floor_secs
+            .as_ref()
+            .map(|c| c.load(Ordering::Relaxed).saturating_mul(1_000_000_000))
+            .unwrap_or(0);
+
         let regs = VtimeRegs {
             mono_ns: now_mono,
             wall_offset_ns: now_wall_off,
             last_sync_mono_ns: st.last_sync_mono_ns,
             sync_source: st.sync_source,
             sync_quality: st.sync_quality,
-            min_wall_ns: 0,
+            min_wall_ns,
             flags: st.flags,
             update_seq: st.update_seq,
         };
@@ -694,5 +749,72 @@ mod tests {
         sim.check_adjust();
 
         assert_eq!(sim.shm.read_u32(r::CMD_OFF_STATUS), r::STATUS_REJECTED);
+    }
+
+    #[test]
+    fn time_device_publishes_the_safe_time_floor_as_min_wall_ns() {
+        use crate::transport::mem::MemTransport;
+        use crate::transport::DeviceTransport;
+        use std::sync::atomic::AtomicU64;
+        use vm_wire::VtimeRegs;
+
+        let tx = MemTransport::new();
+        let regs = tx.open_channel("vm1", "time", "regs", 128).unwrap();
+        let adjust = tx.open_channel("vm1", "time", "adjust", 128).unwrap();
+        let clock = Arc::new(FixedClock {
+            mono: 1_000_000_000,
+            wall_off: 0,
+        });
+        let floor_secs = 1_700_000_000u64;
+        let floor = Arc::new(AtomicU64::new(floor_secs));
+
+        // Spawn the writer with the shared floor cell.
+        let _dev = TimeDevice::with_split_channels_and_floor(
+            regs.clone(),
+            adjust,
+            clock,
+            Duration::from_millis(5),
+            Some(floor.clone()),
+        );
+
+        // Poll the regs channel until the writer publishes a decodable region,
+        // then assert min_wall_ns == floor_secs * 1e9. Bounded wait, no sleeps
+        // baked into the assertion.
+        let mut got = None;
+        for _ in 0..200 {
+            if let Ok(buf) = regs.read() {
+                if let Some(r) = VtimeRegs::from_regs_bytes(&buf) {
+                    got = Some(r.min_wall_ns);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            got,
+            Some(floor_secs * 1_000_000_000),
+            "published min_wall_ns must equal the floor in ns"
+        );
+
+        // Ratcheting the shared cell is reflected on a subsequent tick (live read).
+        let higher = 1_800_000_000u64;
+        floor.store(higher, Ordering::Relaxed);
+        let mut updated = None;
+        for _ in 0..200 {
+            if let Ok(buf) = regs.read() {
+                if let Some(r) = VtimeRegs::from_regs_bytes(&buf) {
+                    if r.min_wall_ns == higher * 1_000_000_000 {
+                        updated = Some(r.min_wall_ns);
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            updated,
+            Some(higher * 1_000_000_000),
+            "a runtime floor ratchet must show up in min_wall_ns"
+        );
     }
 }

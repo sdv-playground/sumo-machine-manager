@@ -145,6 +145,11 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// owned externally. `None` (the default) keeps today's in-process provider
     /// restart.
     pub post_provision_reload: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Sink that steps the host wall clock forward to the safe-time floor after
+    /// an install ratchets it. When `Some`, each built `ComponentBackend` gets it
+    /// via `with_wall_clock_floor`; `None` leaves the log-only no-op default.
+    /// The real host injects a clock-setting impl; tests/CI leave it `None`.
+    pub wall_clock_floor: Option<Arc<dyn component_mgr::sovd::time_floor::WallClockFloor>>,
 }
 
 pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
@@ -314,6 +319,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             if let Some(reload) = &deps.post_provision_reload {
                 backend = backend.with_post_provision_reload(reload.clone());
             }
+            if let Some(sink) = &deps.wall_clock_floor {
+                backend = backend.with_wall_clock_floor(sink.clone());
+            }
             if let Some(crypto) = &deps.hsm_crypto {
                 backend = backend.with_hsm_crypto(crypto.clone());
             }
@@ -416,6 +424,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             }
             if let Some(reload) = &deps.post_provision_reload {
                 backend = backend.with_post_provision_reload(reload.clone());
+            }
+            if let Some(sink) = &deps.wall_clock_floor {
+                backend = backend.with_wall_clock_floor(sink.clone());
             }
             if let Some(crypto) = &deps.hsm_crypto {
                 backend = backend.with_hsm_crypto(crypto.clone());

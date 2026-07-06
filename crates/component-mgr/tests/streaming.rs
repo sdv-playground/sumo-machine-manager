@@ -299,6 +299,10 @@ fn multi_component_separate_uploads() {
     // Step 1: Validate manifest (tiny, ~1KB)
     let validated = validate_manifest(&manifest, &provider, 0).unwrap();
     assert_eq!(validated.bank_set, BankSet::Vm1);
+    // The signed manifest signing time (iat) flows offboard → validate →
+    // ValidatedFirmware, so the install path can ratchet the safe-time floor
+    // from it (docs/design/safe-time-floor.md). The builder set 1_700_000_000.
+    assert_eq!(validated.signing_time_secs, Some(1_700_000_000));
 
     // Step 2: Save payloads as raw files (simulating separate uploads)
     let kernel_path = tmp.path().join("upload-kernel.bin");

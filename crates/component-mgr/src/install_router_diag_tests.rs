@@ -142,6 +142,7 @@ impl ManifestProvider for AcceptingManifestProvider {
             image_size: None,
             raw_envelope: None,
             streamed_files: Vec::new(),
+            signing_time_secs: None,
         })
     }
 }

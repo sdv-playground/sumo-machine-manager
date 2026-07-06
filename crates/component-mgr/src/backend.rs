@@ -356,6 +356,11 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// Threaded from `FactoryDeps::hsm_crypto` via
     /// [`with_hsm_crypto`](Self::with_hsm_crypto).
     hsm_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
+    /// Sink that steps the host wall clock forward to the safe-time floor after
+    /// an install ratchets it (see [`crate::sovd::time_floor`]). Defaults to the
+    /// log-only [`NoopWallClockFloor`]; the real host injects a clock-setting
+    /// impl via [`with_wall_clock_floor`](Self::with_wall_clock_floor).
+    wall_clock_floor: Arc<dyn crate::sovd::time_floor::WallClockFloor>,
     /// Synthetic health source — consulted by `read_data` for
     /// `guest_state` / `heartbeat_seq` when `vm_service_addr` is None.
     /// Set via `with_health_probe` (typically by the host machine manager for the
@@ -567,6 +572,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             // Defaults to the `dyn HsmProvider` path; component-factory injects a
             // crypto-only handle via `with_hsm_crypto` when link-B is configured.
             hsm_crypto: None,
+            wall_clock_floor: Arc::new(crate::sovd::time_floor::NoopWallClockFloor),
             health_probe: None,
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             manifest_describe: Mutex::new(HashMap::new()),
@@ -626,6 +632,17 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // an earlier `with_bank_activator`. A `with_bank_provider` override
         // already carries its own crypto handle, so this rebuild is skipped then.
         self.rebuild_bank_provider();
+        self
+    }
+
+    /// Inject the wall-clock-floor sink. The real host passes a clock-setting
+    /// impl so an install that ratchets the safe-time floor also steps
+    /// `CLOCK_REALTIME` forward to it; the default is the log-only no-op.
+    pub fn with_wall_clock_floor(
+        mut self,
+        sink: Arc<dyn crate::sovd::time_floor::WallClockFloor>,
+    ) -> Self {
+        self.wall_clock_floor = sink;
         self
     }
 
@@ -2743,7 +2760,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             });
             return Ok(transfer_id);
         };
-        let (meta, image_data, image_size, pre_sha256, pre_size, manifest_type, raw_envelope) = {
+        let (
+            meta,
+            image_data,
+            image_size,
+            pre_sha256,
+            pre_size,
+            manifest_type,
+            raw_envelope,
+            signing_time_secs,
+        ) = {
             let packages = self.packages.lock().unwrap();
             let p = packages
                 .get(&package_id)
@@ -2761,8 +2787,42 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 p.validated.image_size,
                 p.validated.manifest_type,
                 p.validated.raw_envelope.clone(),
+                p.validated.signing_time_secs,
             )
         };
+
+        // Safe-time floor: ratchet the HSM's monotonic floor to the verified
+        // manifest's signing time (iat) — a signed lower bound on real time. Done
+        // as soon as the manifest is verified (not gated on trial-boot / commit):
+        // a rolled-back firmware doesn't make real time run backwards, and the
+        // floor only ever moves forward. Every accepted update (firmware or HSM
+        // keys) advances it, so an offline device ratchets forward on each install
+        // (docs/design/safe-time-floor.md). Best-effort: a floor hiccup must not
+        // fail an otherwise-valid install.
+        if let (Some(iat), Some(hsm)) = (signing_time_secs, self.hsm_provider.as_ref()) {
+            match hsm.lock() {
+                Ok(mut hsm_guard) => {
+                    match crate::sovd::time_floor::TimeFloor::advance(&mut *hsm_guard, iat) {
+                        Ok(floor) => {
+                            tracing::info!(
+                                iat,
+                                floor,
+                                "safe-time floor ratcheted from manifest signing time"
+                            );
+                            // Discipline the host wall clock forward to the
+                            // resulting (post-ratchet, max) floor, so every
+                            // reader of CLOCK_REALTIME sees max(now, floor)
+                            // without a separate cache. Forward-only + best-effort.
+                            drop(hsm_guard);
+                            self.wall_clock_floor.discipline_to(floor);
+                        }
+                        Err(e) => tracing::warn!(iat, error = %e,
+                            "could not ratchet safe-time floor from manifest iat"),
+                    }
+                }
+                Err(_) => tracing::warn!("HSM provider lock poisoned — skipped time-floor ratchet"),
+            }
+        }
 
         // HSM key material — route to HsmProvider, skip normal image write
         if manifest_type == ManifestType::HsmKeys {
@@ -4356,6 +4416,7 @@ mod identity_tests {
                     image_size: Some(16),
                     raw_envelope: None,
                     streamed_files: Vec::new(),
+                    signing_time_secs: None,
                 },
                 status: PackageStatus::Verified,
             },
