@@ -496,7 +496,7 @@ pub fn pull_update_router(
                     };
                     let bearer = bearer_of(&headers);
                     match run_pull_update(
-                        &comp,
+                        comp,
                         authorizer.as_ref(),
                         &trust_anchor,
                         bearer.as_deref(),
