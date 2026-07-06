@@ -1006,6 +1006,107 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .unwrap_or_default()
     }
 
+    /// Copy-forward the manifested-but-un-pushed components
+    /// `[next_component .. total_components)` from the active bank into `target`,
+    /// each DIGEST-VERIFIED against the manifest's declared plaintext image digest.
+    ///
+    /// A manifest-only (or partial) push declares components but ships no payload
+    /// for some, signalling "the vehicle already has this" — the vehicle-side half
+    /// of the offboard copy-vs-fetch decision. We reconcile by copying the active
+    /// bank's file for each such component, but ONLY when its on-disk content
+    /// hashes to exactly what the manifest declared. A mismatch (stale / wrong /
+    /// missing active content) returns an error that FAILS the install rather than
+    /// sealing a bank whose bytes don't match the manifest's promise.
+    ///
+    /// Returns the copied files as an [`hsm::ivd::IvdFile`] inventory so the caller
+    /// can fold them into the flash transfer's `streamed_files` (parity with the
+    /// pushed path). A no-op returning empty when there are no un-pushed components.
+    fn copy_forward_unpushed(
+        &self,
+        manifest_bytes: &[u8],
+        next_component: usize,
+        total_components: usize,
+        target: Bank,
+    ) -> BackendResult<Vec<hsm::ivd::IvdFile>> {
+        if next_component >= total_components {
+            return Ok(Vec::new());
+        }
+        let images_dir = self.images_dir.as_ref().ok_or_else(|| {
+            BackendError::Internal(
+                "manifest-only push needs an images_dir to copy the active bank forward".into(),
+            )
+        })?;
+
+        // Resolve the active bank from NV; `target` is its sibling (never self-copy).
+        let active = {
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("nv lock".into()))?;
+            let state = nv
+                .read_boot_state()
+                .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+            state.banks[self.bank_set.as_index()].active_bank
+        };
+        if active == target {
+            return Err(BackendError::Internal(
+                "copy-forward: target bank == active bank — refusing to self-copy".into(),
+            ));
+        }
+
+        let set_name = self.bank_spec.dir_name.as_str();
+        let active_dir = images_dir
+            .join(set_name)
+            .join(crate::bank_provider::bank_dir_name(active));
+        let target_dir = images_dir
+            .join(set_name)
+            .join(crate::bank_provider::bank_dir_name(target));
+
+        // Decode the stored manifest — `validated.image_sha256` is None for a
+        // header-only manifest, so the per-component expected digest comes from
+        // the SUIT manifest itself.
+        let envelope = sumo_codec::decode::decode_envelope(manifest_bytes)
+            .map_err(|e| BackendError::Internal(format!("copy-forward decode manifest: {e:?}")))?;
+        let manifest = sumo_onboard::manifest::Manifest { envelope };
+
+        let mut copied = Vec::with_capacity(total_components - next_component);
+        for i in next_component..total_components {
+            let expected = manifest
+                .image_digest(i)
+                .map(|d| d.0.bytes.clone())
+                .ok_or_else(|| {
+                    BackendError::Internal(format!(
+                        "copy-forward: manifest has no image_digest for component {i}"
+                    ))
+                })?;
+            // Name from the component-id part, not the (content-address) uri.
+            let name = crate::bank_spec::payload_target_name_for_id(
+                self.bank_spec.layout,
+                manifest.component_id(i),
+            );
+
+            let (sha256, size) =
+                crate::bank_seed::copy_forward_file(&active_dir, &target_dir, &name, &expected)
+                    .map_err(|e| {
+                        BackendError::Internal(format!(
+                            "copy-forward refused for component {i}: {e}"
+                        ))
+                    })?;
+            tracing::info!(
+                component = i,
+                file = %name,
+                size,
+                "copy-forward: active bank content matches manifest digest — copied to target",
+            );
+            copied.push(hsm::ivd::IvdFile {
+                relative_path: name,
+                sha256: sha256.to_vec(),
+                size,
+            });
+        }
+        Ok(copied)
+    }
+
     /// Bank to serve installed-manifest / identity from: the boot selector's
     /// active bank (the authority the VM boots), falling back to the
     /// `running_bank` cache only when the selector has no selection.
@@ -3078,6 +3179,68 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     }
 
     async fn finalize_flash(&self) -> BackendResult<()> {
+        // Manifest-only / partial push reconciliation (copy-forward). The
+        // offboard orchestrator pushed the L2 manifest but no payload for some
+        // components, signalling "the vehicle already has these". Those
+        // components were never streamed, so the seal/sign that the final
+        // payload upload normally fires never ran — finalize would otherwise
+        // activate an empty, unsigned target bank (the guest can't boot it →
+        // trial-boot exhaustion → auto-rollback). Detect the un-pushed tail
+        // `[next_component .. total_components)`, copy it forward from the active
+        // bank (digest-verified), then seal the now-complete bank. Only
+        // meaningful with an on-disk bank (`images_dir`); in-memory test backends
+        // have no bank to reconcile and keep their prior behaviour.
+        let manifest_only = if self.images_dir.is_some() {
+            let session = self.flash_session.lock().unwrap();
+            match session.as_ref() {
+                Some(FlashSessionState::AwaitingPayload {
+                    manifest_bytes,
+                    next_component,
+                    total_components,
+                    ..
+                }) if *next_component < *total_components => {
+                    Some((manifest_bytes.clone(), *next_component, *total_components))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((manifest_bytes, next_component, total_components)) = manifest_only {
+            let target = self.determine_target_bank()?;
+            let copied = self.copy_forward_unpushed(
+                &manifest_bytes,
+                next_component,
+                total_components,
+                target,
+            )?;
+            // Fold the copied files into the transfer inventory (parity with the
+            // streamed path), then seal the now-complete bank. `seal`'s own
+            // presence-based seed no-ops the just-copied files and IVD-signs the
+            // full bank so external secure boot / commit accept it.
+            {
+                let mut ft = self.flash_transfer.lock().unwrap();
+                if let Some(ref mut t) = *ft {
+                    t.streamed_files.extend(copied);
+                }
+            }
+            self.ivd_sign_staged_bank(target)?;
+            // Content-complete: advance exactly like the final payload upload would.
+            *self.flash_session.lock().unwrap() = Some(FlashSessionState::Complete);
+            {
+                let mut ft = self.flash_transfer.lock().unwrap();
+                if let Some(ref mut t) = *ft {
+                    t.state = FlashState::AwaitingActivation;
+                }
+            }
+            tracing::info!(
+                bank_set = ?self.bank_set,
+                target = ?target,
+                copied_components = total_components - next_component,
+                "manifest-only push reconciled: un-pushed components copied forward from the active bank; target sealed",
+            );
+        }
+
         // Process staged package (HSM keys, firmware OTA install)
         let package_id = {
             let ft = self.flash_transfer.lock().unwrap();
@@ -5365,5 +5528,282 @@ mod abort_flash_tests {
             // Refused → the finalized transfer is left intact, not cleared.
             assert!(b.flash_transfer.lock().unwrap().is_some(), "{st:?}");
         }
+    }
+}
+
+// ===========================================================================
+// Copy-forward (manifest-only / partial push reconciliation)
+// ===========================================================================
+#[cfg(test)]
+mod copy_forward_tests {
+    use super::*;
+    use crate::manifest_provider::ManifestError;
+    use nv_store::block::MemBlockDevice;
+    use nv_store::store::MIN_NV_DEVICE_SIZE;
+    use sha2::{Digest, Sha256};
+    use sumo_offboard::{keygen, ImageManifestBuilder};
+
+    struct NoopManifest;
+    impl ManifestProvider for NoopManifest {
+        fn validate(&self, _d: &[u8], _m: u32) -> Result<ValidatedFirmware, ManifestError> {
+            Err(ManifestError::ParseError(
+                "unused in copy-forward tests".into(),
+            ))
+        }
+    }
+    struct NoopSecurity;
+    impl SecurityProvider for NoopSecurity {
+        fn generate_seed(&self, _c: BankSet, _l: u8) -> Vec<u8> {
+            Vec::new()
+        }
+        fn validate_key(&self, _c: BankSet, _l: u8, _s: &[u8], _k: &[u8]) -> bool {
+            true
+        }
+    }
+
+    /// A detached (no integrated payload) single-component SUIT manifest whose
+    /// declared image digest is `digest` — mimics the offboard "manifest-only,
+    /// you already have this" push. `component_id = ["vm1", part]` so the on-disk
+    /// name resolves through the VM layout (`firmware` → `rootfs.img`).
+    fn detached_manifest(part: &str, digest: &[u8], size: u64) -> Vec<u8> {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        ImageManifestBuilder::new()
+            .signing_time(1_700_000_000)
+            .component_id(vec!["vm1".into(), part.into()])
+            .sequence_number(2)
+            .payload_digest(digest, size)
+            .payload_uri("#firmware".into())
+            .build(&key)
+            .unwrap()
+    }
+
+    fn vm1_backend(images_dir: PathBuf) -> ComponentBackend<MemBlockDevice> {
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
+        nv.write_boot_state(&mut boot).unwrap();
+        ComponentBackend::with_options(
+            BankSet::Vm1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            Arc::new(NoopSecurity),
+            ComponentConfig::default(),
+            None,
+            Some(images_dir),
+            None,
+        )
+    }
+
+    /// Digest-match: the active bank's content hashes to what the manifest
+    /// declares → copy it forward into the target bank + report the inventory.
+    #[test]
+    fn copy_forward_unpushed_copies_matching_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+        let content = b"vm1 rootfs the vehicle already has";
+        let active = images_dir.join("vm1/bank_a");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::write(active.join("rootfs.img"), content).unwrap();
+        let digest: [u8; 32] = Sha256::digest(content).into();
+
+        let manifest = detached_manifest("firmware", &digest, content.len() as u64);
+        let backend = vm1_backend(images_dir.clone());
+
+        let copied = backend
+            .copy_forward_unpushed(&manifest, 0, 1, Bank::B)
+            .expect("digest matches → copy-forward");
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].relative_path, "rootfs.img");
+        assert_eq!(copied[0].sha256, digest.to_vec());
+        assert_eq!(copied[0].size, content.len() as u64);
+        assert_eq!(
+            std::fs::read(images_dir.join("vm1/bank_b/rootfs.img")).unwrap(),
+            content,
+            "target bank_b gets the active bank's verified rootfs"
+        );
+    }
+
+    /// Digest-mismatch: the active bank holds a different version than the
+    /// manifest declares → the install must FAIL and stage nothing (never ship
+    /// stale content).
+    #[test]
+    fn copy_forward_unpushed_fails_on_stale_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+        let active = images_dir.join("vm1/bank_a");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::write(active.join("rootfs.img"), b"STALE local rootfs").unwrap();
+
+        let declared: [u8; 32] = Sha256::digest(b"the version offboard expects").into();
+        let manifest = detached_manifest("firmware", &declared, 42);
+        let backend = vm1_backend(images_dir.clone());
+
+        let err = backend
+            .copy_forward_unpushed(&manifest, 0, 1, Bank::B)
+            .expect_err("digest mismatch → install must fail");
+        assert!(matches!(err, BackendError::Internal(_)), "got {err:?}");
+        assert!(
+            !images_dir.join("vm1/bank_b/rootfs.img").exists(),
+            "stale content must not be staged into the target bank"
+        );
+    }
+
+    /// No un-pushed components (`next_component == total`) → no-op, empty result.
+    #[test]
+    fn copy_forward_unpushed_noop_when_all_pushed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+        let manifest = detached_manifest("firmware", &[0u8; 32], 0);
+        let backend = vm1_backend(images_dir);
+        let copied = backend
+            .copy_forward_unpushed(&manifest, 1, 1, Bank::B)
+            .expect("no un-pushed components");
+        assert!(copied.is_empty());
+    }
+
+    /// Build a fully-provisioned SimHsm (keystore + device `ivd-signing` keypair)
+    /// so `finalize_flash`'s seal step can sign. Mirrors `identity_tests`.
+    fn provisioned_hsm(
+        tag: &str,
+    ) -> (
+        Arc<Mutex<dyn hsm::HsmProvider>>,
+        Arc<dyn hsm::HsmCryptoProvider>,
+        PathBuf,
+    ) {
+        use hsm::payload::*;
+        use hsm::HsmProvider;
+        use hsm_sim_backend::SimHsm;
+        let keystore = std::env::temp_dir().join(format!("component-mgr-copyfwd-ks-{tag}"));
+        let _ = std::fs::remove_dir_all(&keystore);
+        std::fs::create_dir_all(&keystore).unwrap();
+        let hsm = SimHsm::new(keystore.clone());
+        let ks = HsmKeystore {
+            schema_version: SCHEMA_VERSION,
+            security_version: 1,
+            identities: vec![],
+            slots: vec![KeySlot {
+                key_id: hsm::ivd::IVD_KEY_ID.to_string(),
+                key_kind: KEY_TYPE_EC_P256,
+                anchor_public_key: None,
+                allowed_guests: None,
+                allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
+            }],
+            certificates: Vec::new(),
+            trust_anchors: Vec::new(),
+        };
+        hsm.write_keystore(&ks).unwrap();
+        hsm.ensure_device_keys().unwrap();
+        std::fs::write(keystore.join("provision_state"), b"1\n").unwrap();
+        assert!(hsm.is_provisioned().unwrap());
+        let crypto: Arc<dyn hsm::HsmCryptoProvider> = Arc::new(SimHsm::new(keystore.clone()));
+        (Arc::new(Mutex::new(hsm)), crypto, keystore)
+    }
+
+    /// End-to-end brick fix: a 0-payload (manifest-only) push must NOT activate
+    /// an empty bank. `finalize_flash` copies the un-pushed component forward from
+    /// the active bank, IVD-seals the target, flips NV — so the bank is bootable
+    /// (no auto-rollback), not empty.
+    #[tokio::test]
+    async fn finalize_manifest_only_copies_forward_seals_and_flips_nv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+
+        // Active bank (A) holds the rootfs the manifest-only push declares.
+        let content = b"vm1 rootfs already on the vehicle";
+        let active = images_dir.join("vm1/bank_a");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::write(active.join("rootfs.img"), content).unwrap();
+        let digest: [u8; 32] = Sha256::digest(content).into();
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
+        boot.banks[BankSet::Vm1.as_index()].committed = true;
+        nv.write_boot_state(&mut boot).unwrap();
+        let nv = Arc::new(Mutex::new(nv));
+
+        let (hsm, crypto, keystore) = provisioned_hsm("finalize");
+        let backend = ComponentBackend::with_options(
+            BankSet::Vm1,
+            nv.clone(),
+            Arc::new(NoopManifest),
+            Arc::new(NoopSecurity),
+            ComponentConfig::default(),
+            None,
+            Some(images_dir.clone()),
+            Some(hsm),
+        )
+        .with_hsm_crypto(crypto);
+
+        // Park a manifest-only session (0 of 1 components pushed) + the Firmware
+        // package finalize reads image_meta from (image_sha256 = None, exactly
+        // the header-only shape the real manifest-only path produces).
+        let manifest = detached_manifest("firmware", &digest, content.len() as u64);
+        let validated = ValidatedFirmware {
+            bank_set: BankSet::Vm1,
+            manifest_type: ManifestType::Firmware,
+            image_meta: crate::ota::ImageMeta::default(),
+            image_data: Vec::new(),
+            version_display: "1.0.0".into(),
+            image_sha256: None,
+            image_size: None,
+            raw_envelope: None,
+            streamed_files: Vec::new(),
+            signing_time_secs: None,
+        };
+        backend.packages.lock().unwrap().insert(
+            "m1".into(),
+            StoredPackage {
+                id: "m1".into(),
+                validated: validated.clone(),
+                status: PackageStatus::Verified,
+            },
+        );
+        *backend.flash_transfer.lock().unwrap() = Some(FlashTransferState {
+            transfer_id: "t1".into(),
+            package_id: "m1".into(),
+            state: FlashState::AwaitingActivation,
+            image_size: 0,
+            streamed_files: Vec::new(),
+        });
+        *backend.flash_session.lock().unwrap() = Some(FlashSessionState::AwaitingPayload {
+            manifest_bytes: manifest,
+            validated,
+            next_component: 0,
+            total_components: 1,
+        });
+
+        // Precondition: target bank is empty (would brick if activated as-is).
+        assert!(!images_dir.join("vm1/bank_b/rootfs.img").exists());
+
+        DiagnosticBackend::finalize_flash(&backend)
+            .await
+            .expect("finalize reconciles the manifest-only push");
+
+        // Target bank now carries the copied rootfs AND a signed IVD manifest.
+        assert_eq!(
+            std::fs::read(images_dir.join("vm1/bank_b/rootfs.img")).unwrap(),
+            content,
+            "un-pushed component copied forward from the active bank"
+        );
+        assert!(
+            images_dir.join("vm1/bank_b/ivd-manifest.cbor").exists(),
+            "target bank must be IVD-sealed so secure boot / commit accept it"
+        );
+        assert!(images_dir.join("vm1/bank_b/ivd-signature.bin").exists());
+        // Session advanced; NV flipped to the sealed bank in trial mode.
+        assert!(matches!(
+            *backend.flash_session.lock().unwrap(),
+            Some(FlashSessionState::Complete)
+        ));
+        let s = crate::ota::status(&nv.lock().unwrap(), BankSet::Vm1).unwrap();
+        assert_eq!(
+            s.active_bank,
+            Bank::B,
+            "install_precomputed flipped NV to the sealed bank"
+        );
+        assert!(!s.committed, "banked install enters trial mode");
+
+        let _ = std::fs::remove_dir_all(&keystore);
     }
 }
