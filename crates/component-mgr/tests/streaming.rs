@@ -178,7 +178,7 @@ async fn single_component_unencrypted() {
 
     let envelope = ImageManifestBuilder::new()
         .signing_time(1_700_000_000)
-        .component_id(vec!["vm1".to_string()])
+        .component_id(vec!["vm1".to_string(), "firmware".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, payload.len() as u64)
@@ -222,7 +222,7 @@ async fn single_component_encrypted() {
 
     let envelope = ImageManifestBuilder::new()
         .signing_time(1_700_000_000)
-        .component_id(vec!["vm1".to_string()])
+        .component_id(vec!["vm1".to_string(), "firmware".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, plaintext.len() as u64)
@@ -473,7 +473,7 @@ async fn chunked_delivery() {
 
     let envelope = ImageManifestBuilder::new()
         .signing_time(1_700_000_000)
-        .component_id(vec!["vm1".to_string()])
+        .component_id(vec!["vm1".to_string(), "firmware".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, payload.len() as u64)
