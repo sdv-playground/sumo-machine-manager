@@ -1409,8 +1409,12 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     BackendError::Internal(format!("no digest for component {comp_idx}"))
                 })?;
 
-            let target_name =
-                crate::bank_spec::payload_target_name(self.bank_spec.layout, uri.as_str());
+            // Name from the component-id part, not the (possibly content-address)
+            // uri — see `payload_target_name_for_id`.
+            let target_name = crate::bank_spec::payload_target_name_for_id(
+                self.bank_spec.layout,
+                suit_manifest.component_id(comp_idx),
+            );
 
             // Open the payload sink through the bank provider — it owns where
             // the bytes land and creates the bank dir as needed.
@@ -1673,7 +1677,13 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         let uri = manifest.uri(comp_idx).unwrap_or("#firmware").to_string();
 
         let target_bank = self.determine_target_bank()?;
-        let target_name = crate::bank_spec::payload_target_name(self.bank_spec.layout, &uri);
+        // Name the bank file from the component-id part, NOT the payload uri: the
+        // uri is the content-address fetch reference (sha256:<outer>) and would
+        // otherwise land the file as `sha256:…` (un-bootable).
+        let target_name = crate::bank_spec::payload_target_name_for_id(
+            self.bank_spec.layout,
+            manifest.component_id(comp_idx),
+        );
 
         // Open the payload sink through the bank provider — it owns where the
         // bytes land and creates the bank dir as needed.
