@@ -1,37 +1,19 @@
 //! Per-bank-set behavioral data, decoupled from the `BankSet` identity.
 //!
 //! `BankSet` (a numeric slot index) names a slot; `BankSetSpec` carries
-//! the behaviors that used to be hard-coded in `match bank_set { … }`
-//! helpers — the on-disk directory name and the SUIT-payload-URI →
-//! filename layout. Each component supplies its own `BankSetSpec` at
-//! construction time; the bank-set machinery in component-mgr stays generic.
+//! the behavior that used to be hard-coded in `match bank_set { … }`
+//! helpers — today just the on-disk directory name. Each component
+//! supplies its own `BankSetSpec` at construction time; the bank-set
+//! machinery in component-mgr stays generic.
 //!
-//! Phase 2 of the deep refactor adds this module. Phase 3 makes the
-//! spec construction config-driven (via component-factory's
-//! `ComponentSpec`) so deployments add components without touching
-//! this code at all.
+//! On-disk bank filenames are the SUIT component-id's last segment
+//! **verbatim**: the manifest author picks the real filename
+//! (`rootfs.img`, `vm-config.yaml`, `qvm.conf`, `kernel`, …) and it lands
+//! under the bank dir unchanged. There is no URI→filename remap layer —
+//! naming keys off the stable component-id part, never the (possibly
+//! content-addressed) payload uri.
 
 use nv_store::types::BankSet;
-
-/// How SUIT payload URIs map to on-disk filenames inside a bank dir.
-///
-/// `payload_target_name(layout, uri)` is the lookup helper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BankLayout {
-    /// VM-style: `#kernel` → `kernel`, `#qvm-config` → `qvm.conf`.
-    /// Used by qvm guest VMs (vm1, vm2 today).
-    Vm,
-    /// Bootable IFS: `#kernel` → `boot.ifs`, `#qvm-config` → `qvm.conf`.
-    /// Used by the host OS image, the HSM keystore, and the host
-    /// self-update slot. (The `qvm.conf` part is meaningless for HSM
-    /// but harmless — that slot never delivers a `#qvm-config` URI.)
-    BootIfs,
-    /// Pass-through: no special URI mappings. Any `#foo` URI lands as
-    /// `foo` (the `#` is stripped). Used by Custom-style slots whose
-    /// manifests deliver deployment-specific files (e.g. the RT side's
-    /// `rt-firmware.bin`).
-    Generic,
-}
 
 /// Per-bank-set spec attached to each ComponentBackend at construction.
 #[derive(Debug, Clone)]
@@ -39,16 +21,14 @@ pub struct BankSetSpec {
     /// On-disk subdirectory under `images_dir`. E.g. "vm1", "host-os",
     /// "custom", or a deployment-defined name for an extra slot.
     pub dir_name: String,
-
-    /// SUIT-URI → filename mapping.
-    pub layout: BankLayout,
 }
 
 impl BankSetSpec {
-    /// Build the default spec for one of the six well-known BankSet
-    /// slots. **Bridge for Phase 2** — until Phase 3 wires the spec
-    /// through component-factory, every existing ComponentBackend
-    /// constructor goes through here.
+    /// Build the default spec for one of the well-known BankSet slots —
+    /// the on-disk directory name that slot lives under. Every existing
+    /// ComponentBackend constructor goes through here; component-factory
+    /// overrides `dir_name` from deployment config (`storage_subdir`)
+    /// when a slot needs a distinct directory.
     pub fn for_well_known(bs: BankSet) -> Self {
         let dir_name = match bs {
             BankSet::Hsm => "hsm",
@@ -61,55 +41,25 @@ impl BankSetSpec {
         }
         .to_string();
 
-        let layout = match bs {
-            BankSet::Vm1 | BankSet::Vm2 => BankLayout::Vm,
-            BankSet::Os | BankSet::Hsm => BankLayout::BootIfs,
-            // Bootloader + Rt are pass-through (like the old Custom slot).
-            _ => BankLayout::Generic,
-        };
-
-        Self { dir_name, layout }
+        Self { dir_name }
     }
 }
 
-/// Map a SUIT payload URI to the on-disk filename inside the target
-/// bank dir, given the bank's layout. Replaces the
-/// `bank_set`-keyed `payload_target_name(BankSet, &str)`.
-pub fn payload_target_name(layout: BankLayout, uri: &str) -> String {
-    let (kernel_name, qvm_config_name) = match layout {
-        BankLayout::Vm => ("kernel", "qvm.conf"),
-        BankLayout::BootIfs => ("boot.ifs", "qvm.conf"),
-        BankLayout::Generic => ("", ""),
-    };
-    // Generic banks (e.g. the M7/RT slot) are verbatim — NO VM-style URI
-    // remapping. Without this gate, `#firmware`/`#config` would be force-renamed
-    // to rootfs.img / vm-config.yaml even for rt, so `rt-firmware.s19` lands as
-    // rootfs.img and the m7loader can't find it. Only VM/BootIfs layouts remap.
-    let vm_style = !matches!(layout, BankLayout::Generic);
-    match uri {
-        "#kernel" if !kernel_name.is_empty() => kernel_name.to_string(),
-        "#firmware" if vm_style => "rootfs.img".to_string(),
-        "#config" if vm_style => "vm-config.yaml".to_string(),
-        "#qvm-config" if !qvm_config_name.is_empty() => qvm_config_name.to_string(),
-        other => other.trim_start_matches('#').to_string(),
-    }
-}
-
-/// The on-disk bank filename for a SUIT component, keyed off its component-id
-/// **part** segment rather than its payload uri.
+/// The on-disk bank filename for a SUIT component: its component-id's last
+/// **part** segment, taken verbatim.
 ///
 /// The payload uri is the content-address fetch reference (`sha256:<outer>`) and
 /// must never dictate the on-disk name — otherwise a content-addressed payload
 /// lands verbatim as `sha256:…` and the bank won't boot. The component-id's last
-/// segment is the stable part identity (`[component, part]` → `part`) the layout
-/// maps to `kernel` / `rootfs.img` / `vm-config.yaml`; `#firmware` is the fallback
-/// when a component carries no id.
-pub fn payload_target_name_for_id(layout: BankLayout, component_id: Option<&[Vec<u8>]>) -> String {
-    let key = component_id
+/// segment is the stable part identity (`[component, part]` → `part`) and IS the
+/// on-disk filename as authored (`rootfs.img`, `vm-config.yaml`, `qvm.conf`,
+/// `kernel`, …) — no remap. `firmware` is the fallback when a component carries
+/// no id.
+pub fn payload_target_name_for_id(component_id: Option<&[Vec<u8>]>) -> String {
+    component_id
         .and_then(|segs| segs.last())
-        .map(|seg| format!("#{}", String::from_utf8_lossy(seg)))
-        .unwrap_or_else(|| "#firmware".to_string());
-    payload_target_name(layout, &key)
+        .map(|seg| String::from_utf8_lossy(seg).into_owned())
+        .unwrap_or_else(|| "firmware".to_string())
 }
 
 #[cfg(test)]
@@ -118,123 +68,59 @@ mod tests {
 
     #[test]
     fn for_well_known_vm_slots() {
-        let s = BankSetSpec::for_well_known(BankSet::Vm1);
-        assert_eq!(s.dir_name, "vm1");
-        assert_eq!(s.layout, BankLayout::Vm);
-
-        let s = BankSetSpec::for_well_known(BankSet::Vm2);
-        assert_eq!(s.dir_name, "vm2");
-        assert_eq!(s.layout, BankLayout::Vm);
+        assert_eq!(BankSetSpec::for_well_known(BankSet::Vm1).dir_name, "vm1");
+        assert_eq!(BankSetSpec::for_well_known(BankSet::Vm2).dir_name, "vm2");
     }
 
     #[test]
-    fn for_well_known_boot_ifs_slots() {
-        for bs in [BankSet::Os, BankSet::Hsm] {
-            let s = BankSetSpec::for_well_known(bs);
-            assert_eq!(s.layout, BankLayout::BootIfs);
-        }
+    fn for_well_known_os_hsm_dir_names() {
+        assert_eq!(BankSetSpec::for_well_known(BankSet::Os).dir_name, "os");
+        assert_eq!(BankSetSpec::for_well_known(BankSet::Hsm).dir_name, "hsm");
     }
 
     #[test]
-    fn for_well_known_rt_is_generic() {
-        let s = BankSetSpec::for_well_known(BankSet::Rt);
-        assert_eq!(s.dir_name, "rt");
-        assert_eq!(s.layout, BankLayout::Generic);
+    fn for_well_known_rt_dir_name() {
+        assert_eq!(BankSetSpec::for_well_known(BankSet::Rt).dir_name, "rt");
     }
 
     #[test]
-    fn unknown_slot_falls_back_to_generic_custom() {
-        // Slots beyond the well-known 6 get the same default as Custom.
-        // Phase 3 replaces this with a component-config lookup.
-        let s = BankSetSpec::for_well_known(BankSet(99));
-        assert_eq!(s.dir_name, "custom");
-        assert_eq!(s.layout, BankLayout::Generic);
+    fn unknown_slot_falls_back_to_custom() {
+        // Slots beyond the well-known ones get the "custom" dir. Phase 3
+        // replaces this with a component-config lookup.
+        assert_eq!(BankSetSpec::for_well_known(BankSet(99)).dir_name, "custom");
     }
 
     #[test]
     fn payload_name_from_component_id_not_uri() {
         // Regression guard: a content-address payload uri must NOT leak into the
         // on-disk name (that produced un-bootable `sha256:…` bank files). Naming
-        // keys off the component-id `[component, part]` part segment instead.
+        // keys off the component-id `[component, part]` part segment, taken
+        // VERBATIM — the manifest author already chose the real filename, so
+        // there is no URI→filename remap.
         let kernel = [b"vm1".to_vec(), b"kernel".to_vec()];
-        let rootfs = [b"vm1".to_vec(), b"firmware".to_vec()];
-        let config = [b"vm1".to_vec(), b"config".to_vec()];
+        let rootfs = [b"vm1".to_vec(), b"rootfs.img".to_vec()];
+        let config = [b"vm1".to_vec(), b"vm-config.yaml".to_vec()];
+        let qvm = [b"vm1".to_vec(), b"qvm.conf".to_vec()];
+        // A deployment-specific segment lands verbatim, same as any other.
+        let rt = [b"rt".to_vec(), b"rt-firmware.s19".to_vec()];
         assert_eq!(
-            payload_target_name_for_id(BankLayout::Vm, Some(kernel.as_slice())),
+            payload_target_name_for_id(Some(kernel.as_slice())),
             "kernel"
         );
         assert_eq!(
-            payload_target_name_for_id(BankLayout::Vm, Some(rootfs.as_slice())),
+            payload_target_name_for_id(Some(rootfs.as_slice())),
             "rootfs.img"
         );
         assert_eq!(
-            payload_target_name_for_id(BankLayout::Vm, Some(config.as_slice())),
+            payload_target_name_for_id(Some(config.as_slice())),
             "vm-config.yaml"
         );
-        // No id → the #firmware fallback, never a raw content address.
+        assert_eq!(payload_target_name_for_id(Some(qvm.as_slice())), "qvm.conf");
         assert_eq!(
-            payload_target_name_for_id(BankLayout::Vm, None),
-            "rootfs.img"
-        );
-    }
-
-    #[test]
-    fn payload_uri_mapping_vm() {
-        assert_eq!(payload_target_name(BankLayout::Vm, "#kernel"), "kernel");
-        assert_eq!(
-            payload_target_name(BankLayout::Vm, "#firmware"),
-            "rootfs.img"
-        );
-        assert_eq!(
-            payload_target_name(BankLayout::Vm, "#config"),
-            "vm-config.yaml"
-        );
-        assert_eq!(
-            payload_target_name(BankLayout::Vm, "#qvm-config"),
-            "qvm.conf"
-        );
-        // Anything else strips the leading '#'.
-        assert_eq!(payload_target_name(BankLayout::Vm, "#extra"), "extra");
-    }
-
-    #[test]
-    fn payload_uri_mapping_boot_ifs() {
-        assert_eq!(
-            payload_target_name(BankLayout::BootIfs, "#kernel"),
-            "boot.ifs"
-        );
-        assert_eq!(
-            payload_target_name(BankLayout::BootIfs, "#qvm-config"),
-            "qvm.conf"
-        );
-    }
-
-    #[test]
-    fn payload_uri_mapping_generic_passes_through() {
-        // No special URI mappings — `#kernel` becomes `kernel` via the
-        // trim_start_matches fallback, NOT the layout-specific table.
-        assert_eq!(
-            payload_target_name(BankLayout::Generic, "#kernel"),
-            "kernel"
-        );
-        assert_eq!(
-            payload_target_name(BankLayout::Generic, "#rt-firmware"),
-            "rt-firmware",
-        );
-        // #firmware / #config are VM/BootIfs-isms — Generic must NOT remap them
-        // (the regression that wrote rt's firmware as rootfs.img). Verbatim.
-        assert_eq!(
-            payload_target_name(BankLayout::Generic, "#firmware"),
-            "firmware"
-        );
-        assert_eq!(
-            payload_target_name(BankLayout::Generic, "#config"),
-            "config"
-        );
-        // The real rt payload URI lands verbatim — what the m7loader expects.
-        assert_eq!(
-            payload_target_name(BankLayout::Generic, "#rt-firmware.s19"),
+            payload_target_name_for_id(Some(rt.as_slice())),
             "rt-firmware.s19"
         );
+        // No id → the `firmware` fallback, never a raw content address.
+        assert_eq!(payload_target_name_for_id(None), "firmware");
     }
 }

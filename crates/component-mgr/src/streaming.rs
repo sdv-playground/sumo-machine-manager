@@ -18,7 +18,7 @@ use sumo_onboard::decryptor::StreamingDecryptor;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
-use crate::bank_spec::{payload_target_name_for_id, BankSetSpec};
+use crate::bank_spec::payload_target_name_for_id;
 use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware};
 
 use machine_mgr::bank_provider::BankProvider;
@@ -50,7 +50,6 @@ pub async fn process_envelope_stream(
     min_security_ver: u32,
     bank_provider: Option<&dyn BankProvider>,
     bank_set: BankSet,
-    bank_spec: &BankSetSpec,
     target_bank: Bank,
 ) -> Result<ValidatedFirmware, BackendError> {
     // Convert PackageStream → AsyncRead
@@ -136,8 +135,7 @@ pub async fn process_envelope_stream(
 
         // Name from the component-id part, not the (possibly content-address)
         // payload key — see `payload_target_name_for_id`.
-        let target_name =
-            payload_target_name_for_id(bank_spec.layout, manifest.component_id(comp_idx));
+        let target_name = payload_target_name_for_id(manifest.component_id(comp_idx));
 
         // Open the payload sink through the bank provider — it owns where the
         // bytes land (a file in the target bank dir for IVD, a raw-partition

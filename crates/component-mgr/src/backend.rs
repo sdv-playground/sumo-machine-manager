@@ -1080,10 +1080,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     ))
                 })?;
             // Name from the component-id part, not the (content-address) uri.
-            let name = crate::bank_spec::payload_target_name_for_id(
-                self.bank_spec.layout,
-                manifest.component_id(i),
-            );
+            let name = crate::bank_spec::payload_target_name_for_id(manifest.component_id(i));
 
             let (sha256, size) =
                 crate::bank_seed::copy_forward_file(&active_dir, &target_dir, &name, &expected)
@@ -1512,10 +1509,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
             // Name from the component-id part, not the (possibly content-address)
             // uri — see `payload_target_name_for_id`.
-            let target_name = crate::bank_spec::payload_target_name_for_id(
-                self.bank_spec.layout,
-                suit_manifest.component_id(comp_idx),
-            );
+            let target_name =
+                crate::bank_spec::payload_target_name_for_id(suit_manifest.component_id(comp_idx));
 
             // Open the payload sink through the bank provider — it owns where
             // the bytes land and creates the bank dir as needed.
@@ -1781,10 +1776,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // Name the bank file from the component-id part, NOT the payload uri: the
         // uri is the content-address fetch reference (sha256:<outer>) and would
         // otherwise land the file as `sha256:…` (un-bootable).
-        let target_name = crate::bank_spec::payload_target_name_for_id(
-            self.bank_spec.layout,
-            manifest.component_id(comp_idx),
-        );
+        let target_name =
+            crate::bank_spec::payload_target_name_for_id(manifest.component_id(comp_idx));
 
         // Open the payload sink through the bank provider — it owns where the
         // bytes land and creates the bank dir as needed.
@@ -2643,7 +2636,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             min_security_ver,
             Some(self.bank_provider.as_ref()),
             self.bank_set,
-            &self.bank_spec,
             target_bank,
         )
         .await
@@ -4317,11 +4309,10 @@ fn installed_manifest_json(fw: &InstalledFirmware) -> serde_json::Value {
 // `crate::bank_provider` alongside the IVD bank-layout logic that uses
 // them — the engine no longer touches bank dirs directly, it routes
 // every write through `BankProvider::open_payload_writer`.
-// `bank_set_dir_name` / `bank_file_names` / `payload_target_name`
-// retired earlier — per-slot behavior lives on `BankSetSpec` in
-// `crate::bank_spec` now and is read off `self.bank_spec` for the
-// backend or passed as `&BankSetSpec` to free functions in
-// `streaming::process_envelope_stream`.
+// `bank_set_dir_name` / `bank_file_names` retired earlier — the on-disk
+// dir name lives on `BankSetSpec` in `crate::bank_spec` now and is read
+// off `self.bank_spec.dir_name`. Bank filenames are the SUIT component-id
+// part taken verbatim (`bank_spec::payload_target_name_for_id`), no remap.
 
 fn map_ota_error(e: ota::OtaError) -> BackendError {
     match e {
@@ -5563,8 +5554,9 @@ mod copy_forward_tests {
 
     /// A detached (no integrated payload) single-component SUIT manifest whose
     /// declared image digest is `digest` — mimics the offboard "manifest-only,
-    /// you already have this" push. `component_id = ["vm1", part]` so the on-disk
-    /// name resolves through the VM layout (`firmware` → `rootfs.img`).
+    /// you already have this" push. `component_id = ["vm1", part]` — the part
+    /// segment is the on-disk bank filename, verbatim. The payload uri stays
+    /// `#firmware` on purpose: naming must key off the id, never the uri.
     fn detached_manifest(part: &str, digest: &[u8], size: u64) -> Vec<u8> {
         let key = keygen::generate_signing_key(keygen::ES256).unwrap();
         ImageManifestBuilder::new()
@@ -5606,7 +5598,7 @@ mod copy_forward_tests {
         std::fs::write(active.join("rootfs.img"), content).unwrap();
         let digest: [u8; 32] = Sha256::digest(content).into();
 
-        let manifest = detached_manifest("firmware", &digest, content.len() as u64);
+        let manifest = detached_manifest("rootfs.img", &digest, content.len() as u64);
         let backend = vm1_backend(images_dir.clone());
 
         let copied = backend
@@ -5635,7 +5627,7 @@ mod copy_forward_tests {
         std::fs::write(active.join("rootfs.img"), b"STALE local rootfs").unwrap();
 
         let declared: [u8; 32] = Sha256::digest(b"the version offboard expects").into();
-        let manifest = detached_manifest("firmware", &declared, 42);
+        let manifest = detached_manifest("rootfs.img", &declared, 42);
         let backend = vm1_backend(images_dir.clone());
 
         let err = backend
@@ -5653,7 +5645,7 @@ mod copy_forward_tests {
     fn copy_forward_unpushed_noop_when_all_pushed() {
         let tmp = tempfile::tempdir().unwrap();
         let images_dir = tmp.path().to_path_buf();
-        let manifest = detached_manifest("firmware", &[0u8; 32], 0);
+        let manifest = detached_manifest("rootfs.img", &[0u8; 32], 0);
         let backend = vm1_backend(images_dir);
         let copied = backend
             .copy_forward_unpushed(&manifest, 1, 1, Bank::B)
@@ -5738,7 +5730,7 @@ mod copy_forward_tests {
         // Park a manifest-only session (0 of 1 components pushed) + the Firmware
         // package finalize reads image_meta from (image_sha256 = None, exactly
         // the header-only shape the real manifest-only path produces).
-        let manifest = detached_manifest("firmware", &digest, content.len() as u64);
+        let manifest = detached_manifest("rootfs.img", &digest, content.len() as u64);
         let validated = ValidatedFirmware {
             bank_set: BankSet::Vm1,
             manifest_type: ManifestType::Firmware,

@@ -178,7 +178,7 @@ async fn single_component_unencrypted() {
 
     let envelope = ImageManifestBuilder::new()
         .signing_time(1_700_000_000)
-        .component_id(vec!["vm1".to_string(), "firmware".to_string()])
+        .component_id(vec!["vm1".to_string(), "rootfs.img".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, payload.len() as u64)
@@ -196,7 +196,6 @@ async fn single_component_unencrypted() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -222,7 +221,7 @@ async fn single_component_encrypted() {
 
     let envelope = ImageManifestBuilder::new()
         .signing_time(1_700_000_000)
-        .component_id(vec!["vm1".to_string(), "firmware".to_string()])
+        .component_id(vec!["vm1".to_string(), "rootfs.img".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, plaintext.len() as u64)
@@ -241,7 +240,6 @@ async fn single_component_encrypted() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -473,7 +471,7 @@ async fn chunked_delivery() {
 
     let envelope = ImageManifestBuilder::new()
         .signing_time(1_700_000_000)
-        .component_id(vec!["vm1".to_string(), "firmware".to_string()])
+        .component_id(vec!["vm1".to_string(), "rootfs.img".to_string()])
         .sequence_number(1)
         .security_version(1)
         .payload_digest(&digest, payload.len() as u64)
@@ -491,7 +489,6 @@ async fn chunked_delivery() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -539,7 +536,6 @@ async fn corrupted_payload_digest_mismatch() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -583,7 +579,6 @@ async fn truncated_transfer() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -624,7 +619,6 @@ async fn wrong_device_key() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -665,7 +659,6 @@ async fn anti_rollback_rejects_old_security_version() {
         5, // min_security_ver = 5 — higher than manifest's 1
         Some(&bank_provider),
         BankSet::Vm1,
-        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;
@@ -717,7 +710,6 @@ async fn stream_error_mid_transfer() {
         0,
         Some(&bank_provider),
         BankSet::Vm1,
-        &component_mgr::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1),
         Bank::A,
     )
     .await;

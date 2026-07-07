@@ -58,15 +58,6 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub storage_subdir: Option<String>,
 
-    /// SUIT payload-URI → filename mapping for this slot. One of:
-    /// - `"vm"`: `#kernel` → `kernel`, `#qvm-config` → `qvm.conf`
-    /// - `"boot-ifs"`: `#kernel` → `boot.ifs`, `#qvm-config` → `qvm.conf`
-    /// - `"generic"`: pass-through (`#foo` → `foo`)
-    ///
-    /// Defaults to the well-known layout for the resolved BankSet.
-    #[serde(default)]
-    pub bank_layout: Option<String>,
-
     /// Bank-activator marker. When set, the caller constructs the
     /// appropriate activator and inserts it into `FactoryDeps::bank_activators`.
     /// Also suppresses vm-service notifications for this component.
@@ -182,9 +173,9 @@ pub fn resolve_bank_set(spec: &ComponentSpec) -> Option<BankSet> {
     bank_set_for_id(&spec.id)
 }
 
-/// Resolve both the bank-set slot AND its spec (dir name + layout)
+/// Resolve both the bank-set slot AND its spec (on-disk dir name)
 /// from a `ComponentSpec`. The slot comes from [`resolve_bank_set`];
-/// the dir name and layout are taken from the explicit fields when
+/// the dir name is taken from the explicit `storage_subdir` when
 /// present, else defaulted via `BankSetSpec::for_well_known`.
 ///
 /// Returns `None` if the slot can't be resolved.
@@ -195,21 +186,6 @@ pub fn resolve_bank_set_spec(
     let mut bspec = component_mgr::bank_spec::BankSetSpec::for_well_known(bank_set);
     if let Some(ref subdir) = spec.storage_subdir {
         bspec.dir_name = subdir.clone();
-    }
-    if let Some(ref layout) = spec.bank_layout {
-        bspec.layout = match layout.as_str() {
-            "vm" => component_mgr::bank_spec::BankLayout::Vm,
-            "boot-ifs" | "bootifs" => component_mgr::bank_spec::BankLayout::BootIfs,
-            "generic" | "custom" => component_mgr::bank_spec::BankLayout::Generic,
-            other => {
-                tracing::warn!(
-                    component = %spec.id,
-                    bank_layout = %other,
-                    "unknown bank_layout — falling back to default",
-                );
-                bspec.layout
-            }
-        };
     }
     Some((bank_set, bspec))
 }
