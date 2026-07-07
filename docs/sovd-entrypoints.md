@@ -20,7 +20,7 @@ Across the whole workspace the deployed SOVD-API servers are:
 |---|---|---|---|---|---|
 | 1 | `vm-sovd` (default mode) | sumo-mm | host (dev/sim) | `0.0.0.0:4000` | host-owned components (host-os, vm1, vm2, hsm) + OTA |
 | 2 | `vm-sovd --gateway` | sumo-mm | in-VM **or** on-host | `0.0.0.0:9300` (example) | guest components + onboard pull-update + proxy of host components |
-| 3 | the production host server | vendor-private sibling | host (production) | `0.0.0.0:4000` | production counterpart of #1 — same routes, real HSM, auth |
+| 3 | the production host server | vendor-private sibling | host (production) | `0.0.0.0:4000` | production counterpart of #1 — same routes + onboard pull-update, real HSM, auth |
 | 4 | `sovdd` | SOVDd | standalone | `0.0.0.0:18081` (mock) | reference SOVD server (UDS↔REST, gateway, proxy) |
 | 5 | `example-app` | SOVDd | standalone | `0.0.0.0:4001` | reference app-entity (tier-1 supplier) server |
 
@@ -69,8 +69,11 @@ repo — that serve the **same** wire from the **same** route library.
 - **Serves:** the production counterpart of `vm-sovd` — the same
   `sovd_api::create_router` + the same sumo vendor routes from this repo
   (`component_mgr::sovd::routes::{hsm_router, device_id_router,
-  node_verdict_router, update_state_router}`), plus `x-sumo-boot-id`,
-  `x-sumo-freshness`, and `/factory_reset`. It is **host-only — no gateway
+  node_verdict_router, update_state_router}`), the **onboard pull-update**
+  entry (`component_mgr::sovd::pull_update` — async `202` + status polling;
+  the sw-authority anchor resolves per-POST, so an unprovisioned device
+  answers 503 on that route and starts serving pulls right after
+  provisioning), plus `x-sumo-boot-id` and `/factory_reset`. It is **host-only — no gateway
   mode** (the "proxy" in its code is the *vhsm-ssd* HSM proxy, not SOVD
   proxying). Secure-by-default authorizer is always wired
   (`src/main.rs:1766-1856`).
@@ -94,8 +97,10 @@ It serves:
 
 - the guest's **own** components (its local `Machine`),
 - the **onboard pull-update** operation `POST /vehicle/v1/operations/x-sumo-pull-update/executions`
-  with **route-scoped** Operational `update:execute` authz
-  (`pull_update_router`),
+  with **route-scoped** Operational `update:execute` authz, re-checked per
+  targeted component (`pull_update_router` — async: `202` + `Location`, poll
+  `GET .../executions/{id}`; multi-component campaigns dispatch each L2 to its
+  own component),
 - **host-owned components proxied** to the host SOVD: each `--proxy-component`
   becomes a `sovd_proxy::SovdProxyBackend` forwarding to `--host-sovd-url`, so a
   proxied host component is just another entry in the SOVD entity map — that is

@@ -197,6 +197,35 @@ impl Puller {
         })
     }
 
+    /// Size of a blob via a `HEAD` request — the ciphertext (outer) byte
+    /// count needed to drive [`Self::fetch_blob`], which the SUIT manifest
+    /// does not carry (its `image_size` is the plaintext size). The value is
+    /// untrusted-but-harmless: a lying `Content-Length` fails `fetch_blob`'s
+    /// size/sha checks anyway.
+    #[instrument(skip(self), fields(uri = %blob_uri))]
+    pub async fn blob_size(&self, blob_uri: &str) -> PullerResult<u64> {
+        let url = self.resolve(blob_uri)?;
+        let resp = self
+            .http
+            .head(url.clone())
+            .send()
+            .await
+            .map_err(|e| PullerError::Transport(format!("HEAD {url}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(PullerError::Http {
+                url: url.to_string(),
+                status: status.as_u16(),
+                body: String::new(),
+            });
+        }
+        resp.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| PullerError::Transport(format!("HEAD {url}: no Content-Length")))
+    }
+
     /// Stream a blob to `dst_path`, hashing as it goes and rejecting
     /// on sha256 mismatch.  Supports `Range` resumption — if the
     /// destination already has bytes, the puller asks for the suffix
@@ -382,6 +411,20 @@ pub fn content_address_sha256(uri: &str) -> Option<[u8; 32]> {
     decode_hex32(candidate)
 }
 
+/// Map a content-addressed URI onto the path it is fetched from.
+///
+/// A bare `sha256:<hex>` scheme names content but is not directly fetchable —
+/// [`Puller::resolve`] would treat it as an absolute non-http URL. The
+/// FLEET-REPO-001 / repo convention stores blobs at `blobs/<hex>`, so map the
+/// scheme onto that path. Every other URI (relative path, absolute http(s))
+/// passes through untouched.
+pub fn cas_fetch_path(uri: &str) -> String {
+    match uri.strip_prefix("sha256:") {
+        Some(hex) if decode_hex32(hex).is_some() => format!("blobs/{hex}"),
+        _ => uri.to_string(),
+    }
+}
+
 fn decode_hex32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
@@ -454,5 +497,26 @@ mod content_address_tests {
         assert_eq!(content_address_sha256("blobs/deadbeef"), None);
         assert_eq!(content_address_sha256(""), None);
         assert_eq!(content_address_sha256(&"z".repeat(64)), None);
+    }
+
+    #[test]
+    fn cas_fetch_path_maps_sha256_scheme_to_blob_path() {
+        use super::cas_fetch_path;
+        assert_eq!(
+            cas_fetch_path(&format!("sha256:{HEX}")),
+            format!("blobs/{HEX}")
+        );
+        // Already-fetchable forms pass through untouched.
+        assert_eq!(
+            cas_fetch_path(&format!("blobs/{HEX}")),
+            format!("blobs/{HEX}")
+        );
+        assert_eq!(
+            cas_fetch_path(&format!("https://repo/cas/{HEX}")),
+            format!("https://repo/cas/{HEX}")
+        );
+        // A malformed digest is not a content-address; leave it alone rather
+        // than inventing a blob path for it.
+        assert_eq!(cas_fetch_path("sha256:deadbeef"), "sha256:deadbeef");
     }
 }

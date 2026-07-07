@@ -32,17 +32,20 @@ use crate::sovd::routes::{hsm_router, node_verdict_router, pull_update_router};
 /// on the global `create_router` authorizer — the rest of the surface keeps its
 /// current behaviour (the separate, already-tracked global-enforcement
 /// migration owns that). `trust_anchor` is the device's pinned manifest-signing
-/// key (verifies every fetched campaign dependency).
+/// key (verifies every fetched campaign dependency) — resolved once at gateway
+/// construction, since a guest gateway only starts on a provisioned device.
 pub fn gateway_router(
     machine: Arc<dyn Machine>,
     backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
     authorizer: Arc<dyn Authorizer>,
     trust_anchor: Vec<u8>,
 ) -> Router {
+    let anchor: crate::sovd::pull_update::TrustAnchorSource =
+        Arc::new(move || Some(trust_anchor.clone()));
     create_router(AppState::new(backends))
         .merge(hsm_router(machine.clone()))
         .merge(node_verdict_router(machine.clone()))
-        .merge(pull_update_router(machine, authorizer, trust_anchor))
+        .merge(pull_update_router(machine, authorizer, anchor))
 }
 
 #[cfg(test)]

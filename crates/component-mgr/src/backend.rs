@@ -325,6 +325,13 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     uploaded_parts: Mutex<HashMap<String, UploadedPartLocation>>,
     flash_session: Mutex<Option<FlashSessionState>>,
     flash_transfer: Mutex<Option<FlashTransferState>>,
+    /// Session-scoped pull source (untrusted CAS base URL + trust anchor +
+    /// campaign session id) for installs whose manifest references payloads by
+    /// content-addressed URI. Set by the pull route BEFORE `start_flash` via
+    /// [`set_install_source`](Self::set_install_source); cleared when the
+    /// session ends (`clear_flash_session` / successful `finalize_flash`).
+    /// Never set on the push path.
+    install_source: Mutex<Option<machine_mgr::InstallSource>>,
     /// The bank the ECU is actually running on. Only changes on ecu_reset().
     /// NV active_bank may differ after install (it's the "next boot" bank).
     running_bank: Mutex<Bank>,
@@ -561,6 +568,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             payloads: Mutex::new(HashMap::new()),
             flash_session: Mutex::new(None),
             flash_transfer: Mutex::new(None),
+            install_source: Mutex::new(None),
             running_bank: Mutex::new(running_bank),
             session: Mutex::new(SessionState::Default),
             security: Mutex::new(SecurityAccessState::default()),
@@ -1006,22 +1014,28 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .unwrap_or_default()
     }
 
-    /// Copy-forward the manifested-but-un-pushed components
-    /// `[next_component .. total_components)` from the active bank into `target`,
-    /// each DIGEST-VERIFIED against the manifest's declared plaintext image digest.
+    /// Reconcile the manifested-but-un-pushed components
+    /// `[next_component .. total_components)` so the target bank is
+    /// content-complete, each part DIGEST-VERIFIED against the manifest's
+    /// declared plaintext image digest. Per part, in order:
     ///
-    /// A manifest-only (or partial) push declares components but ships no payload
-    /// for some, signalling "the vehicle already has this" — the vehicle-side half
-    /// of the offboard copy-vs-fetch decision. We reconcile by copying the active
-    /// bank's file for each such component, but ONLY when its on-disk content
-    /// hashes to exactly what the manifest declared. A mismatch (stale / wrong /
-    /// missing active content) returns an error that FAILS the install rather than
-    /// sealing a bank whose bytes don't match the manifest's promise.
+    /// 1. **Copy-forward** from the active bank when its on-disk content hashes
+    ///    to exactly what the manifest declared ("the vehicle already has
+    ///    this" — the push path's manifest-only case, and the pull path's
+    ///    cheap local half of copy-vs-fetch).
+    /// 2. **Fetch by content-address** when copy-forward can't satisfy the
+    ///    part AND the pull route provided a session [`machine_mgr::InstallSource`]
+    ///    AND the (T2-signed) manifest URI carries a content-address: the blob
+    ///    streams from the untrusted CAS through the two-checksum pipeline
+    ///    (outer = signed content-address, inner = manifest `image_digest`)
+    ///    straight into the target bank.
+    /// 3. Otherwise FAIL the install rather than sealing a bank whose bytes
+    ///    don't match the manifest's promise.
     ///
     /// Returns the copied files as an [`hsm::ivd::IvdFile`] inventory so the caller
     /// can fold them into the flash transfer's `streamed_files` (parity with the
     /// pushed path). A no-op returning empty when there are no un-pushed components.
-    fn copy_forward_unpushed(
+    async fn reconcile_unpushed(
         &self,
         manifest_bytes: &[u8],
         next_component: usize,
@@ -1033,7 +1047,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         }
         let images_dir = self.images_dir.as_ref().ok_or_else(|| {
             BackendError::Internal(
-                "manifest-only push needs an images_dir to copy the active bank forward".into(),
+                "manifest-only push needs an images_dir to reconcile the target bank".into(),
             )
         })?;
 
@@ -1066,42 +1080,131 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // header-only manifest, so the per-component expected digest comes from
         // the SUIT manifest itself.
         let envelope = sumo_codec::decode::decode_envelope(manifest_bytes)
-            .map_err(|e| BackendError::Internal(format!("copy-forward decode manifest: {e:?}")))?;
+            .map_err(|e| BackendError::Internal(format!("reconcile decode manifest: {e:?}")))?;
         let manifest = sumo_onboard::manifest::Manifest { envelope };
 
-        let mut copied = Vec::with_capacity(total_components - next_component);
+        // One puller per reconcile pass, built lazily on the first part that
+        // needs a fetch — push-path finalizes never pay for it.
+        let mut cas_puller: Option<puller::Puller> = None;
+
+        let mut done = Vec::with_capacity(total_components - next_component);
         for i in next_component..total_components {
             let expected = manifest
                 .image_digest(i)
                 .map(|d| d.0.bytes.clone())
                 .ok_or_else(|| {
                     BackendError::Internal(format!(
-                        "copy-forward: manifest has no image_digest for component {i}"
+                        "reconcile: manifest has no image_digest for component {i}"
                     ))
                 })?;
             // Name from the component-id part, not the (content-address) uri.
             let name = crate::bank_spec::payload_target_name_for_id(manifest.component_id(i));
 
-            let (sha256, size) =
-                crate::bank_seed::copy_forward_file(&active_dir, &target_dir, &name, &expected)
-                    .map_err(|e| {
+            match crate::bank_seed::copy_forward_file(&active_dir, &target_dir, &name, &expected) {
+                Ok((sha256, size)) => {
+                    tracing::info!(
+                        component = i,
+                        file = %name,
+                        size,
+                        "reconcile: active bank content matches manifest digest — copied to target",
+                    );
+                    done.push(hsm::ivd::IvdFile {
+                        relative_path: name,
+                        sha256: sha256.to_vec(),
+                        size,
+                    });
+                }
+                Err(copy_err) => {
+                    // Copy-forward can't satisfy this part — fall back to
+                    // fetching it by content-address IF the pull route provided
+                    // a session source and the (signed) manifest URI carries an
+                    // address. Otherwise the copy-forward refusal stands: never
+                    // seal a bank whose bytes don't match the manifest promise.
+                    let source = self.install_source.lock().unwrap().clone();
+                    let uri = manifest.uri(i).map(str::to_owned);
+                    let fetchable = source
+                        .zip(uri)
+                        .filter(|(_, u)| puller::content_address_sha256(u).is_some());
+                    let Some((src, uri)) = fetchable else {
+                        return Err(BackendError::Internal(format!(
+                            "reconcile refused for component {i}: {copy_err}; \
+                             no fetch source / content-addressed uri to fall back to"
+                        )));
+                    };
+                    if cas_puller.is_none() {
+                        cas_puller = Some(
+                            puller::Puller::new(&src.cas_base_url, &src.trust_anchor).map_err(
+                                |e| BackendError::Internal(format!("reconcile: build puller: {e}")),
+                            )?,
+                        );
+                    }
+                    let p = cas_puller.as_ref().unwrap();
+                    // `sha256:<hex>` names content but isn't fetchable as-is —
+                    // map it onto the repo's blob path. The mapped path still
+                    // carries the content-address for the outer verify.
+                    let path = puller::cas_fetch_path(&uri);
+                    let outer_size = p.blob_size(&path).await.map_err(|e| {
                         BackendError::Internal(format!(
-                            "copy-forward refused for component {i}: {e}"
+                            "reconcile: blob size for component {i}: {e}"
                         ))
                     })?;
-            tracing::info!(
-                component = i,
-                file = %name,
-                size,
-                "copy-forward: active bank content matches manifest digest — copied to target",
-            );
-            copied.push(hsm::ivd::IvdFile {
-                relative_path: name,
-                sha256: sha256.to_vec(),
-                size,
-            });
+                    // CAS temp lives beside the bank dirs (NOT inside the
+                    // target bank) so start_flash's bank wipe never destroys a
+                    // resumable partial.
+                    let cas_tmp = images_dir.join(set_name).join("cas");
+                    std::fs::create_dir_all(&cas_tmp).map_err(|e| {
+                        BackendError::Internal(format!("reconcile: create cas tmp dir: {e}"))
+                    })?;
+                    let writer = self
+                        .bank_provider
+                        .open_payload_writer(target, &name)
+                        .map_err(|e| {
+                            BackendError::Internal(format!(
+                                "reconcile: open bank writer for {name}: {e}"
+                            ))
+                        })?;
+                    let key_unwrap = self.manifest_provider.key_unwrap_for_decryption();
+                    let fetched = crate::streaming::fetch_and_install_component(
+                        p,
+                        &path,
+                        outer_size,
+                        manifest_bytes,
+                        i,
+                        key_unwrap,
+                        &expected,
+                        writer,
+                        &cas_tmp,
+                    )
+                    .await;
+                    let (size, sha256) = match fetched {
+                        Ok(x) => x,
+                        Err(e) => {
+                            // `open_payload_writer` pre-created the bank file;
+                            // a failed fetch must not leave even a partial
+                            // artifact in the target bank (mirror of
+                            // copy_forward_file's remove-on-mismatch). The
+                            // resumable ciphertext partial in `cas/` is kept.
+                            let _ = std::fs::remove_file(target_dir.join(&name));
+                            return Err(e);
+                        }
+                    };
+                    tracing::info!(
+                        component = i,
+                        file = %name,
+                        size,
+                        uri = %uri,
+                        "reconcile: fetched by content-address into the target bank \
+                         (copy-forward said: {copy_err})",
+                    );
+                    done.push(hsm::ivd::IvdFile {
+                        relative_path: name,
+                        sha256: sha256.to_vec(),
+                        size: size as u64,
+                    });
+                }
+            }
         }
-        Ok(copied)
+        Ok(done)
     }
 
     /// Bank to serve installed-manifest / identity from: the boot selector's
@@ -1263,10 +1366,29 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         *self.flash_session.lock().unwrap() = None;
         *self.flash_transfer.lock().unwrap() = None;
         *self.upload_phase.lock().unwrap() = None;
+        *self.install_source.lock().unwrap() = None;
         self.packages.lock().unwrap().clear();
         self.manifests.lock().unwrap().clear();
         self.payloads.lock().unwrap().clear();
         self.manifest_describe.lock().unwrap().clear();
+    }
+
+    /// Provide the session-scoped pull source for the NEXT install session —
+    /// see [`machine_mgr::InstallSource`]. Called by the pull route before
+    /// `start_flash`; overwrites any previous value. Enables the fetch
+    /// fallback in `finalize_flash`'s reconciliation and stamps the campaign
+    /// session id on the node update-transaction gate.
+    pub fn set_install_source(&self, source: machine_mgr::InstallSource) {
+        *self.install_source.lock().unwrap() = Some(source);
+    }
+
+    /// Terminal session teardown shared by every abort path: drop the staging
+    /// session AND resolve this component's node-transaction membership (the
+    /// gate staged it at `start_flash`). Pre-finalize only — callers reject
+    /// post-finalize aborts first.
+    pub fn abort_session(&self) -> BackendResult<()> {
+        self.clear_flash_session();
+        self.resolve_node_transaction()
     }
 
     /// Whether a flash session is currently in flight.
@@ -1317,13 +1439,22 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // singleshot rt slipped through). A sibling joining the SAME transaction
         // (matching session id) is admitted, so the banked group can stage
         // together. On admit, this component joins the staging set. No-op until
-        // `vm-sovd` injects the coordinator. The session id is the interim zero
-        // until the campaign manifest stamps one (B5/B6); in-trial is wired with
-        // the verdict lifecycle.
+        // `vm-sovd` injects the coordinator. The session id is zero for the push
+        // path; the pull route stamps the L1 campaign id via `install_source`, so
+        // one campaign's components Join a single node transaction and anything
+        // unrelated gets Mixing-refused. In-trial is wired with the verdict
+        // lifecycle.
         if let Some(coord) = &self.node_coordinator {
             let durable = self.node_reboot_owed()?;
+            let session_id = self
+                .install_source
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|s| s.session_id)
+                .unwrap_or([0u8; 32]);
             coord
-                .gate_new_session([0u8; 32], &self.entity_info.id, &durable, &[])
+                .gate_new_session(session_id, &self.entity_info.id, &durable, &[])
                 .map_err(|r| BackendError::Busy(r.to_string()))?;
         }
 
@@ -3171,17 +3302,19 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     }
 
     async fn finalize_flash(&self) -> BackendResult<()> {
-        // Manifest-only / partial push reconciliation (copy-forward). The
-        // offboard orchestrator pushed the L2 manifest but no payload for some
-        // components, signalling "the vehicle already has these". Those
-        // components were never streamed, so the seal/sign that the final
-        // payload upload normally fires never ran — finalize would otherwise
-        // activate an empty, unsigned target bank (the guest can't boot it →
-        // trial-boot exhaustion → auto-rollback). Detect the un-pushed tail
-        // `[next_component .. total_components)`, copy it forward from the active
-        // bank (digest-verified), then seal the now-complete bank. Only
-        // meaningful with an on-disk bank (`images_dir`); in-memory test backends
-        // have no bank to reconcile and keep their prior behaviour.
+        // Manifest-only / partial push reconciliation. The orchestrator pushed
+        // the L2 manifest but no payload for some components — "the vehicle
+        // already has these" (push path) or "fetch them yourself" (pull path).
+        // Those components were never streamed, so the seal/sign that the
+        // final payload upload normally fires never ran — finalize would
+        // otherwise activate an empty, unsigned target bank (the guest can't
+        // boot it → trial-boot exhaustion → auto-rollback). Detect the
+        // un-pushed tail `[next_component .. total_components)` and reconcile
+        // it per part: copy-forward from the active bank (digest-verified),
+        // else fetch by the signed content-address when the pull route
+        // provided a session source; then seal the now-complete bank. Only
+        // meaningful with an on-disk bank (`images_dir`); in-memory test
+        // backends have no bank to reconcile and keep their prior behaviour.
         let manifest_only = if self.images_dir.is_some() {
             let session = self.flash_session.lock().unwrap();
             match session.as_ref() {
@@ -3200,20 +3333,17 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         };
         if let Some((manifest_bytes, next_component, total_components)) = manifest_only {
             let target = self.determine_target_bank()?;
-            let copied = self.copy_forward_unpushed(
-                &manifest_bytes,
-                next_component,
-                total_components,
-                target,
-            )?;
-            // Fold the copied files into the transfer inventory (parity with the
-            // streamed path), then seal the now-complete bank. `seal`'s own
-            // presence-based seed no-ops the just-copied files and IVD-signs the
+            let reconciled = self
+                .reconcile_unpushed(&manifest_bytes, next_component, total_components, target)
+                .await?;
+            // Fold the reconciled files into the transfer inventory (parity with
+            // the streamed path), then seal the now-complete bank. `seal`'s own
+            // presence-based seed no-ops the just-written files and IVD-signs the
             // full bank so external secure boot / commit accept it.
             {
                 let mut ft = self.flash_transfer.lock().unwrap();
                 if let Some(ref mut t) = *ft {
-                    t.streamed_files.extend(copied);
+                    t.streamed_files.extend(reconciled);
                 }
             }
             self.ivd_sign_staged_bank(target)?;
@@ -3228,8 +3358,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             tracing::info!(
                 bank_set = ?self.bank_set,
                 target = ?target,
-                copied_components = total_components - next_component,
-                "manifest-only push reconciled: un-pushed components copied forward from the active bank; target sealed",
+                reconciled_components = total_components - next_component,
+                "manifest-only push reconciled: un-pushed components copied forward or fetched; target sealed",
             );
         }
 
@@ -3413,6 +3543,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         {
             self.set_reboot_owed(true)?;
         }
+        // The install is applied — the session-scoped pull source has served
+        // its purpose (a later commit/rollback never fetches).
+        *self.install_source.lock().unwrap() = None;
         Ok(())
     }
 
@@ -3815,12 +3948,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 "cannot abort: install already finalized".into(),
             ));
         }
-        self.clear_flash_session();
-        // The gate staged this component at start_flash; an abort is a terminal
-        // resolution too, so drop it from the coordinator's staging (return the
-        // node toward Idle). reboot-owed clear is a no-op here — abort is rejected
-        // post-finalize above, so nothing was ever marked.
-        self.resolve_node_transaction()?;
+        // Drop the session AND the coordinator staging membership (the gate
+        // staged this component at start_flash; an abort is a terminal
+        // resolution too). reboot-owed clear is a no-op here — abort is
+        // rejected post-finalize above, so nothing was ever marked.
+        self.abort_session()?;
         Ok(())
     }
 
@@ -5588,8 +5720,8 @@ mod copy_forward_tests {
 
     /// Digest-match: the active bank's content hashes to what the manifest
     /// declares → copy it forward into the target bank + report the inventory.
-    #[test]
-    fn copy_forward_unpushed_copies_matching_component() {
+    #[tokio::test]
+    async fn reconcile_unpushed_copies_matching_component() {
         let tmp = tempfile::tempdir().unwrap();
         let images_dir = tmp.path().to_path_buf();
         let content = b"vm1 rootfs the vehicle already has";
@@ -5602,7 +5734,8 @@ mod copy_forward_tests {
         let backend = vm1_backend(images_dir.clone());
 
         let copied = backend
-            .copy_forward_unpushed(&manifest, 0, 1, Bank::B)
+            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .await
             .expect("digest matches → copy-forward");
         assert_eq!(copied.len(), 1);
         assert_eq!(copied[0].relative_path, "rootfs.img");
@@ -5615,11 +5748,11 @@ mod copy_forward_tests {
         );
     }
 
-    /// Digest-mismatch: the active bank holds a different version than the
-    /// manifest declares → the install must FAIL and stage nothing (never ship
-    /// stale content).
-    #[test]
-    fn copy_forward_unpushed_fails_on_stale_active() {
+    /// Digest-mismatch with no fetch source: the active bank holds a different
+    /// version than the manifest declares → the install must FAIL and stage
+    /// nothing (never ship stale content).
+    #[tokio::test]
+    async fn reconcile_unpushed_fails_on_stale_active() {
         let tmp = tempfile::tempdir().unwrap();
         let images_dir = tmp.path().to_path_buf();
         let active = images_dir.join("vm1/bank_a");
@@ -5631,7 +5764,8 @@ mod copy_forward_tests {
         let backend = vm1_backend(images_dir.clone());
 
         let err = backend
-            .copy_forward_unpushed(&manifest, 0, 1, Bank::B)
+            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .await
             .expect_err("digest mismatch → install must fail");
         assert!(matches!(err, BackendError::Internal(_)), "got {err:?}");
         assert!(
@@ -5641,16 +5775,406 @@ mod copy_forward_tests {
     }
 
     /// No un-pushed components (`next_component == total`) → no-op, empty result.
-    #[test]
-    fn copy_forward_unpushed_noop_when_all_pushed() {
+    #[tokio::test]
+    async fn reconcile_unpushed_noop_when_all_pushed() {
         let tmp = tempfile::tempdir().unwrap();
         let images_dir = tmp.path().to_path_buf();
         let manifest = detached_manifest("rootfs.img", &[0u8; 32], 0);
         let backend = vm1_backend(images_dir);
         let copied = backend
-            .copy_forward_unpushed(&manifest, 1, 1, Bank::B)
+            .reconcile_unpushed(&manifest, 1, 1, Bank::B)
+            .await
             .expect("no un-pushed components");
         assert!(copied.is_empty());
+    }
+
+    /// Like `detached_manifest`, with an explicit payload uri — the pull shape
+    /// puts the CONTENT-ADDRESS there.
+    fn detached_manifest_with_uri(part: &str, digest: &[u8], size: u64, uri: &str) -> Vec<u8> {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        ImageManifestBuilder::new()
+            .signing_time(1_700_000_000)
+            .component_id(vec!["vm1".into(), part.into()])
+            .sequence_number(2)
+            .payload_digest(digest, size)
+            .payload_uri(uri.into())
+            .build(&key)
+            .unwrap()
+    }
+
+    /// A session [`machine_mgr::InstallSource`] over `base` (anchor unused by
+    /// blob fetches — blobs verify by content-address, not signature).
+    fn test_source(base: String) -> machine_mgr::InstallSource {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        machine_mgr::InstallSource {
+            cas_base_url: base,
+            trust_anchor: key.public_key_bytes(),
+            session_id: None,
+        }
+    }
+
+    /// Minimal raw-HTTP/1.1 CAS for the reconcile fetch tests: serves `blobs`
+    /// by exact path, honours HEAD (headers only) and `Range: bytes=N-` (206),
+    /// logs every `"<METHOD> <path>"`, and optionally truncates the FIRST GET
+    /// body after `early_close_once` bytes (then serves fully — the resume
+    /// scenario).
+    async fn serve_cas(
+        blobs: std::collections::HashMap<String, Vec<u8>>,
+        early_close_once: Option<usize>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log_srv = log.clone();
+        let cut = Arc::new(Mutex::new(early_close_once));
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let blobs = blobs.clone();
+                let log = log_srv.clone();
+                let cut = cut.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let mut first = req.lines().next().unwrap_or("").split_whitespace();
+                    let method = first.next().unwrap_or("").to_string();
+                    let path = first.next().unwrap_or("").to_string();
+                    log.lock().unwrap().push(format!("{method} {path}"));
+                    let Some(blob) = blobs.get(&path) else {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    };
+                    let start = req
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Range: bytes="))
+                        .and_then(|r| r.split('-').next())
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .filter(|s| *s <= blob.len());
+                    let (line, mut body): (&str, &[u8]) = match start {
+                        Some(s) => ("206 Partial Content", &blob[s..]),
+                        None => ("200 OK", &blob[..]),
+                    };
+                    let full_len = body.len();
+                    if method == "HEAD" {
+                        body = &[];
+                    } else if let Some(limit) = cut.lock().unwrap().take() {
+                        if body.len() > limit {
+                            body = &body[..limit];
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 {line}\r\nContent-Length: {full_len}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (format!("http://{addr}/"), log)
+    }
+
+    /// Copy-forward misses (empty active bank) → the part is FETCHED by the
+    /// content-address in the (signed) manifest uri: the `sha256:` scheme is
+    /// mapped onto the repo blob path for both the size probe and the fetch,
+    /// the outer sha is verified while streaming, the inner digest at install,
+    /// and the CAS temp is cleaned on success.
+    #[tokio::test]
+    async fn reconcile_fetches_missing_part_by_content_address() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(images_dir.join("vm1/bank_a")).unwrap(); // empty active
+
+        let content = b"vm1 rootfs fetched from the CAS".to_vec();
+        // Unencrypted + uncompressed: outer (ciphertext) == inner (plaintext).
+        let digest: [u8; 32] = Sha256::digest(&content).into();
+        let outer_hex = hex::encode(digest);
+        let (base, log) = serve_cas(
+            std::collections::HashMap::from([(format!("/blobs/{outer_hex}"), content.clone())]),
+            None,
+        )
+        .await;
+
+        let manifest = detached_manifest_with_uri(
+            "rootfs.img",
+            &digest,
+            content.len() as u64,
+            &format!("sha256:{outer_hex}"),
+        );
+        let backend = vm1_backend(images_dir.clone());
+        backend.set_install_source(test_source(base));
+
+        let done = backend
+            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .await
+            .expect("missing active + content-addressed uri → fetch");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].relative_path, "rootfs.img");
+        assert_eq!(done[0].sha256, digest.to_vec());
+        assert_eq!(
+            std::fs::read(images_dir.join("vm1/bank_b/rootfs.img")).unwrap(),
+            content,
+        );
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l == &format!("HEAD /blobs/{outer_hex}")),
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l == &format!("GET /blobs/{outer_hex}")),
+            "{log:?}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(images_dir.join("vm1/cas"))
+            .unwrap()
+            .collect();
+        assert!(leftovers.is_empty(), "CAS temp not cleaned: {leftovers:?}");
+    }
+
+    /// Per-part copy-vs-fetch: parts whose active-bank content matches the
+    /// manifest digest are copied locally; ONLY the changed part is fetched —
+    /// the metered-link litmus (a config-only change never re-downloads the
+    /// rootfs).
+    #[tokio::test]
+    async fn reconcile_copies_matching_parts_and_fetches_only_the_changed_one() {
+        use sumo_offboard::image_builder::{
+            ComponentSpec as SuitComponentSpec, MultiComponentBuilder,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+        let active = images_dir.join("vm1/bank_a");
+        std::fs::create_dir_all(&active).unwrap();
+
+        let kernel = b"kernel bytes the vehicle has".to_vec();
+        let rootfs = b"rootfs bytes the vehicle has".to_vec();
+        let config_new = b"NEW vm config".to_vec();
+        std::fs::write(active.join("kernel"), &kernel).unwrap();
+        std::fs::write(active.join("rootfs.img"), &rootfs).unwrap();
+        std::fs::write(active.join("vm-config.yaml"), b"OLD vm config").unwrap();
+
+        let d_kernel: [u8; 32] = Sha256::digest(&kernel).into();
+        let d_rootfs: [u8; 32] = Sha256::digest(&rootfs).into();
+        let d_config: [u8; 32] = Sha256::digest(&config_new).into();
+        let config_hex = hex::encode(d_config);
+        // Only the changed part exists on the CAS — a request for anything
+        // else would 404 and fail the test via the digest/size checks.
+        let (base, log) = serve_cas(
+            std::collections::HashMap::from([(format!("/blobs/{config_hex}"), config_new.clone())]),
+            None,
+        )
+        .await;
+
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let spec = |part: &str, d: &[u8; 32], len: usize| SuitComponentSpec {
+            id: vec!["vm1".into(), part.into()],
+            digest: d.to_vec(),
+            size: len as u64,
+            uri: format!("sha256:{}", hex::encode(d)),
+            encryption_info: None,
+        };
+        let manifest = MultiComponentBuilder::new()
+            .signing_time(1_700_000_000)
+            .sequence_number(2)
+            .add_component(spec("kernel", &d_kernel, kernel.len()))
+            .add_component(spec("rootfs.img", &d_rootfs, rootfs.len()))
+            .add_component(spec("vm-config.yaml", &d_config, config_new.len()))
+            .build(&key)
+            .unwrap();
+
+        let backend = vm1_backend(images_dir.clone());
+        backend.set_install_source(test_source(base));
+
+        let done = backend
+            .reconcile_unpushed(&manifest, 0, 3, Bank::B)
+            .await
+            .expect("2 copies + 1 fetch");
+        assert_eq!(done.len(), 3);
+        let target = images_dir.join("vm1/bank_b");
+        assert_eq!(std::fs::read(target.join("kernel")).unwrap(), kernel);
+        assert_eq!(std::fs::read(target.join("rootfs.img")).unwrap(), rootfs);
+        assert_eq!(
+            std::fs::read(target.join("vm-config.yaml")).unwrap(),
+            config_new
+        );
+        // Exactly ONE part hit the network (HEAD + GET on the config blob).
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(log.iter().all(|l| l.ends_with(&config_hex)), "{log:?}");
+    }
+
+    /// A CDN serving different bytes behind the content-address is rejected
+    /// while streaming (outer sha mismatch) — nothing lands in the target bank.
+    #[tokio::test]
+    async fn reconcile_rejects_tampered_cdn_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(images_dir.join("vm1/bank_a")).unwrap();
+
+        let content = b"the bytes T2 signed for".to_vec();
+        let digest: [u8; 32] = Sha256::digest(&content).into();
+        let outer_hex = hex::encode(digest);
+        let (base, _log) = serve_cas(
+            std::collections::HashMap::from([(
+                format!("/blobs/{outer_hex}"),
+                b"SWAPPED cdn object".to_vec(),
+            )]),
+            None,
+        )
+        .await;
+
+        let manifest = detached_manifest_with_uri(
+            "rootfs.img",
+            &digest,
+            content.len() as u64,
+            &format!("sha256:{outer_hex}"),
+        );
+        let backend = vm1_backend(images_dir.clone());
+        backend.set_install_source(test_source(base));
+
+        let err = backend
+            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .await
+            .expect_err("tampered CDN content must be rejected");
+        assert!(matches!(err, BackendError::Internal(_)), "got {err:?}");
+        assert!(
+            !images_dir.join("vm1/bank_b/rootfs.img").exists(),
+            "tampered content must never land in the target bank"
+        );
+    }
+
+    /// A transport failure mid-blob keeps the resumable `.part` (outside the
+    /// bank dirs, so a session restart's bank wipe can't destroy it); the
+    /// retry resumes with a Range request and completes.
+    #[tokio::test]
+    async fn reconcile_fetch_failure_is_retry_safe_and_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(images_dir.join("vm1/bank_a")).unwrap();
+
+        let content: Vec<u8> = (0..4096u32).flat_map(|i| i.to_le_bytes()).collect();
+        let digest: [u8; 32] = Sha256::digest(&content).into();
+        let outer_hex = hex::encode(digest);
+        let (base, log) = serve_cas(
+            std::collections::HashMap::from([(format!("/blobs/{outer_hex}"), content.clone())]),
+            Some(1000), // first GET truncates after 1000 bytes
+        )
+        .await;
+
+        let manifest = detached_manifest_with_uri(
+            "rootfs.img",
+            &digest,
+            content.len() as u64,
+            &format!("sha256:{outer_hex}"),
+        );
+        let backend = vm1_backend(images_dir.clone());
+        backend.set_install_source(test_source(base));
+
+        backend
+            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .await
+            .expect_err("truncated transfer must fail the first attempt");
+        let part = images_dir.join(format!("vm1/cas/cas-{outer_hex}.part"));
+        assert!(part.exists(), "resumable partial must persist");
+        assert!(std::fs::metadata(&part).unwrap().len() > 0);
+
+        let done = backend
+            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .await
+            .expect("retry resumes the partial and completes");
+        assert_eq!(done[0].sha256, digest.to_vec());
+        assert_eq!(
+            std::fs::read(images_dir.join("vm1/bank_b/rootfs.img")).unwrap(),
+            content,
+        );
+        // The retry's GET carried a Range (206 path) — visible as a second GET.
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.iter().filter(|l| l.starts_with("GET ")).count(),
+            2,
+            "{log:?}"
+        );
+    }
+
+    /// The pull route stamps the campaign id via `install_source`: siblings
+    /// Join ONE node update transaction, while an unrelated zero-id (push)
+    /// start is Mixing-refused. `abort_install` through the adapter resolves
+    /// the staging so the node returns to Idle.
+    #[tokio::test]
+    async fn install_source_session_id_drives_the_node_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        for set in [BankSet::Vm1, BankSet::Vm2] {
+            boot.banks[set.as_index()].active_bank = Bank::A;
+            boot.banks[set.as_index()].committed = true;
+        }
+        nv.write_boot_state(&mut boot).unwrap();
+        let nv = Arc::new(Mutex::new(nv));
+        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new(vec![
+            (BankSet::Vm1.as_index(), "vm1".into()),
+            (BankSet::Vm2.as_index(), "vm2".into()),
+        ]));
+        let mk = |set: BankSet| {
+            ComponentBackend::with_options(
+                set,
+                nv.clone(),
+                Arc::new(NoopManifest),
+                Arc::new(NoopSecurity),
+                ComponentConfig::default(),
+                None,
+                Some(images_dir.clone()),
+                None,
+            )
+            .with_node_coordinator(coord.clone())
+        };
+        let vm1 = mk(BankSet::Vm1);
+        let vm2 = mk(BankSet::Vm2);
+
+        let campaign = [7u8; 32];
+        let source = |sid| machine_mgr::InstallSource {
+            cas_base_url: "http://cas".into(),
+            trust_anchor: Vec::new(),
+            session_id: Some(sid),
+        };
+        vm1.set_install_source(source(campaign));
+        vm1.ensure_flash_can_start()
+            .expect("first campaign member stages");
+
+        // An unrelated zero-id (push-path) start must not mix into the
+        // campaign's node transaction…
+        let err = vm2
+            .ensure_flash_can_start()
+            .expect_err("zero id must be Mixing-refused during campaign staging");
+        assert!(matches!(err, BackendError::Busy(_)), "got {err:?}");
+
+        // …but the campaign sibling Joins under the same id.
+        vm2.set_install_source(source(campaign));
+        vm2.ensure_flash_can_start()
+            .expect("sibling joins the same node transaction");
+
+        // Adapter-level abort resolves the staging membership (not just the
+        // backend session) — the node returns to Idle once both leave.
+        use machine_mgr::Component as _;
+        let a1 = crate::component_adapter::ComponentAdapter::new(Arc::new(vm1));
+        let a2 = crate::component_adapter::ComponentAdapter::new(Arc::new(vm2));
+        a1.abort_install(&machine_mgr::FlashId::new("x"))
+            .await
+            .unwrap();
+        a2.abort_install(&machine_mgr::FlashId::new("x"))
+            .await
+            .unwrap();
+        let st = coord.node_update_state(&machine_mgr::node_update::Durable::default(), &[]);
+        assert_eq!(st.phase, machine_mgr::node_update::NodePhase::Idle);
     }
 
     /// Build a fully-provisioned SimHsm (keystore + device `ivd-signing` keypair)
@@ -5795,6 +6319,110 @@ mod copy_forward_tests {
             "install_precomputed flipped NV to the sealed bank"
         );
         assert!(!s.committed, "banked install enters trial mode");
+
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// Pull-path finalize end-to-end: the un-pushed component is FETCHED by
+    /// its content-address (the vehicle does NOT have the bytes), the bank
+    /// IVD-sealed, NV flipped into trial — the device-side fetch executor
+    /// completes the install exactly like the push path would, and the
+    /// session-scoped install source is consumed.
+    #[tokio::test]
+    async fn finalize_manifest_only_fetches_seals_and_flips_nv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+
+        // Active bank exists but does NOT carry the declared content.
+        std::fs::create_dir_all(images_dir.join("vm1/bank_a")).unwrap();
+        let content = b"vm1 rootfs only the CAS has".to_vec();
+        let digest: [u8; 32] = Sha256::digest(&content).into();
+        let outer_hex = hex::encode(digest);
+        let (base, _log) = serve_cas(
+            std::collections::HashMap::from([(format!("/blobs/{outer_hex}"), content.clone())]),
+            None,
+        )
+        .await;
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
+        boot.banks[BankSet::Vm1.as_index()].committed = true;
+        nv.write_boot_state(&mut boot).unwrap();
+        let nv = Arc::new(Mutex::new(nv));
+
+        let (hsm, crypto, keystore) = provisioned_hsm("finalize-fetch");
+        let backend = ComponentBackend::with_options(
+            BankSet::Vm1,
+            nv.clone(),
+            Arc::new(NoopManifest),
+            Arc::new(NoopSecurity),
+            ComponentConfig::default(),
+            None,
+            Some(images_dir.clone()),
+            Some(hsm),
+        )
+        .with_hsm_crypto(crypto);
+        backend.set_install_source(test_source(base));
+
+        let manifest = detached_manifest_with_uri(
+            "rootfs.img",
+            &digest,
+            content.len() as u64,
+            &format!("sha256:{outer_hex}"),
+        );
+        let validated = ValidatedFirmware {
+            bank_set: BankSet::Vm1,
+            manifest_type: ManifestType::Firmware,
+            image_meta: crate::ota::ImageMeta::default(),
+            image_data: Vec::new(),
+            version_display: "1.0.0".into(),
+            image_sha256: None,
+            image_size: None,
+            raw_envelope: None,
+            streamed_files: Vec::new(),
+            signing_time_secs: None,
+        };
+        backend.packages.lock().unwrap().insert(
+            "m1".into(),
+            StoredPackage {
+                id: "m1".into(),
+                validated: validated.clone(),
+                status: PackageStatus::Verified,
+            },
+        );
+        *backend.flash_transfer.lock().unwrap() = Some(FlashTransferState {
+            transfer_id: "t1".into(),
+            package_id: "m1".into(),
+            state: FlashState::AwaitingActivation,
+            image_size: 0,
+            streamed_files: Vec::new(),
+        });
+        *backend.flash_session.lock().unwrap() = Some(FlashSessionState::AwaitingPayload {
+            manifest_bytes: manifest,
+            validated,
+            next_component: 0,
+            total_components: 1,
+        });
+
+        DiagnosticBackend::finalize_flash(&backend)
+            .await
+            .expect("finalize fetches the un-pushed component and seals");
+
+        assert_eq!(
+            std::fs::read(images_dir.join("vm1/bank_b/rootfs.img")).unwrap(),
+            content,
+            "un-pushed component fetched from the CAS into the target bank"
+        );
+        assert!(images_dir.join("vm1/bank_b/ivd-manifest.cbor").exists());
+        assert!(images_dir.join("vm1/bank_b/ivd-signature.bin").exists());
+        let s = crate::ota::status(&nv.lock().unwrap(), BankSet::Vm1).unwrap();
+        assert_eq!(s.active_bank, Bank::B);
+        assert!(!s.committed, "banked install enters trial mode");
+        assert!(
+            backend.install_source.lock().unwrap().is_none(),
+            "the session-scoped pull source is consumed by a successful finalize"
+        );
 
         let _ = std::fs::remove_dir_all(&keystore);
     }

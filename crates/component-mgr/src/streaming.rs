@@ -1255,6 +1255,31 @@ pub async fn fetch_and_install_component(
 /// L1 signature *before* calling, then installs each L2 — routed to its target
 /// bank via [`process_envelope_stream`] for an integrated payload, or
 /// [`fetch_and_install_component`] for a remote content-addressed payload.
+/// Validate a T2-signed L1 campaign envelope against the device's pinned
+/// sw-authority anchor (CBOR COSE_Key) — the caller-side precondition
+/// [`resolve_campaign_dependencies`] documents. Mirrors
+/// [`puller::Puller::fetch_manifest`]'s validation of remote L2s, so the L1
+/// and every L2 pass through the same signature gate; without it an unsigned
+/// L1 could compose individually-signed L2s into an unauthorized campaign.
+///
+/// Anti-rollback stays per-component: the sequence gate is left open here
+/// (`min_sequence = 0`) because each L2 is re-validated with the component's
+/// NV security floor at upload.
+pub fn validate_l1(
+    l1_bytes: &[u8],
+    trust_anchor: &[u8],
+) -> Result<sumo_onboard::manifest::Manifest, BackendError> {
+    let mut validator = sumo_onboard::validator::Validator::new(trust_anchor, None);
+    validator.set_min_sequence(0);
+    validator
+        .validate_envelope(
+            l1_bytes,
+            &sumo_crypto::rustcrypto::RustCryptoBackend,
+            /* trusted_time = */ 0,
+        )
+        .map_err(|e| BackendError::InvalidRequest(format!("L1 campaign validation failed: {e:?}")))
+}
+
 pub async fn resolve_campaign_dependencies(
     l1: &sumo_onboard::manifest::Manifest,
     puller: &Puller,

@@ -4,7 +4,7 @@ use bytes::Bytes;
 use crate::error::{MachineError, MachineResult};
 use crate::types::{
     Capabilities, Csr, DidFilter, DidKind, DtcFilter, EnvelopeStream, FlashId, FlashSession,
-    KeyInventory, RuntimeState,
+    InstallSource, KeyInventory, RuntimeState,
 };
 use crate::{ActivationState, ClearFaultsResult, Fault, FlashStatus};
 use nv_store::types::BankSet;
@@ -66,6 +66,16 @@ pub trait Component: Send + Sync {
     //   abort_install   → discard session; pre-finalize always works,
     //                     post-finalize gated by FlashCaps.abortable_after_finalize
     // ------------------------------------------------------------------
+
+    /// Provide a session-scoped pull source BEFORE `start_install`, for
+    /// installs whose manifest references payloads by content-addressed URI
+    /// (`upload_envelope`'s "fetch them transparently" contract). Components
+    /// that can dereference content-addresses at finalize implement this; the
+    /// default rejects, meaning the component installs integrated payloads
+    /// only. The source is cleared when the session ends (finalize/abort).
+    async fn set_install_source(&self, _source: InstallSource) -> MachineResult<()> {
+        Err(MachineError::NotSupported("set_install_source"))
+    }
 
     /// Open a new install session for this component. Returns the handle the
     /// caller uses for the rest of the pipeline.

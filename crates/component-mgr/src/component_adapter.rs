@@ -237,6 +237,11 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
     // Install pipeline — delegates to ComponentBackend's existing flash methods
     // ---------------------------------------------------------------
 
+    async fn set_install_source(&self, source: machine_mgr::InstallSource) -> MachineResult<()> {
+        self.inner.set_install_source(source);
+        Ok(())
+    }
+
     async fn start_install(&self) -> MachineResult<FlashSession> {
         let transfer_id = DiagnosticBackend::start_flash(&*self.inner)
             .await
@@ -298,8 +303,10 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                 "cannot abort: install already finalized".into(),
             ));
         }
-        self.inner.clear_flash_session();
-        Ok(())
+        // abort_session (not bare clear_flash_session): also resolves this
+        // component's node-transaction staging, else an aborted pull dep would
+        // pin the node coordinator out of Idle.
+        self.inner.abort_session().map_err(map_backend_error)
     }
 
     async fn install_status(&self, id: &FlashId) -> MachineResult<FlashStatus> {

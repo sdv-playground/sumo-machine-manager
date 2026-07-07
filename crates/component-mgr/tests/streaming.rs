@@ -1067,25 +1067,33 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use component_mgr::sovd::authz::{Tier, TieredAuthorizer, TrustedIssuer};
-use component_mgr::sovd::routes::{run_pull_update, PullUpdateRequest};
+use component_mgr::sovd::pull_update::{pull_update_router, TrustAnchorSource};
 use machine_mgr::{
-    Capabilities, Component, EnvelopeStream, FlashCaps, FlashId, FlashSession, LifecycleCaps,
-    MachineResult, ResetKind,
+    Capabilities, Component, EntityInfo, EnvelopeStream, FlashCaps, FlashId, FlashSession,
+    LifecycleCaps, Machine, MachineRegistry, MachineResult, ResetKind,
 };
 
 /// A `Component` stub that records how many envelopes were uploaded + finalized,
 /// so the test can assert the pull handler drove the install lifecycle.
 struct PullStub {
+    id: &'static str,
+    bank_set: Option<BankSet>,
+    upload_delay_ms: u64,
     uploads: AtomicUsize,
     finalized: AtomicUsize,
+    aborted: AtomicUsize,
     caps: Capabilities,
 }
 
 impl PullStub {
-    fn new() -> Self {
+    fn new(id: &'static str) -> Self {
         Self {
+            id,
+            bank_set: None,
+            upload_delay_ms: 0,
             uploads: AtomicUsize::new(0),
             finalized: AtomicUsize::new(0),
+            aborted: AtomicUsize::new(0),
             caps: Capabilities {
                 did_store: false,
                 flash: Some(FlashCaps {
@@ -1107,13 +1115,27 @@ impl PullStub {
     }
 }
 
+impl PullStub {
+    fn with_bank_set(mut self, set: BankSet) -> Self {
+        self.bank_set = Some(set);
+        self
+    }
+    fn with_upload_delay_ms(mut self, ms: u64) -> Self {
+        self.upload_delay_ms = ms;
+        self
+    }
+}
+
 #[async_trait]
 impl Component for PullStub {
     fn id(&self) -> &str {
-        "vm1"
+        self.id
     }
     fn capabilities(&self) -> &Capabilities {
         &self.caps
+    }
+    fn bank_set(&self) -> Option<BankSet> {
+        self.bank_set
     }
     async fn start_install(&self) -> MachineResult<FlashSession> {
         Ok(FlashSession {
@@ -1122,12 +1144,18 @@ impl Component for PullStub {
             max_chunk_size: 65536,
         })
     }
+    async fn set_install_source(&self, _source: machine_mgr::InstallSource) -> MachineResult<()> {
+        Ok(())
+    }
     async fn upload_envelope(
         &self,
         _id: &FlashId,
         mut stream: EnvelopeStream,
     ) -> MachineResult<String> {
         use futures::StreamExt;
+        if self.upload_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.upload_delay_ms)).await;
+        }
         let mut total = 0usize;
         while let Some(chunk) = stream.next().await {
             total += chunk.expect("stream chunk").len();
@@ -1138,6 +1166,10 @@ impl Component for PullStub {
     }
     async fn finalize_install(&self, _id: &FlashId) -> MachineResult<()> {
         self.finalized.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn abort_install(&self, _id: &FlashId) -> MachineResult<()> {
+        self.aborted.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -1201,61 +1233,153 @@ fn operational_authorizer(dec: jsonwebtoken::DecodingKey) -> TieredAuthorizer {
     }])
 }
 
-fn pull_request(l1: &[u8], cas_base_url: String) -> PullUpdateRequest {
-    use base64::Engine;
-    PullUpdateRequest {
-        component: "vm1".into(),
-        l1_base64: base64::engine::general_purpose::STANDARD.encode(l1),
-        cas_base_url,
+/// Register `stubs` in a MachineRegistry rooted at a vehicle entity.
+fn pull_machine(stubs: Vec<Arc<dyn Component>>) -> Arc<dyn Machine> {
+    let mut b = MachineRegistry::builder(EntityInfo {
+        id: "vehicle".into(),
+        name: "vehicle".into(),
+        entity_type: "vehicle".into(),
+        description: None,
+        href: "/vehicle/v1".into(),
+        status: None,
+    });
+    for s in stubs {
+        b = b.with_arc(s);
     }
+    Arc::new(b.build())
+}
+
+/// The composed pull-update router over `stubs` + a Tiered authorizer.
+fn pull_router(
+    stubs: Vec<Arc<dyn Component>>,
+    authz: TieredAuthorizer,
+    trust_anchor: Vec<u8>,
+) -> axum::Router {
+    let anchor: TrustAnchorSource = Arc::new(move || Some(trust_anchor.clone()));
+    pull_update_router(pull_machine(stubs), Arc::new(authz), anchor)
+}
+
+fn pull_body(component: Option<&str>, l1: &[u8], cas_base_url: &str) -> String {
+    use base64::Engine;
+    serde_json::to_string(&serde_json::json!({
+        "component": component,
+        "l1_base64": base64::engine::general_purpose::STANDARD.encode(l1),
+        "cas_base_url": cas_base_url,
+    }))
+    .unwrap()
+}
+
+const PULL_PATH: &str = "/vehicle/v1/operations/x-sumo-pull-update/executions";
+
+/// POST the pull op; returns (status, Location header, body bytes).
+async fn post_pull(
+    router: &axum::Router,
+    bearer: Option<&str>,
+    body: String,
+) -> (axum::http::StatusCode, Option<String>, bytes::Bytes) {
+    use tower::ServiceExt;
+    let mut req = axum::http::Request::builder()
+        .method("POST")
+        .uri(PULL_PATH)
+        .header("content-type", "application/json");
+    if let Some(b) = bearer {
+        req = req.header("authorization", b);
+    }
+    let resp = router
+        .clone()
+        .oneshot(req.body(axum::body::Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let location = resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, location, bytes)
+}
+
+/// Poll the execution status URL until it leaves Running.
+async fn poll_execution(router: &axum::Router, location: &str) -> sovd_core::OperationExecution {
+    use tower::ServiceExt;
+    for _ in 0..500 {
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(location)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let exec: sovd_core::OperationExecution = serde_json::from_slice(&bytes).unwrap();
+        if !matches!(exec.status, sovd_core::OperationStatus::Running) {
+            return exec;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("execution never left Running");
 }
 
 #[tokio::test]
 async fn pull_update_installs_campaign_under_operational_token() {
     let (l1, base, trust_anchor) = campaign_fixture().await;
     let (enc, dec) = issuer_keys();
-    let authz = operational_authorizer(dec);
     let bearer = format!(
         "Bearer {}",
         mint_token(&enc, "onboard", "rig-1", "component:vm1 update:execute")
     );
 
-    let stub = Arc::new(PullStub::new());
-    let comp: Arc<dyn Component> = stub.clone();
-    let req = pull_request(&l1, base);
+    let stub = Arc::new(PullStub::new("vm1"));
+    let router = pull_router(
+        vec![stub.clone()],
+        operational_authorizer(dec),
+        trust_anchor,
+    );
 
-    let exec = run_pull_update(&comp, &authz, &trust_anchor, Some(&bearer), &req)
-        .await
-        .expect("authorized pull-update should not 4xx");
+    let (status, location, _) =
+        post_pull(&router, Some(&bearer), pull_body(Some("vm1"), &l1, &base)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let exec = poll_execution(&router, &location.expect("Location header")).await;
     assert!(
         matches!(exec.status, sovd_core::OperationStatus::Completed),
         "status = {:?}, error = {:?}",
         exec.status,
         exec.error
     );
-    // Both deps (integrated + remote content-addressed) installed; one finalize.
+    // Both deps (integrated + remote content-addressed) target vm1 — each is
+    // its own install session: two uploads, two finalizes.
     assert_eq!(
         stub.uploads.load(Ordering::SeqCst),
         2,
         "both deps installed"
     );
-    assert_eq!(stub.finalized.load(Ordering::SeqCst), 1);
+    assert_eq!(stub.finalized.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
 async fn pull_update_rejects_without_token() {
     let (l1, base, trust_anchor) = campaign_fixture().await;
     let (_enc, dec) = issuer_keys();
-    let authz = operational_authorizer(dec);
 
-    let stub = Arc::new(PullStub::new());
-    let comp: Arc<dyn Component> = stub.clone();
-    let req = pull_request(&l1, base);
+    let stub = Arc::new(PullStub::new("vm1"));
+    let router = pull_router(
+        vec![stub.clone()],
+        operational_authorizer(dec),
+        trust_anchor,
+    );
 
-    let err = run_pull_update(&comp, &authz, &trust_anchor, None, &req)
-        .await
-        .expect_err("a tokenless pull-update must be rejected");
-    assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
+    let (status, _, _) = post_pull(&router, None, pull_body(Some("vm1"), &l1, &base)).await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
     assert_eq!(
         stub.uploads.load(Ordering::SeqCst),
         0,
@@ -1267,20 +1391,287 @@ async fn pull_update_rejects_without_token() {
 async fn pull_update_rejects_token_without_update_scope() {
     let (l1, base, trust_anchor) = campaign_fixture().await;
     let (enc, dec) = issuer_keys();
-    let authz = operational_authorizer(dec);
     // Token has the component scope but NOT update:execute.
     let bearer = format!(
         "Bearer {}",
         mint_token(&enc, "onboard", "rig-1", "component:vm1 data:read")
     );
 
-    let stub = Arc::new(PullStub::new());
-    let comp: Arc<dyn Component> = stub.clone();
-    let req = pull_request(&l1, base);
+    let stub = Arc::new(PullStub::new("vm1"));
+    let router = pull_router(
+        vec![stub.clone()],
+        operational_authorizer(dec),
+        trust_anchor,
+    );
 
-    let err = run_pull_update(&comp, &authz, &trust_anchor, Some(&bearer), &req)
-        .await
-        .expect_err("missing update:execute must be rejected");
-    assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
+    let (status, _, _) =
+        post_pull(&router, Some(&bearer), pull_body(Some("vm1"), &l1, &base)).await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
     assert_eq!(stub.uploads.load(Ordering::SeqCst), 0);
+}
+
+/// An L1 campaign whose deps are ALL integrated (no CAS traffic), one
+/// integrated L2 per target component id.
+fn campaign_integrated(signing: &CoseKey, targets: &[&str]) -> Vec<u8> {
+    let mut b = CampaignBuilder::new()
+        .signing_time(1_700_000_000)
+        .sequence_number(1);
+    for (i, t) in targets.iter().enumerate() {
+        let l2 = l2_envelope(signing, t, &[0x30 + i as u8; 128]);
+        b = b.add_integrated_image(format!("dep-{i}"), &l2);
+    }
+    b.build(signing).unwrap()
+}
+
+/// No CAS is contacted for integrated-only campaigns — a dead base URL proves it.
+const DEAD_CAS: &str = "http://127.0.0.1:9/";
+
+#[tokio::test]
+async fn pull_update_dispatches_each_dep_to_its_component() {
+    let (signing, _) = test_keys();
+    let l1 = campaign_integrated(&signing, &["vm1", "vm2"]);
+    let (enc, dec) = issuer_keys();
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(
+            &enc,
+            "onboard",
+            "rig-1",
+            "component:vm1 component:vm2 update:execute"
+        )
+    );
+
+    let vm1 = Arc::new(PullStub::new("vm1"));
+    let vm2 = Arc::new(PullStub::new("vm2"));
+    let router = pull_router(
+        vec![vm1.clone(), vm2.clone()],
+        operational_authorizer(dec),
+        signing.public_key_bytes(),
+    );
+
+    let (status, location, _) =
+        post_pull(&router, Some(&bearer), pull_body(None, &l1, DEAD_CAS)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let exec = poll_execution(&router, &location.unwrap()).await;
+    assert!(
+        matches!(exec.status, sovd_core::OperationStatus::Completed),
+        "status = {:?}, error = {:?}",
+        exec.status,
+        exec.error
+    );
+    // One session per component: each stub saw its own upload + finalize.
+    assert_eq!(vm1.uploads.load(Ordering::SeqCst), 1);
+    assert_eq!(vm1.finalized.load(Ordering::SeqCst), 1);
+    assert_eq!(vm2.uploads.load(Ordering::SeqCst), 1);
+    assert_eq!(vm2.finalized.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn pull_update_rejects_bad_l1_signature() {
+    let (signing, _) = test_keys();
+    let l1 = campaign_integrated(&signing, &["vm1"]);
+    let (enc, dec) = issuer_keys();
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(&enc, "onboard", "rig-1", "component:vm1 update:execute")
+    );
+
+    // The device pins a DIFFERENT sw-authority than the campaign's signer.
+    let other_anchor = keygen::generate_signing_key(keygen::ES256)
+        .unwrap()
+        .public_key_bytes();
+    let stub = Arc::new(PullStub::new("vm1"));
+    let router = pull_router(
+        vec![stub.clone()],
+        operational_authorizer(dec),
+        other_anchor,
+    );
+
+    let (status, _, _) = post_pull(&router, Some(&bearer), pull_body(None, &l1, DEAD_CAS)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        stub.uploads.load(Ordering::SeqCst),
+        0,
+        "an unsigned/mis-signed L1 must never reach a component"
+    );
+}
+
+#[tokio::test]
+async fn pull_update_rejects_garbage_and_non_campaign() {
+    let (signing, _) = test_keys();
+    let (enc, dec) = issuer_keys();
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(&enc, "onboard", "rig-1", "component:vm1 update:execute")
+    );
+    let stub = Arc::new(PullStub::new("vm1"));
+    let router = pull_router(
+        vec![stub.clone()],
+        operational_authorizer(dec),
+        signing.public_key_bytes(),
+    );
+
+    // Garbage base64.
+    let body = r#"{"l1_base64":"!!!not-base64!!!","cas_base_url":"http://127.0.0.1:9/"}"#;
+    let (status, _, _) = post_pull(&router, Some(&bearer), body.to_string()).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+    // A plain (signed) L2 is not a campaign — no dependencies.
+    let l2 = l2_envelope(&signing, "vm1", &[0x77u8; 64]);
+    let (status, _, _) = post_pull(&router, Some(&bearer), pull_body(None, &l2, DEAD_CAS)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(stub.uploads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pull_update_wrong_bank_set_target_is_415() {
+    let (signing, _) = test_keys();
+    let l1 = campaign_integrated(&signing, &["vm2"]);
+    let (enc, dec) = issuer_keys();
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(&enc, "onboard", "rig-1", "component:vm2 update:execute")
+    );
+
+    // A component registered as "vm2" whose banked storage is the Vm1 slot —
+    // the dispatcher's wrong-target check must refuse the envelope (415).
+    let stub = Arc::new(PullStub::new("vm2").with_bank_set(BankSet::Vm1));
+    let router = pull_router(
+        vec![stub.clone()],
+        operational_authorizer(dec),
+        signing.public_key_bytes(),
+    );
+
+    let (status, _, _) = post_pull(&router, Some(&bearer), pull_body(None, &l1, DEAD_CAS)).await;
+    assert_eq!(status, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(stub.uploads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pull_update_unknown_target_is_404() {
+    let (signing, _) = test_keys();
+    let l1 = campaign_integrated(&signing, &["vm9"]);
+    let (enc, dec) = issuer_keys();
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(&enc, "onboard", "rig-1", "component:vm9 update:execute")
+    );
+    let stub = Arc::new(PullStub::new("vm1"));
+    let router = pull_router(
+        vec![stub.clone()],
+        operational_authorizer(dec),
+        signing.public_key_bytes(),
+    );
+
+    let (status, _, _) = post_pull(&router, Some(&bearer), pull_body(None, &l1, DEAD_CAS)).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(stub.uploads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pull_update_component_assertion_mismatch_is_400() {
+    let (signing, _) = test_keys();
+    let l1 = campaign_integrated(&signing, &["vm2"]);
+    let (enc, dec) = issuer_keys();
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(&enc, "onboard", "rig-1", "component:vm2 update:execute")
+    );
+    let vm2 = Arc::new(PullStub::new("vm2"));
+    let router = pull_router(
+        vec![vm2.clone()],
+        operational_authorizer(dec),
+        signing.public_key_bytes(),
+    );
+
+    // The caller asserts vm1, but the signed campaign targets vm2 — refuse
+    // rather than silently install a subset/mismatch.
+    let (status, _, _) = post_pull(
+        &router,
+        Some(&bearer),
+        pull_body(Some("vm1"), &l1, DEAD_CAS),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(vm2.uploads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pull_update_per_dep_authz_aborts_staged_siblings() {
+    let (signing, _) = test_keys();
+    let l1 = campaign_integrated(&signing, &["vm1", "vm2"]);
+    let (enc, dec) = issuer_keys();
+    // Scoped to vm1 ONLY — the vm2 dependency must fail authorization.
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(&enc, "onboard", "rig-1", "component:vm1 update:execute")
+    );
+
+    let vm1 = Arc::new(PullStub::new("vm1"));
+    let vm2 = Arc::new(PullStub::new("vm2"));
+    let router = pull_router(
+        vec![vm1.clone(), vm2.clone()],
+        operational_authorizer(dec),
+        signing.public_key_bytes(),
+    );
+
+    let (status, location, _) =
+        post_pull(&router, Some(&bearer), pull_body(None, &l1, DEAD_CAS)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let exec = poll_execution(&router, &location.unwrap()).await;
+    assert!(
+        matches!(exec.status, sovd_core::OperationStatus::Failed),
+        "{exec:?}"
+    );
+    assert!(exec.error.as_deref().unwrap_or("").contains("unauthorized"));
+    // vm1 staged first, then vm2's authz failed → vm1's open session aborted;
+    // nothing was finalized.
+    assert_eq!(vm1.uploads.load(Ordering::SeqCst), 1);
+    assert_eq!(vm1.finalized.load(Ordering::SeqCst), 0);
+    assert_eq!(vm1.aborted.load(Ordering::SeqCst), 1);
+    assert_eq!(vm2.uploads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pull_update_second_post_while_running_is_409() {
+    let (signing, _) = test_keys();
+    let l1 = campaign_integrated(&signing, &["vm1"]);
+    let (enc, dec) = issuer_keys();
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(&enc, "onboard", "rig-1", "component:vm1 update:execute")
+    );
+    // Slow upload keeps the first execution Running while the second POSTs.
+    let stub = Arc::new(PullStub::new("vm1").with_upload_delay_ms(300));
+    let router = pull_router(
+        vec![stub.clone()],
+        operational_authorizer(dec),
+        signing.public_key_bytes(),
+    );
+
+    let (status, location, _) =
+        post_pull(&router, Some(&bearer), pull_body(None, &l1, DEAD_CAS)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+
+    let (status2, _, _) = post_pull(&router, Some(&bearer), pull_body(None, &l1, DEAD_CAS)).await;
+    assert_eq!(status2, axum::http::StatusCode::CONFLICT);
+
+    // Unknown execution id → 404.
+    use tower::ServiceExt;
+    let resp = router
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("{PULL_PATH}/nope"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+    // Drain the first execution so the test ends deterministically.
+    let exec = poll_execution(&router, &location.unwrap()).await;
+    assert!(matches!(exec.status, sovd_core::OperationStatus::Completed));
 }

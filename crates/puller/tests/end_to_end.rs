@@ -303,6 +303,27 @@ async fn fetch_blob_succeeds_and_verifies_hash() {
 }
 
 #[tokio::test]
+async fn blob_size_reads_content_length_via_head() {
+    let fixture = build_fixture();
+    let bpath = format!("/blobs/sha256:{}", hex::encode(fixture.blob_sha));
+
+    let mut repo = MockRepo::default();
+    repo.objects
+        .insert(bpath.clone(), Bytes::from(fixture.blob.clone()));
+    let mock = spawn_mock(repo).await;
+
+    let puller = Puller::new(&mock.base, &fixture.trust_anchor).unwrap();
+    let size = puller.blob_size(&bpath).await.expect("blob_size");
+    assert_eq!(size, fixture.blob.len() as u64);
+
+    let err = puller.blob_size("/blobs/absent").await.unwrap_err();
+    assert!(
+        matches!(err, PullerError::Http { status: 404, .. }),
+        "expected 404, got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn fetch_blob_rejects_hash_mismatch() {
     let fixture = build_fixture();
     let bpath = "/blobs/sha256:wrong".to_string();
