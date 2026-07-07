@@ -487,7 +487,7 @@ mod tests {
         let session_id = 99;
         let nonce = [0xBBu8; NONCE_LEN];
         let hello = frame_response(OP_HELLO, session_id, STATUS_OK, &nonce);
-        let cwt = vec![0xCAu8, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF].repeat(20);
+        let cwt = [0xCAu8, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF].repeat(20);
         let enroll_ok = frame_response(OP_ENROLL, session_id, STATUS_OK, &cwt);
         let mut combined = Vec::new();
         combined.extend_from_slice(&hello);
@@ -564,7 +564,7 @@ mod tests {
         let session_id = 7;
         let nonce = [0xCCu8; NONCE_LEN];
         let hello = frame_response(OP_HELLO, session_id, STATUS_OK, &nonce);
-        let cwt = vec![0xCAu8, 0xFE, 0xBA, 0xBE].repeat(40);
+        let cwt = [0xCAu8, 0xFE, 0xBA, 0xBE].repeat(40);
         let enroll_ok = frame_response(OP_ENROLL_ASSISTED, session_id, STATUS_OK, &cwt);
         let mut combined = Vec::new();
         combined.extend_from_slice(&hello);

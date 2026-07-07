@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(format!("{h}"), "0x0006");
         assert!(!h.is_dynamic());
         assert!(KeyHandle(vhsm_proto::HANDLE_DYNAMIC_BASE).is_dynamic());
-        assert!(KeyHandle(vhsm_proto::HANDLE_DYNAMIC_BASE - 1).is_dynamic() == false);
+        assert!(!KeyHandle(vhsm_proto::HANDLE_DYNAMIC_BASE - 1).is_dynamic());
     }
 
     #[test]

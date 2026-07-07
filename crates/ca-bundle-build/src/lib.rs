@@ -251,7 +251,7 @@ fn auto_qnx6_geometry(dir: &Path) -> (u32, u32) {
             } else if ft.is_file() {
                 let len = e.metadata().map(|m| m.len()).unwrap_or(0);
                 // Each file occupies whole 4 KiB blocks.
-                *bytes += ((len + BLK - 1) / BLK).saturating_mul(BLK);
+                *bytes += len.div_ceil(BLK).saturating_mul(BLK);
                 *files += 1;
             }
         }
@@ -264,7 +264,7 @@ fn auto_qnx6_geometry(dir: &Path) -> (u32, u32) {
     // 50% margin so block-boundary growth never overruns.
     let overhead = files.saturating_mul(BLK).saturating_add(1024 * 1024);
     let needed = bytes.saturating_add(overhead).saturating_mul(3) / 2;
-    let sectors = ((needed + SECTOR - 1) / SECTOR).max(MIN_SECTORS);
+    let sectors = needed.div_ceil(SECTOR).max(MIN_SECTORS);
     // qnx6 inodes are cheap; scale with file count, floor at 512.
     let inodes = files.saturating_mul(4).max(512);
 

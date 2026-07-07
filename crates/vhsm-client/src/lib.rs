@@ -338,9 +338,10 @@ impl<T: Transport> VhsmClient<T> {
         Ok((handle, pubkey))
     }
 
-    /// Send a raw op code with a verbatim payload, returning the daemon's status
-    /// + response payload without translating the status to a typed error. An
-    /// escape hatch for diagnostics (host-only ops, malformed-payload probes).
+    /// Send a raw op code with a verbatim payload, returning the daemon's
+    /// status + response payload without translating the status to a typed
+    /// error. An escape hatch for diagnostics (host-only ops,
+    /// malformed-payload probes).
     pub fn raw_request(&mut self, op: u32, payload: &[u8]) -> Result<(u32, Vec<u8>)> {
         let session_id = self.next_session;
         self.next_session = self.next_session.wrapping_add(1).max(1);

@@ -332,11 +332,13 @@ mod tests {
 
     #[test]
     fn op_spaces_are_disjoint_crypto_below_provisioning() {
-        assert!(OP_UNWRAP_CEK_ECDH_ES < 0x20, "crypto ops live below 0x20");
-        assert!(
-            OP_IS_PROVISIONED >= 0x20,
-            "provisioning ops live at/above 0x20"
-        );
+        const {
+            assert!(OP_UNWRAP_CEK_ECDH_ES < 0x20, "crypto ops live below 0x20");
+            assert!(
+                OP_IS_PROVISIONED >= 0x20,
+                "provisioning ops live at/above 0x20"
+            );
+        }
         assert_ne!(ST_OK, ST_NOT_SUPPORTED);
     }
 }
