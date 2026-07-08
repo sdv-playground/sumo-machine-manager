@@ -260,9 +260,15 @@ impl QemuRunner {
                 ]);
             }
 
+            // `ro`, not `rw`: an immutable (dm-verity) guest must not remount /
+            // read-write, and a mutable ext4 guest is unaffected — its fstab
+            // `/ defaults` still upgrades to rw during boot (today's behavior).
+            // A dm-verity guest supplies `dm-mod.create=… root=/dev/dm-0 ro` via
+            // `extra_cmdline` (appended below); the kernel's last-wins root=/ro
+            // handling then boots the verity device, not this /dev/vda default.
             let mut cmdline_parts: Vec<String> = vec![
                 "root=/dev/vda".into(),
-                "rw".into(),
+                "ro".into(),
                 format!("console={}", arch.console_device()),
                 "earlycon".into(),
                 "no_console_suspend".into(),

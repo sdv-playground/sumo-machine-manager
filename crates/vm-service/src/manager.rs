@@ -386,12 +386,13 @@ impl VmManager {
         //
         // CURRENT POLICY: log-only. Verify still runs and reports
         // good/bad with timing, but failure does NOT refuse to start.
-        // Reason: autosd's systemd-remount-fs upgrades rootfs.img to
-        // r/w during boot, so the file's bytes legitimately diverge
-        // from the manifest's claim on subsequent boots. Switching
-        // back to fail-closed needs read-only rootfs + overlay (or
-        // dm-verity) — tracked in
-        // tasks/launch-time-verify-mutable-rootfs.md.
+        // Reason (historical): a mutable autosd guest's systemd-remount-fs
+        // upgraded rootfs.img to r/w during boot, so the bytes diverged
+        // from the manifest on subsequent boots. The immutable dm-verity
+        // guest (guest-autosd-rootfs) fixes that at the source — its root
+        // is read-only at the block layer, so the re-hash stays stable.
+        // Flipping this to fail-closed is the tracked follow-up once the
+        // verity image has soaked (tasks/launch-time-verify-mutable-rootfs.md).
         if let Some(ref verify) = self.pre_launch_verify {
             let started = Instant::now();
             match verify(name, &effective_def.image_dir) {
