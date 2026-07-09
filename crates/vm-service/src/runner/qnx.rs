@@ -271,7 +271,8 @@ mod verity_splice_tests {
 
     #[test]
     fn splices_before_closing_quote_and_escapes_inner_quotes() {
-        let base = "system linux-guest-1\ncmdline \"console=ttyAMA0 root=/dev/vda ro\"\nvdev pl011\n";
+        let base =
+            "system linux-guest-1\ncmdline \"console=ttyAMA0 root=/dev/vda ro\"\nvdev pl011\n";
         let frag = "dm-mod.create=\"vroot,,,ro,0 8 verity 1 /dev/vda /dev/vda 4096 4096 1 1 sha256 aa bb\" root=/dev/dm-0 ro";
         let out = splice_verity_cmdline(base, frag);
         assert!(out.contains(
@@ -283,7 +284,10 @@ mod verity_splice_tests {
     #[test]
     fn idempotent_when_already_present() {
         let base = "cmdline \"root=/dev/vda ro dm-mod.create=\\\"x\\\" root=/dev/dm-0 ro\"\n";
-        assert_eq!(splice_verity_cmdline(base, "dm-mod.create=\"y\" root=/dev/dm-0 ro"), base);
+        assert_eq!(
+            splice_verity_cmdline(base, "dm-mod.create=\"y\" root=/dev/dm-0 ro"),
+            base
+        );
     }
 }
 
