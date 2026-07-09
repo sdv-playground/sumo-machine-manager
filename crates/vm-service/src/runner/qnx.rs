@@ -236,6 +236,57 @@ fn wait_for_device(path: &str, timeout: Duration) -> Result<(), RunnerError> {
     )))
 }
 
+/// Splice a dm-verity `dm-mod.create=… root=/dev/dm-0 ro` fragment into the
+/// first `cmdline "…"` line of a qvm.conf, escaping the fragment's inner `"` as
+/// `\"` (qvm's `cmdline` value is itself a double-quoted string). Returns `base`
+/// unchanged if it already carries a `dm-mod.create` or has no `cmdline` line.
+fn splice_verity_cmdline(base: &str, frag: &str) -> String {
+    if base.contains("dm-mod.create") {
+        return base.to_string();
+    }
+    let escaped = frag.replace('"', "\\\"");
+    let mut out = String::with_capacity(base.len() + escaped.len() + 4);
+    let mut done = false;
+    for line in base.lines() {
+        let te = line.trim_end();
+        if !done && line.trim_start().starts_with("cmdline ") && te.ends_with('"') {
+            // Insert the fragment just before the cmdline value's closing quote.
+            out.push_str(&te[..te.len() - 1]);
+            out.push(' ');
+            out.push_str(&escaped);
+            out.push('"');
+            out.push('\n');
+            done = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod verity_splice_tests {
+    use super::splice_verity_cmdline;
+
+    #[test]
+    fn splices_before_closing_quote_and_escapes_inner_quotes() {
+        let base = "system linux-guest-1\ncmdline \"console=ttyAMA0 root=/dev/vda ro\"\nvdev pl011\n";
+        let frag = "dm-mod.create=\"vroot,,,ro,0 8 verity 1 /dev/vda /dev/vda 4096 4096 1 1 sha256 aa bb\" root=/dev/dm-0 ro";
+        let out = splice_verity_cmdline(base, frag);
+        assert!(out.contains(
+            "cmdline \"console=ttyAMA0 root=/dev/vda ro dm-mod.create=\\\"vroot,,,ro,0 8 verity 1 /dev/vda /dev/vda 4096 4096 1 1 sha256 aa bb\\\" root=/dev/dm-0 ro\"\n"
+        ));
+        assert!(out.contains("vdev pl011"));
+    }
+
+    #[test]
+    fn idempotent_when_already_present() {
+        let base = "cmdline \"root=/dev/vda ro dm-mod.create=\\\"x\\\" root=/dev/dm-0 ro\"\n";
+        assert_eq!(splice_verity_cmdline(base, "dm-mod.create=\"y\" root=/dev/dm-0 ro"), base);
+    }
+}
+
 impl VmRunner for QnxRunner {
     /// Slay orphan qvm + devb-loopback for this VM. Called by
     /// VmManager BEFORE the pre-launch verify hook runs so the
@@ -361,14 +412,38 @@ impl VmRunner for QnxRunner {
         // (retired). Everything else in the conf is an absolute /dev/... node the
         // setup above created, so cwd affects only the kernel load.
         let bank_dir = qvm_config.parent().unwrap_or_else(|| Path::new("."));
+
+        // dm-verity guests ship a `verity-cmdline` bank part — the
+        // `dm-mod.create=… root=/dev/dm-0 ro` root-hash fragment — flashed +
+        // IVD-signed alongside rootfs.img. qvm's guest cmdline comes ONLY from
+        // qvm.conf's `cmdline "…"`; rather than bake the per-build hash into the
+        // shipped qvm.conf at seed time (it drifts when the rootfs is rebuilt),
+        // splice the fragment into a TEMP copy of qvm.conf here, at launch, from
+        // the bank file — so the hash always matches this bank's rootfs. Absent →
+        // launch the bank qvm.conf as-is. cwd is the bank dir either way, so the
+        // conf's relative `load kernel` resolves to this bank's kernel.
+        let launch_config = match std::fs::read_to_string(bank_dir.join("verity-cmdline")) {
+            Ok(frag) if !frag.trim().is_empty() => {
+                let base = std::fs::read_to_string(&qvm_config)
+                    .map_err(|e| RunnerError::Config(format!("VM {name}: read qvm.conf: {e}")))?;
+                let merged = splice_verity_cmdline(&base, frag.trim());
+                let out = std::path::PathBuf::from(format!("/tmp/vm-svc-{name}-qvm.conf"));
+                std::fs::write(&out, merged).map_err(|e| {
+                    RunnerError::ProcessFailed(format!("VM {name}: write merged qvm.conf: {e}"))
+                })?;
+                out
+            }
+            _ => qvm_config.clone(),
+        };
+
         tracing::info!(
             "starting qvm for {name}: @{} (cwd {})",
-            qvm_config.display(),
+            launch_config.display(),
             bank_dir.display()
         );
         let child = Command::new("qvm")
             .current_dir(bank_dir)
-            .arg(format!("@{}", qvm_config.display()))
+            .arg(format!("@{}", launch_config.display()))
             .spawn()
             .map_err(|e| RunnerError::ProcessFailed(format!("qvm: {e}")))?;
 

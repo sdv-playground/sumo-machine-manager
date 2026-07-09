@@ -263,9 +263,10 @@ impl QemuRunner {
             // `ro`, not `rw`: an immutable (dm-verity) guest must not remount /
             // read-write, and a mutable ext4 guest is unaffected — its fstab
             // `/ defaults` still upgrades to rw during boot (today's behavior).
-            // A dm-verity guest supplies `dm-mod.create=… root=/dev/dm-0 ro` via
-            // `extra_cmdline` (appended below); the kernel's last-wins root=/ro
-            // handling then boots the verity device, not this /dev/vda default.
+            // A dm-verity guest supplies `dm-mod.create=… root=/dev/dm-0 ro` from
+            // its `verity-cmdline` bank part (read + appended below); the kernel's
+            // last-wins root=/ro handling then boots the verity device, not this
+            // /dev/vda default.
             let mut cmdline_parts: Vec<String> = vec![
                 "root=/dev/vda".into(),
                 "ro".into(),
@@ -283,6 +284,19 @@ impl QemuRunner {
 
             if let Some(ref extra) = def.extra_cmdline {
                 cmdline_parts.push(extra.clone());
+            }
+            // dm-verity guests ship a `verity-cmdline` bank part — the
+            // `dm-mod.create=… root=/dev/dm-0 ro` root-hash fragment — flashed +
+            // IVD-signed in the same bank as rootfs.img, so the hash always matches
+            // the image (no stale baked-in hash to drift). Read it from the bank and
+            // append; the trailing `root=/dev/dm-0` wins the last-root= race. Absent
+            // for a non-verity guest → skipped.
+            let verity_cmdline = def.image_dir.join("verity-cmdline");
+            if let Ok(frag) = std::fs::read_to_string(&verity_cmdline) {
+                let frag = frag.trim();
+                if !frag.is_empty() {
+                    cmdline_parts.push(frag.to_string());
+                }
             }
             // Extra disks (data, swap — from def.disks, not banked)
             let blk_device = arch.virtio_device("blk");
