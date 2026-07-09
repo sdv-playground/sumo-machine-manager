@@ -14,4 +14,9 @@ jobs:
         with:
           toolchain: "1.96.0"
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      # This crate path-deps sibling repos (../sumo-rs, ../SOVDd) that CI doesn't
+      # check out, so `cargo fmt --all` fails at `cargo metadata` ("failed to read
+      # ../sumo-rs/.../Cargo.toml") before rustfmt ever runs. rustfmt needs none of
+      # those deps — format the tracked .rs files directly. rustfmt.toml (edition
+      # 2021) is auto-discovered from the repo root.
+      - run: git ls-files '*.rs' | xargs -r rustfmt --edition 2021 --check
