@@ -255,6 +255,11 @@ fn error_response(e: ManagerError) -> (StatusCode, Json<serde_json::Value>) {
         ManagerError::AlreadyRunning(_) => (StatusCode::CONFLICT, e.to_string()),
         ManagerError::NotRunning(_) => (StatusCode::CONFLICT, e.to_string()),
         ManagerError::Runner(_) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        // Fail-closed pre-launch verify: the bank failed integrity checks, so we
+        // refuse to launch it. 403 (not a transient 409 or a 500 bug) signals a
+        // hard, non-retryable refusal — the bank must be re-flashed with content
+        // that verifies.
+        ManagerError::VerifyRefused(_) => (StatusCode::FORBIDDEN, e.to_string()),
     };
     (code, Json(serde_json::json!({"error": msg})))
 }

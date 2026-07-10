@@ -163,6 +163,10 @@ pub enum ManagerError {
     AlreadyRunning(String),
     NotRunning(String),
     Runner(RunnerError),
+    /// Pre-launch IVD verify refused the bank (fail-closed): the HSM
+    /// signature, install-gen, committed floor, or a file re-hash didn't
+    /// match the signed manifest. Carries the verify hook's message.
+    VerifyRefused(String),
 }
 
 impl std::fmt::Display for ManagerError {
@@ -172,6 +176,9 @@ impl std::fmt::Display for ManagerError {
             ManagerError::AlreadyRunning(name) => write!(f, "VM already running: {name}"),
             ManagerError::NotRunning(name) => write!(f, "VM not running: {name}"),
             ManagerError::Runner(e) => write!(f, "runner error: {e}"),
+            ManagerError::VerifyRefused(msg) => {
+                write!(f, "pre-launch verify refused launch: {msg}")
+            }
         }
     }
 }
@@ -379,20 +386,36 @@ impl VmManager {
         // host-side state; QnxRunner slays orphan qvm + loopback here.
         vm.runner.prepare_for_launch(name, &effective_def);
 
-        // Pre-launch verify gate — the host installs this to run IVD
-        // verify against the selector-chosen bank dir (now in
-        // `effective_def.image_dir`). The hook owns its own per-call
-        // logging (timing, gen, sig status).
+        // Don't start if boot images are missing (e.g. first boot before
+        // provisioning). Checked BEFORE the verify gate: a selected-but-unflashed
+        // bank defers gracefully here rather than tripping the fail-closed verify
+        // below with a "refused" — a missing kernel boots no code, so there is
+        // nothing to attest.
+        if let Some(kernel) = effective_def.kernel_path() {
+            if !kernel.exists() {
+                tracing::warn!(
+                    "VM {name}: kernel not found: {} — deferring start",
+                    kernel.display()
+                );
+                return Err(ManagerError::Runner(crate::runner::RunnerError::Config(
+                    format!("kernel not found: {}", kernel.display()),
+                )));
+            }
+        }
+
+        // Pre-launch verify gate — the host installs this to run IVD verify
+        // against the selector-chosen bank dir (now in `effective_def.image_dir`).
+        // The hook owns its own per-call logging (timing, gen, sig status).
         //
-        // CURRENT POLICY: log-only. Verify still runs and reports
-        // good/bad with timing, but failure does NOT refuse to start.
-        // Reason (historical): a mutable autosd guest's systemd-remount-fs
-        // upgraded rootfs.img to r/w during boot, so the bytes diverged
-        // from the manifest on subsequent boots. The immutable dm-verity
-        // guest (guest-autosd-rootfs) fixes that at the source — its root
-        // is read-only at the block layer, so the re-hash stays stable.
-        // Flipping this to fail-closed is the tracked follow-up once the
-        // verity image has soaked (tasks/launch-time-verify-mutable-rootfs.md).
+        // FAIL-CLOSED: a bank that doesn't verify does NOT launch. This is the
+        // guest secure-boot gate — it's what protects the signed verity-cmdline
+        // root-hash, kernel, and qvm.conf (dm-verity can't; that root hash is its
+        // input). Log-only used to be forced by a mutable autosd guest whose
+        // rootfs.img was remounted r/w at boot and drifted from the manifest on the
+        // 2nd boot; the immutable dm-verity guest (guest-autosd-rootfs) keeps the
+        // root read-only at the block layer, so the re-hash stays stable and the
+        // gate can refuse. No opt-out — an unverified bank is never launched
+        // (tasks/launch-time-verify-mutable-rootfs.md).
         if let Some(ref verify) = self.pre_launch_verify {
             let started = Instant::now();
             match verify(name, &effective_def.image_dir) {
@@ -405,28 +428,15 @@ impl VmManager {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         vm = name,
                         bank_dir = %effective_def.image_dir.display(),
                         verify_ms = started.elapsed().as_millis() as u64,
                         error = %e,
-                        "pre-launch verify FAILED — continuing anyway (log-only policy; \
-                         see tasks/launch-time-verify-mutable-rootfs.md)",
+                        "pre-launch verify FAILED — refusing to launch (fail-closed)",
                     );
+                    return Err(ManagerError::VerifyRefused(e));
                 }
-            }
-        }
-
-        // Don't start if boot images are missing (e.g. first boot before provisioning)
-        if let Some(kernel) = effective_def.kernel_path() {
-            if !kernel.exists() {
-                tracing::warn!(
-                    "VM {name}: kernel not found: {} — deferring start",
-                    kernel.display()
-                );
-                return Err(ManagerError::Runner(crate::runner::RunnerError::Config(
-                    format!("kernel not found: {}", kernel.display()),
-                )));
             }
         }
 
@@ -809,6 +819,33 @@ vms:
             .iter()
             .any(|v| !matches!(v.status, HealthStatus::Stopped));
         assert!(!running, "no VM should be running after a skipped launch");
+    }
+
+    #[test]
+    fn start_vm_refuses_launch_when_verify_fails() {
+        // Fail-closed: a verify hook that returns Err refuses the launch —
+        // start_vm returns VerifyRefused and the dummy runner never starts.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
+
+        mgr = mgr.with_pre_launch_verify(Arc::new(|_name, _bank_dir| {
+            Err("bad signature".to_string())
+        }));
+
+        mgr.set_vm_bank("vm1", Some(Bank::B)).unwrap();
+        let err = mgr
+            .start_vm("vm1")
+            .expect_err("verify failure must refuse the launch");
+        assert!(
+            matches!(err, ManagerError::VerifyRefused(ref m) if m == "bad signature"),
+            "expected VerifyRefused(\"bad signature\"), got {err:?}",
+        );
+
+        // Refused before the runner started ⇒ nothing running.
+        let running = mgr
+            .list()
+            .iter()
+            .any(|v| !matches!(v.status, HealthStatus::Stopped));
+        assert!(!running, "no VM should be running after a refused launch");
     }
 
     #[test]
