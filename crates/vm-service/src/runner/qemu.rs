@@ -205,29 +205,37 @@ impl QemuRunner {
             // -kernel, not this disk path): keep the legacy bare-`-drive` path. It
             // auto-targets q35's BUILT-IN AHCI (an explicit ich9-ahci controller
             // makes devb-ahci miss the disks), whose 6 ports cap the disk count.
-            let mut qnx_disks: Vec<PathBuf> = Vec::new();
+            // (path, read_only). Boot + rootfs are IVD-signed, immutable firmware,
+            // so they are attached READ-ONLY — mirroring the rig, where the QNX6
+            // rootfs mounts read-only. A writable rootfs lets the guest mutate the
+            // host image, so it drifts from the signed manifest and fail-closed
+            // pre-launch verify refuses it on the next boot. Per-bank partitions and
+            // extra disks carry their own `readonly` flag, honoured here exactly
+            // like the Linux path (writable data disks stay rw).
+            let mut qnx_disks: Vec<(PathBuf, bool)> = Vec::new();
             if let Some(boot) = def.kernel_path() {
-                qnx_disks.push(boot);
+                qnx_disks.push((boot, true));
             }
             if let Some(rootfs) = def.rootfs_path() {
-                qnx_disks.push(rootfs);
+                qnx_disks.push((rootfs, true));
             }
             for part in &def.partitions {
                 let path = def.partition_path(part);
                 if path.exists() {
-                    qnx_disks.push(path);
+                    qnx_disks.push((path, part.readonly));
                 }
             }
             for disk in &def.disks {
-                qnx_disks.push(disk.path.clone());
+                qnx_disks.push((disk.path.clone(), disk.readonly));
             }
             if arch == Arch::X86_64 {
-                for (i, path) in qnx_disks.iter().enumerate() {
+                for (i, (path, read_only)) in qnx_disks.iter().enumerate() {
                     let id = format!("qnxd{i}");
                     let bootidx = if i == 0 { ",bootindex=0" } else { "" };
+                    let ro = if *read_only { ",readonly=on" } else { "" };
                     args.extend_from_slice(&[
                         "-drive".into(),
-                        format!("file={},format=raw,if=none,id={id}", path.display()),
+                        format!("file={},format=raw,if=none,id={id}{ro}", path.display()),
                         "-device".into(),
                         format!("virtio-blk-pci,drive={id}{bootidx}"),
                     ]);
@@ -243,10 +251,11 @@ impl QemuRunner {
                     );
                     qnx_disks.truncate(MAX_QNX_DRIVES);
                 }
-                for path in &qnx_disks {
+                for (path, read_only) in &qnx_disks {
+                    let ro = if *read_only { ",readonly=on" } else { "" };
                     args.extend_from_slice(&[
                         "-drive".into(),
-                        format!("file={},format=raw", path.display()),
+                        format!("file={},format=raw{ro}", path.display()),
                     ]);
                 }
             }
