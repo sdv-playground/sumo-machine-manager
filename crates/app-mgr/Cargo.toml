@@ -14,8 +14,8 @@ sha2 = "0.10"
 tar = "0.4"
 futures = "0.3"
 bytes = "1"
-sumo-codec = { path = "../../../sumo-rs/sumo-codec" }
-sumo-onboard = { path = "../../../sumo-rs/sumo-onboard" }
+sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
 
 [dev-dependencies]
 tempfile = "3"
