@@ -4700,18 +4700,19 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
         .await
         .ok()?
         .ok()?;
-    let request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n"
-    );
+    let request = format!("GET {target} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n");
     tokio::time::timeout(deadline, stream.write_all(request.as_bytes()))
         .await
         .ok()?
         .ok()?;
     let mut buf = Vec::with_capacity(64 * 1024);
-    tokio::time::timeout(deadline, (&mut stream).take(4 * 1024 * 1024).read_to_end(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
+    tokio::time::timeout(
+        deadline,
+        (&mut stream).take(4 * 1024 * 1024).read_to_end(&mut buf),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let response = std::str::from_utf8(&buf).ok()?;
     let (head, body) = response.split_once("\r\n\r\n")?;
     if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {

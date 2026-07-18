@@ -100,7 +100,9 @@ impl ComponentSpec {
         }
         self.host_log_globs
             .as_ref()
-            .map(|globs| LogSource::HostFiles { globs: globs.clone() })
+            .map(|globs| LogSource::HostFiles {
+                globs: globs.clone(),
+            })
     }
 }
 
