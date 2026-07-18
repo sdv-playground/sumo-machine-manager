@@ -68,6 +68,7 @@ fn make_wrapper_router() -> axum::Router {
                 supports_rollback: false,
                 single_bank: true,
                 entity_type: "hsm".into(),
+                log_source: None,
             },
         ),
     ];

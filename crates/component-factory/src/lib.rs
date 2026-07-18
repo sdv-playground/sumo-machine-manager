@@ -76,6 +76,32 @@ pub struct ComponentSpec {
     /// routing taxonomy — e.g. id "vm1" routes as "bank" but reports as "vm".
     #[serde(default)]
     pub entity_type: Option<String>,
+
+    /// §7.21 log reads — a guest VM's in-guest log-agent URL (e.g.
+    /// `http://10.0.101.2:9300`; the guest-hal layer runs the agent).
+    /// Setting it flips `capabilities.logs` on for this component.
+    /// Mutually exclusive with `host_log_globs` (this one wins).
+    #[serde(default)]
+    pub log_agent_url: Option<String>,
+
+    /// §7.21 log reads — host-local file globs (`dir/prefix*suffix`)
+    /// for components whose logs live on THIS node (e.g. the supernova
+    /// component: `["/var/log/*.log"]`).
+    #[serde(default)]
+    pub host_log_globs: Option<Vec<String>>,
+}
+
+impl ComponentSpec {
+    /// The backend [`LogSource`] this spec asks for (agent URL wins).
+    fn log_source(&self) -> Option<component_mgr::backend::LogSource> {
+        use component_mgr::backend::LogSource;
+        if let Some(url) = &self.log_agent_url {
+            return Some(LogSource::GuestAgent { url: url.clone() });
+        }
+        self.host_log_globs
+            .as_ref()
+            .map(|globs| LogSource::HostFiles { globs: globs.clone() })
+    }
 }
 
 /// Result of building a component — includes the Component trait object,
@@ -261,6 +287,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 entity_type: "app".into(),
                 supports_rollback: spec.rollback,
                 single_bank: false,
+                log_source: spec.log_source(),
             };
             let app_images_dir = spec.storage_path.clone().or_else(|| spec.base_path.clone());
             let mut backend = ComponentBackend::with_options(
@@ -346,6 +373,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                     .unwrap_or_else(|| spec.component_type.clone()),
                 supports_rollback: spec.rollback,
                 single_bank: spec.single_bank,
+                log_source: spec.log_source(),
             };
 
             let images_dir = spec.storage_path.clone();

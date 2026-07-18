@@ -323,6 +323,8 @@ async fn main() {
             activator: boot_device.as_ref().map(|_| "ifs".to_string()),
             display_name: hostos_name,
             entity_type: Some("host_os".into()),
+            log_agent_url: None,
+            host_log_globs: None,
         },
         ComponentSpec {
             id: "vm1".into(),
@@ -337,6 +339,8 @@ async fn main() {
             activator: None,
             display_name: vm1_name,
             entity_type: Some("vm".into()),
+            log_agent_url: None,
+            host_log_globs: None,
         },
         ComponentSpec {
             id: "vm2".into(),
@@ -351,6 +355,8 @@ async fn main() {
             activator: None,
             display_name: vm2_name,
             entity_type: Some("vm".into()),
+            log_agent_url: None,
+            host_log_globs: None,
         },
         ComponentSpec {
             id: "hsm".into(),
@@ -365,6 +371,8 @@ async fn main() {
             activator: None,
             display_name: None,
             entity_type: Some("hsm".into()),
+            log_agent_url: None,
+            host_log_globs: None,
         },
     ];
 

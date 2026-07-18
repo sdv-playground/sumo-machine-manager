@@ -272,6 +272,23 @@ struct FlashTransferState {
 // Component configuration
 // ---------------------------------------------------------------------------
 
+/// Where this component's logs come from — drives SOVD §7.21
+/// `GET /components/{id}/logs`. `None` (the default) keeps
+/// `capabilities.logs = false` and the route answers "not supported".
+#[derive(Debug, Clone)]
+pub enum LogSource {
+    /// A guest VM: proxy the in-guest `log-agent` (guest-hal layer
+    /// service) over the per-VM `guest_to_host` /30 — e.g.
+    /// `http://10.0.101.2:9300`. Its `GET /logs` returns JSON records
+    /// `{timestamp, priority, message, source}` (mirror-by-convention;
+    /// the guest tree is a different repo).
+    GuestAgent { url: String },
+    /// Host-local plain files (the supernova/host component): bounded
+    /// tails of every file matching the globs (only `dir/prefix*suffix`
+    /// patterns — no full glob engine). Lines carry the file's mtime.
+    HostFiles { globs: Vec<String> },
+}
+
 /// Per-component configuration for ComponentBackend behavior.
 pub struct ComponentConfig {
     /// Whether this component supports rollback (false for HSM).
@@ -280,6 +297,8 @@ pub struct ComponentConfig {
     pub single_bank: bool,
     /// SOVD entity_type for component identity.
     pub entity_type: String,
+    /// §7.21 log source; `None` = component serves no logs.
+    pub log_source: Option<LogSource>,
 }
 
 impl Default for ComponentConfig {
@@ -288,6 +307,7 @@ impl Default for ComponentConfig {
             supports_rollback: true,
             single_bank: false,
             entity_type: "vm".to_string(),
+            log_source: None,
         }
     }
 }
@@ -553,7 +573,9 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 security: true,
                 sub_entities: false,
                 subscriptions: false,
-                logs: false,
+                // §7.21: only components with a configured log source
+                // serve logs; the rest keep the "not supported" answer.
+                logs: config.log_source.is_some(),
                 operations: false,
             },
             bank_set,
@@ -2329,6 +2351,32 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         });
 
         Ok(params)
+    }
+
+    /// SOVD §7.21 `GET /components/{id}/logs` — served only when the
+    /// deployment config gives this component a [`LogSource`]
+    /// (`capabilities.logs` gates the route in sovd-api). A guest VM is
+    /// proxied to its in-guest log-agent; the host component tails its
+    /// own files. Errors degrade to an EMPTY list with one `warn` — a
+    /// down VM must not turn a log read into a 500.
+    async fn get_logs(&self, filter: &LogFilter) -> BackendResult<Vec<LogEntry>> {
+        let Some(source) = &self.config.log_source else {
+            return Ok(Vec::new());
+        };
+        let entries = match source {
+            LogSource::GuestAgent { url } => match query_log_agent(url, filter).await {
+                Some(e) => e,
+                None => {
+                    tracing::warn!(
+                        component = %self.entity_info.id, url = %url,
+                        "log-agent unreachable — serving empty log list"
+                    );
+                    Vec::new()
+                }
+            },
+            LogSource::HostFiles { globs } => host_file_logs(globs, filter),
+        };
+        Ok(entries)
     }
 
     async fn read_data(&self, param_ids: &[String]) -> BackendResult<Vec<DataValue>> {
@@ -4553,6 +4601,272 @@ async fn query_vm_health(addr: &str, vm_name: &str) -> Option<GuestHealth> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// §7.21 log sources (see ComponentConfig::log_source)
+// ---------------------------------------------------------------------------
+
+/// One record from the guest log-agent's `GET /logs`. Field names are the
+/// wire contract, mirrored by convention with `guest-vm-sdk`'s
+/// `log-agent` crate (different repo — never a git dep).
+#[derive(serde::Deserialize)]
+struct AgentLogRecord {
+    timestamp: String,
+    priority: String,
+    message: String,
+    source: String,
+}
+
+fn priority_name(p: LogPriority) -> &'static str {
+    match p {
+        LogPriority::Emergency => "emergency",
+        LogPriority::Alert => "alert",
+        LogPriority::Critical => "critical",
+        LogPriority::Error => "error",
+        LogPriority::Warning => "warning",
+        LogPriority::Notice => "notice",
+        LogPriority::Info => "info",
+        LogPriority::Debug => "debug",
+    }
+}
+
+fn priority_from_name(s: &str) -> LogPriority {
+    match s {
+        "emergency" => LogPriority::Emergency,
+        "alert" => LogPriority::Alert,
+        "critical" => LogPriority::Critical,
+        "error" => LogPriority::Error,
+        "warning" => LogPriority::Warning,
+        "notice" => LogPriority::Notice,
+        "debug" => LogPriority::Debug,
+        _ => LogPriority::Info,
+    }
+}
+
+/// Percent-encode one query value (RFC 3986 unreserved pass-through).
+fn qenc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// `GET {url}/logs?...` against the in-guest log-agent — hand-rolled
+/// HTTP/1.1 over tokio (same shape as [`query_vm_health`]; no HTTP-client
+/// crate in this tree). `None` = unreachable/bad response (the caller
+/// logs and serves empty). Body capped at 4 MiB.
+async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let deadline = std::time::Duration::from_secs(5);
+    let hostport = url.strip_prefix("http://").unwrap_or(url);
+    let (hostport, base_path) = match hostport.split_once('/') {
+        Some((hp, rest)) => (hp, format!("/{rest}")),
+        None => (hostport, String::new()),
+    };
+
+    let mut qs: Vec<String> = Vec::new();
+    if let Some(n) = filter.tail.or(filter.limit) {
+        qs.push(format!("tail={n}"));
+    }
+    if let Some(s) = &filter.source {
+        qs.push(format!("source={}", qenc(s)));
+    }
+    if let Some(p) = &filter.pattern {
+        qs.push(format!("pattern={}", qenc(p)));
+    }
+    if let Some(p) = filter.priority {
+        qs.push(format!("priority={}", priority_name(p)));
+    }
+    if let Some(t) = filter.since {
+        qs.push(format!("since={}", qenc(&t.to_rfc3339())));
+    }
+    if let Some(t) = filter.until {
+        qs.push(format!("until={}", qenc(&t.to_rfc3339())));
+    }
+    let target = if qs.is_empty() {
+        format!("{base_path}/logs")
+    } else {
+        format!("{base_path}/logs?{}", qs.join("&"))
+    };
+
+    let mut stream = tokio::time::timeout(deadline, TcpStream::connect(hostport))
+        .await
+        .ok()?
+        .ok()?;
+    let request = format!(
+        "GET {target} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n"
+    );
+    tokio::time::timeout(deadline, stream.write_all(request.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
+    let mut buf = Vec::with_capacity(64 * 1024);
+    tokio::time::timeout(deadline, (&mut stream).take(4 * 1024 * 1024).read_to_end(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    let response = std::str::from_utf8(&buf).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        return None;
+    }
+    let records: Vec<AgentLogRecord> = serde_json::from_str(body).ok()?;
+
+    let entries = records
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| LogEntry {
+            id: format!("{}-{i}", r.source),
+            timestamp: chrono::DateTime::parse_from_rfc3339(&r.timestamp)
+                .map(|t| t.with_timezone(&Utc))
+                .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH),
+            priority: priority_from_name(&r.priority),
+            message: r.message,
+            source: Some(r.source),
+            pid: None,
+            fields: None,
+            log_type: None,
+            size: None,
+            status: None,
+            href: None,
+            metadata: None,
+        })
+        .collect();
+    Some(entries)
+}
+
+/// Host-local file logs: bounded tails of every file matching the globs.
+/// Only `dir/prefix*suffix` patterns (one `*`, filename position) — a
+/// literal path matches itself. Lines carry the file's mtime; priority
+/// is `Info` (host logs are unstructured text).
+fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
+    const PER_FILE_CAP: u64 = 64 * 1024;
+    const MAX_ENTRIES: usize = 2000;
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for g in globs {
+        let p = std::path::Path::new(g);
+        match p.file_name().and_then(|f| f.to_str()) {
+            Some(name) if name.contains('*') => {
+                let (prefix, suffix) = name.split_once('*').unwrap_or((name, ""));
+                let dir = p.parent().unwrap_or(std::path::Path::new("/"));
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    for e in rd.flatten() {
+                        let f = e.file_name();
+                        let f = f.to_string_lossy();
+                        if f.starts_with(prefix) && f.ends_with(suffix) && e.path().is_file() {
+                            files.push(e.path());
+                        }
+                    }
+                }
+            }
+            _ => {
+                if p.is_file() {
+                    files.push(p.to_path_buf());
+                }
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+
+    let mut entries: Vec<LogEntry> = Vec::new();
+    for path in files {
+        let source = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "host".into());
+        if let Some(want) = &filter.source {
+            if want != &source {
+                continue;
+            }
+        }
+        let mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(chrono::DateTime::<Utc>::from)
+            .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH);
+        if let Some(since) = filter.since {
+            if mtime < since {
+                continue;
+            }
+        }
+        if let Some(until) = filter.until {
+            if mtime > until {
+                continue;
+            }
+        }
+        let lines = match tail_file_lines(&path, PER_FILE_CAP) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        for (i, line) in lines.into_iter().enumerate() {
+            if let Some(pat) = &filter.pattern {
+                if !line.contains(pat.as_str()) {
+                    continue;
+                }
+            }
+            entries.push(LogEntry {
+                id: format!("{source}-{i}"),
+                timestamp: mtime,
+                priority: LogPriority::Info,
+                message: line,
+                source: Some(source.clone()),
+                pid: None,
+                fields: None,
+                log_type: None,
+                size: None,
+                status: None,
+                href: None,
+                metadata: None,
+            });
+            if entries.len() >= MAX_ENTRIES {
+                break;
+            }
+        }
+    }
+    if let Some(p) = filter.priority {
+        entries.retain(|e| e.priority == p);
+    }
+    let tail = filter.tail.or(filter.limit).unwrap_or(200).min(MAX_ENTRIES);
+    if entries.len() > tail {
+        entries.drain(..entries.len() - tail);
+    }
+    entries
+}
+
+/// Last `cap` bytes of `path`, split into non-empty lines (a torn first
+/// line after the seek is dropped). Mirrors the guest agent's reader.
+fn tail_file_lines(path: &std::path::Path, cap: u64) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let mut torn = false;
+    if len > cap {
+        f.seek(SeekFrom::Start(len - cap))?;
+        torn = true;
+    }
+    let mut buf = Vec::with_capacity(cap.min(len) as usize);
+    f.take(cap).read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    if torn && !lines.is_empty() {
+        lines.remove(0);
+    }
+    Ok(lines)
+}
+
 fn guest_state_str(state: u32) -> &'static str {
     match state {
         0 => "booting",
@@ -5375,6 +5689,7 @@ mod bank_provider_injection_tests {
                 supports_rollback: false,
                 single_bank: true,
                 entity_type: "hsm".to_string(),
+                log_source: None,
             },
             None,
             None,
@@ -5482,6 +5797,111 @@ mod bank_provider_injection_tests {
         assert_eq!(v["update_mode"], serde_json::json!("singleshot"));
         assert_eq!(v["supports_rollback"], serde_json::json!(false));
         assert_eq!(v["dual_bank"], serde_json::json!(false));
+    }
+
+    /// §7.21: no log source => capability off + empty list (the route
+    /// answers "not supported" via capabilities().logs).
+    #[tokio::test]
+    async fn logs_unsupported_without_source() {
+        let b = backend();
+        assert!(!b.capabilities().logs);
+        let got = b.get_logs(&LogFilter::default()).await.unwrap();
+        assert!(got.is_empty());
+    }
+
+    fn backend_with_logs(source: LogSource) -> ComponentBackend<MemBlockDevice> {
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        ComponentBackend::with_options(
+            BankSet::Vm1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            Arc::new(NoopSecurity),
+            ComponentConfig {
+                log_source: Some(source),
+                ..ComponentConfig::default()
+            },
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// §7.21 HostFiles source: bounded tails of matching files with
+    /// source/pattern/tail filter semantics.
+    #[tokio::test]
+    async fn logs_host_files_globs_and_filters() {
+        let dir = std::env::temp_dir().join(format!("cm-logs-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("supernova.log"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(dir.join("other.log"), "alpha\nbeta\n").unwrap();
+        std::fs::write(dir.join("skip.txt"), "not a log\n").unwrap();
+
+        let b = backend_with_logs(LogSource::HostFiles {
+            globs: vec![format!("{}/*.log", dir.display())],
+        });
+        assert!(b.capabilities().logs);
+
+        let all = b.get_logs(&LogFilter::default()).await.unwrap();
+        assert_eq!(all.len(), 5, "both .log files, txt excluded");
+        assert!(all.iter().all(|e| e.priority == LogPriority::Info));
+
+        let filtered = b
+            .get_logs(&LogFilter {
+                source: Some("supernova".into()),
+                pattern: Some("t".into()),
+                tail: Some(1),
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].message, "three");
+        assert_eq!(filtered[0].source.as_deref(), Some("supernova"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// §7.21 GuestAgent source: proxy a stub agent (canned JSON) and map
+    /// records to LogEntry; an unreachable agent degrades to empty.
+    #[tokio::test]
+    async fn logs_guest_agent_proxy_and_degrade() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let body = r#"[{"timestamp":"2026-07-18T12:00:00Z","priority":"warning","message":"hb late","source":"vhealth"}]"#;
+            for conn in listener.incoming().take(1) {
+                let mut s = conn.unwrap();
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let b = backend_with_logs(LogSource::GuestAgent {
+            url: format!("http://{addr}"),
+        });
+        assert!(b.capabilities().logs);
+        let got = b.get_logs(&LogFilter::default()).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].message, "hb late");
+        assert_eq!(got[0].priority, LogPriority::Warning);
+        assert_eq!(got[0].source.as_deref(), Some("vhealth"));
+        assert_eq!(got[0].timestamp.to_rfc3339(), "2026-07-18T12:00:00+00:00");
+
+        // Unreachable agent: empty list, not an error (the SOVD route
+        // must stay 200 with [] when a VM is down).
+        let b = backend_with_logs(LogSource::GuestAgent {
+            url: "http://127.0.0.1:1".into(),
+        });
+        let got = b.get_logs(&LogFilter::default()).await.unwrap();
+        assert!(got.is_empty());
     }
 
     #[test]
