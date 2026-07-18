@@ -81,8 +81,8 @@ repo — that serve the **same** wire from the **same** route library.
   `axum::serve` at `src/main.rs:2200`.
 - **Launched by:** a respawn loop with a TOML config — the `qemu-cvc` Docker
   entrypoint (`examples/qemu-cvc/entrypoint.sh`) for the emulated device, and
-  `managed-qnx71/start.sh` → `bank_a/start.sh` on the rig (deployed by the
-  `tower-provision` example).
+  the host runtime bundle's `start.sh` → `bank_a/start.sh` on the rig
+  (deployed by the `tower-provision` example).
 
 ---
 
