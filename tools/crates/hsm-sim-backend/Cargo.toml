@@ -2,7 +2,7 @@
 name = "hsm-sim-backend"
 version = "0.1.0"
 edition = "2021"
-description = "Non-production software HSM backend (SimHsm): file keystore + RustCrypto, served over link-B by the hsm-sim-service bin. A dev/test/CI reference backend, NOT for production."
+description = "Software HSM backend (SimHsm): file keystore + RustCrypto, served over link-B by the hsm-sim-service bin. The HSM for sim/dev deployments (spawned and owned by the host machine manager on sim devices) until real-HSM integration lands; hardware production runs a vendor C link-B service. Provides no hardware key protection. Verified by hsm-conformance."
 
 [dependencies]
 tracing = "0.1"

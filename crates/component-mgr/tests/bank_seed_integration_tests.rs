@@ -22,9 +22,9 @@ use nv_store::block::MemBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
-use crate::backend::ComponentConfig;
-use crate::bank_provider::IvdBankProvider;
-use crate::bank_spec::BankSetSpec;
+use component_mgr::backend::ComponentConfig;
+use component_mgr::bank_provider::IvdBankProvider;
+use component_mgr::bank_spec::BankSetSpec;
 
 fn make_nv() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);

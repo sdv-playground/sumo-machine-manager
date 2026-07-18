@@ -14,12 +14,12 @@ use nv_store::block::MemBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
-use crate::backend::{ComponentBackend, ComponentConfig};
-use crate::component_adapter::ComponentAdapter;
-use crate::did::{DID_SERIAL_NUMBER, DID_VIN};
-use crate::manifest_provider::ManifestProvider;
-use crate::sovd::security::TestSecurityProvider;
-use crate::suit_provider::SuitProvider;
+use component_mgr::backend::{ComponentBackend, ComponentConfig};
+use component_mgr::component_adapter::ComponentAdapter;
+use component_mgr::did::{DID_SERIAL_NUMBER, DID_VIN};
+use component_mgr::manifest_provider::ManifestProvider;
+use component_mgr::sovd::security::TestSecurityProvider;
+use component_mgr::suit_provider::SuitProvider;
 
 fn make_nv() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);

@@ -38,7 +38,8 @@
 //! contract that does not exist yet**. So the production [`SelectorStore`] and
 //! [`Signer`] are loud stubs ([`StubSelectorStore`] / [`StubSigner`]) that
 //! warn and no-op. The cache + state transitions are fully real and unit-tested
-//! against in-memory seams ([`InMemorySelectorStore`] / [`TestSigner`]) so the
+//! against in-memory seams (`InMemorySelectorStore` / `TestSigner`, gated
+//! behind the `test-seams` feature so production builds never link them) so the
 //! state machine is correct the day the sector contract lands — at which point
 //! the stubs are swapped for real eMMC sector I/O + HSM signing and this becomes
 //! the authority. Until then the existing per-component commit/rollback
@@ -52,9 +53,12 @@ use nv_store::types::{Bank, BankSet};
 // can read the selector without depending up on `machine-mgr`. Re-exported here
 // so existing `machine_mgr::system_bank_state::*` paths still resolve.
 pub use nv_store::selector::{
-    FileSelectorStore, InMemorySelectorStore, SelectorBlob, SelectorStore, Signer,
-    StubSelectorStore, StubSigner, TestSigner,
+    FileSelectorStore, SelectorBlob, SelectorStore, Signer, StubSelectorStore, StubSigner,
 };
+// In-memory test seams: only for test builds (this crate's own unit tests, or
+// downstream cfg(test) users via the forwarding `test-seams` feature).
+#[cfg(any(test, feature = "test-seams"))]
+pub use nv_store::selector::{InMemorySelectorStore, TestSigner};
 
 // ---------------------------------------------------------------------------
 // The manager

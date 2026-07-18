@@ -32,8 +32,9 @@ sumo-processor = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = 
 sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
 sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
 hsm = { path = "../hsm", features = ["crypto"] }
-# The dev/test SimHsm CSR/IVD fallback in component_adapter.rs + factory-init's
-# `--hsm-keystore` bring-up (main.rs). Production reaches the HSM over link-B.
+# The software-HSM (SimHsm) CSR/IVD fallback in component_adapter.rs +
+# factory-init's `--hsm-keystore` bring-up (main.rs) — the sim/dev HSM mode.
+# Hardware production reaches a vendor HSM service over link-B instead.
 hsm-sim-backend = { path = "../../tools/crates/hsm-sim-backend" }
 host-os-mgr = { path = "../host-os-mgr" }
 app-mgr = { path = "../app-mgr" }
@@ -58,6 +59,10 @@ coset = "0.3"
 ciborium = "0.2"
 tempfile = "3"
 rand = "0.8"
+# bank_provider's unit tests use the in-memory selector seams re-exported by
+# machine-mgr; the re-declaration enables them for test builds only (cargo
+# unifies dev-features there).
+machine-mgr = { path = "../machine-mgr", features = ["test-seams"] }
 
 [[bin]]
 name = "vm-diagserver"

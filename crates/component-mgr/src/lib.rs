@@ -78,18 +78,3 @@ pub mod sovd {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod sovd_tests;
-
-#[cfg(test)]
-mod component_adapter_tests;
-
-#[cfg(test)]
-mod install_router_diag_tests;
-
-#[cfg(test)]
-mod wrapper_http_tests;
-
-#[cfg(test)]
-mod bank_seed_integration_tests;

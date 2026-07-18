@@ -28,10 +28,10 @@ use nv_store::types::*;
 
 use sovd_core::DiagnosticBackend;
 
-use crate::backend::{ComponentBackend, ComponentConfig, INSTALLED_MANIFEST_PARAM_ID};
-use crate::manifest_provider::ManifestProvider;
-use crate::sovd::security::TestSecurityProvider;
-use crate::suit_provider::SuitProvider;
+use component_mgr::backend::{ComponentBackend, ComponentConfig, INSTALLED_MANIFEST_PARAM_ID};
+use component_mgr::manifest_provider::ManifestProvider;
+use component_mgr::sovd::security::TestSecurityProvider;
+use component_mgr::suit_provider::SuitProvider;
 
 /// Build the same router shape that `vm-sovd`'s `main` registers, but with an
 /// in-memory NV store. vm1 + hsm are non-install-router components, so — as in

@@ -10,3 +10,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tracing = "0.1"
+
+[features]
+# Expose the in-memory selector test seams (`InMemorySelectorStore` /
+# `TestSigner`). For test builds only — downstream crates enable it via a
+# [dev-dependencies] re-declaration, so production builds never see the seams.
+test-seams = []

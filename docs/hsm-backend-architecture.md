@@ -75,7 +75,7 @@ crypto itself; the backend (sim or vendor C) does.
 
 | Backend | What | Role |
 |---|---|---|
-| **`hsm-sim-service`** | `SimHsm` (software) served over link-B (`serve_crypto`) | **non-production** dev/test backend + the runnable reference of a *conforming* impl — **just another link-B implementation, not privileged** |
+| **`hsm-sim-service`** | `SimHsm` (software) served over link-B (`serve_crypto`) | the sim/dev deployment backend (**no hardware key protection**) + the runnable reference of a *conforming* impl — **just another link-B implementation, not privileged** |
 | **vendor C HSE service** | a C process implementing `hsm-link-b` (skeleton: `hsm-link-b/reference/hse_service_skeleton.c`) | the production path, per silicon |
 
 `hsm-sim-service` and a vendor HSE are *peers* behind link B — whoever launches the backend

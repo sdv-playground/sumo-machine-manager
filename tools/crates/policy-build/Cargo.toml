@@ -5,7 +5,7 @@ edition = "2021"
 description = "Build read-only policy images (squashfs for Linux, qnx6 for QNX guests). AUTH-ARCH-001 §4."
 
 [dependencies]
-policy-partition = { path = "../policy-partition" }
+policy-partition = { path = "../../../crates/policy-partition" }
 
 [dev-dependencies]
 tempfile = "3"

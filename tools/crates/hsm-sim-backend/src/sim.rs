@@ -35,11 +35,13 @@ use hsm::{
     HsmError, HsmProvider, KeyHandle, KeyRole, KeyType, ProvisioningState, SlotInfo, SlotKind,
 };
 
-/// Software HSM for **dev / test / CI — NOT for production**.
+/// Software HSM — the sim/dev backend. **No hardware key protection.**
 ///
 /// `SimHsm` is a file-keystore + RustCrypto implementation of `HsmProvider` /
-/// `HsmCryptoProvider`. It is **just another implementation of the HSM contract**,
-/// not a privileged one: production runs a real HSE (a vendor C link-B service
+/// `HsmCryptoProvider` — the HSM sim/dev deployments run (the host machine
+/// manager spawns and owns it on sim devices) until real-HSM integration lands.
+/// It is **just another implementation of the HSM contract**, not a privileged
+/// one: hardware production runs a real HSE (a vendor C link-B service
 /// implementing `hsm-link-b`). It is served over link-B by the `hsm-sim-service`
 /// bin; verify any backend with the `hsm-conformance` suite.
 ///

@@ -84,9 +84,12 @@ pub use component::Component;
 pub use error::{MachineError, MachineResult};
 pub use machine::{Machine, MachineRegistry};
 pub use system_bank_state::{
-    BootSelector, FileSelectorStore, InMemorySelectorStore, SelectorBlob, SelectorStore,
-    SharedSystemBankState, Signer, StubSelectorStore, StubSigner, SystemBankManager, TestSigner,
+    BootSelector, FileSelectorStore, SelectorBlob, SelectorStore, SharedSystemBankState, Signer,
+    StubSelectorStore, StubSigner, SystemBankManager,
 };
+// In-memory test seams: only for test builds (see `system_bank_state`).
+#[cfg(any(test, feature = "test-seams"))]
+pub use system_bank_state::{InMemorySelectorStore, TestSigner};
 pub use types::*;
 
 // Re-exports of SOVD wire types that are also our domain types.

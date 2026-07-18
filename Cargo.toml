@@ -11,12 +11,13 @@ members = [
     "crates/hsm",
     "crates/hsm-contract",
     "crates/hsm-link-b",
-    "crates/sumo-factory-reset-mint",
+    # sumo-verify deliberately STAYS in runtime crates/ — it is a DEPLOYED
+    # launch gate (the supernova CI runtime bundle ships it next to vhsm-ssd,
+    # and the start script invokes it before launching each component), not
+    # developer tooling.
     "crates/sumo-verify",
     "crates/policy-eval",
     "crates/policy-partition",
-    "crates/policy-build",
-    "crates/ca-bundle-build",
     "crates/vhsm-ssd",
     "crates/vm-wire",
     "crates/vm-devices",
@@ -32,14 +33,22 @@ members = [
     "crates/vhsm-crossnode-client",
     "crates/vm-sovd",
 
-    # Dev / test tooling (run by developers, not shipped to the device). Grouped
-    # under tools/crates/ to keep it separate from the runtime crates/ above.
-    # (Candidate siblings to move here next, pending review: ca-bundle-build,
-    # policy-build, sumo-verify, sumo-factory-reset-mint.)
+    # Dev / offboard tooling, grouped under tools/crates/ to keep it separate
+    # from the runtime crates/ above. Of the once-pending relocation candidates,
+    # ca-bundle-build, policy-build and sumo-factory-reset-mint moved here
+    # (offboard image builders / dev token minter, run by developers and CI);
+    # sumo-verify stayed in crates/ — see its note above.
+    # Build read-only CA-bundle images shipped as per-VM SUIT components.
+    "tools/crates/ca-bundle-build",
     "tools/crates/hsm-conformance",
-    # Non-production SimHsm backend + the `hsm-sim-service` link-B bin (was the
-    # sim half of the `hsm` crate; S7b relocated it here).
+    # Software-HSM (SimHsm) backend + the `hsm-sim-service` link-B bin (was the
+    # sim half of the `hsm` crate; S7b relocated it here). Not merely test
+    # tooling: sim/dev deployments run it as their HSM — see its crate docs.
     "tools/crates/hsm-sim-backend",
+    # Build read-only policy images (squashfs / qnx6) for the policy partition.
+    "tools/crates/policy-build",
+    # Dev factory-reset capability-token minter (well-known dev key).
+    "tools/crates/sumo-factory-reset-mint",
 ]
 
 [profile.release]

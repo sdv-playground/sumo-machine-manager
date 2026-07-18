@@ -1,11 +1,13 @@
 //! `hsm-sim-service` — serve a [`SimHsm`] as an out-of-process **link-B** crypto
 //! backend.
 //!
-//! **NON-PRODUCTION.** A *software reference* backend for dev / test / CI — it is
-//! **just another link-B implementation**, not privileged. A real deployment runs a
-//! vendor C HSE service implementing the same `hsm-link-b` contract; `vhsm-ssd`
-//! selects between them purely by `--backend-cmd` and can't tell them apart. Verify
-//! any backend (this one included) with the `hsm-conformance` suite.
+//! The software-HSM backend for **sim / dev deployments** (spawned and owned by
+//! the host machine manager on sim devices) — **just another link-B
+//! implementation**, not privileged, and with **no hardware key protection**.
+//! Hardware production runs a vendor C HSE service implementing the same
+//! `hsm-link-b` contract; `vhsm-ssd` selects between them purely by which
+//! backend command runs and can't tell them apart. Verify any backend (this one
+//! included) with the `hsm-conformance` suite.
 //!
 //! Stage 2 of making the HSM backend a uniform out-of-process link-B service
 //! (Stage 1 = `hsm::link_b`: the frame codec, `serve_crypto`, and `LinkBClient`;

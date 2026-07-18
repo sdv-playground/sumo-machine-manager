@@ -6238,6 +6238,14 @@ mod copy_forward_tests {
     /// logs every `"<METHOD> <path>"`, and optionally truncates the FIRST GET
     /// body after `early_close_once` bytes (then serves fully — the resume
     /// scenario).
+    ///
+    /// Teardown is deliberately graceful (drain the full request, then FIN via
+    /// `shutdown`): an abrupt drop can turn into a TCP RST, and an RST discards
+    /// data the client kernel has buffered but not yet read — which made the
+    /// truncated-body bytes vanish under load (empty `.part`, flaky
+    /// `reconcile_fetch_failure_is_retry_safe_and_resumes`). With a clean FIN
+    /// plus a delivery gap after a truncated body (see below), the client
+    /// reliably sees exactly the bytes written, then EOF.
     async fn serve_cas(
         blobs: std::collections::HashMap<String, Vec<u8>>,
         early_close_once: Option<usize>,
@@ -6258,9 +6266,18 @@ mod copy_forward_tests {
                 let log = log_srv.clone();
                 let cut = cut.clone();
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    // Drain the whole request (headers end at the blank line;
+                    // these requests carry no body). Unread request bytes at
+                    // close would turn the close into an RST.
+                    let mut buf = Vec::with_capacity(4096);
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&buf).into_owned();
                     let mut first = req.lines().next().unwrap_or("").split_whitespace();
                     let method = first.next().unwrap_or("").to_string();
                     let path = first.next().unwrap_or("").to_string();
@@ -6271,6 +6288,7 @@ mod copy_forward_tests {
                                 b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                             )
                             .await;
+                        let _ = sock.shutdown().await;
                         return;
                     };
                     let start = req
@@ -6284,11 +6302,13 @@ mod copy_forward_tests {
                         None => ("200 OK", &blob[..]),
                     };
                     let full_len = body.len();
+                    let mut truncated = false;
                     if method == "HEAD" {
                         body = &[];
                     } else if let Some(limit) = cut.lock().unwrap().take() {
                         if body.len() > limit {
                             body = &body[..limit];
+                            truncated = true;
                         }
                     }
                     let head = format!(
@@ -6297,6 +6317,21 @@ mod copy_forward_tests {
                     let _ = sock.write_all(head.as_bytes()).await;
                     let _ = sock.write_all(body).await;
                     let _ = sock.flush().await;
+                    if truncated {
+                        // Separate the short body from the EOF in time. When
+                        // the truncated bytes and the FIN reach the client as
+                        // one read event, hyper races its buffered body chunk
+                        // against the premature-EOF error and sometimes
+                        // surfaces ONLY the error — the client then persists a
+                        // 0-byte partial and the resume test loses its Range
+                        // leg. With the gap, the client must consume the
+                        // prefix as its own event before the EOF arrives.
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    // FIN, not RST: guarantees delivery of everything written
+                    // (the truncated-GET case relies on the client seeing all
+                    // `early_close_once` bytes, then clean EOF).
+                    let _ = sock.shutdown().await;
                 });
             }
         });
@@ -6504,7 +6539,9 @@ mod copy_forward_tests {
             .expect_err("truncated transfer must fail the first attempt");
         let part = images_dir.join(format!("vm1/cas/cas-{outer_hex}.part"));
         assert!(part.exists(), "resumable partial must persist");
-        assert!(std::fs::metadata(&part).unwrap().len() > 0);
+        // Exactly the delivered prefix — serve_cas's post-truncation gap makes
+        // the 1000 delivered-then-EOF bytes deterministic.
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 1000);
 
         let done = backend
             .reconcile_unpushed(&manifest, 0, 1, Bank::B)

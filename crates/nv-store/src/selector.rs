@@ -19,7 +19,8 @@
 //! contract that does not exist yet**. So the production [`SelectorStore`] and
 //! [`Signer`] here are loud stubs ([`StubSelectorStore`] / [`StubSigner`]) that
 //! warn and no-op. The cache + state transitions are fully real and unit-tested
-//! against in-memory seams ([`InMemorySelectorStore`] / [`TestSigner`]) so the
+//! against in-memory seams (`InMemorySelectorStore` / `TestSigner`, gated
+//! behind the `test-seams` feature so production builds never link them) so the
 //! state machine is correct the day the sector contract lands — at which point
 //! the stubs are swapped for real eMMC sector I/O + HSM signing and this becomes
 //! the authority. Until then the existing per-component commit/rollback
@@ -221,25 +222,30 @@ impl Signer for StubSigner {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory test seams — real sectors + deterministic sign/verify
+// In-memory test seams — real sectors + deterministic sign/verify.
+// Gated behind the `test-seams` feature so production builds never link them;
+// test builds enable the feature via a [dev-dependencies] re-declaration.
 // ---------------------------------------------------------------------------
 
 /// In-memory [`SelectorStore`]: two real cells behind a mutex. Lets the
 /// `SystemBankManager` be exercised end-to-end (including the
 /// reboot-mid-stage case: drop the manager, `load` a fresh one from the *same*
 /// store) without any hardware.
+#[cfg(feature = "test-seams")]
 #[derive(Debug, Default, Clone)]
 pub struct InMemorySelectorStore {
     primary: std::sync::Arc<std::sync::Mutex<Option<SelectorBlob>>>,
     secondary: std::sync::Arc<std::sync::Mutex<Option<SelectorBlob>>>,
 }
 
+#[cfg(feature = "test-seams")]
 impl InMemorySelectorStore {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
+#[cfg(feature = "test-seams")]
 impl SelectorStore for InMemorySelectorStore {
     fn read_primary(&self) -> Option<SelectorBlob> {
         self.primary.lock().expect("primary poisoned").clone()
@@ -259,15 +265,18 @@ impl SelectorStore for InMemorySelectorStore {
 /// XOR-ed by `0xA5`. `verify` recomputes and compares — so a tampered digest or
 /// a forged signature is actually rejected, which is what the
 /// verify-failing-blob test relies on.
+#[cfg(feature = "test-seams")]
 #[derive(Debug, Default, Clone)]
 pub struct TestSigner;
 
+#[cfg(feature = "test-seams")]
 impl TestSigner {
     fn transform(sha: &[u8; 32]) -> Vec<u8> {
         sha.iter().map(|b| b ^ 0xA5).collect()
     }
 }
 
+#[cfg(feature = "test-seams")]
 impl Signer for TestSigner {
     fn sign(&self, sha: &[u8; 32]) -> Vec<u8> {
         Self::transform(sha)

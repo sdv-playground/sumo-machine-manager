@@ -38,13 +38,15 @@ use nv_store::types::*;
 use sumo_offboard::keygen::{self, ES256};
 use sumo_offboard::ImageManifestBuilder;
 
-use crate::app_install_router::AppInstallRouterComponent;
-use crate::backend::{ComponentBackend, ComponentConfig};
-use crate::install_router_diag::InstallRouterDiag;
-use crate::manifest_provider::{ManifestError, ManifestProvider, ManifestType, ValidatedFirmware};
-use crate::ota::ImageMeta;
-use crate::sovd::security::TestSecurityProvider;
-use crate::suit_provider::SuitProvider;
+use component_mgr::app_install_router::AppInstallRouterComponent;
+use component_mgr::backend::{ComponentBackend, ComponentConfig};
+use component_mgr::install_router_diag::InstallRouterDiag;
+use component_mgr::manifest_provider::{
+    ManifestError, ManifestProvider, ManifestType, ValidatedFirmware,
+};
+use component_mgr::ota::ImageMeta;
+use component_mgr::sovd::security::TestSecurityProvider;
+use component_mgr::suit_provider::SuitProvider;
 
 // ---------------------------------------------------------------------------
 // Install-routing tests: container-vs-VM through the real router
@@ -283,7 +285,7 @@ fn router_diag_with_factory(
         id: "container_image",
         caps: Capabilities::default(),
     });
-    let vm: Arc<dyn Component> = Arc::new(crate::component_adapter::ComponentAdapter::new(
+    let vm: Arc<dyn Component> = Arc::new(component_mgr::component_adapter::ComponentAdapter::new(
         backend.clone(),
     ));
     let router: Arc<dyn Component> = Arc::new(AppInstallRouterComponent::new(

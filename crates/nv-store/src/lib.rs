@@ -23,9 +23,10 @@ pub mod store;
 pub mod types;
 
 pub use selector::{
-    FileSelectorStore, InMemorySelectorStore, SelectorBlob, SelectorStore, Signer,
-    StubSelectorStore, StubSigner, TestSigner,
+    FileSelectorStore, SelectorBlob, SelectorStore, Signer, StubSelectorStore, StubSigner,
 };
+#[cfg(feature = "test-seams")]
+pub use selector::{InMemorySelectorStore, TestSigner};
 
 #[cfg(test)]
 mod tests;

@@ -18,3 +18,12 @@ nv-store = { path = "../nv-store" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+# Our own unit tests use the in-memory selector seams; the re-declaration
+# enables them for test builds only (cargo unifies dev-features there).
+nv-store = { path = "../nv-store", features = ["test-seams"] }
+
+[features]
+# Forward nv-store's in-memory selector test seams (`InMemorySelectorStore` /
+# `TestSigner`) through this crate's re-exports. Test builds only — downstream
+# cfg(test) users enable it via a [dev-dependencies] re-declaration.
+test-seams = ["nv-store/test-seams"]
