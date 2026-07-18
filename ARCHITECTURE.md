@@ -289,7 +289,9 @@ the same seam.
 
 Production OTA is SUIT envelopes driven over the SOVD **`/updates`** wire (the older
 `/files` + `/flash/transfer` endpoints are retired). Per component, the driving client
-runs session → security unlock → upload envelope → finalize → activate → commit/rollback.
+runs upload envelope → finalize → activate → commit/rollback. Privileged writes are
+authorized by the JWT bearer token at the sovd-api layer — the legacy UDS
+session/security (seed/key) preamble is retired.
 
 ```mermaid
 sequenceDiagram
@@ -301,7 +303,6 @@ sequenceDiagram
     participant VS as vm-service
     participant H as HSM
 
-    O->>W: session + security unlock
     O->>W: POST /updates + upload SUIT envelope
     W->>CB: start_install / upload_envelope
     CB->>SP: validate COSE_Sign1 + security version ≥ floor

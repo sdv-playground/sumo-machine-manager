@@ -45,7 +45,6 @@ use component_mgr::manifest_provider::{
     ManifestError, ManifestProvider, ManifestType, ValidatedFirmware,
 };
 use component_mgr::ota::ImageMeta;
-use component_mgr::sovd::security::TestSecurityProvider;
 use component_mgr::suit_provider::SuitProvider;
 
 // ---------------------------------------------------------------------------
@@ -156,12 +155,10 @@ fn engine_backend() -> Arc<ComponentBackend<MemBlockDevice>> {
     let nv = Arc::new(Mutex::new(nv));
 
     let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(vec![0u8; 32]));
-    let sp = Arc::new(TestSecurityProvider);
     Arc::new(ComponentBackend::new(
         BankSet::Vm2,
         nv,
         mp,
-        sp,
         ComponentConfig::default(),
     ))
 }
@@ -271,12 +268,10 @@ fn router_diag_with_factory(
 
     let nv = Arc::new(Mutex::new(nv));
     let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(vec![0u8; 32]));
-    let sp = Arc::new(TestSecurityProvider);
     let backend: Arc<ComponentBackend<MemBlockDevice>> = Arc::new(ComponentBackend::new(
         BankSet::Vm2,
         nv,
         mp,
-        sp,
         ComponentConfig::default(),
     ));
 

@@ -22,7 +22,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_yaml = "0.9"
-getrandom = "0.2"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }

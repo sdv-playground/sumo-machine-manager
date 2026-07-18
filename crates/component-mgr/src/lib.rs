@@ -42,7 +42,7 @@
 //!
 //! # Key modules
 //!
-//! - [`backend`]  — `ComponentBackend`: OTA / session / DID impl, one per component
+//! - [`backend`]  — `ComponentBackend`: OTA / DID impl, one per component
 //! - [`ota`]      — install, commit, rollback, image hash verification
 //! - [`did`]      — runtime → FW meta → factory → dynamic DID resolution
 //! - [`suit_provider`] + [`manifest_provider`] — SUIT envelope validation
@@ -72,7 +72,6 @@ pub mod sovd {
     pub mod issuer_keys;
     pub mod pull_update;
     pub mod routes;
-    pub mod security;
     pub mod time_floor;
 }
 

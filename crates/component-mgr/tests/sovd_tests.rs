@@ -20,7 +20,6 @@ use sovd_core::DiagnosticBackend;
 
 use component_mgr::backend::{ComponentBackend, ComponentConfig};
 use component_mgr::manifest_provider::ManifestProvider;
-use component_mgr::sovd::security::TestSecurityProvider;
 use component_mgr::suit_provider::SuitProvider;
 
 use sumo_crypto::{CryptoBackend, RustCryptoBackend};
@@ -91,7 +90,6 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
     // In tests, same key is both provisioning authority and software authority
     suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
     let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
-    let security_provider = Arc::new(TestSecurityProvider);
 
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
     let mut nv = NvStore::new(dev);
@@ -129,7 +127,6 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
                 set,
                 nv.clone(),
                 manifest_provider.clone(),
-                security_provider.clone(),
                 config,
             )),
         );
@@ -286,39 +283,6 @@ async fn poll_status_until_awaiting_verdict(
     panic!("status never reached awaiting-verdict")
 }
 
-/// Unlock a component: switch to programming + seed/key flow.
-async fn unlock_for_flash(router: &axum::Router, component: &str) {
-    put_json(
-        router,
-        &format!("/vehicle/v1/components/{component}/modes/session"),
-        serde_json::json!({"value": "programming"}),
-    )
-    .await;
-
-    let (_, seed_resp) = put_json(
-        router,
-        &format!("/vehicle/v1/components/{component}/modes/security"),
-        serde_json::json!({"value": "level1_requestseed"}),
-    )
-    .await;
-
-    // Seed is a concatenated lowercase hex string per ISO 17978-3
-    // `string:hex` primitive (sovd_iso17978_spec.yaml line 192).
-    let seed_str = seed_resp["seed"].as_str().unwrap();
-    let seed_bytes = hex::decode(seed_str).unwrap();
-    let key_hex: String = seed_bytes
-        .iter()
-        .map(|b| format!("{:02x}", b ^ 0xFF))
-        .collect();
-
-    put_json(
-        router,
-        &format!("/vehicle/v1/components/{component}/modes/security"),
-        serde_json::json!({"value": "level1", "key": key_hex}),
-    )
-    .await;
-}
-
 // ============================================================
 // Health & Components
 // ============================================================
@@ -349,8 +313,10 @@ async fn get_component_vm1() {
     let (status, json) = get(&router, "/vehicle/v1/components/vm1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["id"], "vm1");
-    assert!(json["capabilities"]["sessions"].as_bool().unwrap());
-    assert!(json["capabilities"]["security"].as_bool().unwrap());
+    // Native SOVD server — the UDS session/security (seed/key) surface is
+    // retired; writes are authorized by the JWT bearer at the sovd-api layer.
+    assert!(!json["capabilities"]["sessions"].as_bool().unwrap());
+    assert!(!json["capabilities"]["security"].as_bool().unwrap());
     assert!(json["capabilities"]["software_update"].as_bool().unwrap());
 }
 
@@ -388,142 +354,38 @@ async fn read_committed() {
 }
 
 // ============================================================
-// Session / Security
+// Session / Security — retired surface
 // ============================================================
 
 #[tokio::test]
-async fn session_default_initially() {
+async fn session_security_modes_retired() {
+    // Native SOVD server: privileged /updates writes are authorized by the
+    // JWT bearer token at the sovd-api layer (ISO 17978-3 §5.4.4); in-vehicle
+    // UDS seed/key unlock is transparent server-side in the UDS-device
+    // handler (SOVDd). The classic session → seed/key dance is gone: both
+    // mode routes answer the DiagnosticBackend default (NotSupported → 501).
     let (router, _, _) = make_router();
-    let (status, json) = get(&router, "/vehicle/v1/components/vm1/modes/session").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["value"], "default");
-}
-
-#[tokio::test]
-async fn session_switch_to_programming() {
-    let (router, _, _) = make_router();
-    let (status, json) = put_json(
+    for uri in [
+        "/vehicle/v1/components/vm1/modes/session",
+        "/vehicle/v1/components/vm1/modes/security",
+    ] {
+        let (status, _) = get(&router, uri).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "GET {uri}");
+    }
+    let (status, _) = put_json(
         &router,
         "/vehicle/v1/components/vm1/modes/session",
         serde_json::json!({"value": "programming"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["value"], "programming");
-}
-
-#[tokio::test]
-async fn security_locked_initially() {
-    let (router, _, _) = make_router();
-    let (status, json) = get(&router, "/vehicle/v1/components/vm1/modes/security").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["value"], "locked");
-}
-
-#[tokio::test]
-async fn security_seed_key_unlock() {
-    let (router, _, _) = make_router();
-    // Programming session first
-    put_json(
-        &router,
-        "/vehicle/v1/components/vm1/modes/session",
-        serde_json::json!({"value": "programming"}),
-    )
-    .await;
-
-    // Request seed
-    let (status, json) = put_json(
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    let (status, _) = put_json(
         &router,
         "/vehicle/v1/components/vm1/modes/security",
         serde_json::json!({"value": "level1_requestseed"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    // Seed is a concatenated lowercase hex string per ISO 17978-3
-    // `string:hex` primitive (sovd_iso17978_spec.yaml line 192).
-    assert!(json["seed"].is_string());
-    let seed_str = json["seed"].as_str().unwrap();
-    let seed_bytes = hex::decode(seed_str).unwrap();
-    let key_hex: String = seed_bytes
-        .iter()
-        .map(|b| format!("{:02x}", b ^ 0xFF))
-        .collect();
-
-    // Send key
-    let (status, json) = put_json(
-        &router,
-        "/vehicle/v1/components/vm1/modes/security",
-        serde_json::json!({"value": "level1", "key": key_hex}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    // Unlocked — value should be "level1"
-    assert!(json["value"].as_str().unwrap().contains("level"));
-}
-
-#[tokio::test]
-async fn session_change_resets_security() {
-    let (router, _, _) = make_router();
-    unlock_for_flash(&router, "vm1").await;
-
-    // Switch back to default
-    put_json(
-        &router,
-        "/vehicle/v1/components/vm1/modes/session",
-        serde_json::json!({"value": "default"}),
-    )
-    .await;
-
-    // Security should be locked
-    let (_, json) = get(&router, "/vehicle/v1/components/vm1/modes/security").await;
-    assert_eq!(json["value"], "locked");
-}
-
-// ============================================================
-// Flash authorization (native SOVD: bearer token, not a UDS session)
-// ============================================================
-
-#[tokio::test]
-async fn flash_accepted_without_uds_session() {
-    // The host is a native SOVD server: privileged /updates is authorized by
-    // the bearer token (ISO 17978-3 §5.4.4), NOT a UDS programming session. With
-    // the legacy UDS session/security gate dropped (and auth not yet enforced), a
-    // flash in the default, locked session is accepted — no programming/unlock
-    // dance. This is the path rig + provision drive.
-    let (router, _, keys) = make_router();
-    // Deliberately NO unlock_for_flash — default session, security locked.
-
-    let image = vec![0xBB; 2048];
-    let envelope = make_test_suit_envelope(&keys, "vm1", 2, &image);
-
-    // POST /updates calls backend.start_flash (require_flash_access) — previously
-    // rejected 409 "Session change required: programming" without a session.
-    let (status, body) = post_json(
-        &router,
-        "/vehicle/v1/components/vm1/updates",
-        serde_json::json!({}),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "register_update without unlock: {body}"
-    );
-    let update_id = body["update_id"].as_str().unwrap().to_string();
-
-    // PUT /bulk-data/manifest — the exact upload that hit the 409 gate in the
-    // provision flow; now accepted unauthenticated (server warns).
-    let (status, _) = put_bytes(
-        &router,
-        &format!("/vehicle/v1/components/vm1/updates/{update_id}/bulk-data/manifest"),
-        envelope,
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "manifest upload without unlock"
-    );
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
 }
 
 // ============================================================
@@ -535,8 +397,8 @@ async fn flash_full_suit_flow() {
     // Spec-wire round trip — register the update, upload the SUIT
     // envelope as the `manifest` part, drive prepare + execute(orchestrated),
     // then commit via the Phase B vendor verb.  Asserts every transition.
+    // No mode preamble: the UDS session/security dance is retired.
     let (router, _, keys) = make_router();
-    unlock_for_flash(&router, "vm1").await;
 
     let image = vec![0xBB; 2048];
     let envelope = make_test_suit_envelope(&keys, "vm1", 2, &image);
@@ -623,7 +485,6 @@ async fn get_update_detail_enriched_from_suit_manifest() {
     // manifest (update_name + updated/affected components) instead of the
     // SUIT-agnostic default (update_name == the register-time id).
     let (router, _, keys) = make_router();
-    unlock_for_flash(&router, "vm1").await;
 
     let image = vec![0xCC; 2048];
     let envelope = make_test_suit_envelope_with_text(
@@ -789,7 +650,6 @@ async fn run_spec_cycle(
 #[tokio::test]
 async fn ota_commit_via_sovd() {
     let (router, _, keys) = make_router();
-    unlock_for_flash(&router, "vm1").await;
     let envelope = make_test_suit_envelope(&keys, "vm1", 3, &vec![0xCC; 1024]);
     let final_body = run_spec_cycle(&router, "vm1", envelope, "x-sumo-commit").await;
     assert_eq!(final_body["phase"], "execute");
@@ -800,7 +660,6 @@ async fn ota_commit_via_sovd() {
 #[tokio::test]
 async fn ota_rollback_via_sovd() {
     let (router, _, keys) = make_router();
-    unlock_for_flash(&router, "vm1").await;
     let envelope = make_test_suit_envelope(&keys, "vm1", 4, &vec![0xDD; 1024]);
     let final_body = run_spec_cycle(&router, "vm1", envelope, "x-sumo-rollback").await;
     assert_eq!(final_body["phase"], "execute");
@@ -863,7 +722,6 @@ async fn update_shape_reports_banked_for_ab_components() {
     let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
     suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
     let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
-    let security_provider = Arc::new(TestSecurityProvider);
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
     let nv = Arc::new(Mutex::new(NvStore::new(dev)));
 
@@ -871,7 +729,6 @@ async fn update_shape_reports_banked_for_ab_components() {
         BankSet::Vm1,
         nv.clone(),
         manifest_provider.clone(),
-        security_provider.clone(),
         ComponentConfig::default(),
     );
     assert_eq!(
@@ -884,7 +741,6 @@ async fn update_shape_reports_banked_for_ab_components() {
         BankSet::Hsm,
         nv,
         manifest_provider,
-        security_provider,
         ComponentConfig {
             supports_rollback: false,
             single_bank: true,

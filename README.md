@@ -11,7 +11,7 @@ cargo test                      # 425+ tests
 # Generate SUIT signing keys + encrypted firmware + CRL manifests
 cargo run -p component-mgr --example build_hsm_keys
 
-# Start SOVD server (port 4000) with security helper (port 9100)
+# Start SOVD server (port 4000)
 ./example/run.sh
 
 # Or fresh start (wipes NV store)
@@ -19,8 +19,6 @@ cargo run -p component-mgr --example build_hsm_keys
 ```
 
 Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to `http://localhost:4000`.
-
-**SOVD Explorer settings:** Helper URL `http://localhost:9100`, token `dev-secret-123`.
 
 ## Documentation
 
@@ -158,8 +156,6 @@ Uses [sovd-core](https://github.com/sdv-playground/SOVDd) `DiagnosticBackend` tr
 Standard SOVD REST API including:
 
 ```
-GET/PUT  /vehicle/v1/components/{id}/modes/session                     # Programming session
-GET/PUT  /vehicle/v1/components/{id}/modes/security                    # Seed/key security unlock
 POST     /vehicle/v1/components/{id}/updates                           # Register/open an update → update_id
 PUT      /vehicle/v1/components/{id}/updates/{uid}/bulk-data/manifest  # Upload SUIT envelope (payload part)
 PUT      /vehicle/v1/components/{id}/updates/{uid}/prepare             # Validate (signature + digest + security version)
@@ -170,16 +166,13 @@ PUT      /vehicle/v1/components/{id}/updates/{uid}/x-sumo-rollback     # Rollbac
 POST     /vehicle/v1/components/{id}/reset                             # ECU reset
 ```
 
-### Session & Security
+### Authorization
 
-Flash operations require programming session + security unlock:
-
-1. `PUT /modes/session {"value": "programming"}`
-2. `PUT /modes/security {"value": "level1_requestseed"}` → seed
-3. `PUT /modes/security {"value": "level1", "key": "..."}` → unlocked
-4. Register update → upload manifest → prepare → execute → commit
-
-`SecurityProvider` trait is pluggable — `TestSecurityProvider` (XOR 0xFF) for development, production HSM for deployment. Uses [SOVD Security Helper](https://github.com/sdv-playground/SOVD-security-helper) for key derivation.
+This is a **native SOVD server** — there is no UDS session/security (seed/key)
+dance. Privileged writes (`/updates`, resets) are authorized by the **JWT bearer
+token**, enforced at the sovd-api layer (ISO 17978-3 §5.4.4). For real UDS ECUs
+behind a SOVD server, seed/key unlock is performed transparently server-side in
+the UDS-device handler (SOVDd) — never by the client.
 
 ## Key Concepts
 
@@ -217,8 +210,7 @@ Runtime A/B    — writable DIDs, DTCs (cloned on update)
 ## Flash Flow
 
 ```
-Session → Programming → Security Unlock
-  → Register update (POST /updates) → Upload SUIT envelope (PUT …/bulk-data/manifest)
+Register update (POST /updates) → Upload SUIT envelope (PUT …/bulk-data/manifest)
   → Prepare: validate (signature + digest + security_version)
   → Execute: finalize → install (decrypt + decompress → target bank) → activate (flip bank)
   → Reset → Trial (activated, not committed)
@@ -235,4 +227,3 @@ For CRL manifests: Upload → Apply floor → Done (no flash/reset/commit).
 | [sumo-sovd](https://github.com/sdv-playground/sumo-sovd) | Campaign orchestrator over SOVD |
 | [SOVDd](https://github.com/sdv-playground/SOVDd) | SOVD diagnostic server |
 | [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) | Diagnostic GUI |
-| [SOVD Security Helper](https://github.com/sdv-playground/SOVD-security-helper) | Seed/key challenge service |

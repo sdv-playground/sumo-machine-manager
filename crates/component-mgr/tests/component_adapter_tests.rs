@@ -18,7 +18,6 @@ use component_mgr::backend::{ComponentBackend, ComponentConfig};
 use component_mgr::component_adapter::ComponentAdapter;
 use component_mgr::did::{DID_SERIAL_NUMBER, DID_VIN};
 use component_mgr::manifest_provider::ManifestProvider;
-use component_mgr::sovd::security::TestSecurityProvider;
 use component_mgr::suit_provider::SuitProvider;
 
 fn make_nv() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
@@ -44,8 +43,7 @@ fn vm_backend(
     let trust_anchor = vec![0u8; 32];
     let suit_provider = SuitProvider::new(trust_anchor);
     let mp: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
-    let sp = Arc::new(TestSecurityProvider);
-    Arc::new(ComponentBackend::new(set, nv, mp, sp, config))
+    Arc::new(ComponentBackend::new(set, nv, mp, config))
 }
 
 fn entity() -> EntityInfo {

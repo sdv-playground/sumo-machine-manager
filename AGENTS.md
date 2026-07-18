@@ -35,7 +35,7 @@ Finding commands:
 
 ```bash
 rg --files -g 'Cargo.toml' -g 'README*' -g 'ARCHITECTURE.md' -g 'CLAUDE.md' -g 'specs/**' -g 'docs/**'
-rg -n "Component trait|BankSet|SecurityProvider|SystemBankManager|ComponentBackend|OTA|SUIT|HSM|NV" crates tools docs example specs README.md ARCHITECTURE.md CLAUDE.md
+rg -n "Component trait|BankSet|SystemBankManager|ComponentBackend|OTA|SUIT|HSM|NV" crates tools docs example specs README.md ARCHITECTURE.md CLAUDE.md
 ```
 
 ## Stack
@@ -53,7 +53,7 @@ rg -n "Component trait|BankSet|SecurityProvider|SystemBankManager|ComponentBacke
 ## Gotchas
 
 - Example fresh runs wipe local NV store state.
-- Flash requires programming session plus security unlock before upload/commit paths.
+- Privileged flash writes are authorized by the JWT bearer token at the sovd-api layer — there is no UDS session/security (seed/key) preamble on this native SOVD server.
 - QNX support is via traits/stubs unless using the host's platform crates.
 
 ## Missing docs/specs to watch

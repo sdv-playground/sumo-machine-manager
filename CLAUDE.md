@@ -114,8 +114,7 @@ machine-mgr    — Abstract trait layer connecting them all
 - **Security version** (SUIT custom param -257): separate from `sequence_number`, enables A/B fleet testing
 - **CRL manifests**: policy-only (no firmware), raises anti-rollback floor
 - **Encrypted firmware**: AES-128-GCM + ECDH-ES+A128KW per-device key wrapping
-- **Session/security**: programming session + seed/key unlock before flash
-- **`SecurityProvider` trait**: pluggable key validation (`TestSecurityProvider` for dev)
+- **Write authorization**: JWT bearer token, enforced at the sovd-api layer — this is a native SOVD server, no UDS session/security (seed/key) dance; in-vehicle UDS unlock is transparent server-side in the UDS-device handler (SOVDd)
 
 ### Key Files
 
@@ -129,7 +128,6 @@ crates/component-mgr/src/
   ota.rs                  — OTA engine: install, commit, rollback
   streaming.rs            — upload pipeline (decrypt + decompress + hash)
   did.rs                  — UDS DID resolution (F187-F19E + custom)
-  sovd/security.rs        — SecurityProvider trait + TestSecurityProvider
   main.rs                 — vm-diagserver CLI (NV/bank + factory ops; NOT an HTTP server — the SOVD/OTA server is the vm-sovd crate)
 
 crates/host-os-mgr/src/
@@ -162,9 +160,8 @@ crates/vhsm-ssd/src/
 
 example/
   build_hsm_keys.rs       — Generate keys, encrypted firmware, CRL manifests
-  run.sh                  — Start SOVD server + security helper
+  run.sh                  — Start SOVD server
   factory/                — Factory provisioning YAML manifests
-  config/secrets.toml     — Security helper ECU secrets
 ```
 
 ## Build & Test

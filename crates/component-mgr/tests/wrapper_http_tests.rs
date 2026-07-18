@@ -30,7 +30,6 @@ use sovd_core::DiagnosticBackend;
 
 use component_mgr::backend::{ComponentBackend, ComponentConfig, INSTALLED_MANIFEST_PARAM_ID};
 use component_mgr::manifest_provider::ManifestProvider;
-use component_mgr::sovd::security::TestSecurityProvider;
 use component_mgr::suit_provider::SuitProvider;
 
 /// Build the same router shape that `vm-sovd`'s `main` registers, but with an
@@ -57,7 +56,6 @@ fn make_wrapper_router() -> axum::Router {
     let nv = Arc::new(Mutex::new(nv_store));
     let trust_anchor = vec![0u8; 32];
     let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(trust_anchor));
-    let sp = Arc::new(TestSecurityProvider);
 
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
         ("vm1", BankSet::Vm1, ComponentConfig::default()),
@@ -75,13 +73,8 @@ fn make_wrapper_router() -> axum::Router {
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     for (id, set, cfg) in components {
-        let backend: Arc<dyn DiagnosticBackend> = Arc::new(ComponentBackend::new(
-            set,
-            nv.clone(),
-            mp.clone(),
-            sp.clone(),
-            cfg,
-        ));
+        let backend: Arc<dyn DiagnosticBackend> =
+            Arc::new(ComponentBackend::new(set, nv.clone(), mp.clone(), cfg));
         backends.insert(id.to_string(), backend);
     }
 

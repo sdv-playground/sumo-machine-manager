@@ -12,7 +12,6 @@ use nv_store::types::BankSet;
 use component_mgr::backend::{ComponentBackend, ComponentConfig};
 use component_mgr::component_adapter::ComponentAdapter;
 use component_mgr::manifest_provider::ManifestProvider;
-use component_mgr::sovd::security::SecurityProvider;
 
 /// Declarative component specification — parsed from YAML config.
 #[derive(Debug, Clone, Deserialize)]
@@ -123,7 +122,6 @@ pub struct BuiltComponent {
 pub struct FactoryDeps<D: BlockDevice> {
     pub nv: Arc<Mutex<NvStore<D>>>,
     pub manifest_provider: Arc<dyn ManifestProvider>,
-    pub security_provider: Arc<dyn SecurityProvider>,
     pub vm_service_addr: Option<String>,
     pub hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
     /// Optional crypto-only HSM handle (e.g. the host's shared link-B
@@ -296,7 +294,6 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 bank_set,
                 deps.nv.clone(),
                 deps.manifest_provider.clone(),
-                deps.security_provider.clone(),
                 comp_config,
                 deps.vm_service_addr.clone(),
                 app_images_dir.clone(),
@@ -392,7 +389,6 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 bank_set,
                 deps.nv.clone(),
                 deps.manifest_provider.clone(),
-                deps.security_provider.clone(),
                 comp_config,
                 vm_service,
                 images_dir.clone(),

@@ -9,7 +9,6 @@ use nv_store::types::{BankSet, NvBootState};
 use sovd_core::DiagnosticBackend;
 
 use component_factory::{build_component, ComponentSpec, FactoryDeps};
-use component_mgr::sovd::security::TestSecurityProvider;
 use component_mgr::suit_provider::SuitProvider;
 
 use machine_mgr::{Machine, MachineRegistry};
@@ -156,7 +155,6 @@ async fn main() {
 
     let provider = SuitProvider::with_factory_authority();
     let manifest_provider = Arc::new(provider);
-    let security_provider = Arc::new(TestSecurityProvider);
 
     // Open/create NV store
     let dev = if nv_path.exists() {
@@ -414,7 +412,6 @@ async fn main() {
     let deps = FactoryDeps {
         nv: nv.clone(),
         manifest_provider: manifest_provider.clone(),
-        security_provider: security_provider.clone(),
         vm_service_addr: vm_service_addr.clone(),
         hsm_provider: hsm_provider.clone(),
         // No crypto-only handle in the dev vm-sovd binary — keeps the

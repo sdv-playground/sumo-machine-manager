@@ -314,28 +314,9 @@ impl DiagnosticBackend for InstallRouterDiag {
     }
 
     // -----------------------------------------------------------------
-    // Modes — delegated to the engine.
+    // Modes — delegated to the engine. (No session/security here: the
+    // seed/key surface is retired — both answer the trait default.)
     // -----------------------------------------------------------------
-
-    async fn get_session_mode(&self) -> BackendResult<SessionMode> {
-        self.engine.get_session_mode().await
-    }
-
-    async fn set_session_mode(&self, session: &str) -> BackendResult<SessionMode> {
-        self.engine.set_session_mode(session).await
-    }
-
-    async fn get_security_mode(&self) -> BackendResult<SecurityMode> {
-        self.engine.get_security_mode().await
-    }
-
-    async fn set_security_mode(
-        &self,
-        value: &str,
-        key: Option<&[u8]>,
-    ) -> BackendResult<SecurityMode> {
-        self.engine.set_security_mode(value, key).await
-    }
 
     async fn get_link_mode(&self) -> BackendResult<LinkMode> {
         self.engine.get_link_mode().await

@@ -11,7 +11,6 @@
     clippy::match_like_matches_macro
 )]
 /// - SUIT-based firmware flash with A/B banking
-/// - Session/security mode control
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -34,7 +33,6 @@ use crate::bank_provider::IvdBankProvider;
 use crate::did;
 use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware};
 use crate::ota;
-use crate::sovd::security::SecurityProvider;
 
 /// Vendor SOVD data-parameter id for the committed bank's signed IVD
 /// manifest. `x-sumo-` prefix per ISO 17978-3 Table 70 vendor-extension
@@ -49,40 +47,6 @@ pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-sumo-installed-manifest";
 /// rollback-capability the same way it syncs firmware identity. Same `x-sumo-`
 /// vendor namespace (SOVDd stays spec-pure; the semantics live here in component-mgr).
 pub const UPDATE_MODE_PARAM_ID: &str = "x-sumo-update-mode";
-
-// ---------------------------------------------------------------------------
-// Session / security state (per backend instance)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionState {
-    Default,
-    Programming,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecurityPhase {
-    Locked,
-    SeedAvailable,
-    Unlocked,
-}
-
-#[derive(Debug, Clone)]
-struct SecurityAccessState {
-    phase: SecurityPhase,
-    level: u8,
-    pending_seed: Option<Vec<u8>>,
-}
-
-impl Default for SecurityAccessState {
-    fn default() -> Self {
-        Self {
-            phase: SecurityPhase::Locked,
-            level: 0,
-            pending_seed: None,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Stored package (validated SUIT envelope)
@@ -334,7 +298,6 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// + docs/design/node-update-state.md.
     node_coordinator: Option<Arc<machine_mgr::node_update::NodeCoordinator>>,
     manifest_provider: Arc<dyn ManifestProvider>,
-    security_provider: Arc<dyn SecurityProvider>,
     packages: Mutex<HashMap<String, StoredPackage>>,
     manifests: Mutex<HashMap<String, StoredManifest>>,
     payloads: Mutex<HashMap<String, StoredPayload>>,
@@ -355,8 +318,6 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// The bank the ECU is actually running on. Only changes on ecu_reset().
     /// NV active_bank may differ after install (it's the "next boot" bank).
     running_bank: Mutex<Bank>,
-    session: Mutex<SessionState>,
-    security: Mutex<SecurityAccessState>,
     next_id: Mutex<u64>,
     /// Optional TCP address ("host:port") for vm-service control API.
     /// When set, ecu_reset() POSTs to vm-service to restart the VM.
@@ -460,26 +421,15 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         bank_set: BankSet,
         nv: Arc<Mutex<NvStore<D>>>,
         manifest_provider: Arc<dyn ManifestProvider>,
-        security_provider: Arc<dyn SecurityProvider>,
         config: ComponentConfig,
     ) -> Self {
-        Self::with_options(
-            bank_set,
-            nv,
-            manifest_provider,
-            security_provider,
-            config,
-            None,
-            None,
-            None,
-        )
+        Self::with_options(bank_set, nv, manifest_provider, config, None, None, None)
     }
 
     pub fn with_vm_service(
         bank_set: BankSet,
         nv: Arc<Mutex<NvStore<D>>>,
         manifest_provider: Arc<dyn ManifestProvider>,
-        security_provider: Arc<dyn SecurityProvider>,
         config: ComponentConfig,
         vm_service_addr: Option<String>,
     ) -> Self {
@@ -487,7 +437,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             bank_set,
             nv,
             manifest_provider,
-            security_provider,
             config,
             vm_service_addr,
             None,
@@ -495,12 +444,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn with_options(
         bank_set: BankSet,
         nv: Arc<Mutex<NvStore<D>>>,
         manifest_provider: Arc<dyn ManifestProvider>,
-        security_provider: Arc<dyn SecurityProvider>,
         config: ComponentConfig,
         vm_service_addr: Option<String>,
         images_dir: Option<PathBuf>,
@@ -569,8 +516,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 clear_faults: true,
                 software_update: true,
                 io_control: false,
-                sessions: true,
-                security: true,
+                // Native SOVD server: privileged writes are authorized by the
+                // JWT bearer token at the sovd-api layer — the UDS
+                // session/security (seed/key) surface is retired.
+                sessions: false,
+                security: false,
                 sub_entities: false,
                 subscriptions: false,
                 // §7.21: only components with a configured log source
@@ -583,7 +533,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             config,
             nv,
             manifest_provider,
-            security_provider,
             packages: Mutex::new(HashMap::new()),
             uploaded_parts: Mutex::new(HashMap::new()),
             manifests: Mutex::new(HashMap::new()),
@@ -592,8 +541,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             flash_transfer: Mutex::new(None),
             install_source: Mutex::new(None),
             running_bank: Mutex::new(running_bank),
-            session: Mutex::new(SessionState::Default),
-            security: Mutex::new(SecurityAccessState::default()),
             next_id: Mutex::new(1),
             vm_service_addr,
             images_dir,
@@ -1435,8 +1382,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     }
 
     pub fn ensure_flash_can_start(&self) -> BackendResult<()> {
-        self.require_flash_access()?;
-
         if !self.config.single_bank {
             let nv = self
                 .nv
@@ -1554,8 +1499,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Upload a manifest (small CBOR envelope without integrated payloads).
     /// Validates signature + anti-rollback. Returns manifest_id.
     pub fn receive_manifest(&self, data: &[u8]) -> BackendResult<String> {
-        self.require_flash_access()?;
-
         let min_security_ver = {
             let nv = self
                 .nv
@@ -2044,32 +1987,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             },
         );
         Ok(id)
-    }
-
-    /// Authorization gate for privileged flash operations.
-    ///
-    /// The host is a **native SOVD server**, not a UDS ECU front, so privileged
-    /// `/updates` is authorized by the **bearer token** (ISO 17978-3 §5.4.4), not
-    /// a UDS programming session. The legacy UDS session/security dance has been
-    /// dropped from this path — it leaked the UDS model into a native server, and
-    /// the native-SOVD drivers (rig, provision) never run it. `modes/session` +
-    /// `modes/security` stay for clients that still set them (classic campaign
-    /// unlock), but are no longer *required* to flash.
-    ///
-    /// Until the SOVDd TLS+JWT auth slice lands the bearer token isn't visible to
-    /// the backend, so privileged flash is accepted and we warn. Flip this to a
-    /// 401 token check (absent/invalid token) once auth enforces.
-    fn require_flash_access(&self) -> BackendResult<()> {
-        let in_programming = *self.session.lock().unwrap() == SessionState::Programming;
-        let unlocked = self.security.lock().unwrap().phase == SecurityPhase::Unlocked;
-        if !(in_programming && unlocked) {
-            tracing::warn!(
-                bank_set = ?self.bank_set,
-                "privileged flash operation accepted unauthenticated — authorize with a \
-                 bearer token (ISO 17978-3 §5.4.4) once the SOVD auth slice enforces it"
-            );
-        }
-        Ok(())
     }
 
     pub(crate) fn nv_bytes_to_string(data: &[u8]) -> String {
@@ -2683,8 +2600,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     // --- Package management ---
 
     async fn receive_package(&self, data: &[u8]) -> BackendResult<String> {
-        self.require_flash_access()?;
-
         let min_security_ver = {
             let nv = self
                 .nv
@@ -2739,8 +2654,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         stream: PackageStream,
         content_length: Option<u64>,
     ) -> BackendResult<String> {
-        self.require_flash_access()?;
-
         // Check flash session state — determines how to handle this upload
         let session_state = {
             let session = self.flash_session.lock().unwrap();
@@ -3777,10 +3690,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             }
         }
 
-        // Reset session and security (ISO 14229)
-        *self.session.lock().unwrap() = SessionState::Default;
-        *self.security.lock().unwrap() = SecurityAccessState::default();
-
         // Bank activation happens at install-finalize (finalize_flash),
         // not here. ecu_reset just transitions the flash state machine.
 
@@ -4004,127 +3913,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         Ok(())
     }
 
-    // --- Session ---
-
-    async fn get_session_mode(&self) -> BackendResult<SessionMode> {
-        let session = self.session.lock().unwrap();
-        let (name, id) = match *session {
-            SessionState::Default => ("default", 0x01),
-            SessionState::Programming => ("programming", 0x02),
-        };
-        Ok(SessionMode {
-            mode: "session".to_string(),
-            session: name.to_string(),
-            session_id: id,
-        })
-    }
-
-    async fn set_session_mode(&self, session: &str) -> BackendResult<SessionMode> {
-        let new_state = match session.to_lowercase().as_str() {
-            "default" => SessionState::Default,
-            "programming" => SessionState::Programming,
-            _ => {
-                return Err(BackendError::InvalidRequest(format!(
-                    "unknown session: {session}"
-                )))
-            }
-        };
-
-        {
-            let mut s = self.session.lock().unwrap();
-            let changed = *s != new_state;
-            *s = new_state;
-            if changed {
-                // Security resets on session change (ISO 14229)
-                let mut sec = self.security.lock().unwrap();
-                *sec = SecurityAccessState::default();
-            }
-        }
-
-        self.get_session_mode().await
-    }
-
-    // --- Security ---
-
-    async fn get_security_mode(&self) -> BackendResult<SecurityMode> {
-        let sec = self.security.lock().unwrap();
-        let (state, level, seed) = match sec.phase {
-            SecurityPhase::Locked => (SecurityState::Locked, None, None),
-            SecurityPhase::SeedAvailable => {
-                let seed_hex = sec
-                    .pending_seed
-                    .as_ref()
-                    .map(|s| s.iter().map(|b| format!("{b:02x}")).collect::<String>());
-                (SecurityState::SeedAvailable, Some(sec.level), seed_hex)
-            }
-            SecurityPhase::Unlocked => (SecurityState::Unlocked, Some(sec.level), None),
-        };
-        Ok(SecurityMode {
-            mode: "security".to_string(),
-            state,
-            level,
-            available_levels: Some(vec![1]),
-            seed,
-        })
-    }
-
-    async fn set_security_mode(
-        &self,
-        value: &str,
-        key: Option<&[u8]>,
-    ) -> BackendResult<SecurityMode> {
-        let value_lower = value.to_lowercase();
-
-        if value_lower.ends_with("_requestseed") {
-            let level_str = value_lower.trim_end_matches("_requestseed");
-            let level = parse_security_level(level_str)?;
-
-            let seed = self.security_provider.generate_seed(self.bank_set, level);
-            {
-                let mut sec = self.security.lock().unwrap();
-                sec.phase = SecurityPhase::SeedAvailable;
-                sec.level = level;
-                sec.pending_seed = Some(seed);
-            }
-
-            self.get_security_mode().await
-        } else {
-            let level = parse_security_level(&value_lower)?;
-            let key_bytes = key.ok_or_else(|| {
-                BackendError::InvalidRequest("missing key — required when sending key".into())
-            })?;
-
-            let pending_seed = {
-                let sec = self.security.lock().unwrap();
-                if sec.phase != SecurityPhase::SeedAvailable || sec.level != level {
-                    return Err(BackendError::InvalidRequest(
-                        "no pending seed — call requestseed first".into(),
-                    ));
-                }
-                sec.pending_seed
-                    .clone()
-                    .ok_or_else(|| BackendError::Internal("seed state inconsistency".into()))?
-            };
-
-            if !self
-                .security_provider
-                .validate_key(self.bank_set, level, &pending_seed, key_bytes)
-            {
-                let mut sec = self.security.lock().unwrap();
-                sec.phase = SecurityPhase::Locked;
-                sec.pending_seed = None;
-                return Err(BackendError::SecurityRequired(level));
-            }
-
-            {
-                let mut sec = self.security.lock().unwrap();
-                sec.phase = SecurityPhase::Unlocked;
-                sec.pending_seed = None;
-            }
-
-            self.get_security_mode().await
-        }
-    }
+    // No `modes/session` / `modes/security` here: this is a native SOVD
+    // server, not a UDS ECU front. Privileged `/updates` writes are
+    // authorized by the JWT bearer token at the sovd-api layer (ISO 17978-3
+    // §5.4.4); in-vehicle UDS seed/key unlock is performed transparently
+    // server-side by the UDS-device handler (SOVDd). Both mode routes fall
+    // through to the `DiagnosticBackend` defaults (`NotSupported` → 501).
 }
 
 // ---------------------------------------------------------------------------
@@ -4878,13 +4672,6 @@ fn guest_state_str(state: u32) -> &'static str {
     }
 }
 
-fn parse_security_level(s: &str) -> BackendResult<u8> {
-    let digits = s.trim_start_matches("level");
-    digits
-        .parse::<u8>()
-        .map_err(|_| BackendError::InvalidRequest(format!("invalid security level: {s}")))
-}
-
 // ---------------------------------------------------------------------------
 // Single-source SW identity: end-to-end tests proving the F187-F19E
 // identification DIDs are served from the signed IVD manifest (not NV),
@@ -4907,15 +4694,6 @@ mod identity_tests {
     impl ManifestProvider for NoopManifest {
         fn validate(&self, _d: &[u8], _m: u32) -> Result<ValidatedFirmware, ManifestError> {
             Err(ManifestError::ParseError("unused in identity tests".into()))
-        }
-    }
-    struct NoopSecurity;
-    impl SecurityProvider for NoopSecurity {
-        fn generate_seed(&self, _component: BankSet, _level: u8) -> Vec<u8> {
-            Vec::new()
-        }
-        fn validate_key(&self, _component: BankSet, _level: u8, _seed: &[u8], _key: &[u8]) -> bool {
-            true
         }
     }
 
@@ -4997,7 +4775,6 @@ mod identity_tests {
             BankSet::Vm1,
             nv,
             Arc::new(NoopManifest),
-            Arc::new(NoopSecurity),
             ComponentConfig::default(),
             None,
             Some(images_dir.clone()),
@@ -5488,7 +5265,6 @@ mod identity_tests {
             BankSet::Vm1,
             nv.clone(),
             Arc::new(NoopManifest),
-            Arc::new(NoopSecurity),
             ComponentConfig::default(),
             None,
             Some(images_dir.clone()),
@@ -5553,7 +5329,6 @@ mod identity_tests {
             BankSet::Vm1,
             nv,
             Arc::new(NoopManifest),
-            Arc::new(NoopSecurity),
             ComponentConfig::default(),
             None,
             Some(images_dir.clone()),
@@ -5602,15 +5377,6 @@ mod bank_provider_injection_tests {
     impl ManifestProvider for NoopManifest {
         fn validate(&self, _d: &[u8], _m: u32) -> Result<ValidatedFirmware, ManifestError> {
             Err(ManifestError::ParseError("unused".into()))
-        }
-    }
-    struct NoopSecurity;
-    impl SecurityProvider for NoopSecurity {
-        fn generate_seed(&self, _component: BankSet, _level: u8) -> Vec<u8> {
-            Vec::new()
-        }
-        fn validate_key(&self, _c: BankSet, _l: u8, _s: &[u8], _k: &[u8]) -> bool {
-            true
         }
     }
 
@@ -5668,7 +5434,6 @@ mod bank_provider_injection_tests {
             BankSet::Vm1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
-            Arc::new(NoopSecurity),
             ComponentConfig::default(),
             None,
             None,
@@ -5685,7 +5450,6 @@ mod bank_provider_injection_tests {
             BankSet::Hsm,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
-            Arc::new(NoopSecurity),
             ComponentConfig {
                 supports_rollback: false,
                 single_bank: true,
@@ -5818,7 +5582,6 @@ mod bank_provider_injection_tests {
             BankSet::Vm1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
-            Arc::new(NoopSecurity),
             ComponentConfig {
                 log_source: Some(source),
                 ..ComponentConfig::default()
@@ -5986,15 +5749,6 @@ mod abort_flash_tests {
             Err(ManifestError::ParseError("unused".into()))
         }
     }
-    struct NoopSecurity;
-    impl SecurityProvider for NoopSecurity {
-        fn generate_seed(&self, _component: BankSet, _level: u8) -> Vec<u8> {
-            Vec::new()
-        }
-        fn validate_key(&self, _c: BankSet, _l: u8, _s: &[u8], _k: &[u8]) -> bool {
-            true
-        }
-    }
 
     fn backend() -> ComponentBackend<MemBlockDevice> {
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
@@ -6004,7 +5758,6 @@ mod abort_flash_tests {
             BankSet::Vm1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
-            Arc::new(NoopSecurity),
             ComponentConfig::default(),
             None,
             None,
@@ -6095,16 +5848,6 @@ mod copy_forward_tests {
             ))
         }
     }
-    struct NoopSecurity;
-    impl SecurityProvider for NoopSecurity {
-        fn generate_seed(&self, _c: BankSet, _l: u8) -> Vec<u8> {
-            Vec::new()
-        }
-        fn validate_key(&self, _c: BankSet, _l: u8, _s: &[u8], _k: &[u8]) -> bool {
-            true
-        }
-    }
-
     /// A detached (no integrated payload) single-component SUIT manifest whose
     /// declared image digest is `digest` — mimics the offboard "manifest-only,
     /// you already have this" push. `component_id = ["vm1", part]` — the part
@@ -6131,7 +5874,6 @@ mod copy_forward_tests {
             BankSet::Vm1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
-            Arc::new(NoopSecurity),
             ComponentConfig::default(),
             None,
             Some(images_dir),
@@ -6587,7 +6329,6 @@ mod copy_forward_tests {
                 set,
                 nv.clone(),
                 Arc::new(NoopManifest),
-                Arc::new(NoopSecurity),
                 ComponentConfig::default(),
                 None,
                 Some(images_dir.clone()),
@@ -6701,7 +6442,6 @@ mod copy_forward_tests {
             BankSet::Vm1,
             nv.clone(),
             Arc::new(NoopManifest),
-            Arc::new(NoopSecurity),
             ComponentConfig::default(),
             None,
             Some(images_dir.clone()),
@@ -6814,7 +6554,6 @@ mod copy_forward_tests {
             BankSet::Vm1,
             nv.clone(),
             Arc::new(NoopManifest),
-            Arc::new(NoopSecurity),
             ComponentConfig::default(),
             None,
             Some(images_dir.clone()),

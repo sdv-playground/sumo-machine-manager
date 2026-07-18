@@ -24,8 +24,8 @@ Across the whole workspace the deployed SOVD-API servers are:
 | 4 | `sovdd` | SOVDd | standalone | `0.0.0.0:18081` (mock) | reference SOVD server (UDS↔REST, gateway, proxy) |
 | 5 | `example-app` | SOVDd | standalone | `0.0.0.0:4001` | reference app-entity (tier-1 supplier) server |
 
-Plus two **SOVD-adjacent helper servers** (HTTP, but not the `/vehicle/v1` API):
-`sovd-security-helper` (seed→key) and `sovd-token-helper` (JWT minter).
+Plus one **SOVD-adjacent helper server** (HTTP, but not the `/vehicle/v1` API):
+`sovd-token-helper` (JWT minter).
 
 Servers 1–3 are the sumo-stack deployments and share the same route library;
 4–5 are the upstream reference servers shipped with the SOVDd library itself.
@@ -55,8 +55,8 @@ repo — that serve the **same** wire from the **same** route library.
   (`x-sumo-update-state`). See `crates/vm-sovd/src/main.rs:462-470`.
 - **Bind / port:** `0.0.0.0:4000` by default; override with `--bind <addr>` or a
   positional bind-addr (`crates/vm-sovd/src/main.rs:79`).
-- **Launched by:** `example/run.sh` (alongside `sovd-security-helper` on `:9100`,
-  the `hsm-sim-service` link-B backend, and `vhsm-ssd`). Connect-only to the
+- **Launched by:** `example/run.sh` (alongside the `hsm-sim-service` link-B
+  backend and `vhsm-ssd`). Connect-only to the
   pre-spawned link-B HSM backend via `--backend-socket`. Also run in host mode
   (bind `:4001`) by `examples/campaign/start-ecus.sh`, the `tests/` e2e harness,
   and the workspace-root `compose.yaml`.
@@ -180,18 +180,13 @@ servers present in the workspace.
 
 ---
 
-## 4. SOVD-adjacent helper servers
+## 4. SOVD-adjacent helper server
 
-HTTP servers in the SOVD ecosystem that do **not** serve the `/vehicle/v1`
-diagnostic API — they back the diagnostic flow.
-
-### `sovd-security-helper` — `components/SOVD-security-helper`
-
-- UDS **SecurityAccess** seed→key derivation: holds ECU secrets server-side and
-  computes the unlock response for authenticated callers. Routes `GET /info`,
-  `POST /calculate`.
-- **Bind / port:** `0.0.0.0:9100` (`--port`, `src/main.rs:645-659`).
-- It is **not** the SUIT signing authority (that is `sumo-sign`, offline).
+An HTTP server in the SOVD ecosystem that does **not** serve the `/vehicle/v1`
+diagnostic API — it backs the diagnostic flow. (The former second helper,
+`sovd-security-helper` — client-side seed→key derivation — is retired: the
+sumo servers are native SOVD with JWT bearer authorization, and UDS seed/key
+unlock for real ECUs is transparent server-side in the UDS-device handler.)
 
 ### `sovd-token-helper` — `components/sovd-token-helper`
 
