@@ -7,6 +7,7 @@
 //! `vhsm-handles-ext` (guest Rust).
 
 pub mod codec;
+pub mod cwt;
 
 // ---- Magic and version --------------------------------------------------
 

@@ -74,30 +74,13 @@ pub enum MintError {
     EncodeCose,
 }
 
-/// CWT claim labels (RFC 8392 §3.1.1).
-const CLAIM_ISS: i64 = 1;
-const CLAIM_SUB: i64 = 2;
-const CLAIM_AUD: i64 = 3;
-const CLAIM_EXP: i64 = 4;
-const CLAIM_NBF: i64 = 5;
-const CLAIM_IAT: i64 = 6;
-const CLAIM_CTI: i64 = 7;
-/// RFC 8747 §3.1: confirmation method, "cnf".
-const CLAIM_CNF: i64 = -65537;
-
-/// COSE_Key labels for the pubkey we expect inside `cnf` (RFC 8152
-/// §7).
-const COSE_KEY_KTY: i64 = 1;
-const COSE_KEY_ALG: i64 = 3;
-const COSE_KEY_EC2_CRV: i64 = -1;
-const COSE_KEY_EC2_X: i64 = -2;
-const COSE_KEY_EC2_Y: i64 = -3;
-const KTY_EC2: i64 = 2;
-
-/// The single audience we accept. Different vhsm-ssd instances
-/// across a fleet could use distinct audiences (e.g., per-region
-/// shards); v1 hard-codes the single value.
-pub const VHSM_AUDIENCE: &str = "vhsm-ssd";
+// CWT claim + cnf COSE_Key labels and the audience: the contract lives in
+// vhsm-proto::cwt (shared with offboard minters) — never redefine locally.
+pub use vhsm_proto::cwt::VHSM_AUDIENCE;
+use vhsm_proto::cwt::{
+    CLAIM_AUD, CLAIM_CNF, CLAIM_CTI, CLAIM_EXP, CLAIM_IAT, CLAIM_ISS, CLAIM_NBF, CLAIM_SUB,
+    COSE_KEY_ALG, COSE_KEY_EC2_CRV, COSE_KEY_EC2_X, COSE_KEY_EC2_Y, COSE_KEY_KTY, KTY_EC2,
+};
 
 /// Validated cert as returned by [`validate`]. Owns the bytes it
 /// extracted — callers don't have to keep the original CWT slice
