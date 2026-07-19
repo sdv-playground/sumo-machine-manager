@@ -78,6 +78,30 @@ impl Deactivator for MockDeactivator {
     }
 }
 
+/// Probe-backed component (rt-style): configurable readiness + fixed
+/// runtime extensions, including a deliberate standard-field collision.
+struct MockProbe {
+    running: bool,
+}
+
+impl component_mgr::backend::HealthProbe for MockProbe {
+    fn probe(&self) -> Option<component_mgr::backend::GuestHealth> {
+        self.running.then(|| component_mgr::backend::GuestHealth {
+            guest_state: 1,
+            hb_seq: 7,
+            boot_id: 42,
+            status: "running".into(),
+        })
+    }
+    fn runtime_extensions(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert("m7_total_startup".into(), serde_json::json!(86));
+        // Collision: standard fields must win over probe contributions.
+        m.insert("boot_count".into(), serde_json::json!(999));
+        m
+    }
+}
+
 type SharedNv = Arc<Mutex<NvStore<MemBlockDevice>>>;
 
 fn make_nv() -> SharedNv {
@@ -342,6 +366,47 @@ async fn read_entity_status_tri_state_and_probe_skip() {
     assert!(
         probes.load(Ordering::SeqCst) > 0,
         "enabled components are probed"
+    );
+}
+
+#[tokio::test]
+async fn probe_component_status_rides_the_uniform_node() {
+    // rt-style component: no vm-service, an injected HealthProbe. The probe
+    // drives the STANDARD status field and its extensions ride the SAME
+    // x-sumo-runtime node as every other component's metadata — never a
+    // bespoke per-component route.
+    let nv = make_nv();
+    let b = vm_backend(&nv, BankSet::Rt, None)
+        .with_deactivator(Arc::new(MockDeactivator::ok()))
+        .with_health_probe(Arc::new(MockProbe { running: true }));
+    let status = b.read_entity_status().await.unwrap();
+    assert_eq!(status.status, EntityStatus::Ready, "probe running ⇒ ready");
+    let rt = &status.extensions["x-sumo-runtime"];
+    assert_eq!(rt["admin_state"], "enabled");
+    assert_eq!(rt["m7_total_startup"], 86, "probe extension merged");
+    assert_eq!(rt["boot_count"], 0, "standard field wins the collision");
+    assert_eq!(rt["hb_seq"], 7, "probe health feeds the uniform fields");
+
+    // Probe not running ⇒ the standard status field is honest.
+    let b = vm_backend(&nv, BankSet::Rt, None)
+        .with_deactivator(Arc::new(MockDeactivator::ok()))
+        .with_health_probe(Arc::new(MockProbe { running: false }));
+    let status = b.read_entity_status().await.unwrap();
+    assert_eq!(
+        status.status,
+        EntityStatus::NotReady,
+        "probe down ⇒ notReady"
+    );
+
+    // Disabled ⇒ minimal read: notReady + admin_state, no probe extensions.
+    b.set_admin_state(true).await.expect("disable admitted");
+    let status = b.read_entity_status().await.unwrap();
+    assert_eq!(status.status, EntityStatus::NotReady);
+    let rt = &status.extensions["x-sumo-runtime"];
+    assert_eq!(rt["admin_state"], "disabled");
+    assert!(
+        rt.get("m7_total_startup").is_none(),
+        "disabled read stays minimal"
     );
 }
 

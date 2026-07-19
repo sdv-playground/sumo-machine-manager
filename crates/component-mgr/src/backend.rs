@@ -3852,14 +3852,19 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         } else {
             match &self.vm_service_addr {
                 Some(socket) => query_vm_health(socket, &self.entity_info.id).await,
-                None => None,
+                // No vm-service backing: an injected HealthProbe (e.g. RT/M7)
+                // is the health source — cheap by trait contract (cached).
+                None => self.health_probe.as_ref().and_then(|p| p.probe()),
             }
         };
-        let status = if !admin_disabled
-            && (self.vm_service_addr.is_none()
-                || health
-                    .as_ref()
-                    .is_some_and(|h| h.status == "running" && h.guest_state == 1))
+        let status = if admin_disabled {
+            EntityStatus::NotReady
+        } else if self.vm_service_addr.is_none() && self.health_probe.is_none() {
+            // No health source at all (app-style components): presence = ready.
+            EntityStatus::Ready
+        } else if health
+            .as_ref()
+            .is_some_and(|h| h.status == "running" && h.guest_state == 1)
         {
             EntityStatus::Ready
         } else {
@@ -3899,6 +3904,17 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     "enabled"
                 }),
             );
+        }
+        // Probe-contributed metadata rides the SAME uniform node as every
+        // other per-component fact — never a bespoke per-component route.
+        // Standard fields stay authoritative on key collision (or_insert);
+        // a disabled component's read stays minimal (probe untouched).
+        if !admin_disabled {
+            if let Some(probe) = &self.health_probe {
+                for (k, v) in probe.runtime_extensions() {
+                    runtime.entry(k).or_insert(v);
+                }
+            }
         }
         let mut extensions = serde_json::Map::new();
         extensions.insert("x-sumo-runtime".into(), serde_json::Value::Object(runtime));
@@ -4616,6 +4632,15 @@ pub struct GuestHealth {
 /// when the underlying source is expensive (`m7loader -q` shells out).
 pub trait HealthProbe: Send + Sync {
     fn probe(&self) -> Option<GuestHealth>;
+
+    /// Extra per-component metadata for the `/status` `x-sumo-runtime` block —
+    /// the ONE uniform per-component metadata node. Probe-specific facts
+    /// (e.g. the M7 platform-loader counters) ride here; never a bespoke
+    /// per-component route. Standard fields win on key collision, and the
+    /// same cheapness contract as [`Self::probe`] applies (cache internally).
+    fn runtime_extensions(&self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
 }
 
 /// Query vm-service health endpoint via TCP loopback.
