@@ -3908,12 +3908,23 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // Probe-contributed metadata rides the SAME uniform node as every
         // other per-component fact — never a bespoke per-component route.
         // Standard fields stay authoritative on key collision (or_insert);
-        // a disabled component's read stays minimal (probe untouched).
+        // a disabled component's read stays minimal.
         if !admin_disabled {
             if let Some(probe) = &self.health_probe {
                 for (k, v) in probe.runtime_extensions() {
                     runtime.entry(k).or_insert(v);
                 }
+            }
+        } else if let Some(probe) = &self.health_probe {
+            // A deactivation that ARMS a node reboot (rt: the erase — the M7
+            // keeps executing from SRAM until the node restarts) must stay
+            // OBSERVABLE after the op response is gone. Derived, not stored:
+            // disabled + the probe still reporting a running application ⇒
+            // the reboot hasn't happened yet. Clears itself on the real
+            // reboot (the loader finds an empty slot ⇒ probe goes quiet) —
+            // immune to supernova respawns, no NV clearing to get wrong.
+            if probe.probe().is_some() {
+                runtime.insert("reboot_pending".into(), serde_json::json!(true));
             }
         }
         let mut extensions = serde_json::Map::new();

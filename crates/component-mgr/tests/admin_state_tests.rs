@@ -399,6 +399,8 @@ async fn probe_component_status_rides_the_uniform_node() {
     );
 
     // Disabled ⇒ minimal read: notReady + admin_state, no probe extensions.
+    // Probe not running ⇒ the deactivation is fully realized: no
+    // reboot_pending flag.
     b.set_admin_state(true).await.expect("disable admitted");
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::NotReady);
@@ -407,6 +409,31 @@ async fn probe_component_status_rides_the_uniform_node() {
     assert!(
         rt.get("m7_total_startup").is_none(),
         "disabled read stays minimal"
+    );
+    assert!(
+        rt.get("reboot_pending").is_none(),
+        "realized deactivation carries no reboot_pending"
+    );
+
+    // Disabled but the probe STILL reports running (rt: erased partition,
+    // application executing from SRAM) ⇒ the armed reboot is observable on
+    // the uniform node until the real reboot clears it.
+    let nv2 = make_nv();
+    let b = vm_backend(&nv2, BankSet::Rt, None)
+        .with_deactivator(Arc::new(MockDeactivator::ok()))
+        .with_health_probe(Arc::new(MockProbe { running: true }));
+    set_flag(&nv2, BankSet::Rt, true);
+    let status = b.read_entity_status().await.unwrap();
+    assert_eq!(
+        status.status,
+        EntityStatus::NotReady,
+        "disabled stays notReady"
+    );
+    let rt = &status.extensions["x-sumo-runtime"];
+    assert_eq!(rt["admin_state"], "disabled");
+    assert_eq!(
+        rt["reboot_pending"], true,
+        "armed reboot must be observable"
     );
 }
 
