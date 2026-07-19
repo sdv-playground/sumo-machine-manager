@@ -150,6 +150,13 @@ async fn ensure_vm_running(
 
     let stop_handle = {
         let mut mgr = mgr.lock().await;
+        // Admin-gate pre-check, synchronously on the request: `start_vm`
+        // enforces the gate too, but it runs in the background task below
+        // where a refusal is only a log line — the HTTP caller must get the
+        // 409 here instead of a phantom 200 "queued".
+        if let Err(e) = mgr.check_admin_gate(&name) {
+            return error_response(e);
+        }
         match mgr.initiate_stop(&name) {
             Ok(sh) => Some(sh),
             Err(ManagerError::NotRunning(_)) => None,
@@ -260,6 +267,10 @@ fn error_response(e: ManagerError) -> (StatusCode, Json<serde_json::Value>) {
         // hard, non-retryable refusal — the bank must be re-flashed with content
         // that verifies.
         ManagerError::VerifyRefused(_) => (StatusCode::FORBIDDEN, e.to_string()),
+        // Administratively disabled: persisted operator intent, not a content
+        // problem — 409 (transient by design: re-enable via the SOVD
+        // admin-state op and retry), beside the VerifyRefused 403 above.
+        ManagerError::AdminDisabled(_) => (StatusCode::CONFLICT, e.to_string()),
     };
     (code, Json(serde_json::json!({"error": msg})))
 }
@@ -368,6 +379,31 @@ vms:
             mgr.lock().await.vm_bank("vm1"),
             Some(Bank::B),
             "?bank=b must flip def.bank to Some(B)"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_returns_409_when_admin_gate_refuses() {
+        // The synchronous pre-check must surface the refusal ON the request —
+        // not as a background-task log line after a phantom 200 "queued".
+        let mgr = VmManager::with_device_transport(dummy_config(), None).with_admin_gate(
+            std::sync::Arc::new(|name: &str| {
+                Err(format!("component {name} is administratively disabled"))
+            }),
+        );
+        let mgr: SharedManager = Arc::new(Mutex::new(mgr));
+        let addr = serve(mgr).await;
+
+        let status = post(addr, "/vms/vm1/start").await;
+        assert!(
+            status.contains("409"),
+            "expected 409 Conflict, got: {status}"
+        );
+        // /restart is the same handler — refused identically.
+        let status = post(addr, "/vms/vm1/restart").await;
+        assert!(
+            status.contains("409"),
+            "expected 409 Conflict, got: {status}"
         );
     }
 

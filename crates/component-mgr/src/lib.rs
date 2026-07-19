@@ -62,8 +62,10 @@ pub mod manifest_provider;
 pub mod ota;
 pub mod streaming;
 pub mod suit_provider;
+pub mod vm_deactivator;
 
 pub mod sovd {
+    pub mod admin_state;
     pub mod authz;
     pub mod delegated_rights;
     pub mod delegation;

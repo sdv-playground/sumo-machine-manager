@@ -440,7 +440,8 @@ pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
 
 // The onboard pull-update entry lives in its own module (async, multi-
 // component) — re-exported here so deployers keep one import home for the
-// vendor route fragments.
+// vendor route fragments. Same for the per-component admin-state op.
+pub use super::admin_state::{admin_state_router, AdminStateRequest, ADMIN_STATE_OP_ID};
 pub use super::pull_update::{pull_update_router, PullUpdateRequest};
 
 #[cfg(test)]

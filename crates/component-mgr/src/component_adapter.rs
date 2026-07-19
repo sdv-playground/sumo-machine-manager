@@ -335,6 +335,20 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
             .map_err(map_backend_error)
     }
 
+    /// Per-component administrative state — delegates 1:1 to the backend,
+    /// which owns the admission rule, the persist-first ordering, and the
+    /// deactivator enact. A backend without a deactivator answers
+    /// `NotSupported` (→ the op's 400), same as the trait default.
+    async fn set_admin_state(
+        &self,
+        disable: bool,
+    ) -> MachineResult<machine_mgr::AdminStateOutcome> {
+        self.inner
+            .set_admin_state(disable)
+            .await
+            .map_err(map_backend_error)
+    }
+
     async fn runtime_state(&self) -> MachineResult<RuntimeState> {
         // PR 2: stub. PR 3 will wire vm-service health query and parse it.
         Ok(RuntimeState {

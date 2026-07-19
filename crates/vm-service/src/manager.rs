@@ -123,6 +123,15 @@ pub struct VmManager {
     /// HsmProvider, which vm-service doesn't depend on. Default is
     /// `None` (no gate; same behavior as before this was added).
     pre_launch_verify: Option<PreLaunchVerify>,
+    /// Optional administrative-state gate. Called from `start_vm` with the VM
+    /// name BEFORE any side effect (and before the pre-launch verify);
+    /// returning `Err(reason)` refuses the launch with
+    /// [`ManagerError::AdminDisabled`]. THE start choke point for
+    /// per-component administrative disable: autostart, `ensure_vm_running`,
+    /// and post-reset relaunch all converge here. Owned by the host because
+    /// the persisted admin flag lives in its NV, which vm-service doesn't
+    /// depend on. Default `None` (no gate).
+    admin_gate: Option<AdminGate>,
 }
 
 /// Closure type for [`VmManager::with_pre_launch_verify`].
@@ -132,6 +141,15 @@ pub struct VmManager {
 /// outcome (timing, sig status, gen) — `start_vm` only adds a thin
 /// failure breadcrumb on its end.
 pub type PreLaunchVerify = Arc<dyn Fn(&str, &std::path::Path) -> Result<(), String> + Send + Sync>;
+
+/// Closure type for [`VmManager::with_admin_gate`].
+///
+/// Arg: the VM name. Returns `Ok(())` to allow the start, `Err(reason)` to
+/// refuse it as administratively disabled (mapped to
+/// [`ManagerError::AdminDisabled`] → HTTP 409). Consulted synchronously and
+/// often (every start attempt) — implementations should be cheap (an NV
+/// bitmask read).
+pub type AdminGate = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// Returned by `initiate_stop` — carries enough info to wait for exit
 /// without holding the manager lock.
@@ -167,6 +185,11 @@ pub enum ManagerError {
     /// signature, install-gen, committed floor, or a file re-hash didn't
     /// match the signed manifest. Carries the verify hook's message.
     VerifyRefused(String),
+    /// The admin gate refused the start: the VM is administratively disabled
+    /// (persisted operator intent, not a content problem). Carries the gate's
+    /// reason. Mapped to HTTP 409 — transient by design: re-enable via the
+    /// SOVD admin-state op and retry.
+    AdminDisabled(String),
 }
 
 impl std::fmt::Display for ManagerError {
@@ -176,6 +199,9 @@ impl std::fmt::Display for ManagerError {
             ManagerError::AlreadyRunning(name) => write!(f, "VM already running: {name}"),
             ManagerError::NotRunning(name) => write!(f, "VM not running: {name}"),
             ManagerError::Runner(e) => write!(f, "runner error: {e}"),
+            ManagerError::AdminDisabled(msg) => {
+                write!(f, "VM is administratively disabled: {msg}")
+            }
             ManagerError::VerifyRefused(msg) => {
                 write!(f, "pre-launch verify refused launch: {msg}")
             }
@@ -261,6 +287,7 @@ impl VmManager {
             clock_source: Arc::new(SystemClock::new()),
             time_floor: None,
             pre_launch_verify: None,
+            admin_gate: None,
         }
     }
 
@@ -288,6 +315,28 @@ impl VmManager {
         self
     }
 
+    /// Install the administrative-state gate, consulted at the very top of
+    /// `start_vm` (before any side effect, and before the pre-launch verify).
+    /// Lets the host plug in its persisted NV admin state without vm-service
+    /// taking an NV dependency — the same injection shape as
+    /// [`Self::with_pre_launch_verify`].
+    pub fn with_admin_gate(mut self, hook: AdminGate) -> Self {
+        self.admin_gate = Some(hook);
+        self
+    }
+
+    /// Consult the admin gate for `name` without starting anything. Used by
+    /// the HTTP layer as a synchronous pre-check so the caller of
+    /// `POST /vms/{name}/start` gets the 409 on the request instead of a
+    /// background-task log line ([`start_vm`] re-checks — this is the
+    /// caller-visible surface, not the enforcement point).
+    pub fn check_admin_gate(&self, name: &str) -> Result<(), ManagerError> {
+        match &self.admin_gate {
+            Some(gate) => gate(name).map_err(ManagerError::AdminDisabled),
+            None => Ok(()),
+        }
+    }
+
     /// Set which A/B bank a VM launches from. The host calls this with the
     /// boot selector's `active_bank` for the VM's set right before `start_vm`,
     /// so the launch resolves `base/bank_{a,b}` by enum instead of following
@@ -312,6 +361,24 @@ impl VmManager {
     }
 
     pub fn start_vm(&mut self, name: &str) -> Result<(), ManagerError> {
+        // Admin gate — THE start choke point for per-component administrative
+        // disable. Checked before ANY side effect (channel teardown, bank
+        // resolution) and before the pre-launch verify: a disabled VM is
+        // never launched, whoever the caller is (HTTP start/restart, host
+        // autostart loop, post-reset relaunch). Distinct from VerifyRefused:
+        // this is persisted operator intent (409, re-enable and retry), not a
+        // content integrity failure (403).
+        if let Some(ref gate) = self.admin_gate {
+            if let Err(reason) = gate(name) {
+                tracing::info!(
+                    vm = name,
+                    %reason,
+                    "admin gate refused start — VM is administratively disabled"
+                );
+                return Err(ManagerError::AdminDisabled(reason));
+            }
+        }
+
         let vm = self
             .vms
             .get_mut(name)
@@ -846,6 +913,64 @@ vms:
             .iter()
             .any(|v| !matches!(v.status, HealthStatus::Stopped));
         assert!(!running, "no VM should be running after a refused launch");
+    }
+
+    #[test]
+    fn start_vm_refuses_when_admin_gate_disables() {
+        // The admin gate is THE start choke point: a refusing gate yields
+        // AdminDisabled before any side effect — in particular BEFORE the
+        // pre-launch verify, whose hook must never fire.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
+
+        let verify_fired = Arc::new(StdMutex::new(false));
+        let fired_for_hook = verify_fired.clone();
+        mgr = mgr
+            .with_pre_launch_verify(Arc::new(move |_name, _bank_dir| {
+                *fired_for_hook.lock().unwrap() = true;
+                Ok(())
+            }))
+            .with_admin_gate(Arc::new(|name| {
+                Err(format!("component {name} is administratively disabled"))
+            }));
+
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        let err = mgr
+            .start_vm("vm1")
+            .expect_err("a disabling admin gate must refuse the start");
+        assert!(
+            matches!(err, ManagerError::AdminDisabled(ref m)
+                if m.contains("administratively disabled")),
+            "expected AdminDisabled, got {err:?}",
+        );
+        assert!(
+            !*verify_fired.lock().unwrap(),
+            "the admin gate must refuse BEFORE the pre-launch verify"
+        );
+
+        // Nothing launched.
+        let running = mgr
+            .list()
+            .iter()
+            .any(|v| !matches!(v.status, HealthStatus::Stopped));
+        assert!(!running, "no VM may run after an admin-gate refusal");
+
+        // The synchronous pre-check helper surfaces the same refusal.
+        assert!(matches!(
+            mgr.check_admin_gate("vm1"),
+            Err(ManagerError::AdminDisabled(_))
+        ));
+    }
+
+    #[test]
+    fn start_vm_passes_admin_gate_when_enabled() {
+        // An allowing gate is transparent — the launch proceeds (and the
+        // no-gate default stays untouched by construction).
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None)
+            .with_admin_gate(Arc::new(|_| Ok(())));
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        mgr.start_vm("vm1")
+            .expect("an allowing admin gate must not block the start");
+        assert!(mgr.check_admin_gate("vm1").is_ok());
     }
 
     #[test]

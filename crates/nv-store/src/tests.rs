@@ -252,6 +252,111 @@ fn update_session_region_isolated() {
     assert_eq!(store.read_update_session().unwrap().reboot_owed, 0b10);
 }
 
+#[test]
+fn admin_state_roundtrip() {
+    let mut store = make_store();
+    let mut a = NvAdminState::default();
+    a.set_disabled(BankSet::Vm2, true);
+    a.set_disabled(BankSet::Rt, true);
+    store.write_admin_state(&mut a).unwrap();
+
+    let read = store.read_admin_state();
+    assert!(read.is_disabled(BankSet::Vm2));
+    assert!(read.is_disabled(BankSet::Rt));
+    assert!(!read.is_disabled(BankSet::Vm1));
+    assert_eq!(
+        read.disabled_mask,
+        (1 << BankSet::Vm2.as_index()) | (1 << BankSet::Rt.as_index())
+    );
+
+    // Clearing a bit persists too (re-enable path).
+    let mut a = read;
+    a.set_disabled(BankSet::Vm2, false);
+    store.write_admin_state(&mut a).unwrap();
+    let read = store.read_admin_state();
+    assert!(!read.is_disabled(BankSet::Vm2));
+    assert!(read.is_disabled(BankSet::Rt));
+}
+
+#[test]
+fn admin_state_absent_defaults_all_enabled() {
+    // No record ever written ⇒ every component is enabled (fail-open).
+    let store = make_store();
+    let read = store.read_admin_state();
+    assert_eq!(read.disabled_mask, 0);
+    for set in BankSet::all() {
+        assert!(!read.is_disabled(set), "{set:?} must default to enabled");
+    }
+}
+
+#[test]
+fn admin_state_corrupted_crc_defaults_all_enabled() {
+    // A torn/corrupted admin record must never brick components off: with
+    // every sector invalid, read falls back to the all-enabled default.
+    let mut store = make_store();
+    let mut a = NvAdminState::default();
+    a.set_disabled(BankSet::Vm1, true);
+    store.write_admin_state(&mut a).unwrap();
+    assert!(store.read_admin_state().is_disabled(BankSet::Vm1));
+
+    // Corrupt a payload byte of the single written sector (offset 8 =
+    // disabled_mask, inside the CRC-covered range).
+    let mut dev = store.into_inner();
+    let off = crate::store::layout::ADMIN_STATE_OFFSET + 8;
+    let mut buf = [0u8; 1];
+    dev.read(off, &mut buf).unwrap();
+    dev.write(off, &[buf[0] ^ 0xFF]).unwrap();
+
+    let store = NvStore::new(dev);
+    assert_eq!(
+        store.read_admin_state().disabled_mask,
+        0,
+        "a corrupted admin record must fail open to all-enabled"
+    );
+}
+
+#[test]
+fn admin_state_mask_bit_semantics() {
+    // Bit i == BankSet(i); set/clear are independent and idempotent.
+    let mut a = NvAdminState::default();
+    a.set_disabled(BankSet(0), true);
+    a.set_disabled(BankSet(9), true);
+    assert_eq!(a.disabled_mask, 0b10_0000_0001);
+    a.set_disabled(BankSet(0), true); // idempotent set
+    assert_eq!(a.disabled_mask, 0b10_0000_0001);
+    a.set_disabled(BankSet(9), false);
+    assert_eq!(a.disabled_mask, 0b1);
+    a.set_disabled(BankSet(9), false); // idempotent clear
+    assert_eq!(a.disabled_mask, 0b1);
+}
+
+#[test]
+fn admin_state_region_isolated() {
+    // The new 0xA000 region must not overlap the update-session region below
+    // it (0x8000) or the first bank set at BANKSET_BASE (0x10000).
+    let mut store = make_store();
+    let mut s = NvUpdateSession::default();
+    s.reboot_owed = 0b100;
+    store.write_update_session(&mut s).unwrap();
+
+    let mut meta = NvFwMeta::default();
+    meta.fw_seq = 77;
+    store
+        .write_fw_meta(BankSet::Hsm, Bank::A, &mut meta)
+        .unwrap();
+
+    let mut a = NvAdminState::default();
+    a.set_disabled(BankSet::Vm1, true);
+    store.write_admin_state(&mut a).unwrap();
+
+    assert_eq!(store.read_update_session().unwrap().reboot_owed, 0b100);
+    assert_eq!(
+        store.read_fw_meta(BankSet::Hsm, Bank::A).unwrap().fw_seq,
+        77
+    );
+    assert!(store.read_admin_state().is_disabled(BankSet::Vm1));
+}
+
 // --- Sector rotation tests ---
 
 #[test]

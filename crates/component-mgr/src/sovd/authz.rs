@@ -49,6 +49,10 @@ pub fn capability_tier(cap: Capability) -> Tier {
         // dedicated factory-reset issuer (clear that slot → factory-reset is
         // permanently revoked in production). ECU reboot (`reset:execute`) is
         // Operational: workshop/operational and reversible, never irreversible.
+        // `component-admin` (per-component administrative disable/enable) is
+        // deliberately Operational too: fully reversible (re-enable restores
+        // the component; erased RT content returns via a campaign re-flash) —
+        // same rationale that keeps `reset:execute` Operational.
         Capability::FactoryReset => Tier::HighConsequence,
         _ => Tier::Operational,
     }
@@ -67,6 +71,10 @@ pub fn capability_scope(cap: Capability) -> Option<&'static str> {
         Capability::UpdateVerdict => Some("update:verdict"),
         Capability::ResetExecute => Some("reset:execute"),
         Capability::FactoryReset => Some("factory-reset"),
+        // Bare-hyphenated deliberately: `component:admin` would collide with
+        // the `component:<id>` scope namespace `can_access_component` treats
+        // as component access.
+        Capability::ComponentAdmin => Some("component-admin"),
         Capability::Admin => Some("admin"),
         Capability::Read => None,
     }
@@ -577,6 +585,16 @@ mod tests {
             Tier::Operational
         );
         assert_eq!(capability_tier(Capability::DataRead), Tier::Operational);
+        // component-admin is deliberately Operational: reversible (re-enable /
+        // campaign re-flash), unlike the irreversible factory-reset.
+        assert_eq!(
+            capability_tier(Capability::ComponentAdmin),
+            Tier::Operational
+        );
+        assert_eq!(
+            capability_scope(Capability::ComponentAdmin),
+            Some("component-admin")
+        );
     }
     use jsonwebtoken::{encode, EncodingKey, Header};
 
@@ -669,6 +687,7 @@ mod tests {
             Capability::ModesSet,
             Capability::ResetExecute,
             Capability::FactoryReset,
+            Capability::ComponentAdmin,
         ] {
             assert!(
                 authz.authorize(&noauth(cap)).await.is_err(),

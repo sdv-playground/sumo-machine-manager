@@ -421,6 +421,11 @@ async fn main() {
         hsm_port,
         bank_activators,
         health_probes: HashMap::new(),
+        // No deployment-specific deactivators in the dev vm-sovd binary — VM
+        // components still get the generic vm-service-stop deactivator from
+        // the factory itself (disableable by construction); rt-style injected
+        // deactivators are a host-machine-manager concern.
+        deactivators: HashMap::new(),
         boot_selector: None,
         node_coordinator: Some(node_coordinator.clone()),
         // No reload hook needed: the external link-B backend serves crypto from

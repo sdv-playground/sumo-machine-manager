@@ -167,6 +167,24 @@ pub enum RuntimeStatus {
     Unknown,
 }
 
+/// Outcome of `Component::set_admin_state` — the persisted per-component
+/// administrative state after the call, for the SOVD §7.14 operation
+/// execution render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminStateOutcome {
+    /// The persisted state after the call: `true` = administratively disabled.
+    pub disabled: bool,
+    /// True when the enacted deactivation only completes at the next node
+    /// reset (RT erase) — the caller issues the existing `status/restart`;
+    /// the op itself never reboots (see `crate::deactivator`).
+    pub reboot_required: bool,
+    /// The enactment step's failure, if any. The persisted flag is written
+    /// FIRST, so a failed enact leaves the state changed regardless — the
+    /// caller reports the error honestly instead of rolling the flag back
+    /// (the start/flash gates converge the runtime at the next boot).
+    pub enact_error: Option<String>,
+}
+
 /// Filter for `Component::list_dids`.
 #[derive(Debug, Clone, Default)]
 pub struct DidFilter {

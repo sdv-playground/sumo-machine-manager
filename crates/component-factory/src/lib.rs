@@ -142,6 +142,14 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// (e.g. RT/M7 surfaces `guest_state` via `m7loader -q`). VMs leave
     /// this empty and use vm-service over loopback HTTP instead.
     pub health_probes: HashMap<String, Arc<dyn component_mgr::backend::HealthProbe>>,
+    /// Per-component administrative-disable enactors, keyed by component id —
+    /// for activator-backed components whose deactivation is deployment-
+    /// specific (RT: the m7loader erase). VMs leave this empty: any bank-type
+    /// component with a vm-service behind it gets the generic
+    /// vm-service-stop deactivator built by the factory itself. A component
+    /// is disableable iff it ends up with a deactivator — `hsm` and `app`
+    /// types never do (see `build_component`).
+    pub deactivators: HashMap<String, Arc<dyn machine_mgr::Deactivator>>,
     /// The node's shared, signed boot selector — the **write** handle
     /// (`SharedSystemBankState`), created once by the binary and shared with the
     /// registry. When `Some`, each built component gets a selector-aware
@@ -390,7 +398,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 deps.nv.clone(),
                 deps.manifest_provider.clone(),
                 comp_config,
-                vm_service,
+                vm_service.clone(),
                 images_dir.clone(),
                 deps.hsm_provider.clone(),
             )
@@ -402,6 +410,35 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             }
             if let Some(probe) = deps.health_probes.get(&spec.id) {
                 backend = backend.with_health_probe(probe.clone());
+            }
+
+            // Structural disableability: a component is administratively
+            // disableable iff it leaves the factory with a Deactivator — no
+            // name list anywhere; the op handler's 400 falls out of the
+            // absence. Only the generic `bank` type qualifies: an injected
+            // deployment deactivator wins (activator-backed rt — its
+            // vm_service is None, so it never gets the VM one), otherwise a
+            // VM (has a vm-service to stop it) gets the generic
+            // vm-service-stop deactivator built here. `hsm` (the security
+            // anchor) and `hpc` (the host itself — the manager can't stop
+            // its own node) are never equipped, and neither is `app` in the
+            // arm above.
+            let deactivator: Option<Arc<dyn machine_mgr::Deactivator>> =
+                if spec.component_type == "bank" {
+                    match deps.deactivators.get(&spec.id) {
+                        Some(d) => Some(d.clone()),
+                        None => vm_service.as_ref().map(|addr| {
+                            Arc::new(component_mgr::vm_deactivator::VmDeactivator::new(
+                                addr.clone(),
+                                spec.id.clone(),
+                            )) as Arc<dyn machine_mgr::Deactivator>
+                        }),
+                    }
+                } else {
+                    None
+                };
+            if let Some(d) = deactivator {
+                backend = backend.with_deactivator(d);
             }
             // Inject a selector-aware provider LAST (after with_bank_spec /
             // with_bank_activator, which would otherwise rebuild the default):
