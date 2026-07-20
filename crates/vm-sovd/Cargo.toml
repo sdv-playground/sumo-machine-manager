@@ -39,4 +39,4 @@ sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "mai
 sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 # Gateway mode: proxies host-owned components to the host SOVD.
 sovd-proxy = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
-sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2" }

@@ -22,7 +22,7 @@ hsm-contract = { path = "../hsm-contract" }
 hsm-link-b = { path = "../hsm-link-b" }
 
 # SUIT manifest validation for the `key_unwrap` HSM-backed KeyUnwrap adapter.
-sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1", optional = true }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2", optional = true }
 
 # RustCrypto — `ivd` (SHA-256 bank hashing) and the SPKI→COSE_Key converter
 # (`link_b::cose_key_es256_from_spki_der`). `asm` enables the hardware-
