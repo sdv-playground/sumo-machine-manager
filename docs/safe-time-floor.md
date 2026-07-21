@@ -47,6 +47,16 @@ The caller ratchets the floor **only from signature-verified material** — a
 verified certificate's `not_before`, a signed SUIT manifest's timestamp, a
 Roughtime response checked against a root the caller holds. Never from raw input.
 
+The predicate is **"signature verified to a trusted root"**, which is *weaker* and
+*earlier* than "the artifact was accepted". A SUIT manifest whose signature verifies
+but which the device then **discards** for anti-rollback (`security_version` below the
+floor) or device-identity mismatch still carried a truthful, trusted lower bound on
+real time: `component-mgr` ratchets the floor from its `signing_time` before the
+rejection propagates (`ManifestError::RollbackRejected` carries the signed
+`signing_time_secs`). Monotonicity makes this safe — a stale rejected manifest's
+timestamp can only be a no-op, never a rewind — and it lets an offline device advance
+its floor whenever it merely *sees* trusted signed time, not only on a full install.
+
 This is deliberate. The HSM is *not* asked to verify provenance, because doing so
 would drag SUIT-manifest parsing and Roughtime validation into the HSM's TCB — a
 large attack surface for essentially no security gain (see below). Every new time

@@ -215,9 +215,14 @@ impl SuitProvider {
 
         let secver = manifest.security_version(0).unwrap_or(0);
         if secver < min_security_ver as u64 {
+            // Signature verified to the trusted root above, so the protected
+            // signing_time is a trusted lower bound on real time — carry it so the
+            // caller can ratchet the safe-time floor even though we discard this
+            // (too-old) manifest.
             return Err(ManifestError::RollbackRejected {
                 seq: secver,
                 min: min_security_ver as u64,
+                signing_time_secs: manifest.signing_time(),
             });
         }
 
@@ -348,9 +353,14 @@ impl ManifestProvider for SuitProvider {
         // Check security_version against floor
         let secver = manifest.security_version(0).unwrap_or(0);
         if secver < min_security_ver as u64 {
+            // Signature verified to the trusted root above, so the protected
+            // signing_time is a trusted lower bound on real time — carry it so the
+            // caller can ratchet the safe-time floor even though we discard this
+            // (too-old) manifest.
             return Err(ManifestError::RollbackRejected {
                 seq: secver,
                 min: min_security_ver as u64,
+                signing_time_secs: manifest.signing_time(),
             });
         }
 

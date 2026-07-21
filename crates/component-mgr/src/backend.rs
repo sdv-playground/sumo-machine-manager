@@ -635,6 +635,62 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         self
     }
 
+    /// Ratchet the HSM's monotonic safe-time floor to `iat` (a manifest's signed
+    /// `signing_time`, seconds) and discipline the host wall clock forward to the
+    /// resulting floor. `iat` MUST come from a manifest whose signature already
+    /// verified to a trusted root — it is a signed lower bound on real time
+    /// (`docs/safe-time-floor.md`).
+    ///
+    /// The floor is monotonic (`raise_monotonic` = max), so this is safe to call on
+    /// ANY trust-root-verified manifest — including one the caller then REJECTS for
+    /// anti-rollback / device-identity reasons: a stale manifest's `iat` can only be
+    /// a no-op against the floor, never a rewind, and a rejected manifest still
+    /// carried a truthful signed lower bound on time. Advancing here (not gated on
+    /// acceptance / trial-boot / commit) is what lets an offline device move its
+    /// floor forward whenever it sees trusted signed time. Best-effort: a floor
+    /// hiccup never fails an otherwise-valid operation.
+    fn ratchet_time_floor(&self, iat: u64) {
+        let Some(hsm) = self.hsm_provider.as_ref() else {
+            return;
+        };
+        let mut hsm_guard = match hsm.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!("HSM provider lock poisoned — skipped time-floor ratchet");
+                return;
+            }
+        };
+        match crate::sovd::time_floor::TimeFloor::advance(&mut *hsm_guard, iat) {
+            Ok(floor) => {
+                tracing::info!(iat, floor, "safe-time floor ratcheted from manifest signing time");
+                // Discipline the host wall clock forward to the resulting
+                // (post-ratchet, max) floor, so every reader of CLOCK_REALTIME sees
+                // max(now, floor) without a separate cache. Forward-only + best-effort.
+                drop(hsm_guard);
+                self.wall_clock_floor.discipline_to(floor);
+            }
+            Err(e) => {
+                tracing::warn!(iat, error = %e, "could not ratchet safe-time floor from manifest iat")
+            }
+        }
+    }
+
+    /// Salvage the trusted signed time from a manifest we're about to REJECT.
+    /// A `RollbackRejected` manifest still had its signature verified to a trusted
+    /// root, so its `signing_time` is a truthful lower bound on real time — ratchet
+    /// the floor from it before the rejection propagates. Other rejections (bad
+    /// signature, parse error) carry no trusted time and are ignored.
+    fn ratchet_time_floor_on_reject(&self, err: &crate::manifest_provider::ManifestError) {
+        if let crate::manifest_provider::ManifestError::RollbackRejected {
+            signing_time_secs: Some(iat),
+            ..
+        } = err
+        {
+            tracing::info!(iat, "ratcheting safe-time floor from a rejected (too-old) but trust-root-signed manifest");
+            self.ratchet_time_floor(*iat);
+        }
+    }
+
     /// Override the bank-set spec (on-disk dir + URI→filename layout).
     /// Constructors default to `BankSetSpec::for_well_known(bank_set)`;
     /// component-factory uses this to inject deployment-config-driven
@@ -1967,6 +2023,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             let full_validated = self
                 .manifest_provider
                 .validate(&data, min_security_ver)
+                .inspect_err(|e| self.ratchet_time_floor_on_reject(e))
                 .map_err(|e| BackendError::InvalidRequest(format!("manifest: {e}")))?;
 
             // Store as verified+staged package (ready for install at reset time)
@@ -2861,6 +2918,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         let validated = self
             .manifest_provider
             .validate(data, min_security_ver)
+            .inspect_err(|e| self.ratchet_time_floor_on_reject(e))
             .map_err(|e| BackendError::InvalidRequest(format!("manifest validation: {e}")))?;
 
         if validated.bank_set != self.bank_set {
@@ -3233,37 +3291,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             )
         };
 
-        // Safe-time floor: ratchet the HSM's monotonic floor to the verified
-        // manifest's signing time (iat) — a signed lower bound on real time. Done
-        // as soon as the manifest is verified (not gated on trial-boot / commit):
-        // a rolled-back firmware doesn't make real time run backwards, and the
-        // floor only ever moves forward. Every accepted update (firmware or HSM
-        // keys) advances it, so an offline device ratchets forward on each install
-        // (docs/design/safe-time-floor.md). Best-effort: a floor hiccup must not
-        // fail an otherwise-valid install.
-        if let (Some(iat), Some(hsm)) = (signing_time_secs, self.hsm_provider.as_ref()) {
-            match hsm.lock() {
-                Ok(mut hsm_guard) => {
-                    match crate::sovd::time_floor::TimeFloor::advance(&mut *hsm_guard, iat) {
-                        Ok(floor) => {
-                            tracing::info!(
-                                iat,
-                                floor,
-                                "safe-time floor ratcheted from manifest signing time"
-                            );
-                            // Discipline the host wall clock forward to the
-                            // resulting (post-ratchet, max) floor, so every
-                            // reader of CLOCK_REALTIME sees max(now, floor)
-                            // without a separate cache. Forward-only + best-effort.
-                            drop(hsm_guard);
-                            self.wall_clock_floor.discipline_to(floor);
-                        }
-                        Err(e) => tracing::warn!(iat, error = %e,
-                            "could not ratchet safe-time floor from manifest iat"),
-                    }
-                }
-                Err(_) => tracing::warn!("HSM provider lock poisoned — skipped time-floor ratchet"),
-            }
+        // Safe-time floor: ratchet from the verified manifest's signing time (iat).
+        // See ratchet_time_floor — monotonic, best-effort, done as soon as the
+        // manifest is verified (not gated on trial-boot / commit).
+        if let Some(iat) = signing_time_secs {
+            self.ratchet_time_floor(iat);
         }
 
         // HSM key material — route to HsmProvider, skip normal image write
@@ -6944,5 +6976,105 @@ mod copy_forward_tests {
         );
 
         let _ = std::fs::remove_dir_all(&keystore);
+    }
+}
+
+/// Safe-time floor ratchet (Piece 1): ratchet from a manifest's signed `signing_time`
+/// on ANY trust-root-verified manifest — including one rejected for anti-rollback.
+#[cfg(test)]
+mod time_floor_ratchet_tests {
+    use super::*;
+    use crate::manifest_provider::{ManifestError, ManifestProvider, ValidatedFirmware};
+    use crate::sovd::time_floor::TimeFloor;
+    use hsm::HsmProvider;
+    use hsm_sim_backend::SimHsm;
+    use nv_store::block::MemBlockDevice;
+    use nv_store::store::MIN_NV_DEVICE_SIZE;
+
+    struct NoopManifest;
+    impl ManifestProvider for NoopManifest {
+        fn validate(&self, _d: &[u8], _m: u32) -> Result<ValidatedFirmware, ManifestError> {
+            Err(ManifestError::ParseError("unused".into()))
+        }
+    }
+
+    /// A backend carrying a SimHsm (whose monotonic slot is the safe-time floor).
+    /// Returns the backend + a handle to read the floor back.
+    fn backend_with_hsm(tag: &str) -> (ComponentBackend<MemBlockDevice>, Arc<Mutex<dyn HsmProvider>>) {
+        let keystore = std::env::temp_dir().join(format!("cm-floor-{tag}"));
+        let _ = std::fs::remove_dir_all(&keystore);
+        std::fs::create_dir_all(&keystore).unwrap();
+        let hsm: Arc<Mutex<dyn HsmProvider>> = Arc::new(Mutex::new(SimHsm::new(keystore)));
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        nv.write_boot_state(&mut NvBootState::default()).unwrap();
+        let backend = ComponentBackend::with_options(
+            BankSet::Vm1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig::default(),
+            None,
+            None,
+            Some(hsm.clone()),
+        );
+        (backend, hsm)
+    }
+
+    fn floor(hsm: &Arc<Mutex<dyn HsmProvider>>) -> u64 {
+        TimeFloor::read(&*hsm.lock().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn ratchet_advances_the_floor_and_is_monotonic() {
+        let (backend, hsm) = backend_with_hsm("advance");
+        assert_eq!(floor(&hsm), 0, "floor starts unraised");
+
+        backend.ratchet_time_floor(1_784_600_000);
+        assert_eq!(floor(&hsm), 1_784_600_000, "floor ratchets up to the iat");
+
+        // A LOWER (stale) iat can never rewind the floor — the safety core.
+        backend.ratchet_time_floor(1_000_000_000);
+        assert_eq!(floor(&hsm), 1_784_600_000, "a stale iat is a no-op, never a rewind");
+
+        // A higher iat advances it further.
+        backend.ratchet_time_floor(1_784_600_500);
+        assert_eq!(floor(&hsm), 1_784_600_500, "a newer iat advances the floor");
+    }
+
+    #[test]
+    fn rejected_but_trust_root_signed_manifest_still_ratchets_the_floor() {
+        // The load-bearing Piece-1 behaviour: a manifest whose signature verified to
+        // a trusted root but which we DISCARD for anti-rollback still carried a
+        // truthful signed lower bound on real time — the floor must advance from it.
+        let (backend, hsm) = backend_with_hsm("reject");
+        assert_eq!(floor(&hsm), 0);
+
+        let too_old = ManifestError::RollbackRejected {
+            seq: 3,
+            min: 5,
+            signing_time_secs: Some(1_784_600_000),
+        };
+        backend.ratchet_time_floor_on_reject(&too_old);
+        assert_eq!(
+            floor(&hsm),
+            1_784_600_000,
+            "a rejected-but-trust-root-signed manifest ratchets the floor from its signed iat"
+        );
+    }
+
+    #[test]
+    fn untrusted_or_timeless_rejections_do_not_move_the_floor() {
+        let (backend, hsm) = backend_with_hsm("no-time");
+
+        // Bad signature / parse error → no trusted time → no ratchet.
+        backend.ratchet_time_floor_on_reject(&ManifestError::SignatureInvalid("bad".into()));
+        backend.ratchet_time_floor_on_reject(&ManifestError::DigestMismatch);
+        // RollbackRejected but the manifest carried no signing_time → nothing to adopt.
+        backend.ratchet_time_floor_on_reject(&ManifestError::RollbackRejected {
+            seq: 3,
+            min: 5,
+            signing_time_secs: None,
+        });
+        assert_eq!(floor(&hsm), 0, "no trusted signed time present → floor untouched");
     }
 }

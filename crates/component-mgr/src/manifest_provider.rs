@@ -53,7 +53,18 @@ pub struct ValidatedFirmware {
 pub enum ManifestError {
     ParseError(String),
     SignatureInvalid(String),
-    RollbackRejected { seq: u64, min: u64 },
+    /// The manifest's signature verified to a trusted root, but its
+    /// `security_version` is below the device's anti-rollback floor — the manifest
+    /// is discarded. `signing_time_secs` is the manifest's protected, signature-
+    /// covered `signing_time` (if present): a trusted lower bound on real time even
+    /// though the manifest itself is rejected. The caller ratchets the safe-time
+    /// floor from it before propagating the rejection (monotonic → a stale value is
+    /// a no-op; see `docs/safe-time-floor.md`).
+    RollbackRejected {
+        seq: u64,
+        min: u64,
+        signing_time_secs: Option<u64>,
+    },
     DigestMismatch,
     SizeMismatch { expected: u64, actual: u64 },
     ComponentUnknown(String),
@@ -64,7 +75,7 @@ impl std::fmt::Display for ManifestError {
         match self {
             ManifestError::ParseError(e) => write!(f, "manifest parse error: {e}"),
             ManifestError::SignatureInvalid(e) => write!(f, "signature invalid: {e}"),
-            ManifestError::RollbackRejected { seq, min } => {
+            ManifestError::RollbackRejected { seq, min, .. } => {
                 write!(f, "rollback rejected: sequence {seq} < minimum {min}")
             }
             ManifestError::DigestMismatch => write!(f, "image digest mismatch"),
@@ -146,7 +157,11 @@ mod tests {
 
     #[test]
     fn manifest_error_display_rollback_rejected() {
-        let e = ManifestError::RollbackRejected { seq: 3, min: 5 };
+        let e = ManifestError::RollbackRejected {
+            seq: 3,
+            min: 5,
+            signing_time_secs: None,
+        };
         assert_eq!(format!("{e}"), "rollback rejected: sequence 3 < minimum 5");
     }
 
