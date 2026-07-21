@@ -87,7 +87,7 @@ async fn hsm_component_capabilities_are_single_bank() {
         supports_rollback: false,
         single_bank: true,
         entity_type: "hsm".into(),
-        log_source: None,
+        log_sources: Vec::new(),
     };
     let hsm = vm_backend(nv, BankSet::Hsm, cfg);
     let comp = ComponentAdapter::new(hsm);
@@ -189,7 +189,7 @@ async fn rollback_unsupported_for_hsm() {
         supports_rollback: false,
         single_bank: true,
         entity_type: "hsm".into(),
-        log_source: None,
+        log_sources: Vec::new(),
     };
     let hsm = vm_backend(nv, BankSet::Hsm, cfg);
     let comp = ComponentAdapter::new(hsm);
@@ -242,7 +242,7 @@ async fn get_csr_generates_csr_when_keystore_configured() {
             supports_rollback: false,
             single_bank: true,
             entity_type: "hsm".into(),
-            log_source: None,
+            log_sources: Vec::new(),
         },
     );
 
@@ -280,7 +280,7 @@ async fn get_device_id_returns_a_stable_device_key_thumbprint() {
             supports_rollback: false,
             single_bank: true,
             entity_type: "hsm".into(),
-            log_source: None,
+            log_sources: Vec::new(),
         },
     );
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -389,7 +389,7 @@ async fn machine_registry_holds_multiple_components() {
             supports_rollback: false,
             single_bank: true,
             entity_type: "hsm".into(),
-            log_source: None,
+            log_sources: Vec::new(),
         },
     ));
 

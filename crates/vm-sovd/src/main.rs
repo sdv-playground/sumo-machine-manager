@@ -323,6 +323,7 @@ async fn main() {
             entity_type: Some("host_os".into()),
             log_agent_url: None,
             host_log_globs: None,
+            host_dump_dir: None,
         },
         ComponentSpec {
             id: "vm1".into(),
@@ -339,6 +340,7 @@ async fn main() {
             entity_type: Some("vm".into()),
             log_agent_url: None,
             host_log_globs: None,
+            host_dump_dir: None,
         },
         ComponentSpec {
             id: "vm2".into(),
@@ -355,6 +357,7 @@ async fn main() {
             entity_type: Some("vm".into()),
             log_agent_url: None,
             host_log_globs: None,
+            host_dump_dir: None,
         },
         ComponentSpec {
             id: "hsm".into(),
@@ -371,6 +374,7 @@ async fn main() {
             entity_type: Some("hsm".into()),
             log_agent_url: None,
             host_log_globs: None,
+            host_dump_dir: None,
         },
     ];
 

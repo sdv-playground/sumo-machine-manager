@@ -116,7 +116,7 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
                 supports_rollback: false,
                 single_bank: true,
                 entity_type: "hsm".into(),
-                log_source: None,
+                log_sources: Vec::new(),
             },
         ),
     ];
@@ -745,7 +745,7 @@ async fn update_shape_reports_banked_for_ab_components() {
             supports_rollback: false,
             single_bank: true,
             entity_type: "hsm".into(),
-            log_source: None,
+            log_sources: Vec::new(),
         },
     );
     assert_eq!(

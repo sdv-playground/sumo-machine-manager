@@ -136,7 +136,7 @@ fn hsm_backend(nv: &SharedNv) -> ComponentBackend<MemBlockDevice> {
             supports_rollback: false,
             single_bank: true,
             entity_type: "hsm".into(),
-            log_source: None,
+            log_sources: Vec::new(),
         },
         None,
         None,
@@ -222,8 +222,10 @@ async fn disable_refused_while_node_reboot_owed() {
     let nv = make_nv();
     {
         let mut nv = nv.lock().unwrap();
-        let mut s = NvUpdateSession::default();
-        s.reboot_owed = 1 << BankSet::Vm1.as_index();
+        let mut s = NvUpdateSession {
+            reboot_owed: 1 << BankSet::Vm1.as_index(),
+            ..Default::default()
+        };
         nv.write_update_session(&mut s).unwrap();
     }
     let b = vm_backend(&nv, BankSet::Vm1, None).with_deactivator(Arc::new(MockDeactivator::ok()));

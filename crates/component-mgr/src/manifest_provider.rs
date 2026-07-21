@@ -66,7 +66,10 @@ pub enum ManifestError {
         signing_time_secs: Option<u64>,
     },
     DigestMismatch,
-    SizeMismatch { expected: u64, actual: u64 },
+    SizeMismatch {
+        expected: u64,
+        actual: u64,
+    },
     ComponentUnknown(String),
 }
 

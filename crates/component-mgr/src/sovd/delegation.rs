@@ -155,8 +155,7 @@ pub fn verify_delegate_chain(
     //    effectively "chains to the pinned root?". Root-pinning, path building,
     //    signature, and the clientAuth EKU are all independent of the instant, so a
     //    forged / mis-rooted / wrong-EKU chain is still rejected here.
-    let at_not_before =
-        UnixTime::since_unix_epoch(std::time::Duration::from_secs(not_before_secs));
+    let at_not_before = UnixTime::since_unix_epoch(std::time::Duration::from_secs(not_before_secs));
     verifier
         .verify_client_cert(&leaf_der, &intermediate_ders, at_not_before)
         .map_err(|e| DelegationError::ChainNotTrusted(e.to_string()))?;
@@ -475,7 +474,14 @@ mod tests {
         let ca_key = SigningKey::random(&mut OsRng);
         let ca_name = Name::from_str("CN=root A").unwrap();
         let root_pem = ca_root_pem(&ca_key, &ca_name);
-        let leaf = issue_leaf(&ca_key, &ca_name, "delegate", Some("update:transfer"), future_window(3), 2);
+        let leaf = issue_leaf(
+            &ca_key,
+            &ca_name,
+            "delegate",
+            Some("update:transfer"),
+            future_window(3),
+            2,
+        );
 
         // effective_now = the raw wall clock (no floor yet); the leaf's window is +3h.
         let auth = verify_delegate_chain(std::slice::from_ref(&leaf), &root_pem, now())
@@ -504,7 +510,14 @@ mod tests {
         // Signed by a DIFFERENT CA, with an attacker-friendly far-future window.
         let attacker = SigningKey::random(&mut OsRng);
         let attacker_name = Name::from_str("CN=root B").unwrap();
-        let leaf = issue_leaf(&attacker, &attacker_name, "delegate", Some("update:transfer"), future_window(3), 9);
+        let leaf = issue_leaf(
+            &attacker,
+            &attacker_name,
+            "delegate",
+            Some("update:transfer"),
+            future_window(3),
+            9,
+        );
 
         let err = verify_delegate_chain(&[leaf], &root_pem, now())
             .expect_err("a future-dated cert not chaining to the pinned root must be rejected");
@@ -521,13 +534,23 @@ mod tests {
         let ca_key = SigningKey::random(&mut OsRng);
         let ca_name = Name::from_str("CN=root A").unwrap();
         let root_pem = ca_root_pem(&ca_key, &ca_name);
-        let leaf = issue_leaf(&ca_key, &ca_name, "delegate", Some("update:transfer"), expired_window(), 2);
+        let leaf = issue_leaf(
+            &ca_key,
+            &ca_name,
+            "delegate",
+            Some("update:transfer"),
+            expired_window(),
+            2,
+        );
 
         // effective_now = raw now; the window is [now-2h, now-1h] → not_after < now.
         let err = verify_delegate_chain(&[leaf], &root_pem, now())
             .expect_err("a provably-expired delegate must be rejected");
         let named_expiry =
             matches!(&err, DelegationError::ChainNotTrusted(e) if e.contains("expired"));
-        assert!(named_expiry, "expiry rejection must name the expiry, got {err:?}");
+        assert!(
+            named_expiry,
+            "expiry rejection must name the expiry, got {err:?}"
+        );
     }
 }

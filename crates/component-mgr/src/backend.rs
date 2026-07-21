@@ -260,7 +260,16 @@ pub enum LogSource {
     /// Host-local plain files (the supernova/host component): bounded
     /// tails of every file matching the globs (only `dir/prefix*suffix`
     /// patterns — no full glob engine). Lines carry the file's mtime.
+    /// These produce STANDARD (line) log entries.
     HostFiles { globs: Vec<String> },
+    /// Host-local dump DIRECTORY: the §7.21 CUSTOM-log catalog. Each file
+    /// in `dir` is one retrievable dump artifact (a crash dump, captured
+    /// trace, …) — listed with a stable id, `size`, and `log_type`/`status`
+    /// from an optional `<name>.meta.json` sidecar (else defaults). Content
+    /// = the file bytes; delete = unlink the file (+ sidecar). Unlike
+    /// `HostFiles` (which tails text lines), this exposes whole files as
+    /// discrete downloadable entries — the message-passing pattern.
+    HostDumps { dir: String },
 }
 
 /// Per-component configuration for ComponentBackend behavior.
@@ -271,8 +280,12 @@ pub struct ComponentConfig {
     pub single_bank: bool,
     /// SOVD entity_type for component identity.
     pub entity_type: String,
-    /// §7.21 log source; `None` = component serves no logs.
-    pub log_source: Option<LogSource>,
+    /// §7.21 log sources, queried + merged by `get_logs`. Empty = the
+    /// component serves no logs (`capabilities.logs = false` → route answers
+    /// "not supported"). Additive: a component may have several (e.g. host
+    /// text files + a dump directory), each contributing entries to one
+    /// merged, timestamp-sorted list.
+    pub log_sources: Vec<LogSource>,
 }
 
 impl Default for ComponentConfig {
@@ -281,7 +294,7 @@ impl Default for ComponentConfig {
             supports_rollback: true,
             single_bank: false,
             entity_type: "vm".to_string(),
-            log_source: None,
+            log_sources: Vec::new(),
         }
     }
 }
@@ -546,7 +559,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 subscriptions: false,
                 // §7.21: only components with a configured log source
                 // serve logs; the rest keep the "not supported" answer.
-                logs: config.log_source.is_some(),
+                logs: !config.log_sources.is_empty(),
                 operations: false,
             },
             bank_set,
@@ -672,7 +685,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         };
         match crate::sovd::time_floor::TimeFloor::advance(&mut *hsm_guard, iat) {
             Ok(floor) => {
-                tracing::info!(iat, floor, "safe-time floor ratcheted from manifest signing time");
+                tracing::info!(
+                    iat,
+                    floor,
+                    "safe-time floor ratcheted from manifest signing time"
+                );
                 // Discipline the host wall clock forward to the resulting
                 // (post-ratchet, max) floor, so every reader of CLOCK_REALTIME sees
                 // max(now, floor) without a separate cache. Forward-only + best-effort.
@@ -699,6 +716,51 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             tracing::info!(iat, "ratcheting safe-time floor from a rejected (too-old) but trust-root-signed manifest");
             self.ratchet_time_floor(*iat);
         }
+    }
+
+    // --- §7.21 log-entry resolution (stateless, by the self-describing id) ---
+
+    /// Re-derive a log entry from its id by re-listing the relevant source and
+    /// matching. Stateless: the id says which source + how to match, so a
+    /// restart (or a fresh process) resolves the same id identically while the
+    /// underlying line/dump still exists.
+    async fn find_log_entry(&self, log_id: &str) -> Option<LogEntry> {
+        // Reject a malformed id up front (no source query for garbage). The
+        // parse result isn't otherwise needed — matching is by the full id
+        // string, which is content-addressed / path-encoded per kind.
+        parse_log_id(log_id)?;
+        // Broad re-list (no filter) of the sources, then match by id. Cheap
+        // relative to the network/file cost already paid, and avoids a cache.
+        let filter = LogFilter::default();
+        let mut all: Vec<LogEntry> = Vec::new();
+        for source in &self.config.log_sources {
+            match source {
+                LogSource::GuestAgent { url } => {
+                    if let Some(e) = query_log_agent(url, &filter).await {
+                        all.extend(e);
+                    }
+                }
+                LogSource::HostFiles { globs } => all.extend(host_file_logs(globs, &filter)),
+                LogSource::HostDumps { dir } => all.extend(host_dump_logs(dir, &filter)),
+            }
+        }
+        all.into_iter().find(|e| e.id == log_id)
+    }
+
+    /// Resolve a `dump:host:<file>` id to an on-disk path under this component's
+    /// configured `HostDumps` dir. Returns `EntityNotFound` if the component has
+    /// no dump dir or the file isn't in it. The id carries only a bare filename
+    /// (parse_log_id rejects separators/`..`), so this cannot escape the dir.
+    fn resolve_dump_path(&self, log_id: &str, file: &str) -> BackendResult<std::path::PathBuf> {
+        for source in &self.config.log_sources {
+            if let LogSource::HostDumps { dir } = source {
+                let path = std::path::Path::new(dir).join(file);
+                if path.is_file() {
+                    return Ok(path);
+                }
+            }
+        }
+        Err(BackendError::EntityNotFound(log_id.to_string()))
     }
 
     /// Override the bank-set spec (on-disk dir + URI→filename layout).
@@ -2573,23 +2635,88 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// own files. Errors degrade to an EMPTY list with one `warn` — a
     /// down VM must not turn a log read into a 500.
     async fn get_logs(&self, filter: &LogFilter) -> BackendResult<Vec<LogEntry>> {
-        let Some(source) = &self.config.log_source else {
-            return Ok(Vec::new());
-        };
-        let entries = match source {
-            LogSource::GuestAgent { url } => match query_log_agent(url, filter).await {
-                Some(e) => e,
-                None => {
-                    tracing::warn!(
+        // Query every configured source and merge. Each entry carries a stable,
+        // self-describing id (see `log_id_*`) so get_log / get_log_content /
+        // delete_log can route back to the right source without server state.
+        let mut entries: Vec<LogEntry> = Vec::new();
+        for source in &self.config.log_sources {
+            match source {
+                LogSource::GuestAgent { url } => match query_log_agent(url, filter).await {
+                    Some(e) => entries.extend(e),
+                    None => tracing::warn!(
                         component = %self.entity_info.id, url = %url,
-                        "log-agent unreachable — serving empty log list"
-                    );
-                    Vec::new()
-                }
-            },
-            LogSource::HostFiles { globs } => host_file_logs(globs, filter),
-        };
+                        "log-agent unreachable — skipping this source"
+                    ),
+                },
+                LogSource::HostFiles { globs } => entries.extend(host_file_logs(globs, filter)),
+                LogSource::HostDumps { dir } => entries.extend(host_dump_logs(dir, filter)),
+            }
+        }
+        // Merge order: newest first (mirrors the gateway + single-source shape).
+        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
         Ok(entries)
+    }
+
+    /// SOVD §7.21 `GET /components/{id}/logs/{id}` — one entry's metadata.
+    /// The id is self-describing (`<kind>:<source>:<key>`); we re-derive the
+    /// entry from its backing source rather than hold server state.
+    async fn get_log(&self, log_id: &str) -> BackendResult<LogEntry> {
+        self.find_log_entry(log_id)
+            .await
+            .ok_or_else(|| BackendError::EntityNotFound(log_id.to_string()))
+    }
+
+    /// SOVD §7.21 `GET …/logs/{id}` with `Accept: application/octet-stream` —
+    /// the entry's raw bytes. For a dump this is the file; for a standard line
+    /// it is the line text (utf-8).
+    async fn get_log_content(&self, log_id: &str) -> BackendResult<Vec<u8>> {
+        match parse_log_id(log_id) {
+            Some(ParsedLogId::HostDump { file }) => {
+                let path = self.resolve_dump_path(log_id, &file)?;
+                std::fs::read(&path).map_err(|e| {
+                    BackendError::Internal(format!("read dump {}: {e}", path.display()))
+                })
+            }
+            Some(ParsedLogId::Line) => {
+                // A standard line's "content" is the line itself.
+                let entry = self
+                    .find_log_entry(log_id)
+                    .await
+                    .ok_or_else(|| BackendError::EntityNotFound(log_id.to_string()))?;
+                Ok(entry.message.into_bytes())
+            }
+            Some(ParsedLogId::GuestDump) => Err(BackendError::NotSupported(
+                "guest dump content (guest /dumps proxy not yet wired)".to_string(),
+            )),
+            None => Err(BackendError::EntityNotFound(log_id.to_string())),
+        }
+    }
+
+    /// SOVD §7.21 `DELETE …/logs/{id}` — ack/remove. Only meaningful for a
+    /// retrievable dump (unlink the file + sidecar); a standard journal/text
+    /// line is not individually deletable.
+    async fn delete_log(&self, log_id: &str) -> BackendResult<()> {
+        match parse_log_id(log_id) {
+            Some(ParsedLogId::HostDump { file }) => {
+                let path = self.resolve_dump_path(log_id, &file)?;
+                std::fs::remove_file(&path).map_err(|e| {
+                    BackendError::Internal(format!("delete dump {}: {e}", path.display()))
+                })?;
+                // Best-effort sidecar removal. It is `<name>.meta.json` (the full
+                // filename + suffix, per host_dump_logs) — NOT with_extension,
+                // which would drop the dump's own extension (crash.bin →
+                // crash.meta.json) and orphan the real sidecar.
+                let _ = std::fs::remove_file(path.with_file_name(format!("{file}.meta.json")));
+                Ok(())
+            }
+            Some(ParsedLogId::Line) => Err(BackendError::NotSupported(
+                "a standard log line cannot be individually deleted".to_string(),
+            )),
+            Some(ParsedLogId::GuestDump) => Err(BackendError::NotSupported(
+                "guest dump delete (guest /dumps proxy not yet wired)".to_string(),
+            )),
+            None => Err(BackendError::EntityNotFound(log_id.to_string())),
+        }
     }
 
     async fn read_data(&self, param_ids: &[String]) -> BackendResult<Vec<DataValue>> {
@@ -4817,7 +4944,7 @@ async fn query_vm_health(addr: &str, vm_name: &str) -> Option<GuestHealth> {
 }
 
 // ---------------------------------------------------------------------------
-// §7.21 log sources (see ComponentConfig::log_source)
+// §7.21 log sources (see ComponentConfig::log_sources)
 // ---------------------------------------------------------------------------
 
 /// One record from the guest log-agent's `GET /logs`. Field names are the
@@ -4937,22 +5064,26 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
 
     let entries = records
         .into_iter()
-        .enumerate()
-        .map(|(i, r)| LogEntry {
-            id: format!("{}-{i}", r.source),
-            timestamp: chrono::DateTime::parse_from_rfc3339(&r.timestamp)
+        .map(|r| {
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&r.timestamp)
                 .map(|t| t.with_timezone(&Utc))
-                .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH),
-            priority: priority_from_name(&r.priority),
-            message: r.message,
-            source: Some(r.source),
-            pid: None,
-            fields: None,
-            log_type: None,
-            size: None,
-            status: None,
-            href: None,
-            metadata: None,
+                .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH);
+            LogEntry {
+                // Content-addressed stable id (same scheme as host lines) so a
+                // guest line re-resolves on get_log without server state.
+                id: line_log_id(&r.source, timestamp, &r.message),
+                timestamp,
+                priority: priority_from_name(&r.priority),
+                message: r.message,
+                source: Some(r.source),
+                pid: None,
+                fields: None,
+                log_type: None,
+                size: None,
+                status: None,
+                href: None,
+                metadata: None,
+            }
         })
         .collect();
     Some(entries)
@@ -5023,14 +5154,17 @@ fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
             Ok(l) => l,
             Err(_) => continue,
         };
-        for (i, line) in lines.into_iter().enumerate() {
+        for line in lines.into_iter() {
             if let Some(pat) = &filter.pattern {
                 if !line.contains(pat.as_str()) {
                     continue;
                 }
             }
             entries.push(LogEntry {
-                id: format!("{source}-{i}"),
+                // Stable, content-addressed id so get_log/get_log_content can
+                // re-find this line by re-listing + matching (no server state,
+                // stable across re-list while the line exists).
+                id: line_log_id(&source, mtime, &line),
                 timestamp: mtime,
                 priority: LogPriority::Info,
                 message: line,
@@ -5048,8 +5182,10 @@ fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
             }
         }
     }
+    // Priority filter is "this level and above" (§7.21): lower enum value =
+    // higher severity (Emergency=0 … Debug=7), so keep entries at or above.
     if let Some(p) = filter.priority {
-        entries.retain(|e| e.priority == p);
+        entries.retain(|e| e.priority <= p);
     }
     let tail = filter.tail.or(filter.limit).unwrap_or(200).min(MAX_ENTRIES);
     if entries.len() > tail {
@@ -5081,6 +5217,191 @@ fn tail_file_lines(path: &std::path::Path, cap: u64) -> std::io::Result<Vec<Stri
         lines.remove(0);
     }
     Ok(lines)
+}
+
+// ---------------------------------------------------------------------------
+// §7.21 log id scheme — stable, self-describing, STATELESS.
+//
+// `get_log`/`get_log_content`/`delete_log` must route an id back to its source
+// without a server-side id→artifact map (which would be lost on restart and
+// race the message-passing delete). So the id encodes everything needed:
+//
+//   line:<source>:<b64url(sha256(source|ts|message)[..12])>   a standard line
+//   dump:host:<b64url(filename)>                               a host dump file
+//   dump:<vmN>:<agent-id>                                      a guest dump (future)
+//
+// base64url(no-pad) keeps ids URL-clean. `dump:host` encodes only the FILE NAME
+// (not the dir) — the dir comes from the component's own HostDumps config at
+// fetch time, so the id can't be used to escape that dir (path-traversal safe).
+// ---------------------------------------------------------------------------
+
+fn b64url(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .ok()
+}
+
+/// Content-addressed id for a standard log line (stable while the line exists).
+fn line_log_id(source: &str, ts: chrono::DateTime<Utc>, message: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(source.as_bytes());
+    h.update(b"|");
+    h.update(ts.to_rfc3339().as_bytes());
+    h.update(b"|");
+    h.update(message.as_bytes());
+    let digest = h.finalize();
+    format!("line:{source}:{}", b64url(&digest[..12]))
+}
+
+/// Id for a host dump file — encodes the bare filename (dir is config-supplied).
+fn dump_log_id(file_name: &str) -> String {
+    format!("dump:host:{}", b64url(file_name.as_bytes()))
+}
+
+/// A parsed §7.21 log id — tells the backend how to route get/content/delete.
+/// Carries only what routing consumes today; the id string itself remains the
+/// authoritative key (content-addressed for lines, path-encoded for dumps).
+enum ParsedLogId {
+    /// A standard journal/text line — re-found by re-listing sources and
+    /// matching the full id (stable while the line exists), so no payload needed.
+    Line,
+    /// A host dump file: `file` is the decoded bare filename (no dir component;
+    /// the dir comes from the component's `HostDumps` config).
+    HostDump { file: String },
+    /// A guest dump served by the guest log-agent. The routing target (vm +
+    /// agent id) is re-parsed when the guest `/dumps` proxy is wired; today this
+    /// only selects the "not yet supported" branch.
+    GuestDump,
+}
+
+fn parse_log_id(id: &str) -> Option<ParsedLogId> {
+    let (kind, rest) = id.split_once(':')?;
+    match kind {
+        "line" => {
+            // Shape check only: `line:<source>:<hash>` must have both colons.
+            rest.rsplit_once(':')?;
+            Some(ParsedLogId::Line)
+        }
+        "dump" => {
+            let (src, key) = rest.split_once(':')?;
+            if src == "host" {
+                let file = String::from_utf8(b64url_decode(key)?).ok()?;
+                // Reject any decoded name that isn't a bare filename — no path
+                // separators, no `..` — so the id can never escape the dump dir.
+                if file.contains('/') || file.contains("..") || file.is_empty() {
+                    return None;
+                }
+                Some(ParsedLogId::HostDump { file })
+            } else {
+                Some(ParsedLogId::GuestDump)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Optional sidecar next to a dump file: `<name>.meta.json` → { type, status }.
+#[derive(Debug, serde::Deserialize)]
+struct DumpMeta {
+    #[serde(default, rename = "type")]
+    log_type: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Host dump DIRECTORY as a §7.21 CUSTOM-log catalog: each regular file in
+/// `dir` (excluding `*.meta.json` sidecars) is one retrievable dump entry with
+/// a stable id, `size`, and `log_type`/`status` from an optional sidecar. This
+/// is the discovery surface for custom logs — content/delete address the file
+/// by the id's encoded filename.
+fn host_dump_logs(dir: &str, filter: &LogFilter) -> Vec<LogEntry> {
+    const MAX_ENTRIES: usize = 2000;
+    let mut entries: Vec<LogEntry> = Vec::new();
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return entries, // absent/unreadable dir → no dumps (not an error)
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".meta.json") {
+            continue; // sidecars aren't entries
+        }
+        let meta = std::fs::metadata(&path).ok();
+        let size = meta.as_ref().map(|m| m.len());
+        let mtime = meta
+            .and_then(|m| m.modified().ok())
+            .map(chrono::DateTime::<Utc>::from)
+            .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH);
+
+        // Optional sidecar for type/status.
+        let sidecar = path.with_file_name(format!("{name}.meta.json"));
+        let dm: Option<DumpMeta> = std::fs::read(&sidecar)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        let log_type = dm.as_ref().and_then(|m| m.log_type.clone());
+        let status = match dm.as_ref().and_then(|m| m.status.as_deref()) {
+            Some("retrieved") => Some(LogStatus::Retrieved),
+            Some("processed") => Some(LogStatus::Processed),
+            _ => Some(LogStatus::Pending),
+        };
+
+        // Filters: source (vs filename), type, status, since/until (mtime).
+        if let Some(want) = &filter.source {
+            if want != &name {
+                continue;
+            }
+        }
+        if let Some(t) = &filter.log_type {
+            if log_type.as_deref() != Some(t.as_str()) {
+                continue;
+            }
+        }
+        if let Some(st) = filter.status {
+            if status != Some(st) {
+                continue;
+            }
+        }
+        if let Some(since) = filter.since {
+            if mtime < since {
+                continue;
+            }
+        }
+        if let Some(until) = filter.until {
+            if mtime > until {
+                continue;
+            }
+        }
+
+        entries.push(LogEntry {
+            id: dump_log_id(&name),
+            timestamp: mtime,
+            priority: LogPriority::Notice, // a dump is a notable artifact, not a line
+            message: name.clone(),
+            source: Some(name),
+            pid: None,
+            fields: None,
+            log_type,
+            size,
+            status,
+            href: None, // sovd-api synthesizes the bulk-data href from the id
+            metadata: None,
+        });
+        if entries.len() >= MAX_ENTRIES {
+            break;
+        }
+    }
+    entries
 }
 
 fn guest_state_str(state: u32) -> &'static str {
@@ -5875,7 +6196,7 @@ mod bank_provider_injection_tests {
                 supports_rollback: false,
                 single_bank: true,
                 entity_type: "hsm".to_string(),
-                log_source: None,
+                log_sources: Vec::new(),
             },
             None,
             None,
@@ -6004,7 +6325,7 @@ mod bank_provider_injection_tests {
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
-                log_source: Some(source),
+                log_sources: vec![source],
                 ..ComponentConfig::default()
             },
             None,
@@ -6087,6 +6408,151 @@ mod bank_provider_injection_tests {
         });
         let got = b.get_logs(&LogFilter::default()).await.unwrap();
         assert!(got.is_empty());
+    }
+
+    /// Stable-id round-trip: an id from `get_logs` re-resolves via `get_log`
+    /// and `get_log_content` (no server state) — the fix for the old ephemeral
+    /// `{source}-{i}` ids that resolved nowhere.
+    #[tokio::test]
+    async fn logs_standard_line_id_round_trips() {
+        let dir = std::env::temp_dir().join(format!("cm-logid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("svc.log"), "hello world\nsecond line\n").unwrap();
+
+        let b = backend_with_logs(LogSource::HostFiles {
+            globs: vec![format!("{}/*.log", dir.display())],
+        });
+        let listed = b.get_logs(&LogFilter::default()).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|e| e.id.starts_with("line:svc:")));
+
+        // get_log by the listed id returns the same entry.
+        let one = &listed[0];
+        let fetched = b.get_log(&one.id).await.unwrap();
+        assert_eq!(fetched.id, one.id);
+        assert_eq!(fetched.message, one.message);
+
+        // get_log_content returns the line's bytes.
+        let content = b.get_log_content(&one.id).await.unwrap();
+        assert_eq!(String::from_utf8(content).unwrap(), one.message);
+
+        // a standard line is not deletable.
+        assert!(matches!(
+            b.delete_log(&one.id).await,
+            Err(BackendError::NotSupported(_))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Priority filter is "this level and above" (§7.21, numeric `<=`), not an
+    /// exact match. Host-file lines are `Info` (6); the discriminating case is a
+    /// `Debug` (7) threshold: "and-above" KEEPS the Info line (6 ≤ 7) where the
+    /// old `==` semantics would have dropped it.
+    #[tokio::test]
+    async fn logs_priority_filter_is_and_above() {
+        let dir = std::env::temp_dir().join(format!("cm-prio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("svc.log"), "an info line\n").unwrap();
+        let b = backend_with_logs(LogSource::HostFiles {
+            globs: vec![format!("{}/*.log", dir.display())],
+        });
+
+        // threshold = Debug (least severe): everything at or above is kept — the
+        // Info line survives. `==` would require priority == Debug and drop it.
+        let kept = b
+            .get_logs(&LogFilter {
+                priority: Some(LogPriority::Debug),
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 1, "Info is above Debug — and-above keeps it");
+
+        // threshold = Warning (more severe than Info): the Info line is dropped.
+        let dropped = b
+            .get_logs(&LogFilter {
+                priority: Some(LogPriority::Warning),
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert!(dropped.is_empty(), "Info is below Warning — filtered out");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// §7.21 CUSTOM logs: a dump directory is a catalog — list, fetch content
+    /// by id, delete by id. Sidecar sets type/status.
+    #[tokio::test]
+    async fn logs_host_dumps_catalog_content_and_delete() {
+        let dir = std::env::temp_dir().join(format!("cm-dumps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("crash-001.bin"), b"\x00\x01\x02dump-bytes").unwrap();
+        std::fs::write(
+            dir.join("crash-001.bin.meta.json"),
+            br#"{"type":"engine_dump","status":"pending"}"#,
+        )
+        .unwrap();
+
+        let b = backend_with_logs(LogSource::HostDumps {
+            dir: dir.to_string_lossy().into_owned(),
+        });
+        assert!(b.capabilities().logs);
+
+        // Catalog: one dump, sidecar type/status, size, stable dump: id.
+        let listed = b.get_logs(&LogFilter::default()).await.unwrap();
+        assert_eq!(listed.len(), 1, "sidecar is not itself an entry");
+        let d = &listed[0];
+        assert!(d.id.starts_with("dump:host:"));
+        assert_eq!(d.log_type.as_deref(), Some("engine_dump"));
+        assert_eq!(d.status, Some(LogStatus::Pending));
+        assert_eq!(d.size, Some(13)); // 3 raw bytes + "dump-bytes" (10)
+
+        // Content by id = the file bytes.
+        let content = b.get_log_content(&d.id).await.unwrap();
+        assert_eq!(content, b"\x00\x01\x02dump-bytes");
+
+        // Filter by type.
+        let by_type = b
+            .get_logs(&LogFilter {
+                log_type: Some("engine_dump".into()),
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(by_type.len(), 1);
+
+        // Delete by id removes the file AND its `<name>.meta.json` sidecar
+        // (regression: with_extension would target crash-001.meta.json and
+        // orphan the real crash-001.bin.meta.json).
+        b.delete_log(&d.id).await.unwrap();
+        assert!(!dir.join("crash-001.bin").exists());
+        assert!(
+            !dir.join("crash-001.bin.meta.json").exists(),
+            "sidecar must be removed alongside the dump"
+        );
+        assert!(b.get_logs(&LogFilter::default()).await.unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A crafted dump id can't escape the dump dir (path-traversal defence).
+    #[tokio::test]
+    async fn logs_dump_id_cannot_escape_dir() {
+        // parse_log_id must reject a decoded name containing separators / `..`.
+        let evil = format!("dump:host:{}", b64url(b"../../etc/passwd"));
+        assert!(
+            parse_log_id(&evil).is_none(),
+            "traversal name must not parse"
+        );
+
+        // And a valid-but-absent file id is EntityNotFound, not a read elsewhere.
+        let b = backend_with_logs(LogSource::HostDumps {
+            dir: "/nonexistent-dump-dir".into(),
+        });
+        let missing = dump_log_id("ghost.bin");
+        assert!(matches!(
+            b.get_log_content(&missing).await,
+            Err(BackendError::EntityNotFound(_))
+        ));
     }
 
     #[test]
@@ -7067,7 +7533,12 @@ mod time_floor_ratchet_tests {
 
     /// A backend carrying a SimHsm (whose monotonic slot is the safe-time floor).
     /// Returns the backend + a handle to read the floor back.
-    fn backend_with_hsm(tag: &str) -> (ComponentBackend<MemBlockDevice>, Arc<Mutex<dyn HsmProvider>>) {
+    fn backend_with_hsm(
+        tag: &str,
+    ) -> (
+        ComponentBackend<MemBlockDevice>,
+        Arc<Mutex<dyn HsmProvider>>,
+    ) {
         let keystore = std::env::temp_dir().join(format!("cm-floor-{tag}"));
         let _ = std::fs::remove_dir_all(&keystore);
         std::fs::create_dir_all(&keystore).unwrap();
@@ -7101,7 +7572,11 @@ mod time_floor_ratchet_tests {
 
         // A LOWER (stale) iat can never rewind the floor — the safety core.
         backend.ratchet_time_floor(1_000_000_000);
-        assert_eq!(floor(&hsm), 1_784_600_000, "a stale iat is a no-op, never a rewind");
+        assert_eq!(
+            floor(&hsm),
+            1_784_600_000,
+            "a stale iat is a no-op, never a rewind"
+        );
 
         // A higher iat advances it further.
         backend.ratchet_time_floor(1_784_600_500);
@@ -7142,7 +7617,11 @@ mod time_floor_ratchet_tests {
             min: 5,
             signing_time_secs: None,
         });
-        assert_eq!(floor(&hsm), 0, "no trusted signed time present → floor untouched");
+        assert_eq!(
+            floor(&hsm),
+            0,
+            "no trusted signed time present → floor untouched"
+        );
     }
 
     // --- Piece 2: the x-sumo-attest-time SOVD operation ---------------------
@@ -7156,7 +7635,11 @@ mod time_floor_ratchet_tests {
     fn host_backend_and_signed_manifest(
         tag: &str,
         signing_time: u64,
-    ) -> (ComponentBackend<MemBlockDevice>, Arc<Mutex<dyn HsmProvider>>, Vec<u8>) {
+    ) -> (
+        ComponentBackend<MemBlockDevice>,
+        Arc<Mutex<dyn HsmProvider>>,
+        Vec<u8>,
+    ) {
         let key = keygen::generate_signing_key(keygen::ES256).unwrap();
         // A minimal detached (no payload) manifest — attest-time is verify-only.
         let envelope = ImageManifestBuilder::new()
@@ -7235,7 +7718,10 @@ mod time_floor_ratchet_tests {
             .unwrap();
 
         let res = backend.start_operation(ATTEST_TIME_OP_ID, &forged).await;
-        assert!(res.is_err(), "a manifest not signed by the trusted root is rejected");
+        assert!(
+            res.is_err(),
+            "a manifest not signed by the trusted root is rejected"
+        );
         assert_eq!(floor(&hsm), 0, "a forged manifest never moves the floor");
     }
 }

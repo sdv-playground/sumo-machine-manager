@@ -653,7 +653,11 @@ mod tests {
         // Advance forward: cell rises, sink notified.
         authz.ratchet_floor(1_784_620_143);
         assert_eq!(cell.load(Ordering::Relaxed), 1_784_620_143, "cell advances");
-        assert_eq!(sink.last.load(Ordering::Relaxed), 1_784_620_143, "sink got the value");
+        assert_eq!(
+            sink.last.load(Ordering::Relaxed),
+            1_784_620_143,
+            "sink got the value"
+        );
 
         // A stale (lower) value must NOT rewind the cell (fetch_max), though the
         // sink is still called (it does its own monotonic guard).
