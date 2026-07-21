@@ -27,6 +27,29 @@ use sovd_api::{AccessRequest, Authorizer, Capability, ClientContext};
 // JWT verifying key from the verified leaf needs the x509/p256 SPKI surface.
 use crate::sovd::delegation::verify_delegate_chain;
 
+/// Durably persist a safe-time-floor advance discovered during authorization.
+///
+/// When the delegated path accepts a workshop delegate whose (trusted) `not_before`
+/// is ahead of the device's clock, the authorizer bumps its in-memory floor cell for
+/// the current run — but the *durable* effects (ratchet the HSM monotonic slot so it
+/// survives reboot, and step `CLOCK_REALTIME` forward so the JWT `exp`/`nbf` checks,
+/// which read the raw wall clock, also see the advanced time) require host resources
+/// the HSM-agnostic authorizer does not hold. The deployment injects a sink that does
+/// them (supernova wires it to `TimeFloor::advance` + `SystemWallClockFloor`); the
+/// default is a no-op. Best-effort and monotonic — `secs` at/below the current floor
+/// is a no-op. See `docs/safe-time-floor.md`.
+pub trait FloorSink: Send + Sync {
+    fn advance_floor(&self, secs: u64);
+}
+
+/// No-op sink: the in-memory bump still applies, but nothing is persisted or
+/// clock-disciplined. The default where the deployment wires nothing (tests, or a
+/// platform that owns its own clock).
+pub struct NoopFloorSink;
+impl FloorSink for NoopFloorSink {
+    fn advance_floor(&self, _secs: u64) {}
+}
+
 /// Authority tier. A token may only exercise a capability whose tier is `<=` the
 /// ceiling of the issuer that signed it. Order matters: `Operational <
 /// HighConsequence`.
@@ -135,6 +158,10 @@ pub struct TieredAuthorizer {
     /// at runtime while this authorizer is a cached build. `None` = no floor
     /// (behaviour identical to raw `now`).
     time_floor_secs: Option<Arc<AtomicU64>>,
+    /// Durable persistence for a floor advance discovered during delegated-path
+    /// authorization (HSM ratchet + wall-clock discipline). Injected by the
+    /// deployment; defaults to a no-op. See [`FloorSink`].
+    floor_sink: Arc<dyn FloorSink>,
 }
 
 impl TieredAuthorizer {
@@ -154,6 +181,7 @@ impl TieredAuthorizer {
             aud,
             read_open: false,
             time_floor_secs: None,
+            floor_sink: Arc::new(NoopFloorSink),
         }
     }
 
@@ -214,6 +242,27 @@ impl TieredAuthorizer {
     pub fn with_time_floor(mut self, floor: Arc<AtomicU64>) -> Self {
         self.time_floor_secs = Some(floor);
         self
+    }
+
+    /// Inject the durable [`FloorSink`] — the HSM ratchet + wall-clock discipline
+    /// applied when the delegated path advances the floor from a verified delegate's
+    /// `not_before`. Defaults to a no-op (in-memory bump only).
+    pub fn with_floor_sink(mut self, sink: Arc<dyn FloorSink>) -> Self {
+        self.floor_sink = sink;
+        self
+    }
+
+    /// Ratchet the safe-time floor to `secs` (monotonic): bump the in-memory cell so
+    /// THIS authorizer's `effective_now` reflects it immediately, and hand the value
+    /// to the injected [`FloorSink`] for the durable HSM ratchet + wall-clock
+    /// discipline (so the JWT `exp`/`nbf` checks, which read the raw wall clock, and
+    /// post-reboot runs also see it). `secs` at/below the current floor is a no-op.
+    fn ratchet_floor(&self, secs: u64) {
+        if let Some(cell) = self.time_floor_secs.as_ref() {
+            // fetch_max: monotonic, lock-free — never lowers the floor.
+            cell.fetch_max(secs, Ordering::Relaxed);
+        }
+        self.floor_sink.advance_floor(secs);
     }
 
     /// `max(wall_clock_now, floor)` as a rustls [`UnixTime`] — the time the
@@ -460,11 +509,21 @@ impl TieredAuthorizer {
         // whose freshness comes from boot_id/epoch, not a clock.
         let now = self.effective_now();
 
-        // (c) THE chain trust decision: root-pinning + path building + signature
-        // + validity, plus the leaf's granted scopes. We do not re-implement any
-        // of it.
+        // (c) THE chain trust decision: root-pinning + path building + signature,
+        // and NOT-provably-expired at effective_now, plus the leaf's granted scopes.
+        // verify_delegate_chain verifies the signature window-agnostically, so a
+        // fresh delegate whose not_before is ahead of a lagging clock is accepted
+        // (its expiry is still enforced against the floor).
         let authority = verify_delegate_chain(&chain_ders, pinned_root, now)
             .map_err(|e| format!("delegate chain rejected: {e}"))?;
+
+        // The signature verified to the pinned root, so the leaf's not_before is a
+        // trusted lower bound on real time. Ratchet the in-memory safe-time floor to
+        // it (monotonic) so this authorizer's subsequent effective_now reflects it
+        // immediately — the self-bootstrapping half of the clockless-device model.
+        // The durable HSM ratchet + wall-clock discipline are the injected FloorSink's
+        // job (best-effort); the in-memory bump is what unblocks THIS run.
+        self.ratchet_floor(authority.not_before_secs);
 
         // (d) Derive the JWT verifying key from the *verified* leaf's SPKI — the
         // token must be signed by the key the root just vouched for, nothing
@@ -566,6 +625,43 @@ mod tests {
         assert!(
             unfloored.effective_now() < expected,
             "with no floor, effective_now must track the wall clock"
+        );
+    }
+
+    /// `ratchet_floor` (called after a delegated accept) must: bump the in-memory
+    /// cell monotonically (never rewind), and hand the value to the injected sink.
+    #[test]
+    fn ratchet_floor_bumps_cell_monotonically_and_notifies_the_sink() {
+        use std::sync::atomic::AtomicU64;
+
+        #[derive(Default)]
+        struct RecordingSink {
+            last: AtomicU64,
+        }
+        impl FloorSink for RecordingSink {
+            fn advance_floor(&self, secs: u64) {
+                self.last.store(secs, Ordering::Relaxed);
+            }
+        }
+
+        let cell = Arc::new(AtomicU64::new(1_000));
+        let sink = Arc::new(RecordingSink::default());
+        let authz = TieredAuthorizer::new(Vec::new())
+            .with_time_floor(cell.clone())
+            .with_floor_sink(sink.clone());
+
+        // Advance forward: cell rises, sink notified.
+        authz.ratchet_floor(1_784_620_143);
+        assert_eq!(cell.load(Ordering::Relaxed), 1_784_620_143, "cell advances");
+        assert_eq!(sink.last.load(Ordering::Relaxed), 1_784_620_143, "sink got the value");
+
+        // A stale (lower) value must NOT rewind the cell (fetch_max), though the
+        // sink is still called (it does its own monotonic guard).
+        authz.ratchet_floor(500);
+        assert_eq!(
+            cell.load(Ordering::Relaxed),
+            1_784_620_143,
+            "a lower value never rewinds the in-memory floor"
         );
     }
 

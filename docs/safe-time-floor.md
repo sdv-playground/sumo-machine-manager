@@ -57,6 +57,47 @@ rejection propagates (`ManifestError::RollbackRejected` carries the signed
 timestamp can only be a no-op, never a rewind — and it lets an offline device advance
 its floor whenever it merely *sees* trusted signed time, not only on a full install.
 
+## Self-bootstrapping: the delegate cert's own `not_before`
+
+The workshop minter is a **delegate**, not a pinned issuer — its key isn't in the
+keystore; it presents an `x5c` chain to the pinned delegation root. This is deliberate:
+delegates rotate without re-provisioning every device (a fleet-scale requirement). But
+a delegate leaf's `not_before` is a real-world date, and a no-RTC device boots behind
+real time — so a naive "valid at now" window check rejects a fresh delegate as *not yet
+valid*, deadlocking the very first flash at `open_update` (HTTP 401). Nothing has
+advanced the floor yet, because the flash IS the thing that would.
+
+The delegated path (`sovd/delegation.rs` `verify_delegate_chain` +
+`sovd/authz.rs` `authorize_delegated`) breaks that **without** trusting the delegate to
+assert its own validity blindly, and **without** an operator pre-step:
+
+1. Verify the chain **signature + path + clientAuth EKU** *window-agnostically* — call
+   the webpki verifier at `now = the leaf's own not_before`, so the window is trivially
+   satisfied and the call reduces to "does this chain to the pinned root?". A forged /
+   mis-rooted / wrong-EKU cert still fails here (those checks don't depend on the instant).
+2. Only after the signature verifies is `not_before` trusted — the pinned root signed it,
+   so it's a trusted lower bound on real time. Ratchet the floor to it (the in-memory
+   cell immediately, and the injected `FloorSink` disciplines the wall clock forward so
+   the token's own JWT `exp`/`nbf` checks — which read the raw clock — also see it).
+3. **Expiry is still enforced**: reject iff `not_after < effective_now = max(wall, floor)`.
+
+Net rule: **accept a delegate iff its signature is valid AND we cannot PROVE it expired**
+against the rollback-proof floor. The `not_before` gate is intentionally dropped for
+delegates — advancing the floor can only *tighten* the expiry check, never loosen it, so
+this can't resurrect a cert the device already knows is stale (`not_after < old_floor`
+still rejects). This is the clockless-device model: reject what you can prove stale;
+accept what you can't disprove. It is **not** circular — the accept decision rests on the
+signature (independent of the floor); the floor advance is a *consequence* of an
+already-trusted signature, and being monotonic + forward-only it can never create trust
+it didn't already have.
+
+Residual risk (bounded, same class as any signed-time source): a **stolen, expired**
+delegate presented to a device whose floor is stuck far in the past (fresh / epoch-boot).
+Mitigated by the provisioning-time floor seed (a just-provisioned device's floor ≈
+provisioning time, not epoch), short delegate lifetimes, and `boot_id` + scope binding on
+the token the cert vouches for. A compromised delegation root is out of scope — it can
+mint currently-valid certs regardless.
+
 This is deliberate. The HSM is *not* asked to verify provenance, because doing so
 would drag SUIT-manifest parsing and Roughtime validation into the HSM's TCB — a
 large attack surface for essentially no security gain (see below). Every new time

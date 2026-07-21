@@ -35,6 +35,12 @@ pub struct DelegateAuthority {
     pub leaf_der: Vec<u8>,
     /// Scopes the leaf's delegated-rights extension grants (empty if absent).
     pub granted_scopes: Vec<String>,
+    /// The verified leaf's `not_before`, in UNIX seconds. A trusted lower bound on
+    /// real time: the pinned root signed this cert, so it believed real time had
+    /// reached `not_before` at signing. The caller ratchets the safe-time floor to
+    /// it (monotonic) so a clock-lagging device stops being wrong about "now" — see
+    /// [`verify_delegate_chain`] and `docs/safe-time-floor.md`.
+    pub not_before_secs: u64,
 }
 
 /// Why a delegate chain was rejected.
@@ -62,20 +68,42 @@ impl std::fmt::Display for DelegationError {
 }
 impl std::error::Error for DelegationError {}
 
-/// Verify `x5c` (DER certs, leaf-first) chains to `pinned_root_pem`, valid at `now`.
+/// Verify `x5c` (DER certs, leaf-first) chains to `pinned_root_pem`, and is not
+/// provably expired at `effective_now`.
 ///
-/// Returns the leaf DER plus the scopes its delegated-rights extension grants.
-/// Does **not** verify any JWT signature — the caller does that with the leaf key.
+/// Returns the leaf DER, the scopes its delegated-rights extension grants, and the
+/// verified leaf's `not_before` (UNIX secs). Does **not** verify any JWT signature —
+/// the caller does that with the leaf key.
 ///
-/// The trust decision is entirely the rustls webpki client verifier's: root
-/// pinning, path building, signature verification, and the validity window are
-/// all enforced by [`WebPkiClientVerifier::verify_client_cert`] against the
-/// pinned root, using the explicitly-supplied ring crypto provider (no reliance
-/// on a process-default provider being installed).
+/// # Time model — self-bootstrapping from the trusted `not_before`
+///
+/// A workshop minter is a *delegate*, not a pinned issuer (so it can rotate without
+/// re-provisioning every device). Its leaf's `not_before` is a real-world date; a
+/// device with no RTC boots behind real time, so a naive "valid at now" window check
+/// rejects a freshly-minted delegate as *not yet valid* — deadlocking the flash
+/// (`open_update` → 401). We break that WITHOUT trusting the delegate to assert its
+/// own validity window blindly:
+///
+/// 1. **Signature + path** are verified WINDOW-AGNOSTICALLY — `verify_client_cert`
+///    is called at `now = the leaf's own not_before`, so the window is trivially
+///    in range and the call reduces to "does this chain to the pinned root and carry
+///    clientAuth?". A forged / mis-rooted / non-clientAuth cert still fails here (those
+///    checks are independent of the instant), so an untrusted cert never yields a
+///    `not_before` we'd act on.
+/// 2. Only AFTER the signature verifies do we trust `not_before` — the pinned root
+///    signed it, so it's a trusted lower bound on real time. The caller ratchets the
+///    monotonic safe-time floor to it (see [`DelegateAuthority::not_before_secs`]).
+/// 3. **Expiry** is still enforced: we reject iff `not_after < effective_now`
+///    (`effective_now = max(wall_clock, floor)`). So the net rule is **accept iff the
+///    signature is valid AND we cannot PROVE the cert expired** against the
+///    rollback-proof floor. The `not_before` ("not yet valid") gate is intentionally
+///    dropped for delegates — advancing the floor can only *tighten* the expiry check,
+///    never loosen it, so this cannot resurrect a cert the device already knows is
+///    stale (`not_after < old_floor` still rejects). See `docs/safe-time-floor.md`.
 pub fn verify_delegate_chain(
     x5c: &[Vec<u8>],
     pinned_root_pem: &[u8],
-    now: UnixTime,
+    effective_now: UnixTime,
 ) -> Result<DelegateAuthority, DelegationError> {
     // 1. Leaf-first split: first cert is the leaf, the rest are intermediates.
     let (leaf_bytes, intermediate_bytes) = x5c.split_first().ok_or(DelegationError::NoChain)?;
@@ -104,21 +132,54 @@ pub fn verify_delegate_chain(
     .build()
     .map_err(|e| DelegationError::ChainNotTrusted(e.to_string()))?;
 
-    // 4. THE trust decision: root pinning + path + signatures + validity at `now`.
-    //    The verifier requires the leaf to carry the clientAuth EKU.
-    verifier
-        .verify_client_cert(&leaf_der, &intermediate_ders, now)
-        .map_err(|e| DelegationError::ChainNotTrusted(e.to_string()))?;
-
-    // 5. Read the (now-trusted) leaf's delegated rights. Absent extension =>
-    //    grants nothing.
+    // 4. Parse the (as-yet UNtrusted) leaf to read its own not_before. We do not act
+    //    on this value until the signature verifies at step 5 — a forged cert's
+    //    not_before is meaningless because step 5 rejects the cert.
     let leaf = Certificate::from_der(leaf_der.as_ref())
         .map_err(|e| DelegationError::BadCert(e.to_string()))?;
+    let not_before_secs = leaf
+        .tbs_certificate
+        .validity
+        .not_before
+        .to_unix_duration()
+        .as_secs();
+    let not_after_secs = leaf
+        .tbs_certificate
+        .validity
+        .not_after
+        .to_unix_duration()
+        .as_secs();
+
+    // 5. Signature + path + clientAuth, WINDOW-AGNOSTIC: verify at the leaf's own
+    //    not_before so the validity window is trivially satisfied and this call is
+    //    effectively "chains to the pinned root?". Root-pinning, path building,
+    //    signature, and the clientAuth EKU are all independent of the instant, so a
+    //    forged / mis-rooted / wrong-EKU chain is still rejected here.
+    let at_not_before =
+        UnixTime::since_unix_epoch(std::time::Duration::from_secs(not_before_secs));
+    verifier
+        .verify_client_cert(&leaf_der, &intermediate_ders, at_not_before)
+        .map_err(|e| DelegationError::ChainNotTrusted(e.to_string()))?;
+
+    // 6. EXPIRY (the one time-gate we keep): reject iff the cert is PROVABLY expired
+    //    against effective_now = max(wall_clock, safe-time floor). The not_before
+    //    ("not yet valid") gate is intentionally dropped — the trusted root vouched
+    //    the cert is valid from not_before, and the caller ratchets the floor to it.
+    let now_secs = effective_now.as_secs();
+    if not_after_secs < now_secs {
+        return Err(DelegationError::ChainNotTrusted(format!(
+            "delegate certificate expired: not_after {not_after_secs} < effective_now {now_secs}"
+        )));
+    }
+
+    // 7. Read the (now-trusted) leaf's delegated rights. Absent extension =>
+    //    grants nothing.
     let scopes = granted_scopes(&leaf).unwrap_or_default();
 
     Ok(DelegateAuthority {
         leaf_der: leaf_der.as_ref().to_vec(),
         granted_scopes: scopes,
+        not_before_secs,
     })
 }
 
@@ -381,5 +442,92 @@ mod tests {
             auth.granted_scopes,
             vec!["reset:execute", "update:transfer"]
         );
+    }
+
+    // --- self-bootstrapping time model (advance floor from the delegate's own
+    //     not_before; verify signature window-agnostically; keep expiry) ---------
+
+    /// A validity window entirely in the FUTURE relative to `effective_now`:
+    /// [now+start_h, now+start_h+2h]. Models a fresh workshop delegate on a device
+    /// whose clock/floor lags behind real time.
+    fn future_window(start_h: u64) -> Validity {
+        let start = std::time::SystemTime::now() + Duration::from_secs(start_h * 3600);
+        let end = start + Duration::from_secs(2 * 3600);
+        Validity {
+            not_before: x509_cert::time::Time::try_from(start).unwrap(),
+            not_after: x509_cert::time::Time::try_from(end).unwrap(),
+        }
+    }
+
+    fn secs_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// THE deadlock-breaker: a delegate whose `not_before` is ahead of
+    /// `effective_now` (lagging device) is ACCEPTED — the signature is verified
+    /// window-agnostically, and its expiry is in the future. It also reports the
+    /// trusted `not_before` so the caller can ratchet the floor.
+    #[test]
+    fn future_dated_delegate_is_accepted_and_reports_its_not_before() {
+        let ca_key = SigningKey::random(&mut OsRng);
+        let ca_name = Name::from_str("CN=root A").unwrap();
+        let root_pem = ca_root_pem(&ca_key, &ca_name);
+        let leaf = issue_leaf(&ca_key, &ca_name, "delegate", Some("update:transfer"), future_window(3), 2);
+
+        // effective_now = the raw wall clock (no floor yet); the leaf's window is +3h.
+        let auth = verify_delegate_chain(std::slice::from_ref(&leaf), &root_pem, now())
+            .expect("a signature-valid future-dated delegate must be accepted (deadlock fix)");
+        assert!(
+            auth.granted_scopes.iter().any(|s| s == "update:transfer"),
+            "the accepted delegate carries its scopes"
+        );
+        // not_before is ~3h ahead of now — the trusted lower bound to ratchet to.
+        assert!(
+            auth.not_before_secs > secs_now() + 3600,
+            "reports the leaf's future not_before ({} vs now {})",
+            auth.not_before_secs,
+            secs_now()
+        );
+    }
+
+    /// Security core: a FUTURE-dated cert that does NOT chain to the pinned root is
+    /// still rejected — the window-agnostic step verifies signature+path, so an
+    /// untrusted cert never yields a not_before the caller would ratchet from.
+    #[test]
+    fn future_dated_but_wrong_root_is_still_rejected() {
+        let real = SigningKey::random(&mut OsRng);
+        let real_name = Name::from_str("CN=root A").unwrap();
+        let root_pem = ca_root_pem(&real, &real_name);
+        // Signed by a DIFFERENT CA, with an attacker-friendly far-future window.
+        let attacker = SigningKey::random(&mut OsRng);
+        let attacker_name = Name::from_str("CN=root B").unwrap();
+        let leaf = issue_leaf(&attacker, &attacker_name, "delegate", Some("update:transfer"), future_window(3), 9);
+
+        let err = verify_delegate_chain(&[leaf], &root_pem, now())
+            .expect_err("a future-dated cert not chaining to the pinned root must be rejected");
+        assert!(
+            matches!(err, DelegationError::ChainNotTrusted(_)),
+            "wrong-root rejection must be ChainNotTrusted, got {err:?}"
+        );
+    }
+
+    /// Expiry is still enforced against effective_now: a provably-expired delegate
+    /// (not_after < effective_now) is rejected even though its signature is valid.
+    #[test]
+    fn provably_expired_delegate_is_rejected() {
+        let ca_key = SigningKey::random(&mut OsRng);
+        let ca_name = Name::from_str("CN=root A").unwrap();
+        let root_pem = ca_root_pem(&ca_key, &ca_name);
+        let leaf = issue_leaf(&ca_key, &ca_name, "delegate", Some("update:transfer"), expired_window(), 2);
+
+        // effective_now = raw now; the window is [now-2h, now-1h] → not_after < now.
+        let err = verify_delegate_chain(&[leaf], &root_pem, now())
+            .expect_err("a provably-expired delegate must be rejected");
+        let named_expiry =
+            matches!(&err, DelegationError::ChainNotTrusted(e) if e.contains("expired"));
+        assert!(named_expiry, "expiry rejection must name the expiry, got {err:?}");
     }
 }
