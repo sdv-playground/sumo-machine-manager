@@ -20,7 +20,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE="$(cd "$ROOT_DIR/../.." && pwd)"
-SUMO_RS_DIR="$WORKSPACE/components/sumo-rs"
+# Locate the sumo-rs checkout layout-independently: an explicit $SUMO_RS_DIR override
+# wins; else try the workspace domain layout (sumo/sumo-rs), the legacy flat layout
+# (components/sumo-rs), and a plain sibling — whichever exists.
+if [ -z "${SUMO_RS_DIR:-}" ]; then
+    for cand in \
+        "$WORKSPACE/sumo/sumo-rs" \
+        "$WORKSPACE/components/sumo-rs" \
+        "$WORKSPACE/../sumo-rs"; do
+        if [ -d "$cand" ]; then SUMO_RS_DIR="$cand"; break; fi
+    done
+    : "${SUMO_RS_DIR:=$WORKSPACE/sumo/sumo-rs}"   # default to the current layout for the error msg
+fi
+[ -d "$SUMO_RS_DIR" ] || { echo "[build] sumo-rs not found (set SUMO_RS_DIR); tried sumo/, components/, ../sumo-rs" >&2; exit 1; }
 TMPL_DIR="$SCRIPT_DIR/templates"
 
 export KEYS_DIR="$SCRIPT_DIR/keys"
