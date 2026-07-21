@@ -48,6 +48,16 @@ pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-sumo-installed-manifest";
 /// vendor namespace (SOVDd stays spec-pure; the semantics live here in component-mgr).
 pub const UPDATE_MODE_PARAM_ID: &str = "x-sumo-update-mode";
 
+/// Vendor SOVD operation id for **attest-time**: push a SoftwareAuthority-signed
+/// SUIT manifest so the device ratchets its safe-time floor from the manifest's
+/// signed (protected-header) `signing_time`. Lets an operator advance a
+/// clock-lagging device's trusted-time floor BEFORE a flash, so a freshly-minted
+/// delegate cert (`not_before ≈ now`) validates against `max(wall_clock, floor)`
+/// (`docs/safe-time-floor.md`). Verify-only: no payload, no bank touch; monotonic,
+/// so an older-than-floor manifest is a harmless no-op. Device-global — advertised
+/// on the host/device component (the floor + clock are shared singletons).
+pub const ATTEST_TIME_OP_ID: &str = "x-sumo-attest-time";
+
 // ---------------------------------------------------------------------------
 // Stored package (validated SUIT envelope)
 // ---------------------------------------------------------------------------
@@ -2821,13 +2831,32 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// (`crate::sovd::admin_state`), not by `start_operation`.
     async fn list_operations(&self) -> BackendResult<Vec<OperationInfo>> {
         let mut ops = Vec::new();
+        let id = &self.entity_info.id;
         if self.is_disableable() {
             let op = crate::sovd::admin_state::ADMIN_STATE_OP_ID;
-            let id = &self.entity_info.id;
             ops.push(OperationInfo {
                 id: op.to_string(),
                 name: "Administrative state (disable/enable)".to_string(),
                 description: None,
+                parameters: vec![],
+                requires_security: false,
+                security_level: 0,
+                href: format!("/vehicle/v1/components/{id}/operations/{op}/executions"),
+            });
+        }
+        // attest-time is device-global (ratchets the shared safe-time floor); it
+        // needs an HSM (the floor slot) and is advertised ONCE, on the host/device
+        // component (BankSet::Os), so it doesn't appear per-firmware-component.
+        if self.hsm_provider.is_some() && self.bank_set == BankSet::Os {
+            let op = ATTEST_TIME_OP_ID;
+            ops.push(OperationInfo {
+                id: op.to_string(),
+                name: "Attest trusted time (advance the safe-time floor)".to_string(),
+                description: Some(
+                    "POST a SoftwareAuthority-signed SUIT manifest (hex); the device \
+                     ratchets its safe-time floor from the manifest's signed signing_time."
+                        .to_string(),
+                ),
                 parameters: vec![],
                 requires_security: false,
                 security_level: 0,
@@ -2840,9 +2869,47 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     async fn start_operation(
         &self,
         operation_id: &str,
-        _params: &[u8],
+        params: &[u8],
     ) -> BackendResult<OperationExecution> {
-        Err(BackendError::OperationNotFound(operation_id.to_string()))
+        match operation_id {
+            // Attest trusted time: verify a SoftwareAuthority-signed SUIT manifest
+            // (params = the raw SUIT envelope bytes) and ratchet the safe-time floor
+            // from its signed signing_time. Verify-only — validate_header_only does
+            // signature+digest against the sw-authority anchor, no payload/bank work;
+            // min_security_ver = 0 so an OLD manifest is accepted here (its signed
+            // time is still a trusted lower bound; the floor is monotonic, so an
+            // older-than-floor value is a harmless no-op).
+            ATTEST_TIME_OP_ID => {
+                let validated = self
+                    .manifest_provider
+                    .validate_header_only(params, 0)
+                    .map_err(|e| {
+                        BackendError::InvalidRequest(format!("attest-time manifest: {e}"))
+                    })?;
+                match validated.signing_time_secs {
+                    Some(iat) => {
+                        self.ratchet_time_floor(iat);
+                        let floor = self
+                            .hsm_provider
+                            .as_ref()
+                            .and_then(|h| h.lock().ok())
+                            .and_then(|g| crate::sovd::time_floor::TimeFloor::read(&*g).ok())
+                            .unwrap_or(iat);
+                        Ok(OperationExecution::completed(
+                            operation_id,
+                            operation_id,
+                            serde_json::json!({ "signing_time_secs": iat, "floor_secs": floor }),
+                        ))
+                    }
+                    // Signature verified, but the manifest carried no signing_time —
+                    // nothing to attest. A caller error (send one with an iat).
+                    None => Err(BackendError::InvalidRequest(
+                        "attest-time manifest has no signed signing_time to attest".to_string(),
+                    )),
+                }
+            }
+            _ => Err(BackendError::OperationNotFound(operation_id.to_string())),
+        }
     }
 
     // --- Update package catalog (ISO 17978-3 §7.18.3 Table 261) ---
@@ -7076,5 +7143,99 @@ mod time_floor_ratchet_tests {
             signing_time_secs: None,
         });
         assert_eq!(floor(&hsm), 0, "no trusted signed time present → floor untouched");
+    }
+
+    // --- Piece 2: the x-sumo-attest-time SOVD operation ---------------------
+    use crate::suit_provider::SuitProvider;
+    use sovd_core::DiagnosticBackend;
+    use sumo_offboard::{keygen, ImageManifestBuilder};
+
+    /// Build a SoftwareAuthority-signed SUIT manifest carrying `signing_time`, plus
+    /// a SuitProvider that trusts that key as sw-authority, plus a host (BankSet::Os)
+    /// backend with a SimHsm. This is the operator-pushed attest-time artifact.
+    fn host_backend_and_signed_manifest(
+        tag: &str,
+        signing_time: u64,
+    ) -> (ComponentBackend<MemBlockDevice>, Arc<Mutex<dyn HsmProvider>>, Vec<u8>) {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        // A minimal detached (no payload) manifest — attest-time is verify-only.
+        let envelope = ImageManifestBuilder::new()
+            .signing_time(signing_time)
+            .component_id(vec!["host-os".into(), "ifs".into()])
+            .sequence_number(1)
+            .payload_digest(&[0u8; 32], 0)
+            .payload_uri("#firmware".into())
+            .build(&key)
+            .unwrap();
+
+        // Provider that trusts our signing key as the software authority.
+        let provider = SuitProvider::with_factory_authority();
+        provider.update_keys(key.public_key_bytes(), None, None);
+
+        let keystore = std::env::temp_dir().join(format!("cm-attest-{tag}"));
+        let _ = std::fs::remove_dir_all(&keystore);
+        std::fs::create_dir_all(&keystore).unwrap();
+        let hsm: Arc<Mutex<dyn HsmProvider>> = Arc::new(Mutex::new(SimHsm::new(keystore)));
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        nv.write_boot_state(&mut NvBootState::default()).unwrap();
+        let backend = ComponentBackend::with_options(
+            BankSet::Os, // host/device component — where attest-time is advertised
+            Arc::new(Mutex::new(nv)),
+            Arc::new(provider),
+            ComponentConfig::default(),
+            None,
+            None,
+            Some(hsm.clone()),
+        );
+        (backend, hsm, envelope)
+    }
+
+    #[tokio::test]
+    async fn attest_time_is_advertised_on_the_host_component_with_an_hsm() {
+        let (backend, _hsm, _) = host_backend_and_signed_manifest("advertise", 1_784_600_000);
+        let ops = backend.list_operations().await.unwrap();
+        assert!(
+            ops.iter().any(|o| o.id == ATTEST_TIME_OP_ID),
+            "host component with an HSM advertises x-sumo-attest-time"
+        );
+    }
+
+    #[tokio::test]
+    async fn attest_time_verifies_a_signed_manifest_and_ratchets_the_floor() {
+        let iat = 1_784_620_143; // the fresh-tower cert not_before from the live repro
+        let (backend, hsm, envelope) = host_backend_and_signed_manifest("ratchet", iat);
+        assert_eq!(floor(&hsm), 0, "floor starts unraised");
+
+        let exec = backend
+            .start_operation(ATTEST_TIME_OP_ID, &envelope)
+            .await
+            .expect("a sw-authority-signed manifest attests trusted time");
+        assert_eq!(exec.status, sovd_core::OperationStatus::Completed);
+        assert_eq!(
+            floor(&hsm),
+            iat,
+            "attest-time ratcheted the safe-time floor to the manifest's signed signing_time"
+        );
+    }
+
+    #[tokio::test]
+    async fn attest_time_rejects_a_manifest_not_signed_by_the_trusted_root() {
+        // A manifest signed by a DIFFERENT key must not move the floor — the whole
+        // security property (independent trusted root, non-circular).
+        let (backend, hsm, _good) = host_backend_and_signed_manifest("untrusted", 1_784_620_143);
+        let attacker = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let forged = ImageManifestBuilder::new()
+            .signing_time(9_999_999_999) // far future — the attacker's goal
+            .component_id(vec!["host-os".into(), "ifs".into()])
+            .sequence_number(1)
+            .payload_digest(&[0u8; 32], 0)
+            .payload_uri("#firmware".into())
+            .build(&attacker)
+            .unwrap();
+
+        let res = backend.start_operation(ATTEST_TIME_OP_ID, &forged).await;
+        assert!(res.is_err(), "a manifest not signed by the trusted root is rejected");
+        assert_eq!(floor(&hsm), 0, "a forged manifest never moves the floor");
     }
 }

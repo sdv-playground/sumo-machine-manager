@@ -71,13 +71,45 @@ execution.**
 | Attack | Defense |
 |---|---|
 | Rewind the persisted floor on disk | HSM monotonicity — the NV counter can't go backward |
-| Call `raise` with a bogus far-future value (auth DoS) | `raise` is **host-only link-B**, never exposed over the guest `vhsm-ssd` channel — a filesystem/SOVD attacker has no way to invoke it |
+| Call `raise` with a bogus far-future value (auth DoS) | The raw `raise` op is **host-only link-B**, never exposed over the guest `vhsm-ssd` channel. The only *remote* path that advances it — the `x-sumo-attest-time` SOVD op — takes NO caller-supplied number: it accepts a **SoftwareAuthority-signed SUIT manifest** and ratchets to the manifest's own signature-covered `signing_time`. An attacker cannot forge a far-future time without the sw-authority key. |
 | Feed an unsigned timestamp to the floor | The caller only ratchets from signature-verified sources |
+| Replay an old signed manifest to `x-sumo-attest-time` | Monotonic — an `iat` at/below the floor is a no-op. Worst case: no change. |
 
-The one entity that *can* call `raise` — the OTA engine (`component-mgr`) on the
-host — is already fully trusted: it flashes signed firmware. If it were
-compromised, advancing a time floor is the least of the concerns, and it could
-obtain a genuinely-signed timestamp and advance the floor "legitimately" anyway.
+The host callers that advance the floor are the OTA engine (`component-mgr`, on
+every trust-root-verified manifest — see Provenance) and the `x-sumo-attest-time`
+operator operation (below). Both ratchet only from a SoftwareAuthority-signed
+`signing_time`; neither takes a raw number.
+
+## Operator-pushed time: the `x-sumo-attest-time` operation
+
+Ratcheting the floor during an OTA install has a bootstrap gap: a device whose
+clock lags real time rejects a freshly-minted **workshop-delegate cert**
+(`not_before ≈ now`) at `open_update` ("certificate not valid yet") — before any
+manifest is uploaded, so nothing has advanced the floor yet. The delegate cert's
+validity window is checked against `max(wall_clock, floor)`, and the floor is
+still stale.
+
+`x-sumo-attest-time` breaks that deadlock **without widening any cert window**:
+
+```
+POST /vehicle/v1/components/<host>/operations/x-sumo-attest-time/executions
+  body { "parameters": "<hex of a SoftwareAuthority-signed SUIT manifest>" }
+  → device verifies the signature to its pinned SoftwareAuthority root  (clock-free)
+  → ratchets the safe-time floor to the manifest's signed signing_time  (monotonic)
+  → disciplines CLOCK_REALTIME forward to the floor
+THEN the normal flash: open_update's delegate-cert window is now checked at a
+`now` past its not_before → it validates.
+```
+
+Why this is sound and **non-circular**: the manifest is signed by the
+**SoftwareAuthority** root — a *different, independent* trust anchor from the
+`delegation-root` that vouches for the workshop delegate cert. So a sw-authority
+`signing_time` admitting a delegate cert is not self-referential; the workshop
+minter/delegate is **never** trusted to assert time. Authorization for the op is
+the ordinary `operations:execute` (Operational tier), carriable by a
+`boot_id`-fresh pinned-issuer token — itself clock-free. The op is verify-only
+(no payload, no bank write) and idempotent. An operator (e.g. the autoloader)
+pushes any recent sw-authority-signed manifest it already holds before flashing.
 
 ## Why not verify provenance inside the HSM
 
