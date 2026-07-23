@@ -566,6 +566,13 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 // serve logs; the rest keep the "not supported" answer.
                 logs: !config.log_sources.is_empty(),
                 operations: false,
+                // §7.20: the `/bulk-data` routes are gated on this. We expose a
+                // `logs` bulk-data category only for HostFiles sources (see
+                // list_bulk_data_categories), so mirror that condition exactly.
+                bulk_data: config
+                    .log_sources
+                    .iter()
+                    .any(|s| matches!(s, LogSource::HostFiles { .. })),
             },
             bank_set,
             bank_spec,
@@ -2705,6 +2712,185 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 oldest_cursor: None,
             })
         }
+    }
+
+    // =====================================================================
+    // SOVD §7.20 bulk-data — HOST-FILE log download (C-120 + C-121).
+    //
+    // The inline `LogPage` cursor above is the quick, non-normative view of a
+    // component's logs; this is the spec-native "get ALL logs" path: a `logs`
+    // bulk-data category whose ITEMS are the individual host log files, each
+    // downloaded whole via `GET .../bulk-data/logs/{id}`.
+    //
+    // Scope (this step): HOST-FILE sources only. GuestAgent bulk-data (a guest
+    // log export) and HostDumps (which already carries its own `dump:host:*`
+    // id scheme under the §7.21 log routes) are deliberately NOT surfaced as
+    // bulk-data categories here — that is a later step. We override only the
+    // three bulk-data trait methods; get_logs / get_logs_paged / the dump
+    // routes are untouched.
+    // =====================================================================
+
+    /// `GET /components/{id}/bulk-data` — the categories this component exposes.
+    /// A component with at least one [`LogSource::HostFiles`] source offers a
+    /// single `logs` category (its host log files). Everything else falls back
+    /// to the trait default (empty) — we do NOT invent categories for
+    /// GuestAgent/HostDumps here (see the scope note above).
+    async fn list_bulk_data_categories(&self) -> BackendResult<Vec<BulkCategory>> {
+        let has_host_files = self
+            .config
+            .log_sources
+            .iter()
+            .any(|s| matches!(s, LogSource::HostFiles { .. }));
+        if has_host_files {
+            Ok(vec![BulkCategory {
+                name: "logs".to_string(),
+            }])
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// `GET /components/{id}/bulk-data/{category}` — the downloadable items in a
+    /// category, honouring the created-before/after filter. Only `logs` is known
+    /// here; any other name → `EntityNotFound` (the trait-default contract the
+    /// api layer maps to 404).
+    ///
+    /// Each item is one host log file resolved from every `HostFiles` source's
+    /// globs. The item `id` is the base64url of the file's FULL path bytes —
+    /// stateless and stable (no server-side bookkeeping): [`get_bulk_data`]
+    /// decodes it straight back to the path. (The path is re-validated against
+    /// the live glob set on download, so encoding the full path does not widen
+    /// the read surface — see the security check there.)
+    async fn list_bulk_data(
+        &self,
+        category: &str,
+        filter: &BulkDataFilter,
+    ) -> BackendResult<Vec<BulkDataItem>> {
+        // `logs` is the only category, and it exists only when the component
+        // actually has a HostFiles source — otherwise it is as unknown as any
+        // other name (a HostDumps-only component must 404 here, matching
+        // list_bulk_data_categories which returns []).
+        let has_host_files = self
+            .config
+            .log_sources
+            .iter()
+            .any(|s| matches!(s, LogSource::HostFiles { .. }));
+        if category != "logs" || !has_host_files {
+            return Err(BackendError::EntityNotFound(format!(
+                "bulk-data category: {category}"
+            )));
+        }
+
+        // Gather every file from every HostFiles source (globs resolve to a
+        // sorted, deduped file set — same resolver the tail/paged readers use,
+        // so the catalog and the line views agree on what "the logs" are).
+        let mut items: Vec<BulkDataItem> = Vec::new();
+        for source in &self.config.log_sources {
+            if let LogSource::HostFiles { globs } = source {
+                for path in resolve_log_files(globs) {
+                    // The id is base64url of the path's UTF-8 text, so download
+                    // can decode it straight back (no unsafe OS-string round-trip,
+                    // portable to QNX). A non-UTF-8 path can't produce a stable
+                    // text id — skip it (log file paths are UTF-8 in practice).
+                    let Some(path_str) = path.to_str() else {
+                        continue;
+                    };
+                    let created = file_mtime(&path);
+                    // Filter: keep items created STRICTLY after created_after and
+                    // STRICTLY before created_before (matches the model docs).
+                    if let Some(after) = filter.created_after {
+                        if created <= after {
+                            continue;
+                        }
+                    }
+                    if let Some(before) = filter.created_before {
+                        if created >= before {
+                            continue;
+                        }
+                    }
+                    // size: best-effort file length (0 if metadata unavailable).
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    items.push(BulkDataItem {
+                        // Full path (UTF-8 text), base64url — decodable back to
+                        // the path on download (stateless + stable across restarts).
+                        id: b64url(path_str.as_bytes()),
+                        size,
+                        created,
+                        mime: "text/plain".to_string(),
+                        source: Some(source_name(&path)),
+                    });
+                }
+            }
+        }
+
+        // Deterministic order so listings are stable: by created, then id.
+        items.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
+        Ok(items)
+    }
+
+    /// `GET /components/{id}/bulk-data/logs/{id}` — download one host log file
+    /// whole. Returns the bytes inline ([`BulkDataDownload::Inline`]).
+    ///
+    /// The whole point of bulk-data is "get ALL logs", so — unlike the 64 KiB
+    /// tail reader — we do NOT truncate to a small window. We do cap the read at
+    /// [`MAX_BULK_BYTES`] to guard against OOM on a runaway file: a file at or
+    /// under the cap is served whole; a larger file is served TRUNCATED to the
+    /// first `MAX_BULK_BYTES`. (Future work: when a file exceeds the cap, answer
+    /// `202`/`307` via [`BulkDataDownload::Async`]/`Redirect` and stream it
+    /// out-of-band instead of truncating — not implemented in this step.)
+    async fn get_bulk_data(&self, category: &str, id: &str) -> BackendResult<BulkDataDownload> {
+        /// OOM guard for a single inline bulk download. 32 MiB comfortably holds
+        /// a rotated log file whole while bounding a single response.
+        const MAX_BULK_BYTES: u64 = 32 * 1024 * 1024;
+
+        if category != "logs" {
+            return Err(BackendError::EntityNotFound(format!(
+                "bulk-data category: {category}"
+            )));
+        }
+
+        // Decode the id back to a path. The id is base64url of the path's UTF-8
+        // text (see list_bulk_data); a malformed id, or bytes that aren't valid
+        // UTF-8, can't name one of our log files → 404.
+        let path_str = b64url_decode(id)
+            .and_then(|b| String::from_utf8(b).ok())
+            .ok_or_else(|| BackendError::EntityNotFound(format!("bulk-data item: {id}")))?;
+        let requested = std::path::PathBuf::from(path_str);
+
+        // SECURITY (mandatory): the id encodes an arbitrary path, so we must NOT
+        // read whatever it decodes to — a crafted id could otherwise point at
+        // `/etc/passwd` or any file the daemon can read (path-traversal /
+        // arbitrary-read). We re-resolve the component's live HostFiles globs and
+        // require the requested path to be one of the files that set currently
+        // yields. Anything not in the set is indistinguishable from "no such
+        // item" → EntityNotFound. This confines download to exactly the files
+        // `list_bulk_data` advertised, and re-resolving (rather than trusting the
+        // decoded path) keeps the allow-list authoritative even as files rotate.
+        let in_allowed_set = self.config.log_sources.iter().any(|s| {
+            matches!(s, LogSource::HostFiles { globs }
+                if resolve_log_files(globs).iter().any(|p| p == &requested))
+        });
+        if !in_allowed_set {
+            return Err(BackendError::EntityNotFound(format!("bulk-data item: {id}")));
+        }
+
+        // Read up to the cap. Bounded by MAX_BULK_BYTES via take(); a file at or
+        // under the cap is served whole, a larger one is truncated to the cap.
+        use std::io::Read;
+        let file = std::fs::File::open(&requested).map_err(|e| {
+            BackendError::Internal(format!("read log {}: {e}", requested.display()))
+        })?;
+        let mut bytes = Vec::new();
+        file.take(MAX_BULK_BYTES)
+            .read_to_end(&mut bytes)
+            .map_err(|e| {
+                BackendError::Internal(format!("read log {}: {e}", requested.display()))
+            })?;
+
+        Ok(BulkDataDownload::Inline {
+            mime: "text/plain".to_string(),
+            bytes,
+        })
     }
 
     /// SOVD §7.21 `GET /components/{id}/logs/{id}` — one entry's metadata.
@@ -7271,6 +7457,175 @@ mod bank_provider_injection_tests {
         let missing = dump_log_id("ghost.bin");
         assert!(matches!(
             b.get_log_content(&missing).await,
+            Err(BackendError::EntityNotFound(_))
+        ));
+    }
+
+    // =====================================================================
+    // SOVD §7.20 bulk-data — HOST-FILE log download tests.
+    // =====================================================================
+
+    /// A HostFiles component exposes exactly the `logs` bulk-data category, its
+    /// files list as items (ids round-trip to the paths, sizes/source match),
+    /// an unknown category is 404, and a known item downloads its bytes whole.
+    #[tokio::test]
+    async fn bulk_data_logs_category_list_and_download() {
+        use sovd_core::DiagnosticBackend;
+        let dir = std::env::temp_dir().join(format!("cm-bulk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("supernova.log");
+        let f2 = dir.join("other.log");
+        std::fs::write(&f1, "one\ntwo\nthree\n").unwrap();
+        std::fs::write(&f2, "alpha\nbeta\n").unwrap();
+
+        let b = backend_with_logs(LogSource::HostFiles {
+            globs: vec![format!("{}/*.log", dir.display())],
+        });
+
+        // Capability + category: exactly [{name:"logs"}].
+        assert!(b.capabilities().bulk_data);
+        let cats = b.list_bulk_data_categories().await.unwrap();
+        assert_eq!(cats.len(), 1);
+        assert_eq!(cats[0].name, "logs");
+
+        // Items: both files, ids decode back to the paths, sizes + source match.
+        let items = b
+            .list_bulk_data("logs", &BulkDataFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        for it in &items {
+            assert_eq!(it.mime, "text/plain");
+            let decoded = String::from_utf8(b64url_decode(&it.id).unwrap()).unwrap();
+            let path = std::path::PathBuf::from(&decoded);
+            assert!(path == f1 || path == f2, "id must decode to a listed file");
+            assert_eq!(it.size, std::fs::metadata(&path).unwrap().len());
+            assert_eq!(it.source.as_deref(), Some(source_name(&path)).as_deref());
+        }
+
+        // Unknown category → EntityNotFound.
+        assert!(matches!(
+            b.list_bulk_data("other", &BulkDataFilter::default()).await,
+            Err(BackendError::EntityNotFound(_))
+        ));
+
+        // Download file-1 by its id → Inline bytes == file-1 contents.
+        let id1 = b64url(f1.to_str().unwrap().as_bytes());
+        match b.get_bulk_data("logs", &id1).await.unwrap() {
+            BulkDataDownload::Inline { mime, bytes } => {
+                assert_eq!(mime, "text/plain");
+                assert_eq!(bytes, b"one\ntwo\nthree\n");
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
+
+        // Unknown category on download → EntityNotFound.
+        assert!(matches!(
+            b.get_bulk_data("nope", &id1).await,
+            Err(BackendError::EntityNotFound(_))
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Path-traversal guard: a crafted id naming a file OUTSIDE the component's
+    /// resolved glob set (e.g. /etc/passwd) must NOT be readable — it is
+    /// indistinguishable from "no such item" → EntityNotFound. A malformed
+    /// (non-base64 / non-UTF-8) id is likewise 404.
+    #[tokio::test]
+    async fn bulk_data_download_rejects_arbitrary_path() {
+        use sovd_core::DiagnosticBackend;
+        let dir = std::env::temp_dir().join(format!("cm-bulk-evil-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("svc.log"), "safe\n").unwrap();
+
+        let b = backend_with_logs(LogSource::HostFiles {
+            globs: vec![format!("{}/*.log", dir.display())],
+        });
+
+        // A well-formed id for a real file that is NOT in this component's set.
+        let evil = b64url(b"/etc/passwd");
+        assert!(matches!(
+            b.get_bulk_data("logs", &evil).await,
+            Err(BackendError::EntityNotFound(_))
+        ));
+
+        // A malformed id (not valid base64url) → EntityNotFound, no panic.
+        assert!(matches!(
+            b.get_bulk_data("logs", "!!!not-base64!!!").await,
+            Err(BackendError::EntityNotFound(_))
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The created-before/after filter selects by mtime: a far-future
+    /// `created_after` yields nothing, a far-past `created_before` yields
+    /// nothing, and an open filter yields everything.
+    #[tokio::test]
+    async fn bulk_data_list_honours_created_filter() {
+        use sovd_core::DiagnosticBackend;
+        let dir = std::env::temp_dir().join(format!("cm-bulk-filt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.log"), "x\n").unwrap();
+        std::fs::write(dir.join("b.log"), "y\n").unwrap();
+
+        let b = backend_with_logs(LogSource::HostFiles {
+            globs: vec![format!("{}/*.log", dir.display())],
+        });
+
+        // Open filter → both files.
+        assert_eq!(
+            b.list_bulk_data("logs", &BulkDataFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // created_after in the far future → nothing is newer.
+        let future = chrono::DateTime::<Utc>::from_timestamp(4_000_000_000, 0).unwrap();
+        assert!(b
+            .list_bulk_data(
+                "logs",
+                &BulkDataFilter {
+                    created_after: Some(future),
+                    created_before: None,
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty());
+
+        // created_before in the far past → nothing is older.
+        let past = chrono::DateTime::<Utc>::from_timestamp(1, 0).unwrap();
+        assert!(b
+            .list_bulk_data(
+                "logs",
+                &BulkDataFilter {
+                    created_after: None,
+                    created_before: Some(past),
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A component with NO HostFiles source (dumps only) exposes no bulk-data
+    /// category, and listing `logs` is EntityNotFound.
+    #[tokio::test]
+    async fn bulk_data_absent_without_host_files() {
+        use sovd_core::DiagnosticBackend;
+        let b = backend_with_logs(LogSource::HostDumps {
+            dir: "/nonexistent-dump-dir".into(),
+        });
+        assert!(!b.capabilities().bulk_data);
+        assert!(b.list_bulk_data_categories().await.unwrap().is_empty());
+        assert!(matches!(
+            b.list_bulk_data("logs", &BulkDataFilter::default()).await,
             Err(BackendError::EntityNotFound(_))
         ));
     }
