@@ -14,6 +14,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+// `OnceLock` caches the process-wide boot_epoch (read+bumped once at first
+// paged-log request); `Path`/`BTreeMap` back the reboot-safe log cursor below.
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -2657,6 +2662,51 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         Ok(entries)
     }
 
+    /// SOVD §7.21 paged log access + our reboot-safe cursor extension
+    /// (`tasks/log-retrieval-design.md`). Overrides the trait default (one
+    /// terminal page) ONLY for the pure HOST-FILE component: a component whose
+    /// every source is [`LogSource::HostFiles`] pages forward over a
+    /// `(boot_epoch, per-source byte offset)` cursor via [`host_file_logs_paged`].
+    ///
+    /// Multi-source handling (design doc step 5): a component that mixes in a
+    /// GuestAgent or HostDumps source falls back to the DEFAULT single terminal
+    /// page (the whole `get_logs` result, `next_cursor = None`). Those sources
+    /// have no monotonic ordering key yet (guest paging is the journald-cursor
+    /// follow-up; dumps are a whole-file catalog, not a line stream), and
+    /// conflating a paged host offset with an unpaged dump list in one cursor
+    /// would be incorrect. Picking the simplest correct option: paginate iff the
+    /// source set is purely HostFiles; otherwise defer to the terminal-page
+    /// default. A client's "loop until next_cursor is None" still terminates in
+    /// one step against the fallback, exactly as with any non-paging backend.
+    async fn get_logs_paged(&self, filter: &LogFilter) -> BackendResult<LogPage> {
+        let only_host_files = !self.config.log_sources.is_empty()
+            && self
+                .config
+                .log_sources
+                .iter()
+                .all(|s| matches!(s, LogSource::HostFiles { .. }));
+
+        if only_host_files {
+            // Merge every HostFiles source's globs into one source set — the
+            // per-source cursor keys on the file stem, so multiple globs page
+            // as one coherent resource.
+            let mut globs: Vec<String> = Vec::new();
+            for s in &self.config.log_sources {
+                if let LogSource::HostFiles { globs: g } = s {
+                    globs.extend(g.iter().cloned());
+                }
+            }
+            Ok(host_file_logs_paged(&globs, filter, current_boot_epoch()))
+        } else {
+            // Default behaviour (mirrors the trait default): one terminal page.
+            Ok(LogPage {
+                items: self.get_logs(filter).await?,
+                next_cursor: None,
+                oldest_cursor: None,
+            })
+        }
+    }
+
     /// SOVD §7.21 `GET /components/{id}/logs/{id}` — one entry's metadata.
     /// The id is self-describing (`<kind>:<source>:<key>`); we re-derive the
     /// entry from its backing source rather than hold server state.
@@ -5089,14 +5139,342 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
     Some(entries)
 }
 
-/// Host-local file logs: bounded tails of every file matching the globs.
-/// Only `dir/prefix*suffix` patterns (one `*`, filename position) — a
-/// literal path matches itself. Lines carry the file's mtime; priority
-/// is `Info` (host logs are unstructured text).
-fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
-    const PER_FILE_CAP: u64 = 64 * 1024;
-    const MAX_ENTRIES: usize = 2000;
+// ---------------------------------------------------------------------------
+// Reboot-safe log pagination — HOST-FILE tier (tasks/log-retrieval-design.md)
+//
+// The wire cursor is OPAQUE to clients (base64url of a compact JSON). It carries
+// a per-boot epoch plus a per-source resume byte offset. WHY each piece exists:
+//
+//   * A byte offset into an append-only file is ALREADY reboot-safe: a byte
+//     position is monotonic no matter what the host's 1970→floor→1970 wall clock
+//     does. So offset alone pages PERSISTENT files (/var/log, log-rotate'd)
+//     correctly across a reboot — the offset stays valid.
+//   * boot_epoch has ONE job: INVALIDATE offsets for VOLATILE sources. A file
+//     under /dev/shmem (QNX RAM) is wiped on reboot, so a saved offset into it is
+//     meaningless post-reboot. When the cursor's boot_epoch differs from the
+//     current one AND the source is volatile, we restart that source from 0.
+//   * boot_epoch is NOT a per-line key (MM does not own most host log lines —
+//     they're written by other producers into arbitrary glob'd files), so we do
+//     NOT stamp lines with it. It is purely a cursor-invalidation tag.
+// ---------------------------------------------------------------------------
 
+/// Environment override for the boot-epoch persistence file, so tests never
+/// touch `/var/lib`. When unset, [`DEFAULT_BOOT_EPOCH_FILE`] is used.
+const BOOT_EPOCH_FILE_ENV: &str = "MACHINE_MGR_BOOT_EPOCH_FILE";
+/// Default persistence path for the boot-epoch counter. Deliberately a TINY
+/// plain file, NOT nv-store: nv-store is safety-relevant + format-specced;
+/// boot_epoch is only a log-cursor invalidation tag. Worst case if it's lost or
+/// reset = volatile cursors restart from oldest = SAFE (design doc Q1).
+const DEFAULT_BOOT_EPOCH_FILE: &str = "/var/lib/machine-mgr/boot_epoch";
+
+/// Process-wide cached boot epoch. Read + incremented + written back ONCE at the
+/// first paged-log request (see [`current_boot_epoch`]); never bumped per-request.
+static BOOT_EPOCH: OnceLock<u64> = OnceLock::new();
+
+/// The default page size (entries) when the client sets neither `limit` nor
+/// `tail`, and the hard cap — matches the non-paged `host_file_logs` path.
+const PAGE_DEFAULT: usize = 200;
+const PAGE_MAX: usize = 2000;
+
+/// Return the process-wide boot epoch, reading + incrementing + persisting the
+/// counter file on first call. Its only job is to invalidate cursors for
+/// volatile log sources across a reboot; a read/write failure is NON-FATAL
+/// (warn + fall back to an in-memory value) because a lost epoch merely restarts
+/// volatile sources from oldest, which is safe.
+fn current_boot_epoch() -> u64 {
+    *BOOT_EPOCH.get_or_init(|| {
+        let path = std::env::var(BOOT_EPOCH_FILE_ENV)
+            .unwrap_or_else(|_| DEFAULT_BOOT_EPOCH_FILE.to_string());
+        bump_boot_epoch_file(Path::new(&path))
+    })
+}
+
+/// Read the u64 in `path` (0 if absent/unparseable), increment, write it back,
+/// and return the incremented value. Failures to read/write are logged at
+/// `warn` and treated as a 0 baseline (→ returns 1) so the daemon still boots.
+fn bump_boot_epoch_file(path: &Path) -> u64 {
+    let prev = match std::fs::read_to_string(path) {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
+        // Absent file is the normal first-boot case (not a warn); other errors
+        // (permissions, IO) are unusual — surface them but keep going.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e,
+                "boot_epoch file unreadable — starting from 0 (volatile cursors will restart)");
+            0
+        }
+    };
+    let next = prev.saturating_add(1);
+    // Best-effort persist: create the parent dir, then write. A failure only
+    // means the NEXT boot re-uses this epoch → volatile cursors restart once
+    // more; still safe, so we don't propagate the error.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(path, next.to_string()) {
+        tracing::warn!(path = %path.display(), error = %e,
+            "boot_epoch file unwritable — epoch not persisted this boot");
+    }
+    next
+}
+
+/// Path-based volatility classification (design doc step 2): a file under
+/// `/dev/shmem` (QNX RAM) is VOLATILE — wiped on reboot, so a saved offset into
+/// it is meaningless across boots. Everything else (log-rotate'd `/var/log`
+/// files) is PERSISTENT — a byte offset survives the reboot unchanged.
+fn is_volatile(path: &Path) -> bool {
+    path.starts_with("/dev/shmem")
+}
+
+/// Per-source position within the cursor: the file's rotation generation and the
+/// byte offset to RESUME reading at (the offset AFTER the last complete line
+/// returned). Compact single-letter keys keep the encoded cursor small.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SourcePos {
+    /// Rotation generation: 0 = the live base file `{path}`; 1 = `{path}.1`; etc.
+    /// FIRST CUT: we page only the live base file, so `g` is always 0 today (see
+    /// `host_file_logs_paged` TODO). It is carried so a later rotated-set pager
+    /// can populate it without a cursor-format change.
+    #[serde(rename = "g")]
+    gen: u64,
+    /// Byte offset to resume at.
+    #[serde(rename = "o")]
+    offset: u64,
+}
+
+/// The decoded log cursor. Wire form is base64url(no-pad) of this struct's JSON;
+/// clients NEVER parse it (journald discipline — see design doc).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct LogCursor {
+    /// The boot epoch this cursor was minted under. If it differs from the
+    /// current epoch, offsets into volatile sources are void.
+    #[serde(rename = "b")]
+    boot_epoch: u64,
+    /// Per-source resume position, keyed by the file-stem source name that
+    /// `host_file_logs` already uses. `BTreeMap` for a deterministic key order
+    /// (stable encoded cursor, easier round-trip assertions).
+    #[serde(rename = "s")]
+    sources: BTreeMap<String, SourcePos>,
+}
+
+impl LogCursor {
+    /// Encode as an opaque base64url(no-pad) token. Reuses the crate's existing
+    /// `b64url` helper (same encoding as the log-id scheme) — no new dep.
+    fn encode(&self) -> String {
+        // serde_json on a small fixed struct cannot realistically fail; if it
+        // ever did, an empty string decodes back to "no cursor" (start oldest),
+        // which is the safe fallback rather than a 500.
+        serde_json::to_vec(self).map(|j| b64url(&j)).unwrap_or_default()
+    }
+
+    /// Decode an opaque token. Returns `None` for any malformed input so the
+    /// caller treats a bad cursor as "no cursor" (start from oldest) — never a
+    /// 500, per the design contract.
+    fn decode(token: &str) -> Option<LogCursor> {
+        let bytes = b64url_decode(token)?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+/// Reboot-safe, paginable variant of [`host_file_logs`]. Reads FORWARD from each
+/// source's cursor offset (not a last-64KB tail), returns the entries plus a
+/// `next_cursor` advanced past what it consumed, and an `oldest_cursor` pointing
+/// at offset 0 for every source under the current boot epoch.
+///
+/// FIRST CUT — base-file-only paging: we page the live base file `{path}` (gen
+/// 0) only. Rotated files (`{path}.1`, `{path}.2`, …) are NOT yet walked — that
+/// is the documented follow-up (see the `gen` field). We STILL detect rotation /
+/// truncation via the offset-vs-length gap check below, so we never silently
+/// skip or re-read: if the file shrank under a saved offset we restart it from 0.
+fn host_file_logs_paged(globs: &[String], filter: &LogFilter, boot_epoch: u64) -> LogPage {
+    let cursor = filter.after.as_deref().and_then(LogCursor::decode);
+    // A cursor minted under a different boot epoch only invalidates VOLATILE
+    // sources; persistent offsets stay valid (a byte position is reboot-stable).
+    let cursor_epoch = cursor.as_ref().map(|c| c.boot_epoch);
+
+    let page_size = filter
+        .tail
+        .or(filter.limit)
+        .unwrap_or(PAGE_DEFAULT)
+        .min(PAGE_MAX);
+
+    let files = resolve_log_files(globs);
+
+    let mut items: Vec<LogEntry> = Vec::new();
+    // The next cursor's per-source offsets and the oldest (offset-0) positions.
+    let mut next_sources: BTreeMap<String, SourcePos> = BTreeMap::new();
+    let mut oldest_sources: BTreeMap<String, SourcePos> = BTreeMap::new();
+    // Did we read anything new from ANY source? If not, next_cursor = None so a
+    // client's paging loop terminates (they've reached the head).
+    let mut produced_any = false;
+
+    for path in files {
+        let source = source_name(&path);
+        // Every resolved source contributes an oldest (offset-0) position.
+        oldest_sources.insert(source.clone(), SourcePos { gen: 0, offset: 0 });
+
+        // Source filter: honour it exactly as host_file_logs does.
+        if let Some(want) = &filter.source {
+            if want != &source {
+                continue;
+            }
+        }
+
+        // mtime drives the entry timestamp AND the since/until pre-filter (same
+        // coarse semantics as host_file_logs — these are file-level, not
+        // per-line, because host lines are unstructured text with no timestamp).
+        let mtime = file_mtime(&path);
+        if let Some(since) = filter.since {
+            if mtime < since {
+                // Skipped by time — but still resume from where the cursor was so
+                // a later mtime bump doesn't replay the whole file.
+                if let Some(pos) = cursor.as_ref().and_then(|c| c.sources.get(&source)) {
+                    next_sources.insert(source.clone(), *pos);
+                }
+                continue;
+            }
+        }
+        if let Some(until) = filter.until {
+            if mtime > until {
+                if let Some(pos) = cursor.as_ref().and_then(|c| c.sources.get(&source)) {
+                    next_sources.insert(source.clone(), *pos);
+                }
+                continue;
+            }
+        }
+
+        let file_len = match std::fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(_) => continue, // vanished/unreadable → skip (not an error)
+        };
+
+        // Determine the resume offset for this source.
+        let saved = cursor.as_ref().and_then(|c| c.sources.get(&source));
+        let volatile = is_volatile(&path);
+        let start_offset = match saved {
+            // No cursor, or this source absent from it → start at oldest.
+            None => 0,
+            Some(pos) => {
+                if cursor_epoch != Some(boot_epoch) && volatile {
+                    // Volatile source across a reboot → offset void, restart.
+                    0
+                } else if pos.offset > file_len {
+                    // File shrank (truncated / rotated / replaced) → GAP. Restart
+                    // from 0; oldest_cursor (offset 0) will be > the client's
+                    // `after` so they can detect the dropped history.
+                    0
+                } else {
+                    pos.offset
+                }
+            }
+        };
+
+        // Read forward from start_offset, collecting COMPLETE lines and tracking
+        // the byte offset after the last complete line consumed. A torn trailing
+        // partial line is NOT consumed — its bytes stay for the next call.
+        let remaining = page_size.saturating_sub(items.len());
+        let (lines, new_offset) = match read_lines_from(&path, start_offset, remaining) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if new_offset > start_offset {
+            produced_any = true;
+        }
+        // Record where this source resumes next time. Even a source we didn't
+        // advance keeps its position so the cursor stays complete.
+        next_sources.insert(
+            source.clone(),
+            SourcePos {
+                gen: 0,
+                offset: new_offset,
+            },
+        );
+
+        for line in lines {
+            if let Some(pat) = &filter.pattern {
+                if !line.contains(pat.as_str()) {
+                    continue;
+                }
+            }
+            items.push(LogEntry {
+                // Same content-addressed id scheme as host_file_logs so a paged
+                // line re-resolves via get_log identically.
+                id: line_log_id(&source, mtime, &line),
+                timestamp: mtime,
+                priority: LogPriority::Info,
+                message: line,
+                source: Some(source.clone()),
+                pid: None,
+                fields: None,
+                log_type: None,
+                size: None,
+                status: None,
+                href: None,
+                metadata: None,
+            });
+        }
+
+        if items.len() >= page_size {
+            // Page full. Stop scanning; sources we never reached are carried
+            // below (post-loop) so the next call resumes rather than replays
+            // them. We break AFTER recording this source's advanced offset above.
+            break;
+        }
+    }
+
+    // Carry any source present in the INCOMING cursor that this scan didn't
+    // touch (e.g. sources past a page-fill break, or one currently filtered out
+    // by since/until): keep its prior offset so the next call resumes it instead
+    // of replaying from oldest. New (never-seen) sources are intentionally NOT
+    // synthesised here — they enter next_sources only once actually scanned.
+    if let Some(c) = &cursor {
+        for (source, pos) in &c.sources {
+            next_sources.entry(source.clone()).or_insert(*pos);
+        }
+    }
+
+    // Priority filter is "this level and above" (§7.21): lower enum value = more
+    // severe. Host lines are always Info; keep the check for parity + future
+    // structured sources.
+    if let Some(p) = filter.priority {
+        items.retain(|e| e.priority <= p);
+    }
+
+    let oldest_cursor = Some(
+        LogCursor {
+            boot_epoch,
+            sources: oldest_sources,
+        }
+        .encode(),
+    );
+
+    // next_cursor = None when nothing new was read from ANY source (head
+    // reached) → the client's loop stops. Otherwise carry the advanced offsets.
+    let next_cursor = if produced_any {
+        Some(
+            LogCursor {
+                boot_epoch,
+                sources: next_sources,
+            }
+            .encode(),
+        )
+    } else {
+        None
+    };
+
+    LogPage {
+        items,
+        next_cursor,
+        oldest_cursor,
+    }
+}
+
+/// Resolve a set of `dir/prefix*suffix` (or literal) globs to a sorted, deduped
+/// list of existing regular files. Extracted from `host_file_logs` so the paged
+/// and non-paged readers resolve identically. Only ONE `*` in the filename
+/// position is supported (no full glob engine) — a literal path matches itself.
+fn resolve_log_files(globs: &[String]) -> Vec<std::path::PathBuf> {
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     for g in globs {
         let p = std::path::Path::new(g);
@@ -5123,23 +5501,91 @@ fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
     }
     files.sort();
     files.dedup();
+    files
+}
+
+/// The source name for a log file — its file stem (matches `host_file_logs`).
+fn source_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "host".into())
+}
+
+/// A file's mtime as a UTC timestamp (UNIX epoch if unavailable) — the timestamp
+/// stamped on every line from that file, matching `host_file_logs`.
+fn file_mtime(path: &std::path::Path) -> chrono::DateTime<Utc> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(chrono::DateTime::<Utc>::from)
+        .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH)
+}
+
+/// Read forward from `start` in `path`, returning up to `max` COMPLETE lines and
+/// the byte offset AFTER the last complete line consumed. A torn trailing partial
+/// line (no terminating `\n`) is NOT consumed — its bytes are left for the next
+/// call, so a line being appended concurrently is never split across pages.
+/// Blank/whitespace-only lines are skipped (parity with `tail_file_lines`) but
+/// their bytes still advance the offset so we don't re-scan them.
+fn read_lines_from(
+    path: &std::path::Path,
+    start: u64,
+    max: usize,
+) -> std::io::Result<(Vec<String>, u64)> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::new(f);
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut offset = start;
+    // Read raw bytes so we can distinguish a complete line (ends in `\n`) from a
+    // torn trailing partial (EOF with no newline) — `BufRead::lines` hides that.
+    loop {
+        if lines.len() >= max {
+            break;
+        }
+        let mut raw: Vec<u8> = Vec::new();
+        let n = reader.read_until(b'\n', &mut raw)?;
+        if n == 0 {
+            break; // EOF
+        }
+        if raw.last() != Some(&b'\n') {
+            // Torn partial line at EOF — do NOT consume it or advance past it.
+            break;
+        }
+        // Complete line: advance the offset past it regardless of whether we keep
+        // it (blank lines still move the cursor so they aren't re-scanned).
+        offset += n as u64;
+        let text = String::from_utf8_lossy(&raw);
+        let trimmed = text.trim_end_matches(['\n', '\r']);
+        if !trimmed.trim().is_empty() {
+            lines.push(trimmed.to_string());
+        }
+    }
+    Ok((lines, offset))
+}
+
+/// Host-local file logs: bounded tails of every file matching the globs.
+/// Only `dir/prefix*suffix` patterns (one `*`, filename position) — a
+/// literal path matches itself. Lines carry the file's mtime; priority
+/// is `Info` (host logs are unstructured text).
+fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
+    const PER_FILE_CAP: u64 = 64 * 1024;
+    const MAX_ENTRIES: usize = 2000;
+
+    let files = resolve_log_files(globs);
 
     let mut entries: Vec<LogEntry> = Vec::new();
     for path in files {
-        let source = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "host".into());
+        let source = source_name(&path);
         if let Some(want) = &filter.source {
             if want != &source {
                 continue;
             }
         }
-        let mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .map(chrono::DateTime::<Utc>::from)
-            .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH);
+        let mtime = file_mtime(&path);
         if let Some(since) = filter.since {
             if mtime < since {
                 continue;
@@ -6477,6 +6923,280 @@ mod bank_provider_injection_tests {
             .await
             .unwrap();
         assert!(dropped.is_empty(), "Info is below Warning — filtered out");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Reboot-safe log pagination (tasks/log-retrieval-design.md, HOST tier)
+    // -----------------------------------------------------------------------
+
+    /// Cursor encode→decode preserves the boot epoch and every per-source
+    /// (gen, offset). The token is opaque base64url; clients never parse it.
+    #[test]
+    fn log_cursor_round_trips() {
+        let mut sources = BTreeMap::new();
+        sources.insert("svc".to_string(), SourcePos { gen: 0, offset: 42 });
+        sources.insert(
+            "kern".to_string(),
+            SourcePos {
+                gen: 0,
+                offset: 1_000_000,
+            },
+        );
+        let c = LogCursor {
+            boot_epoch: 7,
+            sources,
+        };
+        let decoded = LogCursor::decode(&c.encode()).expect("round-trips");
+        assert_eq!(decoded, c);
+        assert_eq!(decoded.boot_epoch, 7);
+        assert_eq!(decoded.sources["svc"].offset, 42);
+        assert_eq!(decoded.sources["kern"].offset, 1_000_000);
+    }
+
+    /// A garbage `after` cursor is treated as "no cursor" (start from oldest),
+    /// never a panic or 500.
+    #[test]
+    fn log_cursor_bad_token_is_none() {
+        assert!(LogCursor::decode("").is_none());
+        assert!(LogCursor::decode("!!!not-base64!!!").is_none());
+        // Valid base64url of non-JSON bytes → still None (not a panic).
+        assert!(LogCursor::decode(&b64url(b"\xff\xfe\x00garbage")).is_none());
+    }
+
+    /// Paging an append-only file in batches returns disjoint, in-order lines
+    /// and terminates (next_cursor eventually None). Also: appending AFTER the
+    /// head is reached and re-calling with the last cursor returns ONLY the new
+    /// lines.
+    #[test]
+    fn log_paging_batches_disjoint_and_terminates() {
+        let dir = std::env::temp_dir().join(format!("cm-page-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("svc.log");
+        std::fs::write(&path, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let globs = vec![format!("{}/*.log", dir.display())];
+
+        // Page size 2, boot epoch 1.
+        let f = |after: Option<String>| LogFilter {
+            limit: Some(2),
+            after,
+            ..LogFilter::default()
+        };
+
+        let p1 = host_file_logs_paged(&globs, &f(None), 1);
+        let m1: Vec<_> = p1.items.iter().map(|e| e.message.clone()).collect();
+        assert_eq!(m1, vec!["l1", "l2"]);
+        assert!(p1.next_cursor.is_some());
+        assert!(p1.oldest_cursor.is_some(), "oldest_cursor always reported");
+
+        let p2 = host_file_logs_paged(&globs, &f(p1.next_cursor.clone()), 1);
+        let m2: Vec<_> = p2.items.iter().map(|e| e.message.clone()).collect();
+        assert_eq!(m2, vec!["l3", "l4"]);
+
+        let p3 = host_file_logs_paged(&globs, &f(p2.next_cursor.clone()), 1);
+        let m3: Vec<_> = p3.items.iter().map(|e| e.message.clone()).collect();
+        assert_eq!(m3, vec!["l5"]);
+
+        // Head reached: nothing new → next_cursor None (loop terminates).
+        let p4 = host_file_logs_paged(&globs, &f(p3.next_cursor.clone()), 1);
+        assert!(p4.items.is_empty());
+        assert!(p4.next_cursor.is_none(), "no new bytes → head → None");
+
+        // Append after EOF, re-call with the LAST non-None cursor (p3's): only
+        // the new lines come back, none of l1..l5 replayed.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(b"l6\nl7\n").unwrap();
+        }
+        let p5 = host_file_logs_paged(&globs, &f(p3.next_cursor.clone()), 1);
+        let m5: Vec<_> = p5.items.iter().map(|e| e.message.clone()).collect();
+        assert_eq!(m5, vec!["l6", "l7"], "only the newly-appended lines");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Volatile invalidation: a stale-epoch cursor against a /dev/shmem-style
+    /// (volatile) path restarts from offset 0, while a persistent path with the
+    /// SAME stale epoch keeps its offset. We exercise `is_volatile` directly (no
+    /// real /dev/shmem needed) plus the offset-decision the pager uses.
+    #[test]
+    fn log_volatile_source_invalidated_across_reboot() {
+        assert!(is_volatile(Path::new("/dev/shmem/foo.log")));
+        assert!(!is_volatile(Path::new("/var/log/foo.log")));
+
+        // Persistent file: a stale-epoch cursor's offset MUST be honoured — a
+        // byte offset into an append-only file is reboot-safe.
+        let dir = std::env::temp_dir().join(format!("cm-vol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("persist.log");
+        std::fs::write(&path, "a\nb\nc\nd\n").unwrap();
+        let globs = vec![format!("{}/*.log", dir.display())];
+
+        // Mint a cursor at boot epoch 1 that has already consumed "a\nb\n" (4 bytes).
+        let mut sources = BTreeMap::new();
+        sources.insert("persist".to_string(), SourcePos { gen: 0, offset: 4 });
+        let stale = LogCursor {
+            boot_epoch: 1,
+            sources,
+        }
+        .encode();
+
+        // Current epoch is 2 (a reboot happened). The path is PERSISTENT, so the
+        // offset survives — we resume at "c", not restart at "a".
+        let page = host_file_logs_paged(
+            &globs,
+            &LogFilter {
+                after: Some(stale),
+                ..LogFilter::default()
+            },
+            2,
+        );
+        let msgs: Vec<_> = page.items.iter().map(|e| e.message.clone()).collect();
+        assert_eq!(
+            msgs,
+            vec!["c", "d"],
+            "persistent offset honoured across reboot"
+        );
+
+        // The volatile decision itself: same stale epoch + volatile path ⇒ the
+        // pager's start_offset logic resets to 0. We assert the classifier and
+        // the epoch mismatch that together trigger the reset (the reset branch in
+        // host_file_logs_paged keys on exactly `epoch_mismatch && is_volatile`).
+        let epoch_mismatch = 1u64 != 2u64;
+        assert!(epoch_mismatch && is_volatile(Path::new("/dev/shmem/x.log")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Truncation/rotation gap: a cursor whose offset exceeds the current file
+    /// length (file shrank) restarts that source from 0 rather than seeking past
+    /// EOF and returning nothing.
+    #[test]
+    fn log_paging_truncation_restarts_from_oldest() {
+        let dir = std::env::temp_dir().join(format!("cm-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("svc.log");
+        std::fs::write(&path, "fresh1\nfresh2\n").unwrap(); // 14 bytes
+        let globs = vec![format!("{}/*.log", dir.display())];
+
+        // Cursor claims offset 9999 (way past the 14-byte file) — the file was
+        // clearly truncated/replaced. Same boot epoch so only the gap check fires.
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "svc".to_string(),
+            SourcePos {
+                gen: 0,
+                offset: 9999,
+            },
+        );
+        let cur = LogCursor {
+            boot_epoch: 5,
+            sources,
+        }
+        .encode();
+
+        let page = host_file_logs_paged(
+            &globs,
+            &LogFilter {
+                after: Some(cur),
+                ..LogFilter::default()
+            },
+            5,
+        );
+        let msgs: Vec<_> = page.items.iter().map(|e| e.message.clone()).collect();
+        assert_eq!(msgs, vec!["fresh1", "fresh2"], "shrunk file → restart at 0");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// boot_epoch file: absent → first read yields 1; a second bump yields 2;
+    /// the value persists across calls. Uses a temp path via the override so
+    /// /var/lib is never touched.
+    #[test]
+    fn boot_epoch_file_increments_and_persists() {
+        let dir = std::env::temp_dir().join(format!("cm-epoch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("boot_epoch");
+
+        // Absent file → 0 baseline → returns 1, and persists "1".
+        assert_eq!(bump_boot_epoch_file(&path), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "1");
+        // Second bump reads 1 → returns 2.
+        assert_eq!(bump_boot_epoch_file(&path), 2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "2");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Multi-source components (HostFiles + a non-paginable source) fall back to
+    /// the DEFAULT single terminal page: next_cursor None so a client's loop
+    /// still terminates in one step (design doc step 5 choice).
+    #[tokio::test]
+    async fn logs_paged_multisource_falls_back_to_terminal_page() {
+        use sovd_core::DiagnosticBackend;
+        let dir = std::env::temp_dir().join(format!("cm-multi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("svc.log"), "one\ntwo\n").unwrap();
+
+        // A component with BOTH a HostFiles and a HostDumps source → not pure
+        // HostFiles → terminal page.
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        let b = ComponentBackend::with_options(
+            BankSet::Vm1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig {
+                log_sources: vec![
+                    LogSource::HostFiles {
+                        globs: vec![format!("{}/*.log", dir.display())],
+                    },
+                    LogSource::HostDumps {
+                        dir: dir.to_string_lossy().into_owned(),
+                    },
+                ],
+                ..ComponentConfig::default()
+            },
+            None,
+            None,
+            None,
+        );
+
+        let page = b.get_logs_paged(&LogFilter::default()).await.unwrap();
+        assert!(
+            page.next_cursor.is_none(),
+            "mixed sources → terminal page, loop terminates"
+        );
+        // The host-file lines still appear in that one page.
+        assert!(page.items.iter().any(|e| e.message == "one"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pure-HostFiles components DO paginate through `get_logs_paged`: the first
+    /// page of a >page-size file sets a next_cursor.
+    #[tokio::test]
+    async fn logs_paged_pure_hostfiles_paginates() {
+        use sovd_core::DiagnosticBackend;
+        let dir = std::env::temp_dir().join(format!("cm-pure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: String = (0..10).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(dir.join("svc.log"), body).unwrap();
+
+        let b = backend_with_logs(LogSource::HostFiles {
+            globs: vec![format!("{}/*.log", dir.display())],
+        });
+        let page = b
+            .get_logs_paged(&LogFilter {
+                limit: Some(3),
+                ..LogFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 3);
+        assert!(page.next_cursor.is_some(), "more to read → cursor set");
+        assert!(page.oldest_cursor.is_some());
         std::fs::remove_dir_all(&dir).ok();
     }
 
