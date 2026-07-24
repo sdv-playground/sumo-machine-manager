@@ -2727,6 +2727,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                             items: Vec::new(),
                             next_cursor: None,
                             oldest_cursor: None,
+                            tip_cursor: None,
                         }
                     }
                 });
@@ -2740,6 +2741,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             items: self.get_logs(filter).await?,
             next_cursor: None,
             oldest_cursor: None,
+            tip_cursor: None,
         })
     }
 
@@ -5513,6 +5515,10 @@ async fn query_log_agent_paged(url: &str, filter: &LogFilter) -> Option<LogPage>
         items,
         next_cursor: paged.next_cursor,
         oldest_cursor: None, // guest journald has no cheap "oldest" handle here
+        // The guest could report a tip (journald `-o export -n0 --show-cursor`),
+        // but /logs/page doesn't surface one yet — guest follow is a rig-time
+        // follow-up. None here means "no tip handle for this source".
+        tip_cursor: None,
     })
 }
 
@@ -5926,10 +5932,29 @@ fn host_file_logs_paged(globs: &[String], filter: &LogFilter, boot_epoch: u64) -
         None
     };
 
+    // tip_cursor = every current source at its CURRENT end-of-file (offset =
+    // length). Polling `after=tip` returns only lines appended after this call —
+    // the FOLLOW resume point. Computed from the live file lengths (not the page
+    // offsets), so it names "now" even when the page stopped short of the end.
+    let mut tip_sources: BTreeMap<String, SourcePos> = BTreeMap::new();
+    for path in resolve_log_files(globs) {
+        let src = source_name(&path);
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        tip_sources.insert(src, SourcePos { gen: 0, offset: len });
+    }
+    let tip_cursor = Some(
+        LogCursor {
+            boot_epoch,
+            sources: tip_sources,
+        }
+        .encode(),
+    );
+
     LogPage {
         items,
         next_cursor,
         oldest_cursor,
+        tip_cursor,
     }
 }
 
@@ -7576,6 +7601,42 @@ mod bank_provider_injection_tests {
         let p5 = host_file_logs_paged(&globs, &f(p3.next_cursor.clone()), 1);
         let m5: Vec<_> = p5.items.iter().map(|e| e.message.clone()).collect();
         assert_eq!(m5, vec!["l6", "l7"], "only the newly-appended lines");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// tip_cursor is a FOLLOW anchor: capture the tip "now", append, then poll
+    /// `after=tip` and get ONLY the lines written after the tip was taken.
+    #[test]
+    fn log_tip_cursor_follows_new_lines() {
+        let dir = std::env::temp_dir().join(format!("cm-tip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("svc.log");
+        std::fs::write(&path, "old1\nold2\n").unwrap();
+        let globs = vec![format!("{}/*.log", dir.display())];
+
+        // Take the tip at "now" — it names the current EOF, and is always set.
+        let p = host_file_logs_paged(&globs, &LogFilter::default(), 1);
+        let tip = p.tip_cursor.clone().expect("tip_cursor is always set for host files");
+
+        // Append after capturing the tip.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"new1\nnew2\n").unwrap();
+        }
+
+        // Poll after=tip → only the post-tip lines, not old1/old2.
+        let follow = LogFilter {
+            after: Some(tip),
+            ..LogFilter::default()
+        };
+        let got: Vec<_> = host_file_logs_paged(&globs, &follow, 1)
+            .items
+            .iter()
+            .map(|e| e.message.clone())
+            .collect();
+        assert_eq!(got, vec!["new1", "new2"], "follow from tip yields only new lines");
 
         std::fs::remove_dir_all(&dir).ok();
     }
