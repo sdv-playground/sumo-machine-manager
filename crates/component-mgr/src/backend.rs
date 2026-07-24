@@ -2704,15 +2704,43 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     globs.extend(g.iter().cloned());
                 }
             }
-            Ok(host_file_logs_paged(&globs, filter, current_boot_epoch()))
-        } else {
-            // Default behaviour (mirrors the trait default): one terminal page.
-            Ok(LogPage {
-                items: self.get_logs(filter).await?,
-                next_cursor: None,
-                oldest_cursor: None,
-            })
+            return Ok(host_file_logs_paged(&globs, filter, current_boot_epoch()));
         }
+
+        // A SOLE GuestAgent source pages via the guest's `/logs/page` (journald
+        // `__CURSOR` — opaque + reboot-safe on its own, so it passes straight
+        // through as our cursor; no host boot_epoch wrapping needed). Only the
+        // single-GuestAgent case: mixing a guest cursor with host offsets or a
+        // dump catalog in one opaque token would be incorrect (same reasoning as
+        // the HostFiles-only gate). An unreachable guest degrades to an empty
+        // terminal page, never a 500.
+        if self.config.log_sources.len() == 1 {
+            if let LogSource::GuestAgent { url } = &self.config.log_sources[0] {
+                return Ok(match query_log_agent_paged(url, filter).await {
+                    Some(page) => page,
+                    None => {
+                        tracing::warn!(
+                            component = %self.entity_info.id, url = %url,
+                            "log-agent /logs/page unreachable — empty terminal page"
+                        );
+                        LogPage {
+                            items: Vec::new(),
+                            next_cursor: None,
+                            oldest_cursor: None,
+                        }
+                    }
+                });
+            }
+        }
+
+        // Everything else (mixed sources, dumps): one terminal page (mirrors the
+        // trait default). A client's "loop until next_cursor is None" terminates
+        // in one step.
+        Ok(LogPage {
+            items: self.get_logs(filter).await?,
+            next_cursor: None,
+            oldest_cursor: None,
+        })
     }
 
     // =====================================================================
@@ -5412,6 +5440,82 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
     Some(entries)
 }
 
+/// The guest log-agent's `GET /logs/page` envelope — the cursor forward-paging
+/// view. Mirrors `log-agent::PagedLogs` by convention (different repo).
+#[derive(serde::Deserialize)]
+struct AgentPagedLogs {
+    items: Vec<AgentLogRecord>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+/// Page the guest's logs via its `/logs/page` (journald `__CURSOR` forward-
+/// paging). `filter.after` is the opaque guest cursor, passed straight through
+/// (journald's cursor is reboot-safe on its own — no host boot_epoch wrapping).
+/// Returns a [`LogPage`] whose `next_cursor` is the guest's, so the host loop
+/// terminates exactly when the guest reports the head. `None` = agent
+/// unreachable / non-200 / unparseable → the caller degrades to an empty page.
+async fn query_log_agent_paged(url: &str, filter: &LogFilter) -> Option<LogPage> {
+    let base_path = match url.strip_prefix("http://").unwrap_or(url).split_once('/') {
+        Some((_, rest)) => format!("/{rest}"),
+        None => String::new(),
+    };
+    let mut qs: Vec<String> = Vec::new();
+    if let Some(n) = filter.tail.or(filter.limit) {
+        qs.push(format!("tail={n}"));
+    }
+    if let Some(s) = &filter.source {
+        qs.push(format!("source={}", qenc(s)));
+    }
+    if let Some(p) = &filter.pattern {
+        qs.push(format!("pattern={}", qenc(p)));
+    }
+    if let Some(p) = filter.priority {
+        qs.push(format!("priority={}", priority_name(p)));
+    }
+    if let Some(c) = &filter.after {
+        qs.push(format!("after={}", qenc(c)));
+    }
+    let target = if qs.is_empty() {
+        format!("{base_path}/logs/page")
+    } else {
+        format!("{base_path}/logs/page?{}", qs.join("&"))
+    };
+
+    // 4 MiB cap matches query_log_agent's read bound — a single page is small.
+    let body = guest_http_get(url, &target, 4 * 1024 * 1024).await?;
+    let paged: AgentPagedLogs = serde_json::from_slice(&body).ok()?;
+
+    let items = paged
+        .items
+        .into_iter()
+        .map(|r| {
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&r.timestamp)
+                .map(|t| t.with_timezone(&Utc))
+                .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH);
+            LogEntry {
+                id: line_log_id(&r.source, timestamp, &r.message),
+                timestamp,
+                priority: priority_from_name(&r.priority),
+                message: r.message,
+                source: Some(r.source),
+                pid: None,
+                fields: None,
+                log_type: None,
+                size: None,
+                status: None,
+                href: None,
+                metadata: None,
+            }
+        })
+        .collect();
+    Some(LogPage {
+        items,
+        next_cursor: paged.next_cursor,
+        oldest_cursor: None, // guest journald has no cheap "oldest" handle here
+    })
+}
+
 /// One entry from the guest log-agent's `GET /files` bulk-data catalog. Field
 /// names are the wire contract, mirrored by convention with `guest-vm-sdk`'s
 /// `log-agent::FileEntry` (different repo — never a git dep), exactly like
@@ -7258,6 +7362,62 @@ mod bank_provider_injection_tests {
         });
         let got = b.get_logs(&LogFilter::default()).await.unwrap();
         assert!(got.is_empty());
+    }
+
+    /// Guest cursor paging: get_logs_paged against a sole GuestAgent proxies the
+    /// agent's `/logs/page`, threading its `__CURSOR` through `next_cursor`. The
+    /// stub serves a page WITH a cursor first, then (given `after=`) an empty
+    /// page with no cursor — so a client's loop terminates. A down agent yields
+    /// an empty terminal page, never a 500.
+    #[tokio::test]
+    async fn logs_guest_agent_cursor_paging() {
+        use sovd_core::DiagnosticBackend;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            // Serve until the listener drops. First call (no after=) → 1 item +
+            // cursor "C1"; a call carrying after=C1 → empty page, no cursor.
+            for conn in listener.incoming() {
+                let mut s = match conn { Ok(s) => s, Err(_) => break };
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let target = req.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("");
+                let body = if target.contains("after=C1") {
+                    r#"{"items":[]}"#.to_string()
+                } else {
+                    r#"{"items":[{"timestamp":"2026-07-18T12:00:00Z","priority":"info","message":"line1","source":"vhealth"}],"next_cursor":"C1"}"#.to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let b = backend_with_logs(LogSource::GuestAgent { url: format!("http://{addr}") });
+
+        // Page 1: one item + a next_cursor.
+        let p1 = b.get_logs_paged(&LogFilter::default()).await.unwrap();
+        assert_eq!(p1.items.len(), 1);
+        assert_eq!(p1.items[0].message, "line1");
+        assert_eq!(p1.next_cursor.as_deref(), Some("C1"));
+
+        // Page 2: feed the cursor back → empty, no next_cursor → loop stops.
+        let f2 = LogFilter {
+            after: p1.next_cursor.clone(),
+            ..LogFilter::default()
+        };
+        let p2 = b.get_logs_paged(&f2).await.unwrap();
+        assert!(p2.items.is_empty());
+        assert!(p2.next_cursor.is_none());
+
+        // Down agent → empty terminal page, not an error.
+        let down = backend_with_logs(LogSource::GuestAgent { url: "http://127.0.0.1:1".into() });
+        let pd = down.get_logs_paged(&LogFilter::default()).await.unwrap();
+        assert!(pd.items.is_empty() && pd.next_cursor.is_none());
     }
 
     /// Stable-id round-trip: an id from `get_logs` re-resolves via `get_log`
