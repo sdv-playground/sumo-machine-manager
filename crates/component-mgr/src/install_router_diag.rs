@@ -354,6 +354,30 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.delete_log(log_id).await
     }
 
+    // Cursor paging + §7.20 bulk-data — delegated to the engine like the other
+    // log reads. Without these forwarders an `app`-type component (which is wired
+    // through this router, e.g. the host-os `supernova`) would silently fall back
+    // to the trait defaults: empty bulk-data categories + a cursor-less /logs.
+    async fn get_logs_paged(&self, filter: &LogFilter) -> BackendResult<LogPage> {
+        self.engine.get_logs_paged(filter).await
+    }
+
+    async fn list_bulk_data_categories(&self) -> BackendResult<Vec<BulkCategory>> {
+        self.engine.list_bulk_data_categories().await
+    }
+
+    async fn list_bulk_data(
+        &self,
+        category: &str,
+        filter: &BulkDataFilter,
+    ) -> BackendResult<Vec<BulkDataItem>> {
+        self.engine.list_bulk_data(category, filter).await
+    }
+
+    async fn get_bulk_data(&self, category: &str, id: &str) -> BackendResult<BulkDataDownload> {
+        self.engine.get_bulk_data(category, id).await
+    }
+
     async fn list_outputs(&self) -> BackendResult<Vec<OutputInfo>> {
         self.engine.list_outputs().await
     }
