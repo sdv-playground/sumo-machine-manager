@@ -567,12 +567,13 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 logs: !config.log_sources.is_empty(),
                 operations: false,
                 // §7.20: the `/bulk-data` routes are gated on this. We expose a
-                // `logs` bulk-data category only for HostFiles sources (see
-                // list_bulk_data_categories), so mirror that condition exactly.
-                bulk_data: config
-                    .log_sources
-                    .iter()
-                    .any(|s| matches!(s, LogSource::HostFiles { .. })),
+                // `logs` bulk-data category when the component has downloadable
+                // log FILES — either host-local (HostFiles) or a guest VM whose
+                // log-agent serves `/files` (GuestAgent). Mirror
+                // list_bulk_data_categories' condition exactly.
+                bulk_data: config.log_sources.iter().any(|s| {
+                    matches!(s, LogSource::HostFiles { .. } | LogSource::GuestAgent { .. })
+                }),
             },
             bank_set,
             bank_spec,
@@ -2722,26 +2723,27 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     // bulk-data category whose ITEMS are the individual host log files, each
     // downloaded whole via `GET .../bulk-data/logs/{id}`.
     //
-    // Scope (this step): HOST-FILE sources only. GuestAgent bulk-data (a guest
-    // log export) and HostDumps (which already carries its own `dump:host:*`
-    // id scheme under the §7.21 log routes) are deliberately NOT surfaced as
-    // bulk-data categories here — that is a later step. We override only the
-    // three bulk-data trait methods; get_logs / get_logs_paged / the dump
-    // routes are untouched.
+    // Scope: HOST-FILE sources (host-local log files) AND GUEST sources (a
+    // guest VM's log files, proxied from its in-guest log-agent's `/files`
+    // bulk-data endpoint) both contribute items to the `logs` category. Guest
+    // and host items live in the SAME category, distinguished by their item-id
+    // scheme (see `guest_bulk_id` / the host `b64url(path)` scheme). HostDumps
+    // (which carries its own `dump:host:*` id scheme under the §7.21 log routes)
+    // is still NOT a bulk-data category here. We override only the three
+    // bulk-data trait methods; get_logs / get_logs_paged / the dump routes are
+    // untouched.
     // =====================================================================
 
     /// `GET /components/{id}/bulk-data` — the categories this component exposes.
-    /// A component with at least one [`LogSource::HostFiles`] source offers a
-    /// single `logs` category (its host log files). Everything else falls back
-    /// to the trait default (empty) — we do NOT invent categories for
-    /// GuestAgent/HostDumps here (see the scope note above).
+    /// A component with at least one [`LogSource::HostFiles`] OR
+    /// [`LogSource::GuestAgent`] source offers a single `logs` category (its
+    /// downloadable log files — host-local and/or guest). HostDumps-only
+    /// components fall back to the trait default (empty).
     async fn list_bulk_data_categories(&self) -> BackendResult<Vec<BulkCategory>> {
-        let has_host_files = self
-            .config
-            .log_sources
-            .iter()
-            .any(|s| matches!(s, LogSource::HostFiles { .. }));
-        if has_host_files {
+        let has_files = self.config.log_sources.iter().any(|s| {
+            matches!(s, LogSource::HostFiles { .. } | LogSource::GuestAgent { .. })
+        });
+        if has_files {
             Ok(vec![BulkCategory {
                 name: "logs".to_string(),
             }])
@@ -2755,27 +2757,26 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// here; any other name → `EntityNotFound` (the trait-default contract the
     /// api layer maps to 404).
     ///
-    /// Each item is one host log file resolved from every `HostFiles` source's
-    /// globs. The item `id` is the base64url of the file's FULL path bytes —
-    /// stateless and stable (no server-side bookkeeping): [`get_bulk_data`]
-    /// decodes it straight back to the path. (The path is re-validated against
-    /// the live glob set on download, so encoding the full path does not widen
-    /// the read surface — see the security check there.)
+    /// Each item is one downloadable log file. HOST items: one file resolved
+    /// from every `HostFiles` source's globs, id = base64url of the file's FULL
+    /// path bytes (stateless — [`get_bulk_data`] decodes it straight back;
+    /// re-validated against the live glob set on download). GUEST items: one
+    /// file from each `GuestAgent`'s `/files` catalog, id = [`guest_bulk_id`]
+    /// (namespaced so download can route it back to that agent). A down guest
+    /// contributes zero items (never an error) — see the warn-and-skip below.
     async fn list_bulk_data(
         &self,
         category: &str,
         filter: &BulkDataFilter,
     ) -> BackendResult<Vec<BulkDataItem>> {
         // `logs` is the only category, and it exists only when the component
-        // actually has a HostFiles source — otherwise it is as unknown as any
-        // other name (a HostDumps-only component must 404 here, matching
+        // has a HostFiles OR GuestAgent source — otherwise it is as unknown as
+        // any other name (a HostDumps-only component must 404 here, matching
         // list_bulk_data_categories which returns []).
-        let has_host_files = self
-            .config
-            .log_sources
-            .iter()
-            .any(|s| matches!(s, LogSource::HostFiles { .. }));
-        if category != "logs" || !has_host_files {
+        let has_files = self.config.log_sources.iter().any(|s| {
+            matches!(s, LogSource::HostFiles { .. } | LogSource::GuestAgent { .. })
+        });
+        if category != "logs" || !has_files {
             return Err(BackendError::EntityNotFound(format!(
                 "bulk-data category: {category}"
             )));
@@ -2786,7 +2787,50 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // so the catalog and the line views agree on what "the logs" are).
         let mut items: Vec<BulkDataItem> = Vec::new();
         for source in &self.config.log_sources {
-            if let LogSource::HostFiles { globs } = source {
+            match source {
+            LogSource::GuestAgent { url } => {
+                // Proxy the guest's `/files` catalog. A down/unreachable guest
+                // contributes ZERO items (warn + skip) — a component with a
+                // down VM must still answer 200 with whatever else it has, never
+                // a 500 (mirrors get_logs' degrade-gracefully contract).
+                let files = match fetch_guest_files(url).await {
+                    Some(f) => f,
+                    None => {
+                        tracing::warn!(
+                            component = %self.entity_info.id, url = %url,
+                            "log-agent /files unreachable — skipping guest bulk-data"
+                        );
+                        continue;
+                    }
+                };
+                for f in files {
+                    // Filter on the guest file's `modified` (epoch secs) → UTC,
+                    // matching the host-file mtime filter. A modified we can't
+                    // represent is treated as the epoch (kept unless filtered).
+                    let created = chrono::DateTime::<Utc>::from_timestamp(f.modified as i64, 0)
+                        .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH);
+                    if let Some(after) = filter.created_after {
+                        if created <= after {
+                            continue;
+                        }
+                    }
+                    if let Some(before) = filter.created_before {
+                        if created >= before {
+                            continue;
+                        }
+                    }
+                    items.push(BulkDataItem {
+                        // Namespaced id carrying (url, guest file id) so
+                        // get_bulk_data routes the download back to this agent.
+                        id: guest_bulk_id(url, &f.id),
+                        size: f.size,
+                        created,
+                        mime: "text/plain".to_string(),
+                        source: Some(f.source),
+                    });
+                }
+            }
+            LogSource::HostFiles { globs } => {
                 for path in resolve_log_files(globs) {
                     // The id is base64url of the path's UTF-8 text, so download
                     // can decode it straight back (no unsafe OS-string round-trip,
@@ -2821,6 +2865,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     });
                 }
             }
+            // HostDumps carries its own §7.21 `dump:host:*` catalog — not a
+            // bulk-data source here (see the scope note above).
+            LogSource::HostDumps { .. } => {}
+            }
         }
 
         // Deterministic order so listings are stable: by created, then id.
@@ -2828,8 +2876,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         Ok(items)
     }
 
-    /// `GET /components/{id}/bulk-data/logs/{id}` — download one host log file
-    /// whole. Returns the bytes inline ([`BulkDataDownload::Inline`]).
+    /// `GET /components/{id}/bulk-data/logs/{id}` — download one log file whole.
+    /// Returns the bytes inline ([`BulkDataDownload::Inline`]). Routes by id
+    /// scheme: a `guest:` id (see [`guest_bulk_id`]) is proxied to that guest's
+    /// log-agent; anything else is a host-file id (bare base64url path).
     ///
     /// The whole point of bulk-data is "get ALL logs", so — unlike the 64 KiB
     /// tail reader — we do NOT truncate to a small window. We do cap the read at
@@ -2839,17 +2889,54 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// `202`/`307` via [`BulkDataDownload::Async`]/`Redirect` and stream it
     /// out-of-band instead of truncating — not implemented in this step.)
     async fn get_bulk_data(&self, category: &str, id: &str) -> BackendResult<BulkDataDownload> {
-        /// OOM guard for a single inline bulk download. 32 MiB comfortably holds
-        /// a rotated log file whole while bounding a single response.
-        const MAX_BULK_BYTES: u64 = 32 * 1024 * 1024;
-
         if category != "logs" {
             return Err(BackendError::EntityNotFound(format!(
                 "bulk-data category: {category}"
             )));
         }
 
-        // Decode the id back to a path. The id is base64url of the path's UTF-8
+        // GUEST tier: a `guest:<b64url(url)>:<guest_id>` id names a file behind
+        // one of this component's GuestAgent sources. Route it back to that
+        // agent and proxy the download.
+        if let Some((url, guest_id)) = parse_guest_bulk_id(id) {
+            // SECURITY / defense-in-depth (mandatory): the guest agent ALSO
+            // guards its own /files/{id} allow-list, but the HOST must never
+            // proxy an id it didn't itself just advertise. Two checks:
+            //   1. the url must be one of THIS component's live GuestAgent
+            //      sources — a crafted id can't make us connect anywhere else;
+            //   2. re-list that agent's /files and require guest_id to be in the
+            //      set right now — so we only proxy a file the agent currently
+            //      offers. Either failing is indistinguishable from "no such
+            //      item" → EntityNotFound.
+            let url_is_ours = self
+                .config
+                .log_sources
+                .iter()
+                .any(|s| matches!(s, LogSource::GuestAgent { url: u } if u == &url));
+            if !url_is_ours {
+                return Err(BackendError::EntityNotFound(format!("bulk-data item: {id}")));
+            }
+            // Re-validate against the live guest catalog. A down guest (None) or
+            // an id no longer present → 404 (a down guest never yields a 500).
+            let advertised = fetch_guest_files(&url)
+                .await
+                .map(|files| files.iter().any(|f| f.id == guest_id))
+                .unwrap_or(false);
+            if !advertised {
+                return Err(BackendError::EntityNotFound(format!("bulk-data item: {id}")));
+            }
+            // Proxy the download. An unreachable agent at THIS point (raced with
+            // the re-list) is again a 404, not a 500.
+            let bytes = fetch_guest_file(&url, &guest_id)
+                .await
+                .ok_or_else(|| BackendError::EntityNotFound(format!("bulk-data item: {id}")))?;
+            return Ok(BulkDataDownload::Inline {
+                mime: "text/plain".to_string(),
+                bytes,
+            });
+        }
+
+        // HOST tier: decode the id back to a path. The id is base64url of the path's UTF-8
         // text (see list_bulk_data); a malformed id, or bytes that aren't valid
         // UTF-8, can't name one of our log files → 404.
         let path_str = b64url_decode(id)
@@ -5325,6 +5412,92 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
     Some(entries)
 }
 
+/// One entry from the guest log-agent's `GET /files` bulk-data catalog. Field
+/// names are the wire contract, mirrored by convention with `guest-vm-sdk`'s
+/// `log-agent::FileEntry` (different repo — never a git dep), exactly like
+/// [`AgentLogRecord`] mirrors its `LogRecord`.
+#[derive(serde::Deserialize)]
+struct GuestFileRecord {
+    /// Opaque guest-side id: the agent's base64url of the file's absolute path.
+    /// We treat it as opaque and hand it straight back on download.
+    id: String,
+    /// Basename (human label). Part of the wire mirror; the host derives its
+    /// item `source` from `source` (the stem), not this, so it's carried for
+    /// contract fidelity but not otherwise consumed.
+    #[allow(dead_code)]
+    name: String,
+    /// File size in bytes.
+    size: u64,
+    /// Source label (file stem).
+    source: String,
+    /// Last-modified time, epoch seconds — the key we apply the bulk-data
+    /// `created-before`/`created-after` filter against.
+    modified: u64,
+}
+
+/// Hand-rolled HTTP/1.1 `GET {url}{target}` over tokio, returning the raw
+/// response body bytes iff the status is 200 (same transport shape as
+/// [`query_log_agent`]; no HTTP-client crate in this tree). `None` =
+/// unreachable / non-200 / oversized — the caller logs and degrades. Body is
+/// capped at `cap` bytes via `take()`. Byte-oriented (not UTF-8) so it works
+/// for both the JSON catalog and octet-stream file downloads.
+async fn guest_http_get(url: &str, target: &str, cap: u64) -> Option<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let deadline = std::time::Duration::from_secs(5);
+    let hostport = url.strip_prefix("http://").unwrap_or(url);
+    // A base path in the url (e.g. http://host:9300/base) prefixes the target.
+    let (hostport, base_path) = match hostport.split_once('/') {
+        Some((hp, rest)) => (hp, format!("/{rest}")),
+        None => (hostport, String::new()),
+    };
+    let full_target = format!("{base_path}{target}");
+
+    let mut stream = tokio::time::timeout(deadline, TcpStream::connect(hostport))
+        .await
+        .ok()?
+        .ok()?;
+    let request =
+        format!("GET {full_target} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n");
+    tokio::time::timeout(deadline, stream.write_all(request.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
+    let mut buf = Vec::with_capacity(64 * 1024);
+    tokio::time::timeout(
+        deadline,
+        // +1 KiB headroom for the status line + headers before the body.
+        (&mut stream).take(cap + 1024).read_to_end(&mut buf),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    // Split head/body on the raw CRLFCRLF (body may be non-UTF-8 octets).
+    let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = &buf[..sep];
+    let body = buf[sep + 4..].to_vec();
+    if !head.starts_with(b"HTTP/1.1 200") && !head.starts_with(b"HTTP/1.0 200") {
+        return None;
+    }
+    Some(body)
+}
+
+/// `GET {url}/files` — the guest log-agent's bulk-data catalog. `None` =
+/// unreachable/bad response (caller logs + contributes zero items). JSON body
+/// capped at 4 MiB (a catalog is small).
+async fn fetch_guest_files(url: &str) -> Option<Vec<GuestFileRecord>> {
+    let body = guest_http_get(url, "/files", 4 * 1024 * 1024).await?;
+    serde_json::from_slice(&body).ok()
+}
+
+/// `GET {url}/files/{id}` — download one guest log file whole. `None` =
+/// unreachable/bad response. Bytes capped at [`MAX_BULK_BYTES`] (the guest ALSO
+/// caps its read); a larger file arrives truncated, matching the host-file path.
+async fn fetch_guest_file(url: &str, guest_id: &str) -> Option<Vec<u8>> {
+    guest_http_get(url, &format!("/files/{guest_id}"), MAX_BULK_BYTES).await
+}
+
 // ---------------------------------------------------------------------------
 // Reboot-safe log pagination — HOST-FILE tier (tasks/log-retrieval-design.md)
 //
@@ -5867,6 +6040,12 @@ fn tail_file_lines(path: &std::path::Path, cap: u64) -> std::io::Result<Vec<Stri
 // fetch time, so the id can't be used to escape that dir (path-traversal safe).
 // ---------------------------------------------------------------------------
 
+/// OOM guard for a single inline bulk download (host file OR proxied guest
+/// file). 32 MiB comfortably holds a rotated log file whole while bounding a
+/// single response; a larger file is served truncated to this cap. Matches the
+/// guest agent's `FILE_DOWNLOAD_CAP` so the two halves agree.
+const MAX_BULK_BYTES: u64 = 32 * 1024 * 1024;
+
 fn b64url(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -5895,6 +6074,45 @@ fn line_log_id(source: &str, ts: chrono::DateTime<Utc>, message: &str) -> String
 /// Id for a host dump file — encodes the bare filename (dir is config-supplied).
 fn dump_log_id(file_name: &str) -> String {
     format!("dump:host:{}", b64url(file_name.as_bytes()))
+}
+
+// ---------------------------------------------------------------------------
+// §7.20 bulk-data item id — GUEST tier.
+//
+// A guest log FILE reachable via a component's `GuestAgent` source is exposed
+// as a `logs` bulk-data ITEM. Its item id must be STATELESS + fully decodable
+// so `get_bulk_data` can route the download back to the right agent WITHOUT a
+// server-side map — carrying BOTH which guest (the agent url) and which file
+// (the guest's opaque /files id). Scheme:
+//
+//   guest:<b64url(url)>:<guest_file_id>
+//
+// `guest:` is a fresh namespace (host-file items keep their bare `b64url(path)`
+// id, unchanged — a host id never contains a `:`, so the two never collide and
+// existing host-file behaviour + tests are preserved). The url is base64url'd
+// so it can't introduce a stray `:`; the guest id is already base64url (no `:`)
+// so it needs no wrapping and the split is unambiguous on the LAST-but-one `:`.
+// ---------------------------------------------------------------------------
+
+/// Build the guest-tier bulk-data item id (see the scheme comment above).
+fn guest_bulk_id(url: &str, guest_file_id: &str) -> String {
+    format!("guest:{}:{}", b64url(url.as_bytes()), guest_file_id)
+}
+
+/// Decode a `guest:<b64url(url)>:<guest_file_id>` item id back to
+/// `(url, guest_file_id)`. `None` for anything that isn't this scheme (a
+/// host-file id — bare `b64url(path)`, no `guest:` prefix — falls through here
+/// so `get_bulk_data` routes it to the existing host path).
+fn parse_guest_bulk_id(id: &str) -> Option<(String, String)> {
+    let rest = id.strip_prefix("guest:")?;
+    // `<b64url(url)>:<guest_file_id>` — the guest id is base64url (no `:`), so
+    // the FIRST `:` cleanly separates the two halves.
+    let (url_b64, guest_file_id) = rest.split_once(':')?;
+    let url = String::from_utf8(b64url_decode(url_b64)?).ok()?;
+    if url.is_empty() || guest_file_id.is_empty() {
+        return None;
+    }
+    Some((url, guest_file_id.to_string()))
 }
 
 /// A parsed §7.21 log id — tells the backend how to route get/content/delete.
@@ -7626,6 +7844,142 @@ mod bank_provider_injection_tests {
         assert!(b.list_bulk_data_categories().await.unwrap().is_empty());
         assert!(matches!(
             b.list_bulk_data("logs", &BulkDataFilter::default()).await,
+            Err(BackendError::EntityNotFound(_))
+        ));
+    }
+
+    // =====================================================================
+    // SOVD §7.20 bulk-data — GUEST tier (guest log-agent /files proxy).
+    // =====================================================================
+
+    /// The guest-namespaced bulk-data item id round-trips (encode → decode →
+    /// route decision) WITHOUT any live agent, and does NOT collide with the
+    /// host-file id scheme (bare base64url path, no `guest:` prefix).
+    #[test]
+    fn guest_bulk_id_round_trips_and_is_distinct() {
+        let url = "http://10.0.101.2:9300";
+        let guest_id = b64url(b"/dev/shmem/vhealth.log"); // an opaque guest id
+        let id = guest_bulk_id(url, &guest_id);
+        assert!(id.starts_with("guest:"));
+
+        // Decodes straight back to (url, guest_id).
+        let (u, g) = parse_guest_bulk_id(&id).expect("guest id must parse");
+        assert_eq!(u, url);
+        assert_eq!(g, guest_id);
+
+        // A host-file id (bare base64url path — the unchanged scheme) is NOT
+        // parsed as a guest id, so get_bulk_data routes it to the host path.
+        let host_id = b64url(b"/var/log/supernova.log");
+        assert!(parse_guest_bulk_id(&host_id).is_none());
+        // And the host id still round-trips to its path (scheme unchanged).
+        assert_eq!(
+            String::from_utf8(b64url_decode(&host_id).unwrap()).unwrap(),
+            "/var/log/supernova.log"
+        );
+
+        // Malformed guest ids are rejected (no panic).
+        assert!(parse_guest_bulk_id("guest:not-base64!:x").is_none());
+        assert!(parse_guest_bulk_id("guest:").is_none());
+        assert!(parse_guest_bulk_id(&format!("guest:{}:", b64url(url.as_bytes()))).is_none());
+    }
+
+    /// A GuestAgent component exposes the `logs` bulk-data category; its
+    /// `/files` catalog lists as items (guest-namespaced ids), and downloading
+    /// one proxies the agent's `/files/{id}` bytes. Uses a canned stub agent.
+    #[tokio::test]
+    async fn bulk_data_guest_agent_list_and_download() {
+        use sovd_core::DiagnosticBackend;
+        // Stub agent: /files → one file; /files/<gid> → its bytes.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gid = "Zm9vLmxvZw"; // opaque guest id (base64url, no `:`)
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            // Serve every connection the client makes. get_bulk_data lists /files
+            // TWICE (once in list_bulk_data, once as the defense-in-depth re-list)
+            // and then downloads /files/<gid> — so this test drives 3 requests, and
+            // a fixed `.take(N)` under-counts. Loop until the listener is dropped.
+            for conn in listener.incoming() {
+                let mut s = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 1024];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let target = req.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("");
+                let (ctype, body): (&str, Vec<u8>) = if target == "/files" {
+                    let json = format!(
+                        r#"[{{"id":"{gid}","name":"foo.log","size":9,"source":"foo","modified":1784562613}}]"#
+                    );
+                    ("application/json", json.into_bytes())
+                } else {
+                    // /files/<gid> → the raw bytes.
+                    ("application/octet-stream", b"log bytes".to_vec())
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.write_all(&body);
+            }
+        });
+
+        let url = format!("http://{addr}");
+        let b = backend_with_logs(LogSource::GuestAgent { url: url.clone() });
+
+        // Capability + category are now on for a GuestAgent component.
+        assert!(b.capabilities().bulk_data);
+        assert_eq!(b.list_bulk_data_categories().await.unwrap()[0].name, "logs");
+
+        // Items: the one guest file, guest-namespaced id, mapped metadata.
+        let items = b
+            .list_bulk_data("logs", &BulkDataFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].size, 9);
+        assert_eq!(items[0].source.as_deref(), Some("foo"));
+        assert_eq!(parse_guest_bulk_id(&items[0].id).unwrap(), (url.clone(), gid.to_string()));
+
+        // Download by that id → proxied bytes inline.
+        match b.get_bulk_data("logs", &items[0].id).await.unwrap() {
+            BulkDataDownload::Inline { mime, bytes } => {
+                assert_eq!(mime, "text/plain");
+                assert_eq!(bytes, b"log bytes");
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
+    }
+
+    /// A down/unreachable guest agent contributes ZERO bulk-data items (never a
+    /// 500): list is Ok(empty), and downloading any guest id from it is 404.
+    #[tokio::test]
+    async fn bulk_data_guest_agent_degrades_when_down() {
+        use sovd_core::DiagnosticBackend;
+        let url = "http://127.0.0.1:1".to_string(); // nothing listening
+        let b = backend_with_logs(LogSource::GuestAgent { url: url.clone() });
+
+        // Down guest → empty list, still Ok (200 at the route).
+        let items = b
+            .list_bulk_data("logs", &BulkDataFilter::default())
+            .await
+            .unwrap();
+        assert!(items.is_empty());
+
+        // A well-formed guest id whose agent is down → 404, not 500.
+        let id = guest_bulk_id(&url, "Zm9vLmxvZw");
+        assert!(matches!(
+            b.get_bulk_data("logs", &id).await,
+            Err(BackendError::EntityNotFound(_))
+        ));
+
+        // A guest id for an agent url that is NOT one of ours → 404 (the
+        // url-is-ours guard, before any network call).
+        let foreign = guest_bulk_id("http://10.9.9.9:9300", "Zm9vLmxvZw");
+        assert!(matches!(
+            b.get_bulk_data("logs", &foreign).await,
             Err(BackendError::EntityNotFound(_))
         ));
     }
