@@ -324,6 +324,7 @@ async fn main() {
             log_agent_url: None,
             host_log_globs: None,
             host_dump_dir: None,
+            test_agent_url: None,
         },
         ComponentSpec {
             id: "vm1".into(),
@@ -341,6 +342,7 @@ async fn main() {
             log_agent_url: None,
             host_log_globs: None,
             host_dump_dir: None,
+            test_agent_url: None,
         },
         ComponentSpec {
             id: "vm2".into(),
@@ -358,6 +360,7 @@ async fn main() {
             log_agent_url: None,
             host_log_globs: None,
             host_dump_dir: None,
+            test_agent_url: None,
         },
         ComponentSpec {
             id: "hsm".into(),
@@ -375,6 +378,7 @@ async fn main() {
             log_agent_url: None,
             host_log_globs: None,
             host_dump_dir: None,
+            test_agent_url: None,
         },
     ];
 

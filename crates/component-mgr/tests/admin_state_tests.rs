@@ -137,6 +137,7 @@ fn hsm_backend(nv: &SharedNv) -> ComponentBackend<MemBlockDevice> {
             single_bank: true,
             entity_type: "hsm".into(),
             log_sources: Vec::new(),
+            test_agent_url: None,
         },
         None,
         None,

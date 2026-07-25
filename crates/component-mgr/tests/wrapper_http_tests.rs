@@ -67,6 +67,7 @@ fn make_wrapper_router() -> axum::Router {
                 single_bank: true,
                 entity_type: "hsm".into(),
                 log_sources: Vec::new(),
+                test_agent_url: None,
             },
         ),
     ];

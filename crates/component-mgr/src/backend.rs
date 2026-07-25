@@ -291,6 +291,12 @@ pub struct ComponentConfig {
     /// text files + a dump directory), each contributing entries to one
     /// merged, timestamp-sorted list.
     pub log_sources: Vec<LogSource>,
+    /// §7.15 scripts (developer-registered TESTS): the in-guest test-agent's base
+    /// URL, e.g. `http://10.0.101.2:9310`. `Some` → `list_scripts` proxies its
+    /// `/tests` discovery; `None` → the component exposes no scripts. Guest-VM
+    /// only today (tests aren't a host/per-component concern yet). See
+    /// `tasks/sovd-tests-as-operations-design.md`.
+    pub test_agent_url: Option<String>,
 }
 
 impl Default for ComponentConfig {
@@ -300,6 +306,7 @@ impl Default for ComponentConfig {
             single_bank: false,
             entity_type: "vm".to_string(),
             log_sources: Vec::new(),
+            test_agent_url: None,
         }
     }
 }
@@ -3010,6 +3017,27 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         })
     }
 
+    /// SOVD §7.15 `GET /components/{id}/scripts` — the registered TESTS a guest
+    /// exposes, proxied from its in-guest test-agent `/tests`. Only when a
+    /// `test_agent_url` is configured (guest-VM only today); otherwise none. An
+    /// unreachable agent degrades to an empty list (warn), never a 500 — same
+    /// discipline as the log proxy.
+    async fn list_scripts(&self) -> BackendResult<Vec<ScriptInfo>> {
+        let Some(url) = &self.config.test_agent_url else {
+            return Ok(vec![]);
+        };
+        match query_test_agent(url).await {
+            Some(scripts) => Ok(scripts),
+            None => {
+                tracing::warn!(
+                    component = %self.entity_info.id, url = %url,
+                    "test-agent /tests unreachable — empty scripts list"
+                );
+                Ok(vec![])
+            }
+        }
+    }
+
     /// SOVD §7.21 `GET /components/{id}/logs/{id}` — one entry's metadata.
     /// The id is self-describing (`<kind>:<source>:<key>`); we re-derive the
     /// entry from its backing source rather than hold server state.
@@ -5608,6 +5636,35 @@ async fn fetch_guest_file(url: &str, guest_id: &str) -> Option<Vec<u8>> {
     guest_http_get(url, &format!("/files/{guest_id}"), MAX_BULK_BYTES).await
 }
 
+/// One registered test from the guest test-agent's `GET /tests` discovery. Wire
+/// shape mirrored by hand from `test-agent::TestSummary` (guest-vm-sdk, different
+/// repo — never a git dep), like [`GuestFileRecord`] / [`AgentLogRecord`].
+#[derive(serde::Deserialize)]
+struct AgentTestRecord {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// `GET {url}/tests` — the guest's registered tests (SOVD §7.15 scripts source).
+/// `None` = test-agent unreachable / bad response → the caller degrades to an
+/// empty scripts list. Small JSON; 256 KiB cap is ample.
+async fn query_test_agent(url: &str) -> Option<Vec<ScriptInfo>> {
+    let body = guest_http_get(url, "/tests", 256 * 1024).await?;
+    let recs: Vec<AgentTestRecord> = serde_json::from_slice(&body).ok()?;
+    Some(
+        recs.into_iter()
+            .map(|r| ScriptInfo {
+                id: r.id,
+                title: r.title,
+                tags: r.tags,
+            })
+            .collect(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Reboot-safe log pagination — HOST-FILE tier (tasks/log-retrieval-design.md)
 //
@@ -7176,6 +7233,7 @@ mod bank_provider_injection_tests {
                 single_bank: true,
                 entity_type: "hsm".to_string(),
                 log_sources: Vec::new(),
+                test_agent_url: None,
             },
             None,
             None,
@@ -7311,6 +7369,66 @@ mod bank_provider_injection_tests {
             None,
             None,
         )
+    }
+
+    fn backend_with_test_agent(url: &str) -> ComponentBackend<MemBlockDevice> {
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        ComponentBackend::with_options(
+            BankSet::Vm1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig {
+                test_agent_url: Some(url.to_string()),
+                ..ComponentConfig::default()
+            },
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// §7.15 scripts: list_scripts proxies the guest test-agent's /tests. A stub
+    /// agent returns two registered tests; a down agent degrades to [] (not 500).
+    #[tokio::test]
+    async fn scripts_proxy_guest_test_agent_and_degrade() {
+        use sovd_core::DiagnosticBackend;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for conn in listener.incoming() {
+                let mut s = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let body = r#"[{"id":"guest-hal.smoke","title":"Smoke","tags":["smoke"]},{"id":"guest-hal.slow","tags":["slow"]}]"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let b = backend_with_test_agent(&format!("http://{addr}"));
+        let scripts = b.list_scripts().await.unwrap();
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(scripts[0].id, "guest-hal.smoke");
+        assert_eq!(scripts[0].title.as_deref(), Some("Smoke"));
+        assert_eq!(scripts[0].tags, ["smoke"]);
+        assert_eq!(scripts[1].id, "guest-hal.slow");
+
+        // No test_agent_url configured → empty (not an error).
+        let none = backend_with_logs(LogSource::HostFiles { globs: vec![] });
+        assert!(none.list_scripts().await.unwrap().is_empty());
+
+        // Configured but unreachable → empty terminal, never a 500.
+        let down = backend_with_test_agent("http://127.0.0.1:1");
+        assert!(down.list_scripts().await.unwrap().is_empty());
     }
 
     /// §7.21 HostFiles source: bounded tails of matching files with

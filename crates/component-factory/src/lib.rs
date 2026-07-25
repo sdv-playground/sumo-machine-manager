@@ -94,6 +94,13 @@ pub struct ComponentSpec {
     /// retrievable dump artifact (crash dump, trace). Additive with the above.
     #[serde(default)]
     pub host_dump_dir: Option<String>,
+
+    /// §7.15 scripts (developer-registered TESTS): the in-guest test-agent base
+    /// URL, e.g. `http://10.0.101.2:9310` (the guest-hal layer runs the agent).
+    /// `Some` → `capabilities` expose a `scripts` collection proxied from its
+    /// `/tests`. Guest-VM only today. See tasks/sovd-tests-as-operations-design.md.
+    #[serde(default)]
+    pub test_agent_url: Option<String>,
 }
 
 impl ComponentSpec {
@@ -309,6 +316,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 supports_rollback: spec.rollback,
                 single_bank: false,
                 log_sources: spec.log_sources(),
+                test_agent_url: spec.test_agent_url.clone(),
             };
             let app_images_dir = spec.storage_path.clone().or_else(|| spec.base_path.clone());
             let mut backend = ComponentBackend::with_options(
@@ -394,6 +402,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 supports_rollback: spec.rollback,
                 single_bank: spec.single_bank,
                 log_sources: spec.log_sources(),
+                test_agent_url: spec.test_agent_url.clone(),
             };
 
             let images_dir = spec.storage_path.clone();
