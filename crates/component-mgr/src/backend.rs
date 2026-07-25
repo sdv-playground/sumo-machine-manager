@@ -13,6 +13,7 @@
 /// - SUIT-based firmware flash with A/B banking
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 // `OnceLock` caches the process-wide boot_epoch (read+bumped once at first
 // paged-log request); `Path`/`BTreeMap` back the reboot-safe log cursor below.
@@ -460,6 +461,18 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// shared NV admin-state record (`NvAdminState`), reached through
     /// [`Self::nv`].
     deactivator: Option<Arc<dyn machine_mgr::Deactivator>>,
+    /// SOVD §7.15 script (test) executions, keyed by exec_id. A guest test-agent
+    /// run is SYNCHRONOUS — `start_script` proxies `POST /tests/{id}/run`, which
+    /// blocks until the test finishes, so the [`ScriptExecution`] stored here is
+    /// already terminal (`status = Done`). `get_script_execution` /
+    /// `list_script_executions` read it back for the SOVD 202+poll surface.
+    /// In-memory only (like the SOVDd operation-executions cache); a restart
+    /// drops history — acceptable, a test run is re-runnable.
+    script_executions: Mutex<HashMap<String, ScriptExecution>>,
+    /// Monotonic counter feeding the exec_id (`<script_id>-<n>`). No `rand` in
+    /// this cross-QNX tree, so a per-backend atomic gives a stable, unique-per-
+    /// process id without an external dep.
+    script_exec_seq: AtomicU64,
 }
 
 impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
@@ -614,6 +627,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             node_coordinator: None,
             post_provision_reload: None,
             deactivator: None,
+            script_executions: Mutex::new(HashMap::new()),
+            script_exec_seq: AtomicU64::new(1),
         };
         // Populate DID cache from NV once at construction time. After this,
         // SOVD reads of NV-backed DIDs hit RAM only — see refresh_did_cache.
@@ -883,6 +898,19 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         let v = *id;
         *id += 1;
         v.to_string()
+    }
+
+    /// Current log tip cursor ("now") for the §7.15 execution log-cursor bracket.
+    /// Reuses the SAME logs path the component already exposes — one
+    /// `get_logs_paged(&LogFilter::default())` read, returning its
+    /// `tip_cursor`. `None` when the source can't name its tip (a GuestAgent
+    /// journald cursor the agent didn't report, a mixed/dump source, or no log
+    /// source at all) — the bracket is best-effort and stays `None` then.
+    async fn current_log_tip(&self) -> Option<String> {
+        self.get_logs_paged(&LogFilter::default())
+            .await
+            .ok()
+            .and_then(|page| page.tip_cursor)
     }
 
     /// Re-read every NV-backed DID and atomically replace the in-memory
@@ -3036,6 +3064,100 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 Ok(vec![])
             }
         }
+    }
+
+    /// SOVD §7.15 `POST /components/{id}/scripts/{script}/executions` — run a
+    /// registered test. The guest test-agent `POST /tests/{id}/run` is
+    /// SYNCHRONOUS: it runs the test to completion (bounded by the entry's
+    /// `timeout_ms`) and answers with a `RunResult`, so by the time this proxy
+    /// call returns the run is already finished. We therefore build a terminal
+    /// (`status = Done`) [`ScriptExecution`], store it under a generated exec_id
+    /// (`<script_id>-<n>`, monotonic per process — no `rand` in this QNX tree),
+    /// and return it. SOVDd answers 202+Location regardless; a follow-up GET
+    /// reads the stored terminal result.
+    ///
+    /// Log-cursor BRACKET: we snapshot the component's log tip BEFORE and AFTER
+    /// the run via the same paged-logs path the component already exposes
+    /// (`get_logs_paged(&LogFilter::default()).tip_cursor`), so a tester can page
+    /// exactly this run's window. `None` bracket = the tip was unavailable for
+    /// this component's log source (e.g. a guest cursor the agent didn't report).
+    ///
+    /// Errors, never panics: no `test_agent_url` → `NotSupported`; an unreachable
+    /// / erroring agent → `Transport` (the run couldn't be dispatched).
+    async fn start_script(&self, script_id: &str) -> BackendResult<ScriptExecution> {
+        let Some(url) = self.config.test_agent_url.clone() else {
+            return Err(BackendError::NotSupported(format!(
+                "component '{}' exposes no scripts (no test_agent_url)",
+                self.entity_info.id
+            )));
+        };
+
+        // Snapshot the log tip just before spawning the run (bracket lower bound).
+        let log_from = self.current_log_tip().await;
+        let started = Utc::now();
+
+        let run = run_test_agent(&url, script_id).await.ok_or_else(|| {
+            BackendError::Transport(format!(
+                "test-agent POST /tests/{script_id}/run unreachable at {url}"
+            ))
+        })?;
+
+        // Snapshot the tip again after the run finished (bracket upper bound).
+        let ended = Utc::now();
+        let log_to = self.current_log_tip().await;
+
+        let n = self.script_exec_seq.fetch_add(1, Ordering::Relaxed);
+        let exec_id = format!("{script_id}-{n}");
+        let exec = ScriptExecution {
+            exec_id: exec_id.clone(),
+            script_id: script_id.to_string(),
+            status: ScriptStatus::Done,
+            verdict: Some(agent_verdict_to_core(&run.verdict)),
+            exit_code: run.exit_code,
+            duration_ms: Some(run.duration_ms),
+            message: run.message,
+            stdout_tail: (!run.stdout_tail.is_empty()).then_some(run.stdout_tail),
+            stderr_tail: (!run.stderr_tail.is_empty()).then_some(run.stderr_tail),
+            started: started.to_rfc3339(),
+            ended: Some(ended.to_rfc3339()),
+            log_from,
+            log_to,
+        };
+        self.script_executions
+            .lock()
+            .unwrap()
+            .insert(exec_id, exec.clone());
+        Ok(exec)
+    }
+
+    /// SOVD §7.15 `GET …/scripts/{script}/executions/{exec}` — read a stored
+    /// execution. `EntityNotFound` if the exec_id is unknown (rolled off / typo).
+    async fn get_script_execution(
+        &self,
+        _script_id: &str,
+        exec_id: &str,
+    ) -> BackendResult<ScriptExecution> {
+        self.script_executions
+            .lock()
+            .unwrap()
+            .get(exec_id)
+            .cloned()
+            .ok_or_else(|| BackendError::EntityNotFound(exec_id.to_string()))
+    }
+
+    /// SOVD §7.15 `GET …/scripts/{script}/executions` — the exec ids recorded
+    /// for this script (this process's lifetime; in-memory only).
+    async fn list_script_executions(&self, script_id: &str) -> BackendResult<Vec<String>> {
+        let mut ids: Vec<String> = self
+            .script_executions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.script_id == script_id)
+            .map(|e| e.exec_id.clone())
+            .collect();
+        ids.sort();
+        Ok(ids)
     }
 
     /// SOVD §7.21 `GET /components/{id}/logs/{id}` — one entry's metadata.
@@ -5665,6 +5787,123 @@ async fn query_test_agent(url: &str) -> Option<Vec<ScriptInfo>> {
     )
 }
 
+/// One finished test run from the guest test-agent's `POST /tests/{id}/run`.
+/// Wire shape mirrored BY HAND from `test-agent::RunResult` (guest-vm-sdk,
+/// different repo — the host must NOT git-dep the guest tree), like
+/// [`AgentTestRecord`] / [`GuestFileRecord`]. Keep in lockstep with the agent's
+/// `RunResult`: `{ id, verdict, exit_code?, duration_ms, stdout_tail?,
+/// stderr_tail?, message? }`. The agent omits empty tails (serde
+/// `skip_serializing_if`), so default them here.
+#[derive(serde::Deserialize)]
+struct AgentRunResult {
+    /// Test id the run was for (unused here — we key by our own exec_id — but
+    /// carried for contract fidelity, like `GuestFileRecord::name`).
+    #[allow(dead_code)]
+    id: String,
+    /// `"pass" | "fail" | "error"` — lowercase, matching the agent's `Verdict`.
+    verdict: String,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(default)]
+    stdout_tail: String,
+    #[serde(default)]
+    stderr_tail: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Map the guest agent's lowercase verdict string to the SOVD core enum. An
+/// unrecognised value is treated as `Error` (loud, not silently "pass") — same
+/// discipline as the agent's own `verdict_from_exit`.
+fn agent_verdict_to_core(verdict: &str) -> ScriptVerdict {
+    match verdict {
+        "pass" => ScriptVerdict::Pass,
+        "fail" => ScriptVerdict::Fail,
+        _ => ScriptVerdict::Error,
+    }
+}
+
+/// `POST {url}/tests/{script_id}/run` — run one registered test to completion
+/// (SYNCHRONOUS; the agent blocks until the test exits, bounded by the entry's
+/// `timeout_ms`). `None` = agent unreachable / non-200 / unparseable → the
+/// caller surfaces a `Transport` error (the run couldn't be dispatched). A test
+/// run needs a longer budget than a log read, hence the dedicated timeout.
+async fn run_test_agent(url: &str, script_id: &str) -> Option<AgentRunResult> {
+    let target = format!("/tests/{script_id}/run");
+    // A test may run for a while — give it a generous budget (the agent itself
+    // bounds the run via the entry's timeout_ms; this is the transport ceiling).
+    let body = guest_http_post(
+        url,
+        &target,
+        &[],
+        256 * 1024,
+        std::time::Duration::from_secs(300),
+    )
+    .await?;
+    serde_json::from_slice(&body).ok()
+}
+
+/// Hand-rolled HTTP/1.1 `POST {url}{target}` over tokio (no HTTP-client crate in
+/// this tree — same transport shape as [`guest_http_get`], but with a method +
+/// body + a caller-set timeout for slow runs). Returns the raw response body
+/// bytes iff the status is 200; `None` on unreachable / non-200 / oversized. The
+/// body is sent as `application/json` (empty `body` → an empty JSON-less POST,
+/// which the test-agent's `/run` accepts — the test id is in the path).
+async fn guest_http_post(
+    url: &str,
+    target: &str,
+    body: &[u8],
+    cap: u64,
+    deadline: std::time::Duration,
+) -> Option<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let hostport = url.strip_prefix("http://").unwrap_or(url);
+    let (hostport, base_path) = match hostport.split_once('/') {
+        Some((hp, rest)) => (hp, format!("/{rest}")),
+        None => (hostport, String::new()),
+    };
+    let full_target = format!("{base_path}{target}");
+
+    let mut stream = tokio::time::timeout(deadline, TcpStream::connect(hostport))
+        .await
+        .ok()?
+        .ok()?;
+    let request = format!(
+        "POST {full_target} HTTP/1.1\r\nHost: {hostport}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    tokio::time::timeout(deadline, stream.write_all(request.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
+    if !body.is_empty() {
+        tokio::time::timeout(deadline, stream.write_all(body))
+            .await
+            .ok()?
+            .ok()?;
+    }
+    let mut buf = Vec::with_capacity(64 * 1024);
+    tokio::time::timeout(
+        deadline,
+        (&mut stream).take(cap + 1024).read_to_end(&mut buf),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = &buf[..sep];
+    let body = buf[sep + 4..].to_vec();
+    if !head.starts_with(b"HTTP/1.1 200") && !head.starts_with(b"HTTP/1.0 200") {
+        return None;
+    }
+    Some(body)
+}
+
 // ---------------------------------------------------------------------------
 // Reboot-safe log pagination — HOST-FILE tier (tasks/log-retrieval-design.md)
 //
@@ -7429,6 +7668,77 @@ mod bank_provider_injection_tests {
         // Configured but unreachable → empty terminal, never a 500.
         let down = backend_with_test_agent("http://127.0.0.1:1");
         assert!(down.list_scripts().await.unwrap().is_empty());
+    }
+
+    /// §7.15 execution: start_script proxies the guest test-agent's synchronous
+    /// `POST /tests/{id}/run`, stores the finished run as a terminal
+    /// ScriptExecution (verdict + exit code), and get/list read it back. A down
+    /// agent errors cleanly (Transport), never a panic.
+    #[tokio::test]
+    async fn scripts_execute_proxies_run_and_stores_execution() {
+        use sovd_core::DiagnosticBackend;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for conn in listener.incoming() {
+                let mut s = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                // Mirror test-agent::RunResult for a passing run.
+                let body = r#"{"id":"guest-hal.smoke","verdict":"pass","exit_code":0,"duration_ms":42,"stdout_tail":"ok\n"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let b = backend_with_test_agent(&format!("http://{addr}"));
+        let exec = b.start_script("guest-hal.smoke").await.unwrap();
+        assert_eq!(exec.status, ScriptStatus::Done);
+        assert_eq!(exec.verdict, Some(ScriptVerdict::Pass));
+        assert_eq!(exec.exit_code, Some(0));
+        assert_eq!(exec.duration_ms, Some(42));
+        assert_eq!(exec.stdout_tail.as_deref(), Some("ok\n"));
+        assert_eq!(exec.script_id, "guest-hal.smoke");
+        // exec_id is <script_id>-<n>, monotonic per process.
+        assert!(exec.exec_id.starts_with("guest-hal.smoke-"));
+        assert!(exec.ended.is_some());
+
+        // Stored + retrievable via get / list.
+        let got = b
+            .get_script_execution("guest-hal.smoke", &exec.exec_id)
+            .await
+            .unwrap();
+        assert_eq!(got.exec_id, exec.exec_id);
+        assert_eq!(got.verdict, Some(ScriptVerdict::Pass));
+        let ids = b.list_script_executions("guest-hal.smoke").await.unwrap();
+        assert_eq!(ids, vec![exec.exec_id.clone()]);
+
+        // Unknown exec id → EntityNotFound (404), never a panic.
+        let miss = b
+            .get_script_execution("guest-hal.smoke", "nope")
+            .await
+            .expect_err("unknown exec");
+        assert!(matches!(miss, BackendError::EntityNotFound(_)));
+
+        // A down agent → Transport error, never a panic.
+        let down = backend_with_test_agent("http://127.0.0.1:1");
+        let err = down
+            .start_script("guest-hal.smoke")
+            .await
+            .expect_err("down agent");
+        assert!(matches!(err, BackendError::Transport(_)));
+
+        // No test_agent_url → NotSupported.
+        let none = backend_with_logs(LogSource::HostFiles { globs: vec![] });
+        let err = none.start_script("x").await.expect_err("no agent");
+        assert!(matches!(err, BackendError::NotSupported(_)));
     }
 
     /// §7.21 HostFiles source: bounded tails of matching files with
