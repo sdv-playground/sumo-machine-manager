@@ -6042,6 +6042,14 @@ fn host_capture(argv: &[&str]) -> Result<String, String> {
 /// In-process `du`-equivalent: recursively sum file sizes under `dir`, largest
 /// `n` first, KiB. No external `du` (QNX host toybox may lack it — the same
 /// lesson as the guest diag-agent). Best-effort; unreadable entries skipped.
+/// In-process `du`-equivalent: walk EVERY file under `dir` (no accounting cap —
+/// the whole point is that "many small files" and the true total show up), then
+/// report three views so it can answer "what fills this partition":
+///   TOTAL   — grand total of the tree (reconciles with df's `used`)
+///   FILES   — <total>, <count>
+///   by dir  — cumulative KiB per immediate subdir (depth-1), largest first
+///   top     — the `n` largest individual files (the specific culprits)
+/// Best-effort; unreadable entries skipped; symlinks not followed.
 fn host_du(dir: &str, n: usize) -> Result<String, String> {
     fn walk(dir: &std::path::Path, out: &mut Vec<(u64, String)>) {
         let entries = match std::fs::read_dir(dir) {
@@ -6061,15 +6069,50 @@ fn host_du(dir: &str, n: usize) -> Result<String, String> {
             }
         }
     }
-    if !std::path::Path::new(dir).exists() {
+    let root = std::path::Path::new(dir);
+    if !root.exists() {
         return Err(format!("{dir}: not present"));
     }
     let mut files: Vec<(u64, String)> = Vec::new();
-    walk(std::path::Path::new(dir), &mut files);
-    files.sort_by_key(|f| std::cmp::Reverse(f.0));
-    files.truncate(n);
-    let mut out = String::from("KiB\tpath\n");
-    for (bytes, path) in files {
+    walk(root, &mut files);
+
+    // Grand total + count over ALL files (uncapped — the reconciling number).
+    let total: u64 = files.iter().map(|(b, _)| *b).sum();
+    let count = files.len();
+
+    // Per-immediate-subdir rollup (depth-1 under `dir`): the prefix after
+    // `<dir>/` up to the next `/`. A file directly in `dir` rolls up under `.`.
+    let prefix = format!("{}/", dir.trim_end_matches('/'));
+    let mut by_dir: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for (bytes, path) in &files {
+        let seg = path.strip_prefix(&prefix).unwrap_or(path);
+        let top = seg.split('/').next().filter(|s| !s.is_empty());
+        let key = match top {
+            Some(t) if seg.contains('/') => t.to_string(), // it's a subdir
+            _ => ".".to_string(),                          // file directly in dir
+        };
+        *by_dir.entry(key).or_insert(0) += *bytes;
+    }
+    let mut dirs: Vec<(String, u64)> = by_dir.into_iter().collect();
+    dirs.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+
+    // Top-n largest individual files.
+    let mut top_files = files;
+    top_files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    top_files.truncate(n);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "TOTAL\t{} KiB\t({} files under {dir})\n\n",
+        total.div_ceil(1024),
+        count
+    ));
+    out.push_str("KiB\tsubdir (cumulative)\n");
+    for (name, bytes) in &dirs {
+        out.push_str(&format!("{}\t{name}\n", bytes.div_ceil(1024)));
+    }
+    out.push_str(&format!("\nKiB\ttop {n} files\n"));
+    for (bytes, path) in &top_files {
         out.push_str(&format!("{}\t{path}\n", bytes.div_ceil(1024)));
     }
     Ok(out)
@@ -7958,11 +8001,60 @@ mod bank_provider_injection_tests {
         // A missing dir → ok=false with a reason (real signal, not a crash).
         let miss = b.read_diagnostic("host.log-usage").await.unwrap();
         // /mnt/common-rw/log won't exist on the test host → not present.
-        assert!(!miss.ok || miss.output.starts_with("KiB"));
+        assert!(!miss.ok || miss.output.starts_with("TOTAL"));
 
         // Unknown probe → ok=false, named.
         let bad = b.read_diagnostic("host.nonsense").await.unwrap();
         assert!(!bad.ok && bad.message.unwrap().contains("unknown host probe"));
+    }
+
+    /// host_du reports a reconciling TOTAL + per-subdir rollup + top files —
+    /// so "what fills the partition" is answerable incl. many-small-files (the
+    /// question the old top-40-only view couldn't answer). Controlled tree:
+    /// dir_big/one huge file + dir_many/lots of tiny files.
+    #[test]
+    fn host_du_totals_rollup_and_top_files() {
+        let root = std::env::temp_dir().join(format!("cm-du-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("dir_big")).unwrap();
+        std::fs::create_dir_all(root.join("dir_many")).unwrap();
+        // One 300 KiB file.
+        std::fs::write(root.join("dir_big/huge.img"), vec![0u8; 300 * 1024]).unwrap();
+        // 50 files of 4 KiB each = 200 KiB — invisible to a top-N-files view if
+        // N is small, but must show as a fat subdir + count in the total.
+        for i in 0..50 {
+            std::fs::write(root.join(format!("dir_many/f{i}.log")), vec![0u8; 4 * 1024]).unwrap();
+        }
+        let out = host_du(root.to_str().unwrap(), 5).unwrap();
+
+        // TOTAL reconciles (~500 KiB, 51 files) — not truncated.
+        assert!(out.contains("51 files"), "count in total; got:\n{out}");
+        let total_line = out.lines().next().unwrap();
+        let total_kib: u64 = total_line
+            .split('\t')
+            .nth(1)
+            .and_then(|s| s.trim_end_matches(" KiB").parse().ok())
+            .unwrap();
+        assert!(
+            (498..=502).contains(&total_kib),
+            "total ~500 KiB, got {total_kib}"
+        );
+
+        // Subdir rollup: dir_big (300) > dir_many (200), both present.
+        assert!(out.contains("\tdir_big") && out.contains("\tdir_many"));
+        // The many-small-files dir shows its CUMULATIVE size (~200 KiB), which a
+        // top-5-FILES view would never surface.
+        let many_line = out.lines().find(|l| l.ends_with("dir_many")).unwrap();
+        let many_kib: u64 = many_line.split('\t').next().unwrap().parse().unwrap();
+        assert!(
+            (198..=204).contains(&many_kib),
+            "dir_many cumulative ~200, got {many_kib}"
+        );
+
+        // Top files: the huge one is listed.
+        assert!(out.contains("huge.img"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn backend_with_test_agent(url: &str) -> ComponentBackend<MemBlockDevice> {
