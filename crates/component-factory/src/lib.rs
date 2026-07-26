@@ -107,6 +107,11 @@ pub struct ComponentSpec {
     /// only, mirror of `test_agent_url`. See tasks/diag-agent-design.md.
     #[serde(default)]
     pub diag_agent_url: Option<String>,
+    /// §7.9 diagnostics gathered IN-PROCESS (no guest agent) — set `true` for
+    /// the HOST itself (supernova) / on-box components, so its disk/RAM
+    /// (`/mnt/common-rw`, `/proc/meminfo`) are visible over SOVD. Default false.
+    #[serde(default)]
+    pub host_diagnostics: bool,
 }
 
 impl ComponentSpec {
@@ -324,6 +329,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 log_sources: spec.log_sources(),
                 test_agent_url: spec.test_agent_url.clone(),
                 diag_agent_url: spec.diag_agent_url.clone(),
+                host_diagnostics: spec.host_diagnostics,
             };
             let app_images_dir = spec.storage_path.clone().or_else(|| spec.base_path.clone());
             let mut backend = ComponentBackend::with_options(
@@ -411,6 +417,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 log_sources: spec.log_sources(),
                 test_agent_url: spec.test_agent_url.clone(),
                 diag_agent_url: spec.diag_agent_url.clone(),
+                host_diagnostics: spec.host_diagnostics,
             };
 
             let images_dir = spec.storage_path.clone();

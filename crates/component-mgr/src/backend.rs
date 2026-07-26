@@ -304,6 +304,14 @@ pub struct ComponentConfig {
     /// diagnostics. Guest-VM only, same shape as `test_agent_url`. See
     /// `tasks/diag-agent-design.md`.
     pub diag_agent_url: Option<String>,
+    /// §7.9 diagnostics gathered IN-PROCESS (no guest agent) — for the HOST
+    /// itself (supernova) and any component that runs ON this box. `true` → the
+    /// same built-in probes the guest diag-agent serves (mem/df/du:<dir>/ps/…)
+    /// are gathered locally. The host has no diag-agent to proxy, so this is how
+    /// its `/mnt/common-rw` disk, RAM, etc. become visible over SOVD — the gap a
+    /// flash `No space left on device` exposed. Mutually complementary with
+    /// `diag_agent_url` (a component is one or the other); default off.
+    pub host_diagnostics: bool,
 }
 
 impl Default for ComponentConfig {
@@ -315,6 +323,7 @@ impl Default for ComponentConfig {
             log_sources: Vec::new(),
             test_agent_url: None,
             diag_agent_url: None,
+            host_diagnostics: false,
         }
     }
 }
@@ -604,10 +613,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                         LogSource::HostFiles { .. } | LogSource::GuestAgent { .. }
                     )
                 }),
-                // §7.9: read-only system probes, proxied from a guest's
-                // diag-agent. On iff a diag_agent_url is configured (guest-VM
-                // only) — same gate as scripts on test_agent_url.
-                diagnostics: config.diag_agent_url.is_some(),
+                // §7.9: read-only system probes — proxied from a guest's
+                // diag-agent (diag_agent_url, guest VMs) OR gathered in-process
+                // (host_diagnostics, the host itself). Either turns the
+                // capability on.
+                diagnostics: config.diag_agent_url.is_some() || config.host_diagnostics,
             },
             bank_set,
             bank_spec,
@@ -3192,6 +3202,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// unreachable agent degrades to an empty list (warn), never a 500 — same
     /// discipline as the log / scripts proxies.
     async fn list_diagnostics(&self) -> BackendResult<Vec<DiagnosticInfo>> {
+        // Host in-process probes (supernova / on-box components).
+        if self.config.host_diagnostics {
+            return Ok(host_diag_probes());
+        }
         let Some(url) = &self.config.diag_agent_url else {
             return Ok(vec![]);
         };
@@ -3214,6 +3228,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// `Transport` (couldn't dispatch the read — distinct from a probe that ran
     /// and reported `ok=false`).
     async fn read_diagnostic(&self, probe_id: &str) -> BackendResult<DiagnosticResult> {
+        // Host in-process gather (supernova / on-box components).
+        if self.config.host_diagnostics {
+            return Ok(host_gather(probe_id));
+        }
         let Some(url) = self.config.diag_agent_url.clone() else {
             return Err(BackendError::NotSupported(format!(
                 "component '{}' exposes no diagnostics (no diag_agent_url)",
@@ -5925,6 +5943,147 @@ async fn read_diag_probe(url: &str, probe_id: &str) -> Option<DiagnosticResult> 
     })
 }
 
+// ---------------------------------------------------------------------------
+// Host in-process diagnostics (host_diagnostics=true — supernova / on-box).
+// The host has no guest diag-agent to proxy, so it gathers READ-ONLY probes
+// locally. Scoped to storage/memory triage — the class the flash
+// `No space left on device` exposed. Mirrors the guest diag-agent's source
+// keys, but the host repo can't git-dep that crate so it's a small local set.
+// ---------------------------------------------------------------------------
+
+/// The host's fixed probe catalog (`host_diagnostics`). ids namespaced `host.*`
+/// (parallel to the guest `<layer>.<id>`). Static — the host isn't
+/// layer-contributed like the guest.
+fn host_diag_probes() -> Vec<DiagnosticInfo> {
+    fn p(id: &str, title: &str, tags: &[&str]) -> DiagnosticInfo {
+        DiagnosticInfo {
+            id: id.to_string(),
+            title: Some(title.to_string()),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    vec![
+        p(
+            "host.disk",
+            "Filesystem usage (df)",
+            &["health", "smoke", "storage"],
+        ),
+        p(
+            "host.mem",
+            "Memory (/proc/meminfo)",
+            &["health", "smoke", "resource"],
+        ),
+        // The flash target — where `No space left on device` bit. du, largest
+        // files first, so a full /mnt/common-rw names the culprit in one call.
+        p(
+            "host.common-rw-usage",
+            "Flash/state partition usage — /mnt/common-rw, largest first",
+            &["health", "smoke", "storage"],
+        ),
+        p(
+            "host.log-usage",
+            "Host log usage — /mnt/common-rw/log, largest first",
+            &["storage", "logs"],
+        ),
+    ]
+}
+
+/// Gather one host probe in-process. Read-only; never panics; a bad id or a
+/// failed read is `ok=false` with a message (a real signal, like the guest).
+fn host_gather(probe_id: &str) -> DiagnosticResult {
+    let result = match probe_id {
+        "host.disk" => host_capture(&["df", "-k"]),
+        "host.mem" => {
+            std::fs::read_to_string("/proc/meminfo").map_err(|e| format!("/proc/meminfo: {e}"))
+        }
+        "host.common-rw-usage" => host_du("/mnt/common-rw", 40),
+        "host.log-usage" => host_du("/mnt/common-rw/log", 40),
+        other => {
+            return DiagnosticResult {
+                id: probe_id.to_string(),
+                ok: false,
+                output: String::new(),
+                message: Some(format!("unknown host probe `{other}`")),
+            }
+        }
+    };
+    match result {
+        Ok(out) => DiagnosticResult {
+            id: probe_id.to_string(),
+            ok: true,
+            output: host_head(&out, 64 * 1024),
+            message: None,
+        },
+        Err(e) => DiagnosticResult {
+            id: probe_id.to_string(),
+            ok: false,
+            output: String::new(),
+            message: Some(e),
+        },
+    }
+}
+
+/// Run a read-only host command, capturing stdout+stderr. Err on spawn/exit
+/// failure. Bounded by the caller's head-cap.
+fn host_capture(argv: &[&str]) -> Result<String, String> {
+    use std::process::Command;
+    let (prog, args) = argv.split_first().ok_or("empty cmd")?;
+    let out = Command::new(prog)
+        .args(args)
+        .output()
+        .map_err(|e| format!("spawn {prog}: {e}"))?;
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.stderr.is_empty() {
+        s.push_str(&String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(s)
+}
+
+/// In-process `du`-equivalent: recursively sum file sizes under `dir`, largest
+/// `n` first, KiB. No external `du` (QNX host toybox may lack it — the same
+/// lesson as the guest diag-agent). Best-effort; unreadable entries skipped.
+fn host_du(dir: &str, n: usize) -> Result<String, String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(u64, String)>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = match path.symlink_metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                walk(&path, out);
+            } else if meta.is_file() {
+                out.push((meta.len(), path.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    if !std::path::Path::new(dir).exists() {
+        return Err(format!("{dir}: not present"));
+    }
+    let mut files: Vec<(u64, String)> = Vec::new();
+    walk(std::path::Path::new(dir), &mut files);
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    files.truncate(n);
+    let mut out = String::from("KiB\tpath\n");
+    for (bytes, path) in files {
+        out.push_str(&format!("{}\t{path}\n", bytes.div_ceil(1024)));
+    }
+    Ok(out)
+}
+
+/// Keep the head `cap` bytes of a probe's output (a report's useful part is the
+/// top), with a truncation marker.
+fn host_head(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    format!("{}\n…[{} more bytes truncated]", &s[..cap], s.len() - cap)
+}
+
 /// One finished test run from the guest test-agent's `POST /tests/{id}/run`.
 /// Wire shape mirrored BY HAND from `test-agent::RunResult` (guest-vm-sdk,
 /// different repo — the host must NOT git-dep the guest tree), like
@@ -7620,6 +7779,7 @@ mod bank_provider_injection_tests {
                 log_sources: Vec::new(),
                 test_agent_url: None,
                 diag_agent_url: None,
+                host_diagnostics: false,
             },
             None,
             None,
@@ -7755,6 +7915,54 @@ mod bank_provider_injection_tests {
             None,
             None,
         )
+    }
+
+    /// §7.9 HOST diagnostics: a `host_diagnostics: true` backend gathers probes
+    /// IN-PROCESS (no guest agent) — this is how supernova's own disk/RAM become
+    /// visible over SOVD (the gap a flash `No space left on device` exposed).
+    #[tokio::test]
+    async fn host_diagnostics_gathers_in_process() {
+        use sovd_core::DiagnosticBackend;
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        let b = ComponentBackend::with_options(
+            BankSet::Os,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig {
+                host_diagnostics: true,
+                ..ComponentConfig::default()
+            },
+            None,
+            None,
+            None,
+        );
+
+        // Discovery: the fixed host.* probe set, no guest agent.
+        let probes = b.list_diagnostics().await.unwrap();
+        assert!(probes.iter().any(|p| p.id == "host.disk"));
+        assert!(probes.iter().any(|p| p.id == "host.common-rw-usage"));
+
+        // Gather df in-process — real output on the Linux test host.
+        let r = b.read_diagnostic("host.disk").await.unwrap();
+        assert!(r.ok, "df gather: {:?}", r.message);
+        assert!(!r.output.is_empty());
+
+        // /proc/meminfo (Linux host) → MemTotal.
+        let m = b.read_diagnostic("host.mem").await.unwrap();
+        if std::path::Path::new("/proc/meminfo").exists() {
+            assert!(m.ok && m.output.contains("MemTotal"));
+        }
+
+        // A missing dir → ok=false with a reason (real signal, not a crash).
+        let miss = b.read_diagnostic("host.log-usage").await.unwrap();
+        // /mnt/common-rw/log won't exist on the test host → not present.
+        assert!(!miss.ok || miss.output.starts_with("KiB"));
+
+        // Unknown probe → ok=false, named.
+        let bad = b.read_diagnostic("host.nonsense").await.unwrap();
+        assert!(!bad.ok && bad.message.unwrap().contains("unknown host probe"));
     }
 
     fn backend_with_test_agent(url: &str) -> ComponentBackend<MemBlockDevice> {

@@ -69,6 +69,7 @@ fn make_wrapper_router() -> axum::Router {
                 log_sources: Vec::new(),
                 test_agent_url: None,
                 diag_agent_url: None,
+                host_diagnostics: false,
             },
         ),
     ];

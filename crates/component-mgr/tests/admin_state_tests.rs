@@ -139,6 +139,7 @@ fn hsm_backend(nv: &SharedNv) -> ComponentBackend<MemBlockDevice> {
             log_sources: Vec::new(),
             test_agent_url: None,
             diag_agent_url: None,
+            host_diagnostics: false,
         },
         None,
         None,

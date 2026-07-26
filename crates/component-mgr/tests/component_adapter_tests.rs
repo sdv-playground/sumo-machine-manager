@@ -90,6 +90,7 @@ async fn hsm_component_capabilities_are_single_bank() {
         log_sources: Vec::new(),
         test_agent_url: None,
         diag_agent_url: None,
+        host_diagnostics: false,
     };
     let hsm = vm_backend(nv, BankSet::Hsm, cfg);
     let comp = ComponentAdapter::new(hsm);
@@ -194,6 +195,7 @@ async fn rollback_unsupported_for_hsm() {
         log_sources: Vec::new(),
         test_agent_url: None,
         diag_agent_url: None,
+        host_diagnostics: false,
     };
     let hsm = vm_backend(nv, BankSet::Hsm, cfg);
     let comp = ComponentAdapter::new(hsm);
@@ -249,6 +251,7 @@ async fn get_csr_generates_csr_when_keystore_configured() {
             log_sources: Vec::new(),
             test_agent_url: None,
             diag_agent_url: None,
+            host_diagnostics: false,
         },
     );
 
@@ -289,6 +292,7 @@ async fn get_device_id_returns_a_stable_device_key_thumbprint() {
             log_sources: Vec::new(),
             test_agent_url: None,
             diag_agent_url: None,
+            host_diagnostics: false,
         },
     );
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -400,6 +404,7 @@ async fn machine_registry_holds_multiple_components() {
             log_sources: Vec::new(),
             test_agent_url: None,
             diag_agent_url: None,
+            host_diagnostics: false,
         },
     ));
 

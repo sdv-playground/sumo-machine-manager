@@ -119,6 +119,7 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
                 log_sources: Vec::new(),
                 test_agent_url: None,
                 diag_agent_url: None,
+                host_diagnostics: false,
             },
         ),
     ];
@@ -750,6 +751,7 @@ async fn update_shape_reports_banked_for_ab_components() {
             log_sources: Vec::new(),
             test_agent_url: None,
             diag_agent_url: None,
+            host_diagnostics: false,
         },
     );
     assert_eq!(
