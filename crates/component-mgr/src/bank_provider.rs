@@ -552,15 +552,23 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         name: &str,
         expected_sha256: &[u8; 32],
     ) -> Result<(), BankError> {
-        use sha2::{Digest, Sha256};
         let bank_dir = self
             .target_bank_dir(bank)
             .ok_or_else(|| BankError::Failed("no images_dir configured".into()))?;
         let path = bank_dir.join(name);
-        let bytes = std::fs::read(&path).map_err(|e| {
+        // Stream the hash in 64 KiB chunks — NEVER `std::fs::read` the whole
+        // image into a Vec. A rootfs is hundreds of MB; the one-shot read
+        // pre-sizes a contiguous Vec to the file length and OOMs a
+        // memory-pressured CVC (`verify_payload read …: out of memory`), which
+        // then surfaces as a bank/verify failure. `hash_reader` is O(64 KiB)
+        // resident — same idiom as the upload pipeline's `process_plain`.
+        let file = std::fs::File::open(&path).map_err(|e| {
             BankError::Failed(format!("verify_payload read {}: {e}", path.display()))
         })?;
-        let recomputed: [u8; 32] = Sha256::digest(&bytes).into();
+        let (_len, recomputed) = crate::streaming::hash_reader(std::io::BufReader::new(file))
+            .map_err(|e| {
+                BankError::Failed(format!("verify_payload read {}: {e}", path.display()))
+            })?;
         if &recomputed == expected_sha256 {
             Ok(())
         } else {
@@ -914,6 +922,70 @@ mod tests {
         match p.read_installed(Bank::B) {
             Err(BankError::NotInstalled) => {}
             other => panic!("expected NotInstalled, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+    }
+
+    /// verify_payload streams the hash (no whole-file read) and passes when the
+    /// on-disk bytes match the captured digest. Uses a payload comfortably
+    /// larger than the 64 KiB chunk so the multi-iteration loop is exercised.
+    #[test]
+    fn verify_payload_matches_streamed_hash() {
+        use sha2::{Digest, Sha256};
+        let images_dir = std::env::temp_dir().join("component-mgr-verify-match");
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let bank_dir = images_dir.join("vm1").join("bank_b");
+        std::fs::create_dir_all(&bank_dir).unwrap();
+        // 200 KiB: > 3 chunks, proves the loop (not a single read) is correct.
+        let payload = vec![0xABu8; 200 * 1024];
+        std::fs::write(bank_dir.join("rootfs.img"), &payload).unwrap();
+        let expected: [u8; 32] = Sha256::digest(&payload).into();
+
+        let p = disk_provider_no_hsm(images_dir.clone());
+        p.verify_payload(Bank::B, "rootfs.img", &expected)
+            .expect("streamed hash of matching bytes must verify");
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+    }
+
+    /// A one-byte mismatch → Unverifiable (a clean digest failure), not Failed.
+    #[test]
+    fn verify_payload_mismatch_is_unverifiable() {
+        use sha2::{Digest, Sha256};
+        let images_dir = std::env::temp_dir().join("component-mgr-verify-mismatch");
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let bank_dir = images_dir.join("vm1").join("bank_b");
+        std::fs::create_dir_all(&bank_dir).unwrap();
+        let payload = vec![0x11u8; 100 * 1024];
+        std::fs::write(bank_dir.join("rootfs.img"), &payload).unwrap();
+        // Digest of DIFFERENT bytes → mismatch on disk.
+        let wrong: [u8; 32] = Sha256::digest(b"not the payload").into();
+
+        let p = disk_provider_no_hsm(images_dir.clone());
+        match p.verify_payload(Bank::B, "rootfs.img", &wrong) {
+            Err(BankError::Unverifiable(_)) => {}
+            other => panic!("expected Unverifiable on digest mismatch, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+    }
+
+    /// A missing payload file → Failed with the `verify_payload read …` prefix
+    /// (the same error shape the OOM used to take — now only real I/O errors,
+    /// never allocation failure, land here).
+    #[test]
+    fn verify_payload_missing_file_is_failed() {
+        let images_dir = std::env::temp_dir().join("component-mgr-verify-missing");
+        let _ = std::fs::remove_dir_all(&images_dir);
+        std::fs::create_dir_all(images_dir.join("vm1").join("bank_b")).unwrap();
+
+        let p = disk_provider_no_hsm(images_dir.clone());
+        match p.verify_payload(Bank::B, "absent.img", &[0u8; 32]) {
+            Err(BankError::Failed(msg)) => {
+                assert!(msg.contains("verify_payload read"), "got: {msg}");
+            }
+            other => panic!("expected Failed on missing file, got {other:?}"),
         }
 
         let _ = std::fs::remove_dir_all(&images_dir);

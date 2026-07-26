@@ -651,6 +651,27 @@ fn process_plain<R: Read>(
     Ok((total, hash))
 }
 
+/// SHA-256 a reader in bounded 64 KiB chunks — the same streaming idiom as
+/// [`process_plain`], factored out for the hash-only callers (bank verify) that
+/// must NOT slurp a whole image into RAM. Returns `(bytes_read, digest)`; the
+/// caller compares the digest. O(64 KiB) resident regardless of file size — the
+/// whole point (a `std::fs::read` of a multi-hundred-MB rootfs OOMs a
+/// memory-pressured CVC; this doesn't). Errors are read errors, stringified.
+pub(crate) fn hash_reader<R: Read>(mut reader: R) -> Result<(u64, [u8; 32]), String> {
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((total, hasher.finalize().into()))
+}
+
 /// Accumulates time + bytes spent in an inner reader. Lets the upload pipeline
 /// split decrypt vs decompress: the zstd decoder reads *through* this shim, so
 /// the time recorded here is the decrypt/channel cost, and the decoder's own
