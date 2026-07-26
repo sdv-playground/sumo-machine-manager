@@ -101,6 +101,12 @@ pub struct ComponentSpec {
     /// `/tests`. Guest-VM only today. See tasks/sovd-tests-as-operations-design.md.
     #[serde(default)]
     pub test_agent_url: Option<String>,
+    /// §7.9 diagnostics: the in-guest diag-agent base URL, e.g.
+    /// `http://10.0.101.2:9320`. `Some` → `capabilities` expose a `diagnostics`
+    /// collection (read-only system probes) proxied from its `/probes`. Guest-VM
+    /// only, mirror of `test_agent_url`. See tasks/diag-agent-design.md.
+    #[serde(default)]
+    pub diag_agent_url: Option<String>,
 }
 
 impl ComponentSpec {
@@ -317,6 +323,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 single_bank: false,
                 log_sources: spec.log_sources(),
                 test_agent_url: spec.test_agent_url.clone(),
+                diag_agent_url: spec.diag_agent_url.clone(),
             };
             let app_images_dir = spec.storage_path.clone().or_else(|| spec.base_path.clone());
             let mut backend = ComponentBackend::with_options(
@@ -403,6 +410,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 single_bank: spec.single_bank,
                 log_sources: spec.log_sources(),
                 test_agent_url: spec.test_agent_url.clone(),
+                diag_agent_url: spec.diag_agent_url.clone(),
             };
 
             let images_dir = spec.storage_path.clone();

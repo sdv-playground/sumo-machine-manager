@@ -118,6 +118,7 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
                 entity_type: "hsm".into(),
                 log_sources: Vec::new(),
                 test_agent_url: None,
+                diag_agent_url: None,
             },
         ),
     ];
@@ -748,6 +749,7 @@ async fn update_shape_reports_banked_for_ab_components() {
             entity_type: "hsm".into(),
             log_sources: Vec::new(),
             test_agent_url: None,
+            diag_agent_url: None,
         },
     );
     assert_eq!(

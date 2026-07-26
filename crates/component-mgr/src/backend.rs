@@ -298,6 +298,12 @@ pub struct ComponentConfig {
     /// only today (tests aren't a host/per-component concern yet). See
     /// `tasks/sovd-tests-as-operations-design.md`.
     pub test_agent_url: Option<String>,
+    /// §7.9 diagnostics: the in-guest diag-agent's base URL, e.g.
+    /// `http://10.0.101.2:9320`. `Some` → the component exposes READ-ONLY system
+    /// probes (mem/df/du/…) discovered + gathered by proxy; `None` → no
+    /// diagnostics. Guest-VM only, same shape as `test_agent_url`. See
+    /// `tasks/diag-agent-design.md`.
+    pub diag_agent_url: Option<String>,
 }
 
 impl Default for ComponentConfig {
@@ -308,6 +314,7 @@ impl Default for ComponentConfig {
             entity_type: "vm".to_string(),
             log_sources: Vec::new(),
             test_agent_url: None,
+            diag_agent_url: None,
         }
     }
 }
@@ -592,8 +599,15 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 // log-agent serves `/files` (GuestAgent). Mirror
                 // list_bulk_data_categories' condition exactly.
                 bulk_data: config.log_sources.iter().any(|s| {
-                    matches!(s, LogSource::HostFiles { .. } | LogSource::GuestAgent { .. })
+                    matches!(
+                        s,
+                        LogSource::HostFiles { .. } | LogSource::GuestAgent { .. }
+                    )
                 }),
+                // §7.9: read-only system probes, proxied from a guest's
+                // diag-agent. On iff a diag_agent_url is configured (guest-VM
+                // only) — same gate as scripts on test_agent_url.
+                diagnostics: config.diag_agent_url.is_some(),
             },
             bank_set,
             bank_spec,
@@ -2806,7 +2820,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// components fall back to the trait default (empty).
     async fn list_bulk_data_categories(&self) -> BackendResult<Vec<BulkCategory>> {
         let has_files = self.config.log_sources.iter().any(|s| {
-            matches!(s, LogSource::HostFiles { .. } | LogSource::GuestAgent { .. })
+            matches!(
+                s,
+                LogSource::HostFiles { .. } | LogSource::GuestAgent { .. }
+            )
         });
         if has_files {
             Ok(vec![BulkCategory {
@@ -2839,7 +2856,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // any other name (a HostDumps-only component must 404 here, matching
         // list_bulk_data_categories which returns []).
         let has_files = self.config.log_sources.iter().any(|s| {
-            matches!(s, LogSource::HostFiles { .. } | LogSource::GuestAgent { .. })
+            matches!(
+                s,
+                LogSource::HostFiles { .. } | LogSource::GuestAgent { .. }
+            )
         });
         if category != "logs" || !has_files {
             return Err(BackendError::EntityNotFound(format!(
@@ -2853,86 +2873,86 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         let mut items: Vec<BulkDataItem> = Vec::new();
         for source in &self.config.log_sources {
             match source {
-            LogSource::GuestAgent { url } => {
-                // Proxy the guest's `/files` catalog. A down/unreachable guest
-                // contributes ZERO items (warn + skip) — a component with a
-                // down VM must still answer 200 with whatever else it has, never
-                // a 500 (mirrors get_logs' degrade-gracefully contract).
-                let files = match fetch_guest_files(url).await {
-                    Some(f) => f,
-                    None => {
-                        tracing::warn!(
-                            component = %self.entity_info.id, url = %url,
-                            "log-agent /files unreachable — skipping guest bulk-data"
-                        );
-                        continue;
-                    }
-                };
-                for f in files {
-                    // Filter on the guest file's `modified` (epoch secs) → UTC,
-                    // matching the host-file mtime filter. A modified we can't
-                    // represent is treated as the epoch (kept unless filtered).
-                    let created = chrono::DateTime::<Utc>::from_timestamp(f.modified as i64, 0)
-                        .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH);
-                    if let Some(after) = filter.created_after {
-                        if created <= after {
+                LogSource::GuestAgent { url } => {
+                    // Proxy the guest's `/files` catalog. A down/unreachable guest
+                    // contributes ZERO items (warn + skip) — a component with a
+                    // down VM must still answer 200 with whatever else it has, never
+                    // a 500 (mirrors get_logs' degrade-gracefully contract).
+                    let files = match fetch_guest_files(url).await {
+                        Some(f) => f,
+                        None => {
+                            tracing::warn!(
+                                component = %self.entity_info.id, url = %url,
+                                "log-agent /files unreachable — skipping guest bulk-data"
+                            );
                             continue;
                         }
-                    }
-                    if let Some(before) = filter.created_before {
-                        if created >= before {
-                            continue;
-                        }
-                    }
-                    items.push(BulkDataItem {
-                        // Namespaced id carrying (url, guest file id) so
-                        // get_bulk_data routes the download back to this agent.
-                        id: guest_bulk_id(url, &f.id),
-                        size: f.size,
-                        created,
-                        mime: "text/plain".to_string(),
-                        source: Some(f.source),
-                    });
-                }
-            }
-            LogSource::HostFiles { globs } => {
-                for path in resolve_log_files(globs) {
-                    // The id is base64url of the path's UTF-8 text, so download
-                    // can decode it straight back (no unsafe OS-string round-trip,
-                    // portable to QNX). A non-UTF-8 path can't produce a stable
-                    // text id — skip it (log file paths are UTF-8 in practice).
-                    let Some(path_str) = path.to_str() else {
-                        continue;
                     };
-                    let created = file_mtime(&path);
-                    // Filter: keep items created STRICTLY after created_after and
-                    // STRICTLY before created_before (matches the model docs).
-                    if let Some(after) = filter.created_after {
-                        if created <= after {
-                            continue;
+                    for f in files {
+                        // Filter on the guest file's `modified` (epoch secs) → UTC,
+                        // matching the host-file mtime filter. A modified we can't
+                        // represent is treated as the epoch (kept unless filtered).
+                        let created = chrono::DateTime::<Utc>::from_timestamp(f.modified as i64, 0)
+                            .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH);
+                        if let Some(after) = filter.created_after {
+                            if created <= after {
+                                continue;
+                            }
                         }
-                    }
-                    if let Some(before) = filter.created_before {
-                        if created >= before {
-                            continue;
+                        if let Some(before) = filter.created_before {
+                            if created >= before {
+                                continue;
+                            }
                         }
+                        items.push(BulkDataItem {
+                            // Namespaced id carrying (url, guest file id) so
+                            // get_bulk_data routes the download back to this agent.
+                            id: guest_bulk_id(url, &f.id),
+                            size: f.size,
+                            created,
+                            mime: "text/plain".to_string(),
+                            source: Some(f.source),
+                        });
                     }
-                    // size: best-effort file length (0 if metadata unavailable).
-                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    items.push(BulkDataItem {
-                        // Full path (UTF-8 text), base64url — decodable back to
-                        // the path on download (stateless + stable across restarts).
-                        id: b64url(path_str.as_bytes()),
-                        size,
-                        created,
-                        mime: "text/plain".to_string(),
-                        source: Some(source_name(&path)),
-                    });
                 }
-            }
-            // HostDumps carries its own §7.21 `dump:host:*` catalog — not a
-            // bulk-data source here (see the scope note above).
-            LogSource::HostDumps { .. } => {}
+                LogSource::HostFiles { globs } => {
+                    for path in resolve_log_files(globs) {
+                        // The id is base64url of the path's UTF-8 text, so download
+                        // can decode it straight back (no unsafe OS-string round-trip,
+                        // portable to QNX). A non-UTF-8 path can't produce a stable
+                        // text id — skip it (log file paths are UTF-8 in practice).
+                        let Some(path_str) = path.to_str() else {
+                            continue;
+                        };
+                        let created = file_mtime(&path);
+                        // Filter: keep items created STRICTLY after created_after and
+                        // STRICTLY before created_before (matches the model docs).
+                        if let Some(after) = filter.created_after {
+                            if created <= after {
+                                continue;
+                            }
+                        }
+                        if let Some(before) = filter.created_before {
+                            if created >= before {
+                                continue;
+                            }
+                        }
+                        // size: best-effort file length (0 if metadata unavailable).
+                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        items.push(BulkDataItem {
+                            // Full path (UTF-8 text), base64url — decodable back to
+                            // the path on download (stateless + stable across restarts).
+                            id: b64url(path_str.as_bytes()),
+                            size,
+                            created,
+                            mime: "text/plain".to_string(),
+                            source: Some(source_name(&path)),
+                        });
+                    }
+                }
+                // HostDumps carries its own §7.21 `dump:host:*` catalog — not a
+                // bulk-data source here (see the scope note above).
+                LogSource::HostDumps { .. } => {}
             }
         }
 
@@ -2979,7 +2999,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 .iter()
                 .any(|s| matches!(s, LogSource::GuestAgent { url: u } if u == &url));
             if !url_is_ours {
-                return Err(BackendError::EntityNotFound(format!("bulk-data item: {id}")));
+                return Err(BackendError::EntityNotFound(format!(
+                    "bulk-data item: {id}"
+                )));
             }
             // Re-validate against the live guest catalog. A down guest (None) or
             // an id no longer present → 404 (a down guest never yields a 500).
@@ -2988,7 +3010,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 .map(|files| files.iter().any(|f| f.id == guest_id))
                 .unwrap_or(false);
             if !advertised {
-                return Err(BackendError::EntityNotFound(format!("bulk-data item: {id}")));
+                return Err(BackendError::EntityNotFound(format!(
+                    "bulk-data item: {id}"
+                )));
             }
             // Proxy the download. An unreachable agent at THIS point (raced with
             // the re-list) is again a 404, not a 500.
@@ -3023,7 +3047,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 if resolve_log_files(globs).iter().any(|p| p == &requested))
         });
         if !in_allowed_set {
-            return Err(BackendError::EntityNotFound(format!("bulk-data item: {id}")));
+            return Err(BackendError::EntityNotFound(format!(
+                "bulk-data item: {id}"
+            )));
         }
 
         // Read up to the cap. Bounded by MAX_BULK_BYTES via take(); a file at or
@@ -3158,6 +3184,48 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             .collect();
         ids.sort();
         Ok(ids)
+    }
+
+    /// SOVD §7.9 `GET /components/{id}/diagnostics` — the READ-ONLY system probes
+    /// a guest exposes, proxied from its in-guest diag-agent `/probes`. Only when
+    /// a `diag_agent_url` is configured (guest-VM only); otherwise none. An
+    /// unreachable agent degrades to an empty list (warn), never a 500 — same
+    /// discipline as the log / scripts proxies.
+    async fn list_diagnostics(&self) -> BackendResult<Vec<DiagnosticInfo>> {
+        let Some(url) = &self.config.diag_agent_url else {
+            return Ok(vec![]);
+        };
+        match query_diag_agent(url).await {
+            Some(probes) => Ok(probes),
+            None => {
+                tracing::warn!(
+                    component = %self.entity_info.id, url = %url,
+                    "diag-agent /probes unreachable — empty diagnostics list"
+                );
+                Ok(vec![])
+            }
+        }
+    }
+
+    /// SOVD §7.9 `GET /components/{id}/diagnostics/{probe}` — gather one probe,
+    /// proxied from the guest diag-agent `GET /probes/{id}`. The agent gathers
+    /// synchronously and returns its own `{ok, output, message}`; we pass it
+    /// through. No `diag_agent_url` → `NotSupported`; an unreachable agent →
+    /// `Transport` (couldn't dispatch the read — distinct from a probe that ran
+    /// and reported `ok=false`).
+    async fn read_diagnostic(&self, probe_id: &str) -> BackendResult<DiagnosticResult> {
+        let Some(url) = self.config.diag_agent_url.clone() else {
+            return Err(BackendError::NotSupported(format!(
+                "component '{}' exposes no diagnostics (no diag_agent_url)",
+                self.entity_info.id
+            )));
+        };
+        match read_diag_probe(&url, probe_id).await {
+            Some(result) => Ok(result),
+            None => Err(BackendError::Transport(format!(
+                "diag-agent unreachable at {url} for probe '{probe_id}'"
+            ))),
+        }
     }
 
     /// SOVD §7.21 `GET /components/{id}/logs/{id}` — one entry's metadata.
@@ -5787,6 +5855,68 @@ async fn query_test_agent(url: &str) -> Option<Vec<ScriptInfo>> {
     )
 }
 
+/// One registered probe from the guest diag-agent's `GET /probes` discovery.
+/// Wire shape mirrored BY HAND from `diag_agent::ProbeSummary` (guest-vm-sdk,
+/// different repo — never a git dep), like [`AgentTestRecord`].
+#[derive(serde::Deserialize)]
+struct AgentProbeRecord {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// `GET {url}/probes` — the guest's registered diagnostic probes (SOVD §7.9
+/// source). `None` = diag-agent unreachable / bad response → the caller degrades
+/// to an empty list. Small JSON; 256 KiB cap is ample.
+async fn query_diag_agent(url: &str) -> Option<Vec<DiagnosticInfo>> {
+    let body = guest_http_get(url, "/probes", 256 * 1024).await?;
+    let recs: Vec<AgentProbeRecord> = serde_json::from_slice(&body).ok()?;
+    Some(
+        recs.into_iter()
+            .map(|r| DiagnosticInfo {
+                id: r.id,
+                title: r.title,
+                tags: r.tags,
+            })
+            .collect(),
+    )
+}
+
+/// One gathered probe from the guest diag-agent's `GET /probes/{id}`. Wire shape
+/// mirrored BY HAND from `diag_agent::ProbeResult` — `{ id, ok, output?,
+/// message? }` (the agent omits empty output / absent message via serde
+/// skip_serializing_if, so default them here).
+#[derive(serde::Deserialize)]
+struct AgentProbeResult {
+    id: String,
+    ok: bool,
+    #[serde(default)]
+    output: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// `GET {url}/probes/{id}` — gather one probe. `None` = diag-agent unreachable /
+/// bad response → the caller maps it to a `Transport` error (couldn't dispatch
+/// the read). A probe that RAN and failed comes back as a valid result with
+/// `ok=false` (passed through, not an error). Probe output is bounded by the
+/// agent; a 1 MiB cap here is a generous backstop.
+async fn read_diag_probe(url: &str, probe_id: &str) -> Option<DiagnosticResult> {
+    // Probe ids are `<layer>.<id>` (alphanumerics, dots, dashes) — URL-safe, so
+    // no percent-encoding, matching the scripts proxy's raw `/tests/{id}/run`.
+    let target = format!("/probes/{probe_id}");
+    let body = guest_http_get(url, &target, 1024 * 1024).await?;
+    let r: AgentProbeResult = serde_json::from_slice(&body).ok()?;
+    Some(DiagnosticResult {
+        id: r.id,
+        ok: r.ok,
+        output: r.output,
+        message: r.message,
+    })
+}
+
 /// One finished test run from the guest test-agent's `POST /tests/{id}/run`.
 /// Wire shape mirrored BY HAND from `test-agent::RunResult` (guest-vm-sdk,
 /// different repo — the host must NOT git-dep the guest tree), like
@@ -6029,7 +6159,9 @@ impl LogCursor {
         // serde_json on a small fixed struct cannot realistically fail; if it
         // ever did, an empty string decodes back to "no cursor" (start oldest),
         // which is the safe fallback rather than a 500.
-        serde_json::to_vec(self).map(|j| b64url(&j)).unwrap_or_default()
+        serde_json::to_vec(self)
+            .map(|j| b64url(&j))
+            .unwrap_or_default()
     }
 
     /// Decode an opaque token. Returns `None` for any malformed input so the
@@ -6236,7 +6368,13 @@ fn host_file_logs_paged(globs: &[String], filter: &LogFilter, boot_epoch: u64) -
     for path in resolve_log_files(globs) {
         let src = source_name(&path);
         let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        tip_sources.insert(src, SourcePos { gen: 0, offset: len });
+        tip_sources.insert(
+            src,
+            SourcePos {
+                gen: 0,
+                offset: len,
+            },
+        );
     }
     let tip_cursor = Some(
         LogCursor {
@@ -7473,6 +7611,7 @@ mod bank_provider_injection_tests {
                 entity_type: "hsm".to_string(),
                 log_sources: Vec::new(),
                 test_agent_url: None,
+                diag_agent_url: None,
             },
             None,
             None,
@@ -7620,6 +7759,7 @@ mod bank_provider_injection_tests {
             Arc::new(NoopManifest),
             ComponentConfig {
                 test_agent_url: Some(url.to_string()),
+                diag_agent_url: Some(url.to_string()),
                 ..ComponentConfig::default()
             },
             None,
@@ -7668,6 +7808,76 @@ mod bank_provider_injection_tests {
         // Configured but unreachable → empty terminal, never a 500.
         let down = backend_with_test_agent("http://127.0.0.1:1");
         assert!(down.list_scripts().await.unwrap().is_empty());
+    }
+
+    /// §7.9 diagnostics: list_diagnostics proxies the guest diag-agent's
+    /// /probes, and read_diagnostic proxies /probes/{id} → the ProbeResult. A
+    /// stub agent serves both; no url → NotSupported (read) / [] (list); a down
+    /// agent → [] (list) / Transport (read) — never a panic.
+    #[tokio::test]
+    async fn diagnostics_proxy_guest_diag_agent_and_degrade() {
+        use sovd_core::DiagnosticBackend;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for conn in listener.incoming() {
+                let mut s = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let head = String::from_utf8_lossy(&buf);
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("");
+                let body = if path == "/probes" {
+                    r#"[{"id":"guest-hal.mem","title":"Memory","tags":["health"]},{"id":"guest-hal.disk","tags":["storage"]}]"#.to_string()
+                } else if let Some(id) = path.strip_prefix("/probes/") {
+                    // Echo the requested id back in an ok result.
+                    format!(r#"{{"id":"{id}","ok":true,"output":"MemTotal: 2048 kB\n"}}"#)
+                } else {
+                    "[]".to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let b = backend_with_test_agent(&format!("http://{addr}"));
+        // Discovery.
+        let probes = b.list_diagnostics().await.unwrap();
+        assert_eq!(probes.len(), 2);
+        assert_eq!(probes[0].id, "guest-hal.mem");
+        assert_eq!(probes[0].title.as_deref(), Some("Memory"));
+        assert_eq!(probes[1].id, "guest-hal.disk");
+        // Gather one — the ProbeResult passes through.
+        let r = b.read_diagnostic("guest-hal.mem").await.unwrap();
+        assert!(r.ok);
+        assert_eq!(r.id, "guest-hal.mem");
+        assert!(r.output.contains("MemTotal"));
+
+        // No diag_agent_url → [] (list) / NotSupported (read).
+        let none = backend_with_logs(LogSource::HostFiles { globs: vec![] });
+        assert!(none.list_diagnostics().await.unwrap().is_empty());
+        assert!(matches!(
+            none.read_diagnostic("guest-hal.mem").await,
+            Err(BackendError::NotSupported(_))
+        ));
+
+        // Configured but unreachable → [] (list) / Transport (read).
+        let down = backend_with_test_agent("http://127.0.0.1:1");
+        assert!(down.list_diagnostics().await.unwrap().is_empty());
+        assert!(matches!(
+            down.read_diagnostic("guest-hal.mem").await,
+            Err(BackendError::Transport(_))
+        ));
     }
 
     /// §7.15 execution: start_script proxies the guest test-agent's synchronous
@@ -7832,11 +8042,20 @@ mod bank_provider_injection_tests {
             // Serve until the listener drops. First call (no after=) → 1 item +
             // cursor "C1"; a call carrying after=C1 → empty page, no cursor.
             for conn in listener.incoming() {
-                let mut s = match conn { Ok(s) => s, Err(_) => break };
+                let mut s = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
                 let mut buf = [0u8; 2048];
                 let n = s.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                let target = req.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("");
+                let target = req
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("");
                 let body = if target.contains("after=C1") {
                     r#"{"items":[]}"#.to_string()
                 } else {
@@ -7850,7 +8069,9 @@ mod bank_provider_injection_tests {
             }
         });
 
-        let b = backend_with_logs(LogSource::GuestAgent { url: format!("http://{addr}") });
+        let b = backend_with_logs(LogSource::GuestAgent {
+            url: format!("http://{addr}"),
+        });
 
         // Page 1: one item + a next_cursor.
         let p1 = b.get_logs_paged(&LogFilter::default()).await.unwrap();
@@ -7868,7 +8089,9 @@ mod bank_provider_injection_tests {
         assert!(p2.next_cursor.is_none());
 
         // Down agent → empty terminal page, not an error.
-        let down = backend_with_logs(LogSource::GuestAgent { url: "http://127.0.0.1:1".into() });
+        let down = backend_with_logs(LogSource::GuestAgent {
+            url: "http://127.0.0.1:1".into(),
+        });
         let pd = down.get_logs_paged(&LogFilter::default()).await.unwrap();
         assert!(pd.items.is_empty() && pd.next_cursor.is_none());
     }
@@ -8023,7 +8246,10 @@ mod bank_provider_injection_tests {
         // the new lines come back, none of l1..l5 replayed.
         {
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             file.write_all(b"l6\nl7\n").unwrap();
         }
         let p5 = host_file_logs_paged(&globs, &f(p3.next_cursor.clone()), 1);
@@ -8045,12 +8271,18 @@ mod bank_provider_injection_tests {
 
         // Take the tip at "now" — it names the current EOF, and is always set.
         let p = host_file_logs_paged(&globs, &LogFilter::default(), 1);
-        let tip = p.tip_cursor.clone().expect("tip_cursor is always set for host files");
+        let tip = p
+            .tip_cursor
+            .clone()
+            .expect("tip_cursor is always set for host files");
 
         // Append after capturing the tip.
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(b"new1\nnew2\n").unwrap();
         }
 
@@ -8064,7 +8296,11 @@ mod bank_provider_injection_tests {
             .iter()
             .map(|e| e.message.clone())
             .collect();
-        assert_eq!(got, vec!["new1", "new2"], "follow from tip yields only new lines");
+        assert_eq!(
+            got,
+            vec!["new1", "new2"],
+            "follow from tip yields only new lines"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -8556,7 +8792,13 @@ mod bank_provider_injection_tests {
                 let mut buf = [0u8; 1024];
                 let n = s.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                let target = req.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("");
+                let target = req
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("");
                 let (ctype, body): (&str, Vec<u8>) = if target == "/files" {
                     let json = format!(
                         r#"[{{"id":"{gid}","name":"foo.log","size":9,"source":"foo","modified":1784562613}}]"#
@@ -8590,7 +8832,10 @@ mod bank_provider_injection_tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].size, 9);
         assert_eq!(items[0].source.as_deref(), Some("foo"));
-        assert_eq!(parse_guest_bulk_id(&items[0].id).unwrap(), (url.clone(), gid.to_string()));
+        assert_eq!(
+            parse_guest_bulk_id(&items[0].id).unwrap(),
+            (url.clone(), gid.to_string())
+        );
 
         // Download by that id → proxied bytes inline.
         match b.get_bulk_data("logs", &items[0].id).await.unwrap() {

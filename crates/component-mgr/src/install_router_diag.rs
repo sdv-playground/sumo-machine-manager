@@ -378,6 +378,18 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.get_bulk_data(category, id).await
     }
 
+    // §7.9 diagnostics — delegated to the engine like the other proxied reads.
+    // Without these an app-type component (routed through here) would silently
+    // fall back to the trait defaults (empty probe list / not-supported gather),
+    // same reasoning as the bulk-data forwarders above.
+    async fn list_diagnostics(&self) -> BackendResult<Vec<DiagnosticInfo>> {
+        self.engine.list_diagnostics().await
+    }
+
+    async fn read_diagnostic(&self, probe_id: &str) -> BackendResult<DiagnosticResult> {
+        self.engine.read_diagnostic(probe_id).await
+    }
+
     async fn list_outputs(&self) -> BackendResult<Vec<OutputInfo>> {
         self.engine.list_outputs().await
     }
