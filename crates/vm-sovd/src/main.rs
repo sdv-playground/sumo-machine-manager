@@ -326,6 +326,8 @@ async fn main() {
             host_dump_dir: None,
             test_agent_url: None,
             diag_agent_url: None,
+            // host-os IS the host: gather §7.9 probes in-process (disk/mem/du).
+            host_diagnostics: true,
         },
         ComponentSpec {
             id: "vm1".into(),
@@ -345,6 +347,7 @@ async fn main() {
             host_dump_dir: None,
             test_agent_url: None,
             diag_agent_url: None,
+            host_diagnostics: false,
         },
         ComponentSpec {
             id: "vm2".into(),
@@ -364,6 +367,7 @@ async fn main() {
             host_dump_dir: None,
             test_agent_url: None,
             diag_agent_url: None,
+            host_diagnostics: false,
         },
         ComponentSpec {
             id: "hsm".into(),
@@ -383,6 +387,7 @@ async fn main() {
             host_dump_dir: None,
             test_agent_url: None,
             diag_agent_url: None,
+            host_diagnostics: false,
         },
     ];
 
