@@ -5667,6 +5667,12 @@ struct AgentPagedLogs {
     items: Vec<AgentLogRecord>,
     #[serde(default)]
     next_cursor: Option<String>,
+    /// QNX svclog segment cursors (see the guest log-agent PagedLogs). Absent on
+    /// the journald path / older agents → None (serde default).
+    #[serde(default)]
+    oldest_cursor: Option<String>,
+    #[serde(default)]
+    tip_cursor: Option<String>,
 }
 
 /// Page the guest's logs via its `/logs/page` (journald `__CURSOR` forward-
@@ -5731,12 +5737,14 @@ async fn query_log_agent_paged(url: &str, filter: &LogFilter) -> Option<LogPage>
         .collect();
     Some(LogPage {
         items,
+        // All three cursors pass straight through from the guest — the host is
+        // scheme-agnostic (the guest owns the string: journald `__CURSOR`, or
+        // QNX svclog `<seq>:<offset>`). tip_cursor is what feeds the §7.15
+        // tester log bracket + `sovd-cli logs --follow`; oldest_cursor is gap
+        // detection. All None on an older agent (serde default) → best-effort.
         next_cursor: paged.next_cursor,
-        oldest_cursor: None, // guest journald has no cheap "oldest" handle here
-        // The guest could report a tip (journald `-o export -n0 --show-cursor`),
-        // but /logs/page doesn't surface one yet — guest follow is a rig-time
-        // follow-up. None here means "no tip handle for this source".
-        tip_cursor: None,
+        oldest_cursor: paged.oldest_cursor,
+        tip_cursor: paged.tip_cursor,
     })
 }
 
@@ -8461,6 +8469,61 @@ mod bank_provider_injection_tests {
         assert!(page.items.iter().any(|e| e.message == "one"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sole-GuestAgent component pages via the guest `/logs/page`, and the
+    /// guest's tip_cursor/oldest_cursor (QNX svclog `<seq>:<offset>`) pass
+    /// THROUGH the host relay — this is what feeds the §7.15 tester log bracket
+    /// (current_log_tip) + `sovd-cli logs --follow` on QNX.
+    #[tokio::test]
+    async fn logs_paged_guest_agent_relays_tip_and_oldest_cursors() {
+        use sovd_core::DiagnosticBackend;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for conn in listener.incoming() {
+                let mut s = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                // Mimic the guest PagedLogs: one line + segment cursors.
+                let body = r#"{"items":[{"timestamp":"2026-07-18T15:50:13Z","priority":"info","message":"[vhsm] up","source":"vhsm-daemon"}],"tip_cursor":"7:2048","oldest_cursor":"3:0"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        let b = ComponentBackend::with_options(
+            BankSet::Vm1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig {
+                log_sources: vec![LogSource::GuestAgent {
+                    url: format!("http://{addr}"),
+                }],
+                ..ComponentConfig::default()
+            },
+            None,
+            None,
+            None,
+        );
+
+        let page = b.get_logs_paged(&LogFilter::default()).await.unwrap();
+        assert_eq!(page.tip_cursor.as_deref(), Some("7:2048"), "tip relayed");
+        assert_eq!(page.oldest_cursor.as_deref(), Some("3:0"), "oldest relayed");
+        assert!(page.items.iter().any(|e| e.message == "[vhsm] up"));
+
+        // current_log_tip (the §7.15 bracket source) now returns the tip.
+        assert_eq!(b.current_log_tip().await.as_deref(), Some("7:2048"));
     }
 
     /// Pure-HostFiles components DO paginate through `get_logs_paged`: the first
