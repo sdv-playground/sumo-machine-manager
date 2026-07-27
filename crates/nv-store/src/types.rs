@@ -89,7 +89,7 @@ impl BankSet {
         match s {
             "hsm" => Some(BankSet::Hsm),
             "bootloader" | "boot" => Some(BankSet::Bootloader),
-            "os" | "host-os" | "host_os" | "supernova" | "app" => Some(BankSet::Os),
+            "os" | "host" | "host-os" | "host_os" | "supernova" | "app" => Some(BankSet::Os),
             "rt" | "custom" => Some(BankSet::Rt),
             "os1" | "vm1" => Some(BankSet::Vm1),
             "os2" | "vm2" => Some(BankSet::Vm2),
