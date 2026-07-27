@@ -212,7 +212,7 @@ pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
     match id {
         "hsm" => Some(BankSet::Hsm),
         "bootloader" => Some(BankSet::Bootloader),
-        "os" | "host-os" | "supernova" | "app" => Some(BankSet::Os),
+        "os" | "host" | "host-os" | "supernova" | "app" => Some(BankSet::Os),
         "rt" => Some(BankSet::Rt),
         "vm1" => Some(BankSet::Vm1),
         "vm2" => Some(BankSet::Vm2),
