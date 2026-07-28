@@ -68,6 +68,32 @@ impl PartitionPart {
     }
 }
 
+/// A `File` sink that forces its writes DURABLE to the device on `flush`
+/// (`sync_all` = fsync). The OTA streaming pipeline calls `flush()` once when the
+/// payload is fully written, so wrapping the device file in this guarantees the
+/// bytes are on the eMMC before seal hashes the partition back and before any
+/// post-flash reboot — a raw partition left with dirty pages wedges the node on
+/// reboot (the kernel flushes 133 MB on the way down). `BufWriter` calls this
+/// inner `flush` when the buffer drains, so a `BufWriter<SyncingWriter>` fsyncs on
+/// its terminal flush.
+struct SyncingWriter {
+    inner: std::fs::File,
+    path: String,
+}
+
+impl std::io::Write for SyncingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        // fsync the device — the whole point. sync_all (not just flush) forces
+        // dirty pages out to the eMMC so a subsequent reboot has nothing to drain.
+        self.inner.sync_all()?;
+        tracing::info!(device = %self.path, "partition bank: fsync'd device (payload durable)");
+        Ok(())
+    }
+}
+
 /// A [`BankProvider`] that streams raw-partition banks straight to their eMMC
 /// device. See the module docs.
 pub struct PartitionBankProvider<D: BlockDevice + Send + 'static> {
@@ -183,9 +209,20 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
             .map_err(|e| BankError::Failed(format!("open partition {device} for write: {e}")))?;
         tracing::info!(part = %name, device = %device, ?bank, "partition bank: streaming payload straight to device");
         // 4 MiB buffer — same rationale as IvdBankProvider (the eMMC write is the
-        // #1 upload stage post decrypt/decompress speedups).
+        // #1 upload stage post decrypt/decompress speedups). Wrapped in a
+        // SyncingWriter so the pipeline's terminal `flush()` forces the dirty
+        // pages to the eMMC (fsync). WITHOUT this the 133 MB sits in the kernel
+        // page cache: seal's hash-back reads through the cache and PASSES, but the
+        // bytes aren't durable — then the post-flash `reboot` wedges the node
+        // flushing 133 MB of dirty pages on the way down (observed on the rig:
+        // froze, no reboot, needed a power cycle). The old HostBankActivator did
+        // `Command::new("sync")` for exactly this; the redesign must not lose it.
         const WRITE_BUF: usize = 4 * 1024 * 1024;
-        Ok(Box::new(std::io::BufWriter::with_capacity(WRITE_BUF, file)))
+        let sink = SyncingWriter {
+            inner: file,
+            path: device.to_string(),
+        };
+        Ok(Box::new(std::io::BufWriter::with_capacity(WRITE_BUF, sink)))
     }
 
     /// Seal by hashing the written partition(s) BACK and signing an IVD manifest
