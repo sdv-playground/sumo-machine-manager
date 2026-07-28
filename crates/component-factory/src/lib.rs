@@ -184,6 +184,11 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// (e.g. RT/M7 surfaces `guest_state` via `m7loader -q`). VMs leave
     /// this empty and use vm-service over loopback HTTP instead.
     pub health_probes: HashMap<String, Arc<dyn component_mgr::backend::HealthProbe>>,
+    /// The node's per-boot nonce (`/vehicle/v1/status/x-sumo-boot-id`). When
+    /// `Some`, every built component surfaces it in `x-sumo-runtime.node_boot_id`
+    /// so the offboard flash gate has an unmissable reboot witness (see
+    /// `ComponentBackend::with_node_boot_id`). `None` in tests / vm-sovd.
+    pub node_boot_id: Option<String>,
     /// Per-component administrative-disable enactors, keyed by component id —
     /// for activator-backed components whose deactivation is deployment-
     /// specific (RT: the m7loader erase). VMs leave this empty: any bank-type
@@ -403,6 +408,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             if let Some(coord) = &deps.node_coordinator {
                 backend = backend.with_node_coordinator(coord.clone());
             }
+            if let Some(nb) = &deps.node_boot_id {
+                backend = backend.with_node_boot_id(nb.clone());
+            }
             if let Some(reload) = &deps.post_provision_reload {
                 backend = backend.with_post_provision_reload(reload.clone());
             }
@@ -541,6 +549,9 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             }
             if let Some(coord) = &deps.node_coordinator {
                 backend = backend.with_node_coordinator(coord.clone());
+            }
+            if let Some(nb) = &deps.node_boot_id {
+                backend = backend.with_node_boot_id(nb.clone());
             }
             if let Some(reload) = &deps.post_provision_reload {
                 backend = backend.with_post_provision_reload(reload.clone());

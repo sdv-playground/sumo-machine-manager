@@ -407,6 +407,16 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// RT component, wrapping `m7loader -q`). VMs leave this as None
     /// and use the vm-service HTTP path instead.
     health_probe: Option<Arc<dyn HealthProbe>>,
+    /// The node's per-boot nonce (`/vehicle/v1/status/x-sumo-boot-id`), injected
+    /// by the binary via [`with_node_boot_id`](Self::with_node_boot_id). Surfaced
+    /// in `x-sumo-runtime.node_boot_id` on EVERY component's status so the offboard
+    /// flash gate has an UNMISSABLE reboot witness: it changes on every node reboot
+    /// (fresh supernova process) and is durable state, unlike the transient SOVD
+    /// down→up window a fast reboot can slip through. The per-component heartbeat
+    /// `boot_id` (u32) stays as the VM/RT per-lifetime witness; this is the
+    /// node-wide one for no-heartbeat components (host-os). `None` in tests / where
+    /// unset (field simply omitted from the status then).
+    node_boot_id: Option<String>,
     /// In-memory cache of all NV-backed DID values. Populated at startup
     /// and updated atomically whenever NV is written (under the NV mutex
     /// + cache write lock). Reads bypass NV entirely — eliminates the
@@ -642,6 +652,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             hsm_crypto: None,
             wall_clock_floor: Arc::new(crate::sovd::time_floor::NoopWallClockFloor),
             health_probe: None,
+            node_boot_id: None,
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             manifest_describe: Mutex::new(HashMap::new()),
             verified_manifest_cache: Mutex::new(None),
@@ -666,6 +677,16 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Override the component display name (shown in SOVD component listing).
     pub fn with_display_name(mut self, name: String) -> Self {
         self.entity_info.name = name;
+        self
+    }
+
+    /// Inject the node's per-boot nonce (`/vehicle/v1/status/x-sumo-boot-id`).
+    /// Surfaced in `x-sumo-runtime.node_boot_id` so the offboard flash gate has an
+    /// unmissable reboot witness (changes every node reboot; durable, unlike the
+    /// transient down→up window a fast reboot slips through). The binary hands the
+    /// SAME nonce to every component.
+    pub fn with_node_boot_id(mut self, node_boot_id: String) -> Self {
+        self.node_boot_id = Some(node_boot_id);
         self
     }
 
@@ -4696,6 +4717,17 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
 
         let mut runtime = serde_json::Map::new();
         runtime.insert("boot_count".into(), serde_json::json!(boot_count));
+        // Node reboot witness for the offboard flash gate — present on EVERY
+        // component (it's a node-wide fact). The per-component heartbeat `boot_id`
+        // below only exists for VM/RT; host-os has none, so the gate would fall
+        // back to catching the transient SOVD down→up window, which a fast reboot
+        // misses → the gate times out despite a clean reboot. `node_boot_id`
+        // changes on every node reboot (fresh supernova process) and is durable —
+        // the gate compares it and can't miss the reboot. See
+        // tasks/health-gate-node-bootid.md.
+        if let Some(nb) = &self.node_boot_id {
+            runtime.insert("node_boot_id".into(), serde_json::json!(nb));
+        }
         if let Some(h) = &health {
             runtime.insert("hb_seq".into(), serde_json::json!(h.hb_seq));
             // Per-lifetime nonce — changes on every guest (re)boot (node reboot

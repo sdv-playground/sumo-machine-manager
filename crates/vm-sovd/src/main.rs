@@ -441,6 +441,9 @@ async fn main() {
         // dirs); the host OS bank's PartitionBankProvider is a host-mm concern.
         partition_parts: HashMap::new(),
         health_probes: HashMap::new(),
+        // vm-sovd's VMs report their own heartbeat boot_id; the node-wide nonce
+        // is a host-mm concern (surfaced there for the offboard reboot gate).
+        node_boot_id: None,
         // No deployment-specific deactivators in the dev vm-sovd binary — VM
         // components still get the generic vm-service-stop deactivator from
         // the factory itself (disableable by construction); rt-style injected
