@@ -437,6 +437,9 @@ async fn main() {
         hsm_keystore: Some(hsm_keystore_path.clone()),
         hsm_port,
         bank_activators,
+        // No raw-partition banks in the dev vm-sovd binary (VMs stage to bank
+        // dirs); the host OS bank's PartitionBankProvider is a host-mm concern.
+        partition_parts: HashMap::new(),
         health_probes: HashMap::new(),
         // No deployment-specific deactivators in the dev vm-sovd binary — VM
         // components still get the generic vm-service-stop deactivator from

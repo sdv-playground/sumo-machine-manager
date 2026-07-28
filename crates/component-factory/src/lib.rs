@@ -168,6 +168,17 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// Per-component bank activators, keyed by component id.
     /// Only components with an entry here get post-install activation.
     pub bank_activators: HashMap<String, Arc<dyn machine_mgr::BankActivator>>,
+    /// Per-component RAW-PARTITION bank maps, keyed by component id. A component
+    /// with an entry here is a raw-partition A/B bank: it gets a
+    /// [`PartitionBankProvider`] that streams the payload STRAIGHT to the eMMC
+    /// partition (no staging file, no whole-image RAM read) and computes its IVD
+    /// by hashing the partition back. Mutually exclusive with `bank_activators`
+    /// for the same id — the partition provider owns the write, so no
+    /// separate byte-copy activator is used. The host OS bank uses this today;
+    /// RT/bootloader are the future consumers. Empty ⇒ the file-staging
+    /// `IvdBankProvider` path (VMs, app, or an activator-backed bank).
+    pub partition_parts:
+        HashMap<String, Vec<component_mgr::partition_bank_provider::PartitionPart>>,
     /// Per-component synthetic health probes, keyed by component id.
     /// Used by activator-backed components that have no vm-service backing
     /// (e.g. RT/M7 surfaces `guest_state` via `m7loader -q`). VMs leave
@@ -267,6 +278,7 @@ pub fn resolve_bank_set_spec(
 /// and the override flag suppresses any later rebuild.
 fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
     deps: &FactoryDeps<D>,
+    component_id: &str,
     bank_set: BankSet,
     single_bank: bool,
     images_dir: Option<PathBuf>,
@@ -274,6 +286,36 @@ fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
     activator: Option<Arc<dyn machine_mgr::BankActivator>>,
 ) -> Option<Arc<dyn machine_mgr::BankProvider>> {
     let selector = deps.boot_selector.clone()?;
+
+    // RAW-PARTITION bank (host OS bank; RT/bootloader later): stream straight to
+    // the eMMC partition via PartitionBankProvider. The inner IvdBankProvider is
+    // built with activator = None — the partition provider owns the write, so
+    // activate() is the boot-selector flip only (no byte-copy). Mutually exclusive
+    // with a byte-copy activator for the same id.
+    if let Some(parts) = deps.partition_parts.get(component_id) {
+        let inner = component_mgr::bank_provider::IvdBankProvider::new(
+            deps.nv.clone(),
+            bank_set,
+            single_bank,
+            images_dir,
+            dir_name,
+            deps.hsm_provider.clone(),
+            None, // partition provider owns the write; no byte-copy activator
+            Some(selector),
+        );
+        let inner = match deps.hsm_crypto.clone() {
+            Some(crypto) => inner.with_hsm_crypto(crypto),
+            None => inner,
+        };
+        let provider = component_mgr::partition_bank_provider::PartitionBankProvider::new(
+            inner,
+            parts.clone(),
+            deps.hsm_provider.clone(),
+            deps.hsm_crypto.clone(),
+        );
+        return Some(Arc::new(provider));
+    }
+
     let provider = component_mgr::bank_provider::IvdBankProvider::new(
         deps.nv.clone(),
         bank_set,
@@ -346,6 +388,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             // active/target bank (NV/symlink fallback). App has no activator.
             if let Some(provider) = selector_aware_provider(
                 deps,
+                &spec.id,
                 bank_set,
                 false,
                 app_images_dir,
@@ -483,6 +526,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             // Mirrors the same activator the backend would use.
             if let Some(provider) = selector_aware_provider(
                 deps,
+                &spec.id,
                 bank_set,
                 spec.single_bank,
                 images_dir,
