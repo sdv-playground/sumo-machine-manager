@@ -60,6 +60,7 @@ pub mod install_router_diag;
 pub mod manifest;
 pub mod manifest_provider;
 pub mod ota;
+pub mod partition_bank_provider;
 pub mod streaming;
 pub mod suit_provider;
 pub mod vm_deactivator;

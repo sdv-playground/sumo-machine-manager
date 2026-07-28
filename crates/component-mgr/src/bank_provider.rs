@@ -323,7 +323,7 @@ fn ivd_identity_to_firmware(id: &hsm::ivd::IvdIdentity) -> FirmwareIdentity {
 /// Inverse of [`ivd_identity_to_firmware`] for the `seal` call: the engine
 /// hands a [`FirmwareIdentity`] (mapped from the SUIT `ImageMeta`), and the
 /// IVD manifest stores readable CBOR text strings (`""` for absent fields).
-fn firmware_to_ivd_identity(id: &FirmwareIdentity) -> hsm::ivd::IvdIdentity {
+pub(crate) fn firmware_to_ivd_identity(id: &FirmwareIdentity) -> hsm::ivd::IvdIdentity {
     let s = |o: &Option<String>| o.clone().unwrap_or_default();
     hsm::ivd::IvdIdentity {
         name: s(&id.name),
