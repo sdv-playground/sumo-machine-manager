@@ -473,9 +473,16 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
 
             let images_dir = spec.storage_path.clone();
 
-            // Components with a bank activator (RT, co-processor) are not
-            // VMs — they don't need vm-service notifications or symlink flips.
-            let vm_service = if deps.bank_activators.contains_key(&spec.id) {
+            // Components with a bank activator (RT, co-processor) OR a raw-partition
+            // map (the host OS bank — PartitionBankProvider) are NOT VMs: they don't
+            // have a vm-service backing, so they must not be given vm_service_addr.
+            // Otherwise read_entity_status queries vm-service for a VM of this id
+            // (which doesn't exist) → notReady, and the flash health gate fails even
+            // on a healthy node. (Regression when host moved from HostBankActivator
+            // in bank_activators to partition_parts — it lost its "not a VM" marker.)
+            let vm_service = if deps.bank_activators.contains_key(&spec.id)
+                || deps.partition_parts.contains_key(&spec.id)
+            {
                 None
             } else {
                 deps.vm_service_addr.clone()
