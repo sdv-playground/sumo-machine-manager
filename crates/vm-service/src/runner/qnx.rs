@@ -445,9 +445,41 @@ impl VmRunner for QnxRunner {
             launch_config.display(),
             bank_dir.display()
         );
-        let child = Command::new("qvm")
-            .current_dir(bank_dir)
-            .arg(format!("@{}", launch_config.display()))
+        // Route qvm's stdout/stderr to a PER-VM console file — NOT inherited.
+        // qvm's stdout carries the guest's serial/virtio console (kernel + any
+        // service that writes to /dev/console, e.g. an `autostart.sh` layer that
+        // bypasses svclog). Inheriting our fds funnels that guest console into the
+        // MM's own stdout, which start-managed.sh redirects to supernova.log — so
+        // guest heartbeats like "[teesa-vf] alive (tick N)" pollute the HOST log
+        // and wreck its per-line timestamps. The guest's REAL logs go via svclog →
+        // the in-guest log-agent (surfaced over SOVD §7.21); this console file is a
+        // separate best-effort capture, per VM, for boot-time / no-agent debugging.
+        // Best-effort: if the file won't open we fall back to inherited fds rather
+        // than block the launch (a missing /mnt/common-rw/log must not stop a VM).
+        let console_path = format!("/mnt/common-rw/log/{name}-console.log");
+        let console = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&console_path);
+        let mut cmd = Command::new("qvm");
+        cmd.current_dir(bank_dir)
+            .arg(format!("@{}", launch_config.display()));
+        match console {
+            Ok(f) => {
+                // stderr shares the same file (dup) so both guest console streams land together.
+                let f2 = f.try_clone().map_err(|e| {
+                    RunnerError::ProcessFailed(format!("VM {name}: dup console fd: {e}"))
+                })?;
+                cmd.stdout(std::process::Stdio::from(f))
+                    .stderr(std::process::Stdio::from(f2));
+                tracing::info!(vm = %name, console = %console_path, "qvm console → per-VM file (kept out of the host log)");
+            }
+            Err(e) => {
+                tracing::warn!(vm = %name, console = %console_path, error = %e,
+                    "could not open per-VM console file — qvm console falls back to inherited fds (may leak into the host log)");
+            }
+        }
+        let child = cmd
             .spawn()
             .map_err(|e| RunnerError::ProcessFailed(format!("qvm: {e}")))?;
 
