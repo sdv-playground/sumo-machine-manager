@@ -6536,13 +6536,16 @@ fn host_file_logs_paged(globs: &[String], filter: &LogFilter, boot_epoch: u64) -
                     continue;
                 }
             }
+            // Per-line svclog stamp when present (else epoch "unknown"); the
+            // message drops the stamp when one was parsed. See line_timestamp.
+            let (ts, msg) = line_timestamp(&line);
             items.push(LogEntry {
                 // Same content-addressed id scheme as host_file_logs so a paged
                 // line re-resolves via get_log identically.
-                id: line_log_id(&source, mtime, &line),
-                timestamp: mtime,
+                id: line_log_id(&source, ts, msg),
+                timestamp: ts,
                 priority: LogPriority::Info,
-                message: line,
+                message: msg.to_string(),
                 source: Some(source.clone()),
                 pid: None,
                 fields: None,
@@ -6685,6 +6688,29 @@ fn file_mtime(path: &std::path::Path) -> chrono::DateTime<Utc> {
         .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH)
 }
 
+/// Split a host log line into its own timestamp and the remaining message.
+///
+/// `svclog` (the guest service-log writer) prepends an ISO-8601 UTC stamp
+/// (`YYYY-MM-DDThh:mm:ssZ `) to every line it writes, so a piped source carries a
+/// real PER-LINE time. When that leading stamp parses, use it (and drop it from
+/// the message — the SOVD `timestamp` field carries it instead).
+///
+/// When a line has NO self-timestamp (e.g. supernova's own un-piped stderr) we do
+/// NOT substitute the file `mtime`: mtime is when the file was last written, not
+/// when the line was logged, so it's worthless as a line time and — being shared
+/// by every mtime-stamped line — reproduces the "all timestamps identical" bug.
+/// Instead we return the UNIX epoch as an explicit "unknown" sentinel (the SOVD
+/// `timestamp` is a non-optional `DateTime<Utc>`, so epoch is the honest in-type
+/// way to say "no real time"), keeping the whole line as the message.
+fn line_timestamp(line: &str) -> (chrono::DateTime<Utc>, &str) {
+    if let Some((head, rest)) = line.split_once(' ') {
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(head) {
+            return (ts.with_timezone(&Utc), rest);
+        }
+    }
+    (chrono::DateTime::<Utc>::UNIX_EPOCH, line)
+}
+
 /// Read forward from `start` in `path`, returning up to `max` COMPLETE lines and
 /// the byte offset AFTER the last complete line consumed. A torn trailing partial
 /// line (no terminating `\n`) is NOT consumed — its bytes are left for the next
@@ -6770,14 +6796,17 @@ fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
                     continue;
                 }
             }
+            // Per-line svclog stamp when present (else epoch "unknown"); the
+            // message drops the stamp when one was parsed. See line_timestamp.
+            let (ts, msg) = line_timestamp(&line);
             entries.push(LogEntry {
                 // Stable, content-addressed id so get_log/get_log_content can
                 // re-find this line by re-listing + matching (no server state,
                 // stable across re-list while the line exists).
-                id: line_log_id(&source, mtime, &line),
-                timestamp: mtime,
+                id: line_log_id(&source, ts, msg),
+                timestamp: ts,
                 priority: LogPriority::Info,
-                message: line,
+                message: msg.to_string(),
                 source: Some(source.clone()),
                 pid: None,
                 fields: None,
@@ -8467,6 +8496,70 @@ mod bank_provider_injection_tests {
             b.delete_log(&one.id).await,
             Err(BackendError::NotSupported(_))
         ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Per-line timestamps: a line carrying svclog's leading ISO-8601 stamp gets
+    /// THAT time (and the stamp is stripped from the message); a line without one
+    /// gets the epoch "unknown" sentinel — NOT the file mtime, which would make
+    /// every unstamped line share one bogus time (the old "all timestamps equal"
+    /// bug). Both readers (tailed `get_logs`, paged `get_logs_paged`) agree.
+    #[tokio::test]
+    async fn host_lines_use_per_line_stamp_else_epoch() {
+        let dir = std::env::temp_dir().join(format!("cm-lts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two stamped lines (distinct times) + one bare line, in file order.
+        std::fs::write(
+            dir.join("svc.log"),
+            "2026-07-25T10:00:00Z first stamped\n\
+             2026-07-25T10:00:05Z second stamped\n\
+             bare line no stamp\n",
+        )
+        .unwrap();
+        let b = backend_with_logs(LogSource::HostFiles {
+            globs: vec![format!("{}/*.log", dir.display())],
+        });
+
+        let epoch = chrono::DateTime::<Utc>::UNIX_EPOCH;
+        // Order-independent (readers may not preserve file order): look up by the
+        // stripped message.
+        let check = |entries: &[LogEntry]| {
+            assert_eq!(entries.len(), 3);
+            let ts = |msg: &str| {
+                entries
+                    .iter()
+                    .find(|e| e.message == msg)
+                    .unwrap_or_else(|| panic!("no entry with message {msg:?}"))
+                    .timestamp
+            };
+            // Stamp parsed → that time, message stripped of the stamp.
+            assert_eq!(
+                ts("first stamped").to_rfc3339(),
+                "2026-07-25T10:00:00+00:00"
+            );
+            assert_eq!(
+                ts("second stamped").to_rfc3339(),
+                "2026-07-25T10:00:05+00:00"
+            );
+            // Distinct times — NOT collapsed to one mtime.
+            assert_ne!(ts("first stamped"), ts("second stamped"));
+            // No stamp → epoch sentinel, whole line kept as-is.
+            assert_eq!(ts("bare line no stamp"), epoch);
+        };
+
+        // Tailed reader.
+        let listed = b.get_logs(&LogFilter::default()).await.unwrap();
+        check(&listed);
+        // Paged reader agrees (large page → all three in one page).
+        let paged = b
+            .get_logs_paged(&LogFilter {
+                limit: Some(100),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        check(&paged.items);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
