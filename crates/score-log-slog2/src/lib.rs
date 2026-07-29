@@ -1,33 +1,34 @@
 //! QNX slog2 recorder for Eclipse S-CORE `score_log`.
 //!
-//! [`Slog2Sink`] is an `impl score_log::Log` that forwards each record to the
-//! host's `slogger2` OS bus via `slog2c`. That is the emit half of the
-//! bus-decoupled host log pipeline: supernova (through the `score-log-tracing`
-//! bridge, or `score_log` macros directly) emits here, and SOVD §7.21 reads the
-//! SAME slogger2 buffer back independently (`LogSource::Slog2`) — producer and
-//! reader never share an object, the buffer is kernel-owned (survives a supernova
-//! crash), and the host's driver/eMMC telemetry rides the same bus for free. See
+//! [`Slog2Sink`] is an `impl score_log::Log` that forwards each record to the QNX
+//! `slogger2` ring buffer (the system log) via `slog2c`. Both host binaries and
+//! guest services use it — the buffer set is named after the caller's `context`,
+//! so a reader (`slog2info -b <context>`, or SOVD's `LogSource::Slog2`) can find a
+//! given process's log, and the buffer is kernel-owned (survives a process crash).
+//! For supernova this is the emit half of the bus-decoupled host log pipeline;
+//! for a guest service it's "log the normal QNX way." See
 //! `tasks/host-log-pipeline-design.md`.
 //!
 //! QNX-only: on `target_os = "nto"` this links `libslog2` and registers a buffer;
 //! elsewhere (Linux dev / QEMU container) it is a no-op stub so the crate still
-//! builds — the container uses S-CORE's `stdout_logger` instead.
+//! builds — those targets use S-CORE's `stdout_logger` instead.
 
 use score_log::{Level, Log, Metadata, Record};
 
 /// Build + install the slog2 recorder as the `score_log` global logger.
 ///
-/// `context` is the default DLT-style context tag (≤4 ASCII chars used by
-/// slog2/DLT convention). `max` is the level filter to install via
-/// [`score_log::set_max_level`].
+/// `context` is the DLT-style context tag: it names the slog2 buffer set (so the
+/// process's log is findable as `slog2info -b <context>`) and tags every record.
+/// `max` is the level filter to install via [`score_log::set_max_level`].
 ///
-/// On non-QNX targets this installs nothing and returns `Ok(())` — the caller
-/// (e.g. a container build) is expected to install `stdout_logger` instead.
+/// On non-QNX targets this installs a sink whose emit is a no-op and returns
+/// `Ok(())` — callers that want visible output there use `stdout_logger` instead
+/// (the `sumo-log` helper picks per target).
 pub fn install(context: &str, max: score_log::LevelFilter) -> Result<(), InstallError> {
     let sink = Slog2Sink::new(context);
     #[cfg(target_os = "nto")]
     {
-        imp::register();
+        imp::register(context);
     }
     score_log::set_global_logger(Box::new(sink)).map_err(|_| InstallError::AlreadySet)?;
     score_log::set_max_level(max);
@@ -281,15 +282,17 @@ mod imp {
         }
     }
 
-    /// Register a "SNOVA" buffer set with slogger2. Idempotent; failure (e.g.
+    /// Register a `context`-named buffer set with slogger2 (so the process's log
+    /// is findable as `slog2info -b <context>`). Idempotent; failure (e.g.
     /// slogger2 not running) leaves the buffer null and `send` becomes a no-op.
-    pub(super) fn register() {
+    pub(super) fn register(context: &str) {
         if !BUFFER.load(Ordering::Relaxed).is_null() {
             return;
         }
         // Leak the CStrings: slog2_register stores the pointers and dereferences
-        // them for the process lifetime.
-        let Ok(set_name) = CString::new("SNOVA") else {
+        // them for the process lifetime. Empty context → a safe fallback name.
+        let name = if context.is_empty() { "sumo" } else { context };
+        let Ok(set_name) = CString::new(name) else {
             return;
         };
         let Ok(buf_name) = CString::new("default") else {
@@ -369,8 +372,8 @@ mod tests {
     fn sink_log_is_a_noop_off_qnx_but_runs_the_render_path() {
         // On Linux, emit() is a no-op; assert log() doesn't panic and enabled/
         // context behave.
-        let sink = Slog2Sink::new("SNOVA");
-        assert_eq!(sink.context(), "SNOVA");
-        assert!(sink.enabled(&Metadata::new(Level::Info, "SNOVA")));
+        let sink = Slog2Sink::new("svc");
+        assert_eq!(sink.context(), "svc");
+        assert!(sink.enabled(&Metadata::new(Level::Info, "svc")));
     }
 }

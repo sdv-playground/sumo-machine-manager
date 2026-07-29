@@ -14,7 +14,7 @@ fn main() {
         Ok("aarch64") => "aarch64le",
         Ok("x86_64") => "x86_64",
         Ok("arm") => "armle-v7",
-        other => panic!("host-log-slog2: unhandled QNX target arch {other:?}"),
+        other => panic!("score-log-slog2: unhandled QNX target arch {other:?}"),
     };
     println!("cargo:rustc-link-search=native={qnx_target}/{arch}/lib");
     // Dynamic link (the SDP ships libslog2.so, no static archive).

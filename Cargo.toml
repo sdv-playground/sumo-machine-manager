@@ -26,7 +26,7 @@ members = [
     "crates/host-metrics",
     "crates/log-rotate",
     "crates/score-log-tracing",
-    "crates/host-log-slog2",
+    "crates/score-log-slog2",
     "crates/puller",
     "crates/hsm-rustls",
     "crates/vhsm-proto",

@@ -1,0 +1,12 @@
+[package]
+name = "score-log-slog2"
+version = "0.1.0"
+edition = "2021"
+description = "QNX slog2 recorder for Eclipse S-CORE score_log: Slog2Sink is an `impl score_log::Log` that forwards records to the slogger2 ring buffer (the QNX system log) via slog2c. Used by host binaries (supernova) AND guest services alike — the buffer set is named after the caller's context. QNX-only (cfg target_os=nto); a no-op stub elsewhere so the crate builds on Linux. See tasks/host-log-pipeline-design.md."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+score_log = { git = "https://github.com/eclipse-score/baselibs.git", branch = "main" }
