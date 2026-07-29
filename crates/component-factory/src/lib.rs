@@ -95,6 +95,15 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub host_dump_dir: Option<String>,
 
+    /// §7.21 log reads — the QNX `slogger2` ring (the host system log), read via
+    /// `platform_log::read_slog2`. `true` for the host component on QNX: it serves
+    /// supernova's own records (emitted through score-log-slog2) AND the OS
+    /// driver/eMMC telemetry, decoupled from the producer via the kernel-owned
+    /// ring — replacing the `host_log_globs` tail of supernova.log. Additive with
+    /// the above; a no-op read off QNX. STANDARD (line) logs.
+    #[serde(default)]
+    pub host_slog2: bool,
+
     /// §7.15 scripts (developer-registered TESTS): the in-guest test-agent base
     /// URL, e.g. `http://10.0.101.2:9310` (the guest-hal layer runs the agent).
     /// `Some` → `capabilities` expose a `scripts` collection proxied from its
@@ -131,6 +140,9 @@ impl ComponentSpec {
         }
         if let Some(dir) = &self.host_dump_dir {
             sources.push(LogSource::HostDumps { dir: dir.clone() });
+        }
+        if self.host_slog2 {
+            sources.push(LogSource::Slog2);
         }
         sources
     }
