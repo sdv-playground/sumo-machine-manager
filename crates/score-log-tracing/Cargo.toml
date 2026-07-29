@@ -1,0 +1,21 @@
+[package]
+name = "score-log-tracing"
+version = "0.1.0"
+edition = "2021"
+description = "A tracing_subscriber::Layer that forwards `tracing` events into an Eclipse S-CORE `score_log` global logger. Lets host binaries that already use `tracing` (supernova, vm-service, …) adopt score_log as the logging facade without rewriting call sites — the score_log recorder (stdout_logger, or our Slog2Sink) then decides where records land. See tasks/host-log-pipeline-design.md."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The S-CORE logging facade (adopted as our producer contract — see the design
+# doc). Plain cargo git-dep; no Bazel. baselibs is a cargo workspace, score_log
+# resolves its .workspace inheritance fine as a git-dep.
+score_log = { git = "https://github.com/eclipse-score/baselibs.git", branch = "main" }
+
+tracing-core = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+[dev-dependencies]
+tracing = "0.1"

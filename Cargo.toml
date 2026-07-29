@@ -25,6 +25,7 @@ members = [
     "crates/component-factory",
     "crates/host-metrics",
     "crates/log-rotate",
+    "crates/score-log-tracing",
     "crates/puller",
     "crates/hsm-rustls",
     "crates/vhsm-proto",
