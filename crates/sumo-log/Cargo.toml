@@ -1,0 +1,20 @@
+[package]
+name = "sumo-log"
+version = "0.1.0"
+edition = "2021"
+description = "Fleet-wide logging init for sumo services. One `sumo_log::init(context)` call installs an Eclipse S-CORE score_log recorder chosen by env (SUMO_LOG_SINK: auto|stdout|slog2, SUMO_LOG_LEVEL). Apps pass only their context tag; level/format/destination policy lives here, not in each app — so every service behaves the same and the fleet retargets by env, not code edits."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The S-CORE facade + its stdout recorder (plain cargo git-deps from
+# eclipse-score/baselibs; no Bazel).
+score_log = { git = "https://github.com/eclipse-score/baselibs.git", branch = "main" }
+stdout_logger = { git = "https://github.com/eclipse-score/baselibs.git", branch = "main" }
+# Our slog2 recorder — logs to the QNX slogger2 ring (the "normal QNX way"). It is
+# a no-op stub off QNX, so this dep is harmless on Linux; the crate builds
+# everywhere and `init` only routes to it when asked / on QNX. Sibling crate in
+# this workspace → path dep.
+score-log-slog2 = { path = "../score-log-slog2" }
