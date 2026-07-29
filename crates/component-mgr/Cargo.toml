@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 nv-store = { path = "../nv-store" }
 machine-mgr = { path = "../machine-mgr" }
+# Shared log readers (platform-integration). Provides read_slog2 for the host's
+# LogSource::Slog2 — the QNX slogger2 ring reader (supernova + driver telemetry).
+platform-log = { path = "../platform-integration/platform-log" }
 sha2 = "0.10"
 crc32fast = "1"
 bytes = "1"

@@ -276,6 +276,13 @@ pub enum LogSource {
     /// `HostFiles` (which tails text lines), this exposes whole files as
     /// discrete downloadable entries — the message-passing pattern.
     HostDumps { dir: String },
+    /// The QNX `slogger2` ring — the host system log. Reads supernova's own
+    /// records (emitted via score-log-slog2) AND the OS driver/eMMC telemetry
+    /// (devb_sdmmc, CAM) through `platform_log::read_slog2`, decoupled from the
+    /// producer via the kernel-owned ring. Produces STANDARD (line) entries with
+    /// real per-record timestamps + severities — the host analogue of a guest's
+    /// `GuestAgent` journald source. QNX-only in effect (empty off-QNX).
+    Slog2,
 }
 
 /// Per-component configuration for ComponentBackend behavior.
@@ -822,6 +829,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 }
                 LogSource::HostFiles { globs } => all.extend(host_file_logs(globs, &filter)),
                 LogSource::HostDumps { dir } => all.extend(host_dump_logs(dir, &filter)),
+                LogSource::Slog2 => all.extend(slog2_logs(&filter)),
             }
         }
         all.into_iter().find(|e| e.id == log_id)
@@ -2743,6 +2751,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 },
                 LogSource::HostFiles { globs } => entries.extend(host_file_logs(globs, filter)),
                 LogSource::HostDumps { dir } => entries.extend(host_dump_logs(dir, filter)),
+                LogSource::Slog2 => entries.extend(slog2_logs(filter)),
             }
         }
         // Merge order: newest first (mirrors the gateway + single-source shape).
@@ -2984,6 +2993,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 // HostDumps carries its own §7.21 `dump:host:*` catalog — not a
                 // bulk-data source here (see the scope note above).
                 LogSource::HostDumps { .. } => {}
+                // Slog2 is a live line stream (like HostFiles' tails), not a set of
+                // downloadable whole files — no bulk-data catalog contribution.
+                LogSource::Slog2 => {}
             }
         }
 
@@ -6760,6 +6772,59 @@ fn read_lines_from(
 /// Host-local file logs: bounded tails of every file matching the globs.
 /// Only `dir/prefix*suffix` patterns (one `*`, filename position) — a
 /// literal path matches itself. Lines carry the file's mtime; priority
+/// Read the QNX `slogger2` ring (the [`LogSource::Slog2`] host source) into
+/// `LogEntry`s. Maps the SOVD [`LogFilter`] to a `platform_log::LogQuery` (pushing
+/// source/pattern/tail down; since/until as the server-resolved bare-seconds the
+/// reader expects — priority handled here since slog2's scale differs), calls the
+/// shared `read_slog2`, then maps records → entries with the SAME content-addressed
+/// id scheme as host/guest lines so `get_log` re-resolves without server state.
+/// Off QNX `read_slog2` is empty, so this yields nothing (a Linux host would use a
+/// journald source instead).
+fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
+    let q = platform_log::LogQuery {
+        tail: filter.tail.or(filter.limit),
+        source: filter.source.clone(),
+        pattern: filter.pattern.clone(),
+        // slog2 severities don't line up 1:1 with SOVD "this level and above";
+        // apply the priority filter below against the mapped LogPriority instead.
+        priority: None,
+        // The reader parses bare unix-seconds (the END-relative form the server
+        // resolves to); pass the filter's absolute times as seconds.
+        since: filter.since.map(|t| t.timestamp().to_string()),
+        until: filter.until.map(|t| t.timestamp().to_string()),
+        after: None,
+    };
+    let records = platform_log::read_slog2(&q);
+    let mut entries: Vec<LogEntry> = records
+        .into_iter()
+        .map(|r| {
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&r.timestamp)
+                .map(|t| t.with_timezone(&Utc))
+                .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH);
+            LogEntry {
+                id: line_log_id(&r.source, timestamp, &r.message),
+                timestamp,
+                priority: priority_from_name(&r.priority),
+                message: r.message,
+                source: Some(r.source),
+                pid: None,
+                fields: None,
+                log_type: None,
+                size: None,
+                status: None,
+                href: None,
+                metadata: None,
+            }
+        })
+        .collect();
+    // Priority filter is "this level and above" (§7.21): lower enum value = more
+    // severe, so keep entries at or above the requested threshold.
+    if let Some(p) = filter.priority {
+        entries.retain(|e| e.priority <= p);
+    }
+    entries
+}
+
 /// is `Info` (host logs are unstructured text).
 fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
     const PER_FILE_CAP: u64 = 64 * 1024;
@@ -8001,6 +8066,26 @@ mod bank_provider_injection_tests {
         assert!(!b.capabilities().logs);
         let got = b.get_logs(&LogFilter::default()).await.unwrap();
         assert!(got.is_empty());
+    }
+
+    /// A `Slog2` source advertises the `logs` capability but NOT `bulk_data`
+    /// (it's a live line stream, not downloadable files — like a guest agent's
+    /// line view). Off QNX `platform_log::read_slog2` is an empty stub, so the
+    /// read degrades gracefully to no entries; on the QNX rig it reads the
+    /// slogger2 ring. Either way the route answers 200, never "not supported".
+    #[tokio::test]
+    async fn slog2_source_advertises_logs_not_bulk_data() {
+        let b = backend_with_logs(LogSource::Slog2);
+        assert!(b.capabilities().logs, "Slog2 turns the logs capability on");
+        assert!(
+            !b.capabilities().bulk_data,
+            "Slog2 is a line stream — no bulk-data file catalog"
+        );
+        // Reads succeed (empty via the off-QNX stub here); never an error.
+        let got = b.get_logs(&LogFilter::default()).await.unwrap();
+        assert!(got.is_empty(), "off-QNX stub yields no records");
+        let page = b.get_logs_paged(&LogFilter::default()).await.unwrap();
+        assert!(page.items.is_empty() && page.next_cursor.is_none());
     }
 
     fn backend_with_logs(source: LogSource) -> ComponentBackend<MemBlockDevice> {
