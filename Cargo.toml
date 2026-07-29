@@ -25,10 +25,18 @@ members = [
     "crates/component-factory",
     "crates/host-metrics",
     "crates/log-rotate",
-    "crates/score-log-tracing",
-    "crates/score-log-slog2",
-    "crates/sumo-log",
-    "crates/platform-log",
+    # --- platform-integration tier (NOT machine-manager internals) -----------
+    # Shared logging glue used by BOTH the host (supernova + host binaries) and
+    # the guest (services via sumo-log; the log-agent over platform-log). Lives
+    # here because sumo-mm is the only upstream both host and guest already
+    # git-dep (like vm-wire / hsm-contract). Candidate to extract into a
+    # dedicated `platform-integration` repo later — see
+    # tasks/platform-integration-grouping.md.
+    "crates/score-log-tracing", # tracing → score_log bridge
+    "crates/score-log-slog2",   # score_log → QNX slog2 recorder
+    "crates/sumo-log",          # fleet logging init (env-selected recorder)
+    "crates/platform-log",      # shared log readers (files, journald, bulk-data)
+    # -------------------------------------------------------------------------
     "crates/puller",
     "crates/hsm-rustls",
     "crates/vhsm-proto",
