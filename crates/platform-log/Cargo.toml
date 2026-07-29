@@ -1,0 +1,15 @@
+[package]
+name = "platform-log"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-integration: shared log READING for sumo. Types (LogRecord/FileEntry/LogQuery/PagedLogs) + readers for the platform-native log sources — QNX /dev/shmem+/var/log files, Linux journald (native sd_journal with pushed-down filters, journalctl fallback), and bulk-data file catalog/download. Consumed by the guest log-agent (an HTTP wrapper over it) AND the host (component-mgr LogSource::Slog2, a future Linux host). Dep-light + QNX/Linux-cross-safe. See tasks/platform-integration-grouping.md."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# The journald CLI fallback parses `journalctl -o json`; the native sd_journal
+# reader doesn't need it, but the fallback path does.
+serde_json = "1"

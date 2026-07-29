@@ -28,6 +28,7 @@ members = [
     "crates/score-log-tracing",
     "crates/score-log-slog2",
     "crates/sumo-log",
+    "crates/platform-log",
     "crates/puller",
     "crates/hsm-rustls",
     "crates/vhsm-proto",
