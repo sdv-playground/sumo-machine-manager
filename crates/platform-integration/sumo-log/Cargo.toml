@@ -17,4 +17,4 @@ stdout_logger = { git = "https://github.com/eclipse-score/baselibs.git", branch 
 # a no-op stub off QNX, so this dep is harmless on Linux; the crate builds
 # everywhere and `init` only routes to it when asked / on QNX. Sibling crate in
 # this workspace → path dep.
-score-log-slog2 = { path = "../score-log-slog2" }
+score-log-slog2 = { path = "../score-log-slog2" } # sibling in platform-integration/
