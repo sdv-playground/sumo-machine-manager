@@ -1,0 +1,29 @@
+[package]
+name = "host-log-sink"
+version = "0.1.0"
+edition = "2021"
+description = "Concrete host-log sinks + readers behind the host-log-contract traits. Portable default = StdoutRingSink (JSON-to-stdout for container/cloud collection + a bounded in-process ring the reader serves to SOVD §7.21). A tracing Layer feeds records in. QNX slog2 + a durable file backing (log-rotate) are feature-gated add-ons. See tasks/host-log-pipeline-design.md."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+# Bridge `tracing` events into a LogSink (the `TracingBridge` Layer + a helper to
+# install it). Pulls tracing-subscriber. On by default for host binaries; a
+# minimal-dep implementer can leave it off and call `LogSink::emit` directly.
+tracing-bridge = ["dep:tracing", "dep:tracing-subscriber", "dep:tracing-core"]
+
+[dependencies]
+host-log-contract = { path = "../host-log-contract", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tracing = { version = "0.1", optional = true }
+tracing-core = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["registry"], optional = true }
+
+[dev-dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"] }

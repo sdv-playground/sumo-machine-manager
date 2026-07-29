@@ -1,0 +1,18 @@
+[package]
+name = "host-log-contract"
+version = "0.1.0"
+edition = "2021"
+description = "Thin contract for the host log pipeline: the LogSink + HostLogReader traits and the LogRecord type. Trait/types only — no tracing, no async, dep-light so any producer (host binaries) or reader can implement it without pulling the impl stack. Concrete sinks live in host-log-sink. See tasks/host-log-pipeline-design.md + tasks/reusable-component-convention.md."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Serialize LogRecord (JSON, offboard bundles). Kept OPTIONAL so the contract
+# stays dep-light for minimal-dep implementers (guest agents carry near-zero
+# deps). host-log-sink enables it.
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
