@@ -647,6 +647,26 @@ mod tests {
 #[cfg(target_os = "linux")]
 mod journal_native;
 
+// Native QNX slog2 reader — libslog2parse FFI over the slogger2 ring.
+#[cfg(target_os = "nto")]
+mod slog2_reader;
+
+/// Read the QNX `slogger2` ring (the system log) into records — the HOST's log
+/// source (supernova's own records + driver/eMMC telemetry), read back over SOVD
+/// §7.21 by component-mgr's `LogSource::Slog2`. Distinct from `collect` (which is
+/// the guest log-agent's file/journald path): the host explicitly asks for slog2.
+///
+/// QNX-only. On other targets there is no slog2 ring, so this returns an empty
+/// vec (the crate still builds; a Linux host would use the journald reader).
+#[cfg(target_os = "nto")]
+pub fn read_slog2(q: &LogQuery) -> Vec<LogRecord> {
+    slog2_reader::read(q).unwrap_or_default()
+}
+#[cfg(not(target_os = "nto"))]
+pub fn read_slog2(_q: &LogQuery) -> Vec<LogRecord> {
+    Vec::new()
+}
+
 /// QNX: plain-file logs. `/dev/shmem/*.log` is where the OS layer hook writes
 /// every declared service's output; `/var/log/*` is the OS's own.
 #[cfg(target_os = "nto")]
