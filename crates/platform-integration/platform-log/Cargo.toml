@@ -8,6 +8,15 @@ license = "MIT"
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Native journald reader on Linux (sd_journal FFI, indexed pushed-down filters).
+# OFF by default: it hard-links libsystemd, which a cross-build sysroot (e.g. CI's
+# aarch64-linux-gnu) may not have. The default build uses the `journalctl` CLI
+# fallback (present on any systemd guest, no link) — same records, filters applied
+# in-process. Enable this only where libsystemd is in the target sysroot and native
+# indexed filtering is wanted.
+journald-native = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 # The journald CLI fallback parses `journalctl -o json`; the native sd_journal

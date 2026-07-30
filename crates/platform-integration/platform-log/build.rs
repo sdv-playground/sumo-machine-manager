@@ -16,8 +16,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=QNX_TARGET");
     match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("linux") => {
-            // Native sd_journal reader — verbatim soname so no -dev symlink needed.
-            println!("cargo:rustc-link-lib=dylib:+verbatim=libsystemd.so.0");
+            // Native sd_journal reader — ONLY when the `journald-native` feature is
+            // enabled. Otherwise link nothing: the default build uses the journalctl
+            // CLI fallback (no libsystemd needed), so a cross-build sysroot without
+            // libsystemd still links. Verbatim soname → no -dev symlink needed.
+            if std::env::var("CARGO_FEATURE_JOURNALD_NATIVE").is_ok() {
+                println!("cargo:rustc-link-lib=dylib:+verbatim=libsystemd.so.0");
+            }
         }
         Ok("nto") => {
             // Native slog2 reader. QNX_TARGET is set by qnxsdp-env.sh; libs under

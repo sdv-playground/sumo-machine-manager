@@ -643,8 +643,10 @@ mod tests {
 // sd_journal, journalctl fallback) with /var/log files as the fallback.
 // ===========================================================================
 
-// Native journald reader (Linux only) — sd_journal FFI with pushed-down filters.
-#[cfg(target_os = "linux")]
+// Native journald reader — sd_journal FFI, indexed pushed-down filters. Behind the
+// `journald-native` feature (it links libsystemd, which a cross-build sysroot may
+// lack); without it the journalctl CLI fallback is used.
+#[cfg(all(target_os = "linux", feature = "journald-native"))]
 mod journal_native;
 
 // Native QNX slog2 reader — libslog2parse FFI over the slogger2 ring.
@@ -792,7 +794,7 @@ pub fn collect_page(q: &LogQuery) -> PagedLogs {
 /// One FORWARD page from journald: native `sd_journal` first, then `journalctl`.
 #[cfg(not(target_os = "nto"))]
 fn journald_page(q: &LogQuery) -> (Vec<LogRecord>, Option<String>) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "journald-native"))]
     if let Some(res) = journal_native::journald_page(q) {
         return res;
     }
@@ -952,7 +954,7 @@ fn log_source_of(path: &std::path::Path) -> String {
 /// `journalctl` CLI fallback.
 #[cfg(not(target_os = "nto"))]
 fn journald(q: &LogQuery) -> Vec<LogRecord> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "journald-native"))]
     if let Some(recs) = journal_native::journald(q) {
         return recs;
     }
