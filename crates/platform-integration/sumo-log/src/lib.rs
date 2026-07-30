@@ -1,17 +1,27 @@
 //! Fleet-wide logging init for sumo services.
 //!
-//! Every service logs the SAME way by calling one function at startup:
+//! Every service logs the SAME way by calling ONE function at startup. Which one
+//! depends on how the service emits:
 //!
-//! ```ignore
-//! fn main() {
-//!     sumo_log::init("teesa-vf");   // the only per-app argument: its context tag
-//!     score_log::info!("alive");    // then just use the score_log macros
-//! }
-//! ```
+//! - **`tracing` producers (the standard — nearly all code, plus deps like
+//!   axum/hyper):** call [`init_tracing`]. Service code keeps `tracing::info!`;
+//!   `init_tracing` installs the platform recorder AND the tracing→score_log
+//!   bridge, so those events (ours and our dependencies') are captured.
+//!   ```ignore
+//!   fn main() {
+//!       sumo_log::init_tracing("teesa-vf"); // only per-app arg: its context tag
+//!       tracing::info!("alive");            // then just standard tracing macros
+//!   }
+//!   ```
+//! - **direct `score_log` callers (rare — e.g. a minimal qualified component that
+//!   must keep unqualified `tracing` out of its path):** call [`init`], then use
+//!   `score_log::info!`.
 //!
-//! The service supplies ONLY its `context` tag. Everything else — level, format,
-//! and which recorder (destination) is installed — is fleet policy that lives
-//! HERE, not hardcoded in each app. That means:
+//! Either way the service supplies ONLY its `context` tag. Everything else — the
+//! producer→sink CAPTURE wiring, level, format, and which recorder (destination)
+//! is installed — is fleet policy that lives HERE, not in each app. `tracing` is
+//! the producer; score_log/slog2/stdout is the sink; THIS is the only place that
+//! knows about the capture between them. That means:
 //!   - one place to change the fleet's logging behaviour, and
 //!   - the destination is SELECTABLE at startup via environment, without touching
 //!     any app: set `SUMO_LOG_SINK` in the launch environment (the QNX layer hook
@@ -62,17 +72,52 @@ fn level_from_env() -> LevelFilter {
         .unwrap_or(LevelFilter::Info)
 }
 
-/// Initialize logging for a service with the given `context` tag.
+/// Initialize logging for a service that emits DIRECTLY via `score_log` macros.
 ///
 /// Installs the env-selected `score_log` recorder as the process's global logger.
-/// Call ONCE at startup, before any log macro. Safe to call again (subsequent
-/// calls are ignored — a global logger can only be set once).
+/// Most code should use [`init_tracing`] instead — `tracing` is the standard
+/// producer (and the only way to capture dependency logs). Use `init` only for a
+/// pure score_log caller. Call ONCE at startup; safe to call again (a global
+/// logger can only be set once, so a second call is ignored).
 pub fn init(context: &str) {
-    init_with(context, Sink::from_env(), level_from_env());
+    let _ = init_with(context, Sink::from_env(), level_from_env());
 }
 
-/// The testable core: install `sink` at `level` for `context`.
-fn init_with(context: &str, sink: Sink, level: LevelFilter) {
+/// Initialize logging for a service that emits via `tracing` (the standard — this
+/// is what nearly all code and dependencies like axum/hyper use).
+///
+/// Installs the env-selected `score_log` recorder AND composes the
+/// `ScoreLogBridge` `tracing` layer, so every `tracing::*` event (ours and our
+/// dependencies') is captured into the recorder → the platform sink. Service code
+/// stays standard `tracing`; only THIS init knows about the capture.
+///
+/// The `tracing` level filter comes from `RUST_LOG` (falling back to the same
+/// `SUMO_LOG_LEVEL` the recorder uses); the recorder's own max level is
+/// `SUMO_LOG_LEVEL`. Call ONCE at startup; safe to call again (the global
+/// subscriber + logger are set-once, so a second call is a no-op).
+#[cfg(feature = "tracing")]
+pub fn init_tracing(context: &str) {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::EnvFilter;
+
+    // 1) Install the score_log recorder (the sink).
+    let level = init_with(context, Sink::from_env(), level_from_env());
+
+    // 2) Compose the tracing subscriber: an env filter (RUST_LOG, else the same
+    //    level as the recorder) + the bridge that forwards tracing → score_log.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(level.as_str().to_ascii_lowercase()));
+    // try_init (not init): a second call / an already-set global subscriber is a
+    // no-op rather than a panic, matching init's set-once semantics.
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(score_log_tracing::ScoreLogBridge::new())
+        .try_init();
+}
+
+/// The testable core: install `sink` at `level` for `context`; returns the level
+/// actually applied (so `init_tracing` can align its env-filter fallback).
+fn init_with(context: &str, sink: Sink, level: LevelFilter) -> LevelFilter {
     let resolved = resolve(sink);
     match resolved {
         Sink::Slog2 => {
@@ -80,13 +125,12 @@ fn init_with(context: &str, sink: Sink, level: LevelFilter) {
             // `context`-named buffer; off QNX score-log-slog2's emit is a no-op,
             // but `resolve` already downgraded Auto→Stdout there, so we only reach
             // this arm off-QNX if the user explicitly asked for slog2.
-            if score_log_slog2::install(context, level).is_err() {
-                // Already set — nothing to do.
-            }
+            let _ = score_log_slog2::install(context, level);
         }
         // Auto is resolved to a concrete sink by `resolve`; Stdout is the fallback.
         Sink::Stdout | Sink::Auto => install_stdout(context, level),
     }
+    level
 }
 
 /// Resolve `Auto` to the platform-native concrete sink, and downgrade an explicit
@@ -166,8 +210,26 @@ mod tests {
     #[test]
     fn init_with_installs_and_second_call_is_ignored() {
         // First install wins; a second must not panic (global logger set once).
-        init_with("test-a", Sink::Stdout, LevelFilter::Info);
-        init_with("test-b", Sink::Stdout, LevelFilter::Debug);
+        // Returns the level it applied.
+        assert_eq!(
+            init_with("test-a", Sink::Stdout, LevelFilter::Info),
+            LevelFilter::Info
+        );
+        let _ = init_with("test-b", Sink::Stdout, LevelFilter::Debug);
         // Reaching here without panic is the assertion.
+    }
+
+    /// init_tracing wires the tracing→score_log bridge without panicking, and a
+    /// `tracing::*` call afterward is accepted (goes through the global subscriber).
+    /// Set-once safe: a second init_tracing is a no-op, not a panic.
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn init_tracing_wires_bridge_and_is_set_once_safe() {
+        init_tracing("tr-test");
+        // These must not panic — they flow through the installed subscriber.
+        tracing::info!(target: "tr-test", "hello {}", 1);
+        tracing::warn!("plain");
+        // Second call is ignored (global subscriber + logger are set-once).
+        init_tracing("tr-test-2");
     }
 }

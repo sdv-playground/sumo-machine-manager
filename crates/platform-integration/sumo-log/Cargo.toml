@@ -2,11 +2,19 @@
 name = "sumo-log"
 version = "0.1.0"
 edition = "2021"
-description = "Fleet-wide logging init for sumo services. One `sumo_log::init(context)` call installs an Eclipse S-CORE score_log recorder chosen by env (SUMO_LOG_SINK: auto|stdout|slog2, SUMO_LOG_LEVEL). Apps pass only their context tag; level/format/destination policy lives here, not in each app — so every service behaves the same and the fleet retargets by env, not code edits."
+description = "Fleet-wide logging init for sumo services. `sumo_log::init_tracing(context)` (for `tracing`-emitting code — the standard) or `init(context)` (for direct score_log callers) installs an Eclipse S-CORE score_log recorder chosen by env (SUMO_LOG_SINK: auto|stdout|slog2, SUMO_LOG_LEVEL) and, for the tracing variant, the tracing→score_log bridge. Apps pass only their context tag; level/format/destination policy + the capture wiring live HERE, not in each app."
 license = "MIT"
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+# `tracing`-producer support: init_tracing composes the ScoreLogBridge so code
+# (and deps like axum/hyper) that emit via `tracing` are captured into score_log.
+# ON by default — nearly every binary uses tracing. A pure score_log-only caller
+# (e.g. a minimal qualified component) can turn it off to drop the tracing deps.
+default = ["tracing"]
+tracing = ["dep:tracing-subscriber", "dep:score-log-tracing"]
 
 [dependencies]
 # The S-CORE facade + its stdout recorder (plain cargo git-deps from
@@ -18,3 +26,9 @@ stdout_logger = { git = "https://github.com/eclipse-score/baselibs.git", branch 
 # everywhere and `init` only routes to it when asked / on QNX. Sibling crate in
 # this workspace → path dep.
 score-log-slog2 = { path = "../score-log-slog2" } # sibling in platform-integration/
+# The tracing → score_log bridge (init_tracing). Sibling; optional via `tracing`.
+score-log-tracing = { path = "../score-log-tracing", optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter", "std"], optional = true }
+
+[dev-dependencies]
+tracing = "0.1"
