@@ -12,7 +12,9 @@ policy-partition = { path = "../policy-partition" }
 secstore = { path = "../secstore" }
 log-rotate = { path = "../log-rotate" }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Fleet logging init: sumo_log::init_tracing installs the recorder + the
+# tracing→score_log capture bridge. Sibling crate → path dep.
+sumo-log = { path = "../platform-integration/sumo-log" }
 p256 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["verifying", "der"] }
 rand = "0.8"

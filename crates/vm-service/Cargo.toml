@@ -13,7 +13,9 @@ serde_json = "1"
 serde_yaml = "0.9"
 libc = "0.2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Fleet logging init: sumo_log::init_tracing installs the recorder + the
+# tracing→score_log capture bridge. Sibling crate → path dep.
+sumo-log = { path = "../platform-integration/sumo-log" }
 vm-devices = { path = "../vm-devices", features = ["http-transport"] }
 
 [features]

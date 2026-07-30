@@ -19,12 +19,8 @@ use hsm::{HsmCryptoProvider, HsmProvider, KeyRole, LinkBProvider};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,tower_http=debug".parse().unwrap()),
-        )
-        .init();
+    // Fleet logging: install the env-selected recorder + tracing→score_log bridge.
+    sumo_log::init_tracing("vsvd");
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -324,6 +320,7 @@ async fn main() {
             log_agent_url: None,
             host_log_globs: None,
             host_dump_dir: None,
+            host_slog2: true,
             test_agent_url: None,
             diag_agent_url: None,
             // host-os IS the host: gather §7.9 probes in-process (disk/mem/du).
@@ -345,6 +342,7 @@ async fn main() {
             log_agent_url: None,
             host_log_globs: None,
             host_dump_dir: None,
+            host_slog2: false,
             test_agent_url: None,
             diag_agent_url: None,
             host_diagnostics: false,
@@ -365,6 +363,7 @@ async fn main() {
             log_agent_url: None,
             host_log_globs: None,
             host_dump_dir: None,
+            host_slog2: false,
             test_agent_url: None,
             diag_agent_url: None,
             host_diagnostics: false,
@@ -385,6 +384,7 @@ async fn main() {
             log_agent_url: None,
             host_log_globs: None,
             host_dump_dir: None,
+            host_slog2: false,
             test_agent_url: None,
             diag_agent_url: None,
             host_diagnostics: false,

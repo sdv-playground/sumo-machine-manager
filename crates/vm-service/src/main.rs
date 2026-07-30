@@ -48,12 +48,9 @@ fn parse_args() -> PathBuf {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    // Fleet logging: install the env-selected recorder + tracing→score_log bridge.
+    // `tracing::*` from here (and deps) is captured; RUST_LOG still tunes the filter.
+    sumo_log::init_tracing("vmsv");
 
     let config_path = parse_args();
 

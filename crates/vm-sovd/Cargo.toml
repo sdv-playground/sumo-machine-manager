@@ -33,7 +33,9 @@ host-os-mgr = { path = "../host-os-mgr" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Fleet logging init: sumo_log::init_tracing installs the recorder + the
+# tracing→score_log capture bridge. Sibling crate → path dep.
+sumo-log = { path = "../platform-integration/sumo-log" }
 serde_yaml = "0.9"
 sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }

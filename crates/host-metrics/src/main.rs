@@ -9,12 +9,8 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    // Fleet logging: install the env-selected recorder + tracing→score_log bridge.
+    sumo_log::init_tracing("hmet");
 
     let bind_addr = parse_bind_arg();
 

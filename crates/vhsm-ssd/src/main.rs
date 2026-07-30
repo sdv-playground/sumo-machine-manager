@@ -116,12 +116,8 @@ impl IpResolver for StaticIpResolver {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".parse().unwrap()),
-        )
-        .init();
+    // Fleet logging: install the env-selected recorder + tracing→score_log bridge.
+    sumo_log::init_tracing("vhsm");
 
     let args: Vec<String> = std::env::args().collect();
     let mut keystore_path: Option<PathBuf> = None;
