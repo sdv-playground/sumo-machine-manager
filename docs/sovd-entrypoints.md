@@ -52,9 +52,9 @@ repo — that serve the **same** wire from the **same** route library.
   `component_factory::build_component`), the standard SOVD surface from
   `sovd_api::create_router`, plus the sumo vendor routes —
   `hsm_router` (HSM key inventory + `x-sumo-csr`) and `update_state_router`
-  (`x-sumo-update-state`). See `crates/vm-sovd/src/main.rs:462-470`.
+  (`x-sumo-update-state`). See `crates/vm-sovd/src/main.rs`.
 - **Bind / port:** `0.0.0.0:4000` by default; override with `--bind <addr>` or a
-  positional bind-addr (`crates/vm-sovd/src/main.rs:79`).
+  positional bind-addr (`crates/vm-sovd/src/main.rs`).
 - **Launched by:** `example/run.sh` (alongside the `hsm-sim-service` link-B
   backend and `vhsm-ssd`). Connect-only to the
   pre-spawned link-B HSM backend via `--backend-socket`. Also run in host mode
@@ -75,10 +75,9 @@ repo — that serve the **same** wire from the **same** route library.
   answers 503 on that route and starts serving pulls right after
   provisioning), plus `x-sumo-boot-id` and `/factory_reset`. It is **host-only — no gateway
   mode** (the "proxy" in its code is the *vhsm-ssd* HSM proxy, not SOVD
-  proxying). Secure-by-default authorizer is always wired
-  (`src/main.rs:1766-1856`).
-- **Bind / port:** `cfg.bind`, default `0.0.0.0:4000` (`src/config.rs:427`);
-  `axum::serve` at `src/main.rs:2200`.
+  proxying). Secure-by-default authorizer is always wired (`src/main.rs`).
+- **Bind / port:** `cfg.bind`, default `0.0.0.0:4000` (`src/config.rs`);
+  `axum::serve` in `src/main.rs`.
 - **Launched by:** a respawn loop with a TOML config — the `qemu-cvc` Docker
   entrypoint (`examples/qemu-cvc/entrypoint.sh`) for the emulated device, and
   the host runtime bundle's `start.sh` → `bank_a/start.sh` on the rig
@@ -91,7 +90,7 @@ repo — that serve the **same** wire from the **same** route library.
 The guest's single SOVD front door. **Not a separate binary** — it is the same
 `vm-sovd` with `--gateway`, which swaps the default router for the federating
 gateway router (`build_gateway_router` → `component_mgr::sovd::gateway::gateway_router`,
-`crates/vm-sovd/src/main.rs:429-461`, `554-620`).
+`crates/vm-sovd/src/main.rs`).
 
 It serves:
 
@@ -106,7 +105,7 @@ It serves:
   proxied host component is just another entry in the SOVD entity map — that is
   the federation.
 
-Flags (`crates/vm-sovd/src/main.rs:47-54`):
+Flags (`crates/vm-sovd/src/main.rs`):
 
 - `--gateway` — enable gateway mode.
 - `--host-sovd-url <url>` — the host SOVD to proxy host components to.
@@ -123,7 +122,7 @@ the pull-update trust anchor (the sw-authority key). The mode is chosen by
 
 - **In-VM (`--guest-vhsm`)** — crypto comes from the guest vHSM via
   `vhsm_provider::VhsmProvider::connect_local()`, which forwards over the vHSM
-  wire to the host `vhsm-ssd` (`crates/vm-sovd/src/main.rs:435-441`). This is the
+  wire to the host `vhsm-ssd` (`crates/vm-sovd/src/main.rs`). This is the
   deployed variant: it runs **inside a guest VM** (vm1) as the
   `vehicle-gateway` layer. Example launch
   (`examples/t2-seed-dev/channels/dev/layers/vehicle-gateway/autostart.sh`):
@@ -139,7 +138,7 @@ the pull-update trust anchor (the sw-authority key). The mode is chosen by
 
 - **On-host (no `--guest-vhsm`)** — crypto comes from the host link-B HSM backend
   client (`--backend-socket`); the same gateway router runs on the host
-  (`crates/vm-sovd/src/main.rs:442-450`). Supported by the same binary; used when
+  (`crates/vm-sovd/src/main.rs`). Supported by the same binary; used when
   the gateway is co-located with the host rather than inside a VM.
 
 - **Runs on:** in-VM (guest) or on-host, per the mode above.
@@ -165,8 +164,8 @@ servers present in the workspace.
   `/vehicle/v1` REST API to UDS over SocketCAN / DoIP / Mock, and can federate
   (`sovd-gateway`) and proxy to supplier containers (`sovd-proxy`).
 - **Bind / port:** `0.0.0.0:<config port>`; default `18081` in mock mode
-  (`crates/sovdd/src/main.rs:141,186`). Optional TLS via `[server.tls]`
-  (`axum_server::bind_rustls`, `main.rs:215`).
+  (`crates/sovdd/src/main.rs`). Optional TLS via `[server.tls]`
+  (`axum_server::bind_rustls`).
 - **Launched by:** `sovdd [config.toml] [--did-definitions <path>]`. In-workspace
   it runs as the UDS-ECU aggregating gateway in `examples/campaign`, the `tests/`
   e2e harness, and the root `compose.yaml` (`sovdd .../gateway.toml`, bind `:4000`).
@@ -176,7 +175,7 @@ servers present in the workspace.
 - **Bin:** `example-app`. The reference **app-entity** (tier-1 supplier) SOVD
   HTTP server; embeds `example-ecu` for a full app→ECU stack in one process.
 - **Bind / port:** `0.0.0.0:<--port>`, default `4001`
-  (`crates/example-app/src/main.rs:392-396`).
+  (`crates/example-app/src/main.rs`).
 
 ---
 
@@ -193,8 +192,7 @@ unlock for real ECUs is transparent server-side in the UDS-device handler.)
 - Offboard workshop **JWT minter**: signs short-lived ES256 client→SOVD access
   tokens that the server validates. Routes `GET /health`, `GET /info`,
   `GET /jwks`, `POST /mint`.
-- **Bind / port:** `127.0.0.1:9200` (`0.0.0.0` with `--bind-all`,
-  `src/main.rs:392-396`).
+- **Bind / port:** `127.0.0.1:9200` (`0.0.0.0` with `--bind-all`).
 
 ---
 

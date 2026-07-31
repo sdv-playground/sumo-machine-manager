@@ -1,29 +1,69 @@
-# Log retrieval (SOVD §7.21 + §7.20) — device side
+# Log retrieval + capture (SOVD §7.21 + §7.20) — device side
 
-How `component-mgr` serves a component's logs: the sources it reads, the
-reboot-safe cursor, and the §7.20 bulk-data download path. The SOVD wire contract
-+ the two client-facing paths are documented in SOVDd `ARCHITECTURE.md §6.3.1`;
-this doc is the device/backend half.
+How the sumo host stack CAPTURES logs (the producer side — `tracing` →
+`sumo_log` → a recorder) and how `component-mgr` SERVES them (the reader side —
+sources, the reboot-safe cursor, §7.20 bulk-data). The SOVD wire contract + the
+client-facing paths are in SOVDd `ARCHITECTURE.md §6.3.1`; the standard-vs-vendor
+split is in [sovd-vs-extensions.md](sovd-vs-extensions.md); the external
+integration contract is in [log-integration-contract.md](log-integration-contract.md).
+
+## Capture (producer side) — one facade, one capture point
+Host code (the host machine manager + its companions vm-service / vhsm-ssd /
+vm-sovd / host-metrics / hsm-sim-service) emits with the STANDARD `tracing`
+macros. At
+startup each binary calls `sumo_log::init_tracing(context)` ONCE — the ONLY place
+that knows how those events are captured. It installs an Eclipse S-CORE
+`score_log` recorder AND the `tracing`→`score_log` bridge, so all `tracing::*`
+(ours + deps like axum/hyper) flows to the recorder. `sumo-verify` is the one
+exception (a CLI launch gate — keeps its stderr fmt subscriber).
+
+The recorder is env-selected (`SUMO_LOG_SINK` = `auto`|`stdout`|`slog2`,
+`SUMO_LOG_LEVEL`); `auto` = the QNX slogger2 ring on the rig, stdout off-QNX. So
+retargeting the whole fleet is an env change in the launch environment, not code.
+(crates: `platform-integration/{sumo-log, score-log-tracing, score-log-slog2}`.)
+
+## The capability split — where a log lives
+The dividing line is NOT topic (app vs boot) but **"can this reach our sink
+(slog2)?"**
+- **CAN reach slog2** → it goes there: the host machine manager + companions,
+  plus the OS driver/eMMC telemetry (`devb_*`, CAM) already on the ring. Read
+  back via `LogSource::Slog2`.
+- **CANNOT easily reach slog2** → its OWN file source: the boot log, `/var/log`,
+  and the host-manager funnel-log RESIDUE (shell `[start-managed]` echoes + the
+  manager's pre-slog2-registration stderr). Read via `LogSource::HostFiles`.
+Because the daemons emit to slog2 (not the funnel), the funnel log shrinks to
+residue-only, so the slog2 and file sources DON'T overlap — "additive" is safe.
 
 ## Log sources — per component, additive
 A component's `ComponentConfig.log_sources` is built by `component-factory` from
 its spec (`config.yaml`), additive — a component may have any combination:
 
-- `LogSource::HostFiles { globs }`  ← spec `host_log_globs`
-  Host-local text files (globs like `/mnt/common-rw/log/*.log`, `/var/log/*`,
-  `/dev/shmem/*.log`). The host's OWN daemon logs land in `log_dir`
-  (`/mnt/common-rw/log/`, written by the `log-rotate` crate) — a HostFiles source
-  MUST glob that dir or the daemon logs are invisible (this bit us on the CVC:
-  the deployed globs only had /var/log + /dev/shmem and missed the real logs).
-- `LogSource::GuestAgent { url }`   ← spec `log_agent_url`
-  A guest VM's in-guest `log-agent` (guest-vm-sdk), proxied over the guest↔host
-  /30. QNX guests read `/dev/shmem/*.log` + `/var/log/*`; Linux guests read
-  journald. The host never reads guest files directly — it proxies HTTP.
-- `LogSource::HostDumps { dir }`    ← spec `host_dump_dir`
-  A directory of discrete dump artifacts (the §7.21 message-passing pattern).
+| Variant | Spec key | `source` on the wire | Backing |
+|---|---|---|---|
+| `LogSource::Slog2` | `host_slog2: true` | `slog2` (const `SLOG2_SOURCE`) | QNX `slogger2` ring via `platform_log::read_slog2` (`libslog2parse` FFI) |
+| `LogSource::HostFiles { globs }` | `host_log_globs` | the file stem | host-local text files |
+| `LogSource::GuestAgent { url }` | `log_agent_url` | the guest's own source | in-guest `log-agent`, proxied over the guest↔host /30 |
+| `LogSource::HostDumps { dir }` | `host_dump_dir` | — | directory of discrete dump artifacts (§7.21 message-passing) |
+
+Per-variant detail:
+- **Slog2** — ONE physical `source = "slog2"`; the per-buffer name is the EMITTER
+  (the `context` each binary passes to `sumo_log::init_tracing`: hsm-sim-service →
+  `hsms`, `vhsm`, the host manager → its own tag, plus OS buffers
+  `devb_sdmmc_mx8x`, …), surfaced in `LogEntry.fields.emitter` — NOT `source`. A
+  client filters "all host-bus logs" by `source=slog2` and narrows to one emitter
+  via `fields.emitter`. QNX-only in effect (empty off-QNX; a Linux host would use
+  a journald source).
+- **HostFiles** — globs like `/mnt/common-rw/log/*.log`, `/var/log/*`,
+  `/dev/shmem/*.log`. The "can't reach slog2" bucket: boot/OS logs + funnel-log
+  residue. Lines carry the file mtime as timestamp (coarse) unless a per-line ISO
+  stamp is present.
+- **GuestAgent** — QNX guests read `/dev/shmem/*.log` + `/var/log/*`; Linux guests
+  read journald. The host never reads guest files directly — it proxies HTTP. The
+  external-aggregator integration seam (see log-integration-contract.md).
 
 `get_logs` merges all sources; `capabilities.logs` is true iff any source exists,
-`capabilities.bulk_data` iff a HostFiles OR GuestAgent source exists.
+`capabilities.bulk_data` iff a HostFiles OR GuestAgent source exists (Slog2 +
+HostDumps are line/message streams, NOT downloadable-file catalogs).
 
 ## Reads: tail, cursor page, and bulk-data
 - `get_logs(filter)` — the merged tail/list (newest-first), the classic view.
@@ -33,6 +73,17 @@ its spec (`config.yaml`), additive — a component may have any combination:
 - `list_bulk_data_categories` / `list_bulk_data("logs", …)` / `get_bulk_data` —
   the §7.20 collection: each log file is one downloadable item, fetched whole
   (32 MiB inline cap; 202/307 streaming is future work).
+
+### The entry shape on the wire (source + emitter)
+Each entry: `{id, timestamp, priority, message, source, fields?}`. `source` is the
+PHYSICAL source (`slog2` for the ring; the file stem for HostFiles; the guest's
+own source for GuestAgent). For slog2 the EMITTER (buffer name) is in
+`fields.emitter`, NOT `source` — the whole ring is one source, many emitters. The
+log `id` is content-addressed (`line:<source-or-source:emitter>:<hash>`) so
+`get_log` re-resolves it without server state. NOTE the wire passthrough:
+`sovd_core::LogEntry.fields` must be copied into `sovd-api::LogEntryResponse` —
+it was once dropped there, so the emitter never reached a client despite being
+set (fixed; see the `fields` field on `LogEntryResponse`).
 
 ### The cursor (reboot-safe) — why not a timestamp
 Device wall-clock is non-monotonic (1970 → safe-time floor → reboot → 1970), so
@@ -66,14 +117,14 @@ one of THIS component's live GuestAgent sources AND the guest must still adverti
 the id (re-list `/files`) before proxying the bytes.
 
 ## GOTCHA: InstallRouterDiag must forward new methods
-`app`-type components (e.g. the host-os `supernova`) are wired through
+`app`-type components (e.g. the host-os component) are wired through
 `InstallRouterDiag`, a HAND-WRITTEN `DiagnosticBackend` forwarder that routes
 install/flash to the `Component` and delegates the rest to the engine. It forwards
 each method EXPLICITLY — so a NEW `DiagnosticBackend` method silently falls through
 to the trait default unless a forwarder is added. This shipped a real on-device bug:
-bulk-data + cursor methods weren't forwarded, so `supernova` returned empty
-categories + a cursor-less `/logs` while `bank`-type `vm1` (raw ComponentBackend)
-worked. If you add a `DiagnosticBackend` method, ADD A FORWARDER in
+bulk-data + cursor methods weren't forwarded, so the host-os component returned
+empty categories + a cursor-less `/logs` while `bank`-type `vm1` (raw
+ComponentBackend) worked. If you add a `DiagnosticBackend` method, ADD A FORWARDER in
 `install_router_diag.rs` (there is no compile-time guard — the default impl makes
 it compile silently).
 
