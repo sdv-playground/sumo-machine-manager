@@ -384,7 +384,11 @@ mod tests {
         ks_dir
     }
 
-    fn build(images_dir: PathBuf, parts: Vec<PartitionPart>, tag: &str) -> PartitionBankProvider<MemBlockDevice> {
+    fn build(
+        images_dir: PathBuf,
+        parts: Vec<PartitionPart>,
+        tag: &str,
+    ) -> PartitionBankProvider<MemBlockDevice> {
         let ks = provisioned_keystore(tag);
         // Two independent SimHsm handles over the same keystore dir — one as the
         // provisioning-gate HsmProvider, one as the signing HsmCryptoProvider.
@@ -450,9 +454,18 @@ mod tests {
 
         // The IVD artefacts landed in the metadata dir (NOT a 133MB staging file).
         let md = p.metadata_dir(Bank::A).unwrap();
-        assert!(md.join(hsm::ivd::IVD_MANIFEST_FILE).exists(), "manifest written");
-        assert!(md.join(hsm::ivd::IVD_SIGNATURE_FILE).exists(), "signature written");
-        assert!(!md.join("application.img").exists(), "NO staged image in metadata dir");
+        assert!(
+            md.join(hsm::ivd::IVD_MANIFEST_FILE).exists(),
+            "manifest written"
+        );
+        assert!(
+            md.join(hsm::ivd::IVD_SIGNATURE_FILE).exists(),
+            "signature written"
+        );
+        assert!(
+            !md.join("application.img").exists(),
+            "NO staged image in metadata dir"
+        );
 
         // verify_payload re-hashes the partition and matches the true digest.
         let expected = {
@@ -462,7 +475,8 @@ mod tests {
             let d: [u8; 32] = h.finalize().into();
             d
         };
-        p.verify_payload(Bank::A, "application.img", &expected).unwrap();
+        p.verify_payload(Bank::A, "application.img", &expected)
+            .unwrap();
 
         // A wrong digest is rejected.
         let bad = [0u8; 32];
