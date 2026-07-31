@@ -5657,6 +5657,12 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
     if let Some(s) = &filter.source {
         qs.push(format!("source={}", qenc(s)));
     }
+    if let Some(e) = &filter.emitter {
+        qs.push(format!("x-sumo-emitter={}", qenc(e)));
+    }
+    if let Some(e) = &filter.emitter_exclude {
+        qs.push(format!("x-sumo-emitter-exclude={}", qenc(e)));
+    }
     if let Some(p) = &filter.pattern {
         qs.push(format!("pattern={}", qenc(p)));
     }
@@ -5758,6 +5764,12 @@ async fn query_log_agent_paged(url: &str, filter: &LogFilter) -> Option<LogPage>
     }
     if let Some(s) = &filter.source {
         qs.push(format!("source={}", qenc(s)));
+    }
+    if let Some(e) = &filter.emitter {
+        qs.push(format!("x-sumo-emitter={}", qenc(e)));
+    }
+    if let Some(e) = &filter.emitter_exclude {
+        qs.push(format!("x-sumo-emitter-exclude={}", qenc(e)));
     }
     if let Some(p) = &filter.pattern {
         qs.push(format!("pattern={}", qenc(p)));
@@ -6802,6 +6814,11 @@ fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
         // source/emitter split it's the physical source ("slog2"), already checked
         // above; the reader would otherwise treat it as a buffer filter.
         source: None,
+        // Emitter include/exclude DO map to the slog2 buffer name — push them so
+        // the reader drops muted emitters (e.g. the devb_* eMMC firehose) before
+        // they consume the gather budget.
+        emitter: filter.emitter.clone(),
+        emitter_exclude: filter.emitter_exclude.clone(),
         pattern: filter.pattern.clone(),
         // slog2 severities don't line up 1:1 with SOVD "this level and above";
         // apply the priority filter below against the mapped LogPriority instead.

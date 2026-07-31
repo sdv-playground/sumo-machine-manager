@@ -108,14 +108,25 @@ extern "C" fn on_packet(info: *mut PacketInfo, payload: *mut c_void, param: *mut
         // `buffer_name` is only the INNER buffer ("default" / "slog"), NOT the
         // emitter — don't use it. (buffer_set_name lives in slog2_log_info_t, not
         // the packet.) component-mgr maps this LogRecord.source → fields.emitter.
-        let source = cstr_field(&pi.file_name);
+        // The slog2 buffer-set name IS the emitter (snova / devb_sdmmc_mx8x / …).
+        let emitter = cstr_field(&pi.file_name);
         let priority = severity_name(pi.severity);
         // timestamp is nanoseconds since the epoch (QNX CLOCK_REALTIME).
         let secs = pi.timestamp / 1_000_000_000;
 
+        // Emitter include/exclude FIRST — before the cap check above would have
+        // fired — so a muted high-volume emitter (the devb_* eMMC/CAM firehose)
+        // never consumes the gather budget and can't crowd real records out of
+        // the tail. This is the whole point of server-side emitter filtering.
+        if !acc.q.emitter_allows(&emitter) {
+            return 0;
+        }
+
         // Filters (parse_all has no native match): source/pattern/priority here.
+        // NOTE: `source` on the slog2 record carries the EMITTER (see below); the
+        // component-mgr layer sets the physical `source="slog2"` and checks that.
         if let Some(src) = &acc.q.source {
-            if &source != src {
+            if &emitter != src {
                 return 0;
             }
         }
@@ -133,7 +144,9 @@ extern "C" fn on_packet(info: *mut PacketInfo, payload: *mut c_void, param: *mut
             timestamp: crate::rfc3339_utc(secs),
             priority: priority.into(),
             message,
-            source,
+            // The reader carries the emitter in `source`; component-mgr maps it to
+            // `fields.emitter` and sets the physical `source="slog2"`.
+            source: emitter,
         });
     }
     0

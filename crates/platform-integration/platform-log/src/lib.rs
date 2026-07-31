@@ -96,6 +96,14 @@ pub struct FileEntry {
 pub struct LogQuery {
     pub tail: Option<usize>,
     pub source: Option<String>,
+    /// Keep only these EMITTERs (sub-sources): comma-separated, prefix-matched.
+    /// For slog2 the emitter is the per-buffer name (`snova`/`devb_sdmmc_mx8x`/…);
+    /// on file/journald sources it coincides with `source`. Empty ⇒ all.
+    pub emitter: Option<String>,
+    /// DROP these emitters (comma-separated, prefix-matched), applied after the
+    /// include. Mutes a high-volume sub-source (e.g. `devb_`) before the record
+    /// is gathered — so it can't crowd real records out of a tail.
+    pub emitter_exclude: Option<String>,
     pub pattern: Option<String>,
     pub priority: Option<String>,
     pub since: Option<String>,
@@ -144,6 +152,8 @@ impl LogQuery {
             match k {
                 "tail" | "limit" => q.tail = v.parse().ok(),
                 "source" => q.source = Some(v),
+                "x-sumo-emitter" => q.emitter = Some(v),
+                "x-sumo-emitter-exclude" => q.emitter_exclude = Some(v),
                 "pattern" => q.pattern = Some(v),
                 "priority" => q.priority = Some(v),
                 "since" => q.since = Some(v),
@@ -155,13 +165,43 @@ impl LogQuery {
         q
     }
 
-    /// Apply the in-process filters (source/pattern) and the tail cap to
+    /// Whether an entry with the given `emitter` passes the emitter include /
+    /// exclude filters. Both are comma-separated PREFIX lists (so `devb` matches
+    /// `devb_sdmmc_mx8x`); include is applied first (empty ⇒ all), then exclude
+    /// removes. Mirrors `sovd_core::LogFilter::emitter_allows` so the host and the
+    /// guest agent filter identically. On sources with no sub-source (files,
+    /// journald) the emitter is the `source`.
+    pub fn emitter_allows(&self, emitter: &str) -> bool {
+        let matches_any = |list: &str| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .any(|p| emitter.starts_with(p))
+        };
+        if let Some(inc) = self.emitter.as_deref() {
+            if !inc.trim().is_empty() && !matches_any(inc) {
+                return false;
+            }
+        }
+        if let Some(exc) = self.emitter_exclude.as_deref() {
+            if matches_any(exc) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Apply the in-process filters (source/emitter/pattern) and the tail cap to
     /// an oldest-first record list. Priority/since/until are applied by
     /// the source readers where they can be (journald); plain files
     /// carry `info` and their mtime, so those filters degrade gracefully.
     pub fn apply(&self, mut records: Vec<LogRecord>) -> Vec<LogRecord> {
         if let Some(src) = &self.source {
             records.retain(|r| &r.source == src);
+        }
+        // Emitter filter: for file/journald sources the emitter is the source.
+        if self.emitter.is_some() || self.emitter_exclude.is_some() {
+            records.retain(|r| self.emitter_allows(&r.source));
         }
         if let Some(pat) = &self.pattern {
             records.retain(|r| r.message.contains(pat.as_str()));
@@ -532,6 +572,40 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].message, "hb seq 3");
         assert_eq!(out[1].message, "hb seq 4");
+    }
+
+    #[test]
+    fn emitter_filter_parse_and_apply() {
+        let rec = |src: &str| LogRecord {
+            timestamp: rfc3339_utc(0),
+            priority: "info".into(),
+            message: "m".into(),
+            source: src.into(),
+        };
+        let all = || {
+            vec![
+                rec("snova"),
+                rec("devb_sdmmc_mx8x"),
+                rec("vhsm"),
+                rec("CAM"),
+            ]
+        };
+
+        // exclude drops the firehose (prefix-matched), keeps the rest.
+        let q = LogQuery::parse("x-sumo-emitter-exclude=devb_,CAM");
+        assert_eq!(q.emitter_exclude.as_deref(), Some("devb_,CAM"));
+        let out = q.apply(all());
+        let srcs: Vec<_> = out.iter().map(|r| r.source.as_str()).collect();
+        assert_eq!(srcs, ["snova", "vhsm"]);
+
+        // include narrows to the named emitters only.
+        let q = LogQuery::parse("x-sumo-emitter=snova,vhsm");
+        let out = q.apply(all());
+        let srcs: Vec<_> = out.iter().map(|r| r.source.as_str()).collect();
+        assert_eq!(srcs, ["snova", "vhsm"]);
+
+        // no emitter filter → passthrough (all four).
+        assert_eq!(LogQuery::parse("tail=10").apply(all()).len(), 4);
     }
 
     #[test]

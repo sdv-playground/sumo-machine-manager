@@ -44,6 +44,7 @@ Request query params you MUST honour:
 | Param | Meaning |
 |---|---|
 | `x-sumo-after=<cursor>` | opaque resume token — return entries strictly AFTER it, oldest→newest. Omit = start at oldest available. |
+| `x-sumo-emitter` / `x-sumo-emitter-exclude` | include / exclude emitters (sub-sources) — comma-separated, prefix-matched; exclude applied after include. Only meaningful if one `source` multiplexes emitters; otherwise return everything. |
 | `since` / `until` | RFC 3339 **or** a sentinel: `BEGIN`, `END`/`NOW`, `END-<N>{s,m,h,d}` / `NOW-<N>…`. Resolve server-side against YOUR clock. Malformed → **400**. |
 | `priority` | one of the 8 lowercase syslog levels (below) — return that level and higher. |
 | `source` | filter to one physical source string. |
@@ -156,8 +157,9 @@ over the per-component private /30 (never the public network). Endpoints:
 | `GET /files/{id}` | raw bytes (`application/octet-stream`); `{id}` re-validated against the live `/files` catalog, else 404 |
 
 Query params (percent-decoded; unknown keys ignored): `tail`|`limit`, `source`,
-`pattern`, `priority`, `since`, `until`, `after` (cursor — only `/logs/page`
-reads it; `/logs` ignores it).
+`x-sumo-emitter`, `x-sumo-emitter-exclude` (include/exclude emitters —
+comma-separated, prefix-matched), `pattern`, `priority`, `since`, `until`,
+`after` (cursor — only `/logs/page` reads it; `/logs` ignores it).
 
 **`LogRecord` — the field names ARE the contract** (the host parses exactly
 these):

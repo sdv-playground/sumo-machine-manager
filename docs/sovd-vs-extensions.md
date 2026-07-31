@@ -103,6 +103,8 @@ expect. **This is the part that matters most for building a compatible endpoint.
 | Param | Type | Definition |
 |---|---|---|
 | `x-sumo-after` | opaque string | Cursor. Return entries strictly after this position, oldest→newest. Omit ⇒ start at oldest available. Never parsed by the client. |
+| `x-sumo-emitter` | csv, prefix | INCLUDE only these emitters (sub-sources); comma-separated, prefix-matched (`devb` ⇒ `devb_sdmmc_mx8x`). Narrows within a multi-emitter source (the slog2 ring). Empty/absent ⇒ all. |
+| `x-sumo-emitter-exclude` | csv, prefix | DROP these emitters (same form), applied after the include. Mutes a high-volume sub-source (e.g. the `devb_` eMMC/CAM firehose). The device still SERVES them. |
 | `since` / `until` | RFC 3339 \| sentinel | Sentinels: `BEGIN` (no bound), `END`\|`NOW` (device now), `END-<N>{s,m,h,d}` \| `NOW-<N>{s,m,h,d}` (now minus duration). Resolved server-side vs. device clock. Malformed ⇒ 400. |
 
 **Extra response fields** on the list body (all `skip_if_none`):

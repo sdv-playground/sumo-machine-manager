@@ -50,9 +50,15 @@ Per-variant detail:
   (the `context` each binary passes to `sumo_log::init_tracing`: hsm-sim-service →
   `hsms`, `vhsm`, the host manager → its own tag, plus OS buffers
   `devb_sdmmc_mx8x`, …), surfaced in `LogEntry.fields.emitter` — NOT `source`. A
-  client filters "all host-bus logs" by `source=slog2` and narrows to one emitter
-  via `fields.emitter`. QNX-only in effect (empty off-QNX; a Linux host would use
-  a journald source).
+  client selects "all host-bus logs" by `source=slog2`; the whole ring is one
+  source, many emitters. QNX-only in effect (empty off-QNX; a Linux host would
+  use a journald source).
+  Narrow to / exclude an emitter with the `x-sumo-emitter` / `x-sumo-emitter-exclude`
+  query params (comma-separated, prefix-matched — `LogFilter::{emitter,
+  emitter_exclude}`). The exclude is applied in the slog2 reader callback BEFORE
+  the gather cap, so muting a high-volume emitter (the `devb_*` eMMC/CAM
+  firehose) stops it crowding real records out of a tail. The device still
+  SERVES every emitter — this only shapes the response.
 - **HostFiles** — globs like `/mnt/common-rw/log/*.log`, `/var/log/*`,
   `/dev/shmem/*.log`. The "can't reach slog2" bucket: boot/OS logs + funnel-log
   residue. Lines carry the file mtime as timestamp (coarse) unless a per-line ISO
