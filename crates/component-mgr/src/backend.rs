@@ -276,12 +276,16 @@ pub enum LogSource {
     /// `HostFiles` (which tails text lines), this exposes whole files as
     /// discrete downloadable entries — the message-passing pattern.
     HostDumps { dir: String },
-    /// The QNX `slogger2` ring — the host system log. Reads supernova's own
-    /// records (emitted via score-log-slog2) AND the OS driver/eMMC telemetry
-    /// (devb_sdmmc, CAM) through `platform_log::read_slog2`, decoupled from the
-    /// producer via the kernel-owned ring. Produces STANDARD (line) entries with
-    /// real per-record timestamps + severities — the host analogue of a guest's
-    /// `GuestAgent` journald source. QNX-only in effect (empty off-QNX).
+    /// The QNX `slogger2` ring — the host system log, and the sink for everything
+    /// that CAN emit to it: supernova + vhsm-ssd (via score-log-slog2) plus the OS
+    /// driver/eMMC telemetry (devb_sdmmc, CAM). Read through `platform_log::read_slog2`,
+    /// decoupled from the producer via the kernel-owned ring. It is ONE physical
+    /// `source` (`"slog2"`); the per-buffer name is the EMITTER, surfaced in
+    /// `LogEntry.fields.emitter` (not the source). Produces STANDARD (line) entries
+    /// with real per-record timestamps + severities. QNX-only in effect (empty
+    /// off-QNX). Logs that CANNOT reach slog2 (boot log, /var/log, shell/stderr
+    /// residue) stay their own `HostFiles` sources — see the capability split in
+    /// tasks/host-log-pipeline-design.md.
     Slog2,
 }
 
@@ -6781,9 +6785,23 @@ fn read_lines_from(
 /// Off QNX `read_slog2` is empty, so this yields nothing (a Linux host would use a
 /// journald source instead).
 fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
+    // The slog2 ring is ONE physical `source` ("slog2"); the per-buffer name is the
+    // EMITTER (supernova, vhsm-ssd, devb_sdmmc, …), carried in `fields.emitter` —
+    // not the source. So a `filter.source` naming a specific slog2 buffer would NOT
+    // match here (source is always "slog2"); to narrow to one emitter a client
+    // filters on the emitter field / message, not `source`. A `filter.source` set
+    // to something OTHER than "slog2" means "not this source" → contribute nothing.
+    if let Some(want) = &filter.source {
+        if want != SLOG2_SOURCE {
+            return Vec::new();
+        }
+    }
     let q = platform_log::LogQuery {
         tail: filter.tail.or(filter.limit),
-        source: filter.source.clone(),
+        // Do NOT push filter.source down as a buffer-name match — under the
+        // source/emitter split it's the physical source ("slog2"), already checked
+        // above; the reader would otherwise treat it as a buffer filter.
+        source: None,
         pattern: filter.pattern.clone(),
         // slog2 severities don't line up 1:1 with SOVD "this level and above";
         // apply the priority filter below against the mapped LogPriority instead.
@@ -6801,14 +6819,20 @@ fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
             let timestamp = chrono::DateTime::parse_from_rfc3339(&r.timestamp)
                 .map(|t| t.with_timezone(&Utc))
                 .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH);
+            // `r.source` from the reader is the slog2 BUFFER name → the emitter.
+            let emitter = r.source;
             LogEntry {
-                id: line_log_id(&r.source, timestamp, &r.message),
+                // Keep the emitter in the id input so two emitters' identical
+                // messages/timestamps don't collide to the same log id.
+                id: line_log_id(&format!("{SLOG2_SOURCE}:{emitter}"), timestamp, &r.message),
                 timestamp,
                 priority: priority_from_name(&r.priority),
                 message: r.message,
-                source: Some(r.source),
+                source: Some(SLOG2_SOURCE.to_string()),
                 pid: None,
-                fields: None,
+                // Emitter → structured field (queryable; matches how the journald
+                // reader carries unit/identifier). source stays the physical bus.
+                fields: Some(serde_json::json!({ "emitter": emitter })),
                 log_type: None,
                 size: None,
                 status: None,
@@ -6824,6 +6848,11 @@ fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
     }
     entries
 }
+
+/// The single physical `source` for every record read from the QNX slog2 ring.
+/// The per-buffer emitter (supernova/vhsm-ssd/devb_sdmmc/…) is carried in
+/// `LogEntry.fields.emitter`, NOT the source — slog2 is one bus, many emitters.
+const SLOG2_SOURCE: &str = "slog2";
 
 /// is `Info` (host logs are unstructured text).
 fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
@@ -8086,6 +8115,28 @@ mod bank_provider_injection_tests {
         assert!(got.is_empty(), "off-QNX stub yields no records");
         let page = b.get_logs_paged(&LogFilter::default()).await.unwrap();
         assert!(page.items.is_empty() && page.next_cursor.is_none());
+
+        // Source/emitter split: slog2 is ONE physical source ("slog2"); a
+        // filter.source naming that source is accepted (empty here off-QNX), while
+        // any OTHER source means "not this one" → contribute nothing. (The buffer
+        // name is the emitter, carried in fields, not matched via source.)
+        let f = |s: &str| LogFilter {
+            source: Some(s.to_string()),
+            ..Default::default()
+        };
+        assert!(b.get_logs(&f(SLOG2_SOURCE)).await.unwrap().is_empty());
+        assert!(b
+            .get_logs(&f("some-other-source"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The slog2 physical-source constant is the stable wire value a client sees
+    /// in `LogEntry.source` for every ring record (emitter lives in `fields`).
+    #[test]
+    fn slog2_source_constant_is_slog2() {
+        assert_eq!(SLOG2_SOURCE, "slog2");
     }
 
     fn backend_with_logs(source: LogSource) -> ComponentBackend<MemBlockDevice> {
