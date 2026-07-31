@@ -1,0 +1,15 @@
+[package]
+name = "slog2-drainer"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-integration: Tier-2 host daemon that live-follows the QNX slog2 ring and persists it to sealed, immutable disk segments (<stem>.<seq>.log) via the svclog model — a RAM live file rotated to flash at a size ceiling. Makes host logs reboot-safe + cursor-pageable (read back by component-mgr's LogSource::Slog2Segments through platform_log::read_segments). Applies a persist policy (severity floor + emitter denylist) so the driver firehose never fills the flash budget. QNX-only in effect (a no-op off-nto). NOT part of Tier-1 (provisioning MM reads only the volatile ring)."
+license = "MIT"
+
+[[bin]]
+name = "slog2-drainer"
+path = "src/main.rs"
+
+[dependencies]
+# The slog2 DYNAMIC live-follow FFI (drain_live) + the seal-line/stamp contract
+# (rfc3339_utc, DrainRecord). Links libslog2parse transitively on nto.
+platform-log = { path = "../platform-log" }

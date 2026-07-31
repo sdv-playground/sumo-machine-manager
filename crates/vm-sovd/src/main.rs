@@ -321,6 +321,8 @@ async fn main() {
             host_log_globs: None,
             host_dump_dir: None,
             host_slog2: true,
+            // dev host mode has no slog2-drainer running → no persisted segments.
+            host_slog2_segments_dir: None,
             test_agent_url: None,
             diag_agent_url: None,
             // host-os IS the host: gather §7.9 probes in-process (disk/mem/du).
@@ -343,6 +345,7 @@ async fn main() {
             host_log_globs: None,
             host_dump_dir: None,
             host_slog2: false,
+            host_slog2_segments_dir: None,
             test_agent_url: None,
             diag_agent_url: None,
             host_diagnostics: false,
@@ -364,6 +367,7 @@ async fn main() {
             host_log_globs: None,
             host_dump_dir: None,
             host_slog2: false,
+            host_slog2_segments_dir: None,
             test_agent_url: None,
             diag_agent_url: None,
             host_diagnostics: false,
@@ -385,6 +389,7 @@ async fn main() {
             host_log_globs: None,
             host_dump_dir: None,
             host_slog2: false,
+            host_slog2_segments_dir: None,
             test_agent_url: None,
             diag_agent_url: None,
             host_diagnostics: false,

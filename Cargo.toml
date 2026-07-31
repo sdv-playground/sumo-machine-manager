@@ -36,6 +36,7 @@ members = [
     "crates/platform-integration/score-log-slog2",   # score_log → QNX slog2 recorder
     "crates/platform-integration/sumo-log",          # fleet logging init (env-selected recorder)
     "crates/platform-integration/platform-log",      # shared log readers (files, journald, bulk-data)
+    "crates/platform-integration/slog2-drainer",      # Tier-2 host: drain slog2 ring → sealed disk segments
     # -------------------------------------------------------------------------
     "crates/puller",
     "crates/hsm-rustls",

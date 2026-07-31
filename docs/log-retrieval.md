@@ -40,7 +40,8 @@ its spec (`config.yaml`), additive — a component may have any combination:
 
 | Variant | Spec key | `source` on the wire | Backing |
 |---|---|---|---|
-| `LogSource::Slog2` | `host_slog2: true` | `slog2` (const `SLOG2_SOURCE`) | QNX `slogger2` ring via `platform_log::read_slog2` (`libslog2parse` FFI) |
+| `LogSource::Slog2` | `host_slog2: true` | `slog2` (const `SLOG2_SOURCE`) | QNX `slogger2` ring via `platform_log::read_slog2` (`libslog2parse` FFI). Volatile, cursor:false. |
+| `LogSource::Slog2Segments { dir, stem }` | `host_slog2_segments_dir` (**Tier-2 only**) | `slog2-history` (const `SLOG2_SEGMENTS_SOURCE`) | the slog2 ring PERSISTED to sealed disk segments by the `slog2-drainer`, read via `platform_log::read_segments`. Durable + reboot-safe, cursor:true. |
 | `LogSource::HostFiles { globs }` | `host_log_globs` | the file stem | host-local text files |
 | `LogSource::GuestAgent { url }` | `log_agent_url` | the guest's own source | in-guest `log-agent`, proxied over the guest↔host /30 |
 | `LogSource::HostDumps { dir }` | `host_dump_dir` | — | directory of discrete dump artifacts (§7.21 message-passing) |
@@ -59,6 +60,19 @@ Per-variant detail:
   the gather cap, so muting a high-volume emitter (the `devb_*` eMMC/CAM
   firehose) stops it crowding real records out of a tail. The device still
   SERVES every emitter — this only shapes the response.
+- **Slog2Segments** (Tier-2 only, `slog2-history`) — the SAME ring, but PERSISTED.
+  The `slog2-drainer` daemon (a Tier-2 host companion, spawned by supernova under
+  `#[cfg(feature="vm-runtime")]`) live-follows the ring
+  (`platform_log::drain_live`, DYNAMIC parse) and appends each packet as a stamped
+  line to a RAM live file, sealing it to an immutable flash segment
+  `<dir>/slog2.<seq>.log` at a size ceiling (culling oldest to a byte budget).
+  Read back via `platform_log::read_segments` over the sealed set + live file with
+  the reboot-safe `<seq>:<offset>` cursor (`seq` is a logical clock, so paging is
+  correct across the non-monotonic wall-clock jump). A persist POLICY (severity
+  floor + emitter denylist) keeps the `devb_*` firehose off flash. TWO PLANES,
+  same bus: `slog2` = volatile live tail (all emitters); `slog2-history` = durable
+  cursor-pageable history. Tier-1 (provisioning MM) configures ONLY `slog2` — no
+  drainer, ring alone. See tasks/log-retrieval-design.md (drainer subsystem).
 - **HostFiles** — globs like `/mnt/common-rw/log/*.log`, `/var/log/*`,
   `/dev/shmem/*.log`. The "can't reach slog2" bucket: boot/OS logs + funnel-log
   residue. Lines carry the file mtime as timestamp (coarse) unless a per-line ISO

@@ -335,6 +335,229 @@ pub fn tail_file_lines(path: &std::path::Path) -> std::io::Result<Vec<String>> {
     Ok(lines)
 }
 
+/// Inverse of [`rfc3339_utc`]: parse `YYYY-MM-DDThh:mm:ssZ` back to epoch
+/// seconds (for `since`/`until` compares). `None` if malformed. No chrono.
+pub fn rfc3339_secs(ts: &str) -> Option<u64> {
+    let b = ts.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[19] != b'Z' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| ts.get(r).and_then(|s| s.parse::<i64>().ok());
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, s) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    // days_from_civil (Howard Hinnant).
+    let y2 = if mo <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 + h * 3600 + mi * 60 + s) as u64)
+}
+
+// ---------------------------------------------------------------------------
+// Sealed-segment cursor reader (the svclog `<seq>:<offset>` model).
+//
+// A "segment source" is a directory holding an append-only, immutable set of
+// sealed files `<stem>.<seq>.log` (seq a monotonically-growing integer, never
+// reused) PLUS a single live file `<stem>.log` (the top, still-growing segment).
+// The drainer (host slog2 drainer, or the guest svclog) is the writer; this is
+// the READER: forward-page across the segment spine with a reboot-safe
+// `<seq>:<offset>` cursor. `seq` is a logical clock independent of the (non-
+// monotonic) wall clock, so paging stays correct across a device clock jump.
+//
+// Cursor `<seq>:<offset>`: resume at byte `offset` within segment `seq`, reading
+// forward. The live file is addressed as the virtual seq `max_sealed + 1`.
+// oldest = `<min_seq>:0`; tip = `<live_seq>:<live_len>`.
+// ---------------------------------------------------------------------------
+
+/// The seq of a sealed segment file name `<stem>.<seq>.log`, or `None` for the
+/// live file `<stem>.log` (no numeric segment component) / a non-match.
+fn seg_seq_of(name: &str, stem: &str) -> Option<u64> {
+    let rest = name.strip_prefix(stem)?.strip_prefix('.')?;
+    let seq = rest.strip_suffix(".log")?;
+    if seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    seq.parse::<u64>().ok()
+}
+
+/// A resolved segment: its seq (live file = `max_sealed+1`) and path.
+struct Segment {
+    seq: u64,
+    path: std::path::PathBuf,
+    is_live: bool,
+}
+
+/// Enumerate `dir` for `<stem>.<seq>.log` sealed segments + the live `<stem>.log`,
+/// numerically sorted ascending (oldest→newest, live last). `min_seq` = lowest
+/// sealed seq (for the oldest cursor + gap detection); `live_seq` = the live
+/// file's virtual seq (`max_sealed + 1`, or the lone segment if none sealed).
+fn enumerate_segments(dir: &std::path::Path, stem: &str) -> (Vec<Segment>, Option<u64>, u64) {
+    let mut sealed: Vec<Segment> = Vec::new();
+    let mut live: Option<std::path::PathBuf> = None;
+    let live_name = format!("{stem}.log");
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name == live_name {
+                live = Some(e.path());
+            } else if let Some(seq) = seg_seq_of(&name, stem) {
+                sealed.push(Segment {
+                    seq,
+                    path: e.path(),
+                    is_live: false,
+                });
+            }
+        }
+    }
+    sealed.sort_by_key(|s| s.seq);
+    let min_seq = sealed.first().map(|s| s.seq);
+    let max_sealed = sealed.last().map(|s| s.seq);
+    // Live file's virtual seq: one past the highest sealed (or 0 if none yet).
+    let live_seq = max_sealed.map_or(0, |m| m + 1);
+    let mut segs = sealed;
+    if let Some(path) = live {
+        segs.push(Segment {
+            seq: live_seq,
+            path,
+            is_live: true,
+        });
+    }
+    (segs, min_seq, live_seq)
+}
+
+/// Parse a `<seq>:<offset>` cursor. `None` if malformed (treated as "from start").
+fn decode_seg_cursor(s: &str) -> Option<(u64, u64)> {
+    let (seq, off) = s.split_once(':')?;
+    Some((seq.parse().ok()?, off.parse().ok()?))
+}
+
+/// One record parsed from a stamped segment line + the source stem.
+fn seg_record(line: &str, stem: &str) -> LogRecord {
+    let (stamp, msg) = split_leading_stamp(line);
+    LogRecord {
+        timestamp: stamp
+            .map(str::to_string)
+            .unwrap_or_else(|| rfc3339_utc(0)),
+        priority: "info".into(),
+        message: msg.to_string(),
+        source: stem.to_string(),
+    }
+}
+
+/// Forward-page a sealed-segment source. Reads from `q.after` (`<seq>:<offset>`;
+/// omitted ⇒ oldest) forward up to `tail`/`limit` records, across sealed
+/// segments then the live file. Emits `next_cursor` (where it stopped; `None` at
+/// head), `oldest_cursor` (`<min_seq>:0`), `tip_cursor` (`<live_seq>:<live_len>`).
+/// Gap: an `after` naming a culled seq is clamped forward to the oldest available.
+pub fn read_segments(dir: &std::path::Path, stem: &str, q: &LogQuery) -> PagedLogs {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let (segs, min_seq, live_seq) = enumerate_segments(dir, stem);
+    if segs.is_empty() {
+        return PagedLogs::default();
+    }
+    // Tip = live file at its current EOF (or the highest sealed EOF if no live).
+    let tip_seq = live_seq;
+    let live_len = segs
+        .last()
+        .filter(|s| s.is_live)
+        .and_then(|s| std::fs::metadata(&s.path).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let tip_cursor = Some(format!("{tip_seq}:{live_len}"));
+    let oldest_cursor = Some(format!("{}:0", min_seq.unwrap_or(0)));
+
+    // Resolve the start position from `after`; clamp a culled/old seq forward.
+    let (mut cur_seq, mut cur_off) = match q.after.as_deref().and_then(decode_seg_cursor) {
+        Some((s, o)) => (s, o),
+        None => (min_seq.unwrap_or(0), 0),
+    };
+    if let Some(m) = min_seq {
+        if cur_seq < m {
+            cur_seq = m;
+            cur_off = 0;
+        }
+    }
+
+    let page = q.tail.unwrap_or(DEFAULT_TAIL).min(MAX_RECORDS);
+    let since = q.since.as_deref().and_then(rfc3339_secs);
+    let until = q.until.as_deref().and_then(rfc3339_secs);
+
+    let mut out: Vec<LogRecord> = Vec::new();
+    let mut next_cursor: Option<String> = None;
+
+    'walk: for seg in segs.iter().filter(|s| s.seq >= cur_seq) {
+        // Where in THIS segment to start: the cursor offset for the resume
+        // segment, else the segment's beginning.
+        let start = if seg.seq == cur_seq { cur_off } else { 0 };
+        let Ok(mut f) = std::fs::File::open(&seg.path) else {
+            continue;
+        };
+        if start > 0 && f.seek(SeekFrom::Start(start)).is_err() {
+            continue;
+        }
+        // Cap the read so one huge segment can't OOM; read from `start` forward.
+        let mut buf = Vec::new();
+        if f.take(FILE_DOWNLOAD_CAP).read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        // Walk complete lines, tracking the byte offset AFTER each consumed line
+        // so next_cursor points at the next unread byte.
+        let mut consumed: u64 = start;
+        for raw in buf.split_inclusive(|&b| b == b'\n') {
+            // A trailing partial line (no '\n') in the LIVE file is not yet
+            // complete — stop before it so the cursor resumes there next poll.
+            if !raw.ends_with(b"\n") {
+                break;
+            }
+            let line_len = raw.len() as u64;
+            let line = String::from_utf8_lossy(raw);
+            let line = line.trim_end_matches('\n');
+            consumed += line_len;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rec = seg_record(line, stem);
+            // Filters (source is the stem; emitter == source here).
+            if let Some(src) = &q.source {
+                if &rec.source != src {
+                    continue;
+                }
+            }
+            if !q.emitter_allows(&rec.source) {
+                continue;
+            }
+            if let Some(pat) = &q.pattern {
+                if !rec.message.contains(pat.as_str()) {
+                    continue;
+                }
+            }
+            if since.is_some() || until.is_some() {
+                if let Some(t) = rfc3339_secs(&rec.timestamp) {
+                    if since.is_some_and(|s| t < s) || until.is_some_and(|u| t > u) {
+                        continue;
+                    }
+                }
+            }
+            out.push(rec);
+            if out.len() >= page {
+                // Page full — resume AFTER this line next time.
+                next_cursor = Some(format!("{}:{}", seg.seq, consumed));
+                break 'walk;
+            }
+        }
+    }
+
+    PagedLogs {
+        items: out,
+        next_cursor,
+        oldest_cursor,
+        tip_cursor,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // base64url (RFC 4648 §5, url-safe alphabet, NO padding).
 //
@@ -704,6 +927,164 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // ── read_segments: the sealed-segment cursor reader ──────────────────────
+
+    /// Build a segment dir: sealed `<stem>.<seq>.log` for each (seq, lines) +
+    /// an optional live `<stem>.log`. `tag` MUST be unique per test — the tests
+    /// run in parallel, so a shared dir name would cross-talk.
+    fn seg_dir(tag: &str, stem: &str, sealed: &[(u64, &[&str])], live: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("seg-test-{}-{}", std::process::id(), tag));
+        std::fs::create_dir_all(&dir).unwrap();
+        // clean any stragglers from a prior run
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                std::fs::remove_file(e.path()).ok();
+            }
+        }
+        let stamp = "2026-07-20T15:50:13Z ";
+        let write = |name: String, lines: &[&str]| {
+            let body: String = lines.iter().map(|l| format!("{stamp}{l}\n")).collect();
+            std::fs::write(dir.join(name), body).unwrap();
+        };
+        for (seq, lines) in sealed {
+            write(format!("{stem}.{seq}.log"), lines);
+        }
+        if !live.is_empty() {
+            write(format!("{stem}.log"), live);
+        }
+        dir
+    }
+
+    fn msgs(p: &PagedLogs) -> Vec<String> {
+        p.items.iter().map(|r| r.message.clone()).collect()
+    }
+
+    #[test]
+    fn read_segments_walks_spine_oldest_first_and_names_cursors() {
+        // Two sealed segments + a live file.
+        let dir = seg_dir(
+            "spine",
+            "slog2",
+            &[(100, &["a1", "a2"]), (101, &["b1"])],
+            &["live1", "live2"],
+        );
+        let q = LogQuery {
+            tail: Some(10),
+            ..Default::default()
+        };
+        let p = read_segments(&dir, "slog2", &q);
+        // Oldest→newest across sealed then live; NOT wall-clock sorted.
+        assert_eq!(msgs(&p), ["a1", "a2", "b1", "live1", "live2"]);
+        // oldest = min sealed seq; tip = live seq (max_sealed+1) : live_len.
+        assert_eq!(p.oldest_cursor.as_deref(), Some("100:0"));
+        let live_len = std::fs::metadata(dir.join("slog2.log")).unwrap().len();
+        assert_eq!(p.tip_cursor, Some(format!("102:{live_len}")));
+        // Fit in one page → no next_cursor (head reached).
+        assert!(p.next_cursor.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_segments_pages_and_resumes_via_cursor() {
+        let dir = seg_dir("page", "slog2", &[(1, &["x1", "x2", "x3"]), (2, &["y1", "y2"])], &[]);
+        // page=2 → first two, next_cursor set.
+        let q1 = LogQuery {
+            tail: Some(2),
+            ..Default::default()
+        };
+        let p1 = read_segments(&dir, "slog2", &q1);
+        assert_eq!(msgs(&p1), ["x1", "x2"]);
+        let c1 = p1.next_cursor.clone().expect("more to read");
+
+        // Resume: next page picks up exactly after x2.
+        let q2 = LogQuery {
+            tail: Some(2),
+            after: Some(c1),
+            ..Default::default()
+        };
+        let p2 = read_segments(&dir, "slog2", &q2);
+        assert_eq!(msgs(&p2), ["x3", "y1"]);
+        let c2 = p2.next_cursor.clone().expect("still more");
+
+        // Final page crosses into seg 2 and reaches head → no next_cursor.
+        let q3 = LogQuery {
+            tail: Some(2),
+            after: Some(c2),
+            ..Default::default()
+        };
+        let p3 = read_segments(&dir, "slog2", &q3);
+        assert_eq!(msgs(&p3), ["y2"]);
+        assert!(p3.next_cursor.is_none(), "head reached");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_segments_gap_clamps_culled_after_forward() {
+        // Oldest sealed is seq 5; a client whose cursor names culled seq 2 gets
+        // clamped forward to the oldest available (no panic, no silent loss).
+        let dir = seg_dir("gap", "slog2", &[(5, &["m1", "m2"])], &[]);
+        let q = LogQuery {
+            tail: Some(10),
+            after: Some("2:0".into()),
+            ..Default::default()
+        };
+        let p = read_segments(&dir, "slog2", &q);
+        assert_eq!(msgs(&p), ["m1", "m2"]);
+        assert_eq!(p.oldest_cursor.as_deref(), Some("5:0"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_segments_tip_follow_returns_empty() {
+        // after == tip → nothing new (the follow-tail steady state).
+        let dir = seg_dir("tip", "slog2", &[(1, &["only"])], &["livea"]);
+        let p0 = read_segments(&dir, "slog2", &LogQuery::default());
+        let tip = p0.tip_cursor.clone().unwrap();
+        let q = LogQuery {
+            after: Some(tip),
+            ..Default::default()
+        };
+        let p = read_segments(&dir, "slog2", &q);
+        assert!(p.items.is_empty(), "at tip → no new records: {:?}", msgs(&p));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_segments_ignores_partial_trailing_line_in_live() {
+        // Live file with a complete line + a torn (no-newline) tail: only the
+        // complete line is returned; the cursor stops before the partial so the
+        // next poll resumes there.
+        let dir = seg_dir("partial", "slog2", &[], &[]);
+        std::fs::write(
+            dir.join("slog2.log"),
+            "2026-07-20T15:50:13Z done\n2026-07-20T15:50:14Z partial-no-newline",
+        )
+        .unwrap();
+        let p = read_segments(&dir, "slog2", &LogQuery::default());
+        assert_eq!(msgs(&p), ["done"], "partial line withheld until complete");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_segments_empty_dir_is_empty_page() {
+        let dir = seg_dir("empty", "slog2", &[], &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = read_segments(&dir, "slog2", &LogQuery::default());
+        assert!(p.items.is_empty());
+        assert!(p.next_cursor.is_none() && p.oldest_cursor.is_none() && p.tip_cursor.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn seg_seq_of_parses_only_numeric_sealed_names() {
+        assert_eq!(seg_seq_of("slog2.100.log", "slog2"), Some(100));
+        assert_eq!(seg_seq_of("slog2.log", "slog2"), None); // live file
+        assert_eq!(seg_seq_of("slog2.x.log", "slog2"), None); // non-numeric
+        assert_eq!(seg_seq_of("other.1.log", "slog2"), None); // wrong stem
+        assert_eq!(seg_seq_of("slog2.1.txt", "slog2"), None); // wrong ext
+    }
 }
 
 // ===========================================================================
@@ -742,6 +1123,31 @@ pub fn read_slog2(q: &LogQuery) -> Vec<LogRecord> {
 pub fn read_slog2(_q: &LogQuery) -> Vec<LogRecord> {
     Vec::new()
 }
+
+/// One packet delivered to a [`drain_live`] sink — the raw fields a drainer needs
+/// to write a stamped segment line, before any policy/formatting.
+#[derive(Debug, Clone)]
+pub struct DrainRecord {
+    /// Packet emit time, epoch seconds (QNX CLOCK_REALTIME; non-monotonic — the
+    /// drainer stamps it honestly, the segment SEQ is the ordering spine).
+    pub epoch_secs: u64,
+    /// SOVD priority name (emergency..debug) from the packet severity.
+    pub priority: &'static str,
+    /// The slog2 buffer-set name = the EMITTER (snova / vhsm / devb_sdmmc_mx8x / …).
+    pub emitter: String,
+    pub message: String,
+}
+
+/// Live-follow the QNX slog2 ring, invoking `sink` for every ASCII packet as it
+/// arrives (via `slog2_parse_all` in DYNAMIC|CURRENT mode). BLOCKS forever (the
+/// ring stream never ends) — the drainer runs this on its own thread. QNX-only;
+/// a no-op that returns immediately off-target.
+#[cfg(target_os = "nto")]
+pub fn drain_live<F: FnMut(DrainRecord)>(sink: F) {
+    slog2_reader::drain_live(sink);
+}
+#[cfg(not(target_os = "nto"))]
+pub fn drain_live<F: FnMut(DrainRecord)>(_sink: F) {}
 
 /// QNX: plain-file logs. `/dev/shmem/*.log` is where the OS layer hook writes
 /// every declared service's output; `/var/log/*` is the OS's own.

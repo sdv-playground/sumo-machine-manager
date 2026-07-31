@@ -197,14 +197,14 @@ pub fn read(q: &LogQuery) -> Option<Vec<LogRecord>> {
     let mut out = acc.out;
     if let Some(since) = q.since.as_deref().and_then(parse_secs) {
         out.retain(|r| {
-            rfc3339_secs(&r.timestamp)
+            crate::rfc3339_secs(&r.timestamp)
                 .map(|s| s >= since)
                 .unwrap_or(true)
         });
     }
     if let Some(until) = q.until.as_deref().and_then(parse_secs) {
         out.retain(|r| {
-            rfc3339_secs(&r.timestamp)
+            crate::rfc3339_secs(&r.timestamp)
                 .map(|s| s <= until)
                 .unwrap_or(true)
         });
@@ -223,25 +223,66 @@ fn parse_secs(s: &str) -> Option<u64> {
     s.trim().parse::<u64>().ok()
 }
 
-/// Best-effort inverse of `rfc3339_utc` for the since/until compare — only needs
-/// the epoch seconds back. Parses `YYYY-MM-DDThh:mm:ssZ`. `None` if malformed.
-fn rfc3339_secs(ts: &str) -> Option<u64> {
-    // Cheap fixed-position parse (no chrono), inverse of crate::rfc3339_utc.
-    let b = ts.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[19] != b'Z' {
-        return None;
+// ── live-follow drain (DYNAMIC parse) — feeds the slog2 disk drainer ────────
+
+/// `slog2_parse_all` flags (slog2_parse.h): DYNAMIC = live-stream all buffers
+/// merged; CURRENT = start the live stream from "now" (skip the existing ring
+/// backlog — the drainer wants NEW packets, not a re-dump on every start).
+const SLOG2_PARSE_FLAGS_DYNAMIC: u32 = 0x1;
+const SLOG2_PARSE_FLAGS_CURRENT: u32 = 0x2;
+
+/// Per-packet callback for the DYNAMIC drain: map an ASCII packet to a
+/// [`DrainRecord`] and hand it to the sink. `param` is a `&mut &mut dyn FnMut`.
+/// Returns 0 to keep streaming forever (the drain never asks to stop).
+extern "C" fn on_drain_packet(
+    info: *mut PacketInfo,
+    payload: *mut c_void,
+    param: *mut c_void,
+) -> c_int {
+    // SAFETY: slog2_parse_all passes our sink trait-object ptr as `param`, and a
+    // valid `info` + (ASCII) NUL-terminated `payload` for this call's duration.
+    unsafe {
+        let sink = &mut *(param as *mut &mut dyn FnMut(crate::DrainRecord));
+        let pi = &*info;
+        // ASCII string packets only (data_type 0); skip binary/unsync.
+        if pi.data_type != 0 || payload.is_null() {
+            return 0;
+        }
+        let message = CStr::from_ptr(payload as *const c_char)
+            .to_string_lossy()
+            .into_owned();
+        sink(crate::DrainRecord {
+            epoch_secs: pi.timestamp / 1_000_000_000,
+            priority: severity_name(pi.severity),
+            emitter: cstr_field(&pi.file_name),
+            message,
+        });
     }
-    let num = |r: std::ops::Range<usize>| ts.get(r).and_then(|s| s.parse::<i64>().ok());
-    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (h, mi, s) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    // days_from_civil (Howard Hinnant).
-    let y2 = if mo <= 2 { y - 1 } else { y };
-    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
-    let yoe = y2 - era * 400;
-    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some((days * 86_400 + h * 3600 + mi * 60 + s) as u64)
+    0
+}
+
+/// Live-follow the ring, calling `sink` per ASCII packet. BLOCKS forever (the
+/// DYNAMIC parse only returns if the callback returns non-zero, which we never
+/// do — or on a hard parse error). The caller owns the thread.
+pub fn drain_live<F: FnMut(crate::DrainRecord)>(mut sink: F) {
+    // Pass the sink as a `&mut dyn FnMut` behind one more `&mut` so the C `void*`
+    // round-trips to a fat-pointer we can reconstruct in the callback.
+    let mut dyn_sink: &mut dyn FnMut(crate::DrainRecord) = &mut sink;
+    let param = &mut dyn_sink as *mut &mut dyn FnMut(crate::DrainRecord) as *mut c_void;
+    let mut info: PacketInfo = unsafe { std::mem::zeroed() };
+    info.size = std::mem::size_of::<PacketInfo>() as u32;
+    // SAFETY: valid `info` (size set), our callback + sink ptr as param; dir=NULL
+    // (all buffers, DYNAMIC requires NULL), match_list=NULL.
+    unsafe {
+        slog2_parse_all(
+            SLOG2_PARSE_FLAGS_DYNAMIC | SLOG2_PARSE_FLAGS_CURRENT,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut info,
+            on_drain_packet,
+            param,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -266,8 +307,8 @@ mod tests {
     fn rfc3339_secs_inverts_rfc3339_utc() {
         for secs in [0u64, 1_784_562_613, 951_827_696] {
             let ts = crate::rfc3339_utc(secs);
-            assert_eq!(rfc3339_secs(&ts), Some(secs), "round-trip {ts}");
+            assert_eq!(crate::rfc3339_secs(&ts), Some(secs), "round-trip {ts}");
         }
-        assert_eq!(rfc3339_secs("not-a-timestamp"), None);
+        assert_eq!(crate::rfc3339_secs("not-a-timestamp"), None);
     }
 }

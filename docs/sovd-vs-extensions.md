@@ -114,6 +114,12 @@ a component has >1 source — a sane default, never a cross-source merge. A
 `file`/`dump` source is also downloadable whole via the spec-native
 `/logs/entries` → `/bulk-data/logs/{id}` path.
 
+On the QNX host (Tier-2) the catalog shows TWO slog2 planes: `slog2` (the
+volatile ring, `cursor:false` — a live tail, all emitters) and `slog2-history`
+(the `slog2-drainer`'s sealed disk segments, `cursor:true` — durable +
+reboot-safe, paged by `<seq>:<offset>`). Tier-1 (provisioning MM) shows only
+`slog2`. See [log-retrieval.md](log-retrieval.md) for the drainer.
+
 ### Logs `GET /logs` (§7.21) — wire types in `sovd-api/handlers/logs.rs`
 
 **Extra request params** (base SOVD defines none of these):

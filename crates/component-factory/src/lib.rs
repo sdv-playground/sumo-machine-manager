@@ -104,6 +104,16 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub host_slog2: bool,
 
+    /// §7.21 log reads — the directory of SEALED slog2 disk segments written by
+    /// the `slog2-drainer` (Tier-2 host daemon). `Some(dir)` adds a
+    /// `LogSource::Slog2Segments` — the durable, reboot-safe, cursor-pageable
+    /// history plane (`slog2-history`), distinct from the live ring (`host_slog2`).
+    /// TIER-2 ONLY: set only in the full `config.yaml`; the Tier-1 provisioning
+    /// config never sets it (its absence keeps Tier-1 on the ring alone). The
+    /// stem is fixed `"slog2"` (matches the drainer's default).
+    #[serde(default)]
+    pub host_slog2_segments_dir: Option<String>,
+
     /// §7.15 scripts (developer-registered TESTS): the in-guest test-agent base
     /// URL, e.g. `http://10.0.101.2:9310` (the guest-hal layer runs the agent).
     /// `Some` → `capabilities` expose a `scripts` collection proxied from its
@@ -143,6 +153,12 @@ impl ComponentSpec {
         }
         if self.host_slog2 {
             sources.push(LogSource::Slog2);
+        }
+        if let Some(dir) = &self.host_slog2_segments_dir {
+            sources.push(LogSource::Slog2Segments {
+                dir: dir.clone(),
+                stem: "slog2".to_string(),
+            });
         }
         sources
     }
