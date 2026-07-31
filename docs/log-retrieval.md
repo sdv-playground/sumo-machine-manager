@@ -71,11 +71,22 @@ Per-variant detail:
 `capabilities.bulk_data` iff a HostFiles OR GuestAgent source exists (Slog2 +
 HostDumps are line/message streams, NOT downloadable-file catalogs).
 
-## Reads: tail, cursor page, and bulk-data
-- `get_logs(filter)` — the merged tail/list (newest-first), the classic view.
+## Reads: per-source catalog, tail, cursor page, and bulk-data
+- `list_log_sources()` — the per-source CATALOG (`GET /logs/sources`): one
+  `LogSourceInfo {name, kind: Journal|File|Dump, cursor, emitters}` per source.
+  slog2 → one Journal (cursor:false, emitters:[] — deferred ring walk); HostFiles
+  → one File PER RESOLVED STEM (dynamic — newly-dropped files appear); HostDumps →
+  one Dump; GuestAgent → one Journal (Phase 1 stub). Distinct sources are NEVER
+  merged (independent clocks); a client enumerates then reads one at a time.
+- `get_logs(filter)` — one source's tail/list. With `filter.source` set (the
+  `/logs/sources/{name}` route, or the primary-source default the SOVD `GET /logs`
+  handler fills for a multi-source component) only that source contributes; a
+  single-source component needs no selection.
 - `get_logs_paged(filter)` — reboot-safe forward paging. Returns a `LogPage`
-  {items, next_cursor, oldest_cursor, tip_cursor}. NOTE the SOVD `GET /logs` route
-  calls THIS (not `get_logs`), so every `/logs` read goes through the paged path.
+  {items, next_cursor, oldest_cursor, tip_cursor}. NOTE the SOVD `GET /logs` +
+  `/logs/sources/{name}` routes call THIS, so every entry read goes through the
+  paged path. slog2 has no ring cursor yet → terminal page (cursor:false in the
+  catalog; a client must not loop expecting a cursor).
 - `list_bulk_data_categories` / `list_bulk_data("logs", …)` / `get_bulk_data` —
   the §7.20 collection: each log file is one downloadable item, fetched whole
   (32 MiB inline cap; 202/307 streaming is future work).

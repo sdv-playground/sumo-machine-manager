@@ -96,6 +96,24 @@ exists as `node_boot_id` feeding `x-sumo-runtime` (below).
 Standard routes that carry vendor semantics or fields a pure-spec client wouldn't
 expect. **This is the part that matters most for building a compatible endpoint.**
 
+### Per-source log routes (x-sumo) — `sovd-api/lib.rs` + `handlers/logs_ext.rs`
+
+Distinct log sources are NEVER merged/time-sorted (independent clocks — a live
+journal at real time vs. a boot file stamped 1970). So a source is a resource you
+ENUMERATE then ADDRESS, not a filter value:
+
+| Route | Method | Returns |
+|---|---|---|
+| `/logs/sources` | GET | catalog: `[{ name, kind: journal\|file\|dump, cursor, emitters?, href }]` |
+| `/logs/sources/{name}` | GET | ONE source's entries (same body as `/logs`), paged with its own cursor + emitter filter |
+
+Registered as static routes ahead of the `/logs/{log_id}` catch-all (matchit
+gives statics priority; the 3-segment form can't collide anyway). Bare
+`GET /logs` returns the PRIMARY source (first `journal`, else first source) when
+a component has >1 source — a sane default, never a cross-source merge. A
+`file`/`dump` source is also downloadable whole via the spec-native
+`/logs/entries` → `/bulk-data/logs/{id}` path.
+
 ### Logs `GET /logs` (§7.21) — wire types in `sovd-api/handlers/logs.rs`
 
 **Extra request params** (base SOVD defines none of these):
@@ -194,8 +212,9 @@ boot (§7.1); vehicle-wide tokens' `epoch` claim MUST be ≥ the device epoch fl
 
 ## Summary: the sumo "SOVD (extended)" profile
 
-A sumo-compatible SOVD endpoint = standard SOVD **plus**: the `x-sumo-after`
-cursor + three response cursors on `/logs`; the `END[-N]`/`BEGIN` time sentinels;
+A sumo-compatible SOVD endpoint = standard SOVD **plus**: the `/logs/sources`
+catalog + `/logs/sources/{name}` per-source reads; the `x-sumo-after` cursor +
+three response cursors on `/logs`; the `END[-N]`/`BEGIN` time sentinels;
 reboot-safe (non-timestamp) ordering; `fields.emitter` on log entries; the
 `x-sumo-runtime` status block; and the boot-bound JWT freshness model. The
 `x-sumo-*` OTA/HSM routes are needed only for a device that participates in OTA —

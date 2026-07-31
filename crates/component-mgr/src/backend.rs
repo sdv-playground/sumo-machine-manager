@@ -2862,6 +2862,62 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// [`LogSource::GuestAgent`] source offers a single `logs` category (its
     /// downloadable log files — host-local and/or guest). HostDumps-only
     /// components fall back to the trait default (empty).
+    /// `GET /logs/sources` — the per-source catalog (x-sumo). Expands the
+    /// device-internal `LogSource` set into the wire `LogSourceInfo` list a client
+    /// enumerates then reads one at a time (never a cross-source merge). Dynamic:
+    /// `HostFiles` globs are RESOLVED here, so one glob config yields one entry per
+    /// currently-present file stem — newly-dropped files appear automatically.
+    async fn list_log_sources(&self) -> BackendResult<Vec<LogSourceInfo>> {
+        let mut out: Vec<LogSourceInfo> = Vec::new();
+        for source in &self.config.log_sources {
+            match source {
+                // The QNX ring: ONE journal source, many emitters (in
+                // fields.emitter). cursor:false — no reboot-safe ring cursor yet
+                // (tasks/qnx-log-segments-design.md); emitters:[] — enumerating
+                // them is a full ring walk, deferred (a client discovers them via
+                // fields.emitter / x-sumo-emitter-exclude).
+                LogSource::Slog2 => out.push(LogSourceInfo {
+                    name: SLOG2_SOURCE.to_string(),
+                    kind: LogSourceKind::Journal,
+                    cursor: false,
+                    emitters: Vec::new(),
+                }),
+                // Each resolved file is its OWN source (its stem). File sources
+                // page reboot-safely (byte-offset cursor via host_file_logs_paged).
+                LogSource::HostFiles { globs } => {
+                    for path in resolve_log_files(globs) {
+                        out.push(LogSourceInfo {
+                            name: source_name(&path),
+                            kind: LogSourceKind::File,
+                            cursor: true,
+                            emitters: Vec::new(),
+                        });
+                    }
+                }
+                // A dump directory is one Dump source (message-passing artifacts).
+                LogSource::HostDumps { .. } => out.push(LogSourceInfo {
+                    name: "dumps".to_string(),
+                    kind: LogSourceKind::Dump,
+                    cursor: false,
+                    emitters: Vec::new(),
+                }),
+                // Phase 1: a guest is ONE journal source (stable wire shape). Phase
+                // 2 expands it to the guest's own sources via a guest /sources
+                // endpoint (tasks/log-retrieval-design.md).
+                LogSource::GuestAgent { .. } => out.push(LogSourceInfo {
+                    name: "guest".to_string(),
+                    kind: LogSourceKind::Journal,
+                    cursor: true,
+                    emitters: Vec::new(),
+                }),
+            }
+        }
+        // Stable order + dedup by name (two globs could resolve the same stem).
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.dedup_by(|a, b| a.name == b.name);
+        Ok(out)
+    }
+
     async fn list_bulk_data_categories(&self) -> BackendResult<Vec<BulkCategory>> {
         let has_files = self.config.log_sources.iter().any(|s| {
             matches!(
@@ -8154,6 +8210,65 @@ mod bank_provider_injection_tests {
     #[test]
     fn slog2_source_constant_is_slog2() {
         assert_eq!(SLOG2_SOURCE, "slog2");
+    }
+
+    /// `list_log_sources` maps each configured `LogSource` to a catalog entry:
+    /// slog2 → one Journal (cursor:false), HostFiles → one File PER RESOLVED STEM
+    /// (dynamic, cursor:true), sorted + deduped by name.
+    #[tokio::test]
+    async fn list_log_sources_expands_slog2_and_files_by_stem() {
+        use sovd_core::{DiagnosticBackend, LogSourceKind};
+
+        // Two real files with distinct stems so resolve_log_files finds them.
+        let dir = std::env::temp_dir().join(format!("lsrc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("host-boot.log"), b"boot\n").unwrap();
+        std::fs::write(dir.join("timestamp.log"), b"ts\n").unwrap();
+        let glob = format!("{}/*.log", dir.display());
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        let b = ComponentBackend::with_options(
+            BankSet::Os,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig {
+                log_sources: vec![LogSource::Slog2, LogSource::HostFiles { globs: vec![glob] }],
+                ..ComponentConfig::default()
+            },
+            None,
+            None,
+            None,
+        );
+
+        let srcs = b.list_log_sources().await.unwrap();
+        let names: Vec<&str> = srcs.iter().map(|s| s.name.as_str()).collect();
+        // slog2 (journal) + one File per stem, sorted by name.
+        assert_eq!(names, ["host-boot", "slog2", "timestamp"], "got {names:?}");
+
+        let slog2 = srcs.iter().find(|s| s.name == "slog2").unwrap();
+        assert_eq!(slog2.kind, LogSourceKind::Journal);
+        assert!(!slog2.cursor, "slog2 has no ring cursor yet");
+        assert!(slog2.emitters.is_empty());
+
+        let hb = srcs.iter().find(|s| s.name == "host-boot").unwrap();
+        assert_eq!(hb.kind, LogSourceKind::File);
+        assert!(hb.cursor, "file sources page by byte offset");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A single-source component (the deployed host = `[Slog2]`) advertises
+    /// exactly that one source — the common on-device case.
+    #[tokio::test]
+    async fn list_log_sources_single_slog2() {
+        use sovd_core::{DiagnosticBackend, LogSourceKind};
+        let b = backend_with_logs(LogSource::Slog2);
+        let srcs = b.list_log_sources().await.unwrap();
+        assert_eq!(srcs.len(), 1);
+        assert_eq!(srcs[0].name, "slog2");
+        assert_eq!(srcs[0].kind, LogSourceKind::Journal);
     }
 
     fn backend_with_logs(source: LogSource) -> ComponentBackend<MemBlockDevice> {
