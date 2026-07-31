@@ -437,9 +437,7 @@ fn decode_seg_cursor(s: &str) -> Option<(u64, u64)> {
 fn seg_record(line: &str, stem: &str) -> LogRecord {
     let (stamp, msg) = split_leading_stamp(line);
     LogRecord {
-        timestamp: stamp
-            .map(str::to_string)
-            .unwrap_or_else(|| rfc3339_utc(0)),
+        timestamp: stamp.map(str::to_string).unwrap_or_else(|| rfc3339_utc(0)),
         priority: "info".into(),
         message: msg.to_string(),
         source: stem.to_string(),
@@ -933,7 +931,12 @@ mod tests {
     /// Build a segment dir: sealed `<stem>.<seq>.log` for each (seq, lines) +
     /// an optional live `<stem>.log`. `tag` MUST be unique per test — the tests
     /// run in parallel, so a shared dir name would cross-talk.
-    fn seg_dir(tag: &str, stem: &str, sealed: &[(u64, &[&str])], live: &[&str]) -> std::path::PathBuf {
+    fn seg_dir(
+        tag: &str,
+        stem: &str,
+        sealed: &[(u64, &[&str])],
+        live: &[&str],
+    ) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("seg-test-{}-{}", std::process::id(), tag));
         std::fs::create_dir_all(&dir).unwrap();
         // clean any stragglers from a prior run
@@ -987,7 +990,12 @@ mod tests {
 
     #[test]
     fn read_segments_pages_and_resumes_via_cursor() {
-        let dir = seg_dir("page", "slog2", &[(1, &["x1", "x2", "x3"]), (2, &["y1", "y2"])], &[]);
+        let dir = seg_dir(
+            "page",
+            "slog2",
+            &[(1, &["x1", "x2", "x3"]), (2, &["y1", "y2"])],
+            &[],
+        );
         // page=2 → first two, next_cursor set.
         let q1 = LogQuery {
             tail: Some(2),
@@ -1046,7 +1054,11 @@ mod tests {
             ..Default::default()
         };
         let p = read_segments(&dir, "slog2", &q);
-        assert!(p.items.is_empty(), "at tip → no new records: {:?}", msgs(&p));
+        assert!(
+            p.items.is_empty(),
+            "at tip → no new records: {:?}",
+            msgs(&p)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

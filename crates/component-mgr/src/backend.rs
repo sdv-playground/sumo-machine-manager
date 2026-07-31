@@ -7019,7 +7019,11 @@ fn slog2_segments_logs(dir: &str, stem: &str, filter: &LogFilter) -> Vec<LogEntr
             return Vec::new();
         }
     }
-    let page = platform_log::read_segments(std::path::Path::new(dir), stem, &slog2_segments_query(filter));
+    let page = platform_log::read_segments(
+        std::path::Path::new(dir),
+        stem,
+        &slog2_segments_query(filter),
+    );
     let mut entries: Vec<LogEntry> = page.items.into_iter().map(slog2_segment_entry).collect();
     if let Some(p) = filter.priority {
         entries.retain(|e| e.priority <= p);
@@ -7030,8 +7034,11 @@ fn slog2_segments_logs(dir: &str, stem: &str, filter: &LogFilter) -> Vec<LogEntr
 /// Paged read of the persisted slog2 segments — the reboot-safe `<seq>:<offset>`
 /// cursor path (`GET /logs/sources/slog2-history` with `x-sumo-after`).
 fn slog2_segments_paged(dir: &str, stem: &str, filter: &LogFilter) -> LogPage {
-    let page =
-        platform_log::read_segments(std::path::Path::new(dir), stem, &slog2_segments_query(filter));
+    let page = platform_log::read_segments(
+        std::path::Path::new(dir),
+        stem,
+        &slog2_segments_query(filter),
+    );
     let mut items: Vec<LogEntry> = page.items.into_iter().map(slog2_segment_entry).collect();
     if let Some(p) = filter.priority {
         items.retain(|e| e.priority <= p);
@@ -8384,7 +8391,9 @@ mod bank_provider_injection_tests {
         let mut msgs: Vec<_> = all.iter().map(|e| e.message.clone()).collect();
         msgs.sort();
         assert_eq!(msgs, ["boot one", "boot two", "later"], "got {msgs:?}");
-        assert!(all.iter().all(|e| e.source.as_deref() == Some(SLOG2_SEGMENTS_SOURCE)));
+        assert!(all
+            .iter()
+            .all(|e| e.source.as_deref() == Some(SLOG2_SEGMENTS_SOURCE)));
 
         // Paged read scoped to the source → a real cursor page, in FORWARD order
         // (oldest→newest, the cursor's native order — NOT wall-clock re-sorted).

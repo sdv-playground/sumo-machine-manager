@@ -234,7 +234,10 @@ fn list_segments(dir: &Path, stem: &str) -> Vec<(u64, u64, PathBuf)> {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_str(key: &str, default: &str) -> String {
@@ -248,7 +251,10 @@ fn main() {
     let max_bytes = env_u64("SVCLOG_MAX_BYTES", DEFAULT_MAX_BYTES);
     let keep_bytes = env_u64("SVCLOG_KEEP_BYTES", DEFAULT_KEEP_BYTES);
     let policy = Policy {
-        floor_rank: severity_rank(&env_str("SLOG2_DRAINER_SEVERITY_FLOOR", DEFAULT_SEVERITY_FLOOR)),
+        floor_rank: severity_rank(&env_str(
+            "SLOG2_DRAINER_SEVERITY_FLOOR",
+            DEFAULT_SEVERITY_FLOOR,
+        )),
         deny_prefixes: env_str("SLOG2_DRAINER_EMITTER_DENY", DEFAULT_EMITTER_DENYLIST)
             .split(',')
             .map(|s| s.trim().to_string())
@@ -338,14 +344,21 @@ mod tests {
     fn rotates_and_seals_at_ceiling() {
         let (live, sealed) = tmp("rotate");
         // Tiny ceiling so a couple lines rotate; big budget so nothing culls.
-        let mut s = Segmenter::new(live.clone(), sealed.clone(), "slog2".into(), 40, 100_000).unwrap();
+        let mut s =
+            Segmenter::new(live.clone(), sealed.clone(), "slog2".into(), 40, 100_000).unwrap();
         let p = all_kept();
         // Each formatted line is ~30 bytes; the 2nd should trip the 40-byte ceiling.
-        s.write(&rec(1_784_562_613, "info", "e", "line-one"), &p).unwrap();
-        s.write(&rec(1_784_562_614, "info", "e", "line-two"), &p).unwrap();
-        s.write(&rec(1_784_562_615, "info", "e", "line-three"), &p).unwrap();
+        s.write(&rec(1_784_562_613, "info", "e", "line-one"), &p)
+            .unwrap();
+        s.write(&rec(1_784_562_614, "info", "e", "line-two"), &p)
+            .unwrap();
+        s.write(&rec(1_784_562_615, "info", "e", "line-three"), &p)
+            .unwrap();
         let segs = list_segments(&sealed, "slog2");
-        assert!(!segs.is_empty(), "at least one sealed segment after rotates");
+        assert!(
+            !segs.is_empty(),
+            "at least one sealed segment after rotates"
+        );
         // Sealed segments read back through the real reader, in order.
         let q = platform_log::LogQuery {
             tail: Some(100),
@@ -364,12 +377,18 @@ mod tests {
         let mut s = Segmenter::new(live, sealed.clone(), "slog2".into(), 40, 80).unwrap();
         let p = all_kept();
         for i in 0..8 {
-            s.write(&rec(1_784_562_613 + i, "info", "e", &format!("msg{i:02}")), &p)
-                .unwrap();
+            s.write(
+                &rec(1_784_562_613 + i, "info", "e", &format!("msg{i:02}")),
+                &p,
+            )
+            .unwrap();
         }
         let segs = list_segments(&sealed, "slog2");
         let total: u64 = segs.iter().map(|(_, sz, _)| *sz).sum();
-        assert!(total <= 40, "sealed total {total} must be within seg_budget 40");
+        assert!(
+            total <= 40,
+            "sealed total {total} must be within seg_budget 40"
+        );
         // seq kept climbing across culls (monotonic): the surviving seg's seq > 0.
         assert!(segs.iter().all(|(seq, _, _)| *seq >= 1));
     }
@@ -377,20 +396,28 @@ mod tests {
     #[test]
     fn policy_severity_floor_and_emitter_denylist() {
         let (live, sealed) = tmp("policy");
-        let mut s = Segmenter::new(live, sealed.clone(), "slog2".into(), 100_000, 1_000_000).unwrap();
+        let mut s =
+            Segmenter::new(live, sealed.clone(), "slog2".into(), 100_000, 1_000_000).unwrap();
         let p = Policy {
             floor_rank: severity_rank("notice"), // keep notice+; drop info/debug
             deny_prefixes: vec!["devb_".into(), "CAM".into()],
         };
-        s.write(&rec(1, "info", "snova", "info-dropped"), &p).unwrap();
-        s.write(&rec(2, "debug", "snova", "debug-dropped"), &p).unwrap();
-        s.write(&rec(3, "warning", "snova", "warn-kept"), &p).unwrap();
-        s.write(&rec(4, "error", "devb_sdmmc_mx8x", "driver-dropped"), &p).unwrap();
+        s.write(&rec(1, "info", "snova", "info-dropped"), &p)
+            .unwrap();
+        s.write(&rec(2, "debug", "snova", "debug-dropped"), &p)
+            .unwrap();
+        s.write(&rec(3, "warning", "snova", "warn-kept"), &p)
+            .unwrap();
+        s.write(&rec(4, "error", "devb_sdmmc_mx8x", "driver-dropped"), &p)
+            .unwrap();
         s.write(&rec(5, "error", "snova", "err-kept"), &p).unwrap();
         // Read the LIVE file directly (nothing sealed — huge ceiling).
         let live_body = fs::read_to_string(s.live_path()).unwrap();
         assert!(live_body.contains("warn-kept"));
         assert!(live_body.contains("err-kept"));
-        assert!(!live_body.contains("dropped"), "policy must drop: {live_body}");
+        assert!(
+            !live_body.contains("dropped"),
+            "policy must drop: {live_body}"
+        );
     }
 }
