@@ -8,7 +8,8 @@ description = "Software HSM backend (SimHsm): file keystore + RustCrypto, served
 tracing = "0.1"
 # Subscriber for the `hsm-sim-service` bin (link-B sim backend). Workspace
 # convention (vhsm-ssd, vm-service, …): fmt + env-filter, default `info`.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Fleet logging init (recorder + tracing→score_log bridge). Sibling → path dep.
+sumo-log = { path = "../../../crates/platform-integration/sumo-log" }
 coset = { version = "0.3", default-features = false }
 # bootstrap.yaml read-modify-write for arm/clear-enrollment.
 serde_yaml = "0.9"

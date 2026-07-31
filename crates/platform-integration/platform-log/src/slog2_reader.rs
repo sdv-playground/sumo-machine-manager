@@ -102,7 +102,13 @@ extern "C" fn on_packet(info: *mut PacketInfo, payload: *mut c_void, param: *mut
         let message = CStr::from_ptr(payload as *const c_char)
             .to_string_lossy()
             .into_owned();
-        let source = cstr_field(&pi.buffer_name);
+        // The EMITTER (buffer-SET name: snova / vhsm / devb_ram / …) is the
+        // packet's `file_name` — slog2 names each buffer set's on-disk file after
+        // the set, so `file_name` holds the registrant name. The per-packet
+        // `buffer_name` is only the INNER buffer ("default" / "slog"), NOT the
+        // emitter — don't use it. (buffer_set_name lives in slog2_log_info_t, not
+        // the packet.) component-mgr maps this LogRecord.source → fields.emitter.
+        let source = cstr_field(&pi.file_name);
         let priority = severity_name(pi.severity);
         // timestamp is nanoseconds since the epoch (QNX CLOCK_REALTIME).
         let secs = pi.timestamp / 1_000_000_000;

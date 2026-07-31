@@ -97,12 +97,11 @@ fn serve(listener: UnixListener, hsm: Arc<Mutex<SimHsm>>) {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".parse().unwrap()),
-        )
-        .init();
+    // Fleet logging: install the env-selected recorder + tracing→score_log bridge
+    // (slog2 on QNX). hsm-sim-service is a supernova companion whose stdout would
+    // otherwise funnel ANSI fmt into supernova.log; route it to the bus like the
+    // other host binaries. Context "hsms".
+    sumo_log::init_tracing("hsms");
 
     let args: Vec<String> = std::env::args().collect();
     let (keystore_path, listen_path) = parse_args(&args).unwrap_or_else(|e| {
