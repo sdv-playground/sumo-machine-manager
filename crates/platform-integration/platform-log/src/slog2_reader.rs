@@ -225,11 +225,16 @@ fn parse_secs(s: &str) -> Option<u64> {
 
 // ── live-follow drain (DYNAMIC parse) — feeds the slog2 disk drainer ────────
 
-/// `slog2_parse_all` flags (slog2_parse.h): DYNAMIC = live-stream all buffers
-/// merged; CURRENT = start the live stream from "now" (skip the existing ring
-/// backlog — the drainer wants NEW packets, not a re-dump on every start).
+/// `slog2_parse_all` DYNAMIC flag (slog2_parse.h): live-stream all buffers merged
+/// (dir must be NULL). This is the `slog2info -w` mode per the QNX man page:
+/// "prints all currently active older logs AND starts livestreaming". We use it
+/// ALONE — NOT with `SLOG2_PARSE_FLAGS_CURRENT` (0x2, the `-W` mode which "ignores
+/// all older logs and starts livestreaming active logs from the current moment").
+/// The drainer starts AFTER boot, so it must capture the ring already present at
+/// startup, then keep following — the `-w` (backlog + stream) semantics, not `-W`
+/// (from-now-only). Shipping `-W` was the live-follow bug: it discarded the
+/// pre-existing ring and risked altering the stream-continuation behaviour.
 const SLOG2_PARSE_FLAGS_DYNAMIC: u32 = 0x1;
-const SLOG2_PARSE_FLAGS_CURRENT: u32 = 0x2;
 
 /// Per-packet callback for the DYNAMIC drain: map an ASCII packet to a
 /// [`DrainRecord`] and hand it to the sink. `param` is a `&mut &mut dyn FnMut`.
@@ -275,7 +280,7 @@ pub fn drain_live<F: FnMut(crate::DrainRecord)>(mut sink: F) {
     // (all buffers, DYNAMIC requires NULL), match_list=NULL.
     unsafe {
         slog2_parse_all(
-            SLOG2_PARSE_FLAGS_DYNAMIC | SLOG2_PARSE_FLAGS_CURRENT,
+            SLOG2_PARSE_FLAGS_DYNAMIC,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             &mut info,

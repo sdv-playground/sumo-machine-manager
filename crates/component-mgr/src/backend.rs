@@ -6849,9 +6849,20 @@ fn read_lines_from(
     start: u64,
     max: usize,
 ) -> std::io::Result<(Vec<String>, u64)> {
-    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
     let mut f = std::fs::File::open(path)?;
+    // Defense-in-depth: a binary file caught by a glob (vendor fslog gzip/tar
+    // artifacts, a stray binary `.log`) must not be paged out as lossy text.
+    // Sample the file HEAD (offset 0, not `start`) so gzip magic is seen even
+    // when resuming mid-file, then skip the whole file if it looks binary.
+    {
+        let mut head = [0u8; 512];
+        let n = f.read(&mut head)?;
+        if looks_binary(&head[..n]) {
+            return Ok((Vec::new(), start));
+        }
+    }
     f.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::new(f);
 
@@ -7124,6 +7135,31 @@ fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
     entries
 }
 
+/// Heuristic "this is a binary file, not text" test on a sampled byte buffer.
+/// A log tail is expected to be UTF-8 text; a gzip/tar archive (fslog's session
+/// artifacts) or any file with NUL bytes is binary and must NOT be rendered as
+/// lossy text. Cheap: gzip magic `1f 8b`, any NUL, or an outsized non-printable
+/// ratio (control bytes other than tab/newline/CR) in the sampled prefix.
+fn looks_binary(buf: &[u8]) -> bool {
+    if buf.is_empty() {
+        return false;
+    }
+    if buf.starts_with(&[0x1f, 0x8b]) {
+        return true; // gzip magic (fslog .tar.gz / .log.gz)
+    }
+    // Sample the first 8 KiB — enough to classify without scanning huge tails.
+    let sample = &buf[..buf.len().min(8 * 1024)];
+    if sample.contains(&0) {
+        return true; // NUL byte → not a text log
+    }
+    let nonprintable = sample
+        .iter()
+        .filter(|&&b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r')
+        .count();
+    // >10% control bytes (excluding tab/newline/CR) → treat as binary.
+    nonprintable * 10 > sample.len()
+}
+
 /// Last `cap` bytes of `path`, split into non-empty lines (a torn first
 /// line after the seek is dropped). Mirrors the guest agent's reader.
 fn tail_file_lines(path: &std::path::Path, cap: u64) -> std::io::Result<Vec<String>> {
@@ -7137,6 +7173,13 @@ fn tail_file_lines(path: &std::path::Path, cap: u64) -> std::io::Result<Vec<Stri
     }
     let mut buf = Vec::with_capacity(cap.min(len) as usize);
     f.take(cap).read_to_end(&mut buf)?;
+    // Defense-in-depth: never emit a binary file as lossy text. Even with
+    // `*.log`-only globs, the vendor fslog persister drops gzip/tar archives in
+    // /mnt/common-rw/log; a stray binary match would otherwise dump
+    // replacement-char garbage to the SOVD client. Skip it (empty tail) instead.
+    if looks_binary(&buf) {
+        return Ok(Vec::new());
+    }
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<String> = text
         .lines()
@@ -8823,6 +8866,47 @@ mod bank_provider_injection_tests {
         assert_eq!(filtered[0].source.as_deref(), Some("supernova"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A binary file caught by a glob (e.g. the vendor fslog persister's gzip
+    /// archive, or a stray binary `.log`) must NOT be dumped as replacement-char
+    /// garbage — `tail_file_lines` skips it. A real text log alongside it still
+    /// reads. Regression for the `./sovd-get-logs.sh` binary-garbage report.
+    #[tokio::test]
+    async fn logs_host_files_skip_binary() {
+        let dir = std::env::temp_dir().join(format!("cm-logs-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("real.log"), "hello\nworld\n").unwrap();
+        // gzip-magic + NUL bytes: an fslog-style binary archive named .log.
+        std::fs::write(
+            dir.join("archive.log"),
+            [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x03],
+        )
+        .unwrap();
+
+        let b = backend_with_logs(LogSource::HostFiles {
+            globs: vec![format!("{}/*.log", dir.display())],
+        });
+        let all = b.get_logs(&LogFilter::default()).await.unwrap();
+        let msgs: Vec<_> = all.iter().map(|e| e.message.as_str()).collect();
+        assert!(msgs.contains(&"hello"), "text log read: {msgs:?}");
+        assert!(msgs.contains(&"world"), "text log read: {msgs:?}");
+        assert_eq!(all.len(), 2, "binary file contributes no lines: {msgs:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn looks_binary_classifies() {
+        assert!(!looks_binary(b""), "empty is not binary");
+        assert!(!looks_binary(b"plain text log\nwith lines\n"));
+        assert!(!looks_binary(b"tabs\tand\r\nnewlines ok"));
+        assert!(looks_binary(&[0x1f, 0x8b, 0x08, 0x00]), "gzip magic");
+        assert!(looks_binary(b"text\0with\0nul"), "NUL byte");
+        // >10% control bytes → binary.
+        assert!(looks_binary(&[
+            0x01, 0x02, 0x03, 0x04, b'a', b'b', b'c', b'd'
+        ]));
     }
 
     /// §7.21 GuestAgent source: proxy a stub agent (canned JSON) and map
