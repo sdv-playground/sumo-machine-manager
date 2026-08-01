@@ -31,7 +31,11 @@ use platform_log::{rfc3339_utc, DrainRecord};
 const DEFAULT_MAX_BYTES: u64 = 256 * 1024; // rotate threshold (live file ceiling)
 const DEFAULT_KEEP_BYTES: u64 = 1024 * 1024; // total budget (live + sealed)
 const DEFAULT_STEM: &str = "slog2";
-const DEFAULT_LIVE_DIR: &str = "/dev/shmem/slog2seg";
+// The RAM live file lives DIRECTLY in /dev/shmem — NOT a subdir. On QNX
+// /dev/shmem is a flat shmem-object namespace that does not support mkdir
+// (subdir creation → ENOSYS), so the live file is `/dev/shmem/<stem>.log`,
+// mirroring svclog's flat `/dev/shmem/<svc>.log` convention.
+const DEFAULT_LIVE_DIR: &str = "/dev/shmem";
 const DEFAULT_SEALED_DIR: &str = "/mnt/common-rw/log/segments";
 /// slog2 severity below which a packet isn't persisted (still ring-tailable).
 /// Names→rank via [`severity_rank`]; default keeps `notice` and more-severe.
@@ -98,7 +102,17 @@ impl Segmenter {
         max_bytes: u64,
         keep_bytes: u64,
     ) -> std::io::Result<Self> {
-        fs::create_dir_all(&live_dir)?;
+        // The live dir is typically /dev/shmem — a pre-existing flat shmem
+        // namespace that rejects mkdir (ENOSYS). Only create it if absent, and
+        // tolerate an ENOSYS/EEXIST when it's already there (don't hard-fail init
+        // over a dir that exists). The SEALED dir is a normal fs dir → must exist.
+        if !live_dir.exists() {
+            if let Err(e) = fs::create_dir_all(&live_dir) {
+                if !live_dir.exists() {
+                    return Err(e);
+                }
+            }
+        }
         fs::create_dir_all(&sealed_dir)?;
         let next_seq = max_existing_seq(&sealed_dir, &stem) + 1;
         let live_path = live_dir.join(format!("{stem}.log"));
@@ -317,6 +331,19 @@ mod tests {
             floor_rank: 7,
             deny_prefixes: vec![],
         }
+    }
+
+    #[test]
+    fn new_tolerates_preexisting_live_dir() {
+        // Regression: on QNX the live dir is /dev/shmem — a pre-existing flat
+        // namespace that rejects mkdir (ENOSYS). Init must NOT fail when the live
+        // dir already exists (the earlier bug: create_dir_all on a /dev/shmem
+        // SUBDIR returned ENOSYS and killed the drainer at startup).
+        let (live, sealed) = tmp("preexist");
+        fs::create_dir_all(&live).unwrap(); // simulate /dev/shmem already present
+        let s = Segmenter::new(live.clone(), sealed, "slog2".into(), 256, 1024)
+            .unwrap_or_else(|e| panic!("init must succeed with a pre-existing live dir: {e}"));
+        assert_eq!(s.live_path(), live.join("slog2.log"), "flat live file");
     }
 
     #[test]
