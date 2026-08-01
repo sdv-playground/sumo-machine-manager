@@ -107,7 +107,8 @@ pub struct ComponentSpec {
     /// §7.21 log reads — the directory of SEALED slog2 disk segments written by
     /// the `slog2-drainer` (Tier-2 host daemon). `Some(dir)` adds a
     /// `LogSource::Slog2Segments` — the durable, reboot-safe, cursor-pageable
-    /// history plane (`slog2-history`), distinct from the live ring (`host_slog2`).
+    /// slog2 timeline (SOVD source `slog2`, the resumable primary), distinct from
+    /// the raw volatile ring (`host_slog2` → SOVD source `slog2-ring`).
     /// TIER-2 ONLY: set only in the full `config.yaml`; the Tier-1 provisioning
     /// config never sets it (its absence keeps Tier-1 on the ring alone). The
     /// stem is fixed `"slog2"` (matches the drainer's default).

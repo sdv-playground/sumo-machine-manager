@@ -293,7 +293,8 @@ pub enum LogSource {
     /// `platform_log::read_segments` over the sealed `<stem>.<seq>.log` set + the
     /// live file in `dir`. The `<seq>:<offset>` cursor is reboot-safe (seq is a
     /// logical clock, independent of the non-monotonic wall clock). Surfaced as a
-    /// SEPARATE source (`slog2-history`) from `Slog2` (the live ring): same bus,
+    /// SEPARATE source (`slog2`, the resumable timeline) from `Slog2` (the raw
+    /// ring, `slog2-ring`): same bus,
     /// two planes. Tier-2 ONLY — Tier-1 never configures this.
     Slog2Segments { dir: String, stem: String },
 }
@@ -2815,6 +2816,31 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             return Ok(host_file_logs_paged(&globs, filter, current_boot_epoch()));
         }
 
+        // A read SCOPED to one file source (`filter.source` names a resolved file
+        // stem, set by the per-source route `/logs/sources/{name}`) pages via that
+        // file's reboot-safe byte-offset cursor — even on a MULTI-source host
+        // component (HostFiles + Slog2 ring + Slog2Segments), because the source
+        // scope makes it unambiguous (mirrors the slog2-history branch below).
+        // `host_file_logs_paged` filters to `filter.source` internally, so passing
+        // the merged globs yields just that source's page + cursor. Without this,
+        // a per-file read on Tier-2 fell through to the terminal default and
+        // returned next_cursor=None despite the catalog advertising cursor:true.
+        if let Some(src) = filter.source.as_deref() {
+            let mut globs: Vec<String> = Vec::new();
+            for s in &self.config.log_sources {
+                if let LogSource::HostFiles { globs: g } = s {
+                    globs.extend(g.iter().cloned());
+                }
+            }
+            if !globs.is_empty()
+                && resolve_log_files(&globs)
+                    .iter()
+                    .any(|p| source_name(p) == src)
+            {
+                return Ok(host_file_logs_paged(&globs, filter, current_boot_epoch()));
+            }
+        }
+
         // A SOLE GuestAgent source pages via the guest's `/logs/page` (journald
         // `__CURSOR` — opaque + reboot-safe on its own, so it passes straight
         // through as our cursor; no host boot_epoch wrapping needed). Only the
@@ -2843,7 +2869,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         }
 
         // A read scoped to the persisted-segments source (`filter.source ==
-        // "slog2-history"`, set by the per-source route `/logs/sources/{name}`)
+        // "slog2" — the resumable timeline, set by the per-source route
+        // `/logs/sources/{name}`)
         // pages via the reboot-safe <seq>:<offset> cursor — even on a MULTI-source
         // host component (Slog2 + HostFiles + Slog2Segments), because the source
         // scope makes it unambiguous. Find the configured segments source.
@@ -6976,14 +7003,22 @@ fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
     entries
 }
 
-/// The single physical `source` for every record read from the QNX slog2 ring.
-/// The per-buffer emitter (supernova/vhsm-ssd/devb_sdmmc/…) is carried in
-/// `LogEntry.fields.emitter`, NOT the source — slog2 is one bus, many emitters.
-const SLOG2_SOURCE: &str = "slog2";
+/// The `source` for the raw QNX slog2 RING — the unfiltered, volatile live
+/// firehose. Named `slog2-ring` (not `slog2`) because it is NOT the primary slog2
+/// timeline: the ring's u16 `sequence_number` wraps and `slog2_parse_all` has no
+/// resume API, so this source is `cursor:false` — good for "last N raw records /
+/// sub-policy noise", but a client wanting the resumable slog2 log uses `slog2`
+/// (the drained segments plane) instead. The per-buffer emitter
+/// (supernova/vhsm-ssd/devb_sdmmc/…) is carried in `LogEntry.fields.emitter`, NOT
+/// the source — slog2 is one bus, many emitters.
+const SLOG2_SOURCE: &str = "slog2-ring";
 
-/// The `source` for the PERSISTED slog2 segments (the drainer's disk history) —
-/// distinct from the live ring's `slog2` so a client can address each plane.
-const SLOG2_SEGMENTS_SOURCE: &str = "slog2-history";
+/// The `source` for the drained slog2 timeline: sealed flash segments → the live
+/// drainer file, paged oldest→now as ONE reboot-safe `<seq>:<offset>` cursor
+/// (`read_segments`). This is the PRIMARY, resumable slog2 log, so it takes the
+/// bare `slog2` name; the raw volatile ring is `slog2-ring` (non-resumable). Both
+/// planes ride the same slog2 bus — this one is the durable, cursor-pageable view.
+const SLOG2_SEGMENTS_SOURCE: &str = "slog2";
 
 /// Build the `platform_log::LogQuery` shared by the segment read + page paths.
 fn slog2_segments_query(filter: &LogFilter) -> platform_log::LogQuery {
@@ -7000,7 +7035,8 @@ fn slog2_segments_query(filter: &LogFilter) -> platform_log::LogQuery {
     }
 }
 
-/// Map one segment `LogRecord` → a `LogEntry` (source = `slog2-history`).
+/// Map one segment `LogRecord` → a `LogEntry` (source = `slog2`, the resumable
+/// drained timeline).
 fn slog2_segment_entry(r: platform_log::LogRecord) -> LogEntry {
     let timestamp = chrono::DateTime::parse_from_rfc3339(&r.timestamp)
         .map(|t| t.with_timezone(&Utc))
@@ -7023,7 +7059,7 @@ fn slog2_segment_entry(r: platform_log::LogRecord) -> LogEntry {
 
 /// Read the PERSISTED slog2 segments (`LogSource::Slog2Segments`) as merged
 /// (non-paged) entries — the tail/list view. A `filter.source` naming something
-/// other than `slog2-history` contributes nothing (source/plane check).
+/// other than `slog2` (the resumable timeline) contributes nothing (source/plane check).
 fn slog2_segments_logs(dir: &str, stem: &str, filter: &LogFilter) -> Vec<LogEntry> {
     if let Some(want) = &filter.source {
         if want != SLOG2_SEGMENTS_SOURCE {
@@ -7043,7 +7079,7 @@ fn slog2_segments_logs(dir: &str, stem: &str, filter: &LogFilter) -> Vec<LogEntr
 }
 
 /// Paged read of the persisted slog2 segments — the reboot-safe `<seq>:<offset>`
-/// cursor path (`GET /logs/sources/slog2-history` with `x-sumo-after`).
+/// cursor path (`GET /logs/sources/slog2` with `x-sumo-after`).
 fn slog2_segments_paged(dir: &str, stem: &str, filter: &LogFilter) -> LogPage {
     let page = platform_log::read_segments(
         std::path::Path::new(dir),
@@ -8372,15 +8408,18 @@ mod bank_provider_injection_tests {
             .is_empty());
     }
 
-    /// The slog2 physical-source constant is the stable wire value a client sees
-    /// in `LogEntry.source` for every ring record (emitter lives in `fields`).
+    /// The raw-ring physical-source constant is the stable wire value a client
+    /// sees in `LogEntry.source` for every ring record (emitter lives in
+    /// `fields`). It is `slog2-ring` — the bare `slog2` name belongs to the
+    /// resumable drained timeline (`SLOG2_SEGMENTS_SOURCE`).
     #[test]
-    fn slog2_source_constant_is_slog2() {
-        assert_eq!(SLOG2_SOURCE, "slog2");
+    fn slog2_source_constant_is_slog2_ring() {
+        assert_eq!(SLOG2_SOURCE, "slog2-ring");
+        assert_eq!(SLOG2_SEGMENTS_SOURCE, "slog2");
     }
 
     /// A `Slog2Segments` source reads the drainer's sealed disk segments as the
-    /// durable `slog2-history` journal: it advertises a cursor (cursor:true, the
+    /// durable `slog2` journal (the resumable timeline): it advertises a cursor (cursor:true, the
     /// reboot-safe <seq>:<offset>), reads entries back, and pages them — unlike the
     /// volatile ring. Uses a real tempdir of sealed segments (target-agnostic; no
     /// QNX needed since the reader is plain file IO).
@@ -8420,14 +8459,14 @@ mod bank_provider_injection_tests {
             None,
         );
 
-        // Catalog: one journal source `slog2-history`, cursor:true.
+        // Catalog: one journal source `slog2` (the resumable timeline), cursor:true.
         let srcs = b.list_log_sources().await.unwrap();
         assert_eq!(srcs.len(), 1);
         assert_eq!(srcs[0].name, SLOG2_SEGMENTS_SOURCE);
         assert_eq!(srcs[0].kind, LogSourceKind::Journal);
         assert!(srcs[0].cursor, "persisted segments are cursor-pageable");
 
-        // Merged tail read: all three lines present, source = slog2-history.
+        // Merged tail read: all three lines present, source = slog2 (resumable timeline).
         // (get_logs is the newest-first merged view; the paged path below is the
         // authoritative FORWARD-ordered read.)
         let all = b.get_logs(&LogFilter::default()).await.unwrap();
@@ -8453,6 +8492,75 @@ mod bank_provider_injection_tests {
         assert_eq!(pmsgs, ["boot one", "boot two"], "forward cursor order");
         assert!(page.next_cursor.is_some(), "more to read → next_cursor set");
         assert!(page.tip_cursor.is_some(), "segments name their tip");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: on a MULTI-source host component (the Tier-2 shape: HostFiles +
+    /// Slog2 ring + Slog2Segments), a per-file source read must still page via its
+    /// byte-offset cursor — the catalog advertises the file source cursor:true, so
+    /// get_logs_paged must honour it even though the set isn't purely HostFiles.
+    /// Before the source-scoped file branch, this fell through to the terminal
+    /// default and returned next_cursor=None (broken --all over a large file).
+    #[tokio::test]
+    async fn multi_source_file_read_pages_via_cursor() {
+        use sovd_core::DiagnosticBackend;
+
+        let dir = std::env::temp_dir().join(format!("multisrc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            std::fs::remove_file(e.path()).ok();
+        }
+        // A file source with several lines so one page leaves more to read.
+        std::fs::write(
+            dir.join("supernova.log"),
+            "line-a\nline-b\nline-c\nline-d\nline-e\n",
+        )
+        .unwrap();
+        let segdir = dir.join("segments");
+        std::fs::create_dir_all(&segdir).unwrap();
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        // The full Tier-2 host mix: ring + files + persisted segments.
+        let b = ComponentBackend::with_options(
+            BankSet::Os,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig {
+                log_sources: vec![
+                    LogSource::Slog2,
+                    LogSource::HostFiles {
+                        globs: vec![format!("{}/*.log", dir.display())],
+                    },
+                    LogSource::Slog2Segments {
+                        dir: segdir.to_string_lossy().into_owned(),
+                        stem: "slog2".into(),
+                    },
+                ],
+                ..ComponentConfig::default()
+            },
+            None,
+            None,
+            None,
+        );
+
+        // Per-file paged read, scoped by source (as the /logs/sources/{name} route
+        // sets it): must return a cursor despite the mixed source set.
+        let page = b
+            .get_logs_paged(&LogFilter {
+                source: Some("supernova".into()),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!page.items.is_empty(), "file source yields lines");
+        assert!(
+            page.next_cursor.is_some(),
+            "multi-source per-file read MUST page (cursor:true promise): {page:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -8489,12 +8597,19 @@ mod bank_provider_injection_tests {
 
         let srcs = b.list_log_sources().await.unwrap();
         let names: Vec<&str> = srcs.iter().map(|s| s.name.as_str()).collect();
-        // slog2 (journal) + one File per stem, sorted by name.
-        assert_eq!(names, ["host-boot", "slog2", "timestamp"], "got {names:?}");
+        // slog2-ring (journal, the raw ring) + one File per stem, sorted by name.
+        assert_eq!(
+            names,
+            ["host-boot", "slog2-ring", "timestamp"],
+            "got {names:?}"
+        );
 
-        let slog2 = srcs.iter().find(|s| s.name == "slog2").unwrap();
+        let slog2 = srcs.iter().find(|s| s.name == "slog2-ring").unwrap();
         assert_eq!(slog2.kind, LogSourceKind::Journal);
-        assert!(!slog2.cursor, "slog2 has no ring cursor yet");
+        assert!(
+            !slog2.cursor,
+            "raw ring has no cursor (u16 wrap, no resume API)"
+        );
         assert!(slog2.emitters.is_empty());
 
         let hb = srcs.iter().find(|s| s.name == "host-boot").unwrap();
@@ -8512,8 +8627,9 @@ mod bank_provider_injection_tests {
         let b = backend_with_logs(LogSource::Slog2);
         let srcs = b.list_log_sources().await.unwrap();
         assert_eq!(srcs.len(), 1);
-        assert_eq!(srcs[0].name, "slog2");
+        assert_eq!(srcs[0].name, "slog2-ring", "raw ring is slog2-ring");
         assert_eq!(srcs[0].kind, LogSourceKind::Journal);
+        assert!(!srcs[0].cursor, "raw ring is non-resumable (cursor:false)");
     }
 
     fn backend_with_logs(source: LogSource) -> ComponentBackend<MemBlockDevice> {

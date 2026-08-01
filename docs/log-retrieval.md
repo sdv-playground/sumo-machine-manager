@@ -40,18 +40,18 @@ its spec (`config.yaml`), additive — a component may have any combination:
 
 | Variant | Spec key | `source` on the wire | Backing |
 |---|---|---|---|
-| `LogSource::Slog2` | `host_slog2: true` | `slog2` (const `SLOG2_SOURCE`) | QNX `slogger2` ring via `platform_log::read_slog2` (`libslog2parse` FFI). Volatile, cursor:false. |
-| `LogSource::Slog2Segments { dir, stem }` | `host_slog2_segments_dir` (**Tier-2 only**) | `slog2-history` (const `SLOG2_SEGMENTS_SOURCE`) | the slog2 ring PERSISTED to sealed disk segments by the `slog2-drainer`, read via `platform_log::read_segments`. Durable + reboot-safe, cursor:true. |
+| `LogSource::Slog2` | `host_slog2: true` | `slog2-ring` (const `SLOG2_SOURCE`) | QNX `slogger2` ring via `platform_log::read_slog2` (`libslog2parse` FFI). Raw + volatile, cursor:false (u16 seq wraps, no resume API). |
+| `LogSource::Slog2Segments { dir, stem }` | `host_slog2_segments_dir` (**Tier-2 only**) | `slog2` (const `SLOG2_SEGMENTS_SOURCE`) — the PRIMARY resumable slog2 timeline | the slog2 ring PERSISTED to sealed disk segments by the `slog2-drainer`, read via `platform_log::read_segments`. Durable + reboot-safe, cursor:true. |
 | `LogSource::HostFiles { globs }` | `host_log_globs` | the file stem | host-local text files |
 | `LogSource::GuestAgent { url }` | `log_agent_url` | the guest's own source | in-guest `log-agent`, proxied over the guest↔host /30 |
 | `LogSource::HostDumps { dir }` | `host_dump_dir` | — | directory of discrete dump artifacts (§7.21 message-passing) |
 
 Per-variant detail:
-- **Slog2** — ONE physical `source = "slog2"`; the per-buffer name is the EMITTER
+- **Slog2** — ONE physical `source = "slog2-ring"` (the raw volatile ring); the per-buffer name is the EMITTER
   (the `context` each binary passes to `sumo_log::init_tracing`: hsm-sim-service →
   `hsms`, `vhsm`, the host manager → its own tag, plus OS buffers
   `devb_sdmmc_mx8x`, …), surfaced in `LogEntry.fields.emitter` — NOT `source`. A
-  client selects "all host-bus logs" by `source=slog2`; the whole ring is one
+  client selects "all raw host-bus logs" by `source=slog2-ring`; the whole ring is one
   source, many emitters. QNX-only in effect (empty off-QNX; a Linux host would
   use a journald source).
   Narrow to / exclude an emitter with the `x-sumo-emitter` / `x-sumo-emitter-exclude`
@@ -60,7 +60,7 @@ Per-variant detail:
   the gather cap, so muting a high-volume emitter (the `devb_*` eMMC/CAM
   firehose) stops it crowding real records out of a tail. The device still
   SERVES every emitter — this only shapes the response.
-- **Slog2Segments** (Tier-2 only, `slog2-history`) — the SAME ring, but PERSISTED.
+- **Slog2Segments** (Tier-2 only, SOVD source `slog2` — the PRIMARY resumable timeline) — the SAME ring, but PERSISTED.
   The `slog2-drainer` daemon live-follows the ring (`platform_log::drain_live`,
   DYNAMIC parse) and appends each packet as a stamped line to a RAM live file,
   sealing it to an immutable flash segment `<dir>/slog2.<seq>.log` at a size
@@ -69,9 +69,9 @@ Per-variant detail:
   reboot-safe `<seq>:<offset>` cursor (`seq` is a logical clock, so paging is
   correct across the non-monotonic wall-clock jump). A persist POLICY (severity
   floor + emitter denylist) keeps the `devb_*` firehose off flash. TWO PLANES,
-  same bus: `slog2` = volatile live tail (all emitters); `slog2-history` = durable
-  cursor-pageable history. supernova is the READER half only
-  (`LogSource::Slog2Segments`).
+  same bus: `slog2-ring` = raw volatile live tail (all emitters, cursor:false);
+  `slog2` = the durable, cursor-pageable, resumable timeline (oldest→now). supernova
+  is the READER half only (`LogSource::Slog2Segments`).
   LAUNCH: the drainer is an OS-level daemon that must OUTLIVE supernova (else it
   can't capture supernova's own crash + dies on every re-exec), so it is started
   by `runtime/start-managed.sh` ONCE before the supernova respawn loop — NOT by
