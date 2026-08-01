@@ -38,8 +38,19 @@ const DEFAULT_STEM: &str = "slog2";
 const DEFAULT_LIVE_DIR: &str = "/dev/shmem";
 const DEFAULT_SEALED_DIR: &str = "/mnt/common-rw/log/segments";
 /// slog2 severity below which a packet isn't persisted (still ring-tailable).
-/// Names→rank via [`severity_rank`]; default keeps `notice` and more-severe.
-const DEFAULT_SEVERITY_FLOOR: &str = "notice";
+/// Names→rank via [`severity_rank`]; default keeps `info` and more-severe.
+///
+/// `info`, NOT `notice`: supernova (via score-log-slog2) maps its `Info` level to
+/// SLOG2_INFO and NEVER emits at `notice` (score-log-slog2: "SLOG2_NOTICE exists
+/// but nothing maps to it"). A `notice+` floor therefore dropped supernova's ENTIRE
+/// operational trail (ivd-route, vhsm handshakes, bank serving) — the durable
+/// `slog2` timeline captured only boot-time OS lines + the rare WARNING, so it read
+/// nearly empty on a healthy device while all real content lived only in the
+/// volatile ring. `info` makes the persisted timeline actually mirror supernova.
+/// Flash wear stays bounded by the emitter denylist (kills the `devb_`/CAM driver
+/// firehose — the real volume) + the cull budget (SVCLOG_KEEP_BYTES); info-level
+/// supernova traffic itself is light. Override with SLOG2_DRAINER_SEVERITY_FLOOR.
+const DEFAULT_SEVERITY_FLOOR: &str = "info";
 /// Emitter prefixes never persisted (comma-separated, prefix-matched).
 const DEFAULT_EMITTER_DENYLIST: &str = "devb_,CAM";
 
