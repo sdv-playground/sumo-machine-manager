@@ -456,13 +456,37 @@ fn decode_seg_cursor(s: &str) -> Option<(u64, u64)> {
 
 /// One record parsed from a stamped segment line + the source stem.
 fn seg_record(line: &str, stem: &str) -> LogRecord {
-    let (stamp, msg) = split_leading_stamp(line);
+    let (stamp, rest) = split_leading_stamp(line);
+    // After the stamp the drainer writes `<priority> <message>`. Peel the first
+    // whitespace-delimited token; if it's a known SOVD priority name, use it and
+    // the remainder is the message. Otherwise there's no priority token (a line
+    // that isn't drainer-formatted) — treat the whole rest as the message at the
+    // `info` default.
+    let (priority, message) = split_leading_priority(rest);
     LogRecord {
         timestamp: stamp.map(str::to_string).unwrap_or_else(|| rfc3339_utc(0)),
-        priority: "info".into(),
-        message: msg.to_string(),
+        priority: priority.unwrap_or("info").to_string(),
+        message: message.to_string(),
         source: stem.to_string(),
     }
+}
+
+/// Peel a leading SOVD priority token (`emergency`..`debug`) + its trailing space
+/// off `s`. Returns `(Some(priority), message)` when the first token is a known
+/// priority name, else `(None, s)` (no token — message is the whole string).
+fn split_leading_priority(s: &str) -> (Option<&str>, &str) {
+    match s.split_once(' ') {
+        Some((tok, rest)) if is_priority_name(tok) => (Some(tok), rest),
+        _ => (None, s),
+    }
+}
+
+/// Is `t` one of the SOVD §7.21 priority names the drainer writes?
+fn is_priority_name(t: &str) -> bool {
+    matches!(
+        t,
+        "emergency" | "alert" | "critical" | "error" | "warning" | "notice" | "info" | "debug"
+    )
 }
 
 /// Forward-page a sealed-segment source. Reads from `q.after` (`<seq>:<offset>`;

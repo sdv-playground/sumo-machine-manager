@@ -14,10 +14,15 @@
 //! adds the durable, cursor-pageable history plane (`LogSource::Slog2Segments`).
 //!
 //! Persist policy (what's WORTH keeping on flash — live appends are free in RAM):
-//! a severity FLOOR (default `notice`+) and an emitter DENYLIST (default
+//! a severity FLOOR (default `info`+, so supernova's operational trail persists —
+//! it emits at `info`, never `notice`) and an emitter DENYLIST (default
 //! `devb_,CAM` — the eMMC/CAM driver firehose). Both env-tunable. Everything is
 //! still live-tailable via the ring regardless; the policy only bounds what
 //! PERSISTS.
+//!
+//! Segment line format: `<20-char ISO stamp> <priority> <message>` — the priority
+//! token preserves severity so the durable timeline isn't severity-blind (the
+//! reader's `seg_record` recovers it).
 //!
 //! QNX-only in effect: off-nto `drain_live` is a no-op, so `main` exits cleanly
 //! (the crate builds + tests everywhere; the segmenter logic is target-agnostic).
@@ -151,13 +156,21 @@ impl Segmenter {
         self.sealed_dir.join(format!("{}.{seq}.log", self.stem))
     }
 
-    /// Format one record as a sealed-segment line: the 21-char ISO prefix
-    /// (`split_leading_stamp` contract) + message + `\n`.
+    /// Format one record as a sealed-segment line:
+    /// `<20-char ISO stamp> <priority> <message>\n`.
+    ///
+    /// The priority token sits between the stamp and the message so the durable
+    /// timeline preserves severity — without it every drained line read back as
+    /// `info` (the reader had no severity to recover), making priority filtering on
+    /// the `slog2` source useless. The reader's `split_leading_stamp` still parses
+    /// the leading 20-char stamp; `seg_record` then peels the next whitespace token
+    /// as the priority.
     fn format_line(rec: &DrainRecord) -> String {
         // rfc3339_utc yields `YYYY-MM-DDThh:mm:ssZ` (20 chars); + a space = the
-        // 21-char prefix the reader's split_leading_stamp requires.
+        // 21-char prefix the reader's split_leading_stamp requires, then
+        // `<priority> ` before the message.
         let msg = rec.message.trim_end_matches('\n');
-        format!("{} {}\n", rfc3339_utc(rec.epoch_secs), msg)
+        format!("{} {} {}\n", rfc3339_utc(rec.epoch_secs), rec.priority, msg)
     }
 
     /// Apply policy, then append the record — rotating FIRST if this line would
@@ -359,12 +372,13 @@ mod tests {
 
     #[test]
     fn format_line_matches_split_leading_stamp_contract() {
-        let line = Segmenter::format_line(&rec(1_784_562_613, "info", "snova", "hello"));
-        assert_eq!(line, "2026-07-20T15:50:13Z hello\n");
-        // Reader must parse the stamp back off it.
-        let (stamp, msg) = platform_log::split_leading_stamp(line.trim_end_matches('\n'));
+        let line = Segmenter::format_line(&rec(1_784_562_613, "error", "snova", "hello"));
+        // `<stamp> <priority> <message>` — severity preserved for read-back.
+        assert_eq!(line, "2026-07-20T15:50:13Z error hello\n");
+        // Reader must parse the stamp back off it; the priority token follows.
+        let (stamp, rest) = platform_log::split_leading_stamp(line.trim_end_matches('\n'));
         assert_eq!(stamp, Some("2026-07-20T15:50:13Z"));
-        assert_eq!(msg, "hello");
+        assert_eq!(rest, "error hello");
     }
 
     #[test]
@@ -406,6 +420,47 @@ mod tests {
         // The live file (not in `sealed` dir) isn't read here; sealed history is.
         let msgs: Vec<_> = page.items.iter().map(|r| r.message.clone()).collect();
         assert!(msgs.contains(&"line-one".to_string()), "got {msgs:?}");
+        // Severity round-trips: the written priority is recovered on read-back
+        // (not fabricated as `info`). "line-one" was written at `info`; verify a
+        // non-info line too via the priority-preservation test below.
+        let one = page.items.iter().find(|r| r.message == "line-one").unwrap();
+        assert_eq!(
+            one.priority, "info",
+            "priority recovered from the segment line"
+        );
+    }
+
+    #[test]
+    fn severity_round_trips_through_segments() {
+        let (live, sealed) = tmp("severity");
+        let mut s =
+            Segmenter::new(live, sealed.clone(), "slog2".into(), 100_000, 1_000_000).unwrap();
+        let p = all_kept();
+        s.write(&rec(1_784_562_613, "error", "snova", "boom"), &p)
+            .unwrap();
+        s.write(&rec(1_784_562_614, "warning", "snova", "careful"), &p)
+            .unwrap();
+        // Force a seal so the reader walks a sealed segment.
+        s.seal_and_rotate().unwrap();
+        let page = platform_log::read_segments(
+            &sealed,
+            "slog2",
+            None,
+            &platform_log::LogQuery {
+                tail: Some(100),
+                ..Default::default()
+            },
+        );
+        let by_msg = |m: &str| {
+            page.items
+                .iter()
+                .find(|r| r.message == m)
+                .unwrap_or_else(|| panic!("missing {m}: {:?}", page.items))
+                .priority
+                .clone()
+        };
+        assert_eq!(by_msg("boom"), "error", "error severity preserved");
+        assert_eq!(by_msg("careful"), "warning", "warning severity preserved");
     }
 
     #[test]
