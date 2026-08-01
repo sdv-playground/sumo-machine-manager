@@ -115,6 +115,17 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub host_slog2_segments_dir: Option<String>,
 
+    /// Directory of the drainer's still-growing LIVE file (`slog2.log`), when it
+    /// is NOT colocated with the sealed segments. The drainer keeps its live file
+    /// in RAM (`/dev/shmem`) while sealing to flash (`host_slog2_segments_dir`), so
+    /// the reader needs both dirs — without this the resumable `slog2` source reads
+    /// EMPTY until the first seal (the live tail lives in a dir the reader doesn't
+    /// scan). Defaults to the drainer's default live dir `/dev/shmem`; only override
+    /// if `SLOG2_DRAINER_LIVE_DIR` was changed. Ignored unless
+    /// `host_slog2_segments_dir` is set.
+    #[serde(default = "default_slog2_live_dir")]
+    pub host_slog2_live_dir: String,
+
     /// §7.15 scripts (developer-registered TESTS): the in-guest test-agent base
     /// URL, e.g. `http://10.0.101.2:9310` (the guest-hal layer runs the agent).
     /// `Some` → `capabilities` expose a `scripts` collection proxied from its
@@ -159,6 +170,7 @@ impl ComponentSpec {
             sources.push(LogSource::Slog2Segments {
                 dir: dir.clone(),
                 stem: "slog2".to_string(),
+                live_dir: Some(self.host_slog2_live_dir.clone()),
             });
         }
         sources
@@ -649,4 +661,11 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
 
 fn default_true() -> bool {
     true
+}
+
+/// The slog2-drainer's default live-file directory (`SLOG2_DRAINER_LIVE_DIR`
+/// default). The reader looks here for the still-growing `slog2.log` when it isn't
+/// colocated with the sealed segments.
+fn default_slog2_live_dir() -> String {
+    "/dev/shmem".to_string()
 }

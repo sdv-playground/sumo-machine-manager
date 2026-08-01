@@ -290,13 +290,21 @@ pub enum LogSource {
     /// The slog2 ring PERSISTED to disk as sealed segments by the `slog2-drainer`
     /// (Tier-2 host daemon) — the durable, cursor-pageable, reboot-safe history
     /// plane the volatile ring can't offer. Read through
-    /// `platform_log::read_segments` over the sealed `<stem>.<seq>.log` set + the
-    /// live file in `dir`. The `<seq>:<offset>` cursor is reboot-safe (seq is a
-    /// logical clock, independent of the non-monotonic wall clock). Surfaced as a
-    /// SEPARATE source (`slog2`, the resumable timeline) from `Slog2` (the raw
-    /// ring, `slog2-ring`): same bus,
+    /// `platform_log::read_segments` over the sealed `<stem>.<seq>.log` set in
+    /// `dir` PLUS the still-growing live file `<stem>.log` in `live_dir`. The
+    /// drainer keeps that live file in RAM (`/dev/shmem`) while sealing to flash
+    /// (`dir`), so the two are in DIFFERENT directories — without `live_dir` the
+    /// reader misses the live tail and a not-yet-sealed source reads EMPTY.
+    /// `live_dir: None` means live + sealed are colocated in `dir`. The
+    /// `<seq>:<offset>` cursor is reboot-safe (seq is a logical clock, independent
+    /// of the non-monotonic wall clock). Surfaced as a SEPARATE source (`slog2`,
+    /// the resumable timeline) from `Slog2` (the raw ring, `slog2-ring`): same bus,
     /// two planes. Tier-2 ONLY — Tier-1 never configures this.
-    Slog2Segments { dir: String, stem: String },
+    Slog2Segments {
+        dir: String,
+        stem: String,
+        live_dir: Option<String>,
+    },
 }
 
 /// Per-component configuration for ComponentBackend behavior.
@@ -844,9 +852,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 LogSource::HostFiles { globs } => all.extend(host_file_logs(globs, &filter)),
                 LogSource::HostDumps { dir } => all.extend(host_dump_logs(dir, &filter)),
                 LogSource::Slog2 => all.extend(slog2_logs(&filter)),
-                LogSource::Slog2Segments { dir, stem } => {
-                    all.extend(slog2_segments_logs(dir, stem, &filter))
-                }
+                LogSource::Slog2Segments {
+                    dir,
+                    stem,
+                    live_dir,
+                } => all.extend(slog2_segments_logs(dir, stem, live_dir.as_deref(), &filter)),
             }
         }
         all.into_iter().find(|e| e.id == log_id)
@@ -2769,9 +2779,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 LogSource::HostFiles { globs } => entries.extend(host_file_logs(globs, filter)),
                 LogSource::HostDumps { dir } => entries.extend(host_dump_logs(dir, filter)),
                 LogSource::Slog2 => entries.extend(slog2_logs(filter)),
-                LogSource::Slog2Segments { dir, stem } => {
-                    entries.extend(slog2_segments_logs(dir, stem, filter))
-                }
+                LogSource::Slog2Segments {
+                    dir,
+                    stem,
+                    live_dir,
+                } => entries.extend(slog2_segments_logs(dir, stem, live_dir.as_deref(), filter)),
             }
         }
         // Merge order: newest first (mirrors the gateway + single-source shape).
@@ -2875,13 +2887,17 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // host component (Slog2 + HostFiles + Slog2Segments), because the source
         // scope makes it unambiguous. Find the configured segments source.
         if filter.source.as_deref() == Some(SLOG2_SEGMENTS_SOURCE) {
-            if let Some(LogSource::Slog2Segments { dir, stem }) = self
+            if let Some(LogSource::Slog2Segments {
+                dir,
+                stem,
+                live_dir,
+            }) = self
                 .config
                 .log_sources
                 .iter()
                 .find(|s| matches!(s, LogSource::Slog2Segments { .. }))
             {
-                return Ok(slog2_segments_paged(dir, stem, filter));
+                return Ok(slog2_segments_paged(dir, stem, live_dir.as_deref(), filter));
             }
         }
 
@@ -7078,7 +7094,12 @@ fn slog2_segment_entry(r: platform_log::LogRecord) -> LogEntry {
 /// Read the PERSISTED slog2 segments (`LogSource::Slog2Segments`) as merged
 /// (non-paged) entries — the tail/list view. A `filter.source` naming something
 /// other than `slog2` (the resumable timeline) contributes nothing (source/plane check).
-fn slog2_segments_logs(dir: &str, stem: &str, filter: &LogFilter) -> Vec<LogEntry> {
+fn slog2_segments_logs(
+    dir: &str,
+    stem: &str,
+    live_dir: Option<&str>,
+    filter: &LogFilter,
+) -> Vec<LogEntry> {
     if let Some(want) = &filter.source {
         if want != SLOG2_SEGMENTS_SOURCE {
             return Vec::new();
@@ -7087,6 +7108,7 @@ fn slog2_segments_logs(dir: &str, stem: &str, filter: &LogFilter) -> Vec<LogEntr
     let page = platform_log::read_segments(
         std::path::Path::new(dir),
         stem,
+        live_dir.map(std::path::Path::new),
         &slog2_segments_query(filter),
     );
     let mut entries: Vec<LogEntry> = page.items.into_iter().map(slog2_segment_entry).collect();
@@ -7098,10 +7120,16 @@ fn slog2_segments_logs(dir: &str, stem: &str, filter: &LogFilter) -> Vec<LogEntr
 
 /// Paged read of the persisted slog2 segments — the reboot-safe `<seq>:<offset>`
 /// cursor path (`GET /logs/sources/slog2` with `x-sumo-after`).
-fn slog2_segments_paged(dir: &str, stem: &str, filter: &LogFilter) -> LogPage {
+fn slog2_segments_paged(
+    dir: &str,
+    stem: &str,
+    live_dir: Option<&str>,
+    filter: &LogFilter,
+) -> LogPage {
     let page = platform_log::read_segments(
         std::path::Path::new(dir),
         stem,
+        live_dir.map(std::path::Path::new),
         &slog2_segments_query(filter),
     );
     let mut items: Vec<LogEntry> = page.items.into_iter().map(slog2_segment_entry).collect();
@@ -8469,6 +8497,7 @@ mod bank_provider_injection_tests {
                 log_sources: vec![LogSource::Slog2Segments {
                     dir: dir.to_string_lossy().into_owned(),
                     stem: "slog2".into(),
+                    live_dir: None, // colocated: live file (if any) shares `dir`
                 }],
                 ..ComponentConfig::default()
             },
@@ -8555,6 +8584,7 @@ mod bank_provider_injection_tests {
                     LogSource::Slog2Segments {
                         dir: segdir.to_string_lossy().into_owned(),
                         stem: "slog2".into(),
+                        live_dir: None,
                     },
                 ],
                 ..ComponentConfig::default()
@@ -8619,6 +8649,7 @@ mod bank_provider_injection_tests {
                     LogSource::Slog2Segments {
                         dir: segdir.to_string_lossy().into_owned(),
                         stem: "slog2".into(),
+                        live_dir: None,
                     },
                 ],
                 ..ComponentConfig::default()

@@ -391,7 +391,7 @@ mod tests {
             tail: Some(100),
             ..Default::default()
         };
-        let page = platform_log::read_segments(&sealed, "slog2", &q);
+        let page = platform_log::read_segments(&sealed, "slog2", None, &q);
         // The live file (not in `sealed` dir) isn't read here; sealed history is.
         let msgs: Vec<_> = page.items.iter().map(|r| r.message.clone()).collect();
         assert!(msgs.contains(&"line-one".to_string()), "got {msgs:?}");

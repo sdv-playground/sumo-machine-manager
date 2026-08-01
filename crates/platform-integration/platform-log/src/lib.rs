@@ -393,7 +393,18 @@ struct Segment {
 /// numerically sorted ascending (oldest→newest, live last). `min_seq` = lowest
 /// sealed seq (for the oldest cursor + gap detection); `live_seq` = the live
 /// file's virtual seq (`max_sealed + 1`, or the lone segment if none sealed).
-fn enumerate_segments(dir: &std::path::Path, stem: &str) -> (Vec<Segment>, Option<u64>, u64) {
+///
+/// The live file may live in a SEPARATE directory from the sealed segments: the
+/// slog2-drainer keeps its RAM live file in `/dev/shmem` while sealing to flash
+/// (`/mnt/common-rw/log/segments`). `live_dir` names where `<stem>.log` lives;
+/// `None` (the guest svclog case + tests) means it's colocated in `dir`. A live
+/// file found in `dir` itself is always honoured too, so a colocated layout keeps
+/// working regardless of `live_dir`.
+fn enumerate_segments(
+    dir: &std::path::Path,
+    stem: &str,
+    live_dir: Option<&std::path::Path>,
+) -> (Vec<Segment>, Option<u64>, u64) {
     let mut sealed: Vec<Segment> = Vec::new();
     let mut live: Option<std::path::PathBuf> = None;
     let live_name = format!("{stem}.log");
@@ -408,6 +419,16 @@ fn enumerate_segments(dir: &std::path::Path, stem: &str) -> (Vec<Segment>, Optio
                     path: e.path(),
                     is_live: false,
                 });
+            }
+        }
+    }
+    // Live file in a separate RAM dir (the drainer's /dev/shmem case): if we
+    // didn't already find a colocated live file, look for `<stem>.log` there.
+    if live.is_none() {
+        if let Some(ld) = live_dir {
+            let p = ld.join(&live_name);
+            if p.exists() {
+                live = Some(p);
             }
         }
     }
@@ -449,10 +470,22 @@ fn seg_record(line: &str, stem: &str) -> LogRecord {
 /// segments then the live file. Emits `next_cursor` (where it stopped; `None` at
 /// head), `oldest_cursor` (`<min_seq>:0`), `tip_cursor` (`<live_seq>:<live_len>`).
 /// Gap: an `after` naming a culled seq is clamped forward to the oldest available.
-pub fn read_segments(dir: &std::path::Path, stem: &str, q: &LogQuery) -> PagedLogs {
+///
+/// `live_dir` names where the still-growing `<stem>.log` lives when it is NOT
+/// colocated with the sealed segments (the drainer keeps it in `/dev/shmem` while
+/// sealing to flash). Pass `None` when live + sealed share `dir` (guest svclog /
+/// tests). Without the correct `live_dir`, a source whose history hasn't sealed
+/// yet reads EMPTY even though the live tail has content — the on-device bug where
+/// `slog2` returned 0 items while `/dev/shmem/slog2.log` held 608 bytes.
+pub fn read_segments(
+    dir: &std::path::Path,
+    stem: &str,
+    live_dir: Option<&std::path::Path>,
+    q: &LogQuery,
+) -> PagedLogs {
     use std::io::{Read, Seek, SeekFrom};
 
-    let (segs, min_seq, live_seq) = enumerate_segments(dir, stem);
+    let (segs, min_seq, live_seq) = enumerate_segments(dir, stem, live_dir);
     if segs.is_empty() {
         return PagedLogs::default();
     }
@@ -976,7 +1009,7 @@ mod tests {
             tail: Some(10),
             ..Default::default()
         };
-        let p = read_segments(&dir, "slog2", &q);
+        let p = read_segments(&dir, "slog2", None, &q);
         // Oldest→newest across sealed then live; NOT wall-clock sorted.
         assert_eq!(msgs(&p), ["a1", "a2", "b1", "live1", "live2"]);
         // oldest = min sealed seq; tip = live seq (max_sealed+1) : live_len.
@@ -1001,7 +1034,7 @@ mod tests {
             tail: Some(2),
             ..Default::default()
         };
-        let p1 = read_segments(&dir, "slog2", &q1);
+        let p1 = read_segments(&dir, "slog2", None, &q1);
         assert_eq!(msgs(&p1), ["x1", "x2"]);
         let c1 = p1.next_cursor.clone().expect("more to read");
 
@@ -1011,7 +1044,7 @@ mod tests {
             after: Some(c1),
             ..Default::default()
         };
-        let p2 = read_segments(&dir, "slog2", &q2);
+        let p2 = read_segments(&dir, "slog2", None, &q2);
         assert_eq!(msgs(&p2), ["x3", "y1"]);
         let c2 = p2.next_cursor.clone().expect("still more");
 
@@ -1021,7 +1054,7 @@ mod tests {
             after: Some(c2),
             ..Default::default()
         };
-        let p3 = read_segments(&dir, "slog2", &q3);
+        let p3 = read_segments(&dir, "slog2", None, &q3);
         assert_eq!(msgs(&p3), ["y2"]);
         assert!(p3.next_cursor.is_none(), "head reached");
         std::fs::remove_dir_all(&dir).ok();
@@ -1037,7 +1070,7 @@ mod tests {
             after: Some("2:0".into()),
             ..Default::default()
         };
-        let p = read_segments(&dir, "slog2", &q);
+        let p = read_segments(&dir, "slog2", None, &q);
         assert_eq!(msgs(&p), ["m1", "m2"]);
         assert_eq!(p.oldest_cursor.as_deref(), Some("5:0"));
         std::fs::remove_dir_all(&dir).ok();
@@ -1047,19 +1080,62 @@ mod tests {
     fn read_segments_tip_follow_returns_empty() {
         // after == tip → nothing new (the follow-tail steady state).
         let dir = seg_dir("tip", "slog2", &[(1, &["only"])], &["livea"]);
-        let p0 = read_segments(&dir, "slog2", &LogQuery::default());
+        let p0 = read_segments(&dir, "slog2", None, &LogQuery::default());
         let tip = p0.tip_cursor.clone().unwrap();
         let q = LogQuery {
             after: Some(tip),
             ..Default::default()
         };
-        let p = read_segments(&dir, "slog2", &q);
+        let p = read_segments(&dir, "slog2", None, &q);
         assert!(
             p.items.is_empty(),
             "at tip → no new records: {:?}",
             msgs(&p)
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_segments_live_file_in_separate_dir() {
+        // The drainer keeps its live file in a SEPARATE RAM dir (/dev/shmem) from
+        // the sealed segments (flash). read_segments must find the live tail via
+        // `live_dir`. Regression: on-device `slog2` read 0 items while
+        // /dev/shmem/slog2.log held content, because the reader only scanned the
+        // (empty, not-yet-sealed) sealed dir.
+        let sealed = std::env::temp_dir().join(format!("splitseg-{}-s", std::process::id()));
+        let live = std::env::temp_dir().join(format!("splitseg-{}-l", std::process::id()));
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        for d in [&sealed, &live] {
+            if let Ok(rd) = std::fs::read_dir(d) {
+                for e in rd.flatten() {
+                    std::fs::remove_file(e.path()).ok();
+                }
+            }
+        }
+        // NO sealed segments yet — only a live file in the separate dir (the exact
+        // on-device state: 608 B live, empty segments dir).
+        std::fs::write(
+            live.join("slog2.log"),
+            "2026-08-01T13:21:00Z live-one\n2026-08-01T13:21:01Z live-two\n",
+        )
+        .unwrap();
+
+        // Without live_dir the reader sees an empty sealed dir → nothing.
+        let none = read_segments(&sealed, "slog2", None, &LogQuery::default());
+        assert!(none.items.is_empty(), "no live_dir → misses the live tail");
+
+        // With live_dir it finds the live file and returns its lines.
+        let p = read_segments(&sealed, "slog2", Some(&live), &LogQuery::default());
+        assert_eq!(
+            msgs(&p),
+            ["live-one", "live-two"],
+            "reads the separate live file"
+        );
+        assert!(p.tip_cursor.is_some(), "live file names a tip");
+
+        std::fs::remove_dir_all(&sealed).ok();
+        std::fs::remove_dir_all(&live).ok();
     }
 
     #[test]
@@ -1073,7 +1149,7 @@ mod tests {
             "2026-07-20T15:50:13Z done\n2026-07-20T15:50:14Z partial-no-newline",
         )
         .unwrap();
-        let p = read_segments(&dir, "slog2", &LogQuery::default());
+        let p = read_segments(&dir, "slog2", None, &LogQuery::default());
         assert_eq!(msgs(&p), ["done"], "partial line withheld until complete");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1083,7 +1159,7 @@ mod tests {
         let dir = seg_dir("empty", "slog2", &[], &[]);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let p = read_segments(&dir, "slog2", &LogQuery::default());
+        let p = read_segments(&dir, "slog2", None, &LogQuery::default());
         assert!(p.items.is_empty());
         assert!(p.next_cursor.is_none() && p.oldest_cursor.is_none() && p.tip_cursor.is_none());
         std::fs::remove_dir_all(&dir).ok();
