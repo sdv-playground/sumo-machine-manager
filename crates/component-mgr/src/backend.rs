@@ -2979,8 +2979,26 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 }),
             }
         }
-        // Stable order + dedup by name (two globs could resolve the same stem).
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        // Stable order + dedup by name (two globs could resolve the same stem, OR
+        // a file stem could collide with a built-in source name — e.g. a
+        // `/dev/shmem/slog2.log` glob vs the drained `slog2` segments source). On a
+        // name collision, PREFER the higher-value source so a plain file can never
+        // shadow a cursor-pageable journal: sort by name, then cursor-capable
+        // first, then Journal-kind first — `dedup_by` keeps the first of each
+        // equal-named run, so the preferred one survives.
+        fn kind_rank(k: &LogSourceKind) -> u8 {
+            match k {
+                LogSourceKind::Journal => 0,
+                LogSourceKind::File => 1,
+                LogSourceKind::Dump => 2,
+            }
+        }
+        out.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| b.cursor.cmp(&a.cursor)) // cursor:true before false
+                .then_with(|| kind_rank(&a.kind).cmp(&kind_rank(&b.kind)))
+        });
         out.dedup_by(|a, b| a.name == b.name);
         Ok(out)
     }
@@ -8561,6 +8579,71 @@ mod bank_provider_injection_tests {
             page.next_cursor.is_some(),
             "multi-source per-file read MUST page (cursor:true promise): {page:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Name-collision dedup: a HostFiles glob resolving a file whose stem equals a
+    /// built-in source name (the real case: `/dev/shmem/slog2.log` vs the drained
+    /// `slog2` segments source) must NOT let the plain file shadow the
+    /// cursor-pageable journal. list_log_sources prefers the journal/cursor source
+    /// on a name tie. Regression for the on-device catalog showing `slog2` as a
+    /// non-cursor `file` (the drainer's own live file) instead of the journal.
+    #[tokio::test]
+    async fn list_log_sources_collision_prefers_journal() {
+        use sovd_core::{DiagnosticBackend, LogSourceKind};
+
+        let dir = std::env::temp_dir().join(format!("collide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            std::fs::remove_file(e.path()).ok();
+        }
+        // A file literally named slog2.log (the drainer live-file shape) — its stem
+        // `slog2` collides with the Slog2Segments source name.
+        std::fs::write(dir.join("slog2.log"), "live tail line\n").unwrap();
+        let segdir = dir.join("segments");
+        std::fs::create_dir_all(&segdir).unwrap();
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        nv.write_boot_state(&mut boot).unwrap();
+        let b = ComponentBackend::with_options(
+            BankSet::Os,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig {
+                log_sources: vec![
+                    LogSource::HostFiles {
+                        globs: vec![format!("{}/*.log", dir.display())],
+                    },
+                    LogSource::Slog2Segments {
+                        dir: segdir.to_string_lossy().into_owned(),
+                        stem: "slog2".into(),
+                    },
+                ],
+                ..ComponentConfig::default()
+            },
+            None,
+            None,
+            None,
+        );
+
+        let srcs = b.list_log_sources().await.unwrap();
+        let slog2 = srcs
+            .iter()
+            .find(|s| s.name == "slog2")
+            .expect("a slog2 source survives the collision");
+        assert_eq!(
+            slog2.kind,
+            LogSourceKind::Journal,
+            "the drained journal must win the name collision, not the shmem file"
+        );
+        assert!(
+            slog2.cursor,
+            "the surviving slog2 source is cursor-pageable"
+        );
+        // Exactly one `slog2` (deduped).
+        assert_eq!(srcs.iter().filter(|s| s.name == "slog2").count(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }
