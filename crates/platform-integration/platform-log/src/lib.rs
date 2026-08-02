@@ -68,6 +68,16 @@ pub struct LogRecord {
     /// Service/file identity: file stem (QNX) or syslog identifier /
     /// unit (journald).
     pub source: String,
+    /// Monotonic runtime, seconds since boot — jump-proof, the axis the
+    /// `x-sumo-runtime` window filters on. `None` for sources without a monotonic
+    /// clock (plain files, or a ring packet with no captured uptime). Serialized
+    /// `x-sumo-uptime-secs` to match the host wire contract.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "x-sumo-uptime-secs"
+    )]
+    pub uptime_secs: Option<u64>,
 }
 
 /// One downloadable log FILE in the `/files` bulk-data catalog. Field names
@@ -111,6 +121,12 @@ pub struct LogQuery {
     /// Opaque forward-paging cursor (journald `__CURSOR`). Only the `/logs/page`
     /// endpoint reads it; `/logs` (the tail view) ignores it.
     pub after: Option<String>,
+    /// RUNTIME window, seconds: keep only records within the last N seconds of the
+    /// producer's MONOTONIC runtime, measured back from the newest record (the
+    /// tip). Boot-scoped — the walk stops at a uptime reset (a prior boot). The
+    /// jump-proof alternative to `since`/`until` on a device with an unreliable
+    /// wall clock. Records without `uptime_secs` are excluded when this is set.
+    pub runtime_secs: Option<u64>,
 }
 
 /// One page of the `/logs/page` (cursor) view: the records plus the cursors.
@@ -462,20 +478,33 @@ fn decode_seg_cursor(s: &str) -> Option<(u64, u64)> {
     Some((seq.parse().ok()?, off.parse().ok()?))
 }
 
-/// One record parsed from a stamped segment line + the source stem.
+/// One record parsed from a stamped segment line + the source stem. The drainer
+/// writes `<wall-stamp> <uptime> <priority> <message>`; peel the stamp, then the
+/// uptime (a bare integer), then the priority token, each optionally — a line that
+/// isn't fully drainer-formatted still parses (missing pieces default sensibly).
 fn seg_record(line: &str, stem: &str) -> LogRecord {
     let (stamp, rest) = split_leading_stamp(line);
-    // After the stamp the drainer writes `<priority> <message>`. Peel the first
-    // whitespace-delimited token; if it's a known SOVD priority name, use it and
-    // the remainder is the message. Otherwise there's no priority token (a line
-    // that isn't drainer-formatted) — treat the whole rest as the message at the
-    // `info` default.
+    let (uptime_secs, rest) = split_leading_uptime(rest);
     let (priority, message) = split_leading_priority(rest);
     LogRecord {
         timestamp: stamp.map(str::to_string).unwrap_or_else(|| rfc3339_utc(0)),
         priority: priority.unwrap_or("info").to_string(),
         message: message.to_string(),
         source: stem.to_string(),
+        uptime_secs,
+    }
+}
+
+/// Peel a leading uptime token — a bare integer (seconds since boot) + its
+/// trailing space. Returns `(Some(secs), message)` when the first token parses as
+/// a u64, else `(None, s)` (no uptime column — a plain/guest line).
+fn split_leading_uptime(s: &str) -> (Option<u64>, &str) {
+    match s.split_once(' ') {
+        Some((tok, rest)) => match tok.parse::<u64>() {
+            Ok(n) => (Some(n), rest),
+            Err(_) => (None, s),
+        },
+        None => (None, s),
     }
 }
 
@@ -618,12 +647,53 @@ pub fn read_segments(
         }
     }
 
+    // RUNTIME window (jump-proof): keep only the newest-boot tail within N seconds
+    // of the tip uptime. Applied after the walk since it needs the tip (newest
+    // record) and must stop at a boot boundary (a uptime RESET). Clears
+    // next_cursor when it trims — the window is a bounded view, not a paging spine.
+    if let Some(window) = q.runtime_secs {
+        let trimmed = apply_runtime_window(&out, window);
+        if trimmed < out.len() {
+            out.drain(..out.len() - trimmed);
+            next_cursor = None;
+        }
+    }
+
     PagedLogs {
         items: out,
         next_cursor,
         oldest_cursor,
         tip_cursor,
     }
+}
+
+/// How many records from the END of `items` (oldest→newest) fall inside the last
+/// `window` seconds of runtime, boot-scoped. Walks backward from the newest: keeps
+/// records whose `uptime_secs >= tip_uptime - window`, and STOPS at a boot
+/// boundary — a point where an older record's uptime is GREATER than its
+/// successor's (CLOCK_MONOTONIC resets to ~0 each boot, so within one boot uptime
+/// only decreases going backward; an increase means we crossed into a prior boot).
+/// Records without `uptime_secs` end the window (they can't be placed on the
+/// runtime axis). Returns the count of the kept newest-tail suffix.
+fn apply_runtime_window(items: &[LogRecord], window: u64) -> usize {
+    let Some(tip) = items.last().and_then(|r| r.uptime_secs) else {
+        return 0; // no monotonic tip → nothing is on the runtime axis
+    };
+    let floor = tip.saturating_sub(window);
+    let mut kept = 0;
+    let mut prev_uptime = tip;
+    for r in items.iter().rev() {
+        let Some(u) = r.uptime_secs else { break };
+        if u > prev_uptime {
+            break; // uptime increased going backward → boot boundary
+        }
+        if u < floor {
+            break; // older than the window
+        }
+        kept += 1;
+        prev_uptime = u;
+    }
+    kept
 }
 
 // ---------------------------------------------------------------------------
@@ -852,6 +922,7 @@ mod tests {
             priority: "info".into(),
             message: msg.into(),
             source: src.into(),
+            uptime_secs: None,
         };
         let out = q.apply(vec![
             rec("vhealth", "hb seq 1"),
@@ -872,6 +943,7 @@ mod tests {
             priority: "info".into(),
             message: "m".into(),
             source: src.into(),
+            uptime_secs: None,
         };
         let all = || {
             vec![
@@ -1192,6 +1264,78 @@ mod tests {
     }
 
     #[test]
+    fn apply_runtime_window_boot_scoped() {
+        // Build records oldest→newest with uptime_secs; a boot boundary is a
+        // uptime RESET (older record has HIGHER uptime than its successor).
+        let mk = |up: Option<u64>| LogRecord {
+            timestamp: rfc3339_utc(0),
+            priority: "info".into(),
+            message: "m".into(),
+            source: "slog2".into(),
+            uptime_secs: up,
+        };
+        // Prior boot: uptime 900,905 ; current boot: 3,10,40,100 (tip=100).
+        let items = vec![
+            mk(Some(900)),
+            mk(Some(905)),
+            mk(Some(3)),
+            mk(Some(10)),
+            mk(Some(40)),
+            mk(Some(100)),
+        ];
+        // Window 70s back from tip=100 → floor 30 → keeps uptimes 40,100 (2).
+        assert_eq!(apply_runtime_window(&items, 70), 2);
+        // Window 200s → floor 0, but STOP at the boot boundary (905 > 3 going
+        // back) → keeps only the current boot's 3,10,40,100 (4), NOT the prior boot.
+        assert_eq!(apply_runtime_window(&items, 200), 4);
+        // Tiny window → just the tip.
+        assert_eq!(apply_runtime_window(&items, 0), 1);
+        // No uptime on the tip → nothing is on the runtime axis.
+        assert_eq!(apply_runtime_window(&[mk(None)], 60), 0);
+    }
+
+    #[test]
+    fn read_segments_runtime_window_excludes_older_and_prior_boot() {
+        // A single segment with the drainer's <stamp> <uptime> <priority> <msg>
+        // lines spanning a boot reset. runtime=50 keeps only the current-boot tail
+        // within 50s of the tip.
+        let dir = std::env::temp_dir().join(format!("rtwin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            std::fs::remove_file(e.path()).ok();
+        }
+        let st = "2026-07-20T15:50:13Z";
+        // prior boot (uptime 800,810) then current boot (5,20,90,100 = tip).
+        let body = format!(
+            "{st} 800 info prior-a\n{st} 810 info prior-b\n\
+             {st} 5 info cur-a\n{st} 20 info cur-b\n{st} 90 info cur-c\n{st} 100 error cur-tip\n"
+        );
+        std::fs::write(dir.join("slog2.1.log"), body).unwrap();
+
+        let p = read_segments(
+            &dir,
+            "slog2",
+            None,
+            &LogQuery {
+                tail: Some(100),
+                runtime_secs: Some(50), // floor = tip(100) - 50 = 50
+                ..Default::default()
+            },
+        );
+        // Keeps cur-c (90) + cur-tip (100); excludes cur-a/b (<50) and both prior-boot.
+        assert_eq!(
+            msgs(&p),
+            ["cur-c", "cur-tip"],
+            "runtime window + boot scope"
+        );
+        // Severity + uptime round-trip on the kept records.
+        assert_eq!(p.items.last().unwrap().priority, "error");
+        assert_eq!(p.items.last().unwrap().uptime_secs, Some(100));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn read_segments_live_file_in_separate_dir() {
         // The drainer keeps its live file in a SEPARATE RAM dir (/dev/shmem) from
         // the sealed segments (flash). read_segments must find the live tail via
@@ -1315,6 +1459,12 @@ pub struct DrainRecord {
     /// Packet emit time, epoch seconds (QNX CLOCK_REALTIME; non-monotonic — the
     /// drainer stamps it honestly, the segment SEQ is the ordering spine).
     pub epoch_secs: u64,
+    /// Monotonic runtime, seconds since boot (CLOCK_MONOTONIC), read at drain
+    /// time. Jump-proof (unlike `epoch_secs`) — the axis the `x-sumo-runtime`
+    /// window filters on. The drainer follows near-live, so this is the drain
+    /// instant, not the packet's exact emit-uptime (slog2 packets carry no
+    /// monotonic field); the small skew is immaterial for minute/hour windows.
+    pub uptime_secs: u64,
     /// SOVD priority name (emergency..debug) from the packet severity.
     pub priority: &'static str,
     /// The slog2 buffer-set name = the EMITTER (snova / vhsm / devb_sdmmc_mx8x / …).
@@ -1536,6 +1686,7 @@ fn journald_page_cli(q: &LogQuery) -> (Vec<LogRecord>, Option<String>) {
             priority: pri.into(),
             message: msg,
             source,
+            uptime_secs: None, // journald monotonic wired in Phase 2
         });
         if out.len() >= limit {
             break;
@@ -1588,6 +1739,7 @@ fn files_from_dirs(dirs: &[&str]) -> Vec<LogRecord> {
                     priority: "info".into(),
                     message: msg.to_string(),
                     source: source.clone(),
+                    uptime_secs: None, // plain file: no monotonic clock
                 });
                 if out.len() >= MAX_RECORDS {
                     return out;
@@ -1678,6 +1830,7 @@ fn journald_cli(q: &LogQuery) -> Vec<LogRecord> {
             priority: pri.into(),
             message: msg,
             source,
+            uptime_secs: None, // journald monotonic wired in Phase 2
         });
         if out.len() >= MAX_RECORDS {
             break;

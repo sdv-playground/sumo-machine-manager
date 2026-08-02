@@ -5753,6 +5753,11 @@ struct AgentLogRecord {
     priority: String,
     message: String,
     source: String,
+    /// Monotonic runtime, seconds since the guest's boot (journald
+    /// `__MONOTONIC_TIMESTAMP`). The `x-sumo-runtime` window axis. Absent on a
+    /// guest agent that doesn't emit it yet → `None`.
+    #[serde(default, rename = "x-sumo-uptime-secs")]
+    uptime_secs: Option<u64>,
 }
 
 fn priority_name(p: LogPriority) -> &'static str {
@@ -5886,6 +5891,7 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
                 status: None,
                 href: None,
                 metadata: None,
+                uptime_secs: r.uptime_secs,
             }
         })
         .collect();
@@ -5970,6 +5976,7 @@ async fn query_log_agent_paged(url: &str, filter: &LogFilter) -> Option<LogPage>
                 status: None,
                 href: None,
                 metadata: None,
+                uptime_secs: r.uptime_secs,
             }
         })
         .collect();
@@ -6742,6 +6749,7 @@ fn host_file_logs_paged(globs: &[String], filter: &LogFilter, boot_epoch: u64) -
                 status: None,
                 href: None,
                 metadata: None,
+                uptime_secs: None, // host file: mtime-based, no monotonic clock
             });
         }
 
@@ -7000,6 +7008,7 @@ fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
         since: filter.since.map(|t| t.timestamp().to_string()),
         until: filter.until.map(|t| t.timestamp().to_string()),
         after: None,
+        runtime_secs: filter.runtime_secs,
     };
     let records = platform_log::read_slog2(&q);
     let mut entries: Vec<LogEntry> = records
@@ -7027,6 +7036,7 @@ fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
                 status: None,
                 href: None,
                 metadata: None,
+                uptime_secs: r.uptime_secs,
             }
         })
         .collect();
@@ -7067,6 +7077,7 @@ fn slog2_segments_query(filter: &LogFilter) -> platform_log::LogQuery {
         since: filter.since.map(|t| t.timestamp().to_string()),
         until: filter.until.map(|t| t.timestamp().to_string()),
         after: filter.after.clone(),
+        runtime_secs: filter.runtime_secs,
     }
 }
 
@@ -7089,6 +7100,7 @@ fn slog2_segment_entry(r: platform_log::LogRecord) -> LogEntry {
         status: None,
         href: None,
         metadata: None,
+        uptime_secs: r.uptime_secs,
     }
 }
 
@@ -7200,6 +7212,7 @@ fn host_file_logs(globs: &[String], filter: &LogFilter) -> Vec<LogEntry> {
                 status: None,
                 href: None,
                 metadata: None,
+                uptime_secs: None, // host file: mtime-based, no monotonic clock
             });
             if entries.len() >= MAX_ENTRIES {
                 break;
@@ -7497,6 +7510,7 @@ fn host_dump_logs(dir: &str, filter: &LogFilter) -> Vec<LogEntry> {
             status,
             href: None, // sovd-api synthesizes the bulk-data href from the id
             metadata: None,
+            uptime_secs: None, // dump artifact: no per-line monotonic clock
         });
         if entries.len() >= MAX_ENTRIES {
             break;

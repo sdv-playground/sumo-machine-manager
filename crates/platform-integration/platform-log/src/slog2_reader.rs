@@ -20,7 +20,7 @@
 //! bytes == C `sizeof`), and `.size` is set before the call for the version gate.
 
 use std::ffi::CStr;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_long, c_void};
 
 use crate::{LogQuery, LogRecord, DEFAULT_TAIL, MAX_RECORDS};
 
@@ -58,6 +58,34 @@ extern "C" {
         callback: PacketCallback,
         param: *mut c_void,
     ) -> c_int;
+    fn clock_gettime(clock_id: c_int, tp: *mut Timespec) -> c_int;
+}
+
+/// POSIX `struct timespec` (QNX: `time_t` + `long`).
+#[repr(C)]
+struct Timespec {
+    tv_sec: c_long,
+    tv_nsec: c_long,
+}
+
+/// `CLOCK_MONOTONIC` on QNX (`time.h`: `#define CLOCK_MONOTONIC 2`).
+const CLOCK_MONOTONIC: c_int = 2;
+
+/// Seconds since boot from `CLOCK_MONOTONIC` — the drain-time uptime stamped on
+/// each `DrainRecord`. Jump-proof (immune to the wall-clock 1970→2026 set). 0 if
+/// the clock read fails (never negative).
+fn monotonic_secs() -> u64 {
+    // SAFETY: `clock_gettime` writes a valid `Timespec` on success (ret 0).
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    if rc == 0 && ts.tv_sec >= 0 {
+        ts.tv_sec as u64
+    } else {
+        0
+    }
 }
 
 /// slog2 severity (0=SHUTDOWN … 7=DEBUG2) → SOVD priority name. Mirrors the
@@ -147,6 +175,10 @@ extern "C" fn on_packet(info: *mut PacketInfo, payload: *mut c_void, param: *mut
             // The reader carries the emitter in `source`; component-mgr maps it to
             // `fields.emitter` and sets the physical `source="slog2"`.
             source: emitter,
+            // The raw ring (`slog2-ring`) is a point-in-time snapshot with no
+            // per-packet monotonic clock; the runtime axis is the drained `slog2`
+            // segment plane (drainer-stamped). None here.
+            uptime_secs: None,
         });
     }
     0
@@ -258,6 +290,7 @@ extern "C" fn on_drain_packet(
             .into_owned();
         sink(crate::DrainRecord {
             epoch_secs: pi.timestamp / 1_000_000_000,
+            uptime_secs: monotonic_secs(),
             priority: severity_name(pi.severity),
             emitter: cstr_field(&pi.file_name),
             message,

@@ -157,20 +157,25 @@ impl Segmenter {
     }
 
     /// Format one record as a sealed-segment line:
-    /// `<20-char ISO stamp> <priority> <message>\n`.
+    /// `<20-char ISO stamp> <uptime-secs> <priority> <message>\n`.
     ///
-    /// The priority token sits between the stamp and the message so the durable
-    /// timeline preserves severity — without it every drained line read back as
-    /// `info` (the reader had no severity to recover), making priority filtering on
-    /// the `slog2` source useless. The reader's `split_leading_stamp` still parses
-    /// the leading 20-char stamp; `seg_record` then peels the next whitespace token
-    /// as the priority.
+    /// Two metadata tokens sit between the stamp and the message so the durable
+    /// timeline preserves BOTH the monotonic runtime (the jump-proof
+    /// `x-sumo-runtime` window axis) AND the severity. The reader's
+    /// `split_leading_stamp` parses the leading 20-char wall stamp; `seg_record`
+    /// then peels the uptime (a bare integer) and the priority token in order.
     fn format_line(rec: &DrainRecord) -> String {
         // rfc3339_utc yields `YYYY-MM-DDThh:mm:ssZ` (20 chars); + a space = the
         // 21-char prefix the reader's split_leading_stamp requires, then
-        // `<priority> ` before the message.
+        // `<uptime> <priority> ` before the message.
         let msg = rec.message.trim_end_matches('\n');
-        format!("{} {} {}\n", rfc3339_utc(rec.epoch_secs), rec.priority, msg)
+        format!(
+            "{} {} {} {}\n",
+            rfc3339_utc(rec.epoch_secs),
+            rec.uptime_secs,
+            rec.priority,
+            msg
+        )
     }
 
     /// Apply policy, then append the record — rotating FIRST if this line would
@@ -344,6 +349,10 @@ mod tests {
     fn rec(secs: u64, prio: &'static str, emitter: &str, msg: &str) -> DrainRecord {
         DrainRecord {
             epoch_secs: secs,
+            // A stand-in monotonic value for tests: use the wall secs so the
+            // uptime column is present + round-trips. Real drains read
+            // CLOCK_MONOTONIC (slog2_reader::monotonic_secs).
+            uptime_secs: secs,
             priority: prio,
             emitter: emitter.to_string(),
             message: msg.to_string(),
@@ -373,12 +382,13 @@ mod tests {
     #[test]
     fn format_line_matches_split_leading_stamp_contract() {
         let line = Segmenter::format_line(&rec(1_784_562_613, "error", "snova", "hello"));
-        // `<stamp> <priority> <message>` — severity preserved for read-back.
-        assert_eq!(line, "2026-07-20T15:50:13Z error hello\n");
-        // Reader must parse the stamp back off it; the priority token follows.
+        // `<stamp> <uptime> <priority> <message>` — uptime + severity preserved.
+        // (rec() sets uptime_secs = the wall secs as a stand-in.)
+        assert_eq!(line, "2026-07-20T15:50:13Z 1784562613 error hello\n");
+        // Reader parses the stamp back off it; the uptime + priority tokens follow.
         let (stamp, rest) = platform_log::split_leading_stamp(line.trim_end_matches('\n'));
         assert_eq!(stamp, Some("2026-07-20T15:50:13Z"));
-        assert_eq!(rest, "error hello");
+        assert_eq!(rest, "1784562613 error hello");
     }
 
     #[test]
