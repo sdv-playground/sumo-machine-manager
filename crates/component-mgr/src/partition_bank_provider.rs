@@ -155,6 +155,9 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
     fn target_bank(&self) -> Bank {
         self.inner.target_bank()
     }
+    fn pending_reboot(&self) -> bool {
+        self.inner.pending_reboot()
+    }
     fn prepare_target(&self, bank: Bank) -> Result<(), BankError> {
         // Clears the metadata dir (old manifest/sig) — the partition itself is
         // overwritten by the stream. Reuses the inner's dir prep.

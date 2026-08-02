@@ -1158,10 +1158,24 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         })
     }
 
-    /// The bank an OTA upload should write to — delegated to the bank
-    /// provider (the *inactive* bank for dual-bank, `Bank::A` for single-bank,
-    /// resolved from the boot selector / NV `active_bank`).
+    /// The bank an OTA upload should write to — the sibling of the RUNNING bank
+    /// (NV `active_bank`), delegated to the bank provider. `Bank::A` for
+    /// single-bank.
+    ///
+    /// Refuses with a clear error when a reboot is PENDING (the boot selector's
+    /// next-boot selection disagrees with the running bank — the state a
+    /// rollback-without-reboot leaves). In that window the running bank is
+    /// loopback-mounted (unwriteable) and the target is ambiguous; forcing a flash
+    /// anyway tried to write the running bank → `Resource busy` (rig-observed).
+    /// The operator must reboot (which reconverges selector ↔ running) first.
     fn determine_target_bank(&self) -> BackendResult<Bank> {
+        if self.bank_provider.pending_reboot() {
+            return Err(BackendError::InvalidRequest(
+                "a reboot is pending (boot selector disagrees with the running bank — \
+                 e.g. after a rollback); reboot the ECU before starting a new update"
+                    .into(),
+            ));
+        }
         Ok(self.bank_provider.target_bank())
     }
 

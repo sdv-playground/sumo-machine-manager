@@ -124,6 +124,17 @@ pub trait BankProvider: Send + Sync {
     /// The bank the next install should target (A/B alternation off `active_bank`).
     fn target_bank(&self) -> Bank;
 
+    /// Whether a reboot is OWED before a new install is safe: the boot selector's
+    /// next-boot selection disagrees with the running bank (e.g. after a
+    /// rollback-without-reboot, or a trial flip not yet booted). In that window the
+    /// running bank is loopback-mounted (unwriteable) while the selector points
+    /// elsewhere, so a flash target is ambiguous — the engine refuses the update
+    /// until a reboot reconverges them. Default `false` (no selector concept ⇒
+    /// running is always the single authority).
+    fn pending_reboot(&self) -> bool {
+        false
+    }
+
     /// Ready `bank` for a fresh install — clear it / reclaim space, seed
     /// unchanged files from the active bank if the medium supports partial OTA.
     fn prepare_target(&self, bank: Bank) -> Result<(), BankError>;

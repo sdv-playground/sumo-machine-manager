@@ -363,25 +363,37 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         })
     }
 
+    fn pending_reboot(&self) -> bool {
+        // A reboot is OWED when the boot selector's NEXT-boot selection disagrees
+        // with the RUNNING bank (NV `active_bank`) — the state a
+        // rollback-without-reboot (or a trial flip not yet booted) leaves behind.
+        // In that window the running bank is loopback-mounted (unwriteable) yet
+        // the selector points elsewhere, so a flash can't safely pick a target:
+        // the caller refuses the update until the reboot reconverges the two.
+        // No selector, or selection == running, ⇒ consistent ⇒ no reboot pending.
+        match self.selected_bank() {
+            Some(selected) => selected != self.fallback_target_active(),
+            None => false,
+        }
+    }
+
     fn target_bank(&self) -> Bank {
         // Single-bank (HSM) always targets bank A.
         if self.single_bank {
             return Bank::A;
         }
-        // Derive the active bank selector-then-fallback (PRIMARY = shared boot
-        // selector; FALLBACK = NV `active_bank`), then target its sibling. The
-        // selector mirrors NV, so this picks the same target as the NV-only
-        // fallback path did.
-        let active = self
-            .selector
-            .as_ref()
-            .and_then(|s| {
-                s.read()
-                    .expect("selector poisoned")
-                    .active_bank(self.bank_set)
-            })
-            .unwrap_or_else(|| self.fallback_target_active());
-        active.other()
+        // Target the sibling of the RUNNING bank — NV `active_bank`, which tracks
+        // the bank that physically booted (boot updates it) and is therefore the
+        // one currently loopback-mounted + UNWRITEABLE. We must NOT anchor to the
+        // boot selector here: the selector is the NEXT-boot INTENT, and after a
+        // rollback-without-reboot it points at the committed-floor bank while the
+        // device still runs the other one. Anchoring to the selector then computed
+        // target = the running bank → `open partition … : Resource busy` (observed
+        // on the rig). NV-active is physical reality; matches `ota::install`, which
+        // also targets `state.banks[idx].active_bank.other()`. (A pending reboot —
+        // selector ≠ NV-active — is refused up front at flash-start; see
+        // `ensure_no_pending_reboot`.)
+        self.fallback_target_active().other()
     }
 
     fn prepare_target(&self, bank: Bank) -> Result<(), BankError> {
@@ -739,23 +751,50 @@ mod tests {
     }
 
     #[test]
-    fn injected_selector_is_primary_source_for_active_and_target() {
+    fn selector_is_serving_authority_but_target_anchors_to_running_bank() {
         let set = BankSet::Vm1;
-        // NV/fallback says A; the injected selector says B — the selector wins.
+        // The desync a rollback-without-reboot leaves: NV/running says A (what
+        // physically booted + is loopback-mounted), the selector says B (next-boot
+        // intent). These MUST resolve differently for their two purposes.
         let nv = nv_with_active(set, Bank::A);
         let selector = selector_with(set, Bank::B);
         let p = provider(nv, set, Some(selector));
 
+        // SERVING authority = the selector (what boot will honour): B.
         assert_eq!(
             p.active_bank(),
             Bank::B,
-            "selector (B) is primary, not NV (A)"
+            "active/serving bank follows the selector (B)"
         );
+        // WRITE target = sibling of the RUNNING bank (NV active = A), NOT the
+        // sibling of the selector. Anchoring to the selector would target A = the
+        // running, loopback-mounted, UNWRITEABLE bank (the rig `Resource busy` bug).
         assert_eq!(
             p.target_bank(),
-            Bank::A,
-            "target is the sibling of the selector's active bank"
+            Bank::B,
+            "target is the sibling of the RUNNING bank (NV A), never the running bank"
         );
+        // …and because selector (B) ≠ running (A), a reboot is owed: a flash in
+        // this window is refused up front.
+        assert!(
+            p.pending_reboot(),
+            "selector disagrees with running bank → reboot pending"
+        );
+    }
+
+    #[test]
+    fn no_pending_reboot_when_selector_matches_running() {
+        let set = BankSet::Vm1;
+        // Consistent state: selector and NV/running both A → no reboot owed,
+        // target is the clean sibling (B).
+        let nv = nv_with_active(set, Bank::A);
+        let selector = selector_with(set, Bank::A);
+        let p = provider(nv, set, Some(selector));
+        assert!(
+            !p.pending_reboot(),
+            "selector == running → no reboot pending"
+        );
+        assert_eq!(p.target_bank(), Bank::B, "target is the inactive sibling");
     }
 
     #[test]
