@@ -51,7 +51,17 @@ extern "C" {
         size: *mut usize,
     ) -> c_int;
     fn sd_journal_get_realtime_usec(j: Journal, usec: *mut u64) -> c_int;
+    fn sd_journal_get_monotonic_usec(j: Journal, usec: *mut u64, boot_id: *mut SdId128) -> c_int;
     fn sd_journal_get_cursor(j: Journal, cursor: *mut *mut c_char) -> c_int;
+}
+
+/// `sd_id128_t` — 16 opaque bytes (journald's 128-bit boot id). We only need it
+/// as an out-param for `sd_journal_get_monotonic_usec` (the monotonic clock is
+/// per-boot; the boot id identifies which boot). We don't decode it here — the
+/// runtime window is scoped to the current boot by only reading `-b` entries.
+#[repr(C)]
+struct SdId128 {
+    bytes: [u8; 16],
 }
 
 /// RAII wrapper: opens the journal and closes it on drop. `None` if the journal
@@ -154,6 +164,21 @@ impl JournalHandle {
         }
     }
 
+    /// Monotonic runtime of the current entry, SECONDS since the entry's boot
+    /// (journald `__MONOTONIC_TIMESTAMP`). The jump-proof `x-sumo-runtime` axis.
+    /// `None` on error (kept off the runtime axis).
+    fn monotonic_secs(&self) -> Option<u64> {
+        let mut usec: u64 = 0;
+        let mut boot = SdId128 { bytes: [0u8; 16] };
+        // SAFETY: valid handle + out-pointers; boot_id is written but unused here.
+        let rc = unsafe { sd_journal_get_monotonic_usec(self.0, &mut usec, &mut boot) };
+        if rc < 0 {
+            None
+        } else {
+            Some(usec / 1_000_000)
+        }
+    }
+
     /// The current entry's opaque cursor. `None` on error.
     fn cursor(&self) -> Option<String> {
         let mut ptr_out: *mut c_char = ptr::null_mut();
@@ -228,6 +253,7 @@ fn record_from_current(j: &JournalHandle) -> Option<LogRecord> {
         priority: priority.into(),
         message,
         source,
+        uptime_secs: j.monotonic_secs(),
     })
 }
 

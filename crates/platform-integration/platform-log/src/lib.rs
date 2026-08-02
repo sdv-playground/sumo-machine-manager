@@ -175,6 +175,9 @@ impl LogQuery {
                 "since" => q.since = Some(v),
                 "until" => q.until = Some(v),
                 "after" => q.after = Some(v),
+                // Runtime window: `<N>{s,m,h,d}` → seconds (also accept a bare
+                // integer as seconds). The host proxy forwards this verbatim.
+                "x-sumo-runtime" => q.runtime_secs = parse_duration_secs(&v),
                 _ => {}
             }
         }
@@ -225,12 +228,41 @@ impl LogQuery {
         if let Some(pri) = &self.priority {
             records.retain(|r| &r.priority == pri);
         }
+        // RUNTIME window (jump-proof, boot-scoped): keep the newest-boot tail within
+        // N seconds of the tip uptime. Records are oldest→newest here, so this is
+        // the same backward-walk the segment reader uses (journald monotonic axis).
+        if let Some(window) = self.runtime_secs {
+            let kept = apply_runtime_window(&records, window);
+            if kept < records.len() {
+                records.drain(..records.len() - kept);
+            }
+        }
         let tail = self.tail.unwrap_or(DEFAULT_TAIL).min(MAX_RECORDS);
         if records.len() > tail {
             records.drain(..records.len() - tail);
         }
         records
     }
+}
+
+/// Parse a duration `<N>{s,m,h,d}` (e.g. `3h`, `90s`) — or a bare integer taken as
+/// seconds — into seconds. `None` if malformed. Mirrors sovd-api's
+/// `parse_duration_secs` so the `x-sumo-runtime` value means the same host-side
+/// and in-guest.
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u64>() {
+        return Some(n); // bare seconds
+    }
+    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
+    let mult = match unit {
+        "s" | "S" => 1,
+        "m" | "M" => 60,
+        "h" | "H" => 3_600,
+        "d" | "D" => 86_400,
+        _ => return None,
+    };
+    num.parse::<u64>().ok()?.checked_mul(mult)
 }
 
 /// Minimal percent-decoding (enough for patterns/timestamps in query
@@ -1586,11 +1618,32 @@ fn after_at_or_past_tip(after: Option<&str>, tip: &Option<String>) -> bool {
     }
 }
 
+/// Monotonic runtime (seconds since boot) of a journald JSON entry, from
+/// `__MONOTONIC_TIMESTAMP` (µs since the entry's boot). The jump-proof
+/// `x-sumo-runtime` axis. `None` when absent/unparseable.
+#[cfg(not(target_os = "nto"))]
+fn journald_monotonic_secs(v: &serde_json::Value) -> Option<u64> {
+    v.get("__MONOTONIC_TIMESTAMP")
+        .and_then(|t| t.as_str())
+        .and_then(|t| t.parse::<u64>().ok())
+        .map(|usec| usec / 1_000_000)
+}
+
 /// Linux: journald IS the monotonic, reboot-safe cursor. `__CURSOR` pages FORWARD.
 #[cfg(not(target_os = "nto"))]
 pub fn collect_page(q: &LogQuery) -> PagedLogs {
-    let (items, next_cursor) = journald_page(q);
+    let (mut items, mut next_cursor) = journald_page(q);
     if !items.is_empty() || q.after.is_some() {
+        // RUNTIME window (boot-scoped): trim to the newest-boot tail within N secs
+        // of the tip uptime. Clears next_cursor when it trims — a bounded view, not
+        // a paging spine (mirrors read_segments).
+        if let Some(window) = q.runtime_secs {
+            let kept = apply_runtime_window(&items, window);
+            if kept < items.len() {
+                items.drain(..items.len() - kept);
+                next_cursor = None;
+            }
+        }
         let tip_cursor = next_cursor.clone();
         return PagedLogs {
             items,
@@ -1686,7 +1739,7 @@ fn journald_page_cli(q: &LogQuery) -> (Vec<LogRecord>, Option<String>) {
             priority: pri.into(),
             message: msg,
             source,
-            uptime_secs: None, // journald monotonic wired in Phase 2
+            uptime_secs: journald_monotonic_secs(&v),
         });
         if out.len() >= limit {
             break;
@@ -1830,7 +1883,7 @@ fn journald_cli(q: &LogQuery) -> Vec<LogRecord> {
             priority: pri.into(),
             message: msg,
             source,
-            uptime_secs: None, // journald monotonic wired in Phase 2
+            uptime_secs: journald_monotonic_secs(&v),
         });
         if out.len() >= MAX_RECORDS {
             break;

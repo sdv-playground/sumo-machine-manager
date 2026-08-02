@@ -5840,6 +5840,11 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
     if let Some(t) = filter.until {
         qs.push(format!("until={}", qenc(&t.to_rfc3339())));
     }
+    // Runtime window (jump-proof): forward as seconds; the guest agent parses
+    // x-sumo-runtime and applies the boot-scoped monotonic window.
+    if let Some(secs) = filter.runtime_secs {
+        qs.push(format!("x-sumo-runtime={secs}"));
+    }
     let target = if qs.is_empty() {
         format!("{base_path}/logs")
     } else {
@@ -5945,6 +5950,12 @@ async fn query_log_agent_paged(url: &str, filter: &LogFilter) -> Option<LogPage>
     }
     if let Some(c) = &filter.after {
         qs.push(format!("after={}", qenc(c)));
+    }
+    // Runtime window (jump-proof): forward as seconds so the guest agent applies
+    // the boot-scoped monotonic window on its /logs/page too. (The paged proxy
+    // historically forwarded NO time window — this closes that gap for runtime.)
+    if let Some(secs) = filter.runtime_secs {
+        qs.push(format!("x-sumo-runtime={secs}"));
     }
     let target = if qs.is_empty() {
         format!("{base_path}/logs/page")
