@@ -337,6 +337,14 @@ pub fn tail_file_lines(path: &std::path::Path) -> std::io::Result<Vec<String>> {
 
 /// Inverse of [`rfc3339_utc`]: parse `YYYY-MM-DDThh:mm:ssZ` back to epoch
 /// seconds (for `since`/`until` compares). `None` if malformed. No chrono.
+/// Parse a since/until bound: BARE UNIX SECONDS first (the form component-mgr and
+/// the ring reader use — an END-<N>s sentinel resolved to `.timestamp()`), else a
+/// literal RFC 3339 stamp. Used by `read_segments`; keeping both forms means the
+/// window filter works regardless of which the caller passes.
+fn parse_secs_or_rfc3339(s: &str) -> Option<u64> {
+    s.trim().parse::<u64>().ok().or_else(|| rfc3339_secs(s))
+}
+
 pub fn rfc3339_secs(ts: &str) -> Option<u64> {
     let b = ts.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[19] != b'Z' {
@@ -537,8 +545,13 @@ pub fn read_segments(
     }
 
     let page = q.tail.unwrap_or(DEFAULT_TAIL).min(MAX_RECORDS);
-    let since = q.since.as_deref().and_then(rfc3339_secs);
-    let until = q.until.as_deref().and_then(rfc3339_secs);
+    // since/until arrive as BARE UNIX SECONDS (the component-mgr resolves the
+    // END-<N>s sentinels to an absolute time and passes `.timestamp()` — same form
+    // the ring reader's `parse_secs` takes). Accept that, with RFC 3339 as a
+    // fallback. (Parsing ONLY as RFC 3339 silently disabled the window filter — a
+    // trouble-report "last 60s" then dumped the whole drained timeline.)
+    let since = q.since.as_deref().and_then(parse_secs_or_rfc3339);
+    let until = q.until.as_deref().and_then(parse_secs_or_rfc3339);
 
     let mut out: Vec<LogRecord> = Vec::new();
     let mut next_cursor: Option<String> = None;
@@ -1097,6 +1110,65 @@ mod tests {
         let p = read_segments(&dir, "slog2", None, &q);
         assert_eq!(msgs(&p), ["m1", "m2"]);
         assert_eq!(p.oldest_cursor.as_deref(), Some("5:0"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_segments_since_until_window_bare_seconds() {
+        // since/until arrive as BARE UNIX SECONDS (component-mgr resolves the
+        // END-<N>s sentinel then passes `.timestamp()`). The window MUST filter —
+        // regression for the trouble-report "last 60s" that dumped the whole
+        // timeline because read_segments parsed only RFC 3339 and silently dropped
+        // the (bare-seconds) bounds. All lines here are stamped 1784562613.
+        let dir = seg_dir("window", "slog2", &[(1, &["a", "b", "c"])], &[]);
+
+        // since AFTER the lines → nothing in window.
+        let after_all = read_segments(
+            &dir,
+            "slog2",
+            None,
+            &LogQuery {
+                tail: Some(100),
+                since: Some("1784562700".into()), // > 1784562613
+                ..Default::default()
+            },
+        );
+        assert!(
+            after_all.items.is_empty(),
+            "since after all lines → empty: {:?}",
+            msgs(&after_all)
+        );
+
+        // since BEFORE + until AFTER → all in window.
+        let in_win = read_segments(
+            &dir,
+            "slog2",
+            None,
+            &LogQuery {
+                tail: Some(100),
+                since: Some("1784562600".into()), // < 1784562613
+                until: Some("1784562620".into()), // > 1784562613
+                ..Default::default()
+            },
+        );
+        assert_eq!(msgs(&in_win), ["a", "b", "c"], "all lines within window");
+
+        // until BEFORE the lines → nothing.
+        let before_all = read_segments(
+            &dir,
+            "slog2",
+            None,
+            &LogQuery {
+                tail: Some(100),
+                until: Some("1784562600".into()), // < 1784562613
+                ..Default::default()
+            },
+        );
+        assert!(
+            before_all.items.is_empty(),
+            "until before all lines → empty"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

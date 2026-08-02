@@ -6994,8 +6994,9 @@ fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
         // slog2 severities don't line up 1:1 with SOVD "this level and above";
         // apply the priority filter below against the mapped LogPriority instead.
         priority: None,
-        // The reader parses bare unix-seconds (the END-relative form the server
-        // resolves to); pass the filter's absolute times as seconds.
+        // read_segments parses these as bare unix-seconds (parse_secs_or_rfc3339 —
+        // the END-relative sentinel the server already resolved to an absolute
+        // time); pass the filter's absolute times as seconds.
         since: filter.since.map(|t| t.timestamp().to_string()),
         until: filter.until.map(|t| t.timestamp().to_string()),
         after: None,
