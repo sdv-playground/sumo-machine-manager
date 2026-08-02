@@ -747,6 +747,50 @@ impl VmManager {
             }
         }
     }
+
+    /// Stop all running VMs for a REBOOT: signal graceful shutdown to every VM
+    /// at once, then wait a SINGLE short overall deadline (`grace_secs`), then
+    /// force-kill + clean up whatever's left. Unlike `stop_all` (which waits each
+    /// VM's own `shutdown_timeout_secs`, up to ~60s EACH, sequentially — far too
+    /// long for a reboot), this bounds the whole graceful phase so the reboot
+    /// proceeds fast. The point is to unmount the guests' bank-image loopbacks (via
+    /// each runner's cleanup) BEFORE the kernel reboot, so shutdown isn't left to
+    /// tear down ~17 devb-loopback mounts (which it can't do in time → the reboot
+    /// silently fails to fire). Best-effort: never blocks longer than `grace_secs`.
+    pub fn stop_all_for_reboot(&mut self, grace_secs: u64) {
+        let names: Vec<String> = self.vms.keys().cloned().collect();
+        // 1. Signal graceful shutdown to ALL at once (parallel, not sequential).
+        let mut pids: Vec<(String, u32)> = Vec::new();
+        for name in &names {
+            match self.initiate_stop(name) {
+                Ok(sh) => {
+                    if let Some(pid) = sh.pid {
+                        pids.push((name.clone(), pid));
+                    }
+                }
+                Err(e) => tracing::warn!("VM {name}: initiate_stop for reboot failed: {e}"),
+            }
+        }
+        // 2. One short overall deadline for ALL guests to exit gracefully.
+        let deadline = Instant::now() + Duration::from_secs(grace_secs);
+        while Instant::now() < deadline {
+            pids.retain(|(_, pid)| unsafe { libc::kill(*pid as i32, 0) == 0 });
+            if pids.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if !pids.is_empty() {
+            let left: Vec<&str> = pids.iter().map(|(n, _)| n.as_str()).collect();
+            tracing::warn!(
+                "reboot: VMs {left:?} didn't exit within {grace_secs}s — force-killing + reboot proceeds"
+            );
+        }
+        // 3. Force-kill any survivors + clean up (unmounts bank loopbacks).
+        for name in &names {
+            self.finalize_stop(name);
+        }
+    }
 }
 
 /// Compute current `HealthDetail`. Pulled out so `health_detail` and `list`
