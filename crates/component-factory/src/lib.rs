@@ -666,6 +666,6 @@ fn default_true() -> bool {
 /// The slog2-drainer's default live-file directory (`SLOG2_DRAINER_LIVE_DIR`
 /// default). The reader looks here for the still-growing `slog2.log` when it isn't
 /// colocated with the sealed segments.
-fn default_slog2_live_dir() -> String {
+pub fn default_slog2_live_dir() -> String {
     "/dev/shmem".to_string()
 }
