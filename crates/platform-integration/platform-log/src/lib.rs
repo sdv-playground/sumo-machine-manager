@@ -247,10 +247,19 @@ impl LogQuery {
         // RUNTIME window (jump-proof, boot-scoped): keep the newest-boot tail within
         // N seconds of the tip uptime. Records are oldest→newest here, so this is
         // the same backward-walk the segment reader uses (journald monotonic axis).
+        // ONLY meaningful for sources with a monotonic clock (slog2/journald). A
+        // plain-FILE source (`/dev/shmem/*.log`, `/var/log`) has no uptime_secs, so
+        // the window can't apply — SKIP it and fall through to the plain tail,
+        // matching the HOST (host_file_logs never applies the window). Without this
+        // guard apply_runtime_window returns 0 for a no-uptime source and drains
+        // every record → empty reads (the trouble-report per-source symptom).
         if let Some(window) = self.runtime_secs {
-            let kept = apply_runtime_window(&records, window);
-            if kept < records.len() {
-                records.drain(..records.len() - kept);
+            let has_monotonic = records.iter().any(|r| r.uptime_secs.is_some());
+            if has_monotonic {
+                let kept = apply_runtime_window(&records, window);
+                if kept < records.len() {
+                    records.drain(..records.len() - kept);
+                }
             }
         }
         let tail = self.tail.unwrap_or(DEFAULT_TAIL).min(MAX_RECORDS);
@@ -699,11 +708,15 @@ pub fn read_segments(
     // of the tip uptime. Applied after the walk since it needs the tip (newest
     // record) and must stop at a boot boundary (a uptime RESET). Clears
     // next_cursor when it trims — the window is a bounded view, not a paging spine.
+    // Only meaningful for a monotonic (uptime-bearing) source; a no-uptime source
+    // skips the window (plain tail), matching host_file_logs — see LogQuery::apply.
     if let Some(window) = q.runtime_secs {
-        let trimmed = apply_runtime_window(&out, window);
-        if trimmed < out.len() {
-            out.drain(..out.len() - trimmed);
-            next_cursor = None;
+        if out.iter().any(|r| r.uptime_secs.is_some()) {
+            let trimmed = apply_runtime_window(&out, window);
+            if trimmed < out.len() {
+                out.drain(..out.len() - trimmed);
+                next_cursor = None;
+            }
         }
     }
 
@@ -1340,6 +1353,44 @@ mod tests {
         assert_eq!(apply_runtime_window(&items, 0), 1);
         // No uptime on the tip → nothing is on the runtime axis.
         assert_eq!(apply_runtime_window(&[mk(None)], 60), 0);
+    }
+
+    #[test]
+    fn apply_runtime_window_skipped_for_no_uptime_source() {
+        // A plain-FILE source (no monotonic clock → uptime_secs None) must NOT be
+        // emptied by a runtime window: the window is meaningless there, so it falls
+        // through to the plain tail (matching host_file_logs). Regression: a
+        // runtime-windowed read of doip-edge/etc. returned [] because
+        // apply_runtime_window drops every no-uptime record.
+        let mk = |msg: &str| LogRecord {
+            timestamp: rfc3339_utc(0),
+            priority: "info".into(),
+            message: msg.into(),
+            source: "doip-edge".into(),
+            uptime_secs: None,
+        };
+        let q = LogQuery {
+            runtime_secs: Some(300),
+            ..Default::default()
+        };
+        let out = q.apply(vec![mk("a"), mk("b"), mk("c")]);
+        assert_eq!(out.len(), 3, "no-uptime file source must survive the window");
+
+        // A monotonic (uptime-bearing) source still gets windowed.
+        let mkm = |up: u64| LogRecord {
+            timestamp: rfc3339_utc(0),
+            priority: "info".into(),
+            message: "m".into(),
+            source: "slog2".into(),
+            uptime_secs: Some(up),
+        };
+        let q2 = LogQuery {
+            runtime_secs: Some(30),
+            ..Default::default()
+        };
+        // tip=100, floor=70 → keeps 80,100 (2).
+        let out2 = q2.apply(vec![mkm(10), mkm(80), mkm(100)]);
+        assert_eq!(out2.len(), 2, "monotonic source is still windowed");
     }
 
     #[test]
