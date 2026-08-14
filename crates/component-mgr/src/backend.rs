@@ -2989,15 +2989,36 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     cursor: false,
                     emitters: Vec::new(),
                 }),
-                // Phase 1: a guest is ONE journal source (stable wire shape). Phase
-                // 2 expands it to the guest's own sources via a guest /sources
-                // endpoint (tasks/log-retrieval-design.md).
-                LogSource::GuestAgent { .. } => out.push(LogSourceInfo {
-                    name: "guest".to_string(),
-                    kind: LogSourceKind::Journal,
-                    cursor: true,
-                    emitters: Vec::new(),
-                }),
+                // Phase 2: enumerate the guest's OWN sources via its
+                // `GET /logs/sources` (one per stream: doip-edge, slog2, …), each
+                // with its own cursor. The name round-trips as a real `source=`
+                // filter the guest can satisfy — fixing the Phase-1 bug where the
+                // synthetic `"guest"` name matched no guest record so per-source
+                // reads were always empty. An OLDER agent (no route) or an
+                // unreachable guest → fall back to the single synthetic source, so
+                // a Phase-1 guest still lists (and reads bare `/logs`).
+                LogSource::GuestAgent { url } => match query_log_agent_sources(url).await {
+                    Some(sources) if !sources.is_empty() => {
+                        for s in sources {
+                            out.push(LogSourceInfo {
+                                name: s.name,
+                                kind: if s.kind == "file" {
+                                    LogSourceKind::File
+                                } else {
+                                    LogSourceKind::Journal
+                                },
+                                cursor: s.cursor,
+                                emitters: Vec::new(),
+                            });
+                        }
+                    }
+                    _ => out.push(LogSourceInfo {
+                        name: "guest".to_string(),
+                        kind: LogSourceKind::Journal,
+                        cursor: true,
+                        emitters: Vec::new(),
+                    }),
+                },
                 // The drainer's persisted ring: a durable, reboot-safe journal
                 // paged by the <seq>:<offset> cursor — cursor:true (unlike the
                 // volatile `slog2` ring).
@@ -5915,6 +5936,61 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
         })
         .collect();
     Some(entries)
+}
+
+/// The guest log-agent's `GET /logs/sources` entry — one log STREAM the guest
+/// serves. Mirrors `log-agent::SourceInfo` by convention (different repo):
+/// `{name, kind, cursor}`. Each becomes a `LogSourceInfo` the host advertises.
+#[derive(serde::Deserialize)]
+struct AgentSourceInfo {
+    name: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    cursor: bool,
+}
+
+/// Ask the guest agent for its source catalog (`GET /logs/sources`) — the real
+/// per-stream sources (doip-edge, doip-gateway, slog2, …), each with its own
+/// cursor. Replaces the synthetic single `"guest"` source: forwarding that name
+/// as a `source=` filter matched no guest record, so per-source reads were always
+/// empty. `None` = agent unreachable / non-200 / unparseable (e.g. an OLDER agent
+/// without the route) → the caller falls back to the single synthetic source.
+async fn query_log_agent_sources(url: &str) -> Option<Vec<AgentSourceInfo>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let deadline = std::time::Duration::from_secs(5);
+    let hostport = url.strip_prefix("http://").unwrap_or(url);
+    let (hostport, base_path) = match hostport.split_once('/') {
+        Some((hp, rest)) => (hp, format!("/{rest}")),
+        None => (hostport, String::new()),
+    };
+    let target = format!("{base_path}/logs/sources");
+
+    let mut stream = tokio::time::timeout(deadline, TcpStream::connect(hostport))
+        .await
+        .ok()?
+        .ok()?;
+    let request = format!("GET {target} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n");
+    tokio::time::timeout(deadline, stream.write_all(request.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
+    let mut buf = Vec::with_capacity(8 * 1024);
+    tokio::time::timeout(
+        deadline,
+        (&mut stream).take(1024 * 1024).read_to_end(&mut buf),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let response = std::str::from_utf8(&buf).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        return None;
+    }
+    serde_json::from_str(body).ok()
 }
 
 /// The guest log-agent's `GET /logs/page` envelope — the cursor forward-paging

@@ -53,6 +53,22 @@ pub const DEFAULT_TAIL: usize = 200;
 /// bytes. Matches the host's `MAX_BULK_BYTES`.
 pub const FILE_DOWNLOAD_CAP: u64 = 32 * 1024 * 1024;
 
+/// One log SOURCE (stream) the agent serves, on the wire. Field names are the
+/// CONTRACT — the host's component-mgr `list_log_sources` parses exactly these
+/// (mirror-by-convention with `sovd_core::LogSourceInfo`; the guest tree has no
+/// sovd-core dep). One entry per distinct stream: each `/dev/shmem/<name>.log` /
+/// `/var/log/<file>` (the layer hook creates one per declared service — see
+/// services.conf) and the slog2/journald ring. `kind` is always the journal-style
+/// paged read here (`"journal"`); `cursor` = supports `<seq>:<offset>` paging.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceInfo {
+    pub name: String,
+    /// Mirrors `sovd_core::LogSourceKind` (kebab-case). File/ring streams are all
+    /// `"journal"` — a paged line stream — on the guest.
+    pub kind: String,
+    pub cursor: bool,
+}
+
 /// One log line on the wire. Field names are the CONTRACT — the host's
 /// component-mgr parses exactly these (mirror-by-convention; see
 /// Cargo.toml). Priorities use the SOVD §7.21 names
@@ -1545,12 +1561,54 @@ pub fn file_dirs() -> &'static [&'static str] {
     &["/var/log"]
 }
 
+/// Enumerate the guest's log SOURCES (streams) — LIVE, one per distinct stream.
+/// Each `/dev/shmem/<name>.log` and `/var/log/<file>` is its own source (the OS
+/// layer hook creates one `/dev/shmem/<name>.log` per declared service — see the
+/// layers' services.conf — so the live file set IS the dynamic, declared source
+/// list; a freshly-mounted layer's source shows up on the next call, no restart).
+/// Sub-sources WITHIN a stream (slog2 per-buffer emitters) are NOT sources — the
+/// `x-sumo-emitter` filter handles those. Deduped by stem (svclog segments
+/// `<stem>.<seq>.log` collapse to one `<stem>` source).
+#[cfg(target_os = "nto")]
+pub fn list_sources() -> Vec<SourceInfo> {
+    use std::collections::BTreeSet;
+    let mut stems: BTreeSet<String> = BTreeSet::new();
+    for dir in file_dirs() {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_log = path
+                .extension()
+                .map(|e| e == "log")
+                .unwrap_or(*dir == "/var/log");
+            if !is_log || !path.is_file() {
+                continue;
+            }
+            stems.insert(log_source_of(&path));
+        }
+    }
+    stems
+        .into_iter()
+        .map(|name| SourceInfo {
+            name,
+            kind: "journal".to_string(),
+            cursor: true,
+        })
+        .collect()
+}
+
 /// Cursor forward-paging (the `/logs/page` view) — oldest→newest, resumable.
 /// QNX svclog segment model: `<seq>:<offset>` cursors; see
-/// tasks/qnx-log-segments-design.md.
+/// tasks/qnx-log-segments-design.md. PER-STREAM: cursor bounds + records are
+/// scoped to the ONE stem named by `q.source` (so `/logs/sources/{stem}` reads
+/// that stream with its own cursor). With no `source` (bare `/logs/page`) the
+/// bounds span every stream — the legacy whole-dir view.
 #[cfg(target_os = "nto")]
 pub fn collect_page(q: &LogQuery) -> PagedLogs {
-    let (oldest, tip) = shmem_cursor_bounds();
+    let (oldest, tip) = shmem_cursor_bounds(q.source.as_deref());
     let items = if after_at_or_past_tip(q.after.as_deref(), &tip) {
         Vec::new()
     } else {
@@ -1564,9 +1622,12 @@ pub fn collect_page(q: &LogQuery) -> PagedLogs {
     }
 }
 
-/// (oldest_cursor, tip_cursor) for the svclog segment set in /dev/shmem.
+/// (oldest_cursor, tip_cursor) for the svclog segment set in /dev/shmem. When
+/// `stem` is `Some`, bounds cover ONLY that stream's files (`<stem>.log` +
+/// `<stem>.<seq>.log`) — so each source pages on its OWN cursor. `None` spans
+/// all streams (the legacy whole-dir bound).
 #[cfg(target_os = "nto")]
-fn shmem_cursor_bounds() -> (Option<String>, Option<String>) {
+fn shmem_cursor_bounds(stem: Option<&str>) -> (Option<String>, Option<String>) {
     use std::fs;
     let dir = "/dev/shmem";
     let entries = match fs::read_dir(dir) {
@@ -1580,6 +1641,13 @@ fn shmem_cursor_bounds() -> (Option<String>, Option<String>) {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.ends_with(".log") {
             continue;
+        }
+        // Scope to the requested stream: a file belongs to `stem` iff its own
+        // stem (segment number stripped) matches.
+        if let Some(want) = stem {
+            if log_source_of(&entry.path()) != want {
+                continue;
+            }
         }
         let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
         let base = name.strip_suffix(".log").unwrap_or(&name);
@@ -1627,6 +1695,34 @@ fn journald_monotonic_secs(v: &serde_json::Value) -> Option<u64> {
         .and_then(|t| t.as_str())
         .and_then(|t| t.parse::<u64>().ok())
         .map(|usec| usec / 1_000_000)
+}
+
+/// Enumerate the guest's log SOURCES (Linux): the systemd `journal` (paged via
+/// journald's opaque `__CURSOR`) plus each `/var/log/<file>` stem. Mirrors the
+/// QNX `list_sources` contract so the host's `list_log_sources` is target-agnostic.
+#[cfg(not(target_os = "nto"))]
+pub fn list_sources() -> Vec<SourceInfo> {
+    use std::collections::BTreeSet;
+    let mut out = vec![SourceInfo {
+        name: "journal".to_string(),
+        kind: "journal".to_string(),
+        cursor: true,
+    }];
+    let mut stems: BTreeSet<String> = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir("/var/log") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                stems.insert(log_source_of(&path));
+            }
+        }
+    }
+    out.extend(stems.into_iter().map(|name| SourceInfo {
+        name,
+        kind: "journal".to_string(),
+        cursor: true,
+    }));
+    out
 }
 
 /// Linux: journald IS the monotonic, reboot-safe cursor. `__CURSOR` pages FORWARD.
