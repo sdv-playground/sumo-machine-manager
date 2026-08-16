@@ -237,6 +237,56 @@ fn update_session_clear_drops_the_reboot_owed() {
 }
 
 #[test]
+fn confirm_running_bank_match_clears_reboot_owed() {
+    let mut store = make_store();
+    // Os armed to B (finalize flipped the pointer), uncommitted, and owing a node reboot.
+    let mut boot = NvBootState::default();
+    boot.banks[BankSet::Os.as_index()].active_bank = Bank::B;
+    boot.banks[BankSet::Os.as_index()].committed = false;
+    store.write_boot_state(&mut boot).unwrap();
+    let mut s = NvUpdateSession::default();
+    s.reboot_owed = 1 << BankSet::Os.as_index();
+    store.write_update_session(&mut s).unwrap();
+
+    // Booted the armed bank (B) → the trial is live, the owed bit is cleared.
+    let verdict = store.confirm_running_bank(BankSet::Os, Bank::B).unwrap();
+    assert_eq!(verdict, RunningBankVerdict::Confirmed { bank: Bank::B });
+    assert!(!store.read_update_session().unwrap().owes(BankSet::Os));
+}
+
+#[test]
+fn confirm_running_bank_mismatch_leaves_reboot_owed() {
+    let mut store = make_store();
+    // Os armed to B, but the trial boot fell back to the recovery bank A.
+    let mut boot = NvBootState::default();
+    boot.banks[BankSet::Os.as_index()].active_bank = Bank::B;
+    store.write_boot_state(&mut boot).unwrap();
+    let mut s = NvUpdateSession::default();
+    s.reboot_owed = 1 << BankSet::Os.as_index();
+    store.write_update_session(&mut s).unwrap();
+
+    let verdict = store.confirm_running_bank(BankSet::Os, Bank::A).unwrap();
+    assert_eq!(
+        verdict,
+        RunningBankVerdict::Mismatch {
+            running: Bank::A,
+            armed: Bank::B,
+        }
+    );
+    // The owed bit persists → phase stays RebootPending → the commit gate refuses.
+    assert!(store.read_update_session().unwrap().owes(BankSet::Os));
+}
+
+#[test]
+fn confirm_running_bank_without_boot_state_is_a_noop() {
+    let mut store = make_store(); // no boot state written
+    assert_eq!(
+        store.confirm_running_bank(BankSet::Os, Bank::A).unwrap(),
+        RunningBankVerdict::NoBootState
+    );
+}
+
+#[test]
 fn update_session_region_isolated() {
     // The new 0x8000 region must not overlap the vehicle / boot / app regions.
     let mut store = make_store();

@@ -174,6 +174,23 @@ pub struct NvStore<D: BlockDevice> {
     dev: D,
 }
 
+/// Outcome of [`NvStore::confirm_running_bank`] — whether the node is running
+/// the bank it armed for a bank set, and thus whether that set's node-level
+/// reboot-owed marker was cleared. The caller logs the distinction
+/// (trial-live vs still-owed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunningBankVerdict {
+    /// The running bank matches the armed bank: the reboot-owed bit was cleared
+    /// (or was already clear) — the banked trial is live and may be committed.
+    Confirmed { bank: Bank },
+    /// The running bank differs from the armed bank — a trial boot that fell
+    /// back to the recovery bank. The reboot-owed bit is LEFT set, so the node
+    /// stays `RebootPending` and a commit is refused (the safety property).
+    Mismatch { running: Bank, armed: Bank },
+    /// No boot state recorded yet (a fresh device): nothing to confirm.
+    NoBootState,
+}
+
 impl<D: BlockDevice> NvStore<D> {
     pub fn new(dev: D) -> Self {
         Self { dev }
@@ -283,6 +300,46 @@ impl<D: BlockDevice> NvStore<D> {
     pub fn clear_update_session(&mut self) -> Result<(), BlockError> {
         let mut s = NvUpdateSession::default();
         self.write_update_session(&mut s)
+    }
+
+    /// Confirm the node is running the bank it armed for `bank_set` and, on a
+    /// match, clear that set's node-level reboot-owed bit — the banked-trial
+    /// confirmation the `RebootPending` commit gate relies on.
+    ///
+    /// Contract: `running_bank` is a TRUSTED boot-time signal — the bank the
+    /// bootloader actually launched (e.g. the `SELECTED_OS_BANK` env the
+    /// bootloader exports), NOT a value re-derived from the NV the device could
+    /// have mis-flipped. The ARMED bank is read from NV (`active_bank` for the
+    /// set — the pointer `finalize_flash` flipped). The reboot-owed bit is
+    /// cleared ONLY when `running_bank == armed`; a mismatch (a trial that fell
+    /// back to the recovery bank) LEAVES it set, so the node stays
+    /// `RebootPending` and a commit is refused. Idempotent: a match with the bit
+    /// already clear is a no-op `Confirmed`.
+    ///
+    /// The counterpart to component-mgr's `set_reboot_owed(true)` mark at
+    /// finalize/arm: mark on arm, clear on confirmed `running == armed`.
+    pub fn confirm_running_bank(
+        &mut self,
+        bank_set: BankSet,
+        running_bank: Bank,
+    ) -> Result<RunningBankVerdict, BlockError> {
+        let Some(state) = self.read_boot_state() else {
+            return Ok(RunningBankVerdict::NoBootState);
+        };
+        let armed = state.banks[bank_set.as_index()].active_bank;
+        if running_bank != armed {
+            return Ok(RunningBankVerdict::Mismatch {
+                running: running_bank,
+                armed,
+            });
+        }
+        let mut s = self.read_update_session().unwrap_or_default();
+        let bit = 1u16 << bank_set.as_index();
+        if s.reboot_owed & bit != 0 {
+            s.reboot_owed &= !bit;
+            self.write_update_session(&mut s)?;
+        }
+        Ok(RunningBankVerdict::Confirmed { bank: armed })
     }
 
     // --- FW Meta (per bank set, per bank) ---

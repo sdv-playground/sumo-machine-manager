@@ -4751,17 +4751,27 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             };
         }
 
-        // A write-through singleshot that still needs a node reboot (e.g. rt):
-        // `committed` stays true, so this reboot-owed bit is the only durable
-        // record that "a node reboot is owed" — and it survives a power cycle (or
-        // a failed/refused reset), which the in-memory flash state does not. The
-        // gate then refuses a new flash node-wide until the reboot runs and the
-        // trial is resolved (cleared in commit_flash). Rollbackable (banked)
-        // components do NOT mark here: they stage together before one reboot, so
-        // it would refuse their own siblings. See docs/design/node-update-state.md.
-        if !self.config.supports_rollback
-            && self.reset_kind() == machine_mgr::ResetKind::RequiresEcuReset
-        {
+        // Any component that owes a full node ECU reset to run its just-armed
+        // state marks the durable reboot-owed bit — the only record of "a node
+        // reboot is owed" that survives a power cycle (or a failed/refused
+        // reset), which the in-memory flash state does not. It stays set until
+        // the node is CONFIRMED running the armed bank (supernova's
+        // `NvStore::confirm_running_bank` at boot) or the trial is resolved
+        // (commit/rollback → `resolve_node_transaction`).
+        //
+        // This now covers BANKED `RequiresEcuReset` components (host-os), not
+        // just write-through singleshots (rt). Why banked needs it: after arm,
+        // `committed == false` alone reads as phase `Trial` (commit-allowed),
+        // but the node hasn't rebooted into the armed bank yet — and a trial
+        // that falls back to the recovery bank never will. The owed bit makes
+        // the phase `RebootPending` from arm until confirmation; a fall-back
+        // leaves it set → commit refused → the campaign fails honestly and
+        // rolls back. `Local`-reset components (VMs: qvm/process cycle) never
+        // owe a node reboot and are excluded. Sibling-safe: the orchestrator
+        // stages every component before any finalize (the ordering rt's
+        // existing mark already relies on), so marking here never refuses a
+        // not-yet-started sibling. See docs/design/node-update-state.md.
+        if self.reset_kind() == machine_mgr::ResetKind::RequiresEcuReset {
             self.set_reboot_owed(true)?;
         }
         // The install is applied — the session-scoped pull source has served
@@ -11083,6 +11093,112 @@ mod copy_forward_tests {
             "install_precomputed flipped NV to the sealed bank"
         );
         assert!(!s.committed, "banked install enters trial mode");
+
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// A banked (dual-bank, rollbackable) activator that still needs a full node
+    /// ECU reset to run its armed bank — host-os's shape. Injected via
+    /// `with_bank_activator` so the default file provider's `reset_kind` folds in
+    /// `RequiresEcuReset`.
+    struct EcuResetActivator;
+    impl machine_mgr::BankActivator for EcuResetActivator {
+        fn activate(&self, _dir: &std::path::Path) -> Result<(), machine_mgr::BankActivatorError> {
+            Ok(())
+        }
+        fn reset_kind(&self) -> machine_mgr::ResetKind {
+            machine_mgr::ResetKind::RequiresEcuReset
+        }
+    }
+
+    /// The banked blind-spot fix: a BANKED `RequiresEcuReset` component (host-os)
+    /// must now mark the durable node reboot-owed bit at finalize/arm — it did
+    /// not before (only write-through singleshots did), so a banked trial that
+    /// fell back to recovery read as `Trial` (commit-allowed). Reuses the
+    /// manifest-only finalize harness with a `RequiresEcuReset` activator.
+    #[tokio::test]
+    async fn banked_requires_ecu_reset_finalize_marks_reboot_owed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images_dir = tmp.path().to_path_buf();
+
+        let content = b"vm1 rootfs already on the vehicle";
+        let active = images_dir.join("vm1/bank_a");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::write(active.join("rootfs.img"), content).unwrap();
+        let digest: [u8; 32] = Sha256::digest(content).into();
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
+        boot.banks[BankSet::Vm1.as_index()].committed = true;
+        nv.write_boot_state(&mut boot).unwrap();
+        let nv = Arc::new(Mutex::new(nv));
+
+        let (hsm, crypto, keystore) = provisioned_hsm("banked-owed");
+        let backend = ComponentBackend::with_options(
+            BankSet::Vm1,
+            nv.clone(),
+            Arc::new(NoopManifest),
+            ComponentConfig::default(), // banked: supports_rollback, dual-bank
+            None,
+            Some(images_dir.clone()),
+            Some(hsm),
+        )
+        .with_hsm_crypto(crypto)
+        .with_bank_activator(Arc::new(EcuResetActivator));
+
+        // Precondition: banked + RequiresEcuReset, and nothing owed yet.
+        assert_eq!(
+            backend.reset_kind(),
+            machine_mgr::ResetKind::RequiresEcuReset
+        );
+        assert!(backend.node_reboot_owed().unwrap().reboot_owed.is_empty());
+
+        let manifest = detached_manifest("rootfs.img", &digest, content.len() as u64);
+        let validated = ValidatedFirmware {
+            bank_set: BankSet::Vm1,
+            manifest_type: ManifestType::Firmware,
+            image_meta: crate::ota::ImageMeta::default(),
+            image_data: Vec::new(),
+            version_display: "1.0.0".into(),
+            image_sha256: None,
+            image_size: None,
+            raw_envelope: None,
+            streamed_files: Vec::new(),
+            signing_time_secs: None,
+            disable_target: None,
+        };
+        backend.packages.lock().unwrap().insert(
+            "m1".into(),
+            StoredPackage {
+                id: "m1".into(),
+                validated: validated.clone(),
+                status: PackageStatus::Verified,
+            },
+        );
+        *backend.flash_transfer.lock().unwrap() = Some(FlashTransferState {
+            transfer_id: "t1".into(),
+            package_id: "m1".into(),
+            state: FlashState::AwaitingActivation,
+            image_size: 0,
+            streamed_files: Vec::new(),
+        });
+        *backend.flash_session.lock().unwrap() = Some(FlashSessionState::AwaitingPayload {
+            manifest_bytes: manifest,
+            validated,
+            next_component: 0,
+            total_components: 1,
+        });
+
+        DiagnosticBackend::finalize_flash(&backend)
+            .await
+            .expect("banked RequiresEcuReset finalize");
+
+        // The fix: arming a banked RequiresEcuReset component now owes a node reboot.
+        assert_eq!(
+            backend.node_reboot_owed().unwrap().reboot_owed,
+            vec![format!("bank-set {}", BankSet::Vm1.as_index())]
+        );
 
         let _ = std::fs::remove_dir_all(&keystore);
     }
