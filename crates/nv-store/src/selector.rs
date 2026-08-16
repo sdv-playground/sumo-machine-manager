@@ -26,7 +26,7 @@
 //! the authority. Until then the existing per-component commit/rollback
 //! (`BankProvider` + `NvBootState`) remains the authority; this runs alongside.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -36,18 +36,26 @@ use crate::types::{Bank, BankSet};
 /// The on-medium selector record: which bank each component boots from, at a
 /// given global generation, signed.
 ///
-/// `selectors` is a [`BTreeMap`] precisely so the canonical byte encoding used
-/// for [`Self::sha256`] is **stable** regardless of insertion order — a
-/// `HashMap` would hash differently run to run and the signature would not
-/// reproduce.
+/// `selectors` (and `disabled`) are ordered collections ([`BTreeMap`] /
+/// [`BTreeSet`]) precisely so the canonical byte encoding used for
+/// [`Self::sha256`] is **stable** regardless of insertion order — a `HashMap`
+/// would hash differently run to run and the signature would not reproduce.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectorBlob {
     /// Global anti-rollback generation. Monotonic on `seal`.
     pub generation: u64,
     /// `BankSet -> Bank` boot selection, canonically ordered.
     pub selectors: BTreeMap<BankSet, Bank>,
-    /// SHA-256 over the canonical `(generation, selectors)` bytes — the digest
-    /// the signature covers. Serialized as a lowercase hex string.
+    /// Bank sets the node must **not** boot — the signed per-component disable
+    /// set, canonically ordered. **Additive**: an empty set appends nothing to
+    /// the canonical bytes, so an enabled-only blob hashes (and signs)
+    /// byte-for-byte as it did before this field existed. `#[serde(default)]`
+    /// so selector blobs written before the field existed (no `disabled` key)
+    /// still deserialize — to an empty set — and re-verify.
+    #[serde(default)]
+    pub disabled: BTreeSet<BankSet>,
+    /// SHA-256 over the canonical `(generation, selectors, disabled)` bytes —
+    /// the digest the signature covers. Serialized as a lowercase hex string.
     #[serde(with = "hex_array")]
     pub sha256: [u8; 32],
     /// Detached signature over [`Self::sha256`] (HSM `Signer::sign`).
@@ -58,40 +66,60 @@ pub struct SelectorBlob {
 
 impl SelectorBlob {
     /// Build the canonical, order-stable byte encoding of `(generation,
-    /// selectors)` that [`Self::sha256`] digests and the signature covers.
+    /// selectors, disabled)` that [`Self::sha256`] digests and the signature
+    /// covers.
     ///
     /// Layout (little-endian, fixed-width — no length-prefixed text, so it is
     /// reproducible byte-for-byte): the u64 generation, then each
-    /// `(BankSet.0: u8, Bank: u8)` pair in `BTreeMap` (ascending `BankSet`)
-    /// order. `BankSet` is a `u8` newtype and `Bank` is `repr(u8)`, so two
-    /// bytes per entry suffice.
-    pub fn canonical_bytes(generation: u64, selectors: &BTreeMap<BankSet, Bank>) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + selectors.len() * 2);
+    /// `(BankSet.0: u8, Bank: u8)` selector pair in `BTreeMap` (ascending
+    /// `BankSet`) order, then each disabled `BankSet.0: u8` in `BTreeSet`
+    /// (ascending) order. `BankSet` is a `u8` newtype and `Bank` is `repr(u8)`,
+    /// so one/two bytes per entry suffice.
+    ///
+    /// **Additive**: the disabled bytes come *after* all selector pairs, so an
+    /// empty `disabled` appends nothing and an enabled-only blob encodes — and
+    /// therefore hashes and signs — byte-for-byte as before this set existed.
+    pub fn canonical_bytes(
+        generation: u64,
+        selectors: &BTreeMap<BankSet, Bank>,
+        disabled: &BTreeSet<BankSet>,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + selectors.len() * 2 + disabled.len());
         buf.extend_from_slice(&generation.to_le_bytes());
         for (set, bank) in selectors {
             buf.push(set.0);
             buf.push(*bank as u8);
         }
+        for set in disabled {
+            buf.push(set.0);
+        }
         buf
     }
 
-    /// Compute the canonical SHA-256 for `(generation, selectors)`.
-    pub fn compute_sha256(generation: u64, selectors: &BTreeMap<BankSet, Bank>) -> [u8; 32] {
+    /// Compute the canonical SHA-256 for `(generation, selectors, disabled)`.
+    pub fn compute_sha256(
+        generation: u64,
+        selectors: &BTreeMap<BankSet, Bank>,
+        disabled: &BTreeSet<BankSet>,
+    ) -> [u8; 32] {
         use sha2::{Digest, Sha256};
-        Sha256::digest(Self::canonical_bytes(generation, selectors)).into()
+        Sha256::digest(Self::canonical_bytes(generation, selectors, disabled)).into()
     }
 
-    /// Build + sign a blob for `selectors` at `generation` using `signer`.
+    /// Build + sign a blob for `selectors` (with `disabled`) at `generation`
+    /// using `signer`.
     pub fn signed(
         generation: u64,
         selectors: BTreeMap<BankSet, Bank>,
+        disabled: BTreeSet<BankSet>,
         signer: &dyn Signer,
     ) -> SelectorBlob {
-        let sha256 = Self::compute_sha256(generation, &selectors);
+        let sha256 = Self::compute_sha256(generation, &selectors, &disabled);
         let signature = signer.sign(&sha256);
         SelectorBlob {
             generation,
             selectors,
+            disabled,
             sha256,
             signature,
         }
@@ -101,7 +129,7 @@ impl SelectorBlob {
     /// signature over that digest. A blob whose `sha256` doesn't match its own
     /// contents, or whose signature doesn't verify, is rejected.
     pub fn is_valid(&self, signer: &dyn Signer) -> bool {
-        let recomputed = Self::compute_sha256(self.generation, &self.selectors);
+        let recomputed = Self::compute_sha256(self.generation, &self.selectors, &self.disabled);
         recomputed == self.sha256 && signer.verify(&self.sha256, &self.signature)
     }
 }

@@ -3,7 +3,7 @@ use bytes::Bytes;
 
 use crate::error::{MachineError, MachineResult};
 use crate::types::{
-    AdminStateOutcome, Capabilities, Csr, DidFilter, DidKind, DtcFilter, EnvelopeStream, FlashId,
+    Capabilities, Csr, DidFilter, DidKind, DtcFilter, EnvelopeStream, FlashId,
     FlashSession, InstallSource, KeyInventory, RuntimeState,
 };
 use crate::{ActivationState, ClearFaultsResult, Fault, FlashStatus};
@@ -169,19 +169,6 @@ pub trait Component: Send + Sync {
     /// be a no-op or a daemon restart.
     async fn restart(&self) -> MachineResult<()> {
         Err(MachineError::NotSupported("restart"))
-    }
-
-    /// Set the component's persisted administrative state (`disable == true`
-    /// ⇒ disabled). Only components equipped with a
-    /// [`crate::deactivator::Deactivator`] support this — the default
-    /// `NotSupported` IS the "cannot be disabled" answer (hsm, host-os, app);
-    /// the SOVD op maps it to 400. Disable is admitted only when the
-    /// component is idle (own bank set committed, no node transaction owing
-    /// it) — else `Busy`. Idempotent: setting the current state is a no-op
-    /// success. The flag is persisted BEFORE the runtime is enacted
-    /// (stop/erase), so a crash between the two converges at the next boot.
-    async fn set_admin_state(&self, _disable: bool) -> MachineResult<AdminStateOutcome> {
-        Err(MachineError::NotSupported("set_admin_state"))
     }
 
     async fn runtime_state(&self) -> MachineResult<RuntimeState> {

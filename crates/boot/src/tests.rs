@@ -7,7 +7,7 @@ use nv_store::selector::{InMemorySelectorStore, SelectorBlob, SelectorStore, Tes
 use nv_store::store::MIN_NV_DEVICE_SIZE;
 use nv_store::types::*;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::*;
 
@@ -537,7 +537,7 @@ fn sel_map(entries: &[(BankSet, Bank)]) -> BTreeMap<BankSet, Bank> {
 
 /// Build a signed selector blob (via `TestSigner`) for `entries` at `gen`.
 fn signed_blob(gen: u64, entries: &[(BankSet, Bank)]) -> SelectorBlob {
-    SelectorBlob::signed(gen, sel_map(entries), &TestSigner)
+    SelectorBlob::signed(gen, sel_map(entries), BTreeSet::new(), &TestSigner)
 }
 
 /// Seed PRIMARY == SECONDARY at the given selection — the committed baseline

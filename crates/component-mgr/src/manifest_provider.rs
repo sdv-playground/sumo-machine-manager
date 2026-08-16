@@ -47,6 +47,12 @@ pub struct ValidatedFirmware {
     /// accepted update advances the floor even fully offline
     /// (docs/design/safe-time-floor.md). `None` if the manifest carried none.
     pub signing_time_secs: Option<u64>,
+    /// Set for an administrative-*disable* manifest (a `suit-directive-disable`
+    /// in the shared sequence, no firmware payload): the index of the component
+    /// it disables. The upload path enacts it via the component's `Deactivator`
+    /// instead of staging a payload. `None` for ordinary firmware and genuine
+    /// CRL/policy manifests, which are unaffected.
+    pub disable_target: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -215,6 +221,7 @@ mod tests {
                 raw_envelope: None,
                 streamed_files: Vec::new(),
                 signing_time_secs: None,
+                disable_target: None,
             })
         }
     }

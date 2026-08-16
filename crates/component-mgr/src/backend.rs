@@ -189,7 +189,9 @@ enum FlashSessionState {
     /// Manifest received, waiting for payload at component index N.
     AwaitingPayload {
         manifest_bytes: Vec<u8>,
-        #[allow(dead_code)] // TODO: use validated firmware metadata during payload processing
+        /// The validated manifest, parked with the session. `finalize_flash`
+        /// reads its `disable_target` to route a no-payload disable manifest to
+        /// the enact path instead of reconcile/activate.
         validated: ValidatedFirmware,
         next_component: usize,
         total_components: usize,
@@ -508,13 +510,13 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// The administrative-disable enactment seam — stops/erases this
     /// component's runtime when the operator disables it. Its PRESENCE is what
     /// makes the component disableable (structural, no name list): `None` ⇒
-    /// the admin-state op answers "component does not support administrative
-    /// disable". Injected by component-factory via
-    /// [`with_deactivator`](Self::with_deactivator): VMs get the generic
-    /// vm-service-stop deactivator, RT gets the deployment-injected erase,
-    /// hsm/app/host-os never get one. The persisted flag itself lives in the
-    /// shared NV admin-state record (`NvAdminState`), reached through
-    /// [`Self::nv`].
+    /// [`is_disableable`](Self::is_disableable) is false and a disable request
+    /// answers "component does not support administrative disable". Injected by
+    /// component-factory via [`with_deactivator`](Self::with_deactivator): VMs
+    /// get the generic vm-service-stop deactivator, RT gets the
+    /// deployment-injected erase, hsm/app/host-os never get one. The persisted
+    /// disable itself lives in the boot authority (the signed selector), read
+    /// through the bank provider.
     deactivator: Option<Arc<dyn machine_mgr::Deactivator>>,
     /// SOVD §7.15 script (test) executions, keyed by exec_id. A guest test-agent
     /// run is SYNCHRONOUS — `start_script` proxies `POST /tests/{id}/run`, which
@@ -1675,16 +1677,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     }
 
     pub fn ensure_flash_can_start(&self) -> BackendResult<()> {
-        // FIRST: an administratively disabled component is not a flash target
-        // — enable it before flashing (fleet side, the BOM convergence enables
-        // first). Same Busy → HTTP 409 wire path as the trial refusal below.
-        // This refusal is also what keeps the admission rule airtight: a
-        // disabled component can never acquire `committed == false`.
-        if self.admin_disabled() {
-            return Err(BackendError::Busy(
-                "component is administratively disabled — enable it before flashing".into(),
-            ));
-        }
+        // A disabled component is admitted here — the real-flash paths clear the
+        // selector's disable bit at admission (before any trial mutation), so a
+        // campaign that flashes it as a normal member re-enables it first. The
+        // "disabled ⇒ never uncommitted" invariant now holds by clearing before
+        // trial, not by refusing the flash.
 
         if !self.config.single_bank {
             let nv = self
@@ -1808,187 +1805,69 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     }
 
     /// The component's *effective* administrative state: `true` only for a
-    /// disableable component whose persisted NV flag is set. A stale NV bit
-    /// on a component with no deactivator (the deployment shape changed)
-    /// reads as enabled — the equipped deactivator is the authority on
-    /// disableability. Fail-open to enabled on a poisoned lock, matching the
-    /// NV record's own absent/corrupt contract ([`nv_store::types::NvAdminState`]).
+    /// disableable component that the boot authority (the signed selector, read
+    /// through the bank provider) marks disabled. A disable bit on a component
+    /// with no deactivator (the deployment shape changed) reads as enabled — the
+    /// equipped deactivator is the authority on disableability. A userspace/
+    /// post-boot gate: read to gate start / flash, never consulted at vm-boot.
     pub fn admin_disabled(&self) -> bool {
-        self.is_disableable()
-            && self
-                .nv
-                .lock()
-                .map(|nv| nv.read_admin_state().is_disabled(self.bank_set))
-                .unwrap_or(false)
+        self.is_disableable() && self.bank_provider.disabled(self.bank_set)
     }
 
-    /// Set the component's persisted administrative state and enact it.
+    /// Enact a SUIT administrative-*disable* manifest — the no-payload
+    /// counterpart to a firmware install. Runs THIS component's `Deactivator`
+    /// (the manifest was POSTed to this component's upload endpoint, and the
+    /// caller's `bank_set` check already rejected a manifest naming another
+    /// component). The sync deactivator runs off the async worker and
+    /// `reboot_required` is surfaced.
     ///
-    /// - Non-disableable (no deactivator) ⇒ `NotSupported` (the op's 400).
-    /// - Idempotent: already in the requested state ⇒ no-op success.
-    /// - **Disable is admitted only when idle**: own bank set committed, no
-    ///   open flash session here, and no node transaction owing this
-    ///   component its activation reboot — else `Busy` (the op's 409). The
-    ///   payoff: a disabled component can never hold `committed == false`,
-    ///   so the node-phase derivation, boot-trial counting, and verdict
-    ///   fan-out need no disabled-awareness at all (assert, don't filter).
-    /// - Ordering on disable: persist the flag FIRST, then enact via the
-    ///   deactivator — a crash between the two converges at the next boot
-    ///   (the start gate skips a disabled component). An enact failure keeps
-    ///   the component disabled and is reported in
-    ///   [`machine_mgr::AdminStateOutcome::enact_error`].
-    /// - On enable: clear the flag, then best-effort start for VMs (the
-    ///   NV-active bank). Activator-backed components (RT) stay empty —
-    ///   content returns via a normal campaign re-flash.
-    pub async fn set_admin_state(
-        &self,
-        disable: bool,
-    ) -> BackendResult<machine_mgr::AdminStateOutcome> {
+    /// Enact-first: only once the deactivator succeeds is the disable persisted
+    /// in the boot authority (the signed selector, via the bank provider), so
+    /// an enact failure has nothing to fall back on and is reported as an error
+    /// rather than a persisted-but-failed state. `NotSupported` when the
+    /// component is not disableable (no `Deactivator`).
+    async fn enact_disable_manifest(&self) -> BackendResult<()> {
         let Some(deactivator) = self.deactivator.clone() else {
             return Err(BackendError::NotSupported(
                 "component does not support administrative disable".into(),
             ));
         };
 
-        // Idempotent no-op: nothing to admit or enact.
-        if self.admin_disabled() == disable {
-            return Ok(machine_mgr::AdminStateOutcome {
-                disabled: disable,
-                reboot_required: false,
-                enact_error: None,
-            });
+        let enact = tokio::task::spawn_blocking(move || deactivator.deactivate()).await;
+        let reboot_required = match enact {
+            Ok(Ok(outcome)) => outcome.reboot_required,
+            Ok(Err(e)) => {
+                return Err(BackendError::Internal(format!("deactivation failed: {e}")))
+            }
+            Err(e) => {
+                return Err(BackendError::Internal(format!(
+                    "deactivator task join error: {e}"
+                )))
+            }
+        };
+
+        // Deactivation succeeded — persist the disable in the boot authority
+        // (the signed selector, via the provider) so `admin_disabled()` reads it
+        // and the start gate keeps the component down across reboots.
+        self.bank_provider
+            .record_disabled(self.bank_set, true)
+            .map_err(|e| BackendError::Internal(format!("record disable in selector: {e}")))?;
+
+        // A deactivation that owes an ECU reset records the node reboot in the
+        // same durable NV marker `finalize_flash` uses for firmware singleshots,
+        // so the reboot survives a power cycle and the node-update gate refuses a
+        // new flash until it runs. No-op when the deactivation is fully realized.
+        if reboot_required {
+            self.set_reboot_owed(true)?;
         }
 
-        if disable {
-            // Admission (idle-only). (a) Own bank set committed — the mirror
-            // of `ensure_flash_can_start`'s trial refusal.
-            if !self.config.single_bank {
-                let nv = self
-                    .nv
-                    .lock()
-                    .map_err(|_| BackendError::Internal("nv lock".into()))?;
-                let state = nv
-                    .read_boot_state()
-                    .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-                if !state.banks[self.bank_set.as_index()].committed {
-                    return Err(BackendError::Busy(format!(
-                        "bank set {:?} is in trial mode (uncommitted) — commit or roll back \
-                         the pending upgrade before disabling",
-                        self.bank_set
-                    )));
-                }
-            }
-            // (b) No open flash session on this component (in-memory staging
-            // is node-transaction membership too).
-            if self.flash_in_progress() {
-                return Err(BackendError::Busy(
-                    "a flash session is in progress on this component — resolve it before \
-                     disabling"
-                        .into(),
-                ));
-            }
-            // (c) No durable node transaction owing this component its
-            // activation reboot (the reboot-owed record survives power cuts).
-            {
-                let nv = self
-                    .nv
-                    .lock()
-                    .map_err(|_| BackendError::Internal("nv lock".into()))?;
-                if nv
-                    .read_update_session()
-                    .unwrap_or_default()
-                    .owes(self.bank_set)
-                {
-                    return Err(BackendError::Busy(
-                        "this component owes the node a pending activation reboot — resolve \
-                         the update transaction before disabling"
-                            .into(),
-                    ));
-                }
-            }
-
-            // Persist FIRST, then enact: a crash after the write converges at
-            // the next boot (start gate + autostart skip the disabled set).
-            self.write_admin_flag(true)?;
-
-            // The deactivator is sync and may legitimately block for the
-            // guest's graceful-shutdown window — run it off the async worker.
-            let enact = tokio::task::spawn_blocking(move || deactivator.deactivate()).await;
-            let (reboot_required, enact_error) = match enact {
-                Ok(Ok(outcome)) => (outcome.reboot_required, None),
-                Ok(Err(e)) => (false, Some(e.to_string())),
-                Err(e) => (false, Some(format!("deactivator task join error: {e}"))),
-            };
-            match &enact_error {
-                None => tracing::info!(
-                    component = %self.entity_info.id,
-                    reboot_required,
-                    "component administratively disabled"
-                ),
-                Some(e) => tracing::warn!(
-                    component = %self.entity_info.id,
-                    error = %e,
-                    "component administratively disabled, but enacting the stop failed \
-                     (flag persisted — the start gate keeps it down)"
-                ),
-            }
-            Ok(machine_mgr::AdminStateOutcome {
-                disabled: true,
-                reboot_required,
-                enact_error,
-            })
-        } else {
-            // Enable: clear the flag first (the start gate reads NV), then
-            // best-effort start for VMs. RT/activator components stay empty
-            // until a campaign re-flash delivers content — nothing to start.
-            self.write_admin_flag(false)?;
-
-            let mut enact_error = None;
-            if let Some(addr) = self.vm_service_addr.clone() {
-                let active_bank = if self.config.single_bank {
-                    Some(Bank::A)
-                } else {
-                    self.nv
-                        .lock()
-                        .ok()
-                        .and_then(|nv| nv.read_boot_state())
-                        .map(|s| s.banks[self.bank_set.as_index()].active_bank)
-                };
-                let id = &self.entity_info.id;
-                if let Err(e) = Self::notify_vm_service(&addr, id, "start", active_bank).await {
-                    tracing::warn!(
-                        component = %id,
-                        error = %e,
-                        "component administratively enabled, but the vm-service start failed \
-                         (flag cleared — a later reset/start will bring it up)"
-                    );
-                    enact_error = Some(format!("vm-service start: {e}"));
-                } else {
-                    tracing::info!(component = %id, "component administratively enabled — start requested");
-                }
-            } else {
-                tracing::info!(
-                    component = %self.entity_info.id,
-                    "component administratively enabled (no vm-service — content returns via re-flash)"
-                );
-            }
-            Ok(machine_mgr::AdminStateOutcome {
-                disabled: false,
-                reboot_required: false,
-                enact_error,
-            })
-        }
-    }
-
-    /// Read-modify-write this component's bit in the shared NV admin-state
-    /// record. Atomic under the NV mutex (single guard scope), so concurrent
-    /// ops on sibling components can't lose each other's bits.
-    fn write_admin_flag(&self, disabled: bool) -> BackendResult<()> {
-        let mut nv = self.nv_write()?;
-        let mut state = nv.read_admin_state();
-        state.set_disabled(self.bank_set, disabled);
-        nv.write_admin_state(&mut state)
-            .map_err(|e| BackendError::Internal(format!("nv write admin-state: {e:?}")))
+        tracing::info!(
+            component = %self.entity_info.id,
+            bank_set = ?self.bank_set,
+            reboot_required,
+            "component disabled via SUIT disable manifest"
+        );
+        Ok(())
     }
 
     // =================================================================
@@ -3773,25 +3652,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
 
     // --- Operations ---
 
-    /// Cheap discoverability: a disableable component advertises the vendor
-    /// `x-sumo-admin-state` op (id + name + href only); everything else keeps
-    /// the empty list. The execution itself is served by the vendor router
-    /// (`crate::sovd::admin_state`), not by `start_operation`.
+    /// Cheap discoverability: the host/device component advertises the vendor
+    /// `x-sumo-attest-time` op (id + name + href); everything else keeps the
+    /// empty list. That op's execution is served by `start_operation`.
     async fn list_operations(&self) -> BackendResult<Vec<OperationInfo>> {
         let mut ops = Vec::new();
         let id = &self.entity_info.id;
-        if self.is_disableable() {
-            let op = crate::sovd::admin_state::ADMIN_STATE_OP_ID;
-            ops.push(OperationInfo {
-                id: op.to_string(),
-                name: "Administrative state (disable/enable)".to_string(),
-                description: None,
-                parameters: vec![],
-                requires_security: false,
-                security_level: 0,
-                href: format!("/vehicle/v1/components/{id}/operations/{op}/executions"),
-            });
-        }
         // attest-time is device-global (ratchets the shared safe-time floor); it
         // needs an HSM (the floor slot) and is advertised ONCE, on the host/device
         // component (BankSet::Os), so it doesn't appear per-firmware-component.
@@ -3943,6 +3809,14 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             )));
         }
 
+        // Administrative-disable manifest: no payload to stage — enact the
+        // disable against this component's `Deactivator` instead of storing a
+        // package.
+        if validated.disable_target.is_some() {
+            self.enact_disable_manifest().await?;
+            return Ok(self.next_id());
+        }
+
         let id = self.next_id();
 
         // Single-shot upload still carries the raw envelope here, so cache
@@ -4064,6 +3938,36 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         };
 
         *self.upload_phase.lock().unwrap() = None;
+
+        // Administrative-disable manifest: no payload was staged — enact the
+        // disable against this component's `Deactivator` and finish (there is
+        // no bank to prepare). Identical enact to the single-shot path.
+        if validated.disable_target.is_some() {
+            *self.flash_transfer.lock().unwrap() = None;
+            self.enact_disable_manifest().await?;
+            return Ok(self.next_id());
+        }
+
+        // Non-disable legacy flash of a currently-disabled component = re-enable.
+        // This one-shot path enacts inline (no separate finalize_flash), so the
+        // re-enable clear lives HERE — after the disable check (so it never fires
+        // for a disable member) and before the bank state advances below, so the
+        // component is enabled before trial. Mirrors finalize_flash's re-enable
+        // branch. Guarded so a normal flash of a never-disabled component doesn't
+        // re-sign the selector.
+        if self.bank_provider.disabled(self.bank_set) {
+            self.bank_provider
+                .record_disabled(self.bank_set, false)
+                .map_err(|e| {
+                    BackendError::Internal(format!("clear disable on re-enable install: {e}"))
+                })?;
+            tracing::info!(
+                component = %self.entity_info.id,
+                bank_set = ?self.bank_set,
+                "component re-enabled on campaign install"
+            );
+        }
+
         {
             let mut ft = self.flash_transfer.lock().unwrap();
             if let Some(ref mut t) = *ft {
@@ -4557,6 +4461,53 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     }
 
     async fn finalize_flash(&self) -> BackendResult<()> {
+        // Campaign/session disable enact + re-enable clear — decided HERE, on the
+        // validated manifest, POST-validation and PRE-trial, before any of the
+        // reconcile/install/activate work below. A no-payload disable manifest is
+        // parked in `AwaitingPayload` by the manifest upload (no payload follows),
+        // so its `validated.disable_target` is the campaign path's disable signal.
+        let is_disable = {
+            let session = self.flash_session.lock().unwrap();
+            matches!(
+                session.as_ref(),
+                Some(FlashSessionState::AwaitingPayload { validated, .. })
+                    if validated.disable_target.is_some()
+            )
+        };
+        if is_disable {
+            // Enact against this component's Deactivator (deactivate +
+            // record_disabled(true) + reboot-owed), then finish like an activated
+            // singleshot: a disable stages no payload and touches no bank, so the
+            // reconcile/install/activate path below does not apply and would
+            // otherwise hard-error demanding an image_digest the disable lacks.
+            self.enact_disable_manifest().await?;
+            *self.flash_session.lock().unwrap() = Some(FlashSessionState::Complete);
+            {
+                let mut ft = self.flash_transfer.lock().unwrap();
+                if let Some(ref mut t) = *ft {
+                    t.state = FlashState::Activated;
+                }
+            }
+            *self.install_source.lock().unwrap() = None;
+            return Ok(());
+        } else if self.bank_provider.disabled(self.bank_set) {
+            // Normal flash of a currently-disabled component = re-enable. Clear the
+            // selector's disable bit HERE — before the activate below — so the
+            // component is enabled before it enters trial ("a disabled component is
+            // never in trial/uncommitted"). Guarded so a normal flash of a
+            // never-disabled component doesn't re-sign the selector.
+            self.bank_provider
+                .record_disabled(self.bank_set, false)
+                .map_err(|e| {
+                    BackendError::Internal(format!("clear disable on re-enable install: {e}"))
+                })?;
+            tracing::info!(
+                component = %self.entity_info.id,
+                bank_set = ?self.bank_set,
+                "component re-enabled on campaign install"
+            );
+        }
+
         // Manifest-only / partial push reconciliation. The orchestrator pushed
         // the L2 manifest but no payload for some components — "the vehicle
         // already has these" (push path) or "fetch them yourself" (pull path).
@@ -7763,6 +7714,7 @@ mod identity_tests {
                     raw_envelope: None,
                     streamed_files: Vec::new(),
                     signing_time_secs: None,
+                    disable_target: None,
                 },
                 status: PackageStatus::Verified,
             },
@@ -11062,6 +11014,7 @@ mod copy_forward_tests {
             raw_envelope: None,
             streamed_files: Vec::new(),
             signing_time_secs: None,
+            disable_target: None,
         };
         backend.packages.lock().unwrap().insert(
             "m1".into(),
@@ -11177,6 +11130,7 @@ mod copy_forward_tests {
             raw_envelope: None,
             streamed_files: Vec::new(),
             signing_time_secs: None,
+            disable_target: None,
         };
         backend.packages.lock().unwrap().insert(
             "m1".into(),

@@ -20,7 +20,7 @@
 //! implement it without circular deps. The implementor holds its own NV / HSM /
 //! disk handles, so these signatures stay free of those crates.
 
-use nv_store::types::Bank;
+use nv_store::types::{Bank, BankSet};
 
 use crate::types::ResetKind;
 
@@ -185,5 +185,21 @@ pub trait BankProvider: Send + Sync {
     /// component-local one. (Absorbs `BankActivator::reset_kind`.)
     fn reset_kind(&self) -> ResetKind {
         ResetKind::Local
+    }
+
+    /// Persist `set`'s administrative-disable state in the boot authority (the
+    /// signed selector) so it survives reboot and gates userspace start. This is
+    /// a userspace/post-boot gate — the value is NOT consulted at vm-boot.
+    /// Default no-op `Ok` for providers with no selector concept (their
+    /// [`Self::disabled`] stays `false`), leaving them unaffected.
+    fn record_disabled(&self, _set: BankSet, _disabled: bool) -> Result<(), BankError> {
+        Ok(())
+    }
+
+    /// Whether `set` is administratively disabled per the boot authority (the
+    /// signed selector) — read post-boot to gate start / flash, never from
+    /// vm-boot. Default `false` (providers without a selector concept).
+    fn disabled(&self, _set: BankSet) -> bool {
+        false
     }
 }

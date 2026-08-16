@@ -45,7 +45,7 @@
 //! the authority. Until then the existing per-component commit/rollback
 //! (`BankProvider` + `NvBootState`) remains the authority; this runs alongside.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nv_store::types::{Bank, BankSet};
 
@@ -87,6 +87,12 @@ pub struct SystemBankManager {
     /// SECONDARY / rollback-floor selection (+ its own generation).
     committed: BTreeMap<BankSet, Bank>,
     committed_generation: u64,
+    /// Booted (PRIMARY) per-component disable set — the bank sets the node must
+    /// not boot, carried inside the signed blob. Mutated by
+    /// [`stage_disabled`](Self::stage_disabled) and read by
+    /// [`disabled`](Self::disabled). Additive: empty ⇒ blobs sign exactly as
+    /// before this field existed.
+    disabled: BTreeSet<BankSet>,
     /// In-memory staging; `None` until `stage` is called. Never persisted until
     /// `seal`.
     pending: Option<BTreeMap<BankSet, Bank>>,
@@ -107,9 +113,9 @@ impl SystemBankManager {
     /// generation 0.
     pub fn load(store: Box<dyn SelectorStore>, signer: Box<dyn Signer>) -> Self {
         let primary = store.read_primary().filter(|b| b.is_valid(&*signer));
-        let (current, generation) = match primary {
-            Some(b) => (b.selectors, b.generation),
-            None => (BTreeMap::new(), 0),
+        let (current, generation, disabled) = match primary {
+            Some(b) => (b.selectors, b.generation, b.disabled),
+            None => (BTreeMap::new(), 0, BTreeSet::new()),
         };
 
         let secondary = store.read_secondary().filter(|b| b.is_valid(&*signer));
@@ -125,6 +131,7 @@ impl SystemBankManager {
             generation,
             committed,
             committed_generation,
+            disabled,
             pending: None,
         }
     }
@@ -155,18 +162,49 @@ impl SystemBankManager {
             return false;
         };
         let gen = self.generation.max(self.committed_generation) + 1;
-        let blob = SelectorBlob::signed(gen, pending.clone(), &*self.signer);
+        let blob = SelectorBlob::signed(gen, pending.clone(), self.disabled.clone(), &*self.signer);
         self.store.write_primary(&blob);
         self.current = pending;
         self.generation = gen;
         true
     }
 
+    /// Set (`disabled == true`) or clear a bank set's membership in the booted
+    /// (PRIMARY) disable set and re-sign PRIMARY in place.
+    ///
+    /// Unlike [`stage`](Self::stage) + [`seal`](Self::seal), this writes
+    /// immediately: disabling a component is an idle-time admin action, not a
+    /// staged boot trial. The whole blob is re-signed (all `current` selectors
+    /// plus the new disable set) at the **current** generation — no
+    /// anti-rollback bump, because the booted selection is unchanged and a
+    /// single component disables at idle (enforced elsewhere), so there is no
+    /// in-flight selector trial to disturb. SECONDARY (the rollback floor) is
+    /// left untouched.
+    pub fn stage_disabled(&mut self, set: BankSet, disabled: bool) {
+        if disabled {
+            self.disabled.insert(set);
+        } else {
+            self.disabled.remove(&set);
+        }
+        let blob = SelectorBlob::signed(
+            self.generation,
+            self.current.clone(),
+            self.disabled.clone(),
+            &*self.signer,
+        );
+        self.store.write_primary(&blob);
+    }
+
     /// Promote the booted (PRIMARY) selection to the rollback floor (SECONDARY)
     /// — "the trial is over, this is now the floor". Builds + signs a blob from
     /// `current` at the *current* generation and writes it to SECONDARY.
     pub fn commit(&mut self) {
-        let blob = SelectorBlob::signed(self.generation, self.current.clone(), &*self.signer);
+        let blob = SelectorBlob::signed(
+            self.generation,
+            self.current.clone(),
+            self.disabled.clone(),
+            &*self.signer,
+        );
         self.store.write_secondary(&blob);
         self.committed = self.current.clone();
         self.committed_generation = self.generation;
@@ -184,6 +222,7 @@ impl SystemBankManager {
         let blob = SelectorBlob::signed(
             self.committed_generation,
             self.committed.clone(),
+            self.disabled.clone(),
             &*self.signer,
         );
         self.store.write_primary(&blob);
@@ -196,6 +235,12 @@ impl SystemBankManager {
     /// node has no selection for that set.
     pub fn active_bank(&self, set: BankSet) -> Option<Bank> {
         self.current.get(&set).copied()
+    }
+
+    /// Whether `set` is in the booted (PRIMARY) disable set — i.e. the node
+    /// must not boot it. See [`BootSelector::disabled`].
+    pub fn disabled(&self, set: BankSet) -> bool {
+        self.disabled.contains(&set)
     }
 
     /// Whether the node is in a trial: the booted selection (PRIMARY) differs
@@ -258,6 +303,12 @@ impl BootSelector {
     /// selection for that set. See [`SystemBankManager::active_bank`].
     pub fn active_bank(&self, set: BankSet) -> Option<Bank> {
         self.0.read().expect("selector poisoned").active_bank(set)
+    }
+
+    /// Whether `set` is disabled in the booted selector (PRIMARY) — the node
+    /// must not boot it. See [`SystemBankManager::disabled`].
+    pub fn disabled(&self, set: BankSet) -> bool {
+        self.0.read().expect("selector poisoned").disabled(set)
     }
 
     /// Whether the node is in a trial (PRIMARY differs from SECONDARY). See
@@ -406,7 +457,8 @@ mod tests {
         let bad = SelectorBlob {
             generation,
             selectors: selectors.clone(),
-            sha256: SelectorBlob::compute_sha256(generation, &selectors),
+            disabled: BTreeSet::new(),
+            sha256: SelectorBlob::compute_sha256(generation, &selectors, &BTreeSet::new()),
             signature: Vec::new(), // invalid under TestSigner
         };
         store.write_primary(&bad);
@@ -420,6 +472,7 @@ mod tests {
         let tampered = SelectorBlob {
             generation,
             selectors: selectors.clone(),
+            disabled: BTreeSet::new(),
             sha256: [0u8; 32], // doesn't match contents
             signature: TestSigner.sign(&[0u8; 32]),
         };
@@ -448,10 +501,11 @@ mod tests {
     fn blob(generation: u64, set: BankSet, bank: Bank) -> SelectorBlob {
         let mut selectors = BTreeMap::new();
         selectors.insert(set, bank);
-        let sha256 = SelectorBlob::compute_sha256(generation, &selectors);
+        let sha256 = SelectorBlob::compute_sha256(generation, &selectors, &BTreeSet::new());
         SelectorBlob {
             generation,
             selectors,
+            disabled: BTreeSet::new(),
             sha256,
             signature: TestSigner.sign(&sha256),
         }
@@ -503,5 +557,123 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    // --- signed per-component `disabled` set ---
+
+    #[test]
+    fn empty_disabled_hashes_identically_to_pre_field_encoding() {
+        // (a) Additive: an empty `disabled` appends nothing to the canonical
+        // bytes, so the digest equals the pre-`disabled` encoding — u64
+        // generation LE, then each (BankSet.0, Bank as u8) selector pair.
+        // Rebuild that legacy encoding by hand and compare.
+        use sha2::{Digest, Sha256};
+        let generation: u64 = 42;
+        let mut selectors = BTreeMap::new();
+        selectors.insert(BankSet::Os, Bank::A);
+        selectors.insert(BankSet::Vm1, Bank::B);
+
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&generation.to_le_bytes());
+        for (set, bank) in &selectors {
+            legacy.push(set.0);
+            legacy.push(*bank as u8);
+        }
+        let legacy_sha: [u8; 32] = Sha256::digest(&legacy).into();
+
+        assert_eq!(
+            SelectorBlob::compute_sha256(generation, &selectors, &BTreeSet::new()),
+            legacy_sha,
+            "empty disabled must hash byte-for-byte as before the field existed",
+        );
+    }
+
+    #[test]
+    fn disabled_membership_changes_digest_and_signature() {
+        // (b) A bank set in `disabled` must produce a different digest — and
+        // therefore a different signature — than the enabled-only blob.
+        let generation: u64 = 7;
+        let mut selectors = BTreeMap::new();
+        selectors.insert(BankSet::Vm1, Bank::A);
+
+        let enabled =
+            SelectorBlob::signed(generation, selectors.clone(), BTreeSet::new(), &TestSigner);
+        let mut disabled = BTreeSet::new();
+        disabled.insert(BankSet::Vm1);
+        let with_disabled =
+            SelectorBlob::signed(generation, selectors.clone(), disabled, &TestSigner);
+
+        assert_ne!(
+            enabled.sha256, with_disabled.sha256,
+            "a bank set in `disabled` must change the digest",
+        );
+        assert_ne!(
+            enabled.signature, with_disabled.signature,
+            "a changed digest must change the signature",
+        );
+    }
+
+    #[test]
+    fn stage_disabled_round_trips_and_persists() {
+        // (c) `stage_disabled` + `disabled(set)` round-trip: set, clear, re-set;
+        // the disable persists into PRIMARY (survives a reload) and is visible
+        // through the read-only `BootSelector` view.
+        use std::sync::{Arc, RwLock};
+
+        let store = InMemorySelectorStore::new();
+        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        m.stage(BankSet::Vm1, Bank::A);
+        m.seal();
+
+        m.stage_disabled(BankSet::Vm1, true);
+        assert!(m.disabled(BankSet::Vm1));
+        assert!(!m.disabled(BankSet::Vm2));
+        m.stage_disabled(BankSet::Vm1, false);
+        assert!(!m.disabled(BankSet::Vm1), "clearing removes membership");
+        m.stage_disabled(BankSet::Vm1, true);
+
+        // Re-sealed into PRIMARY, so a fresh load sees the disable and the
+        // selection is intact.
+        let m2 = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        assert!(m2.disabled(BankSet::Vm1), "disable survives reload");
+        assert_eq!(m2.active_bank(BankSet::Vm1), Some(Bank::A), "selection intact");
+
+        // Visible through the read-only BootSelector view.
+        let selector = BootSelector::new(Arc::new(RwLock::new(m)));
+        assert!(selector.disabled(BankSet::Vm1));
+        assert!(!selector.disabled(BankSet::Vm2));
+    }
+
+    #[test]
+    fn is_valid_holds_for_a_disabled_carrying_blob() {
+        // (d) A blob whose signed digest covers a disable still verifies.
+        let generation: u64 = 3;
+        let mut selectors = BTreeMap::new();
+        selectors.insert(BankSet::Vm1, Bank::B);
+        let mut disabled = BTreeSet::new();
+        disabled.insert(BankSet::Vm1);
+        let blob = SelectorBlob::signed(generation, selectors, disabled, &TestSigner);
+        assert!(blob.is_valid(&TestSigner));
+    }
+
+    #[test]
+    fn legacy_json_without_disabled_key_deserializes_and_verifies() {
+        // Backward-compat for the additive constraint: a selector blob written
+        // before `disabled` existed had no `disabled` key AND a digest that
+        // covered no disable. Simulate one by serializing an empty-disabled blob
+        // and stripping the key, then confirm it round-trips to an empty set,
+        // equals the original, and still verifies.
+        let mut selectors = BTreeMap::new();
+        selectors.insert(BankSet::Os, Bank::A);
+        let legacy = SelectorBlob::signed(9, selectors, BTreeSet::new(), &TestSigner);
+
+        let mut json = serde_json::to_value(&legacy).unwrap();
+        json.as_object_mut().unwrap().remove("disabled");
+        assert!(json.get("disabled").is_none(), "legacy JSON has no disabled key");
+
+        let parsed: SelectorBlob = serde_json::from_value(json).expect("legacy blob parses");
+        assert!(parsed.disabled.is_empty(), "missing key defaults to empty set");
+        assert_eq!(parsed, legacy, "legacy blob equals the empty-disabled blob");
+        assert!(parsed.is_valid(&TestSigner), "legacy blob still verifies");
     }
 }

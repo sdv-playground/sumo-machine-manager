@@ -1,32 +1,29 @@
-//! Integration tests for the per-component administrative state slice:
-//! `ComponentBackend::set_admin_state` semantics (persist-first, idle-only
-//! admission, idempotency), the flash-gate + status + reset enforcement
-//! points, and the `x-sumo-admin-state` vendor router (auth, wire codes,
-//! §7.14 execution body) through the public API — mirroring the
-//! `sovd_tests.rs` harness style.
+//! Integration tests for the per-component administrative state slice: the
+//! SUIT disable-manifest enact path (`enact_disable_manifest`), the signed
+//! selector as the disable authority (`admin_disabled`), and the flash-gate +
+//! status + reset enforcement points — mirroring the `sovd_tests.rs` harness
+//! style.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use http_body_util::BodyExt;
-use tower::ServiceExt;
 
 use nv_store::block::MemBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
 use machine_mgr::{
-    DeactivateError, DeactivateOutcome, Deactivator, EntityInfo, Machine, MachineRegistry,
+    DeactivateError, DeactivateOutcome, Deactivator, InMemorySelectorStore, SharedSystemBankState,
+    SystemBankManager, TestSigner,
 };
-use sovd_core::{DiagnosticBackend, EntityStatus};
+use sovd_core::{BackendError, DiagnosticBackend, EntityStatus, PackageStream};
 
 use component_mgr::backend::{ComponentBackend, ComponentConfig};
-use component_mgr::component_adapter::ComponentAdapter;
-use component_mgr::manifest_provider::{ManifestError, ManifestProvider, ValidatedFirmware};
-use component_mgr::sovd::admin_state::{admin_state_router, ADMIN_STATE_OP_ID};
-use component_mgr::sovd::authz::{Tier, TieredAuthorizer, TrustedIssuer};
+use component_mgr::bank_provider::IvdBankProvider;
+use component_mgr::manifest_provider::{
+    ManifestError, ManifestProvider, ManifestType, ValidatedFirmware,
+};
+use component_mgr::ota::ImageMeta;
+use sumo_offboard::{keygen, ImageManifestBuilder};
 
 // --- Harness ---------------------------------------------------------------
 
@@ -36,6 +33,32 @@ struct StubManifests;
 impl ManifestProvider for StubManifests {
     fn validate(&self, _data: &[u8], _min: u32) -> Result<ValidatedFirmware, ManifestError> {
         Err(ManifestError::ParseError("stub".into()))
+    }
+}
+
+/// Provider that yields a pre-baked no-payload `ValidatedFirmware`: a disable
+/// manifest when `disable_target` is `Some`, an ordinary CRL/policy no-op when
+/// `None`. The raw upload bytes are ignored — the disable routing keys off the
+/// flag the real `SuitProvider` sets from the manifest's shared sequence.
+struct CannedManifest {
+    bank_set: BankSet,
+    disable_target: Option<usize>,
+}
+impl ManifestProvider for CannedManifest {
+    fn validate(&self, _data: &[u8], _min: u32) -> Result<ValidatedFirmware, ManifestError> {
+        Ok(ValidatedFirmware {
+            bank_set: self.bank_set,
+            manifest_type: ManifestType::Firmware,
+            image_meta: ImageMeta::default(),
+            image_data: Vec::new(),
+            version_display: "disable".into(),
+            image_sha256: None,
+            image_size: None,
+            raw_envelope: None,
+            streamed_files: Vec::new(),
+            signing_time_secs: None,
+            disable_target: self.disable_target,
+        })
     }
 }
 
@@ -57,6 +80,12 @@ impl MockDeactivator {
     fn failing() -> Self {
         Self {
             fail: true,
+            ..Self::ok()
+        }
+    }
+    fn rebooting() -> Self {
+        Self {
+            reboot_required: true,
             ..Self::ok()
         }
     }
@@ -127,36 +156,64 @@ fn vm_backend(
     )
 }
 
-fn hsm_backend(nv: &SharedNv) -> ComponentBackend<MemBlockDevice> {
+/// Backend wired with a caller-supplied manifest provider (the disable-upload
+/// tests swap in `CannedManifest`; the rest use `StubManifests`).
+fn backend_with_manifests(
+    nv: &SharedNv,
+    set: BankSet,
+    manifests: Arc<dyn ManifestProvider>,
+) -> ComponentBackend<MemBlockDevice> {
     ComponentBackend::with_options(
-        BankSet::Hsm,
+        set,
         nv.clone(),
-        Arc::new(StubManifests),
-        ComponentConfig {
-            supports_rollback: false,
-            single_bank: true,
-            entity_type: "hsm".into(),
-            log_sources: Vec::new(),
-            test_agent_url: None,
-            diag_agent_url: None,
-            host_diagnostics: false,
-        },
+        manifests,
+        ComponentConfig::default(),
         None,
         None,
         None,
     )
 }
 
-/// Write the raw NV admin flag directly (the state another path persisted).
-fn set_flag(nv: &SharedNv, set: BankSet, disabled: bool) {
-    let mut nv = nv.lock().unwrap();
-    let mut st = nv.read_admin_state();
-    st.set_disabled(set, disabled);
-    nv.write_admin_state(&mut st).unwrap();
+/// A shared boot selector with a booted selection for `set` (so the provider
+/// resolves a bank); the disable set starts empty. The signed selector is the
+/// read/write authority for a component's administrative disable state.
+fn selector_for(set: BankSet) -> SharedSystemBankState {
+    let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner));
+    let shared: SharedSystemBankState = Arc::new(std::sync::RwLock::new(mgr));
+    {
+        let mut g = shared.write().unwrap();
+        g.stage(set, Bank::A);
+        g.seal();
+    }
+    shared
 }
 
-fn flag_of(nv: &SharedNv, set: BankSet) -> bool {
-    nv.lock().unwrap().read_admin_state().is_disabled(set)
+/// Set/clear `set`'s disable bit in the selector directly — the state a SUIT
+/// disable manifest (`record_disabled`) persists and `admin_disabled()` reads.
+fn set_selector_disabled(sel: &SharedSystemBankState, set: BankSet, disabled: bool) {
+    sel.write().unwrap().stage_disabled(set, disabled);
+}
+
+/// A vm-style backend whose bank provider is wired to `selector`, so the
+/// disable read/write paths route through it (the production shape once the
+/// signed selector is the disable authority).
+fn vm_backend_with_selector(
+    nv: &SharedNv,
+    set: BankSet,
+    vm_service_addr: Option<String>,
+    selector: SharedSystemBankState,
+) -> ComponentBackend<MemBlockDevice> {
+    let provider = IvdBankProvider::new(
+        nv.clone(),
+        set,
+        false,
+        None,
+        "disable".into(),
+        None,
+        None,
+        Some(selector),
+    );
+    vm_backend(nv, set, vm_service_addr).with_bank_provider(Arc::new(provider))
 }
 
 /// Serve canned `200 OK`s on an ephemeral loopback port, counting accepted
@@ -185,134 +242,23 @@ async fn counting_server() -> (String, Arc<AtomicUsize>) {
     (addr, count)
 }
 
-/// A loopback port with nothing listening (bind-then-drop).
-fn dead_addr() -> String {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    format!("127.0.0.1:{}", l.local_addr().unwrap().port())
-}
-
 // --- Backend semantics -----------------------------------------------------
 
 #[tokio::test]
-async fn disable_persists_flag_enacts_once_and_is_idempotent() {
+async fn non_disableable_component_omits_admin_state() {
+    // No deactivator ⇒ not disableable. `admin_disabled()` short-circuits on
+    // `is_disableable()`, so even a disable bit set in the signed selector reads
+    // as enabled — the equipped deactivator is the authority.
     let nv = make_nv();
-    let deact = Arc::new(MockDeactivator::ok());
-    let b = vm_backend(&nv, BankSet::Vm1, None).with_deactivator(deact.clone());
-
-    assert!(b.is_disableable());
-    assert!(!b.admin_disabled());
-
-    let out = b.set_admin_state(true).await.expect("disable admitted");
-    assert!(out.disabled);
-    assert!(!out.reboot_required);
-    assert!(out.enact_error.is_none());
-    // Flag persisted in NV, deactivator enacted exactly once.
-    assert!(flag_of(&nv, BankSet::Vm1), "flag must persist in NV");
-    assert!(b.admin_disabled());
-    assert_eq!(deact.calls(), 1);
-
-    // Idempotent repeat: no-op success, NO second enact.
-    let out = b.set_admin_state(true).await.expect("no-op disable");
-    assert!(out.disabled);
-    assert!(out.enact_error.is_none());
-    assert_eq!(deact.calls(), 1, "a no-op repeat must not re-enact");
-}
-
-#[tokio::test]
-async fn disable_refused_while_node_reboot_owed() {
-    // The durable reboot-owed record marks this component as owing the node
-    // transaction its activation reboot — disable is not idle then.
-    let nv = make_nv();
-    {
-        let mut nv = nv.lock().unwrap();
-        let mut s = NvUpdateSession {
-            reboot_owed: 1 << BankSet::Vm1.as_index(),
-            ..Default::default()
-        };
-        nv.write_update_session(&mut s).unwrap();
-    }
-    let b = vm_backend(&nv, BankSet::Vm1, None).with_deactivator(Arc::new(MockDeactivator::ok()));
-    let err = b
-        .set_admin_state(true)
-        .await
-        .expect_err("owing the node reboot must refuse disable");
-    assert!(
-        err.to_string().contains("pending activation reboot"),
-        "wrong refusal: {err}"
-    );
-    assert!(!flag_of(&nv, BankSet::Vm1), "no flag on a refused disable");
-}
-
-#[tokio::test]
-async fn enable_clears_flag_and_reports_best_effort_start_failure() {
-    // vm-service is unreachable: the enable still succeeds (flag cleared —
-    // that IS the state change), and the failed best-effort start is
-    // reported honestly as the enact error.
-    let nv = make_nv();
-    let b = vm_backend(&nv, BankSet::Vm1, Some(dead_addr()))
-        .with_deactivator(Arc::new(MockDeactivator::ok()));
-    set_flag(&nv, BankSet::Vm1, true);
-    assert!(b.admin_disabled());
-
-    let out = b.set_admin_state(false).await.expect("enable succeeds");
-    assert!(!out.disabled);
-    assert!(!out.reboot_required);
-    assert!(
-        out.enact_error
-            .as_deref()
-            .is_some_and(|e| e.contains("vm-service start")),
-        "the failed best-effort start must be reported: {:?}",
-        out.enact_error
-    );
-    assert!(!flag_of(&nv, BankSet::Vm1), "flag must be cleared in NV");
-}
-
-#[tokio::test]
-async fn enact_failure_keeps_disabled_and_reports() {
-    // Persist-first ordering: the deactivator failing does NOT roll the flag
-    // back — the start gate keeps the component down and the error rides in
-    // the outcome.
-    let nv = make_nv();
-    let deact = Arc::new(MockDeactivator::failing());
-    let b = vm_backend(&nv, BankSet::Vm1, None).with_deactivator(deact.clone());
-
-    let out = b
-        .set_admin_state(true)
-        .await
-        .expect("state change succeeds");
-    assert!(out.disabled);
-    assert!(
-        out.enact_error
-            .as_deref()
-            .is_some_and(|e| e.contains("mock enact failure")),
-        "enact error must surface: {:?}",
-        out.enact_error
-    );
-    assert!(flag_of(&nv, BankSet::Vm1), "flag stays persisted");
-    assert!(b.admin_disabled());
-    assert_eq!(deact.calls(), 1);
-}
-
-#[tokio::test]
-async fn non_disableable_component_answers_not_supported() {
-    let nv = make_nv();
-    let b = hsm_backend(&nv);
+    let sel = selector_for(BankSet::Vm1);
+    let b = vm_backend_with_selector(&nv, BankSet::Vm1, None, sel.clone());
     assert!(!b.is_disableable());
 
-    let err = b
-        .set_admin_state(true)
-        .await
-        .expect_err("no deactivator = cannot be disabled");
+    set_selector_disabled(&sel, BankSet::Vm1, true);
     assert!(
-        err.to_string()
-            .contains("does not support administrative disable"),
-        "{err}"
+        !b.admin_disabled(),
+        "a disable bit on a non-disableable component reads as enabled"
     );
-
-    // A stale NV bit on a non-disableable slot reads as enabled — the
-    // equipped deactivator is the authority.
-    set_flag(&nv, BankSet::Hsm, true);
-    assert!(!b.admin_disabled());
 
     // No admin_state field in /status (tri-state read-back), no advertised op.
     let status = b.read_entity_status().await.unwrap();
@@ -325,33 +271,35 @@ async fn non_disableable_component_answers_not_supported() {
 }
 
 #[tokio::test]
-async fn ensure_flash_can_start_refuses_disabled() {
+async fn ensure_flash_can_start_admits_disabled() {
+    // E4a relaxed the gate: a disabled component is NO LONGER refused here — the
+    // real-flash paths clear its disable bit at admission (re-enable on flash),
+    // so the gate must admit it. The "disabled ⇒ never uncommitted" invariant is
+    // preserved by clearing before trial, not by refusing at this gate.
     let nv = make_nv();
-    let b = vm_backend(&nv, BankSet::Vm1, None).with_deactivator(Arc::new(MockDeactivator::ok()));
+    let sel = selector_for(BankSet::Vm1);
+    let b = vm_backend_with_selector(&nv, BankSet::Vm1, None, sel.clone())
+        .with_deactivator(Arc::new(MockDeactivator::ok()));
     b.ensure_flash_can_start()
         .expect("enabled component is flashable");
 
-    set_flag(&nv, BankSet::Vm1, true);
-    let err = b
-        .ensure_flash_can_start()
-        .expect_err("a disabled component is not a flash target");
-    assert!(
-        err.to_string().contains("administratively disabled"),
-        "wrong refusal: {err}"
-    );
+    set_selector_disabled(&sel, BankSet::Vm1, true);
+    b.ensure_flash_can_start()
+        .expect("a disabled component is now admitted (re-enabled at flash admission)");
 }
 
 #[tokio::test]
 async fn read_entity_status_tri_state_and_probe_skip() {
     let nv = make_nv();
     let (addr, probes) = counting_server().await;
-    let b =
-        vm_backend(&nv, BankSet::Vm1, Some(addr)).with_deactivator(Arc::new(MockDeactivator::ok()));
+    let sel = selector_for(BankSet::Vm1);
+    let b = vm_backend_with_selector(&nv, BankSet::Vm1, Some(addr), sel.clone())
+        .with_deactivator(Arc::new(MockDeactivator::ok()));
 
     // Disabled: NotReady, admin_state "disabled", and the vm-service probe
     // is SKIPPED (zero connections — no phantom health traffic to a VM that
     // is down by design).
-    set_flag(&nv, BankSet::Vm1, true);
+    set_selector_disabled(&sel, BankSet::Vm1, true);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::NotReady);
     assert_eq!(
@@ -362,7 +310,7 @@ async fn read_entity_status_tri_state_and_probe_skip() {
 
     // Enabled again: the probe runs (our canned server is not a healthy
     // guest, so spec status stays notReady — honesty), admin_state "enabled".
-    set_flag(&nv, BankSet::Vm1, false);
+    set_selector_disabled(&sel, BankSet::Vm1, false);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(
         status.extensions["x-sumo-runtime"]["admin_state"], "enabled",
@@ -393,7 +341,8 @@ async fn probe_component_status_rides_the_uniform_node() {
     assert_eq!(rt["hb_seq"], 7, "probe health feeds the uniform fields");
 
     // Probe not running ⇒ the standard status field is honest.
-    let b = vm_backend(&nv, BankSet::Rt, None)
+    let sel = selector_for(BankSet::Rt);
+    let b = vm_backend_with_selector(&nv, BankSet::Rt, None, sel.clone())
         .with_deactivator(Arc::new(MockDeactivator::ok()))
         .with_health_probe(Arc::new(MockProbe { running: false }));
     let status = b.read_entity_status().await.unwrap();
@@ -406,7 +355,7 @@ async fn probe_component_status_rides_the_uniform_node() {
     // Disabled ⇒ minimal read: notReady + admin_state, no probe extensions.
     // Probe not running ⇒ the deactivation is fully realized: no
     // reboot_pending flag.
-    b.set_admin_state(true).await.expect("disable admitted");
+    set_selector_disabled(&sel, BankSet::Rt, true);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::NotReady);
     let rt = &status.extensions["x-sumo-runtime"];
@@ -424,10 +373,11 @@ async fn probe_component_status_rides_the_uniform_node() {
     // application executing from SRAM) ⇒ the armed reboot is observable on
     // the uniform node until the real reboot clears it.
     let nv2 = make_nv();
-    let b = vm_backend(&nv2, BankSet::Rt, None)
+    let sel2 = selector_for(BankSet::Rt);
+    let b = vm_backend_with_selector(&nv2, BankSet::Rt, None, sel2.clone())
         .with_deactivator(Arc::new(MockDeactivator::ok()))
         .with_health_probe(Arc::new(MockProbe { running: true }));
-    set_flag(&nv2, BankSet::Rt, true);
+    set_selector_disabled(&sel2, BankSet::Rt, true);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(
         status.status,
@@ -446,12 +396,13 @@ async fn probe_component_status_rides_the_uniform_node() {
 async fn ecu_reset_skips_vm_service_when_disabled() {
     let nv = make_nv();
     let (addr, hits) = counting_server().await;
-    let b =
-        vm_backend(&nv, BankSet::Vm1, Some(addr)).with_deactivator(Arc::new(MockDeactivator::ok()));
+    let sel = selector_for(BankSet::Vm1);
+    let b = vm_backend_with_selector(&nv, BankSet::Vm1, Some(addr), sel.clone())
+        .with_deactivator(Arc::new(MockDeactivator::ok()));
 
     // Disabled: a reset must NOT resurrect the VM — zero vm-service traffic
     // (neither the was-running probe nor the start/restart notify).
-    set_flag(&nv, BankSet::Vm1, true);
+    set_selector_disabled(&sel, BankSet::Vm1, true);
     b.ecu_reset(0x01).await.unwrap();
     assert_eq!(
         hits.load(Ordering::SeqCst),
@@ -460,7 +411,7 @@ async fn ecu_reset_skips_vm_service_when_disabled() {
     );
 
     // Enabled: the reset notifies vm-service again.
-    set_flag(&nv, BankSet::Vm1, false);
+    set_selector_disabled(&sel, BankSet::Vm1, false);
     b.ecu_reset(0x01).await.unwrap();
     assert!(
         hits.load(Ordering::SeqCst) > 0,
@@ -468,302 +419,330 @@ async fn ecu_reset_skips_vm_service_when_disabled() {
     );
 }
 
+// --- Disable-manifest upload routing ---------------------------------------
+// A SUIT disable manifest (no payload) uploaded to a component's package
+// endpoint routes to that component's `Deactivator` instead of the CRL/policy
+// no-op — the single-shot `receive_package` path (the streaming path shares the
+// same `enact_disable_manifest` helper).
+
 #[tokio::test]
-async fn list_operations_advertises_admin_op_for_disableable() {
+async fn disable_manifest_upload_enacts_deactivator_and_handles_reboot() {
     let nv = make_nv();
-    let b = vm_backend(&nv, BankSet::Vm1, None).with_deactivator(Arc::new(MockDeactivator::ok()));
-    let ops = b.list_operations().await.unwrap();
-    assert_eq!(ops.len(), 1);
-    assert_eq!(ops[0].id, ADMIN_STATE_OP_ID);
-    assert_eq!(
-        ops[0].href,
-        format!("/vehicle/v1/components/vm1/operations/{ADMIN_STATE_OP_ID}/executions")
-    );
-}
-
-// --- Router (wire) ---------------------------------------------------------
-
-/// A deterministic ES256 issuer keypair (no RNG — stable across runs).
-fn issuer_keys() -> (jsonwebtoken::EncodingKey, jsonwebtoken::DecodingKey) {
-    use p256::ecdsa::SigningKey;
-    use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-    let mut scalar = [0u8; 32];
-    scalar[31] = 7;
-    let sk = SigningKey::from_bytes(&p256::FieldBytes::from(scalar)).expect("valid scalar");
-    let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).expect("pkcs8 pem");
-    let pub_pem = sk
-        .verifying_key()
-        .to_public_key_pem(LineEnding::LF)
-        .expect("spki pem");
-    (
-        jsonwebtoken::EncodingKey::from_ec_pem(priv_pem.as_bytes()).expect("encoding key"),
-        jsonwebtoken::DecodingKey::from_ec_pem(pub_pem.as_bytes()).expect("decoding key"),
+    let deact = Arc::new(MockDeactivator::rebooting());
+    let b = backend_with_manifests(
+        &nv,
+        BankSet::Vm1,
+        Arc::new(CannedManifest {
+            bank_set: BankSet::Vm1,
+            disable_target: Some(0),
+        }),
     )
-}
+    .with_deactivator(deact.clone());
 
-fn mint(enc: &jsonwebtoken::EncodingKey, scopes: &[&str]) -> String {
-    use jsonwebtoken::{encode, Algorithm, Header};
-    let mut header = Header::new(Algorithm::ES256);
-    header.kid = Some("workshop".to_string());
-    let claims = serde_json::json!({
-        "sub": "operator",
-        "iss": "workshop",
-        "aud": "vehicle-1",
-        "exp": 9_999_999_999u64,
-        "scope": scopes.join(" "),
-    });
-    encode(&header, &claims, enc).expect("mint")
-}
-
-/// The wire rig: vm1 (disableable, mock deactivator) + hsm (not disableable)
-/// behind the admin-state router with a real `TieredAuthorizer`.
-struct Rig {
-    router: axum::Router,
-    nv: SharedNv,
-    deactivator: Arc<MockDeactivator>,
-    enc: jsonwebtoken::EncodingKey,
-}
-
-fn rig_with(deactivator: Arc<MockDeactivator>) -> Rig {
-    let nv = make_nv();
-    let vm1 = Arc::new(vm_backend(&nv, BankSet::Vm1, None).with_deactivator(deactivator.clone()));
-    let hsm = Arc::new(hsm_backend(&nv));
-    let machine: Arc<dyn Machine> = Arc::new(
-        MachineRegistry::builder(EntityInfo {
-            id: "vehicle".into(),
-            name: "vehicle".into(),
-            entity_type: "vehicle".into(),
-            description: None,
-            href: "/vehicle/v1".into(),
-            status: None,
-        })
-        .with_arc(Arc::new(ComponentAdapter::new(vm1)) as Arc<dyn machine_mgr::Component>)
-        .with_arc(Arc::new(ComponentAdapter::new(hsm)) as Arc<dyn machine_mgr::Component>)
-        .build(),
-    );
-    let (enc, dec) = issuer_keys();
-    let authorizer: Arc<dyn sovd_api::Authorizer> =
-        Arc::new(TieredAuthorizer::new(vec![TrustedIssuer {
-            id: "workshop".into(),
-            audience: "vehicle-1".into(),
-            key: dec,
-            ceiling: Tier::Operational,
-        }]));
-    Rig {
-        router: admin_state_router(machine, authorizer),
-        nv,
-        deactivator,
-        enc,
-    }
-}
-
-fn rig() -> Rig {
-    rig_with(Arc::new(MockDeactivator::ok()))
-}
-
-/// A token carrying the right verb + a wildcard component scope.
-fn admin_token(rig: &Rig) -> String {
-    mint(&rig.enc, &["component:*", "component-admin"])
-}
-
-async fn post_admin(
-    router: &axum::Router,
-    component: &str,
-    body: serde_json::Value,
-    bearer: Option<&str>,
-) -> (StatusCode, serde_json::Value) {
-    let uri =
-        format!("/vehicle/v1/components/{component}/operations/{ADMIN_STATE_OP_ID}/executions");
-    let mut req = Request::post(&uri).header("content-type", "application/json");
-    if let Some(token) = bearer {
-        req = req.header("authorization", format!("Bearer {token}"));
-    }
-    let resp = router
-        .clone()
-        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+    // Routes to the deactivator (not stored as a package); reboot_required=true
+    // is handled (captured, non-fatal).
+    b.receive_package(b"disable-envelope")
         .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::String(
-        String::from_utf8_lossy(&bytes).into_owned(),
-    ));
-    (status, json)
+        .expect("disable manifest enacted");
+    assert_eq!(deact.calls(), 1, "deactivate() invoked exactly once");
 }
 
 #[tokio::test]
-async fn router_401_without_token() {
-    let rig = rig();
-    let (status, _) = post_admin(
-        &rig.router,
-        "vm1",
-        serde_json::json!({"state": "disabled"}),
+async fn suit_disable_manifest_writes_selector_and_start_flash_admits_without_clearing() {
+    // A SUIT disable manifest on the single-shot `receive_package` path routes to
+    // `enact_disable_manifest`, which persists the disable in the signed selector
+    // (`record_disabled(true)`); `admin_disabled()` reads it back. Re-enable has
+    // MOVED off flash admission: `start_flash` now admits a disabled component but
+    // no longer clears the selector — that clear happens at `finalize_flash`,
+    // before trial (see `campaign_normal_flash_reenables_at_finalize`).
+    let nv = make_nv();
+    let sel = selector_for(BankSet::Vm1);
+    let deact = Arc::new(MockDeactivator::ok());
+    let b = backend_with_manifests(
+        &nv,
+        BankSet::Vm1,
+        Arc::new(CannedManifest {
+            bank_set: BankSet::Vm1,
+            disable_target: Some(0),
+        }),
+    )
+    .with_deactivator(deact.clone())
+    .with_bank_provider(Arc::new(IvdBankProvider::new(
+        nv.clone(),
+        BankSet::Vm1,
+        false,
         None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(!flag_of(&rig.nv, BankSet::Vm1));
-    assert_eq!(rig.deactivator.calls(), 0);
-}
+        "vm1".into(),
+        None,
+        None,
+        Some(sel.clone()),
+    )));
 
-#[tokio::test]
-async fn router_403_wrong_verb() {
-    // A genuine token missing the component-admin verb: verified but denied.
-    let rig = rig();
-    let token = mint(&rig.enc, &["component:vm1", "data:read"]);
-    let (status, body) = post_admin(
-        &rig.router,
-        "vm1",
-        serde_json::json!({"state": "disabled"}),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
-    assert_eq!(rig.deactivator.calls(), 0);
-}
+    assert!(!b.admin_disabled(), "starts enabled");
+    assert!(!sel.read().unwrap().disabled(BankSet::Vm1));
 
-#[tokio::test]
-async fn router_404_unknown_component() {
-    let rig = rig();
-    let token = admin_token(&rig);
-    let (status, _) = post_admin(
-        &rig.router,
-        "no-such-component",
-        serde_json::json!({"state": "disabled"}),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn router_400_non_disableable() {
-    let rig = rig();
-    let token = admin_token(&rig);
-    let (status, body) = post_admin(
-        &rig.router,
-        "hsm",
-        serde_json::json!({"state": "disabled"}),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Disable via the SUIT manifest → deactivate + record_disabled(true).
+    b.receive_package(b"disable-envelope")
+        .await
+        .expect("disable manifest enacted");
+    assert_eq!(deact.calls(), 1, "deactivator enacted once");
     assert!(
-        body.as_str()
-            .is_some_and(|s| s.contains("does not support administrative disable")),
-        "body: {body}"
+        sel.read().unwrap().disabled(BankSet::Vm1),
+        "the disable is persisted in the signed selector"
+    );
+    assert!(b.admin_disabled(), "admin_disabled() reads the selector");
+
+    // Re-enable moved OUT of flash admission: `start_flash` now ADMITS a disabled
+    // component (the gate is relaxed) but no longer clears the selector — the
+    // re-enable clear happens at `finalize_flash`, before trial. So the disable
+    // bit is still set right after admission.
+    b.start_flash()
+        .await
+        .expect("start_flash admits a disabled component");
+    assert!(
+        sel.read().unwrap().disabled(BankSet::Vm1),
+        "start_flash no longer clears the disable bit — that moved to finalize"
+    );
+    assert!(b.admin_disabled(), "still disabled until finalize re-enables");
+}
+
+#[tokio::test]
+async fn non_disable_no_payload_manifest_is_a_noop() {
+    let nv = make_nv();
+    let deact = Arc::new(MockDeactivator::ok());
+    let b = backend_with_manifests(
+        &nv,
+        BankSet::Vm1,
+        Arc::new(CannedManifest {
+            bank_set: BankSet::Vm1,
+            disable_target: None,
+        }),
+    )
+    .with_deactivator(deact.clone());
+
+    // No disable directive ⇒ genuine CRL/policy no-op: stored as a package, the
+    // deactivator is never touched.
+    let id = b
+        .receive_package(b"crl-envelope")
+        .await
+        .expect("no-op manifest accepted");
+    assert!(!id.is_empty());
+    assert_eq!(deact.calls(), 0, "no deactivate() for a non-disable manifest");
+}
+
+#[tokio::test]
+async fn disable_manifest_without_deactivator_errors() {
+    let nv = make_nv();
+    // No `.with_deactivator(...)` — this component is not disableable.
+    let b = backend_with_manifests(
+        &nv,
+        BankSet::Vm1,
+        Arc::new(CannedManifest {
+            bank_set: BankSet::Vm1,
+            disable_target: Some(0),
+        }),
+    );
+    let err = b
+        .receive_package(b"disable-envelope")
+        .await
+        .expect_err("a non-disableable component must reject a disable manifest");
+    assert!(
+        matches!(err, BackendError::NotSupported(_)),
+        "expected NotSupported, got {err:?}"
     );
 }
 
 #[tokio::test]
-async fn router_400_bad_state_value() {
-    let rig = rig();
-    let token = admin_token(&rig);
-    let (status, _) = post_admin(
-        &rig.router,
-        "vm1",
-        serde_json::json!({"state": "off"}),
-        Some(&token),
+async fn disable_manifest_enact_failure_is_reported() {
+    let nv = make_nv();
+    let deact = Arc::new(MockDeactivator::failing());
+    let b = backend_with_manifests(
+        &nv,
+        BankSet::Vm1,
+        Arc::new(CannedManifest {
+            bank_set: BankSet::Vm1,
+            disable_target: Some(0),
+        }),
     )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    .with_deactivator(deact.clone());
+    let err = b
+        .receive_package(b"disable-envelope")
+        .await
+        .expect_err("a failing deactivator must surface an error");
+    assert_eq!(deact.calls(), 1);
+    assert!(matches!(err, BackendError::Internal(_)), "got {err:?}");
 }
 
 #[tokio::test]
-async fn router_409_while_in_trial() {
-    let rig = rig();
-    {
-        let mut nv = rig.nv.lock().unwrap();
-        let mut boot = nv.read_boot_state().unwrap();
-        boot.banks[BankSet::Vm1.as_index()].committed = false;
-        nv.write_boot_state(&mut boot).unwrap();
-    }
-    let token = admin_token(&rig);
-    let (status, body) = post_admin(
-        &rig.router,
-        "vm1",
-        serde_json::json!({"state": "disabled", "reason": "test rig"}),
-        Some(&token),
+async fn disable_manifest_for_other_component_is_rejected_before_enact() {
+    let nv = make_nv();
+    let deact = Arc::new(MockDeactivator::ok());
+    // Manifest names Vm2 but is POSTed to the Vm1 backend — the existing
+    // bank_set guard rejects it before any enact (no cross-component dispatch).
+    let b = backend_with_manifests(
+        &nv,
+        BankSet::Vm1,
+        Arc::new(CannedManifest {
+            bank_set: BankSet::Vm2,
+            disable_target: Some(0),
+        }),
     )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    .with_deactivator(deact.clone());
+    let err = b
+        .receive_package(b"disable-envelope")
+        .await
+        .expect_err("cross-component disable must be rejected");
     assert!(
-        body.as_str().is_some_and(|s| s.contains("trial")),
-        "the 409 must carry the reason: {body}"
+        matches!(err, BackendError::InvalidRequest(_)),
+        "got {err:?}"
     );
-    assert!(!flag_of(&rig.nv, BankSet::Vm1));
+    assert_eq!(
+        deact.calls(),
+        0,
+        "deactivator must not run on a bank_set mismatch"
+    );
+}
+
+// --- Campaign/session lifecycle: disable enact + re-enable at finalize --------
+// The single-shot `receive_package` tests above do NOT exercise the campaign
+// path (`start_flash` → `upload_envelope` → `finalize_flash`) where the disable
+// is parked and enacted. These drive that real lifecycle end-to-end.
+
+/// A minimal detached (no integrated payload) single-component SUIT envelope —
+/// just enough that `handle_manifest_upload`'s envelope decode succeeds and the
+/// session parks in `AwaitingPayload`. The disable-vs-normal decision is supplied
+/// by the wired `CannedManifest`, not by this envelope's contents.
+fn detached_envelope() -> Vec<u8> {
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
+        .component_id(vec!["vm1".into(), "firmware".into()])
+        .sequence_number(2)
+        .payload_digest(&[0u8; 32], 0)
+        .payload_uri("#firmware".into())
+        .build(&key)
+        .unwrap()
+}
+
+/// Wrap envelope bytes as the single-chunk `PackageStream` the upload path reads.
+fn envelope_stream(data: Vec<u8>) -> PackageStream {
+    Box::pin(futures::stream::iter(vec![Ok::<
+        bytes::Bytes,
+        Box<dyn std::error::Error + Send + Sync>,
+    >(bytes::Bytes::from(data))]))
+}
+
+/// A vm1 backend wired with `CannedManifest` (so the campaign manifest upload
+/// validates to the desired disable/normal shape) AND a selector-backed provider
+/// (so `record_disabled` writes/reads the shared selector `sel`).
+fn campaign_backend(
+    nv: &SharedNv,
+    manifests: Arc<dyn ManifestProvider>,
+    sel: &SharedSystemBankState,
+) -> ComponentBackend<MemBlockDevice> {
+    backend_with_manifests(nv, BankSet::Vm1, manifests).with_bank_provider(Arc::new(
+        IvdBankProvider::new(
+            nv.clone(),
+            BankSet::Vm1,
+            false,
+            None,
+            "vm1".into(),
+            None,
+            None,
+            Some(sel.clone()),
+        ),
+    ))
 }
 
 #[tokio::test]
-async fn router_happy_disable_then_enable() {
-    let rig = rig();
-    let token = admin_token(&rig);
-
-    // Disable: 200, §7.14 execution completed, result {state, reboot_required}.
-    let (status, body) = post_admin(
-        &rig.router,
-        "vm1",
-        serde_json::json!({"state": "disabled", "reason": "bench test of vm1 sibling"}),
-        Some(&token),
+async fn campaign_disable_manifest_enacts_at_finalize() {
+    // The REAL campaign path: a no-payload disable manifest is parked in
+    // AwaitingPayload by the manifest upload (no payload follows), then
+    // finalize_flash must ENACT it — deactivate + record_disabled(true) + record
+    // the owed reboot — and return Ok, instead of driving the parked manifest
+    // into reconcile (which would hard-error demanding an image_digest a disable
+    // lacks). Reverting the finalize enact makes this fail (deactivate never runs).
+    let nv = make_nv();
+    let sel = selector_for(BankSet::Vm1);
+    let deact = Arc::new(MockDeactivator::rebooting());
+    let b = campaign_backend(
+        &nv,
+        Arc::new(CannedManifest {
+            bank_set: BankSet::Vm1,
+            disable_target: Some(0),
+        }),
+        &sel,
     )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["operation_id"], ADMIN_STATE_OP_ID);
-    assert_eq!(body["status"], "completed");
-    assert_eq!(body["result"]["state"], "disabled");
-    assert_eq!(body["result"]["reboot_required"], false);
-    assert!(body.get("error").is_none() || body["error"].is_null());
-    assert!(flag_of(&rig.nv, BankSet::Vm1), "flag persisted");
-    assert_eq!(rig.deactivator.calls(), 1, "deactivator enacted");
+    .with_deactivator(deact.clone());
 
-    // Idempotent repeat: still 200/completed, no second enact.
-    let (status, body) = post_admin(
-        &rig.router,
-        "vm1",
-        serde_json::json!({"state": "disabled"}),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["result"]["state"], "disabled");
-    assert_eq!(rig.deactivator.calls(), 1, "no re-enact on repeat");
+    assert!(!sel.read().unwrap().disabled(BankSet::Vm1), "starts enabled");
 
-    // Enable: 200, flag cleared. (No vm_service_addr on this backend — the
-    // no-start branch, i.e. the activator-component shape.)
-    let (status, body) = post_admin(
-        &rig.router,
-        "vm1",
-        serde_json::json!({"state": "enabled"}),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["status"], "completed");
-    assert_eq!(body["result"]["state"], "enabled");
-    assert!(!flag_of(&rig.nv, BankSet::Vm1), "flag cleared");
-}
+    // start_flash → manifest upload parks the disable manifest (no payload).
+    b.start_flash().await.expect("flash session starts");
+    b.receive_package_stream(envelope_stream(detached_envelope()), None)
+        .await
+        .expect("disable manifest parked");
 
-#[tokio::test]
-async fn router_reports_failed_execution_when_enact_fails() {
-    // Enact failure ⇒ HTTP 200 (the state change persisted) with the honest
-    // §7.14 `failed` status + error — the trials response shape.
-    let rig = rig_with(Arc::new(MockDeactivator::failing()));
-    let token = admin_token(&rig);
-    let (status, body) = post_admin(
-        &rig.router,
-        "vm1",
-        serde_json::json!({"state": "disabled"}),
-        Some(&token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["status"], "failed");
-    assert_eq!(body["result"]["state"], "disabled");
+    // finalize enacts the parked disable instead of reconciling/activating.
+    b.finalize_flash()
+        .await
+        .expect("finalize enacts the disable; no reconcile error");
+
+    // (a) the Deactivator ran; (b) the selector records the disable.
+    assert_eq!(deact.calls(), 1, "deactivate() ran exactly once at finalize");
     assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("mock enact failure")),
-        "body: {body}"
+        sel.read().unwrap().disabled(BankSet::Vm1),
+        "record_disabled(true) persisted in the signed selector"
     );
-    assert!(flag_of(&rig.nv, BankSet::Vm1), "flag persisted regardless");
+    // (c) the owed node reboot is recorded durably (reboot_required deactivator).
+    let owed = nv
+        .lock()
+        .unwrap()
+        .read_update_session()
+        .map(|s| s.reboot_owed)
+        .unwrap_or(0);
+    assert_ne!(
+        owed & (1u16 << BankSet::Vm1.as_index()),
+        0,
+        "the disable's owed reboot is recorded in NV"
+    );
+}
+
+#[tokio::test]
+async fn campaign_normal_flash_reenables_at_finalize() {
+    // Companion to the disable test: a NORMAL (non-disable) campaign flash of a
+    // currently-disabled component RE-ENABLES it — finalize_flash clears the
+    // selector's disable bit before trial, the SUIT-native replacement for the
+    // manual enable lever now that the mis-placed start_flash clear is gone.
+    let nv = make_nv();
+    let sel = selector_for(BankSet::Vm1);
+    let deact = Arc::new(MockDeactivator::ok());
+    let b = campaign_backend(
+        &nv,
+        Arc::new(CannedManifest {
+            bank_set: BankSet::Vm1,
+            disable_target: None,
+        }),
+        &sel,
+    )
+    .with_deactivator(deact.clone());
+
+    // Pre-disable it (as a prior disable manifest would have).
+    set_selector_disabled(&sel, BankSet::Vm1, true);
+    assert!(sel.read().unwrap().disabled(BankSet::Vm1), "starts disabled");
+
+    // A normal flash through the same lifecycle.
+    b.start_flash().await.expect("flash session starts");
+    b.receive_package_stream(envelope_stream(detached_envelope()), None)
+        .await
+        .expect("normal manifest parked");
+    b.finalize_flash()
+        .await
+        .expect("finalize re-enables + activates");
+
+    assert!(
+        !sel.read().unwrap().disabled(BankSet::Vm1),
+        "finalize cleared the selector's disable bit (re-enabled)"
+    );
+    assert_eq!(deact.calls(), 0, "re-enable must not run the deactivator");
 }

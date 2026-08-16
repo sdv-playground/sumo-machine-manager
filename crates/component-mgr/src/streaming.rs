@@ -61,7 +61,8 @@ pub async fn process_envelope_stream(
         parse_envelope_header(&mut reader).await?;
 
     // Step 2: Validate using header-only envelope (no payload)
-    let validated = validate_header(manifest_provider, &header_bytes, min_security_ver, bank_set)?;
+    let mut validated =
+        validate_header(manifest_provider, &header_bytes, min_security_ver, bank_set)?;
 
     // HSM key manifests: small enough to buffer entirely, pass raw to HSM provider.
     if validated.manifest_type == ManifestType::HsmKeys {
@@ -87,8 +88,16 @@ pub async fn process_envelope_stream(
             .map_err(|e| BackendError::InvalidRequest(format!("manifest validation: {e}")));
     }
 
-    // If no payloads (CRL manifest), return early
+    // If no payloads (CRL or administrative-disable manifest), detect a
+    // `suit-directive-disable` from the header so the caller can enact it via
+    // the component's `Deactivator`, then return early. A genuine CRL/policy
+    // manifest carries no such directive → `disable_target` stays None → the
+    // caller no-ops exactly as before.
     if pending_payloads.is_empty() {
+        let envelope = sumo_codec::decode::decode_envelope(&header_bytes)
+            .map_err(|_| BackendError::Internal("failed to re-parse envelope header".into()))?;
+        let manifest = sumo_onboard::manifest::Manifest { envelope };
+        validated.disable_target = manifest.disable_target();
         return Ok(validated);
     }
 
@@ -267,6 +276,9 @@ pub async fn process_envelope_stream(
         streamed_files,
         // Carry the verified manifest's signing time through the streaming path.
         signing_time_secs: validated.signing_time_secs,
+        // This is the payload (firmware-install) return; a disable manifest has
+        // no payload and returns from the early branch above.
+        disable_target: None,
     })
 }
 

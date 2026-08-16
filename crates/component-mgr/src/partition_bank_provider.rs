@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nv_store::block::BlockDevice;
-use nv_store::types::Bank;
+use nv_store::types::{Bank, BankSet};
 
 use machine_mgr::bank_provider::{BankError, BankProvider, FirmwareIdentity, InstalledFirmware};
 use machine_mgr::ResetKind;
@@ -179,6 +179,12 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
     }
     fn rollback(&self) -> Result<(), BankError> {
         self.inner.rollback()
+    }
+    fn record_disabled(&self, set: BankSet, disabled: bool) -> Result<(), BankError> {
+        self.inner.record_disabled(set, disabled)
+    }
+    fn disabled(&self, set: BankSet) -> bool {
+        self.inner.disabled(set)
     }
     fn reset_kind(&self) -> ResetKind {
         // A raw partition takes effect only after the node reboots + the

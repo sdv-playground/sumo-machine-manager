@@ -119,7 +119,6 @@ pub const MAGIC_RUNTIME: u32 = 0x4E565231; // "NVR1"
 pub const MAGIC_APP: u32 = 0x4E564131; // "NVA1"
 pub const MAGIC_VEHICLE: u32 = 0x4E565631; // "NVV1"
 pub const MAGIC_UPDATE_SESSION: u32 = 0x4E565531; // "NVU1" (node update transaction)
-pub const MAGIC_ADMIN_STATE: u32 = 0x4E564431; // "NVD1" (per-component admin disable state)
 
 /// Trait for NV records that can be serialized to/from raw sector bytes.
 ///
@@ -796,77 +795,3 @@ impl NvRecord for NvUpdateSession {
     }
 }
 
-/// Per-component administrative state — the persisted "disabled" flag per bank
-/// set. Owned by the machine-manager layer: written by the SOVD
-/// `x-sumo-admin-state` op, read by the flash gate, the status read-back, and
-/// the VM start choke point. Survives reboot + OTA (lives outside bank dirs);
-/// wiped only by factory reset — factory state = all enabled, which is
-/// intended.
-///
-/// The default (absent record, torn write, bad CRC) is **all-enabled**:
-/// fail-open to enabled is deliberate — a torn write must never brick
-/// components off. A missed disable merely means the component runs until the
-/// operator re-issues the op; a phantom disable would silently take
-/// components down.
-///
-/// ```text
-/// [0..4]    magic (NVD1)
-/// [4..8]    write_seq
-/// [8..10]   disabled_mask (u16 bitmask over bank sets; bit i = BankSet(i))
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct NvAdminState {
-    pub write_seq: u32,
-    /// Bank sets that are administratively disabled (bit i ⇒ `BankSet(i)`).
-    /// Zero ⇒ everything enabled (the factory / default state).
-    pub disabled_mask: u16,
-}
-
-impl NvAdminState {
-    /// True when bank set `set` is administratively disabled.
-    pub fn is_disabled(&self, set: BankSet) -> bool {
-        self.disabled_mask & (1u16 << set.as_index()) != 0
-    }
-
-    /// Set or clear the disabled bit for bank set `set`.
-    pub fn set_disabled(&mut self, set: BankSet, disabled: bool) {
-        let bit = 1u16 << set.as_index();
-        if disabled {
-            self.disabled_mask |= bit;
-        } else {
-            self.disabled_mask &= !bit;
-        }
-    }
-}
-
-impl NvRecord for NvAdminState {
-    const MAGIC: u32 = MAGIC_ADMIN_STATE;
-
-    fn size() -> usize {
-        10
-    }
-
-    fn write_seq(&self) -> u32 {
-        self.write_seq
-    }
-
-    fn set_write_seq(&mut self, seq: u32) {
-        self.write_seq = seq;
-    }
-
-    fn serialize(&self, buf: &mut [u8]) {
-        put_u32_le(buf, 0, Self::MAGIC);
-        put_u32_le(buf, 4, self.write_seq);
-        put_u16_le(buf, 8, self.disabled_mask);
-    }
-
-    fn deserialize(buf: &[u8]) -> Option<Self> {
-        if buf.len() < Self::size() {
-            return None;
-        }
-        Some(Self {
-            write_seq: get_u32_le(buf, 4),
-            disabled_mask: get_u16_le(buf, 8),
-        })
-    }
-}

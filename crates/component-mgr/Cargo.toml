@@ -29,10 +29,10 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
-sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2" }
-sumo-processor = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2" }
-sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2" }
-sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2" }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
+sumo-processor = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
+sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 hsm = { path = "../hsm", features = ["crypto"] }
 # The software-HSM (SimHsm) CSR/IVD fallback in component_adapter.rs +
 # factory-init's `--hsm-keystore` bring-up (main.rs) — the sim/dev HSM mode.
@@ -56,7 +56,7 @@ rustls-pemfile = "2"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 hyper = "1"
-sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.2" }
+sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 coset = "0.3"
 ciborium = "0.2"
 tempfile = "3"

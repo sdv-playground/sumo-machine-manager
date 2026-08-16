@@ -29,12 +29,6 @@ pub mod layout {
     pub const UPDATE_SESSION_OFFSET: u64 = 0x008000;
     pub const UPDATE_SESSION_SECTORS: usize = 2;
 
-    // Per-component administrative state (the "disabled" bitmask). Header
-    // region, after UPDATE_SESSION (0xA000..0xC000), still below BANKSET_BASE
-    // (0xC000..0x10000 remains free headroom).
-    pub const ADMIN_STATE_OFFSET: u64 = 0x00A000;
-    pub const ADMIN_STATE_SECTORS: usize = 2;
-
     pub const BANKSET_BASE: u64 = 0x010000;
     pub const BANKSET_STRIDE: u64 = 0x018000; // 96 KB per bank set
 
@@ -289,30 +283,6 @@ impl<D: BlockDevice> NvStore<D> {
     pub fn clear_update_session(&mut self) -> Result<(), BlockError> {
         let mut s = NvUpdateSession::default();
         self.write_update_session(&mut s)
-    }
-
-    // --- Admin state (per-component administrative disable) ---
-
-    /// Read the per-component admin state. Absent or invalid (torn write, bad
-    /// CRC on every sector) ⇒ the default **all-enabled** record — fail-open
-    /// to enabled is correct here: a torn write must never brick components
-    /// off (see [`NvAdminState`]).
-    pub fn read_admin_state(&self) -> NvAdminState {
-        read_record(
-            &self.dev,
-            layout::ADMIN_STATE_OFFSET,
-            layout::ADMIN_STATE_SECTORS,
-        )
-        .unwrap_or_default()
-    }
-
-    pub fn write_admin_state(&mut self, state: &mut NvAdminState) -> Result<(), BlockError> {
-        write_record(
-            &mut self.dev,
-            layout::ADMIN_STATE_OFFSET,
-            layout::ADMIN_STATE_SECTORS,
-            state,
-        )
     }
 
     // --- FW Meta (per bank set, per bank) ---

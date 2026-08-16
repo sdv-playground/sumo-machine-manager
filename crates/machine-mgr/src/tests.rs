@@ -106,17 +106,6 @@ async fn component_defaults_return_not_supported() {
         Err(MachineError::NotSupported(_))
     ));
 
-    // Admin state — the default IS "cannot be disabled" (no deactivator);
-    // the SOVD op maps it to 400.
-    assert!(matches!(
-        c.set_admin_state(true).await,
-        Err(MachineError::NotSupported(_))
-    ));
-    assert!(matches!(
-        c.set_admin_state(false).await,
-        Err(MachineError::NotSupported(_))
-    ));
-
     // Activation — returns Ok(None), not NotSupported (component has no concept)
     assert!(matches!(c.activation_state().await, Ok(None)));
 

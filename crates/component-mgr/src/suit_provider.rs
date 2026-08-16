@@ -321,6 +321,9 @@ impl SuitProvider {
             // Signed lower bound on real time — the device ratchets its HSM
             // safe-time floor from this at install (see backend install path).
             signing_time_secs: manifest.signing_time(),
+            // Disable detection is done by `validate`/streaming after this
+            // shared extraction (both have the parsed manifest in hand).
+            disable_target: None,
         })
     }
 }
@@ -372,6 +375,13 @@ impl ManifestProvider for SuitProvider {
             validated.raw_envelope = Some(data.to_vec());
             return Ok(validated);
         }
+
+        // Administrative-disable manifest (a `suit-directive-disable` in the
+        // shared sequence, no firmware payload): flag the target component so
+        // the caller enacts it via the component's `Deactivator`. Ordinary
+        // firmware and genuine CRL/policy manifests carry no such directive →
+        // `None` → the no-payload branch below stays a plain no-op.
+        validated.disable_target = manifest.disable_target();
 
         // Determine update type from manifest command sequences
         let has_payload = manifest.has_firmware();
