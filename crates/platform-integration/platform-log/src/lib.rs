@@ -1374,7 +1374,11 @@ mod tests {
             ..Default::default()
         };
         let out = q.apply(vec![mk("a"), mk("b"), mk("c")]);
-        assert_eq!(out.len(), 3, "no-uptime file source must survive the window");
+        assert_eq!(
+            out.len(),
+            3,
+            "no-uptime file source must survive the window"
+        );
 
         // A monotonic (uptime-bearing) source still gets windowed.
         let mkm = |up: u64| LogRecord {

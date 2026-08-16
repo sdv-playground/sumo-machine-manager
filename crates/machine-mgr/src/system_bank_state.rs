@@ -636,7 +636,11 @@ mod tests {
         // selection is intact.
         let m2 = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
         assert!(m2.disabled(BankSet::Vm1), "disable survives reload");
-        assert_eq!(m2.active_bank(BankSet::Vm1), Some(Bank::A), "selection intact");
+        assert_eq!(
+            m2.active_bank(BankSet::Vm1),
+            Some(Bank::A),
+            "selection intact"
+        );
 
         // Visible through the read-only BootSelector view.
         let selector = BootSelector::new(Arc::new(RwLock::new(m)));
@@ -669,10 +673,16 @@ mod tests {
 
         let mut json = serde_json::to_value(&legacy).unwrap();
         json.as_object_mut().unwrap().remove("disabled");
-        assert!(json.get("disabled").is_none(), "legacy JSON has no disabled key");
+        assert!(
+            json.get("disabled").is_none(),
+            "legacy JSON has no disabled key"
+        );
 
         let parsed: SelectorBlob = serde_json::from_value(json).expect("legacy blob parses");
-        assert!(parsed.disabled.is_empty(), "missing key defaults to empty set");
+        assert!(
+            parsed.disabled.is_empty(),
+            "missing key defaults to empty set"
+        );
         assert_eq!(parsed, legacy, "legacy blob equals the empty-disabled blob");
         assert!(parsed.is_valid(&TestSigner), "legacy blob still verifies");
     }

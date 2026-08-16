@@ -1836,9 +1836,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         let enact = tokio::task::spawn_blocking(move || deactivator.deactivate()).await;
         let reboot_required = match enact {
             Ok(Ok(outcome)) => outcome.reboot_required,
-            Ok(Err(e)) => {
-                return Err(BackendError::Internal(format!("deactivation failed: {e}")))
-            }
+            Ok(Err(e)) => return Err(BackendError::Internal(format!("deactivation failed: {e}"))),
             Err(e) => {
                 return Err(BackendError::Internal(format!(
                     "deactivator task join error: {e}"

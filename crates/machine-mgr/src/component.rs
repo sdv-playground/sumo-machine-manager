@@ -3,8 +3,8 @@ use bytes::Bytes;
 
 use crate::error::{MachineError, MachineResult};
 use crate::types::{
-    Capabilities, Csr, DidFilter, DidKind, DtcFilter, EnvelopeStream, FlashId,
-    FlashSession, InstallSource, KeyInventory, RuntimeState,
+    Capabilities, Csr, DidFilter, DidKind, DtcFilter, EnvelopeStream, FlashId, FlashSession,
+    InstallSource, KeyInventory, RuntimeState,
 };
 use crate::{ActivationState, ClearFaultsResult, Fault, FlashStatus};
 use nv_store::types::BankSet;

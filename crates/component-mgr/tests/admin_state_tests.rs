@@ -503,7 +503,10 @@ async fn suit_disable_manifest_writes_selector_and_start_flash_admits_without_cl
         sel.read().unwrap().disabled(BankSet::Vm1),
         "start_flash no longer clears the disable bit — that moved to finalize"
     );
-    assert!(b.admin_disabled(), "still disabled until finalize re-enables");
+    assert!(
+        b.admin_disabled(),
+        "still disabled until finalize re-enables"
+    );
 }
 
 #[tokio::test]
@@ -527,7 +530,11 @@ async fn non_disable_no_payload_manifest_is_a_noop() {
         .await
         .expect("no-op manifest accepted");
     assert!(!id.is_empty());
-    assert_eq!(deact.calls(), 0, "no deactivate() for a non-disable manifest");
+    assert_eq!(
+        deact.calls(),
+        0,
+        "no deactivate() for a non-disable manifest"
+    );
 }
 
 #[tokio::test]
@@ -675,7 +682,10 @@ async fn campaign_disable_manifest_enacts_at_finalize() {
     )
     .with_deactivator(deact.clone());
 
-    assert!(!sel.read().unwrap().disabled(BankSet::Vm1), "starts enabled");
+    assert!(
+        !sel.read().unwrap().disabled(BankSet::Vm1),
+        "starts enabled"
+    );
 
     // start_flash → manifest upload parks the disable manifest (no payload).
     b.start_flash().await.expect("flash session starts");
@@ -689,7 +699,11 @@ async fn campaign_disable_manifest_enacts_at_finalize() {
         .expect("finalize enacts the disable; no reconcile error");
 
     // (a) the Deactivator ran; (b) the selector records the disable.
-    assert_eq!(deact.calls(), 1, "deactivate() ran exactly once at finalize");
+    assert_eq!(
+        deact.calls(),
+        1,
+        "deactivate() ran exactly once at finalize"
+    );
     assert!(
         sel.read().unwrap().disabled(BankSet::Vm1),
         "record_disabled(true) persisted in the signed selector"
@@ -729,7 +743,10 @@ async fn campaign_normal_flash_reenables_at_finalize() {
 
     // Pre-disable it (as a prior disable manifest would have).
     set_selector_disabled(&sel, BankSet::Vm1, true);
-    assert!(sel.read().unwrap().disabled(BankSet::Vm1), "starts disabled");
+    assert!(
+        sel.read().unwrap().disabled(BankSet::Vm1),
+        "starts disabled"
+    );
 
     // A normal flash through the same lifecycle.
     b.start_flash().await.expect("flash session starts");
