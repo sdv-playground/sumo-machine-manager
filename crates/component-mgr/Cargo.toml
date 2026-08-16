@@ -43,6 +43,9 @@ app-mgr = { path = "../app-mgr" }
 # Content-addressed fleet-repo pull (onboard/fleet PULL payload fetch).
 puller = { path = "../puller" }
 hex = "0.4.3"
+# Fresh v4 execution ids per node-verdict POST (replay-proof — the op id is no
+# longer reused as the execution id).
+uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 jsonwebtoken = "10"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }

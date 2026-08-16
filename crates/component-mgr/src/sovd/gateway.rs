@@ -11,10 +11,13 @@
 //! another entry in the SOVD entity map — federation falls out of the map.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
+use machine_mgr::node_update::NodeCoordinator;
 use machine_mgr::Machine;
+use nv_store::block::BlockDevice;
+use nv_store::store::NvStore;
 use sovd_api::{create_router, AppState, Authorizer};
 use sovd_core::DiagnosticBackend;
 
@@ -35,17 +38,19 @@ use crate::sovd::routes::{hsm_router, node_verdict_router, pull_update_router};
 /// the device's pinned manifest-signing key (verifies every fetched campaign
 /// dependency) — resolved once at gateway construction, since a guest gateway
 /// only starts on a provisioned device.
-pub fn gateway_router(
+pub fn gateway_router<D: BlockDevice + Send + 'static>(
     machine: Arc<dyn Machine>,
     backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
     authorizer: Arc<dyn Authorizer>,
     trust_anchor: Vec<u8>,
+    nv: Arc<Mutex<NvStore<D>>>,
+    coord: Arc<NodeCoordinator>,
 ) -> Router {
     let anchor: crate::sovd::pull_update::TrustAnchorSource =
         Arc::new(move || Some(trust_anchor.clone()));
     create_router(AppState::new(backends))
         .merge(hsm_router(machine.clone()))
-        .merge(node_verdict_router(machine.clone()))
+        .merge(node_verdict_router(machine.clone(), nv, coord))
         .merge(pull_update_router(machine, authorizer, anchor))
 }
 
@@ -57,7 +62,17 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use machine_mgr::{Capabilities, Component, EntityInfo, MachineRegistry};
+    use nv_store::block::MemBlockDevice;
+    use nv_store::store::MIN_NV_DEVICE_SIZE;
     use tower::ServiceExt;
+
+    /// A minimal idle NV store for gateway assembly — the verdict routes need an
+    /// `NvStore` handle, but this test exercises only the pull-update route.
+    fn test_nv() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
+        Arc::new(Mutex::new(NvStore::new(MemBlockDevice::new(
+            MIN_NV_DEVICE_SIZE as usize,
+        ))))
+    }
 
     use crate::sovd::authz::TieredAuthorizer;
 
@@ -105,6 +120,8 @@ mod tests {
             HashMap::new(),
             authorizer,
             b"anchor".to_vec(),
+            test_nv(),
+            Arc::new(NodeCoordinator::new(Vec::new())),
         );
 
         let resp = router

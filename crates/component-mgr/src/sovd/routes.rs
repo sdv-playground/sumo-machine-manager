@@ -14,7 +14,7 @@ use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use machine_mgr::node_update::{Durable, NodeCoordinator};
+use machine_mgr::node_update::{Durable, NodeCoordinator, NodePhase, NodeUpdateState};
 use machine_mgr::{Component, FlashId, FlashState, Machine, MachineError};
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
@@ -37,31 +37,7 @@ pub fn update_state_router<D: BlockDevice + Send + 'static>(
             let nv = nv.clone();
             let coord = coord.clone();
             async move {
-                let (durable, in_trial) = {
-                    let nv = nv.lock().expect("nv lock poisoned");
-                    let session = nv.read_update_session().unwrap_or_default();
-                    let reboot_owed: Vec<String> = (0..NUM_BANK_SETS)
-                        .filter(|&i| session.reboot_owed & (1u16 << i) != 0)
-                        .map(|i| coord.label(i))
-                        .collect();
-                    let in_trial: Vec<String> = nv
-                        .read_boot_state()
-                        .map(|s| {
-                            (0..NUM_BANK_SETS)
-                                .filter(|&i| !s.banks[i].committed)
-                                .map(|i| coord.label(i))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    (
-                        Durable {
-                            session_id: session.session_id,
-                            reboot_owed,
-                        },
-                        in_trial,
-                    )
-                };
-                let st = coord.node_update_state(&durable, &in_trial);
+                let st = derive_node_update_state(&nv, &coord);
                 Json(serde_json::json!({
                     "phase": st.phase.as_str(),
                     "components": st.components,
@@ -69,6 +45,42 @@ pub fn update_state_router<D: BlockDevice + Send + 'static>(
             }
         }),
     )
+}
+
+/// Derive the node's update-transaction state from NV + the coordinator's
+/// in-memory staging — the shared derivation behind both the
+/// `x-sumo-update-state` resource and the commit gate ([`handle_verdict`]).
+/// Translates the durable reboot-owed bitmask and per-bank `committed` flags
+/// into component labels, then folds in the coordinator's staging.
+fn derive_node_update_state<D: BlockDevice>(
+    nv: &Mutex<NvStore<D>>,
+    coord: &NodeCoordinator,
+) -> NodeUpdateState {
+    let (durable, in_trial) = {
+        let nv = nv.lock().expect("nv lock poisoned");
+        let session = nv.read_update_session().unwrap_or_default();
+        let reboot_owed: Vec<String> = (0..NUM_BANK_SETS)
+            .filter(|&i| session.reboot_owed & (1u16 << i) != 0)
+            .map(|i| coord.label(i))
+            .collect();
+        let in_trial: Vec<String> = nv
+            .read_boot_state()
+            .map(|s| {
+                (0..NUM_BANK_SETS)
+                    .filter(|&i| !s.banks[i].committed)
+                    .map(|i| coord.label(i))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (
+            Durable {
+                session_id: session.session_id,
+                reboot_owed,
+            },
+            in_trial,
+        )
+    };
+    coord.node_update_state(&durable, &in_trial)
 }
 
 /// Build the HSM component's SOVD vendor surface — the key-slot data resource
@@ -298,6 +310,29 @@ impl Verdict {
     }
 }
 
+/// Optional POST body for the node-verdict operations. The client MAY supply a
+/// `nonce` for replay-proofing — it is echoed verbatim in the execution record,
+/// so a caller can tell its own fresh POST from a transport-level replay of an
+/// earlier one. An absent body / non-JSON content type deserialises to `None`
+/// (old clients, unchanged wire).
+#[derive(serde::Deserialize)]
+struct VerdictRequest {
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
+/// A verdict operation execution with the optional client `nonce` echoed back.
+/// `#[serde(flatten)]` keeps the bare [`OperationExecution`] shape for old
+/// clients (no nonce ⇒ the field is skipped); a supplied nonce is appended
+/// verbatim as a top-level field.
+#[derive(serde::Serialize)]
+struct VerdictExecution {
+    #[serde(flatten)]
+    execution: OperationExecution,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nonce: Option<String>,
+}
+
 /// Outcome of fanning a verdict out across a node's components.
 struct VerdictOutcome {
     /// Components the verdict acted on (committed / rolled back).
@@ -359,7 +394,14 @@ async fn run_verdict(components: &[Arc<dyn Component>], verdict: Verdict) -> Ver
 }
 
 /// Render a [`VerdictOutcome`] as an ISO 17978-3 §7.14 operation execution.
-fn verdict_response(verdict: Verdict, out: VerdictOutcome) -> axum::response::Response {
+/// `execution_id` is freshly minted per POST (never the op id) and `nonce` is
+/// the client's echoed replay token.
+fn verdict_response(
+    verdict: Verdict,
+    execution_id: String,
+    nonce: Option<String>,
+    out: VerdictOutcome,
+) -> axum::response::Response {
     let failed = !out.errors.is_empty();
     let mut result = serde_json::Map::new();
     result.insert(
@@ -368,8 +410,8 @@ fn verdict_response(verdict: Verdict, out: VerdictOutcome) -> axum::response::Re
     );
     result.insert("skipped".to_string(), serde_json::json!(out.skipped));
     let now = chrono::Utc::now();
-    let body = OperationExecution {
-        execution_id: verdict.op_id().to_string(),
+    let execution = OperationExecution {
+        execution_id,
         operation_id: verdict.op_id().to_string(),
         status: if failed {
             OperationStatus::Failed
@@ -386,10 +428,58 @@ fn verdict_response(verdict: Verdict, out: VerdictOutcome) -> axum::response::Re
     } else {
         StatusCode::OK
     };
-    (code, Json(body)).into_response()
+    (code, Json(VerdictExecution { execution, nonce })).into_response()
 }
 
-async fn handle_verdict(machine: Arc<dyn Machine>, verdict: Verdict) -> axum::response::Response {
+/// The commit gate's refusal (HTTP 409): a commit was issued while the node
+/// still owes its activation reboot — the armed bank is not the running bank
+/// yet, and a trial that fell back to the recovery bank must not be committed
+/// (field-proven). Rendered as a failed execution so clients read the reason
+/// from the same shape as a normal verdict, with the `nonce` echoed.
+fn commit_reboot_pending(execution_id: String, nonce: Option<String>) -> axum::response::Response {
+    let now = chrono::Utc::now();
+    let execution = OperationExecution {
+        execution_id,
+        operation_id: Verdict::Commit.op_id().to_string(),
+        status: OperationStatus::Failed,
+        result: None,
+        error: Some(
+            "commit refused: a reboot is pending (armed bank not booted) — reset the ECU and let \
+             the trial run"
+                .to_string(),
+        ),
+        started_at: now,
+        completed_at: Some(now),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(VerdictExecution { execution, nonce }),
+    )
+        .into_response()
+}
+
+async fn handle_verdict<D: BlockDevice>(
+    machine: Arc<dyn Machine>,
+    nv: Arc<Mutex<NvStore<D>>>,
+    coord: Arc<NodeCoordinator>,
+    verdict: Verdict,
+    req: Option<VerdictRequest>,
+) -> axum::response::Response {
+    let nonce = req.and_then(|r| r.nonce);
+    let execution_id = uuid::Uuid::new_v4().to_string();
+
+    // Commit gate: refuse while the node still owes its activation reboot. In
+    // that phase the armed bank has not been booted (a trial boot can fall back
+    // to the recovery bank — selector/armed state ≠ running), so committing
+    // would lock in a bank the node never ran. `RebootPending` is derived from
+    // NV exactly like the `x-sumo-update-state` wire, and is always reachable.
+    // Rollback is the recovery path and is never gated here.
+    if let Verdict::Commit = verdict {
+        if derive_node_update_state(&nv, &coord).phase == NodePhase::RebootPending {
+            return commit_reboot_pending(execution_id, nonce);
+        }
+    }
+
     let out = run_verdict(machine.components(), verdict).await;
     let acted = out.acted.len();
     let skipped = out.skipped.len();
@@ -401,7 +491,7 @@ async fn handle_verdict(machine: Arc<dyn Machine>, verdict: Verdict) -> axum::re
         errors,
         "node-level verdict fanned out across the registry"
     );
-    verdict_response(verdict, out)
+    verdict_response(verdict, execution_id, nonce, out)
 }
 
 /// Build the node-level commit/rollback verdict routes.
@@ -419,21 +509,36 @@ async fn handle_verdict(machine: Arc<dyn Machine>, verdict: Verdict) -> axum::re
 /// to re-attach after the node reboot — membership is the NV-derived in-trial
 /// set, identical before and after the reboot. Vendor extensions live here in
 /// sumo-mm, not SOVDd (the three-layer rule, like `csr_router`).
-pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
-    let commit = machine.clone();
+pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
+    machine: Arc<dyn Machine>,
+    nv: Arc<Mutex<NvStore<D>>>,
+    coord: Arc<NodeCoordinator>,
+) -> Router {
+    let commit_machine = machine.clone();
+    let commit_nv = nv.clone();
+    let commit_coord = coord.clone();
     Router::new()
         .route(
             "/vehicle/v1/operations/x-sumo-commit-trials/executions",
-            post(move || {
-                let machine = commit.clone();
-                async move { handle_verdict(machine, Verdict::Commit).await }
+            post(move |req: Option<Json<VerdictRequest>>| {
+                let machine = commit_machine.clone();
+                let nv = commit_nv.clone();
+                let coord = commit_coord.clone();
+                async move {
+                    handle_verdict(machine, nv, coord, Verdict::Commit, req.map(|Json(r)| r)).await
+                }
             }),
         )
         .route(
             "/vehicle/v1/operations/x-sumo-rollback-trials/executions",
-            post(move || {
+            post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = machine.clone();
-                async move { handle_verdict(machine, Verdict::Rollback).await }
+                let nv = nv.clone();
+                let coord = coord.clone();
+                async move {
+                    handle_verdict(machine, nv, coord, Verdict::Rollback, req.map(|Json(r)| r))
+                        .await
+                }
             }),
         )
 }
@@ -449,9 +554,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::http::Request;
     use machine_mgr::{
-        ActivationState, Capabilities, FlashCaps, LifecycleCaps, MachineResult, ResetKind,
+        ActivationState, Capabilities, EntityInfo, FlashCaps, LifecycleCaps, MachineRegistry,
+        MachineResult, ResetKind,
     };
+    use nv_store::block::MemBlockDevice;
+    use nv_store::store::MIN_NV_DEVICE_SIZE;
+    use nv_store::types::{NvBootState, NvUpdateSession};
+    use tower::ServiceExt;
+
+    const COMMIT_URI: &str = "/vehicle/v1/operations/x-sumo-commit-trials/executions";
 
     /// Minimal `Component` whose `activation_state` is fixed at construction
     /// and which counts commit/rollback calls. Only `id` + `capabilities` are
@@ -526,6 +640,93 @@ mod tests {
             .collect()
     }
 
+    /// A `Machine` over the given stubs, for the router-level verdict tests.
+    fn machine_with(stubs: &[Arc<VerdictStub>]) -> Arc<dyn Machine> {
+        let mut builder = MachineRegistry::builder(EntityInfo {
+            id: "vehicle".into(),
+            name: "vehicle".into(),
+            entity_type: "vehicle".into(),
+            description: None,
+            href: "/vehicle/v1".into(),
+            status: None,
+        });
+        for s in stubs {
+            builder = builder.with_arc(s.clone() as Arc<dyn Component>);
+        }
+        Arc::new(builder.build())
+    }
+
+    /// An NV store seeded with `boot` + an optional update session.
+    fn nv_with(
+        mut boot: NvBootState,
+        session: Option<NvUpdateSession>,
+    ) -> Arc<Mutex<NvStore<MemBlockDevice>>> {
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        nv.write_boot_state(&mut boot).unwrap();
+        if let Some(mut s) = session {
+            nv.write_update_session(&mut s).unwrap();
+        }
+        Arc::new(Mutex::new(nv))
+    }
+
+    /// Idle: everything committed, no session (`x-sumo-update-state` = Idle).
+    fn nv_idle() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
+        nv_with(NvBootState::default(), None)
+    }
+
+    /// RebootPending: a node reboot is owed (bit 4, vm1) — armed, not yet booted.
+    fn nv_reboot_pending() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
+        nv_with(
+            NvBootState::default(),
+            Some(NvUpdateSession {
+                reboot_owed: 1 << 4,
+                ..Default::default()
+            }),
+        )
+    }
+
+    /// Trial: rebooted (no reboot owed) but vm1 (slot 4) is still uncommitted.
+    fn nv_trial() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
+        let mut boot = NvBootState::default();
+        boot.banks[4].committed = false;
+        nv_with(boot, None)
+    }
+
+    fn coord() -> Arc<NodeCoordinator> {
+        Arc::new(NodeCoordinator::new(Vec::new()))
+    }
+
+    /// A `POST` to `uri`, with a JSON `{"nonce": …}` body when `nonce` is set
+    /// and no body at all otherwise (the old-client shape).
+    fn post(uri: &str, nonce: Option<&str>) -> Request<Body> {
+        let builder = Request::builder().method("POST").uri(uri);
+        match nonce {
+            Some(n) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"nonce":"{n}"}}"#)))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The `execution_id` from one commit POST against an idle node.
+    async fn commit_execution_id() -> String {
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
+        let router = node_verdict_router(machine_with(&[stub]), nv_idle(), coord());
+        let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
+        body_json(resp).await["execution_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     #[tokio::test]
     async fn commits_only_in_trial_banked_components() {
         // A banked component in trial, a banked component already committed, a
@@ -572,5 +773,88 @@ mod tests {
         assert_eq!(out.acted, vec!["vm1".to_string()]);
         assert_eq!(in_trial.rollbacks.load(Ordering::SeqCst), 1);
         assert_eq!(in_trial.commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn commit_refused_while_reboot_pending() {
+        // The node owes an activation reboot: the armed bank hasn't been booted,
+        // so a commit must be refused (409) with the phase named — never acting
+        // on the component.
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&stub)),
+            nv_reboot_pending(),
+            coord(),
+        );
+
+        let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(stub.commits.load(Ordering::SeqCst), 0);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["error"],
+            "commit refused: a reboot is pending (armed bank not booted) — reset the ECU and let the trial run"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_proceeds_in_valid_trial() {
+        // Rebooted into the trial bank (no reboot owed): the gate lets the commit
+        // through and it acts on the in-trial component (existing behavior).
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&stub)),
+            nv_trial(),
+            coord(),
+        );
+
+        let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(stub.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(body_json(resp).await["result"]["committed"][0], "vm1");
+    }
+
+    #[tokio::test]
+    async fn commit_proceeds_when_idle() {
+        // An idle node (nothing in trial) commits as a no-op success — the gate
+        // only refuses RebootPending.
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
+        let router = node_verdict_router(machine_with(&[stub]), nv_idle(), coord());
+        let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn echoes_client_nonce_and_omits_when_absent() {
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
+
+        // A supplied nonce is echoed verbatim in the execution record.
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&stub)),
+            nv_idle(),
+            coord(),
+        );
+        let resp = router
+            .oneshot(post(COMMIT_URI, Some("abc-123")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["nonce"], "abc-123");
+
+        // No body ⇒ old-client shape: no `nonce` field.
+        let router = node_verdict_router(machine_with(&[stub]), nv_idle(), coord());
+        let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
+        assert!(body_json(resp).await.get("nonce").is_none());
+    }
+
+    #[tokio::test]
+    async fn mints_unique_execution_ids_per_post() {
+        let id1 = commit_execution_id().await;
+        let id2 = commit_execution_id().await;
+        // Fresh per POST, and never the (replayable) constant op id.
+        assert_ne!(id1, id2);
+        assert_ne!(id1, Verdict::Commit.op_id());
     }
 }

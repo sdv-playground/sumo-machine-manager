@@ -755,7 +755,16 @@ where
     tracing::info!(
         "vm-sovd GATEWAY: device={device_id}, host={host_url}, proxied={proxy_components:?}"
     );
-    component_mgr::sovd::gateway::gateway_router(machine, backends, authorizer, trust_anchor).merge(
-        component_mgr::sovd::routes::update_state_router(nv, node_coordinator),
+    component_mgr::sovd::gateway::gateway_router(
+        machine,
+        backends,
+        authorizer,
+        trust_anchor,
+        nv.clone(),
+        node_coordinator.clone(),
     )
+    .merge(component_mgr::sovd::routes::update_state_router(
+        nv,
+        node_coordinator,
+    ))
 }
