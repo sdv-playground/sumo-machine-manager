@@ -33,6 +33,7 @@
 //! Per-consumer variance is only the part→partition A/B path map ([`PartitionPart`],
 //! data). host/rt/bootloader each construct the provider with their own map.
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -68,27 +69,48 @@ impl PartitionPart {
     }
 }
 
-/// A `File` sink that forces its writes DURABLE to the device on `flush`
-/// (`sync_all` = fsync). The OTA streaming pipeline calls `flush()` once when the
-/// payload is fully written, so wrapping the device file in this guarantees the
-/// bytes are on the eMMC before seal hashes the partition back and before any
-/// post-flash reboot — a raw partition left with dirty pages wedges the node on
-/// reboot (the kernel flushes 133 MB on the way down). `BufWriter` calls this
-/// inner `flush` when the buffer drains, so a `BufWriter<SyncingWriter>` fsyncs on
-/// its terminal flush.
-struct SyncingWriter {
-    inner: std::fs::File,
+/// A sink whose terminal `flush` forces its accumulated writes DURABLE to the
+/// medium (`sync_all` = fsync). The OTA streaming pipeline calls `flush()` once
+/// when the payload is fully written, so wrapping the device file guarantees the
+/// bytes are on the eMMC before `seal` hashes the partition back, before the
+/// readback-verify, and before any post-flash reboot/reset — a raw partition left
+/// with dirty pages either wedges the node on reboot (the kernel flushes 133 MB
+/// on the way down) or, worse, is TRUNCATED when a post-"staged" node reset races
+/// the write-behind flush (observed twice on RDB3). `BufWriter` calls this inner
+/// `flush` when the buffer drains, so a `BufWriter<SyncingWriter>` fsyncs on its
+/// terminal flush.
+///
+/// The device is also opened `O_SYNC` (see [`open_payload_writer`]), so in
+/// production every write is already write-through and this `flush` is a
+/// belt-and-suspenders barrier. The [`DurableSink`] seam keeps the barrier
+/// unit-testable: production wraps a `std::fs::File` (fsync); a test double
+/// substitutes a recorder that observes the sync fires AFTER the last write.
+///
+/// [`open_payload_writer`]: PartitionBankProvider::open_payload_writer
+trait DurableSink: std::io::Write {
+    fn sync(&self) -> std::io::Result<()>;
+}
+
+impl DurableSink for std::fs::File {
+    fn sync(&self) -> std::io::Result<()> {
+        self.sync_all()
+    }
+}
+
+struct SyncingWriter<W: DurableSink> {
+    inner: W,
     path: String,
 }
 
-impl std::io::Write for SyncingWriter {
+impl<W: DurableSink> std::io::Write for SyncingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.inner.write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        // fsync the device — the whole point. sync_all (not just flush) forces
-        // dirty pages out to the eMMC so a subsequent reboot has nothing to drain.
-        self.inner.sync_all()?;
+        // fsync the device — the whole point. sync (not just a buffer drain)
+        // forces dirty pages out to the eMMC so a subsequent reboot/reset has
+        // nothing to drain and cannot truncate the just-written partition.
+        self.inner.sync()?;
         tracing::info!(device = %self.path, "partition bank: fsync'd device (payload durable)");
         Ok(())
     }
@@ -212,20 +234,27 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
             return self.inner.open_payload_writer(bank, name);
         };
         let device = part.device(bank);
+        // Open write-through (`O_SYNC`): each write reaches the eMMC before it
+        // returns, so there is NO write-behind cache for a post-flash node reset
+        // to race. Without it the 133 MB sits in the block driver's cache: seal's
+        // hash-back + the readback-verify read THROUGH that cache and PASS, but the
+        // bytes aren't durable — then either the post-flash reboot wedges the node
+        // flushing 133 MB on the way down, or (observed twice on RDB3) a node reset
+        // fired seconds after the "staged" ack truncates the partition mid-flush,
+        // leaving a bank the qnx6 mount rejects. Write-through also keeps the driver
+        // cache coherent with the medium, so the readback-verify reflects what
+        // actually landed. The old HostBankActivator ran `sync(1)` for this; the
+        // streaming redesign must not lose durability.
         let file = std::fs::OpenOptions::new()
             .write(true)
+            .custom_flags(libc::O_SYNC)
             .open(device)
             .map_err(|e| BankError::Failed(format!("open partition {device} for write: {e}")))?;
-        tracing::info!(part = %name, device = %device, ?bank, "partition bank: streaming payload straight to device");
+        tracing::info!(part = %name, device = %device, ?bank, "partition bank: streaming payload straight to device (O_SYNC)");
         // 4 MiB buffer — same rationale as IvdBankProvider (the eMMC write is the
         // #1 upload stage post decrypt/decompress speedups). Wrapped in a
-        // SyncingWriter so the pipeline's terminal `flush()` forces the dirty
-        // pages to the eMMC (fsync). WITHOUT this the 133 MB sits in the kernel
-        // page cache: seal's hash-back reads through the cache and PASSES, but the
-        // bytes aren't durable — then the post-flash `reboot` wedges the node
-        // flushing 133 MB of dirty pages on the way down (observed on the rig:
-        // froze, no reboot, needed a power cycle). The old HostBankActivator did
-        // `Command::new("sync")` for exactly this; the redesign must not lose it.
+        // SyncingWriter so the pipeline's terminal `flush()` fsyncs as a final
+        // barrier on top of O_SYNC.
         const WRITE_BUF: usize = 4 * 1024 * 1024;
         let sink = SyncingWriter {
             inner: file,
@@ -509,5 +538,98 @@ mod tests {
         // "ifs" is not mapped → inner opens images/os/bank_a/ifs
         let w = p.open_payload_writer(Bank::A, "ifs");
         assert!(w.is_ok(), "unmapped name should fall back, not error");
+    }
+
+    // A DurableSink double that records the order of writes vs the durability
+    // barrier (sync), so we can assert the fsync fires only AFTER the last byte is
+    // written — the property the post-flash node reset depends on. A sync that ran
+    // before the final write would leave dirty bytes for the reset to lose.
+    #[derive(Clone, Default)]
+    struct SyncLog(Arc<Mutex<Vec<&'static str>>>);
+    struct RecordingSink(SyncLog);
+    impl std::io::Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 .0.lock().unwrap().push("write");
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl DurableSink for RecordingSink {
+        fn sync(&self) -> std::io::Result<()> {
+            self.0 .0.lock().unwrap().push("sync");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn syncing_writer_syncs_after_all_writes() {
+        // Mirror production: BufWriter<SyncingWriter<_>>. The terminal flush must
+        // drain every buffered byte to the sink (`write`s) and THEN fsync (`sync`),
+        // with nothing written after the barrier.
+        let log = SyncLog::default();
+        let mut w = std::io::BufWriter::new(SyncingWriter {
+            inner: RecordingSink(log.clone()),
+            path: "test-device".into(),
+        });
+        w.write_all(b"first-chunk").unwrap();
+        w.write_all(b"second-chunk").unwrap();
+        w.flush().unwrap();
+
+        let events = log.0.lock().unwrap().clone();
+        let sync_pos = events
+            .iter()
+            .position(|e| *e == "sync")
+            .expect("durability barrier (sync) must fire");
+        assert_eq!(
+            sync_pos,
+            events.len() - 1,
+            "sync is the terminal op — nothing written after the barrier: {events:?}"
+        );
+        assert!(
+            events[..sync_pos].iter().all(|e| *e == "write"),
+            "every write precedes the sync: {events:?}"
+        );
+        assert!(
+            sync_pos >= 1,
+            "at least one write reached the sink before the sync"
+        );
+    }
+
+    #[test]
+    fn verify_payload_fails_on_truncated_partition() {
+        // Models the RDB3 failure: the streaming pipeline computed the hash of the
+        // FULL image, but a node reset raced the flush and only part of it landed
+        // on the medium. verify_payload re-hashes what is actually on the device
+        // and must reject it — so the staged/finalized ack fails loudly (both
+        // hashes in the error) instead of sealing a partition the post-reset boot
+        // can't mount.
+        let base = tmp("truncated");
+        let dev_a = base.join("bankA.img");
+        let full_image = vec![0xABu8; 4096];
+        let expected_full = {
+            use sha2::{Digest, Sha256};
+            let d: [u8; 32] = Sha256::digest(&full_image).into();
+            d
+        };
+        // Only the first 1 KiB actually landed (short/interrupted write).
+        std::fs::write(&dev_a, &full_image[..1024]).unwrap();
+        let parts = vec![PartitionPart {
+            file: "application.img".into(),
+            partition_a: dev_a.to_string_lossy().into(),
+            partition_b: base.join("bankB.img").to_string_lossy().into(),
+        }];
+        let p = build(base.join("images"), parts, "truncated");
+
+        match p.verify_payload(Bank::A, "application.img", &expected_full) {
+            Err(BankError::Unverifiable(msg)) => {
+                assert!(
+                    msg.contains(&hex::encode(expected_full)),
+                    "loud failure must carry the expected hash: {msg}"
+                );
+            }
+            other => panic!("truncated partition must fail verify, got {other:?}"),
+        }
     }
 }

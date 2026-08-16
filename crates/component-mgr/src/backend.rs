@@ -2283,6 +2283,23 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         .await?;
         let process_elapsed = process_started.elapsed();
 
+        // Durable readback-verify BEFORE this upload is acked: re-hash the bytes
+        // now on the medium and confirm they match what the streaming pipeline
+        // wrote. The sink is opened write-through (O_SYNC) and fsync'd on its
+        // terminal flush, so this readback reflects the eMMC — not a write-behind
+        // cache. A short/interrupted write (e.g. the node reset that raced the
+        // "staged" ack on the rig) is caught HERE as a staging failure, so we
+        // never seal + ack a partition the post-reset boot can't mount. Mirrors
+        // `verify_part`'s mapping: wrong bytes on disk = 4xx, read fault = 5xx.
+        self.bank_provider
+            .verify_payload(target_bank, &target_name, &image_hash)
+            .map_err(|e| match e {
+                machine_mgr::bank_provider::BankError::Unverifiable(_) => {
+                    BackendError::InvalidRequest(format!("staging verify {target_name}: {e}"))
+                }
+                _ => BackendError::Internal(format!("staging verify {target_name}: {e}")),
+            })?;
+
         // Record the freshly-hashed file for `ivd_sign_staged_bank` so
         // it doesn't need to re-walk + re-hash this payload from disk
         // when sealing the bank.

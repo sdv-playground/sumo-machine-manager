@@ -51,6 +51,9 @@ const-oid = { version = "0.9", features = ["db"] }
 der = { version = "0.7", features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+# O_SYNC (write-through) on the raw partition device — see
+# partition_bank_provider::open_payload_writer.
+libc = "0.2"
 
 [dev-dependencies]
 http-body-util = "0.1"
