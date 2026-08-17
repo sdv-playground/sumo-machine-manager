@@ -124,15 +124,12 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
         ),
     ];
     for (id, set, config) in components {
-        backends.insert(
-            id.to_string(),
-            Arc::new(ComponentBackend::new(
-                set,
-                nv.clone(),
-                manifest_provider.clone(),
-                config,
-            )),
-        );
+        // Thread the configured id like the factory does (`build_component` ->
+        // `with_id(spec.id)`), so the fixture exercises spec.id winning over the
+        // bank-set table — the invariant `os_component_wire_id_is_host` guards.
+        let backend = ComponentBackend::new(set, nv.clone(), manifest_provider.clone(), config)
+            .with_id(id.to_string());
+        backends.insert(id.to_string(), Arc::new(backend));
     }
 
     let state = sovd_api::AppState::new(backends);
@@ -321,6 +318,32 @@ async fn get_component_vm1() {
     assert!(!json["capabilities"]["sessions"].as_bool().unwrap());
     assert!(!json["capabilities"]["security"].as_bool().unwrap());
     assert!(json["capabilities"]["software_update"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn os_component_wire_id_is_host() {
+    // Regression guard for the host-os split-brain (field 2026-08-17): the OS
+    // component's wire id MUST be the configured spec.id ("host"), never the
+    // internal bank-set table's "host-os". The factory threads spec.id via
+    // `ComponentBackend::with_id` (mirrored in make_router); assert both wire
+    // surfaces the harness reaches — the registry listing and the entity body.
+    let (router, _, _) = make_router();
+
+    let (status, json) = get(&router, "/vehicle/v1/components").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"host"), "registry ids = {ids:?}");
+    assert!(!ids.contains(&"host-os"), "leaked bank-set id: {ids:?}");
+
+    // Entity body id — where the bank-set table used to override spec.id.
+    let (status, json) = get(&router, "/vehicle/v1/components/host").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["id"], "host");
 }
 
 // ============================================================
