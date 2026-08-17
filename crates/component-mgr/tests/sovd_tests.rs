@@ -100,7 +100,7 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
         (
-            "host-os",
+            "host",
             BankSet::Os,
             ComponentConfig {
                 entity_type: "host_os".into(),

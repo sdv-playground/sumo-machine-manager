@@ -569,6 +569,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         images_dir: Option<PathBuf>,
         hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
     ) -> Self {
+        // `name`/`desc` are the display defaults per bank set. `id` is only the
+        // FALLBACK id, used when the caller doesn't thread the configured
+        // component id via `with_id` (direct-constructor uses in tests). The
+        // factory always supplies `spec.id`, which then wins — so the registry
+        // key and the verdict/entity id share one source of truth.
         let (id, name, desc) = match bank_set {
             BankSet::Hsm => ("hsm", "HSM Key Store", "Hardware Security Module"),
             BankSet::Bootloader => ("bootloader", "Bootloader", "Reserved bootloader bank set"),
@@ -708,6 +713,21 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Override the component display name (shown in SOVD component listing).
     pub fn with_display_name(mut self, name: String) -> Self {
         self.entity_info.name = name;
+        self
+    }
+
+    /// Override the component id (and its self-`href`) with the configured
+    /// component id — the single source of truth. The factory threads
+    /// `spec.id` here so the SOVD registry key and the verdict / entity id
+    /// agree by construction (previously the id came only from the bank-set
+    /// table in `with_options`, which could diverge from the config id). An
+    /// empty id is a no-op: the bank-set table's legacy id stands, preserving
+    /// direct-constructor uses (tests) that don't thread one.
+    pub fn with_id(mut self, id: String) -> Self {
+        if !id.is_empty() {
+            self.entity_info.href = format!("/vehicle/v1/components/{id}");
+            self.entity_info.id = id;
+        }
         self
     }
 

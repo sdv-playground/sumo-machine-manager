@@ -292,7 +292,7 @@ async fn main() {
             None
         };
         (
-            read_display_name("host-os", BankSet::Os),
+            read_display_name("host", BankSet::Os),
             read_display_name("vm1", BankSet::Vm1),
             read_display_name("vm2", BankSet::Vm2),
         )
@@ -305,7 +305,7 @@ async fn main() {
     // (the factory would otherwise report the routing key).
     let specs: Vec<ComponentSpec> = vec![
         ComponentSpec {
-            id: "host-os".into(),
+            id: "host".into(),
             component_type: "hpc".into(),
             rollback: true,
             single_bank: false,
@@ -405,7 +405,7 @@ async fn main() {
     let mut bank_activators: HashMap<String, Arc<dyn machine_mgr::BankActivator>> = HashMap::new();
     if let Some(ref dev) = boot_device {
         bank_activators.insert(
-            "host-os".into(),
+            "host".into(),
             Arc::new(host_os_mgr::ifs::dev::DevBankActivator::new(
                 dev.clone(),
                 boot_mount.clone(),

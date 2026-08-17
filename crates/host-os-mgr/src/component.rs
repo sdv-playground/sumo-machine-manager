@@ -68,7 +68,7 @@ impl<D: BlockDevice + Send + 'static> HostOsComponent<D> {
 #[async_trait]
 impl<D: BlockDevice + Send + 'static> Component for HostOsComponent<D> {
     fn id(&self) -> &str {
-        "host-os"
+        "host"
     }
 
     fn capabilities(&self) -> &Capabilities {

@@ -429,6 +429,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 app_images_dir.clone(),
                 deps.hsm_provider.clone(),
             )
+            .with_id(spec.id.clone())
             .with_bank_spec(bank_spec.clone());
             // Inject a selector-aware provider LAST so the boot selector drives
             // active/target bank (NV/symlink fallback). App has no activator.
@@ -538,6 +539,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 images_dir.clone(),
                 deps.hsm_provider.clone(),
             )
+            .with_id(spec.id.clone())
             .with_bank_spec(bank_spec.clone());
 
             let activator = deps.bank_activators.get(&spec.id).cloned();
