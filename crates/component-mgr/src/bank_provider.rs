@@ -623,7 +623,28 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         if let Some(sel) = &self.selector {
             let mut g = sel.write().expect("selector poisoned");
             g.stage(self.bank_set, bank);
-            g.seal();
+            let wrote = g.seal();
+            // Boot-vector (selector PRIMARY) write is the load-bearing step that makes
+            // the just-activated bank the one the node boots. It was previously silent
+            // — a skipped/failed seal left the selector missing this component's slot,
+            // so on the next boot the VM/host defaulted to an empty bank and never
+            // launched (no way to tell from the log). Log EVERY seal with the outcome
+            // so a missing boot-vector write is diagnosable.
+            tracing::info!(
+                bank_set = ?self.bank_set,
+                bank = ?bank,
+                wrote,
+                generation = g.generation(),
+                is_trial = g.is_trial(),
+                "boot-vector write: sealed selector PRIMARY for the activated bank"
+            );
+        } else {
+            tracing::warn!(
+                bank_set = ?self.bank_set,
+                bank = ?bank,
+                "boot-vector NOT written — no selector wired to this provider (the activated \
+                 bank will not be reflected in the boot selector)"
+            );
         }
         Ok(self.reset_kind())
     }
