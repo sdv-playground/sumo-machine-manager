@@ -3,11 +3,13 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use nv_store::block::MemBlockDevice;
-use nv_store::selector::{InMemorySelectorStore, SelectorBlob, SelectorStore, TestSigner};
+use nv_store::selector::{
+    InMemorySelectorStore, SelectorBlob, SelectorStore, SlotSelect, TestSigner,
+};
 use nv_store::store::MIN_NV_DEVICE_SIZE;
 use nv_store::types::*;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::*;
 
@@ -531,13 +533,16 @@ fn make_bootmgr_with_selector() -> (BootManager<MemBlockDevice>, InMemorySelecto
     (mgr, store)
 }
 
-fn sel_map(entries: &[(BankSet, Bank)]) -> BTreeMap<BankSet, Bank> {
-    entries.iter().copied().collect()
+fn sel_map(entries: &[(BankSet, Bank)]) -> BTreeMap<BankSet, SlotSelect> {
+    entries
+        .iter()
+        .map(|&(set, bank)| (set, SlotSelect::enabled(bank)))
+        .collect()
 }
 
 /// Build a signed selector blob (via `TestSigner`) for `entries` at `gen`.
 fn signed_blob(gen: u64, entries: &[(BankSet, Bank)]) -> SelectorBlob {
-    SelectorBlob::signed(gen, sel_map(entries), BTreeSet::new(), &TestSigner)
+    SelectorBlob::signed(gen, sel_map(entries), &TestSigner)
 }
 
 /// Seed PRIMARY == SECONDARY at the given selection — the committed baseline
@@ -682,7 +687,7 @@ fn selector_global_rollback_after_max_trial_boots() {
     let primary = store.read_primary().unwrap();
     let secondary = store.read_secondary().unwrap();
     assert_eq!(primary.selectors, secondary.selectors);
-    assert_eq!(primary.selectors.get(&BankSet::Os), Some(&Bank::A));
+    assert_eq!(primary.selectors[&BankSet::Os].bank, Bank::A);
     // The copied PRIMARY verifies (it is the already-signed SECONDARY blob).
     assert!(primary.is_valid(&TestSigner));
     // The trialed set's boot_count was reset.

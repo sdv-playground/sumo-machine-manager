@@ -631,6 +631,8 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             // launched (no way to tell from the log). Log EVERY seal with the outcome
             // so a missing boot-vector write is diagnosable.
             tracing::info!(
+                slot = self.bank_set.as_index(),
+                label = %self.dir_name,
                 bank_set = ?self.bank_set,
                 bank = ?bank,
                 wrote,
@@ -640,6 +642,8 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             );
         } else {
             tracing::warn!(
+                slot = self.bank_set.as_index(),
+                label = %self.dir_name,
                 bank_set = ?self.bank_set,
                 bank = ?bank,
                 "boot-vector NOT written — no selector wired to this provider (the activated \

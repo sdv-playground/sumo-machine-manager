@@ -262,13 +262,17 @@ impl<D: BlockDevice> BootManager<D> {
         let mut trialed: Vec<(usize, Bank, Bank)> = Vec::new();
         let mut handled = [false; NUM_BANK_SETS];
 
-        for (set, &bank) in &primary.selectors {
+        for (set, sel) in &primary.selectors {
+            let bank = sel.bank;
             let idx = set.as_index();
             if idx >= NUM_BANK_SETS {
                 continue;
             }
             handled[idx] = true;
-            let floor = secondary.and_then(|s| s.selectors.get(set).copied());
+            // Trial is a BANK-selection difference; the per-slot enable bit is
+            // orthogonal (an idle disable must not look like a trial), so compare
+            // the floor's bank only.
+            let floor = secondary.and_then(|s| s.selectors.get(set).map(|s| s.bank));
 
             if floor == Some(bank) {
                 // Committed: PRIMARY == SECONDARY for this set.
@@ -429,8 +433,8 @@ impl<D: BlockDevice> BootManager<D> {
     pub fn active_bank(&self, set: BankSet) -> Option<Bank> {
         if let Some(selector) = self.selector.as_ref() {
             if let Some(primary) = selector.read_primary() {
-                if let Some(bank) = primary.selectors.get(&set).copied() {
-                    return Some(bank);
+                if let Some(sel) = primary.selectors.get(&set) {
+                    return Some(sel.bank);
                 }
             }
         }

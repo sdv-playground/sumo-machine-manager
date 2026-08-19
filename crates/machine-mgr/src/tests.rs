@@ -276,8 +276,8 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
     );
     let primary = store.read_primary().expect("PRIMARY written by the seed");
     assert_eq!(primary.generation, 1);
-    assert_eq!(primary.selectors.get(&BankSet::Vm1), Some(&Bank::B));
-    assert_eq!(primary.selectors.get(&BankSet::Vm2), Some(&Bank::A));
+    assert_eq!(primary.selectors[&BankSet::Vm1].bank, Bank::B);
+    assert_eq!(primary.selectors[&BankSet::Vm2].bank, Bank::A);
 
     // The seed commits too, so SECONDARY is written equal to PRIMARY — the
     // not-in-trial baseline (PRIMARY == SECONDARY).
