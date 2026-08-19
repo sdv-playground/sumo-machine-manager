@@ -623,7 +623,16 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         if let Some(sel) = &self.selector {
             let mut g = sel.write().expect("selector poisoned");
             g.stage(self.bank_set, bank);
-            let wrote = g.seal();
+            let wrote = g.seal().map_err(|e| {
+                BankError::Failed(format!(
+                    "persisting the boot selector for {bank:?} failed: {e}"
+                ))
+            })?;
+            if !wrote {
+                return Err(BankError::Failed(
+                    "boot selector seal unexpectedly had no staged activation".into(),
+                ));
+            }
             // Boot-vector (selector PRIMARY) write is the load-bearing step that makes
             // the just-activated bank the one the node boots. It was previously silent
             // — a skipped/failed seal left the selector missing this component's slot,
@@ -667,7 +676,12 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // Dual-write: promote the selector's PRIMARY to SECONDARY (rollback
         // floor) — see the GLOBAL-op caveat on `activate`.
         if let Some(sel) = &self.selector {
-            sel.write().expect("selector poisoned").commit();
+            sel.write()
+                .expect("selector poisoned")
+                .commit()
+                .map_err(|e| {
+                    BankError::Failed(format!("persisting committed boot selector failed: {e}"))
+                })?;
         }
         Ok(())
     }
@@ -685,7 +699,12 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // Dual-write: roll the selector's PRIMARY back to the committed floor
         // (SECONDARY) — see the GLOBAL-op caveat on `activate`.
         if let Some(sel) = &self.selector {
-            sel.write().expect("selector poisoned").rollback();
+            sel.write()
+                .expect("selector poisoned")
+                .rollback()
+                .map_err(|e| {
+                    BankError::Failed(format!("persisting rollback boot selector failed: {e}"))
+                })?;
         }
         Ok(())
     }
@@ -698,7 +717,10 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         if let Some(sel) = &self.selector {
             sel.write()
                 .expect("selector poisoned")
-                .stage_disabled(set, disabled);
+                .stage_disabled(set, disabled)
+                .map_err(|e| {
+                    BankError::Failed(format!("persisting component admin state failed: {e}"))
+                })?;
         }
         Ok(())
     }
@@ -782,7 +804,7 @@ mod tests {
         {
             let mut g = shared.write().unwrap();
             g.stage(set, bank);
-            assert!(g.seal());
+            assert!(g.seal().expect("persist selector"));
             assert_eq!(g.active_bank(set), Some(bank));
         }
         shared

@@ -548,8 +548,12 @@ fn signed_blob(gen: u64, entries: &[(BankSet, Bank)]) -> SelectorBlob {
 /// Seed PRIMARY == SECONDARY at the given selection — the committed baseline
 /// (mirrors `seed_selector`'s seal+commit).
 fn seed_committed(store: &InMemorySelectorStore, gen: u64, entries: &[(BankSet, Bank)]) {
-    store.write_primary(&signed_blob(gen, entries));
-    store.write_secondary(&signed_blob(gen, entries));
+    store
+        .write_primary(&signed_blob(gen, entries))
+        .expect("write primary selector");
+    store
+        .write_secondary(&signed_blob(gen, entries))
+        .expect("write secondary selector");
 }
 
 #[test]
@@ -595,8 +599,12 @@ fn selector_committed_does_not_touch_nv_count() {
 fn selector_trial_increments_boot_count() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // SECONDARY floor at host-os=A; PRIMARY booted at host-os=B → trial.
-    store.write_secondary(&signed_blob(1, &[(BankSet::Os, Bank::A)]));
-    store.write_primary(&signed_blob(2, &[(BankSet::Os, Bank::B)]));
+    store
+        .write_secondary(&signed_blob(1, &[(BankSet::Os, Bank::A)]))
+        .expect("write secondary selector");
+    store
+        .write_primary(&signed_blob(2, &[(BankSet::Os, Bank::B)]))
+        .expect("write primary selector");
 
     let os = BankSet::Os.as_index();
     let actions = mgr.process_boot().unwrap();
@@ -627,14 +635,18 @@ fn selector_trial_increments_boot_count() {
 fn selector_trial_and_committed_sets_are_independent() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // host-os in trial (A floor, B booted); vm1 committed (A == A).
-    store.write_secondary(&signed_blob(
-        1,
-        &[(BankSet::Os, Bank::A), (BankSet::Vm1, Bank::A)],
-    ));
-    store.write_primary(&signed_blob(
-        2,
-        &[(BankSet::Os, Bank::B), (BankSet::Vm1, Bank::A)],
-    ));
+    store
+        .write_secondary(&signed_blob(
+            1,
+            &[(BankSet::Os, Bank::A), (BankSet::Vm1, Bank::A)],
+        ))
+        .expect("write secondary selector");
+    store
+        .write_primary(&signed_blob(
+            2,
+            &[(BankSet::Os, Bank::B), (BankSet::Vm1, Bank::A)],
+        ))
+        .expect("write primary selector");
 
     let os = BankSet::Os.as_index();
     let vm1 = BankSet::Vm1.as_index();
@@ -657,8 +669,12 @@ fn selector_trial_and_committed_sets_are_independent() {
 fn selector_global_rollback_after_max_trial_boots() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // SECONDARY floor host-os=A; PRIMARY booted host-os=B → trial.
-    store.write_secondary(&signed_blob(1, &[(BankSet::Os, Bank::A)]));
-    store.write_primary(&signed_blob(2, &[(BankSet::Os, Bank::B)]));
+    store
+        .write_secondary(&signed_blob(1, &[(BankSet::Os, Bank::A)]))
+        .expect("write secondary selector");
+    store
+        .write_primary(&signed_blob(2, &[(BankSet::Os, Bank::B)]))
+        .expect("write primary selector");
 
     let os = BankSet::Os.as_index();
     // Boot MAX times — all trial.
@@ -713,8 +729,12 @@ fn selector_global_rollback_reverts_every_trialed_set_at_once() {
         (BankSet::Vm1, Bank::A),
         (BankSet::Vm2, Bank::B),
     ];
-    store.write_secondary(&signed_blob(1, &floor));
-    store.write_primary(&signed_blob(2, &booted));
+    store
+        .write_secondary(&signed_blob(1, &floor))
+        .expect("write secondary selector");
+    store
+        .write_primary(&signed_blob(2, &booted))
+        .expect("write primary selector");
 
     // Drive host-os to the brink (count == MAX) but leave vm2 lower, so the
     // NEXT boot trips host-os over the budget and the GLOBAL rollback reverts

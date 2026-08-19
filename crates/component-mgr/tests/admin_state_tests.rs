@@ -183,7 +183,7 @@ fn selector_for(set: BankSet) -> SharedSystemBankState {
     {
         let mut g = shared.write().unwrap();
         g.stage(set, Bank::A);
-        g.seal();
+        g.seal().expect("persist selector");
     }
     shared
 }
@@ -191,7 +191,10 @@ fn selector_for(set: BankSet) -> SharedSystemBankState {
 /// Set/clear `set`'s disable bit in the selector directly — the state a SUIT
 /// disable manifest (`record_disabled`) persists and `admin_disabled()` reads.
 fn set_selector_disabled(sel: &SharedSystemBankState, set: BankSet, disabled: bool) {
-    sel.write().unwrap().stage_disabled(set, disabled);
+    sel.write()
+        .unwrap()
+        .stage_disabled(set, disabled)
+        .expect("persist selector admin state");
 }
 
 /// A vm-style backend whose bank provider is wired to `selector`, so the

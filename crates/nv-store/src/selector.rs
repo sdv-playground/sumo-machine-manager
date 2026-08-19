@@ -188,9 +188,14 @@ mod hex_bytes {
 /// sector contract lands.
 pub trait SelectorStore: Send + Sync {
     fn read_primary(&self) -> Option<SelectorBlob>;
-    fn write_primary(&self, blob: &SelectorBlob);
+    /// Persist PRIMARY before the caller makes it the in-memory boot choice.
+    ///
+    /// A selector write is on the reboot-critical path.  Returning an error is
+    /// therefore essential: accepting an activation while only the in-memory
+    /// mirror changed can select an old bank after an immediate hardware reset.
+    fn write_primary(&self, blob: &SelectorBlob) -> std::io::Result<()>;
     fn read_secondary(&self) -> Option<SelectorBlob>;
-    fn write_secondary(&self, blob: &SelectorBlob);
+    fn write_secondary(&self, blob: &SelectorBlob) -> std::io::Result<()>;
 }
 
 /// The attestation seam: sign / verify the selector digest. The production impl
@@ -221,10 +226,11 @@ impl SelectorStore for StubSelectorStore {
         );
         None
     }
-    fn write_primary(&self, _blob: &SelectorBlob) {
+    fn write_primary(&self, _blob: &SelectorBlob) -> std::io::Result<()> {
         tracing::warn!(
             "TODO(bootloader): SystemBankState sector I/O unimplemented — selector partition layout pending bootloader support"
         );
+        Ok(())
     }
     fn read_secondary(&self) -> Option<SelectorBlob> {
         tracing::warn!(
@@ -232,10 +238,11 @@ impl SelectorStore for StubSelectorStore {
         );
         None
     }
-    fn write_secondary(&self, _blob: &SelectorBlob) {
+    fn write_secondary(&self, _blob: &SelectorBlob) -> std::io::Result<()> {
         tracing::warn!(
             "TODO(bootloader): SystemBankState sector I/O unimplemented — selector partition layout pending bootloader support"
         );
+        Ok(())
     }
 }
 
@@ -289,14 +296,16 @@ impl SelectorStore for InMemorySelectorStore {
     fn read_primary(&self) -> Option<SelectorBlob> {
         self.primary.lock().expect("primary poisoned").clone()
     }
-    fn write_primary(&self, blob: &SelectorBlob) {
+    fn write_primary(&self, blob: &SelectorBlob) -> std::io::Result<()> {
         *self.primary.lock().expect("primary poisoned") = Some(blob.clone());
+        Ok(())
     }
     fn read_secondary(&self) -> Option<SelectorBlob> {
         self.secondary.lock().expect("secondary poisoned").clone()
     }
-    fn write_secondary(&self, blob: &SelectorBlob) {
+    fn write_secondary(&self, blob: &SelectorBlob) -> std::io::Result<()> {
         *self.secondary.lock().expect("secondary poisoned") = Some(blob.clone());
+        Ok(())
     }
 }
 
@@ -366,30 +375,23 @@ impl FileSelectorStore {
         }
     }
 
-    /// Atomically write a slot: serialize into `<name>.tmp`, then rename over
-    /// `<name>`. Errors warn and are swallowed (the in-memory state in
-    /// `SystemBankManager` is the live view; the file is the shadow).
-    fn write_slot(&self, name: &str, blob: &SelectorBlob) {
-        if let Err(e) = std::fs::create_dir_all(&self.dir) {
-            tracing::warn!(dir = ?self.dir, error = %e, "selector dir create failed");
-            return;
-        }
+    /// Atomically and durably write a slot: serialize into `<name>.tmp`, flush
+    /// it, rename over `<name>`, then flush the renamed file.  A CVC hardware
+    /// reboot can follow the second component activation immediately; without
+    /// the flush the first selector write could survive while the later VM2
+    /// selection was still only in cache.
+    fn write_slot(&self, name: &str, blob: &SelectorBlob) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
         let final_path = self.dir.join(name);
         let tmp_path = self.dir.join(format!("{name}.tmp"));
-        let file = match std::fs::File::create(&tmp_path) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(path = ?tmp_path, error = %e, "selector tmp create failed");
-                return;
-            }
-        };
-        if let Err(e) = serde_json::to_writer_pretty(file, blob) {
-            tracing::warn!(path = ?tmp_path, error = %e, "selector serialize failed");
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
-            tracing::warn!(from = ?tmp_path, to = ?final_path, error = %e, "selector rename failed");
-        }
+        let file = std::fs::File::create(&tmp_path)?;
+        serde_json::to_writer_pretty(&file, blob)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, &final_path)?;
+        // Re-open after rename so QNX flushes both the content and metadata of
+        // the name the next boot will read.
+        std::fs::File::open(&final_path)?.sync_all()
     }
 }
 
@@ -397,13 +399,13 @@ impl SelectorStore for FileSelectorStore {
     fn read_primary(&self) -> Option<SelectorBlob> {
         self.read_slot("primary")
     }
-    fn write_primary(&self, blob: &SelectorBlob) {
-        self.write_slot("primary", blob);
+    fn write_primary(&self, blob: &SelectorBlob) -> std::io::Result<()> {
+        self.write_slot("primary", blob)
     }
     fn read_secondary(&self) -> Option<SelectorBlob> {
         self.read_slot("secondary")
     }
-    fn write_secondary(&self, blob: &SelectorBlob) {
-        self.write_slot("secondary", blob);
+    fn write_secondary(&self, blob: &SelectorBlob) -> std::io::Result<()> {
+        self.write_slot("secondary", blob)
     }
 }
