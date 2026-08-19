@@ -13,3 +13,9 @@ path = "src/main.rs"
 # The slog2 DYNAMIC live-follow FFI (drain_live) + the seal-line/stamp contract
 # (rfc3339_utc, DrainRecord). Links libslog2parse transitively on nto.
 platform-log = { path = "../platform-log" }
+
+# Unix: sigwait-based SIGTERM/SIGINT seal-on-shutdown (flush the RAM live file to a
+# disk segment before a reboot wipes /dev/shmem). All-unix so the host build also
+# compiles + exercises the signal path (drain_live itself is the nto-only part).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

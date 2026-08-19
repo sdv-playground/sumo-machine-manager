@@ -305,7 +305,7 @@ fn main() {
             .collect(),
     };
 
-    let mut seg = match Segmenter::new(
+    let seg = match Segmenter::new(
         live_dir.clone(),
         sealed_dir.clone(),
         stem.clone(),
@@ -325,13 +325,90 @@ fn main() {
         seg.next_seq, policy.floor_rank, policy.deny_prefixes
     );
 
-    // BLOCKS forever on QNX (the DYNAMIC ring stream never ends); a no-op that
-    // returns immediately off-nto (so the bin builds + exits cleanly on Linux).
-    platform_log::drain_live(|rec| {
-        if let Err(e) = seg.write(&rec, &policy) {
-            eprintln!("slog2-drainer: write failed: {e}");
+    // SEAL-ON-SHUTDOWN. The live file lives in /dev/shmem (RAM) — a reboot wipes it,
+    // and hop-2 sealing only fires at the size ceiling, so a small pre-reboot burst
+    // (e.g. an OTA flash's finalize/`boot-vector write` lines) is normally LOST on
+    // reboot. supernova's reboot path SIGTERMs us (with a bounded grace) BEFORE the
+    // kernel reset so we can flush the live file to a durable disk segment first.
+    //
+    // Pattern (mirrors vhsm-ssd's signal path): BLOCK SIGTERM/SIGINT in the main
+    // thread, then a dedicated waiter thread `sigwait`s them. `sigwait` returns in
+    // NORMAL thread context (NOT a signal handler), so the seal — which does file
+    // I/O — runs directly, with no async-signal-safety constraints and no atomic
+    // dance. The FFI drain runs on this (main) thread; the waiter seals + exits the
+    // process on the signal.
+    let seg = std::sync::Arc::new(std::sync::Mutex::new(seg));
+
+    #[cfg(unix)]
+    {
+        block_term_int_in_main_thread();
+        let seg = std::sync::Arc::clone(&seg);
+        std::thread::Builder::new()
+            .name("drain-seal-on-term".into())
+            .spawn(move || {
+                let sig = wait_for_term_int();
+                // Flush the RAM live file → a durable disk segment before exit, so
+                // the pre-reboot window survives (the reboot wipes /dev/shmem).
+                match seg.lock().map(|mut s| s.seal_and_rotate()) {
+                    Ok(Ok(())) => {
+                        eprintln!("slog2-drainer: sealed live file on signal {sig} — exiting")
+                    }
+                    Ok(Err(e)) => eprintln!("slog2-drainer: shutdown seal failed: {e}"),
+                    Err(_) => eprintln!("slog2-drainer: segmenter lock poisoned at shutdown"),
+                }
+                std::process::exit(0);
+            })
+            .ok();
+    }
+
+    // BLOCKS forever on QNX (the DYNAMIC ring stream never ends); the seal-on-term
+    // thread exits the process on SIGTERM. A no-op that returns immediately off-nto
+    // (so the bin builds + exits cleanly on Linux).
+    platform_log::drain_live(move |rec| {
+        if let Ok(mut s) = seg.lock() {
+            if let Err(e) = s.write(&rec, &policy) {
+                eprintln!("slog2-drainer: write failed: {e}");
+            }
         }
     });
+}
+
+/// The SIGTERM+SIGINT set — one place so block + wait use a byte-identical set.
+#[cfg(unix)]
+fn term_int_set() -> libc::sigset_t {
+    // SAFETY: a zeroed sigset_t is a valid (empty) set on Linux/QNX; sigemptyset +
+    // sigaddset then populate it per the libc contract.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        set
+    }
+}
+
+/// Block SIGTERM/SIGINT in the current (main) thread so the waiter thread can
+/// `sigwait` them (the block is inherited by later-spawned threads). Mirrors
+/// vhsm-ssd's proven-on-QNX signal path.
+#[cfg(unix)]
+fn block_term_int_in_main_thread() {
+    let set = term_int_set();
+    // SAFETY: a standard POSIX sigmask call with a valid set pointer.
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Block until SIGTERM/SIGINT, returning the signal number. `sigwait` returns
+/// OUTSIDE handler context, so the caller may run arbitrary code (the seal) after.
+/// A nonzero return (e.g. EINTR) → wait again rather than return spuriously.
+#[cfg(unix)]
+fn wait_for_term_int() -> libc::c_int {
+    let set = term_int_set();
+    let mut sig: libc::c_int = 0;
+    // SAFETY: `set` and `sig` are valid, suitably-aligned locals.
+    while unsafe { libc::sigwait(&set, &mut sig) } != 0 {}
+    sig
 }
 
 #[cfg(test)]

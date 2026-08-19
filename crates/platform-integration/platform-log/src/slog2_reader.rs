@@ -270,7 +270,8 @@ const SLOG2_PARSE_FLAGS_DYNAMIC: u32 = 0x1;
 
 /// Per-packet callback for the DYNAMIC drain: map an ASCII packet to a
 /// [`DrainRecord`] and hand it to the sink. `param` is a `&mut &mut dyn FnMut`.
-/// Returns 0 to keep streaming forever (the drain never asks to stop).
+/// Returns 0 to keep streaming forever (the drainer stops via a signal that exits
+/// the process from its seal-on-term thread, not by unwinding this walk).
 extern "C" fn on_drain_packet(
     info: *mut PacketInfo,
     payload: *mut c_void,

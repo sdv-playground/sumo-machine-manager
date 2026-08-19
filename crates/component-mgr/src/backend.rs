@@ -986,8 +986,9 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
     /// Equip this component with its administrative-disable enactment
     /// (`Deactivator`) — which is what MAKES it disableable (see the field
-    /// docs). Also flips `capabilities.operations` on, since the component
-    /// now advertises the `x-sumo-admin-state` op in `list_operations`.
+    /// docs). Disable is now driven by a signed SUIT *disable* manifest (the
+    /// selector's `disabled` set is the authority — see `enact_disable_manifest`
+    /// / `admin_disabled`), NOT the retired `x-sumo-admin-state` operation.
     /// Threaded from `FactoryDeps::deactivators` / built by component-factory.
     pub fn with_deactivator(mut self, deactivator: Arc<dyn machine_mgr::Deactivator>) -> Self {
         self.deactivator = Some(deactivator);
