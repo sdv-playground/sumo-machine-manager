@@ -366,9 +366,17 @@ impl FileSelectorStore {
         }
     }
 
-    /// Atomically write a slot: serialize into `<name>.tmp`, then rename over
-    /// `<name>`. Errors warn and are swallowed (the in-memory state in
-    /// `SystemBankManager` is the live view; the file is the shadow).
+    /// Atomically + durably write a slot: serialize into `<name>.tmp`, **fsync
+    /// it**, rename over `<name>`, then fsync the renamed file. Errors warn and
+    /// are swallowed (the in-memory state in `SystemBankManager` is the live
+    /// view; the file is the shadow).
+    ///
+    /// The fsyncs matter because a CVC hardware reboot can follow a bank
+    /// activation IMMEDIATELY, and `sysmgr_reboot` is kernel-direct — without
+    /// the flush a just-sealed selection could sit only in the block cache and
+    /// be lost across the reset, so the next boot reads the STALE (pre-seal)
+    /// slot. (`reboot_now` also `sync()`s globally, but flushing here makes each
+    /// write durable on its own, independent of that path.)
     fn write_slot(&self, name: &str, blob: &SelectorBlob) {
         if let Err(e) = std::fs::create_dir_all(&self.dir) {
             tracing::warn!(dir = ?self.dir, error = %e, "selector dir create failed");
@@ -383,12 +391,31 @@ impl FileSelectorStore {
                 return;
             }
         };
-        if let Err(e) = serde_json::to_writer_pretty(file, blob) {
+        if let Err(e) = serde_json::to_writer_pretty(&file, blob) {
             tracing::warn!(path = ?tmp_path, error = %e, "selector serialize failed");
+            return;
+        }
+        // Flush the payload to disk BEFORE the rename — the rename is only
+        // atomic for ordering, not durability.
+        if let Err(e) = file.sync_all() {
+            tracing::warn!(path = ?tmp_path, error = %e, "selector tmp fsync failed");
             return;
         }
         if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
             tracing::warn!(from = ?tmp_path, to = ?final_path, error = %e, "selector rename failed");
+            return;
+        }
+        // Re-open + fsync the renamed file so the directory entry the next boot
+        // reads is itself durable, not just the tmp payload.
+        match std::fs::File::open(&final_path) {
+            Ok(f) => {
+                if let Err(e) = f.sync_all() {
+                    tracing::warn!(path = ?final_path, error = %e, "selector final fsync failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path = ?final_path, error = %e, "selector reopen-for-fsync failed");
+            }
         }
     }
 }

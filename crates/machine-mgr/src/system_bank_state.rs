@@ -66,6 +66,27 @@ pub use nv_store::selector::{
 #[cfg(any(test, feature = "test-seams"))]
 pub use nv_store::selector::{InMemorySelectorStore, TestSigner};
 
+/// Compact one-line render of a selector map for logs, e.g.
+/// `{0:A+ 2:B+ 4:B-}` where `+`/`-` is enabled/disabled. Slot order is
+/// ascending `BankSet`. Keeps the mutation logs greppable + diffable across
+/// boots so a lost/reverted slot is obvious at a glance.
+fn render_slots(m: &BTreeMap<BankSet, SlotSelect>) -> String {
+    let mut s = String::from("{");
+    for (i, (set, sel)) in m.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(&format!(
+            "{}:{:?}{}",
+            set.as_index(),
+            sel.bank,
+            if sel.enabled { '+' } else { '-' }
+        ));
+    }
+    s.push('}');
+    s
+}
+
 // ---------------------------------------------------------------------------
 // The manager
 // ---------------------------------------------------------------------------
@@ -170,6 +191,12 @@ impl SystemBankManager {
         self.store.write_primary(&blob);
         self.current = pending;
         self.generation = gen;
+        tracing::info!(
+            op = "seal",
+            generation = gen,
+            slots = %render_slots(&self.current),
+            "boot-selector SEAL → PRIMARY (new booted selection)"
+        );
         true
     }
 
@@ -203,6 +230,14 @@ impl SystemBankManager {
         }
         let blob = SelectorBlob::signed(self.generation, self.current.clone(), &*self.signer);
         self.store.write_primary(&blob);
+        tracing::info!(
+            op = "stage_disabled",
+            set = set.as_index(),
+            disabled,
+            generation = self.generation,
+            slots = %render_slots(&self.current),
+            "boot-selector STAGE_DISABLED → PRIMARY re-signed (enable bit flip)"
+        );
     }
 
     /// Promote the booted (PRIMARY) selection to the rollback floor (SECONDARY)
@@ -213,6 +248,12 @@ impl SystemBankManager {
         self.store.write_secondary(&blob);
         self.committed = self.current.clone();
         self.committed_generation = self.generation;
+        tracing::info!(
+            op = "commit",
+            generation = self.generation,
+            slots = %render_slots(&self.committed),
+            "boot-selector COMMIT → SECONDARY (PRIMARY copied to rollback floor)"
+        );
     }
 
     /// Roll the booted (PRIMARY) selection back to the committed floor
@@ -230,6 +271,16 @@ impl SystemBankManager {
             &*self.signer,
         );
         self.store.write_primary(&blob);
+        // WARN, not info: a rollback DISCARDS the trial (overwrites PRIMARY with
+        // the SECONDARY floor). If a freshly-sealed VM slot vanishes across a
+        // reboot, THIS line firing is the smoking gun (active revert); its
+        // ABSENCE means the loss was cache/durability, not a rollback.
+        tracing::warn!(
+            op = "rollback",
+            generation = self.committed_generation,
+            slots = %render_slots(&self.committed),
+            "boot-selector ROLLBACK → PRIMARY overwritten with SECONDARY floor (trial discarded)"
+        );
         self.current = self.committed.clone();
         self.generation = self.committed_generation;
         self.pending = None;
