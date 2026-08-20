@@ -132,8 +132,9 @@ impl MachineRegistry {
             // exist and are equal — the not-in-trial baseline (PRIMARY ==
             // SECONDARY). A real trial (the two diverging) only arises later
             // from an OTA stage/seal, not from this mirror seed.
-            sb.seal();
-            sb.commit();
+            if let Err(e) = sb.seal().and_then(|_| sb.commit()) {
+                tracing::error!(error = %e, "failed to persist seeded boot selector");
+            }
         }
     }
 }

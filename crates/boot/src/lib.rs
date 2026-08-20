@@ -83,6 +83,7 @@ pub enum HashCheck {
 #[derive(Debug)]
 pub enum BootError {
     Nv(nv_store::block::BlockError),
+    Selector(std::io::Error),
 }
 
 impl From<nv_store::block::BlockError> for BootError {
@@ -95,6 +96,7 @@ impl std::fmt::Display for BootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BootError::Nv(e) => write!(f, "NV store error: {e}"),
+            BootError::Selector(e) => write!(f, "boot selector error: {e}"),
         }
     }
 }
@@ -312,7 +314,8 @@ impl<D: BlockDevice> BootManager<D> {
             self.selector
                 .as_ref()
                 .expect("selector present in this path")
-                .write_primary(secondary);
+                .write_primary(secondary)
+                .map_err(BootError::Selector)?;
             for &(idx, from, to) in &trialed {
                 state.banks[idx].boot_count = 0;
                 actions[idx] = BootAction::AutoRollback { from, to };
