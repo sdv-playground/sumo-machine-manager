@@ -1,0 +1,708 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "sumo-machine-manager SOVD — vendor extensions (x-sumo-*)",
+    "description": "OpenAPI 3.1 description of the sumo VENDOR EXTENSION surface (the `x-sumo-*` operations) exposed by the sumo-machine-manager SOVD servers. Every operation here is a vendor extension per the ISO 17978-1 extension rules — none is part of the ISO 17978-3 base surface, which this document deliberately does NOT annotate. For the ISO 17978-3 surface see the standard's own OpenAPI artifact (ISO 17978-3 ed.1 `openapi-specification-1.1.0-rc1.zip`, https://standards.iso.org/iso/17978/-3/ed-1/en/) and the sumo conformance file `docs/sovd_iso17978_spec.yaml` in the sumo-workspace (the 42/57 baseline). Auth: only `x-sumo-pull-update` (POST) requires a bearer token (an Operational `update:execute` JWT bound to the device); the dev/sim `vm-sovd` binary defaults to open auth, so the requirement is advisory there.",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/vehicle/v1/components/hsm/data/keys": {
+      "get": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "`GET …/hsm/data/keys` — the key-slot inventory (public metadata only).",
+        "operationId": "hsm_keys_list",
+        "responses": {
+          "200": {
+            "description": "The HSM key-slot inventory (public metadata only; never key material).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HsmKeysResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No HSM component, or the HSM keys are unavailable.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vehicle/v1/components/hsm/operations/x-sumo-csr/executions": {
+      "post": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "`POST …/hsm/operations/x-sumo-csr/executions` — sign a PKCS#10 CSR for the\nrequested slot and return it (DER, base64) in an operation execution.",
+        "operationId": "hsm_csr_execute",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CsrRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "CSR generated; returned in an ISO 17978-3 §7.14 operation execution whose `result` is a CsrResult.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationExecution"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Policy rejected CSR generation for this slot (failed execution).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationExecution"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No HSM component, or CSR not configured.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vehicle/v1/components/{component_id}/updates/{update_id}/x-sumo-commit": {
+      "put": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).",
+        "operationId": "x_sumo_commit",
+        "parameters": [
+          {
+            "name": "component_id",
+            "in": "path",
+            "description": "Target component.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "update_id",
+            "in": "path",
+            "description": "The /updates entry; must be paused at execute/awaiting-verdict.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Commit verdict posted; poll .../status.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "URL of the update status resource."
+              }
+            }
+          },
+          "409": {
+            "description": "The update is not paused at awaiting-verdict."
+          }
+        }
+      }
+    },
+    "/vehicle/v1/components/{component_id}/updates/{update_id}/x-sumo-rollback": {
+      "put": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).",
+        "operationId": "x_sumo_rollback",
+        "parameters": [
+          {
+            "name": "component_id",
+            "in": "path",
+            "description": "Target component.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "update_id",
+            "in": "path",
+            "description": "The /updates entry; must be paused at execute/awaiting-verdict.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Rollback verdict posted; poll .../status.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "URL of the update status resource."
+              }
+            }
+          },
+          "409": {
+            "description": "The update is not paused at awaiting-verdict."
+          }
+        }
+      }
+    },
+    "/vehicle/v1/components/{component_id}/x-sumo-force-rollback": {
+      "put": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).",
+        "operationId": "x_sumo_force_rollback",
+        "parameters": [
+          {
+            "name": "component_id",
+            "in": "path",
+            "description": "Target component.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Backend trial state cleared unconditionally (idempotent)."
+          }
+        }
+      }
+    },
+    "/vehicle/v1/data/x-sumo-update-state": {
+      "get": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "`GET /vehicle/v1/data/x-sumo-update-state` — the handler behind\n[`update_state_router`].",
+        "operationId": "update_state",
+        "responses": {
+          "200": {
+            "description": "The node's update-transaction phase and the components it covers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStateResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vehicle/v1/operations/x-sumo-commit-trials/executions": {
+      "post": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "Build the node-level commit/rollback verdict routes.",
+        "description": "Wire (ISO 17978-3 §7.14 operation executions, at the **entity root**):\n\n  `POST /vehicle/v1/operations/x-sumo-commit-trials/executions`\n  `POST /vehicle/v1/operations/x-sumo-rollback-trials/executions`\n\nThe orchestrator issues ONE verdict per node per campaign step — the update\n*session* is the commit unit, never a single component. Entity-root\naddressing (no `{id}` segment) keeps these clear of the dynamic\n`/components/{id}/operations/{op_id}/...` routes (mirrors the entity-root\n`factory-reset` op) and means there is no per-component `/updates` session\nto re-attach after the node reboot — membership is the NV-derived in-trial\nset, identical before and after the reboot. Vendor extensions live here in\nsumo-mm, not SOVDd (the three-layer rule, like `csr_router`).\n`POST /vehicle/v1/operations/x-sumo-commit-trials/executions` — the node\ncommit verdict; see [`node_verdict_router`] for the wire contract.",
+        "operationId": "commit_trials",
+        "requestBody": {
+          "description": "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape).",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerdictRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Verdict applied across the node's in-trial components (`result.committed` / `skipped`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Refused: a node activation reboot is still owed (armed bank not booted).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "One or more components failed to commit (failed execution).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vehicle/v1/operations/x-sumo-pull-update/executions": {
+      "post": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "The POST handler: synchronous pre-flight (auth / anchor / L1 signature /\nintegrated-dep dispatch plan / busy check — every 4xx surfaces BEFORE the\n202), then spawn the install task and reply `202 + Location`.",
+        "operationId": "handle_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PullUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted; the install runs in the background. Poll the `Location` for the execution.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "URL of the created execution resource."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationExecution"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "L1 not base64, not a campaign, or an integrated dependency failed its dispatch plan.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or insufficient Operational update:execute token bound to this device.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A pull-update execution is already running.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Device not provisioned: no sw-authority trust anchor.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/vehicle/v1/operations/x-sumo-pull-update/executions/{execution_id}": {
+      "get": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "`GET /vehicle/v1/operations/x-sumo-pull-update/executions/{execution_id}` —\npoll a pull-update execution; see [`pull_update_router`].",
+        "operationId": "get_pull_update_status",
+        "parameters": [
+          {
+            "name": "execution_id",
+            "in": "path",
+            "description": "The execution id returned by the POST.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The execution's current status (running / completed / failed).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationExecution"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No execution with that id.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vehicle/v1/operations/x-sumo-rollback-trials/executions": {
+      "post": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "`POST /vehicle/v1/operations/x-sumo-rollback-trials/executions` — the node\nrollback verdict; see [`node_verdict_router`] for the wire contract.",
+        "operationId": "rollback_trials",
+        "requestBody": {
+          "description": "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape).",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerdictRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Verdict applied across the node's in-trial components (`result.rolled_back` / `skipped`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "One or more components failed to roll back (failed execution).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CsrRequest": {
+        "type": "object",
+        "description": "Body of the `x-sumo-csr` operation: which key slot to generate a CSR for.",
+        "required": [
+          "key_id"
+        ],
+        "properties": {
+          "key_id": {
+            "type": "string"
+          }
+        }
+      },
+      "CsrResult": {
+        "type": "object",
+        "description": "The `result` of a successful `x-sumo-csr` execution: the requested slot and\nits PKCS#10 CSR (DER, base64).",
+        "required": [
+          "key_id",
+          "csr_der_base64"
+        ],
+        "properties": {
+          "csr_der_base64": {
+            "type": "string"
+          },
+          "key_id": {
+            "type": "string"
+          }
+        }
+      },
+      "HsmKeyEntry": {
+        "type": "object",
+        "description": "One HSM key-slot entry in the [`HsmKeysResponse`] inventory — public\nmetadata only, never key material.",
+        "required": [
+          "id",
+          "kind",
+          "has_certificate"
+        ],
+        "properties": {
+          "allowed_ops": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "has_certificate": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "public_key_der_base64": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "HsmKeysResponse": {
+        "type": "object",
+        "description": "The `hsm/data/keys` inventory: the device's provisioning state plus every\nkey slot.",
+        "required": [
+          "provisioned",
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HsmKeyEntry"
+            }
+          },
+          "provisioned": {
+            "type": "boolean"
+          }
+        }
+      },
+      "OperationExecution": {
+        "type": "object",
+        "description": "Doc mirror of `sovd_core::OperationExecution` (ISO 17978-3 §7.14).",
+        "required": [
+          "execution_id",
+          "operation_id",
+          "status",
+          "started_at"
+        ],
+        "properties": {
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution_id": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "result": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationStatus"
+          }
+        }
+      },
+      "OperationStatus": {
+        "type": "string",
+        "description": "Doc mirror of `sovd_core::OperationStatus`.",
+        "enum": [
+          "running",
+          "completed",
+          "failed",
+          "stopped"
+        ]
+      },
+      "PullUpdateRequest": {
+        "type": "object",
+        "description": "Body of the `x-sumo-pull-update` operation.",
+        "required": [
+          "l1_base64",
+          "cas_base_url"
+        ],
+        "properties": {
+          "cas_base_url": {
+            "type": "string",
+            "description": "Base URL of the content-addressed store the device pulls dependencies\nand payloads from. Untrusted — every fetched blob is verified against\nthe signed content-address before use."
+          },
+          "component": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional target assertion: when set, every dependency in the signed\ncampaign must target this component (400 otherwise). An ASSERTION, not\na filter — silently installing a subset of a signed campaign would\nsubvert the L1 as the decision artifact."
+          },
+          "l1_base64": {
+            "type": "string",
+            "description": "The T2-signed L1 campaign manifest envelope (base64 of the COSE bytes).\nIts dependency/payload URIs are content-addresses, so the device pins\nwhat it fetches to what the signed manifest commits to."
+          }
+        }
+      },
+      "UpdateStateResponse": {
+        "type": "object",
+        "description": "The `x-sumo-update-state` resource body — the node's update-transaction\nphase plus the component ids the transaction covers.",
+        "required": [
+          "phase",
+          "components"
+        ],
+        "properties": {
+          "components": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "phase": {
+            "type": "string"
+          }
+        }
+      },
+      "VerdictExecution": {
+        "type": "object",
+        "description": "Doc mirror of `super::super::routes::VerdictExecution` — an\nOperationExecution with the client `nonce` echoed back.",
+        "required": [
+          "execution_id",
+          "operation_id",
+          "status",
+          "started_at"
+        ],
+        "properties": {
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution_id": {
+            "type": "string"
+          },
+          "nonce": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "result": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationStatus"
+          }
+        }
+      },
+      "VerdictRequest": {
+        "type": "object",
+        "description": "Optional POST body for the node-verdict operations. The client MAY supply a\n`nonce` for replay-proofing — it is echoed verbatim in the execution record,\nso a caller can tell its own fresh POST from a transport-level replay of an\nearlier one. An absent body / non-JSON content type deserialises to `None`\n(old clients, unchanged wire).",
+        "properties": {
+          "nonce": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "x-sumo-vendor-extension",
+      "description": "sumo vendor extensions to ISO 17978-3 (the x-sumo-* operations)."
+    }
+  ]
+}

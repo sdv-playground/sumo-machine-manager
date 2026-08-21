@@ -48,7 +48,12 @@ pub fn gateway_router<D: BlockDevice + Send + 'static>(
 ) -> Router {
     let anchor: crate::sovd::pull_update::TrustAnchorSource =
         Arc::new(move || Some(trust_anchor.clone()));
-    create_router(AppState::new(backends))
+    let state = AppState::new(backends);
+    // Advertise the x-sumo vendor ops in the merged §7.5 capability description
+    // (feature off until the sovd-api hook is on the pinned git dep).
+    #[cfg(feature = "sovd-docs-hook")]
+    let state = state.with_capability_extensions(crate::sovd::openapi::capability_extensions());
+    create_router(state)
         .merge(hsm_router(machine.clone()))
         .merge(node_verdict_router(machine.clone(), nv, coord))
         .merge(pull_update_router(machine, authorizer, anchor))

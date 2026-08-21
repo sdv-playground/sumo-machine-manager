@@ -1,0 +1,209 @@
+//! Code-first OpenAPI 3.1 document for the sumo VENDOR EXTENSION surface
+//! (`x-sumo-*`) of the machine-manager SOVD servers.
+//!
+//! Generated with `utoipa` from the actual handlers/types in [`super::routes`]
+//! and [`super::pull_update`] (plus the three SOVDd-resident `x-sumo-*` update
+//! verbs, declared here as path carriers because their handlers live in
+//! SOVDd). The ISO 17978-3 base surface is deliberately NOT annotated — the
+//! document delegates it by reference (see the `info.description`).
+//!
+//! Two consumers:
+//!   * `docs/openapi-x-sumo.json` — the committed, reviewable subset, kept
+//!     current by `tests/openapi_current.rs` (`UPDATE_OPENAPI=1` rewrites it).
+//!   * the live `GET /vehicle/v1/docs` capability description — the vendor
+//!     paths + schemas are contributed to SOVDd's §7.5 document via its neutral
+//!     `CapabilityExtensions` hook (see [`capability_extensions`]).
+
+/// The bearer security scheme (`x-sumo-pull-update` is the only op that
+/// requires it; the dev/sim binary defaults to open auth).
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "bearer",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .build(),
+            ),
+        );
+    }
+}
+
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "sumo-machine-manager SOVD — vendor extensions (x-sumo-*)",
+        description = "OpenAPI 3.1 description of the sumo VENDOR EXTENSION surface (the `x-sumo-*` \
+operations) exposed by the sumo-machine-manager SOVD servers. Every operation here is a vendor \
+extension per the ISO 17978-1 extension rules — none is part of the ISO 17978-3 base surface, \
+which this document deliberately does NOT annotate. For the ISO 17978-3 surface see the standard's \
+own OpenAPI artifact (ISO 17978-3 ed.1 `openapi-specification-1.1.0-rc1.zip`, \
+https://standards.iso.org/iso/17978/-3/ed-1/en/) and the sumo conformance file \
+`docs/sovd_iso17978_spec.yaml` in the sumo-workspace (the 42/57 baseline). Auth: only \
+`x-sumo-pull-update` (POST) requires a bearer token (an Operational `update:execute` JWT bound to \
+the device); the dev/sim `vm-sovd` binary defaults to open auth, so the requirement is advisory \
+there."
+    ),
+    tags(
+        (name = "x-sumo-vendor-extension", description = "sumo vendor extensions to ISO 17978-3 (the x-sumo-* operations).")
+    ),
+    paths(
+        super::routes::update_state,
+        super::routes::hsm_keys_list,
+        super::routes::hsm_csr_execute,
+        super::routes::commit_trials,
+        super::routes::rollback_trials,
+        super::pull_update::handle_post,
+        super::pull_update::get_pull_update_status,
+        doc::x_sumo_commit,
+        doc::x_sumo_rollback,
+        doc::x_sumo_force_rollback,
+    ),
+    components(schemas(
+        super::routes::UpdateStateResponse,
+        super::routes::HsmKeyEntry,
+        super::routes::HsmKeysResponse,
+        super::routes::CsrRequest,
+        super::routes::CsrResult,
+        super::routes::VerdictRequest,
+        super::pull_update::PullUpdateRequest,
+        doc::OperationStatus,
+        doc::OperationExecution,
+        doc::VerdictExecution,
+    )),
+    modifiers(&SecurityAddon)
+)]
+struct XSumoApi;
+
+/// The in-process vendor-extension OpenAPI document; `info.version` is pinned to
+/// the crate version.
+pub fn openapi() -> utoipa::openapi::OpenApi {
+    let mut doc = <XSumoApi as utoipa::OpenApi>::openapi();
+    doc.info.version = env!("CARGO_PKG_VERSION").to_string();
+    // The crate declares no license; drop the empty `license.name` utoipa
+    // synthesizes from Cargo metadata rather than ship it in the artifact.
+    doc.info.license = None;
+    doc
+}
+
+/// The committed-artifact rendering: pretty JSON with a trailing newline. Key
+/// order is stable across runs (utoipa emits sorted schema maps), so a
+/// byte-equality regen test is meaningful.
+pub fn openapi_json_pretty() -> String {
+    let mut s = serde_json::to_string_pretty(&openapi()).expect("OpenApi serializes to JSON");
+    s.push('\n');
+    s
+}
+
+/// The vendor paths + schemas as a SOVDd capability-description extension,
+/// registered on `sovd_api::AppState` so the merged `GET /vehicle/v1/docs`
+/// advertises them.
+// TODO(openapi-docs): the pinned `sovd-api` git dep does not yet carry the
+// `CapabilityExtensions` hook, so this is gated off by default; drop the gate
+// after the SOVDd lock bump lands the hook.
+#[cfg(feature = "sovd-docs-hook")]
+pub fn capability_extensions() -> sovd_api::CapabilityExtensions {
+    let doc = serde_json::to_value(openapi()).expect("OpenApi serializes to JSON");
+    sovd_api::CapabilityExtensions::from_openapi(&doc)
+}
+
+pub(crate) mod doc {
+    //! Doc-only scaffolding: schema mirrors of foreign / flattened wire types
+    //! and path carriers for the SOVDd-resident vendor routes. None of these
+    //! run — the mirrors let the generated document `$ref` the `sovd_core` wire
+    //! types (whose crate is not built with utoipa's `openapi` feature at the
+    //! pinned revision), and the carriers attach path items whose handlers live
+    //! in SOVDd's `sovd-api`.
+    #![allow(dead_code)]
+
+    /// Doc mirror of `sovd_core::OperationStatus`.
+    #[derive(utoipa::ToSchema)]
+    #[schema(as = OperationStatus, rename_all = "snake_case")]
+    pub(crate) enum OperationStatus {
+        Running,
+        Completed,
+        Failed,
+        Stopped,
+    }
+
+    /// Doc mirror of `sovd_core::OperationExecution` (ISO 17978-3 §7.14).
+    #[derive(utoipa::ToSchema)]
+    #[schema(as = OperationExecution)]
+    pub(crate) struct OperationExecution {
+        pub execution_id: String,
+        pub operation_id: String,
+        pub status: OperationStatus,
+        #[schema(value_type = Option<Object>)]
+        pub result: Option<serde_json::Value>,
+        pub error: Option<String>,
+        pub started_at: chrono::DateTime<chrono::Utc>,
+        pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    /// Doc mirror of `super::super::routes::VerdictExecution` — an
+    /// OperationExecution with the client `nonce` echoed back.
+    #[derive(utoipa::ToSchema)]
+    #[schema(as = VerdictExecution)]
+    pub(crate) struct VerdictExecution {
+        pub execution_id: String,
+        pub operation_id: String,
+        pub status: OperationStatus,
+        #[schema(value_type = Option<Object>)]
+        pub result: Option<serde_json::Value>,
+        pub error: Option<String>,
+        pub started_at: chrono::DateTime<chrono::Utc>,
+        pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+        pub nonce: Option<String>,
+    }
+
+    /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).
+    #[utoipa::path(
+        put,
+        path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-sumo-commit",
+        tag = "x-sumo-vendor-extension",
+        params(
+            ("component_id" = String, Path, description = "Target component."),
+            ("update_id" = String, Path, description = "The /updates entry; must be paused at execute/awaiting-verdict."),
+        ),
+        responses(
+            (status = 202, description = "Commit verdict posted; poll .../status.", headers(("Location" = String, description = "URL of the update status resource."))),
+            (status = 409, description = "The update is not paused at awaiting-verdict."),
+        ),
+    )]
+    pub(crate) fn x_sumo_commit() {}
+
+    /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).
+    #[utoipa::path(
+        put,
+        path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-sumo-rollback",
+        tag = "x-sumo-vendor-extension",
+        params(
+            ("component_id" = String, Path, description = "Target component."),
+            ("update_id" = String, Path, description = "The /updates entry; must be paused at execute/awaiting-verdict."),
+        ),
+        responses(
+            (status = 202, description = "Rollback verdict posted; poll .../status.", headers(("Location" = String, description = "URL of the update status resource."))),
+            (status = 409, description = "The update is not paused at awaiting-verdict."),
+        ),
+    )]
+    pub(crate) fn x_sumo_rollback() {}
+
+    /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).
+    #[utoipa::path(
+        put,
+        path = "/vehicle/v1/components/{component_id}/x-sumo-force-rollback",
+        tag = "x-sumo-vendor-extension",
+        params(
+            ("component_id" = String, Path, description = "Target component."),
+        ),
+        responses(
+            (status = 204, description = "Backend trial state cleared unconditionally (idempotent)."),
+        ),
+    )]
+    pub(crate) fn x_sumo_force_rollback() {}
+}

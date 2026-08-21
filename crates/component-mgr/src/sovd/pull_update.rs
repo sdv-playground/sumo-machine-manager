@@ -38,7 +38,7 @@ pub const PULL_OP_ID: &str = "x-sumo-pull-update";
 pub const PULL_OP_PATH: &str = "/vehicle/v1/operations/x-sumo-pull-update/executions";
 
 /// Body of the `x-sumo-pull-update` operation.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct PullUpdateRequest {
     /// Optional target assertion: when set, every dependency in the signed
     /// campaign must target this component (400 otherwise). An ASSERTION, not
@@ -65,7 +65,7 @@ pub type TrustAnchorSource = Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
 /// state — the durable truth is NV (`x-sumo-update-state` + per-component
 /// activation), which a restarted orchestrator polls to re-derive where it is.
 #[derive(Default)]
-struct Executions {
+pub(crate) struct Executions {
     map: Mutex<HashMap<String, OperationExecution>>,
     seq: AtomicU64,
 }
@@ -144,25 +144,56 @@ pub fn pull_update_router(
             get(
                 move |axum::extract::Path(execution_id): axum::extract::Path<String>| {
                     let execs = execs.clone();
-                    async move {
-                        match execs.get(&execution_id) {
-                            Some(exec) => (StatusCode::OK, Json(exec)).into_response(),
-                            None => (
-                                StatusCode::NOT_FOUND,
-                                format!("no execution '{execution_id}'"),
-                            )
-                                .into_response(),
-                        }
-                    }
+                    async move { get_pull_update_status(execs, execution_id).await }
                 },
             ),
         )
 }
 
+/// `GET /vehicle/v1/operations/x-sumo-pull-update/executions/{execution_id}` —
+/// poll a pull-update execution; see [`pull_update_router`].
+#[utoipa::path(
+    get,
+    path = "/vehicle/v1/operations/x-sumo-pull-update/executions/{execution_id}",
+    tag = "x-sumo-vendor-extension",
+    params(("execution_id" = String, Path, description = "The execution id returned by the POST.")),
+    responses(
+        (status = 200, description = "The execution's current status (running / completed / failed).", body = super::openapi::doc::OperationExecution),
+        (status = 404, description = "No execution with that id.", body = String),
+    ),
+)]
+pub(crate) async fn get_pull_update_status(
+    execs: Arc<Executions>,
+    execution_id: String,
+) -> axum::response::Response {
+    match execs.get(&execution_id) {
+        Some(exec) => (StatusCode::OK, Json(exec)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("no execution '{execution_id}'"),
+        )
+            .into_response(),
+    }
+}
+
 /// The POST handler: synchronous pre-flight (auth / anchor / L1 signature /
 /// integrated-dep dispatch plan / busy check — every 4xx surfaces BEFORE the
 /// 202), then spawn the install task and reply `202 + Location`.
-async fn handle_post(
+#[utoipa::path(
+    post,
+    path = "/vehicle/v1/operations/x-sumo-pull-update/executions",
+    tag = "x-sumo-vendor-extension",
+    request_body = PullUpdateRequest,
+    security(("bearer" = [])),
+    responses(
+        (status = 202, description = "Accepted; the install runs in the background. Poll the `Location` for the execution.", body = super::openapi::doc::OperationExecution, headers(("Location" = String, description = "URL of the created execution resource."))),
+        (status = 400, description = "L1 not base64, not a campaign, or an integrated dependency failed its dispatch plan.", body = String),
+        (status = 401, description = "Missing or insufficient Operational update:execute token bound to this device.", body = String),
+        (status = 409, description = "A pull-update execution is already running.", body = String),
+        (status = 503, description = "Device not provisioned: no sw-authority trust anchor.", body = String),
+    ),
+)]
+pub(crate) async fn handle_post(
     machine: Arc<dyn Machine>,
     authorizer: Arc<dyn sovd_api::Authorizer>,
     trust_anchor: TrustAnchorSource,

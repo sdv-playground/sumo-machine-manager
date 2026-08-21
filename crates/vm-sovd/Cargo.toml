@@ -42,3 +42,9 @@ sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main
 # Gateway mode: proxies host-owned components to the host SOVD.
 sovd-proxy = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
+
+[features]
+# Contribute the x-sumo vendor OpenAPI paths to SOVDd's §7.5 capability
+# description (GET /vehicle/v1/docs). Off by default: activates once the pinned
+# sovd-api git dep carries the CapabilityExtensions hook component-mgr targets.
+sovd-docs-hook = ["component-mgr/sovd-docs-hook"]

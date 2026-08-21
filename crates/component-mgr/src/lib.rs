@@ -72,6 +72,7 @@ pub mod sovd {
     pub mod gateway;
     pub mod identity;
     pub mod issuer_keys;
+    pub mod openapi;
     pub mod pull_update;
     pub mod routes;
     pub mod time_floor;

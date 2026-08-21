@@ -515,6 +515,11 @@ async fn main() {
         .await
     } else {
         let state = sovd_api::AppState::new(backends);
+        // Advertise the x-sumo vendor ops in the merged §7.5 capability
+        // description (feature off until the sovd-api hook is on the pinned dep).
+        #[cfg(feature = "sovd-docs-hook")]
+        let state =
+            state.with_capability_extensions(component_mgr::sovd::openapi::capability_extensions());
         sovd_api::create_router(state)
             .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
             .merge(component_mgr::sovd::routes::update_state_router(

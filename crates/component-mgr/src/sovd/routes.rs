@@ -36,15 +36,38 @@ pub fn update_state_router<D: BlockDevice + Send + 'static>(
         get(move || {
             let nv = nv.clone();
             let coord = coord.clone();
-            async move {
-                let st = derive_node_update_state(&nv, &coord);
-                Json(serde_json::json!({
-                    "phase": st.phase.as_str(),
-                    "components": st.components,
-                }))
-            }
+            async move { update_state(nv, coord).await }
         }),
     )
+}
+
+/// The `x-sumo-update-state` resource body — the node's update-transaction
+/// phase plus the component ids the transaction covers.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct UpdateStateResponse {
+    pub phase: String,
+    pub components: Vec<String>,
+}
+
+/// `GET /vehicle/v1/data/x-sumo-update-state` — the handler behind
+/// [`update_state_router`].
+#[utoipa::path(
+    get,
+    path = "/vehicle/v1/data/x-sumo-update-state",
+    tag = "x-sumo-vendor-extension",
+    responses(
+        (status = 200, description = "The node's update-transaction phase and the components it covers.", body = UpdateStateResponse),
+    ),
+)]
+pub(crate) async fn update_state<D: BlockDevice>(
+    nv: Arc<Mutex<NvStore<D>>>,
+    coord: Arc<NodeCoordinator>,
+) -> Json<UpdateStateResponse> {
+    let st = derive_node_update_state(&nv, &coord);
+    Json(UpdateStateResponse {
+        phase: st.phase.as_str().to_string(),
+        components: st.components,
+    })
 }
 
 /// Derive the node's update-transaction state from NV + the coordinator's
@@ -132,8 +155,36 @@ pub fn hsm_router(machine: Arc<dyn Machine>) -> Router {
         )
 }
 
+/// One HSM key-slot entry in the [`HsmKeysResponse`] inventory — public
+/// metadata only, never key material.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct HsmKeyEntry {
+    pub id: String,
+    pub kind: String,
+    pub has_certificate: bool,
+    pub allowed_ops: Option<Vec<String>>,
+    pub public_key_der_base64: Option<String>,
+}
+
+/// The `hsm/data/keys` inventory: the device's provisioning state plus every
+/// key slot.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct HsmKeysResponse {
+    pub provisioned: bool,
+    pub items: Vec<HsmKeyEntry>,
+}
+
 /// `GET …/hsm/data/keys` — the key-slot inventory (public metadata only).
-async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
+#[utoipa::path(
+    get,
+    path = "/vehicle/v1/components/hsm/data/keys",
+    tag = "x-sumo-vendor-extension",
+    responses(
+        (status = 200, description = "The HSM key-slot inventory (public metadata only; never key material).", body = HsmKeysResponse),
+        (status = 503, description = "No HSM component, or the HSM keys are unavailable.", body = String),
+    ),
+)]
+pub(crate) async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
     let Some(comp) = machine.component("hsm") else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -143,7 +194,7 @@ async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
     };
     match comp.list_keys().await {
         Ok(inv) => {
-            let items: Vec<_> = inv
+            let items: Vec<HsmKeyEntry> = inv
                 .keys
                 .into_iter()
                 .map(|k| {
@@ -152,17 +203,20 @@ async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
                         .public_key
                         .as_ref()
                         .map(|der| base64::engine::general_purpose::STANDARD.encode(der));
-                    serde_json::json!({
-                        "id": k.key_id,
-                        "kind": k.kind.label(),
-                        "has_certificate": k.has_certificate,
-                        "allowed_ops": k.allowed_ops,
-                        "public_key_der_base64": public_key_der_base64,
-                    })
+                    HsmKeyEntry {
+                        id: k.key_id,
+                        kind: k.kind.label().to_string(),
+                        has_certificate: k.has_certificate,
+                        allowed_ops: k.allowed_ops,
+                        public_key_der_base64,
+                    }
                 })
                 .collect();
-            Json(serde_json::json!({ "provisioned": inv.provisioned, "items": items }))
-                .into_response()
+            Json(HsmKeysResponse {
+                provisioned: inv.provisioned,
+                items,
+            })
+            .into_response()
         }
         Err(MachineError::NotSupported(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -181,14 +235,36 @@ async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
 }
 
 /// Body of the `x-sumo-csr` operation: which key slot to generate a CSR for.
-#[derive(serde::Deserialize)]
-struct CsrRequest {
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub(crate) struct CsrRequest {
     key_id: String,
+}
+
+/// The `result` of a successful `x-sumo-csr` execution: the requested slot and
+/// its PKCS#10 CSR (DER, base64).
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct CsrResult {
+    pub key_id: String,
+    pub csr_der_base64: String,
 }
 
 /// `POST …/hsm/operations/x-sumo-csr/executions` — sign a PKCS#10 CSR for the
 /// requested slot and return it (DER, base64) in an operation execution.
-async fn hsm_csr_execute(machine: Arc<dyn Machine>, req: CsrRequest) -> axum::response::Response {
+#[utoipa::path(
+    post,
+    path = "/vehicle/v1/components/hsm/operations/x-sumo-csr/executions",
+    tag = "x-sumo-vendor-extension",
+    request_body = CsrRequest,
+    responses(
+        (status = 200, description = "CSR generated; returned in an ISO 17978-3 §7.14 operation execution whose `result` is a CsrResult.", body = super::openapi::doc::OperationExecution),
+        (status = 403, description = "Policy rejected CSR generation for this slot (failed execution).", body = super::openapi::doc::OperationExecution),
+        (status = 503, description = "No HSM component, or CSR not configured.", body = String),
+    ),
+)]
+pub(crate) async fn hsm_csr_execute(
+    machine: Arc<dyn Machine>,
+    req: CsrRequest,
+) -> axum::response::Response {
     const OP_ID: &str = "x-sumo-csr";
     let Some(comp) = machine.component("hsm") else {
         return (
@@ -207,10 +283,13 @@ async fn hsm_csr_execute(machine: Arc<dyn Machine>, req: CsrRequest) -> axum::re
                 execution_id: OP_ID.to_string(),
                 operation_id: OP_ID.to_string(),
                 status: OperationStatus::Completed,
-                result: Some(serde_json::json!({
-                    "key_id": req.key_id,
-                    "csr_der_base64": der_b64,
-                })),
+                result: Some(
+                    serde_json::to_value(CsrResult {
+                        key_id: req.key_id,
+                        csr_der_base64: der_b64,
+                    })
+                    .expect("CsrResult is infallibly serializable"),
+                ),
                 error: None,
                 started_at: now,
                 completed_at: Some(now),
@@ -315,8 +394,8 @@ impl Verdict {
 /// so a caller can tell its own fresh POST from a transport-level replay of an
 /// earlier one. An absent body / non-JSON content type deserialises to `None`
 /// (old clients, unchanged wire).
-#[derive(serde::Deserialize)]
-struct VerdictRequest {
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub(crate) struct VerdictRequest {
     #[serde(default)]
     nonce: Option<String>,
 }
@@ -509,6 +588,49 @@ async fn handle_verdict<D: BlockDevice>(
 /// to re-attach after the node reboot — membership is the NV-derived in-trial
 /// set, identical before and after the reboot. Vendor extensions live here in
 /// sumo-mm, not SOVDd (the three-layer rule, like `csr_router`).
+/// `POST /vehicle/v1/operations/x-sumo-commit-trials/executions` — the node
+/// commit verdict; see [`node_verdict_router`] for the wire contract.
+#[utoipa::path(
+    post,
+    path = "/vehicle/v1/operations/x-sumo-commit-trials/executions",
+    tag = "x-sumo-vendor-extension",
+    request_body(content = VerdictRequest, description = "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape)."),
+    responses(
+        (status = 200, description = "Verdict applied across the node's in-trial components (`result.committed` / `skipped`).", body = super::openapi::doc::VerdictExecution),
+        (status = 409, description = "Refused: a node activation reboot is still owed (armed bank not booted).", body = super::openapi::doc::VerdictExecution),
+        (status = 500, description = "One or more components failed to commit (failed execution).", body = super::openapi::doc::VerdictExecution),
+    ),
+)]
+pub(crate) async fn commit_trials<D: BlockDevice>(
+    machine: Arc<dyn Machine>,
+    nv: Arc<Mutex<NvStore<D>>>,
+    coord: Arc<NodeCoordinator>,
+    req: Option<VerdictRequest>,
+) -> axum::response::Response {
+    handle_verdict(machine, nv, coord, Verdict::Commit, req).await
+}
+
+/// `POST /vehicle/v1/operations/x-sumo-rollback-trials/executions` — the node
+/// rollback verdict; see [`node_verdict_router`] for the wire contract.
+#[utoipa::path(
+    post,
+    path = "/vehicle/v1/operations/x-sumo-rollback-trials/executions",
+    tag = "x-sumo-vendor-extension",
+    request_body(content = VerdictRequest, description = "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape)."),
+    responses(
+        (status = 200, description = "Verdict applied across the node's in-trial components (`result.rolled_back` / `skipped`).", body = super::openapi::doc::VerdictExecution),
+        (status = 500, description = "One or more components failed to roll back (failed execution).", body = super::openapi::doc::VerdictExecution),
+    ),
+)]
+pub(crate) async fn rollback_trials<D: BlockDevice>(
+    machine: Arc<dyn Machine>,
+    nv: Arc<Mutex<NvStore<D>>>,
+    coord: Arc<NodeCoordinator>,
+    req: Option<VerdictRequest>,
+) -> axum::response::Response {
+    handle_verdict(machine, nv, coord, Verdict::Rollback, req).await
+}
+
 pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
     machine: Arc<dyn Machine>,
     nv: Arc<Mutex<NvStore<D>>>,
@@ -524,9 +646,7 @@ pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
                 let machine = commit_machine.clone();
                 let nv = commit_nv.clone();
                 let coord = commit_coord.clone();
-                async move {
-                    handle_verdict(machine, nv, coord, Verdict::Commit, req.map(|Json(r)| r)).await
-                }
+                async move { commit_trials(machine, nv, coord, req.map(|Json(r)| r)).await }
             }),
         )
         .route(
@@ -535,10 +655,7 @@ pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
                 let machine = machine.clone();
                 let nv = nv.clone();
                 let coord = coord.clone();
-                async move {
-                    handle_verdict(machine, nv, coord, Verdict::Rollback, req.map(|Json(r)| r))
-                        .await
-                }
+                async move { rollback_trials(machine, nv, coord, req.map(|Json(r)| r)).await }
             }),
         )
 }
@@ -856,5 +973,83 @@ mod tests {
         // Fresh per POST, and never the (replayable) constant op id.
         assert_ne!(id1, id2);
         assert_ne!(id1, Verdict::Commit.op_id());
+    }
+
+    // Shape-identity guards: the named response structs must serialize to the
+    // exact JSON the handlers emitted as ad-hoc `serde_json::json!` before the
+    // utoipa refactor (the regen test only covers the doc, not the wire).
+    #[test]
+    fn update_state_response_shape_is_stable() {
+        let resp = UpdateStateResponse {
+            phase: "RebootPending".to_string(),
+            components: vec!["vm1".to_string(), "hsm".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap(),
+            serde_json::json!({
+                "phase": "RebootPending",
+                "components": ["vm1", "hsm"],
+            })
+        );
+    }
+
+    #[test]
+    fn hsm_keys_response_shape_is_stable() {
+        let resp = HsmKeysResponse {
+            provisioned: true,
+            items: vec![
+                HsmKeyEntry {
+                    id: "tls-identity".to_string(),
+                    kind: "EC-P256".to_string(),
+                    has_certificate: true,
+                    allowed_ops: Some(vec!["sign".to_string(), "verify".to_string()]),
+                    public_key_der_base64: Some("QUJD".to_string()),
+                },
+                HsmKeyEntry {
+                    id: "time-floor".to_string(),
+                    kind: "monotonic".to_string(),
+                    has_certificate: false,
+                    allowed_ops: None,
+                    public_key_der_base64: None,
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap(),
+            serde_json::json!({
+                "provisioned": true,
+                "items": [
+                    {
+                        "id": "tls-identity",
+                        "kind": "EC-P256",
+                        "has_certificate": true,
+                        "allowed_ops": ["sign", "verify"],
+                        "public_key_der_base64": "QUJD",
+                    },
+                    {
+                        "id": "time-floor",
+                        "kind": "monotonic",
+                        "has_certificate": false,
+                        "allowed_ops": null,
+                        "public_key_der_base64": null,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn csr_result_shape_is_stable() {
+        let resp = CsrResult {
+            key_id: "tls-identity".to_string(),
+            csr_der_base64: "QUJD".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap(),
+            serde_json::json!({
+                "key_id": "tls-identity",
+                "csr_der_base64": "QUJD",
+            })
+        );
     }
 }

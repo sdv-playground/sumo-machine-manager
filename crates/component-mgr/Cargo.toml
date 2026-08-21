@@ -20,6 +20,8 @@ coset = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Code-first OpenAPI 3.1 doc for the x-sumo vendor surface (sovd::openapi).
+utoipa = { version = "5", features = ["chrono"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 tracing = "0.1"
@@ -57,6 +59,13 @@ rustls-pemfile = "2"
 # O_SYNC (write-through) on the raw partition device — see
 # partition_bank_provider::open_payload_writer.
 libc = "0.2"
+
+[features]
+# Register the x-sumo vendor OpenAPI paths + schemas into SOVDd's §7.5
+# capability description via sovd-api's CapabilityExtensions hook (sovd::openapi
+# ::capability_extensions). Off by default: the hook lands only once the pinned
+# sovd-api git dep is bumped past the commit that adds it.
+sovd-docs-hook = []
 
 [dev-dependencies]
 http-body-util = "0.1"
