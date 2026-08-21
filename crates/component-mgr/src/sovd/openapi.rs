@@ -56,6 +56,7 @@ there."
         super::routes::update_state,
         super::routes::hsm_keys_list,
         super::routes::hsm_csr_execute,
+        super::routes::device_id,
         super::routes::commit_trials,
         super::routes::rollback_trials,
         super::pull_update::handle_post,

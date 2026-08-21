@@ -88,6 +88,47 @@
         }
       }
     },
+    "/vehicle/v1/components/hsm/x-sumo-id": {
+      "get": {
+        "tags": [
+          "x-sumo-vendor-extension"
+        ],
+        "summary": "`GET /vehicle/v1/components/hsm/x-sumo-id` — the ECU's id; see\n[`device_id_router`].",
+        "operationId": "device_id",
+        "responses": {
+          "200": {
+            "description": "The ECU's id — its HSM device-key thumbprint (lowercase hex), the token `aud`. Served whether or not the device is provisioned.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Device id read failed.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No HSM component, or the device id is unavailable.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/vehicle/v1/components/{component_id}/updates/{update_id}/x-sumo-commit": {
       "put": {
         "tags": [

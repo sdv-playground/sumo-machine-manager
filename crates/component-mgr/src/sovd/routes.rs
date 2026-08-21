@@ -334,33 +334,47 @@ pub fn device_id_router(machine: Arc<dyn Machine>) -> Router {
         "/vehicle/v1/components/hsm/x-sumo-id",
         get(move || {
             let machine = machine.clone();
-            async move {
-                let Some(comp) = machine.component("hsm") else {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "no hsm component".to_string(),
-                    )
-                        .into_response();
-                };
-                match comp.get_device_id().await {
-                    Ok(Some(id)) => ([(header::CONTENT_TYPE, "text/plain")], id).into_response(),
-                    Ok(None) => (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "device id unavailable".to_string(),
-                    )
-                        .into_response(),
-                    Err(e) => {
-                        tracing::error!(error = %e, "device id read failed");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("device id error: {e}"),
-                        )
-                            .into_response()
-                    }
-                }
-            }
+            async move { device_id(machine).await }
         }),
     )
+}
+
+/// `GET /vehicle/v1/components/hsm/x-sumo-id` — the ECU's id; see
+/// [`device_id_router`].
+#[utoipa::path(
+    get,
+    path = "/vehicle/v1/components/hsm/x-sumo-id",
+    tag = "x-sumo-vendor-extension",
+    responses(
+        (status = 200, description = "The ECU's id — its HSM device-key thumbprint (lowercase hex), the token `aud`. Served whether or not the device is provisioned.", content_type = "text/plain", body = String),
+        (status = 503, description = "No HSM component, or the device id is unavailable.", body = String),
+        (status = 500, description = "Device id read failed.", body = String),
+    ),
+)]
+pub(crate) async fn device_id(machine: Arc<dyn Machine>) -> axum::response::Response {
+    let Some(comp) = machine.component("hsm") else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no hsm component".to_string(),
+        )
+            .into_response();
+    };
+    match comp.get_device_id().await {
+        Ok(Some(id)) => ([(header::CONTENT_TYPE, "text/plain")], id).into_response(),
+        Ok(None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "device id unavailable".to_string(),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "device id read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("device id error: {e}"),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Which way a node-level verdict resolves the node's in-trial components.
