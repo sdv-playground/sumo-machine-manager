@@ -573,7 +573,7 @@
       },
       "OperationExecution": {
         "type": "object",
-        "description": "Doc mirror of `sovd_core::OperationExecution` (ISO 17978-3 §7.14).",
+        "description": "Result of starting an operation",
         "required": [
           "execution_id",
           "operation_id",
@@ -586,38 +586,42 @@
               "string",
               "null"
             ],
-            "format": "date-time"
+            "format": "date-time",
+            "description": "When the operation completed (if done)"
           },
           "error": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Error message (if failed)"
           },
           "execution_id": {
-            "type": "string"
+            "type": "string",
+            "description": "Unique execution ID (for tracking async operations)"
           },
           "operation_id": {
-            "type": "string"
+            "type": "string",
+            "description": "Operation that was executed"
           },
           "result": {
-            "type": [
-              "object",
-              "null"
-            ]
+            "type": "object",
+            "description": "Result data (if completed)"
           },
           "started_at": {
             "type": "string",
-            "format": "date-time"
+            "format": "date-time",
+            "description": "When the operation started"
           },
           "status": {
-            "$ref": "#/components/schemas/OperationStatus"
+            "$ref": "#/components/schemas/OperationStatus",
+            "description": "Current status"
           }
         }
       },
       "OperationStatus": {
         "type": "string",
-        "description": "Doc mirror of `sovd_core::OperationStatus`.",
+        "description": "Status of an operation execution — ISO 17978-3 §7.14 line 387.\n\nSpec-defined values: `running | completed | failed | stopped`.\n(Pre-Phase-E variants `pending`/`cancelled` were non-spec and have\nbeen removed — `pending` collapses to `running` once an execution\nresource exists; `cancelled` is spelled `stopped` by the spec.)",
         "enum": [
           "running",
           "completed",
@@ -670,54 +674,23 @@
         }
       },
       "VerdictExecution": {
-        "type": "object",
-        "description": "Doc mirror of `super::super::routes::VerdictExecution` — an\nOperationExecution with the client `nonce` echoed back.",
-        "required": [
-          "execution_id",
-          "operation_id",
-          "status",
-          "started_at"
-        ],
-        "properties": {
-          "completed_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time"
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperationExecution"
           },
-          "error": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "execution_id": {
-            "type": "string"
-          },
-          "nonce": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "operation_id": {
-            "type": "string"
-          },
-          "result": {
-            "type": [
-              "object",
-              "null"
-            ]
-          },
-          "started_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "status": {
-            "$ref": "#/components/schemas/OperationStatus"
+          {
+            "type": "object",
+            "properties": {
+              "nonce": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
           }
-        }
+        ],
+        "description": "A verdict operation execution with the optional client `nonce` echoed back.\n`#[serde(flatten)]` keeps the bare [`OperationExecution`] shape for old\nclients (no nonce ⇒ the field is skipped); a supplied nonce is appended\nverbatim as a top-level field."
       },
       "VerdictRequest": {
         "type": "object",

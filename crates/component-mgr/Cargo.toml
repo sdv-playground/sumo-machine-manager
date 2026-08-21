@@ -29,7 +29,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_yaml = "0.9"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
-sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+# `openapi` = the feature-gated utoipa::ToSchema derives on OperationExecution /
+# OperationStatus, so sovd::openapi references the real wire types (no mirror).
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main", features = ["openapi"] }
 sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 sumo-processor = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }

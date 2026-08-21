@@ -73,9 +73,9 @@ there."
         super::routes::CsrResult,
         super::routes::VerdictRequest,
         super::pull_update::PullUpdateRequest,
-        doc::OperationStatus,
-        doc::OperationExecution,
-        doc::VerdictExecution,
+        sovd_core::OperationStatus,
+        sovd_core::OperationExecution,
+        super::routes::VerdictExecution,
     )),
     modifiers(&SecurityAddon)
 )]
@@ -114,53 +114,10 @@ pub fn capability_extensions() -> sovd_api::CapabilityExtensions {
 }
 
 pub(crate) mod doc {
-    //! Doc-only scaffolding: schema mirrors of foreign / flattened wire types
-    //! and path carriers for the SOVDd-resident vendor routes. None of these
-    //! run — the mirrors let the generated document `$ref` the `sovd_core` wire
-    //! types (whose crate is not built with utoipa's `openapi` feature at the
-    //! pinned revision), and the carriers attach path items whose handlers live
-    //! in SOVDd's `sovd-api`.
+    //! Path carriers for the SOVDd-resident vendor routes: their handlers live
+    //! in SOVDd's `sovd-api`, so these zero-body fns exist only to attach the
+    //! path items to the generated document — they are never called.
     #![allow(dead_code)]
-
-    /// Doc mirror of `sovd_core::OperationStatus`.
-    #[derive(utoipa::ToSchema)]
-    #[schema(as = OperationStatus, rename_all = "snake_case")]
-    pub(crate) enum OperationStatus {
-        Running,
-        Completed,
-        Failed,
-        Stopped,
-    }
-
-    /// Doc mirror of `sovd_core::OperationExecution` (ISO 17978-3 §7.14).
-    #[derive(utoipa::ToSchema)]
-    #[schema(as = OperationExecution)]
-    pub(crate) struct OperationExecution {
-        pub execution_id: String,
-        pub operation_id: String,
-        pub status: OperationStatus,
-        #[schema(value_type = Option<Object>)]
-        pub result: Option<serde_json::Value>,
-        pub error: Option<String>,
-        pub started_at: chrono::DateTime<chrono::Utc>,
-        pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    }
-
-    /// Doc mirror of `super::super::routes::VerdictExecution` — an
-    /// OperationExecution with the client `nonce` echoed back.
-    #[derive(utoipa::ToSchema)]
-    #[schema(as = VerdictExecution)]
-    pub(crate) struct VerdictExecution {
-        pub execution_id: String,
-        pub operation_id: String,
-        pub status: OperationStatus,
-        #[schema(value_type = Option<Object>)]
-        pub result: Option<serde_json::Value>,
-        pub error: Option<String>,
-        pub started_at: chrono::DateTime<chrono::Utc>,
-        pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
-        pub nonce: Option<String>,
-    }
 
     /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).
     #[utoipa::path(

@@ -256,8 +256,8 @@ pub(crate) struct CsrResult {
     tag = "x-sumo-vendor-extension",
     request_body = CsrRequest,
     responses(
-        (status = 200, description = "CSR generated; returned in an ISO 17978-3 §7.14 operation execution whose `result` is a CsrResult.", body = super::openapi::doc::OperationExecution),
-        (status = 403, description = "Policy rejected CSR generation for this slot (failed execution).", body = super::openapi::doc::OperationExecution),
+        (status = 200, description = "CSR generated; returned in an ISO 17978-3 §7.14 operation execution whose `result` is a CsrResult.", body = sovd_core::OperationExecution),
+        (status = 403, description = "Policy rejected CSR generation for this slot (failed execution).", body = sovd_core::OperationExecution),
         (status = 503, description = "No HSM component, or CSR not configured.", body = String),
     ),
 )]
@@ -418,8 +418,8 @@ pub(crate) struct VerdictRequest {
 /// `#[serde(flatten)]` keeps the bare [`OperationExecution`] shape for old
 /// clients (no nonce ⇒ the field is skipped); a supplied nonce is appended
 /// verbatim as a top-level field.
-#[derive(serde::Serialize)]
-struct VerdictExecution {
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct VerdictExecution {
     #[serde(flatten)]
     execution: OperationExecution,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -610,9 +610,9 @@ async fn handle_verdict<D: BlockDevice>(
     tag = "x-sumo-vendor-extension",
     request_body(content = VerdictRequest, description = "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape)."),
     responses(
-        (status = 200, description = "Verdict applied across the node's in-trial components (`result.committed` / `skipped`).", body = super::openapi::doc::VerdictExecution),
-        (status = 409, description = "Refused: a node activation reboot is still owed (armed bank not booted).", body = super::openapi::doc::VerdictExecution),
-        (status = 500, description = "One or more components failed to commit (failed execution).", body = super::openapi::doc::VerdictExecution),
+        (status = 200, description = "Verdict applied across the node's in-trial components (`result.committed` / `skipped`).", body = VerdictExecution),
+        (status = 409, description = "Refused: a node activation reboot is still owed (armed bank not booted).", body = VerdictExecution),
+        (status = 500, description = "One or more components failed to commit (failed execution).", body = VerdictExecution),
     ),
 )]
 pub(crate) async fn commit_trials<D: BlockDevice>(
@@ -632,8 +632,8 @@ pub(crate) async fn commit_trials<D: BlockDevice>(
     tag = "x-sumo-vendor-extension",
     request_body(content = VerdictRequest, description = "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape)."),
     responses(
-        (status = 200, description = "Verdict applied across the node's in-trial components (`result.rolled_back` / `skipped`).", body = super::openapi::doc::VerdictExecution),
-        (status = 500, description = "One or more components failed to roll back (failed execution).", body = super::openapi::doc::VerdictExecution),
+        (status = 200, description = "Verdict applied across the node's in-trial components (`result.rolled_back` / `skipped`).", body = VerdictExecution),
+        (status = 500, description = "One or more components failed to roll back (failed execution).", body = VerdictExecution),
     ),
 )]
 pub(crate) async fn rollback_trials<D: BlockDevice>(

@@ -158,7 +158,7 @@ pub fn pull_update_router(
     tag = "x-sumo-vendor-extension",
     params(("execution_id" = String, Path, description = "The execution id returned by the POST.")),
     responses(
-        (status = 200, description = "The execution's current status (running / completed / failed).", body = super::openapi::doc::OperationExecution),
+        (status = 200, description = "The execution's current status (running / completed / failed).", body = sovd_core::OperationExecution),
         (status = 404, description = "No execution with that id.", body = String),
     ),
 )]
@@ -186,7 +186,7 @@ pub(crate) async fn get_pull_update_status(
     request_body = PullUpdateRequest,
     security(("bearer" = [])),
     responses(
-        (status = 202, description = "Accepted; the install runs in the background. Poll the `Location` for the execution.", body = super::openapi::doc::OperationExecution, headers(("Location" = String, description = "URL of the created execution resource."))),
+        (status = 202, description = "Accepted; the install runs in the background. Poll the `Location` for the execution.", body = sovd_core::OperationExecution, headers(("Location" = String, description = "URL of the created execution resource."))),
         (status = 400, description = "L1 not base64, not a campaign, or an integrated dependency failed its dispatch plan.", body = String),
         (status = 401, description = "Missing or insufficient Operational update:execute token bound to this device.", body = String),
         (status = 409, description = "A pull-update execution is already running.", body = String),
