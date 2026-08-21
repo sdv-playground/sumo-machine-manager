@@ -63,8 +63,9 @@ libc = "0.2"
 [features]
 # Register the x-sumo vendor OpenAPI paths + schemas into SOVDd's §7.5
 # capability description via sovd-api's CapabilityExtensions hook (sovd::openapi
-# ::capability_extensions). Off by default: the hook lands only once the pinned
-# sovd-api git dep is bumped past the commit that adds it.
+# ::capability_extensions). Default-on since sovd-api c33a01d carries the hook;
+# consumers pinned to an older sovd-api opt out with --no-default-features.
+default = ["sovd-docs-hook"]
 sovd-docs-hook = []
 
 [dev-dependencies]

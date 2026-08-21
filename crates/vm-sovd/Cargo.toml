@@ -45,6 +45,8 @@ sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v
 
 [features]
 # Contribute the x-sumo vendor OpenAPI paths to SOVDd's §7.5 capability
-# description (GET /vehicle/v1/docs). Off by default: activates once the pinned
-# sovd-api git dep carries the CapabilityExtensions hook component-mgr targets.
+# description (GET /vehicle/v1/docs). Default-on since sovd-api c33a01d carries
+# the CapabilityExtensions hook; the flag remains so a build against an older
+# pin can opt out with --no-default-features.
+default = ["sovd-docs-hook"]
 sovd-docs-hook = ["component-mgr/sovd-docs-hook"]
