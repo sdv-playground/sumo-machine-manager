@@ -86,15 +86,10 @@ fn derive_node_update_state<D: BlockDevice>(
             .filter(|&i| session.reboot_owed & (1u16 << i) != 0)
             .map(|i| coord.label(i))
             .collect();
-        let in_trial: Vec<String> = nv
-            .read_boot_state()
-            .map(|s| {
-                (0..NUM_BANK_SETS)
-                    .filter(|&i| !s.banks[i].committed)
-                    .map(|i| coord.label(i))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // The in-trial set is derived by the shared `node_in_trial_labels` so this
+        // wire and the node flash gate (`ComponentBackend::ensure_flash_can_start`)
+        // name identical components.
+        let in_trial = crate::backend::node_in_trial_labels(&nv, coord);
         (
             Durable {
                 session_id: session.session_id,
