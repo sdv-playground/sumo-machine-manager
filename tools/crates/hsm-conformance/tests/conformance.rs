@@ -119,6 +119,63 @@ fn sim_hsm_conforms() {
 }
 
 #[test]
+fn bare_keystore_inventory_conforms() {
+    // A FRESH keystore is the lifecycle state I2 must accept without help: the
+    // sim mints the six device-generated keys at first boot and the time-floor
+    // counter is structural, but the four trust anchors have no onboard
+    // material until provisioning delivers their public halves. The old I2
+    // demanded all 11 sumo-core slots unconditionally and failed right here
+    // ("mandatory slot 'sw-authority' … missing from list_slots"); nothing may
+    // be generated over the wire before the section runs, or this test decays
+    // into `sim_hsm_conforms`' populated-keystore case.
+    let backend = match locate_hsm_sim_service() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "SKIP: hsm-sim-service not built — run \
+                 `cargo build -p hsm-sim-backend --bin hsm-sim-service` first"
+            );
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let keystore = dir.path().to_path_buf();
+    let socket = keystore.join("backend.sock");
+    let (client, mut child) =
+        spawn_and_connect(&backend, Some(&keystore), &socket).expect("spawn + connect sim");
+
+    // Prove the precondition, not just the verdict: the anchors must be absent
+    // from the inventory, so a pass below exercises I2's skip branch (absent
+    // AND unresolvable) rather than the trivially-populated path.
+    let listed = client.list_slots().expect("list_slots on bare keystore");
+    for role in hsm::KeyRole::mandatory_roles()
+        .iter()
+        .filter(|r| !r.is_device_generated())
+    {
+        assert!(
+            !listed.iter().any(|s| s.handle == role.handle()),
+            "anchor {role:?} must not be in a bare keystore's inventory"
+        );
+    }
+
+    let inv = check_inventory(&client);
+    eprintln!("{inv}");
+    assert!(
+        inv.all_passed(),
+        "a bare keystore is a conforming inventory:\n{inv}"
+    );
+    assert!(
+        matches!(inv.outcome("I4"), Some(Outcome::Pass)),
+        "I4 (time-floor counter present as Monotonic) must pass on a bare keystore:\n{inv}"
+    );
+
+    drop(client);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn stub_example_does_not_conform() {
     // Locate the in-repo C skeleton by walking up from this crate's manifest dir
     // to the workspace root — the first ancestor that actually holds it. Robust to
