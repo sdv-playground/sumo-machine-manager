@@ -479,11 +479,16 @@ pub fn check_monotonic(client: &LinkBClient) -> ConformanceReport {
 /// Run the **slot-inventory** conformance section against a link-B backend,
 /// returning a peer [`ConformanceReport`].
 ///
-/// `list_slots` (the renamed `list_keys`) must enumerate EVERY slot — the key
-/// slots AND the non-key monotonic-counter slot (the time-floor). This section
-/// asserts the full mandatory sumo-core slot set is present and correctly
-/// **kinded**: key slots as `Key(..)`, the time-floor as `Monotonic` and
-/// host-only (`guest_exposed = false` in the registry).
+/// `list_slots` (the renamed `list_keys`) must enumerate EVERY slot it holds —
+/// the key slots AND the non-key monotonic-counter slot (the time-floor). This
+/// section asserts that set is present and correctly **kinded**: key slots as
+/// `Key(..)`, the time-floor as `Monotonic` and host-only
+/// (`guest_exposed = false` in the registry).
+///
+/// "Every slot it holds" is deliberate, and I2 explains the distinction: the four
+/// trust anchors are absent from a correct backend until provisioning delivers
+/// their public halves, so this section is runnable at any lifecycle state — on a
+/// bare keystore as well as a provisioned one.
 ///
 /// The load-bearing property is **I4**: the monotonic counter now APPEARS in the
 /// inventory (a backend that silently drops non-key slots — as the pre-rename
@@ -511,20 +516,70 @@ pub fn check_inventory(client: &LinkBClient) -> ConformanceReport {
         }
     };
 
-    // ── I2: every mandatory sumo-core slot is present. ────────────────────────
+    // ── I2: every slot the backend HAS is enumerated. ─────────────────────────
+    //
+    // The contract is "every slot **currently in the keystore inventory**"
+    // (`hsm::HsmProvider::list_slots`), not "every entry in the registry". Those
+    // differ, and the difference is by design: of the 11 sumo-core slots, six are
+    // device-generated (minted at first boot), the time-floor is structural, and
+    // the remaining four — sw-authority, key-authority, operational-issuer,
+    // factory-reset-issuer — are TRUST ANCHORS whose private halves live offboard.
+    // Only provisioning delivers their public halves, and `SimHsm` has a test
+    // asserting it must NOT invent them at first boot. Demanding all 11 on a fresh
+    // keystore therefore asks a correct backend to advertise key material it does
+    // not have.
+    //
+    // So I2 asserts two things instead:
+    //   (a) the always-present set — device-generated keys + the counter — must be
+    //       enumerated whatever the lifecycle state;
+    //   (b) any *other* registry slot the backend can resolve via `get_slot_info`
+    //       must also appear. A backend that can address a slot but hides it from
+    //       its own inventory is the defect this check exists to catch, and (b)
+    //       finds it in any lifecycle state — which the old unconditional form
+    //       only did on an already-populated keystore.
+    //
+    // (b) mirrors what production does: `component_adapter` enumerates the registry
+    // and keeps what `get_slot_info` resolves.
     let i2 = (|| -> Result<(), String> {
+        let anchors: Vec<u32> = hsm::KeyRole::mandatory_roles()
+            .iter()
+            .filter(|r| !r.is_device_generated())
+            .map(|r| r.handle().get())
+            .collect();
+
+        let mut missing: Vec<String> = Vec::new();
         for slot in vhsm_proto::SUMO_CORE_SLOTS {
-            if !slots.iter().any(|s| s.handle.get() == slot.handle) {
-                return Err(format!(
-                    "mandatory slot '{}' (handle {:#06x}) missing from list_slots",
+            let listed = slots.iter().any(|s| s.handle.get() == slot.handle);
+            if listed {
+                continue;
+            }
+            if anchors.contains(&slot.handle) {
+                // Absent anchor: correct only if the backend cannot resolve it
+                // either. If it can, the inventory is hiding a slot it has.
+                if client.get_slot_info(KeyHandle(slot.handle)).is_err() {
+                    continue;
+                }
+                missing.push(format!(
+                    "'{}' ({:#06x}, resolvable via get_slot_info but not listed)",
                     slot.key_id, slot.handle
                 ));
+            } else {
+                missing.push(format!("'{}' ({:#06x})", slot.key_id, slot.handle));
             }
         }
-        Ok(())
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // Report every missing slot: the old form returned on the first, so a
+        // reader fixed one and immediately met the next.
+        Err(format!(
+            "{} slot(s) missing from list_slots: {}",
+            missing.len(),
+            missing.join(", ")
+        ))
     })();
     checks.push(Check::from_result(
-        "I2 mandatory set — every sumo-core slot is enumerated",
+        "I2 mandatory set — every slot the backend holds is enumerated",
         i2,
     ));
 

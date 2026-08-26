@@ -86,11 +86,15 @@ fn sim_hsm_conforms() {
         "M3 (never rewinds) must pass for the sim:\n{mono}"
     );
 
-    // The slot-inventory section requires the full mandatory sumo-core set.
-    // run_conformance only generated jwt-signing, so generate the rest of the
-    // sumo-core KEY slots over the wire (the time-floor counter is structural —
-    // the sim lists it unconditionally). Then the inventory must conform, and
-    // most importantly I4 — the counter now appears as Monotonic.
+    // Populate every sumo-core KEY slot over the wire (the time-floor counter is
+    // structural — the sim lists it unconditionally). This is no longer needed to
+    // make I2 pass: a bare keystore conforms, because the four trust anchors have
+    // no onboard material until provisioning delivers their public halves.
+    //
+    // It is here to exercise I2's *strong* branch. I2 skips an anchor only while
+    // get_slot_info cannot resolve it; generating the anchors makes them
+    // resolvable, so I2 then demands they also appear in list_slots. Drop this
+    // loop and the anchors go untested — the section would pass vacuously.
     for slot in vhsm_proto::SUMO_CORE_SLOTS
         .iter()
         .filter(|s| s.alg != vhsm_proto::ALG_MONOTONIC)
