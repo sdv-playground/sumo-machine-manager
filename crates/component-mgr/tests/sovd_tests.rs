@@ -5,6 +5,7 @@
 //! standard SOVD REST API.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -12,13 +13,18 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use machine_mgr::{
+    DeactivateError, DeactivateOutcome, Deactivator, InMemorySelectorStore, SharedSystemBankState,
+    SystemBankManager, TestSigner,
+};
 use nv_store::block::MemBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
-use sovd_core::DiagnosticBackend;
+use sovd_core::{DiagnosticBackend, FlashState};
 
 use component_mgr::backend::{ComponentBackend, ComponentConfig};
+use component_mgr::bank_provider::IvdBankProvider;
 use component_mgr::manifest_provider::ManifestProvider;
 use component_mgr::suit_provider::SuitProvider;
 
@@ -781,5 +787,287 @@ async fn update_shape_reports_banked_for_ab_components() {
         DiagnosticBackend::update_shape(&singleshot),
         "singleshot",
         "single_bank=true must report singleshot (HSM keystore semantics)"
+    );
+}
+
+// =============================================================================
+// Administrative disable over the real /updates wire
+// =============================================================================
+
+/// Recording deactivator — an equipped `Deactivator` is what makes a component
+/// disableable, and its call count is the "did the enact actually run?" probe.
+struct CountingDeactivator(AtomicUsize);
+
+impl Deactivator for CountingDeactivator {
+    fn deactivate(&self) -> Result<DeactivateOutcome, DeactivateError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(DeactivateOutcome {
+            reboot_required: false,
+        })
+    }
+}
+
+/// A single-component router wired for administrative disable: a `Deactivator`
+/// (so the component is disableable) plus a selector-backed bank provider (so
+/// `record_disabled` lands in the shared signed selector the test reads back).
+/// `config.single_bank` picks the update shape — banked (vm1) vs singleshot
+/// (rt, the field shape). Also hands back the backend, so a test can read the
+/// flash transfer state the /updates wire polls.
+fn make_disable_router(
+    id: &str,
+    set: BankSet,
+    config: ComponentConfig,
+) -> (
+    axum::Router,
+    TestKeys,
+    SharedSystemBankState,
+    Arc<CountingDeactivator>,
+    Arc<ComponentBackend<MemBlockDevice>>,
+) {
+    let keys = generate_test_keys();
+    let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
+    suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
+    let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
+
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    let mut boot_state = NvBootState::default();
+    nv.write_boot_state(&mut boot_state).unwrap();
+    let nv = Arc::new(Mutex::new(nv));
+
+    // Sealed booted selection for the component; the disable set starts empty.
+    let selector: SharedSystemBankState = Arc::new(std::sync::RwLock::new(
+        SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner)),
+    ));
+    {
+        let mut g = selector.write().unwrap();
+        g.stage(set, Bank::A);
+        g.seal();
+    }
+
+    let single_bank = config.single_bank;
+    let deactivator = Arc::new(CountingDeactivator(AtomicUsize::new(0)));
+    let backend = Arc::new(
+        ComponentBackend::new(set, nv.clone(), manifest_provider, config)
+            .with_id(id.to_string())
+            .with_bank_provider(Arc::new(IvdBankProvider::new(
+                nv,
+                set,
+                single_bank,
+                None,
+                id.into(),
+                None,
+                None,
+                Some(selector.clone()),
+            )))
+            .with_deactivator(deactivator.clone()),
+    );
+
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert(id.to_string(), backend.clone());
+    let router = sovd_api::create_router(sovd_api::AppState::new(backends));
+    (router, keys, selector, deactivator, backend)
+}
+
+/// A REAL signed administrative-disable manifest: one component, no payload
+/// digest, `suit-directive-disable` in the shared sequence — the shape the
+/// campaign minter emits (151 bytes on the wire).
+fn make_disable_envelope(keys: &TestKeys, component: &str, seq: u64) -> Vec<u8> {
+    ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
+        .component_id(vec![component.to_string()])
+        .sequence_number(seq)
+        .build_disable(&keys.signing_key)
+        .unwrap()
+}
+
+/// A detached firmware manifest: declares one payload part (digest + uri) but
+/// carries no integrated payload, so the upload must park awaiting that part.
+fn make_detached_firmware_envelope(keys: &TestKeys, component: &str, seq: u64) -> Vec<u8> {
+    let image = vec![0xAA; 1024];
+    let digest = RustCryptoBackend::new().sha256(&image);
+    ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
+        .component_id(vec![component.to_string(), "firmware".to_string()])
+        .sequence_number(seq)
+        .payload_digest(&digest, image.len() as u64)
+        .payload_uri("#firmware".to_string())
+        .build(&keys.signing_key)
+        .unwrap()
+}
+
+/// Register an update and upload `envelope` as the `manifest` part.
+async fn register_and_upload_manifest(
+    router: &axum::Router,
+    component: &str,
+    envelope: Vec<u8>,
+) -> String {
+    let (status, body) = post_json(
+        router,
+        &format!("/vehicle/v1/components/{component}/updates"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
+    let update_id = body["update_id"].as_str().unwrap().to_string();
+
+    let (status, _) = put_bytes(
+        router,
+        &format!("/vehicle/v1/components/{component}/updates/{update_id}/bulk-data/manifest"),
+        envelope,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    update_id
+}
+
+#[tokio::test]
+async fn disable_manifest_settles_prepare_and_enacts_at_execute() {
+    // Field failure (S32G3 bench): the 151-byte signed disable manifest uploaded
+    // fine, then PUT /prepare burned SOVDd's whole 30 s `await_flash_settled`
+    // window and returned GatewayTimeout. The manifest declares NO payload part,
+    // so nothing would ever arrive to move `flash_transfer.state` off
+    // Transferring. Drives the real router end to end: upload → prepare (must
+    // settle at once) → execute (must enact the disable).
+    let (router, keys, selector, deact, _backend) =
+        make_disable_router("vm1", BankSet::Vm1, ComponentConfig::default());
+    assert!(
+        !selector.read().unwrap().disabled(BankSet::Vm1),
+        "starts enabled"
+    );
+
+    let update_id =
+        register_and_upload_manifest(&router, "vm1", make_disable_envelope(&keys, "vm1", 5)).await;
+
+    // Prepare must settle immediately — nothing to transfer. The elapsed bound
+    // IS the regression: pre-fix this sat in `await_flash_settled` for 30 s.
+    let started = std::time::Instant::now();
+    let (status, _) = put_empty(
+        &router,
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/prepare"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let prepared = poll_status_until_terminal(&router, "vm1", &update_id).await;
+    assert_eq!(prepared["phase"], "prepare", "prepare: {prepared}");
+    assert_eq!(prepared["status"], "completed", "prepare: {prepared}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "prepare took {:?} — a payload-less manifest must not wait on a transfer",
+        started.elapsed(),
+    );
+
+    // Execute enacts: deactivate + record_disabled(true) in the signed selector.
+    // The banked follow-on validate/activate are no-ops on the already-Activated
+    // transfer a disable parks, so the wire reports a clean execute/completed.
+    let (status, _) = put_empty(
+        &router,
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/execute"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let executed = poll_status_until_terminal(&router, "vm1", &update_id).await;
+    assert_eq!(executed["phase"], "execute", "execute: {executed}");
+    assert_eq!(executed["status"], "completed", "execute: {executed}");
+
+    assert_eq!(
+        deact.0.load(Ordering::SeqCst),
+        1,
+        "deactivate() ran exactly once, at execute"
+    );
+    assert!(
+        selector.read().unwrap().disabled(BankSet::Vm1),
+        "record_disabled(true) persisted in the signed selector"
+    );
+    // And it is visible on the wire the operator reads.
+    let (status, body) = get(&router, "/vehicle/v1/components/vm1/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["x-runtime"]["admin_state"], "disabled",
+        "entity status read-back: {body}"
+    );
+}
+
+#[tokio::test]
+async fn firmware_manifest_still_awaits_its_payload() {
+    // Counter-assertion to the settle above: a manifest that DOES declare a
+    // payload part keeps parking — the transfer stays Transferring until the
+    // part arrives, so `await_flash_settled` still means "the payload landed".
+    let (router, keys, _selector, _deact, backend) =
+        make_disable_router("vm1", BankSet::Vm1, ComponentConfig::default());
+
+    let _update_id = register_and_upload_manifest(
+        &router,
+        "vm1",
+        make_detached_firmware_envelope(&keys, "vm1", 6),
+    )
+    .await;
+
+    let flash = backend.get_flash_status("").await.unwrap();
+    assert_eq!(
+        flash.state,
+        FlashState::Transferring,
+        "a manifest declaring a payload part must stay Transferring until it arrives"
+    );
+}
+
+#[tokio::test]
+async fn singleshot_disable_settles_prepare_and_enacts_at_execute() {
+    // The FIELD shape: `rt` is single-bank, so `update_shape` is "singleshot"
+    // and the execute wire drives finalize → commit_flash, never
+    // validate/activate. Same contract as the banked case — prepare settles at
+    // once, execute enacts and terminates clean.
+    let (router, keys, selector, deact, backend) = make_disable_router(
+        "rt",
+        BankSet::Rt,
+        ComponentConfig {
+            supports_rollback: false,
+            single_bank: true,
+            entity_type: "rt".into(),
+            ..ComponentConfig::default()
+        },
+    );
+    assert_eq!(
+        DiagnosticBackend::update_shape(backend.as_ref()),
+        "singleshot",
+        "fixture must reproduce the field component's shape"
+    );
+
+    let update_id =
+        register_and_upload_manifest(&router, "rt", make_disable_envelope(&keys, "rt", 5)).await;
+
+    let started = std::time::Instant::now();
+    let (status, _) = put_empty(
+        &router,
+        &format!("/vehicle/v1/components/rt/updates/{update_id}/prepare"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let prepared = poll_status_until_terminal(&router, "rt", &update_id).await;
+    assert_eq!(prepared["status"], "completed", "prepare: {prepared}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "prepare took {:?} — a payload-less manifest must not wait on a transfer",
+        started.elapsed(),
+    );
+
+    let (status, _) = put_empty(
+        &router,
+        &format!("/vehicle/v1/components/rt/updates/{update_id}/execute"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let executed = poll_status_until_terminal(&router, "rt", &update_id).await;
+    assert_eq!(executed["phase"], "execute", "execute: {executed}");
+    assert_eq!(executed["status"], "completed", "execute: {executed}");
+
+    assert_eq!(
+        deact.0.load(Ordering::SeqCst),
+        1,
+        "deactivate() ran exactly once, at execute"
+    );
+    assert!(
+        selector.read().unwrap().disabled(BankSet::Rt),
+        "record_disabled(true) persisted in the signed selector"
     );
 }

@@ -2113,7 +2113,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 .unwrap_or(0)
         };
 
-        let validated = crate::streaming::validate_manifest(
+        let mut validated = crate::streaming::validate_manifest(
             &data,
             self.manifest_provider.as_ref(),
             min_security_ver,
@@ -2125,6 +2125,23 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         let has_integrated = !envelope.integrated_payloads.is_empty();
         let manifest = sumo_onboard::manifest::Manifest { envelope };
         let total_components = manifest.component_count();
+        // Detached payload PARTS — not the same thing as components. A part
+        // exists only where the manifest declares an `image_digest`, which is
+        // exactly what `handle_payload_upload` and `reconcile_unpushed` demand
+        // per part. An administrative-disable manifest carries one component and
+        // NO digest, so it owes ZERO uploads; counting components instead told
+        // the session to await a payload that could never arrive.
+        let payload_parts = (0..total_components)
+            .filter(|i| manifest.image_digest(*i).is_some())
+            .count();
+        // Header-only validation is the SHARED metadata extraction and leaves
+        // `disable_target` to whoever has the parsed manifest in hand (as
+        // `SuitProvider::validate` and the streaming path both do). Fill it in
+        // here when the provider had no opinion — `finalize_flash` reads it off
+        // the parked session to route a disable manifest to enact, not install.
+        if validated.disable_target.is_none() {
+            validated.disable_target = manifest.disable_target();
+        }
 
         let id = self.next_id();
 
@@ -2195,13 +2212,21 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
             return Ok(id);
         } else {
-            // Manifest-only — wait for separate payload uploads
-            tracing::info!(
-                manifest_id = %id,
-                components = total_components,
-                "manifest validated — awaiting {} payload(s)",
-                total_components,
-            );
+            // Manifest-only — wait for separate payload uploads.
+            if payload_parts == 0 {
+                tracing::info!(
+                    manifest_id = %id,
+                    components = total_components,
+                    "manifest validated — declares no payload, nothing to transfer",
+                );
+            } else {
+                tracing::info!(
+                    manifest_id = %id,
+                    components = total_components,
+                    "manifest validated — awaiting {} payload(s)",
+                    payload_parts,
+                );
+            }
 
             // Store as package so finalize_flash can find it
             {
@@ -2221,11 +2246,19 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 .unwrap()
                 .insert(id.clone(), UploadedPartLocation::Manifest { upload_sha256 });
 
-            // Set package_id on flash transfer
+            // Set package_id on flash transfer. With no payload part owed there
+            // is nothing left to transfer, so settle the transfer HERE:
+            // no upload will ever arrive to advance it, and the caller's
+            // flash-settled wait would otherwise burn its whole window and time
+            // out. The session still parks in `AwaitingPayload` — that is what
+            // `finalize_flash` reads at execute to route a disable to enact.
             {
                 let mut ft = self.flash_transfer.lock().unwrap();
                 if let Some(ref mut t) = *ft {
                     t.package_id = id.clone();
+                    if payload_parts == 0 {
+                        t.state = FlashState::AwaitingActivation;
+                    }
                 }
             }
 
@@ -2234,7 +2267,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 manifest_bytes: data,
                 validated,
                 next_component: 0,
-                total_components,
+                total_components: payload_parts,
             });
         }
 
@@ -4855,8 +4888,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 transfer.state = FlashState::Validated;
                 Ok(())
             }
+            // Already activated — the activation event has happened, so there is
+            // nothing left to validate and the state must NOT be walked back.
+            // The disable manifest is the path that lands here on a banked
+            // component: it wrote no bank content, and `finalize_flash` already
+            // enacted it and parked the transfer Activated, so the execute
+            // wire's validate step is a no-op. Also makes an execute retry safe.
+            FlashState::Activated => Ok(()),
             other => Err(BackendError::InvalidRequest(format!(
-                "validate() requires AwaitingActivation, Validated, or AwaitingReboot, got {:?}",
+                "validate() requires AwaitingActivation, Validated, AwaitingReboot, or Activated, got {:?}",
                 other
             ))),
         }
@@ -4904,8 +4944,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 };
                 Ok(())
             }
+            // Already activated — nothing left to schedule, and a banked
+            // transfer must NOT be pushed on to AwaitingReboot from here: a
+            // disable manifest wrote no bank content, so arming an owed reboot
+            // for it would gate the node on a reset nothing needs. `finalize_flash`
+            // enacted the disable and parked the transfer Activated; this step is
+            // a no-op. Also makes an execute retry safe.
+            FlashState::Activated => Ok(()),
             other => Err(BackendError::InvalidRequest(format!(
-                "activate() requires Validated, got {:?}",
+                "activate() requires Validated or Activated, got {:?}",
                 other
             ))),
         }
