@@ -43,7 +43,7 @@ impl NodePhase {
 }
 
 /// A snapshot of the node update-transaction state — what the gate decides on and
-/// the `x-sumo-update-state` SOVD resource reports.
+/// the `x-ota-update-state` SOVD resource reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeUpdateState {
     pub phase: NodePhase,
@@ -201,7 +201,7 @@ pub fn admit(
 /// node-level ("uber-component") update state. Owns the in-memory [`Staging`] and
 /// the gate; built once and shared (`Arc`) into each component (for the
 /// `start_flash` gate) and the SOVD layer (reboot / verdict / the
-/// `x-sumo-update-state` report). The durable facts (`Durable` reboot-owed,
+/// `x-ota-update-state` report). The durable facts (`Durable` reboot-owed,
 /// `in_trial`) are supplied by the caller — component-mgr, which holds NV + the
 /// components. See `docs/design/node-update-state.md`.
 #[derive(Default)]
@@ -259,7 +259,7 @@ impl NodeCoordinator {
         admit(session_id, comp, durable, in_trial, &mut staging)
     }
 
-    /// The node's current update-transaction state (for the `x-sumo-update-state`
+    /// The node's current update-transaction state (for the `x-ota-update-state`
     /// resource), combining the durable facts with the in-memory staging.
     pub fn node_update_state(&self, durable: &Durable, in_trial: &[String]) -> NodeUpdateState {
         let staging = self.staging.read().expect("staging lock poisoned");

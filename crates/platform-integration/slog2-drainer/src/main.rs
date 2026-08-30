@@ -161,7 +161,7 @@ impl Segmenter {
     ///
     /// Two metadata tokens sit between the stamp and the message so the durable
     /// timeline preserves BOTH the monotonic runtime (the jump-proof
-    /// `x-sumo-runtime` window axis) AND the severity. The reader's
+    /// `x-log-runtime` window axis) AND the severity. The reader's
     /// `split_leading_stamp` parses the leading 20-char wall stamp; `seg_record`
     /// then peels the uptime (a bare integer) and the priority token in order.
     fn format_line(rec: &DrainRecord) -> String {

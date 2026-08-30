@@ -273,7 +273,7 @@ async fn poll_status_until_awaiting_verdict(
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        if body["x-sumo-substate"].as_str() == Some("awaiting-verdict")
+        if body["x-ota-substate"].as_str() == Some("awaiting-verdict")
             || matches!(body["status"].as_str(), Some("completed") | Some("failed"))
         {
             return body;
@@ -470,13 +470,13 @@ async fn flash_full_suit_flow() {
         "after PUT /prepare: {prepared}"
     );
 
-    // 4. PUT /execute?x-sumo-control=orchestrated — banked ComponentBackend
+    // 4. PUT /execute?x-ota-control=orchestrated — banked ComponentBackend
     //    runs finalize+validate+activate then pauses at
     //    substate=awaiting-verdict.
     let (status, _) = put_empty(
         &router,
         &format!(
-            "/vehicle/v1/components/vm1/updates/{update_id}/execute?x-sumo-control=orchestrated"
+            "/vehicle/v1/components/vm1/updates/{update_id}/execute?x-ota-control=orchestrated"
         ),
     )
     .await;
@@ -484,7 +484,7 @@ async fn flash_full_suit_flow() {
     let paused = poll_status_until_awaiting_verdict(&router, "vm1", &update_id).await;
     assert_eq!(paused["phase"], "execute");
     assert_eq!(paused["status"], "inProgress");
-    assert_eq!(paused["x-sumo-substate"], "awaiting-verdict");
+    assert_eq!(paused["x-ota-substate"], "awaiting-verdict");
 
     // 5. PUT /x-ota-commit — Phase B vendor verb.  Wakes the paused
     //    execute task; calls backend.commit_flash; transitions to
@@ -498,7 +498,7 @@ async fn flash_full_suit_flow() {
     let final_body = poll_status_until_terminal(&router, "vm1", &update_id).await;
     assert_eq!(final_body["phase"], "execute");
     assert_eq!(final_body["status"], "completed");
-    assert!(final_body.get("x-sumo-substate").is_none());
+    assert!(final_body.get("x-ota-substate").is_none());
 }
 
 // ============================================================
@@ -657,7 +657,7 @@ async fn run_spec_cycle(
         router,
         &format!(
             "/vehicle/v1/components/{component}/updates/{update_id}\
-             /execute?x-sumo-control=orchestrated"
+             /execute?x-ota-control=orchestrated"
         ),
     )
     .await;
@@ -691,7 +691,7 @@ async fn ota_rollback_via_sovd() {
     assert_eq!(final_body["phase"], "execute");
     assert_eq!(final_body["status"], "failed");
     assert_eq!(
-        final_body["error"]["error_code"], "x-sumo-verdict-rollback",
+        final_body["error"]["error_code"], "x-ota-verdict-rollback",
         "rollback attribution: {final_body}"
     );
 }

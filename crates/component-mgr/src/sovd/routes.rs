@@ -21,18 +21,18 @@ use nv_store::store::NvStore;
 use nv_store::types::NUM_BANK_SETS;
 use sovd_core::{OperationExecution, OperationStatus};
 
-/// `GET /vehicle/v1/data/x-sumo-update-state` — the node's update-transaction
+/// `GET /vehicle/v1/data/x-ota-update-state` — the node's update-transaction
 /// state (phase + the components involved), for the orchestrator to poll before
 /// each campaign step and refuse to proceed while a prior transaction is
 /// unresolved. Derived from the shared NV reboot-owed record (`NvUpdateSession`)
-/// and per-bank `committed`, plus the coordinator's in-memory staging. An `x-sumo`
+/// and per-bank `committed`, plus the coordinator's in-memory staging. An `x-ota`
 /// vendor route (sumo-mm, not SOVDd); see `docs/design/node-update-state.md`.
 pub fn update_state_router<D: BlockDevice + Send + 'static>(
     nv: Arc<Mutex<NvStore<D>>>,
     coord: Arc<NodeCoordinator>,
 ) -> Router {
     Router::new().route(
-        "/vehicle/v1/data/x-sumo-update-state",
+        "/vehicle/v1/data/x-ota-update-state",
         get(move || {
             let nv = nv.clone();
             let coord = coord.clone();
@@ -41,7 +41,7 @@ pub fn update_state_router<D: BlockDevice + Send + 'static>(
     )
 }
 
-/// The `x-sumo-update-state` resource body — the node's update-transaction
+/// The `x-ota-update-state` resource body — the node's update-transaction
 /// phase plus the component ids the transaction covers.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct UpdateStateResponse {
@@ -49,12 +49,12 @@ pub(crate) struct UpdateStateResponse {
     pub components: Vec<String>,
 }
 
-/// `GET /vehicle/v1/data/x-sumo-update-state` — the handler behind
+/// `GET /vehicle/v1/data/x-ota-update-state` — the handler behind
 /// [`update_state_router`].
 #[utoipa::path(
     get,
-    path = "/vehicle/v1/data/x-sumo-update-state",
-    tag = "x-sumo-vendor-extension",
+    path = "/vehicle/v1/data/x-ota-update-state",
+    tag = "x-extensions",
     responses(
         (status = 200, description = "The node's update-transaction phase and the components it covers.", body = UpdateStateResponse),
     ),
@@ -72,7 +72,7 @@ pub(crate) async fn update_state<D: BlockDevice>(
 
 /// Derive the node's update-transaction state from NV + the coordinator's
 /// in-memory staging — the shared derivation behind both the
-/// `x-sumo-update-state` resource and the commit gate ([`handle_verdict`]).
+/// `x-ota-update-state` resource and the commit gate ([`handle_verdict`]).
 /// Translates the durable reboot-owed bitmask and per-bank `committed` flags
 /// into component labels, then folds in the coordinator's staging.
 fn derive_node_update_state<D: BlockDevice>(
@@ -115,16 +115,16 @@ fn derive_node_update_state<D: BlockDevice>(
 ///          `EC-P256`/`AES-256`/…) AND the monotonic counter (`kind` =
 ///          `monotonic`). Public-only; `public_key_der_base64` is the SPKI for
 ///          asymmetric key slots, `null` for symmetric keys and the counter.
-///   `POST /vehicle/v1/components/hsm/operations/x-sumo-csr/executions`
+///   `POST /vehicle/v1/components/hsm/operations/x-csr/executions`
 ///        body `{ "key_id": "<slot>" }` → 200 ISO 17978-3 §7.14 operation
 ///        execution; `result.csr_der_base64` is the PKCS#10 CSR.
 ///
 /// `data/keys` is a SOVD **data** resource and returns only non-compromising
 /// metadata — never key material (the keystore manifest holds no private bytes).
 /// Generating a CSR **signs** (proof-of-possession), so it's an **operation**,
-/// not a data read — a `POST …/operations/x-sumo-csr/executions` keyed on the
+/// not a data read — a `POST …/operations/x-csr/executions` keyed on the
 /// slot, addressing any device-generated key (`tls-identity`, `device-decrypt`,
-/// …). Both are `x-sumo` vendor extensions (neither is SOVD-native) and live in
+/// …). Both are `x-` vendor extensions (neither is SOVD-native) and live in
 /// sumo-mm, not SOVDd, per the three-layer rule. The signed cert comes back via
 /// the SUIT keystore update (one channel — `feedback_hsm_one_channel_key_material.md`).
 ///
@@ -142,7 +142,7 @@ pub fn hsm_router(machine: Arc<dyn Machine>) -> Router {
             }),
         )
         .route(
-            "/vehicle/v1/components/hsm/operations/x-sumo-csr/executions",
+            "/vehicle/v1/components/hsm/operations/x-csr/executions",
             post(move |Json(req): Json<CsrRequest>| {
                 let machine = csr.clone();
                 async move { hsm_csr_execute(machine, req).await }
@@ -173,7 +173,7 @@ pub(crate) struct HsmKeysResponse {
 #[utoipa::path(
     get,
     path = "/vehicle/v1/components/hsm/data/keys",
-    tag = "x-sumo-vendor-extension",
+    tag = "x-extensions",
     responses(
         (status = 200, description = "The HSM key-slot inventory (public metadata only; never key material).", body = HsmKeysResponse),
         (status = 503, description = "No HSM component, or the HSM keys are unavailable.", body = String),
@@ -229,13 +229,13 @@ pub(crate) async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::
     }
 }
 
-/// Body of the `x-sumo-csr` operation: which key slot to generate a CSR for.
+/// Body of the `x-csr` operation: which key slot to generate a CSR for.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub(crate) struct CsrRequest {
     key_id: String,
 }
 
-/// The `result` of a successful `x-sumo-csr` execution: the requested slot and
+/// The `result` of a successful `x-csr` execution: the requested slot and
 /// its PKCS#10 CSR (DER, base64).
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct CsrResult {
@@ -243,12 +243,12 @@ pub(crate) struct CsrResult {
     pub csr_der_base64: String,
 }
 
-/// `POST …/hsm/operations/x-sumo-csr/executions` — sign a PKCS#10 CSR for the
+/// `POST …/hsm/operations/x-csr/executions` — sign a PKCS#10 CSR for the
 /// requested slot and return it (DER, base64) in an operation execution.
 #[utoipa::path(
     post,
-    path = "/vehicle/v1/components/hsm/operations/x-sumo-csr/executions",
-    tag = "x-sumo-vendor-extension",
+    path = "/vehicle/v1/components/hsm/operations/x-csr/executions",
+    tag = "x-extensions",
     request_body = CsrRequest,
     responses(
         (status = 200, description = "CSR generated; returned in an ISO 17978-3 §7.14 operation execution whose `result` is a CsrResult.", body = sovd_core::OperationExecution),
@@ -260,7 +260,7 @@ pub(crate) async fn hsm_csr_execute(
     machine: Arc<dyn Machine>,
     req: CsrRequest,
 ) -> axum::response::Response {
-    const OP_ID: &str = "x-sumo-csr";
+    const OP_ID: &str = "x-csr";
     let Some(comp) = machine.component("hsm") else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -318,15 +318,15 @@ pub(crate) async fn hsm_csr_execute(
     }
 }
 
-/// Build the `x-sumo-id` route.
+/// Build the `x-ecu-id` route.
 ///
-/// `GET /vehicle/v1/components/hsm/x-sumo-id` → 200, body = the ECU's id (its
+/// `GET /vehicle/v1/components/hsm/x-ecu-id` → 200, body = the ECU's id (its
 /// HSM device-key thumbprint, lowercase hex) — the token `aud`. Unlike the CSR
 /// this is read-only identity, served whether or not the device is provisioned.
 /// Vendor extension per ISO 17978-3 §5.3.6.
 pub fn device_id_router(machine: Arc<dyn Machine>) -> Router {
     Router::new().route(
-        "/vehicle/v1/components/hsm/x-sumo-id",
+        "/vehicle/v1/components/hsm/x-ecu-id",
         get(move || {
             let machine = machine.clone();
             async move { device_id(machine).await }
@@ -334,12 +334,12 @@ pub fn device_id_router(machine: Arc<dyn Machine>) -> Router {
     )
 }
 
-/// `GET /vehicle/v1/components/hsm/x-sumo-id` — the ECU's id; see
+/// `GET /vehicle/v1/components/hsm/x-ecu-id` — the ECU's id; see
 /// [`device_id_router`].
 #[utoipa::path(
     get,
-    path = "/vehicle/v1/components/hsm/x-sumo-id",
-    tag = "x-sumo-vendor-extension",
+    path = "/vehicle/v1/components/hsm/x-ecu-id",
+    tag = "x-extensions",
     responses(
         (status = 200, description = "The ECU's id — its HSM device-key thumbprint (lowercase hex), the token `aud`. Served whether or not the device is provisioned.", content_type = "text/plain", body = String),
         (status = 503, description = "No HSM component, or the device id is unavailable.", body = String),
@@ -384,8 +384,8 @@ impl Verdict {
     /// synchronous, so there is no execution resource to GET).
     fn op_id(self) -> &'static str {
         match self {
-            Verdict::Commit => "x-sumo-commit-trials",
-            Verdict::Rollback => "x-sumo-rollback-trials",
+            Verdict::Commit => "x-ota-commit-trials",
+            Verdict::Rollback => "x-ota-rollback-trials",
         }
     }
 
@@ -560,7 +560,7 @@ async fn handle_verdict<D: BlockDevice>(
     // that phase the armed bank has not been booted (a trial boot can fall back
     // to the recovery bank — selector/armed state ≠ running), so committing
     // would lock in a bank the node never ran. `RebootPending` is derived from
-    // NV exactly like the `x-sumo-update-state` wire, and is always reachable.
+    // NV exactly like the `x-ota-update-state` wire, and is always reachable.
     // Rollback is the recovery path and is never gated here.
     if let Verdict::Commit = verdict {
         if derive_node_update_state(&nv, &coord).phase == NodePhase::RebootPending {
@@ -586,8 +586,8 @@ async fn handle_verdict<D: BlockDevice>(
 ///
 /// Wire (ISO 17978-3 §7.14 operation executions, at the **entity root**):
 ///
-///   `POST /vehicle/v1/operations/x-sumo-commit-trials/executions`
-///   `POST /vehicle/v1/operations/x-sumo-rollback-trials/executions`
+///   `POST /vehicle/v1/operations/x-ota-commit-trials/executions`
+///   `POST /vehicle/v1/operations/x-ota-rollback-trials/executions`
 ///
 /// The orchestrator issues ONE verdict per node per campaign step — the update
 /// *session* is the commit unit, never a single component. Entity-root
@@ -597,12 +597,12 @@ async fn handle_verdict<D: BlockDevice>(
 /// to re-attach after the node reboot — membership is the NV-derived in-trial
 /// set, identical before and after the reboot. Vendor extensions live here in
 /// sumo-mm, not SOVDd (the three-layer rule, like `csr_router`).
-/// `POST /vehicle/v1/operations/x-sumo-commit-trials/executions` — the node
+/// `POST /vehicle/v1/operations/x-ota-commit-trials/executions` — the node
 /// commit verdict; see [`node_verdict_router`] for the wire contract.
 #[utoipa::path(
     post,
-    path = "/vehicle/v1/operations/x-sumo-commit-trials/executions",
-    tag = "x-sumo-vendor-extension",
+    path = "/vehicle/v1/operations/x-ota-commit-trials/executions",
+    tag = "x-extensions",
     request_body(content = VerdictRequest, description = "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape)."),
     responses(
         (status = 200, description = "Verdict applied across the node's in-trial components (`result.committed` / `skipped`).", body = VerdictExecution),
@@ -619,12 +619,12 @@ pub(crate) async fn commit_trials<D: BlockDevice>(
     handle_verdict(machine, nv, coord, Verdict::Commit, req).await
 }
 
-/// `POST /vehicle/v1/operations/x-sumo-rollback-trials/executions` — the node
+/// `POST /vehicle/v1/operations/x-ota-rollback-trials/executions` — the node
 /// rollback verdict; see [`node_verdict_router`] for the wire contract.
 #[utoipa::path(
     post,
-    path = "/vehicle/v1/operations/x-sumo-rollback-trials/executions",
-    tag = "x-sumo-vendor-extension",
+    path = "/vehicle/v1/operations/x-ota-rollback-trials/executions",
+    tag = "x-extensions",
     request_body(content = VerdictRequest, description = "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape)."),
     responses(
         (status = 200, description = "Verdict applied across the node's in-trial components (`result.rolled_back` / `skipped`).", body = VerdictExecution),
@@ -650,7 +650,7 @@ pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
     let commit_coord = coord.clone();
     Router::new()
         .route(
-            "/vehicle/v1/operations/x-sumo-commit-trials/executions",
+            "/vehicle/v1/operations/x-ota-commit-trials/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = commit_machine.clone();
                 let nv = commit_nv.clone();
@@ -659,7 +659,7 @@ pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
             }),
         )
         .route(
-            "/vehicle/v1/operations/x-sumo-rollback-trials/executions",
+            "/vehicle/v1/operations/x-ota-rollback-trials/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = machine.clone();
                 let nv = nv.clone();
@@ -691,7 +691,7 @@ mod tests {
     use nv_store::types::{NvBootState, NvUpdateSession};
     use tower::ServiceExt;
 
-    const COMMIT_URI: &str = "/vehicle/v1/operations/x-sumo-commit-trials/executions";
+    const COMMIT_URI: &str = "/vehicle/v1/operations/x-ota-commit-trials/executions";
 
     /// Minimal `Component` whose `activation_state` is fixed at construction
     /// and which counts commit/rollback calls. Only `id` + `capabilities` are
@@ -795,7 +795,7 @@ mod tests {
         Arc::new(Mutex::new(nv))
     }
 
-    /// Idle: everything committed, no session (`x-sumo-update-state` = Idle).
+    /// Idle: everything committed, no session (`x-ota-update-state` = Idle).
     fn nv_idle() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
         nv_with(NvBootState::default(), None)
     }

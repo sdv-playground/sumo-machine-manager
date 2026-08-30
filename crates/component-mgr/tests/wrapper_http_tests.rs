@@ -332,7 +332,7 @@ async fn fw_version_reads_real_value_when_listed() {
     }
 }
 
-/// Without a committed signed IVD manifest, the vendor `x-sumo-installed-manifest`
+/// Without a committed signed IVD manifest, the vendor `x-ota-installed-manifest`
 /// parameter is absent from the `/data` list AND `GET /data/{id}` 404s — the
 /// spec-correct "unknown parameter" case (consistent list/read).
 #[tokio::test]

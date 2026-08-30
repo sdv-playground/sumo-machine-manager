@@ -41,18 +41,18 @@ use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware
 use crate::ota;
 
 /// Vendor SOVD data-parameter id for the committed bank's signed IVD
-/// manifest. `x-sumo-` prefix per ISO 17978-3 Table 70 vendor-extension
+/// manifest. `x-ota-` prefix per ISO 17978-3 Table 70 vendor-extension
 /// namespacing — the route is plain `/data/{id}` (SOVDd stays spec-pure /
 /// format-agnostic); the vendor semantics live entirely here in component-mgr.
-pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-sumo-installed-manifest";
+pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-ota-installed-manifest";
 
 /// Vendor SOVD data-parameter id for this component's **update-mode** — how it
 /// updates: A/B-banked + trial + rollback, vs single-bank write-through &
 /// irreversible (the HSM keystore). A STABLE per-component config property,
 /// readable any time (even pre-flash), so an offboard twin can sync
-/// rollback-capability the same way it syncs firmware identity. Same `x-sumo-`
+/// rollback-capability the same way it syncs firmware identity. Same `x-ota-`
 /// vendor namespace (SOVDd stays spec-pure; the semantics live here in component-mgr).
-pub const UPDATE_MODE_PARAM_ID: &str = "x-sumo-update-mode";
+pub const UPDATE_MODE_PARAM_ID: &str = "x-ota-update-mode";
 
 /// Vendor SOVD operation id for **attest-time**: push a SoftwareAuthority-signed
 /// SUIT manifest so the device ratchets its safe-time floor from the manifest's
@@ -62,7 +62,7 @@ pub const UPDATE_MODE_PARAM_ID: &str = "x-sumo-update-mode";
 /// (`docs/safe-time-floor.md`). Verify-only: no payload, no bank touch; monotonic,
 /// so an older-than-floor manifest is a harmless no-op. Device-global — advertised
 /// on the host/device component (the floor + clock are shared singletons).
-pub const ATTEST_TIME_OP_ID: &str = "x-sumo-attest-time";
+pub const ATTEST_TIME_OP_ID: &str = "x-attest-time";
 
 // ---------------------------------------------------------------------------
 // Stored package (validated SUIT envelope)
@@ -438,9 +438,9 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// RT component, wrapping `m7loader -q`). VMs leave this as None
     /// and use the vm-service HTTP path instead.
     health_probe: Option<Arc<dyn HealthProbe>>,
-    /// The node's per-boot nonce (`/vehicle/v1/status/x-sumo-boot-id`), injected
+    /// The node's per-boot nonce (`/vehicle/v1/status/x-boot-id`), injected
     /// by the binary via [`with_node_boot_id`](Self::with_node_boot_id). Surfaced
-    /// in `x-sumo-runtime.node_boot_id` on EVERY component's status so the offboard
+    /// in `x-runtime.node_boot_id` on EVERY component's status so the offboard
     /// flash gate has an UNMISSABLE reboot witness: it changes on every node reboot
     /// (fresh supernova process) and is durable state, unlike the transient SOVD
     /// down→up window a fast reboot can slip through. The per-component heartbeat
@@ -465,7 +465,7 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// Signature-verified IVD manifest of the RUNNING/committed bank,
     /// cached so the diagnostics reads that need it — the identity-DID
     /// overlay (`verified_bank_identity`) and the vendor
-    /// `x-sumo-installed-manifest` data parameter — share a single verify
+    /// `x-ota-installed-manifest` data parameter — share a single verify
     /// pass rather than re-reading + re-verifying CBOR on every SOVD call.
     ///
     /// `(bank, installed)`: the bank the cached firmware was read for, so a
@@ -731,8 +731,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         self
     }
 
-    /// Inject the node's per-boot nonce (`/vehicle/v1/status/x-sumo-boot-id`).
-    /// Surfaced in `x-sumo-runtime.node_boot_id` so the offboard flash gate has an
+    /// Inject the node's per-boot nonce (`/vehicle/v1/status/x-boot-id`).
+    /// Surfaced in `x-runtime.node_boot_id` so the offboard flash gate has an
     /// unmissable reboot witness (changes every node reboot; durable, unlike the
     /// transient down→up window a fast reboot slips through). The binary hands the
     /// SAME nonce to every component.
@@ -1043,7 +1043,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // write (`NvWriteGuard::drop`), so dropping it here covers
         // install/commit/ecu_reset. The identity overlay below re-populates
         // it via `verified_bank_identity`; the vendor
-        // `x-sumo-installed-manifest` reader re-populates lazily on demand.
+        // `x-ota-installed-manifest` reader re-populates lazily on demand.
         *self
             .verified_manifest_cache
             .lock()
@@ -1162,7 +1162,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         self.bank_provider.reset_kind()
     }
 
-    /// Render this component's update-mode as the `x-sumo-update-mode` JSON
+    /// Render this component's update-mode as the `x-ota-update-mode` JSON
     /// value: `banked` (A/B + trial + rollback) vs `singleshot` (single-bank,
     /// write-through, irreversible — the HSM keystore), plus the flash-cap
     /// fields an offboard twin keys its composition guard on. Stable config —
@@ -1525,7 +1525,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// in place but never fires.
     ///
     /// Used for the RUNNING/committed bank: `read_data` of the identity DIDs
-    /// and the vendor `x-sumo-installed-manifest` parameter both pass
+    /// and the vendor `x-ota-installed-manifest` parameter both pass
     /// `*self.running_bank`, the same bank whose identity overlay is built in
     /// `refresh_did_cache_locked`.
     fn verified_bank_manifest(&self, bank: Bank) -> Option<Arc<InstalledFirmware>> {
@@ -1727,7 +1727,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // activation reboot (the durable half — survives a power cycle, unlike the
         // in-memory flash state, which is how a singleshot rt slipped through) OR
         // it owes a commit/rollback verdict for a component still in trial. Both
-        // sets are derived from the same NV facts the `x-sumo-update-state` wire
+        // sets are derived from the same NV facts the `x-ota-update-state` wire
         // reports (`node_reboot_owed` + `node_in_trial_labels`), so the gate
         // refuses exactly what that resource shows unresolved — with reboot-owed
         // taking precedence, so an armed-but-not-yet-rebooted component refuses as
@@ -2503,7 +2503,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
 /// The node's in-trial component set — every bank set whose active bank is not
 /// yet committed (`committed == false`), labelled via the coordinator. Shared by
-/// the `x-sumo-update-state` wire (`sovd::routes::derive_node_update_state`) and
+/// the `x-ota-update-state` wire (`sovd::routes::derive_node_update_state`) and
 /// the node flash gate (`ComponentBackend::ensure_flash_can_start`) so both name
 /// exactly the same in-trial components — the gate refuses precisely what that
 /// resource reports unresolved. The reboot-owed precedence inside
@@ -2608,9 +2608,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
 
         // Bank + manifest presence are resolved ONCE here and reused for both
         // the identity-DID list gate (below) and the vendor
-        // `x-sumo-installed-manifest` advertisement (further down) — same
+        // `x-ota-installed-manifest` advertisement (further down) — same
         // authority `read_data` / the cache overlay use. `verified_bank_manifest`
-        // memoises per-bank, so the later x-sumo check is a cache hit.
+        // memoises per-bank, so the later x-ota check is a cache hit.
         let serving = self.serving_bank();
         let manifest_present = self.verified_bank_manifest(serving).is_some();
 
@@ -2901,7 +2901,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// [`LogSource::GuestAgent`] source offers a single `logs` category (its
     /// downloadable log files — host-local and/or guest). HostDumps-only
     /// components fall back to the trait default (empty).
-    /// `GET /logs/sources` — the per-source catalog (x-sumo). Expands the
+    /// `GET /logs/sources` — the per-source catalog (vendor extension). Expands the
     /// device-internal `LogSource` set into the wire `LogSourceInfo` list a client
     /// enumerates then reads one at a time (never a cross-source merge). Dynamic:
     /// `HostFiles` globs are RESOLVED here, so one glob config yields one entry per
@@ -2914,7 +2914,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 // fields.emitter). cursor:false — no reboot-safe ring cursor yet
                 // (tasks/qnx-log-segments-design.md); emitters:[] — enumerating
                 // them is a full ring walk, deferred (a client discovers them via
-                // fields.emitter / x-sumo-emitter-exclude).
+                // fields.emitter / x-log-emitter-exclude).
                 LogSource::Slog2 => out.push(LogSourceInfo {
                     name: SLOG2_SOURCE.to_string(),
                     kind: LogSourceKind::Journal,
@@ -3508,14 +3508,14 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             // authority the VM boots from), not the stale `running_bank` cache.
             if param_id == INSTALLED_MANIFEST_PARAM_ID {
                 let serving = self.serving_bank();
-                tracing::info!(component = %self.entity_info.id, serving_bank = ?serving, running_bank = ?*self.running_bank.lock().unwrap(), "ivd-route: read_data x-sumo-installed-manifest requested");
+                tracing::info!(component = %self.entity_info.id, serving_bank = ?serving, running_bank = ?*self.running_bank.lock().unwrap(), "ivd-route: read_data x-ota-installed-manifest requested");
                 let vm = match self.verified_bank_manifest(serving) {
                     Some(vm) => {
                         tracing::info!(
                             component = %self.entity_info.id,
                             bank = ?serving,
                             gen = vm.gen,
-                            "ivd-route: read_data x-sumo-installed-manifest served",
+                            "ivd-route: read_data x-ota-installed-manifest served",
                         );
                         vm
                     }
@@ -3523,7 +3523,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                         tracing::info!(
                             component = %self.entity_info.id,
                             bank = ?serving,
-                            "ivd-route: read_data x-sumo-installed-manifest 404 (NotInstalled)",
+                            "ivd-route: read_data x-ota-installed-manifest 404 (NotInstalled)",
                         );
                         return Err(BackendError::EntityNotFound(format!(
                             "{INSTALLED_MANIFEST_PARAM_ID}: no committed IVD manifest for {} bank {:?}",
@@ -3725,7 +3725,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     // --- Operations ---
 
     /// Cheap discoverability: the host/device component advertises the vendor
-    /// `x-sumo-attest-time` op (id + name + href); everything else keeps the
+    /// `x-attest-time` op (id + name + href); everything else keeps the
     /// empty list. That op's execution is served by `start_operation`.
     async fn list_operations(&self) -> BackendResult<Vec<OperationInfo>> {
         let mut ops = Vec::new();
@@ -4914,7 +4914,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// Read the entity's runtime status — ISO 17978-3 §7.19.2. Liveness comes
     /// from the guest heartbeat (`ready` = running + a fresh heartbeat; otherwise
     /// `notReady`); non-guest components (no vm-service addr) are present-by-
-    /// definition → `ready`. The vendor `x-sumo-runtime` block (§5.4.5) carries
+    /// definition → `ready`. The vendor `x-runtime` block (§5.4.5) carries
     /// the heartbeat `boot_id` (a per-lifetime nonce — the orchestrator's reboot
     /// witness: a *changed* boot_id proves a fresh guest lifetime, including a
     /// node reboot, which `boot_count` cannot witness), the heartbeat `hb_seq`
@@ -5019,7 +5019,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             }
         }
         let mut extensions = serde_json::Map::new();
-        extensions.insert("x-sumo-runtime".into(), serde_json::Value::Object(runtime));
+        extensions.insert("x-runtime".into(), serde_json::Value::Object(runtime));
 
         Ok(EntityStatusBody {
             status,
@@ -5622,7 +5622,7 @@ fn identity_to_did_bytes(identity: &FirmwareIdentity) -> Vec<(u16, Vec<u8>)> {
         .collect()
 }
 
-/// Render the installed firmware as the `x-sumo-installed-manifest` JSON
+/// Render the installed firmware as the `x-ota-installed-manifest` JSON
 /// body: the signed identity + per-file `(path, sha256-hex)` inventory + the
 /// base64 of the raw signature and manifest bytes (so a SW-mapping tool can
 /// re-verify the device signature independently).
@@ -5713,7 +5713,7 @@ pub struct GuestHealth {
     pub guest_state: u32,
     pub hb_seq: u32,
     /// Random per-guest-lifetime id from the heartbeat wire format. Surfaced in
-    /// `/status` `x-sumo-runtime.boot_id` — the orchestrator's reboot witness: a
+    /// `/status` `x-runtime.boot_id` — the orchestrator's reboot witness: a
     /// *changed* boot_id confirms a fresh post-reset lifetime, not stale shmem
     /// from the previous one (qvm-shmem regions persist across stop/start).
     pub boot_id: u32,
@@ -5735,7 +5735,7 @@ pub struct GuestHealth {
 pub trait HealthProbe: Send + Sync {
     fn probe(&self) -> Option<GuestHealth>;
 
-    /// Extra per-component metadata for the `/status` `x-sumo-runtime` block —
+    /// Extra per-component metadata for the `/status` `x-runtime` block —
     /// the ONE uniform per-component metadata node. Probe-specific facts
     /// (e.g. the M7 platform-loader counters) ride here; never a bespoke
     /// per-component route. Standard fields win on key collision, and the
@@ -5822,9 +5822,9 @@ struct AgentLogRecord {
     message: String,
     source: String,
     /// Monotonic runtime, seconds since the guest's boot (journald
-    /// `__MONOTONIC_TIMESTAMP`). The `x-sumo-runtime` window axis. Absent on a
+    /// `__MONOTONIC_TIMESTAMP`). The `x-log-runtime` window axis. Absent on a
     /// guest agent that doesn't emit it yet → `None`.
-    #[serde(default, rename = "x-sumo-uptime-secs")]
+    #[serde(default, rename = "x-log-uptime-secs")]
     uptime_secs: Option<u64>,
 }
 
@@ -5891,10 +5891,10 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
         qs.push(format!("source={}", qenc(s)));
     }
     if let Some(e) = &filter.emitter {
-        qs.push(format!("x-sumo-emitter={}", qenc(e)));
+        qs.push(format!("x-log-emitter={}", qenc(e)));
     }
     if let Some(e) = &filter.emitter_exclude {
-        qs.push(format!("x-sumo-emitter-exclude={}", qenc(e)));
+        qs.push(format!("x-log-emitter-exclude={}", qenc(e)));
     }
     if let Some(p) = &filter.pattern {
         qs.push(format!("pattern={}", qenc(p)));
@@ -5909,9 +5909,9 @@ async fn query_log_agent(url: &str, filter: &LogFilter) -> Option<Vec<LogEntry>>
         qs.push(format!("until={}", qenc(&t.to_rfc3339())));
     }
     // Runtime window (jump-proof): forward as seconds; the guest agent parses
-    // x-sumo-runtime and applies the boot-scoped monotonic window.
+    // x-log-runtime and applies the boot-scoped monotonic window.
     if let Some(secs) = filter.runtime_secs {
-        qs.push(format!("x-sumo-runtime={secs}"));
+        qs.push(format!("x-log-runtime={secs}"));
     }
     let target = if qs.is_empty() {
         format!("{base_path}/logs")
@@ -6060,10 +6060,10 @@ async fn query_log_agent_paged(url: &str, filter: &LogFilter) -> Option<LogPage>
         qs.push(format!("source={}", qenc(s)));
     }
     if let Some(e) = &filter.emitter {
-        qs.push(format!("x-sumo-emitter={}", qenc(e)));
+        qs.push(format!("x-log-emitter={}", qenc(e)));
     }
     if let Some(e) = &filter.emitter_exclude {
-        qs.push(format!("x-sumo-emitter-exclude={}", qenc(e)));
+        qs.push(format!("x-log-emitter-exclude={}", qenc(e)));
     }
     if let Some(p) = &filter.pattern {
         qs.push(format!("pattern={}", qenc(p)));
@@ -6078,7 +6078,7 @@ async fn query_log_agent_paged(url: &str, filter: &LogFilter) -> Option<LogPage>
     // the boot-scoped monotonic window on its /logs/page too. (The paged proxy
     // historically forwarded NO time window — this closes that gap for runtime.)
     if let Some(secs) = filter.runtime_secs {
-        qs.push(format!("x-sumo-runtime={secs}"));
+        qs.push(format!("x-log-runtime={secs}"));
     }
     let target = if qs.is_empty() {
         format!("{base_path}/logs/page")
@@ -7266,7 +7266,7 @@ fn slog2_segments_logs(
 }
 
 /// Paged read of the persisted slog2 segments — the reboot-safe `<seq>:<offset>`
-/// cursor path (`GET /logs/sources/slog2` with `x-sumo-after`).
+/// cursor path (`GET /logs/sources/slog2` with `x-log-after`).
 fn slog2_segments_paged(
     dir: &str,
     stem: &str,
@@ -7987,7 +7987,7 @@ mod identity_tests {
     }
 
     // -----------------------------------------------------------------
-    // Vendor data parameter: x-sumo-installed-manifest
+    // Vendor data parameter: x-ota-installed-manifest
     // -----------------------------------------------------------------
 
     #[tokio::test]
@@ -8003,7 +8003,7 @@ mod identity_tests {
         let p = params
             .iter()
             .find(|p| p.id == INSTALLED_MANIFEST_PARAM_ID)
-            .expect("x-sumo-installed-manifest must be listed when a manifest exists");
+            .expect("x-ota-installed-manifest must be listed when a manifest exists");
         assert!(p.read_only);
         assert_eq!(p.category, Some(DataCategory::IdentData));
         assert!(p.did.is_none());
@@ -8518,13 +8518,13 @@ mod bank_provider_injection_tests {
     async fn update_mode_param_banked_for_default_component() {
         // Default backend: dual-bank VM, NO firmware flashed. The vendor param
         // is advertised + readable unconditionally (stable config), proving it
-        // works pre-flash — unlike x-sumo-installed-manifest which 404s.
+        // works pre-flash — unlike x-ota-installed-manifest which 404s.
         let b = backend();
         let params = b.list_parameters().await.unwrap();
         let p = params
             .iter()
             .find(|p| p.id == UPDATE_MODE_PARAM_ID)
-            .expect("x-sumo-update-mode must be listed even with no committed manifest");
+            .expect("x-ota-update-mode must be listed even with no committed manifest");
         assert!(p.read_only);
         assert!(p.did.is_none());
 
@@ -8547,7 +8547,7 @@ mod bank_provider_injection_tests {
         let params = b.list_parameters().await.unwrap();
         assert!(
             params.iter().any(|p| p.id == UPDATE_MODE_PARAM_ID),
-            "x-sumo-update-mode must be listed for the HSM component too"
+            "x-ota-update-mode must be listed for the HSM component too"
         );
         let vals = b
             .read_data(&[UPDATE_MODE_PARAM_ID.to_string()])
@@ -11562,7 +11562,7 @@ mod time_floor_ratchet_tests {
         );
     }
 
-    // --- Piece 2: the x-sumo-attest-time SOVD operation ---------------------
+    // --- Piece 2: the x-attest-time SOVD operation ---------------------
     use crate::suit_provider::SuitProvider;
     use sovd_core::DiagnosticBackend;
     use sumo_offboard::{keygen, ImageManifestBuilder};
@@ -11618,7 +11618,7 @@ mod time_floor_ratchet_tests {
         let ops = backend.list_operations().await.unwrap();
         assert!(
             ops.iter().any(|o| o.id == ATTEST_TIME_OP_ID),
-            "host component with an HSM advertises x-sumo-attest-time"
+            "host component with an HSM advertises x-attest-time"
         );
     }
 

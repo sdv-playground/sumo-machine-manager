@@ -515,7 +515,7 @@ async fn main() {
         .await
     } else {
         let state = sovd_api::AppState::new(backends);
-        // Advertise the x-sumo vendor ops in the merged §7.5 capability
+        // Advertise the vendor extension ops in the merged §7.5 capability
         // description (feature off until the sovd-api hook is on the pinned dep).
         #[cfg(feature = "sovd-docs-hook")]
         let state =

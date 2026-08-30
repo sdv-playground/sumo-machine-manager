@@ -53,7 +53,7 @@ struct Cli {
     #[arg(long, default_value_t = 900)]
     ttl_secs: u64,
     /// `boot_id` claim — binds the token to the device's current boot (§7.1
-    /// freshness). Omit for no binding; read the live value from x-sumo-boot-id.
+    /// freshness). Omit for no binding; read the live value from x-boot-id.
     #[arg(long)]
     boot_id: Option<String>,
     /// `epoch` claim — binds a VEHICLE-WIDE token to the vehicle-epoch (§7.3

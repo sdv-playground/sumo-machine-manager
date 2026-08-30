@@ -49,7 +49,7 @@ pub struct InstalledFile {
 }
 
 /// The verified installed firmware for a bank — what the engine serves as the
-/// `x-sumo-installed-manifest` data parameter and the identData DIDs.
+/// `x-ota-installed-manifest` data parameter and the identData DIDs.
 #[derive(Debug, Clone)]
 pub struct InstalledFirmware {
     pub bank: Bank,

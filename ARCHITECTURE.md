@@ -336,11 +336,11 @@ The engine steps (`ComponentBackend` + `ota.rs`):
 
 `FlashState` (sovd-core) is the 13-state dual-bank machine; single-bank collapses to
 `… → Activated → Committed`. The committed bank's signed identity is exposed as the
-vendor data param **`x-sumo-installed-manifest`** (files+sha inventory + IVD identity +
+vendor data param **`x-ota-installed-manifest`** (files+sha inventory + IVD identity +
 signature for re-verification), and each component's update-mode as
-**`x-sumo-update-mode`** (`{update_mode: banked|singleshot, supports_rollback, dual_bank,
+**`x-ota-update-mode`** (`{update_mode: banked|singleshot, supports_rollback, dual_bank,
 reset_kind}`, readable even pre-flash). Both are served from component-mgr's `read_data` hook
-over the SOVD server's generic vendor-parameter wire — **all `x-sumo-*` vendor surface
+over the SOVD server's generic vendor-parameter wire — **all `x-*` vendor surface
 is owned by this codebase**, keeping the SOVD server layer itself vendor-free.
 
 ## VM launch (vm-service)
@@ -421,7 +421,7 @@ cover sign/verify/encrypt/derive + handle/policy + SUIT key provisioning.
   cwd=bank_dir. (`mmgr/current`, the host manager's own self-update bank pointer, stays.)
 - **qvm.conf moved to the deployment** as host-integration config (examples in the
   guest repos).
-- **Vendor data params** `x-sumo-installed-manifest` (signed IVD identity) +
-  `x-sumo-update-mode` (rollback-capability, for an offboard twin to sync).
+- **Vendor data params** `x-ota-installed-manifest` (signed IVD identity) +
+  `x-ota-update-mode` (rollback-capability, for an offboard twin to sync).
 - **Dropped** the `Banked`/`Singleshot` compile-time trait split (the real risk is
   upgrade composition, enforced offboard).

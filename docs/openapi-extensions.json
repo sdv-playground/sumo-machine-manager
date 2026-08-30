@@ -1,15 +1,15 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "sumo-machine-manager SOVD — vendor extensions (x-sumo-*)",
-    "description": "OpenAPI 3.1 description of the sumo VENDOR EXTENSION surface (the `x-sumo-*` operations) exposed by the sumo-machine-manager SOVD servers. Every operation here is a vendor extension per the ISO 17978-1 extension rules — none is part of the ISO 17978-3 base surface, which this document deliberately does NOT annotate. For the ISO 17978-3 surface see the standard's own OpenAPI artifact (ISO 17978-3 ed.1 `openapi-specification-1.1.0-rc1.zip`, https://standards.iso.org/iso/17978/-3/ed-1/en/) and the sumo conformance file `docs/sovd_iso17978_spec.yaml` in the sumo-workspace (the 42/57 baseline). Auth: only `x-sumo-pull-update` (POST) requires a bearer token (an Operational `update:execute` JWT bound to the device); the dev/sim `vm-sovd` binary defaults to open auth, so the requirement is advisory there.",
+    "title": "sumo-machine-manager SOVD — vendor extensions (x-*)",
+    "description": "OpenAPI 3.1 description of the VENDOR EXTENSION surface (the `x-*` operations) exposed by the sumo-machine-manager SOVD servers. Every operation here is a vendor extension per the ISO 17978-1 extension rules — none is part of the ISO 17978-3 base surface, which this document deliberately does NOT annotate. For the ISO 17978-3 surface see the standard's own OpenAPI artifact (ISO 17978-3 ed.1 `openapi-specification-1.1.0-rc1.zip`, https://standards.iso.org/iso/17978/-3/ed-1/en/) and the sumo conformance file `docs/sovd_iso17978_spec.yaml` in the sumo-workspace (the 42/57 baseline). Auth: only `x-ota-pull-update` (POST) requires a bearer token (an Operational `update:execute` JWT bound to the device); the dev/sim `vm-sovd` binary defaults to open auth, so the requirement is advisory there.",
     "version": "0.1.0"
   },
   "paths": {
     "/vehicle/v1/components/hsm/data/keys": {
       "get": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
         "summary": "`GET …/hsm/data/keys` — the key-slot inventory (public metadata only).",
         "operationId": "hsm_keys_list",
@@ -37,12 +37,12 @@
         }
       }
     },
-    "/vehicle/v1/components/hsm/operations/x-sumo-csr/executions": {
+    "/vehicle/v1/components/hsm/operations/x-csr/executions": {
       "post": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
-        "summary": "`POST …/hsm/operations/x-sumo-csr/executions` — sign a PKCS#10 CSR for the\nrequested slot and return it (DER, base64) in an operation execution.",
+        "summary": "`POST …/hsm/operations/x-csr/executions` — sign a PKCS#10 CSR for the\nrequested slot and return it (DER, base64) in an operation execution.",
         "operationId": "hsm_csr_execute",
         "requestBody": {
           "content": {
@@ -88,12 +88,12 @@
         }
       }
     },
-    "/vehicle/v1/components/hsm/x-sumo-id": {
+    "/vehicle/v1/components/hsm/x-ecu-id": {
       "get": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
-        "summary": "`GET /vehicle/v1/components/hsm/x-sumo-id` — the ECU's id; see\n[`device_id_router`].",
+        "summary": "`GET /vehicle/v1/components/hsm/x-ecu-id` — the ECU's id; see\n[`device_id_router`].",
         "operationId": "device_id",
         "responses": {
           "200": {
@@ -132,7 +132,7 @@
     "/vehicle/v1/components/{component_id}/updates/{update_id}/x-ota-commit": {
       "put": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
         "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).",
         "operationId": "x_ota_commit",
@@ -177,7 +177,7 @@
     "/vehicle/v1/components/{component_id}/updates/{update_id}/x-ota-rollback": {
       "put": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
         "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).",
         "operationId": "x_ota_rollback",
@@ -222,7 +222,7 @@
     "/vehicle/v1/components/{component_id}/x-ota-force-rollback": {
       "put": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
         "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).",
         "operationId": "x_ota_force_rollback",
@@ -244,12 +244,12 @@
         }
       }
     },
-    "/vehicle/v1/data/x-sumo-update-state": {
+    "/vehicle/v1/data/x-ota-update-state": {
       "get": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
-        "summary": "`GET /vehicle/v1/data/x-sumo-update-state` — the handler behind\n[`update_state_router`].",
+        "summary": "`GET /vehicle/v1/data/x-ota-update-state` — the handler behind\n[`update_state_router`].",
         "operationId": "update_state",
         "responses": {
           "200": {
@@ -265,13 +265,13 @@
         }
       }
     },
-    "/vehicle/v1/operations/x-sumo-commit-trials/executions": {
+    "/vehicle/v1/operations/x-ota-commit-trials/executions": {
       "post": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
         "summary": "Build the node-level commit/rollback verdict routes.",
-        "description": "Wire (ISO 17978-3 §7.14 operation executions, at the **entity root**):\n\n  `POST /vehicle/v1/operations/x-sumo-commit-trials/executions`\n  `POST /vehicle/v1/operations/x-sumo-rollback-trials/executions`\n\nThe orchestrator issues ONE verdict per node per campaign step — the update\n*session* is the commit unit, never a single component. Entity-root\naddressing (no `{id}` segment) keeps these clear of the dynamic\n`/components/{id}/operations/{op_id}/...` routes (mirrors the entity-root\n`factory-reset` op) and means there is no per-component `/updates` session\nto re-attach after the node reboot — membership is the NV-derived in-trial\nset, identical before and after the reboot. Vendor extensions live here in\nsumo-mm, not SOVDd (the three-layer rule, like `csr_router`).\n`POST /vehicle/v1/operations/x-sumo-commit-trials/executions` — the node\ncommit verdict; see [`node_verdict_router`] for the wire contract.",
+        "description": "Wire (ISO 17978-3 §7.14 operation executions, at the **entity root**):\n\n  `POST /vehicle/v1/operations/x-ota-commit-trials/executions`\n  `POST /vehicle/v1/operations/x-ota-rollback-trials/executions`\n\nThe orchestrator issues ONE verdict per node per campaign step — the update\n*session* is the commit unit, never a single component. Entity-root\naddressing (no `{id}` segment) keeps these clear of the dynamic\n`/components/{id}/operations/{op_id}/...` routes (mirrors the entity-root\n`factory-reset` op) and means there is no per-component `/updates` session\nto re-attach after the node reboot — membership is the NV-derived in-trial\nset, identical before and after the reboot. Vendor extensions live here in\nsumo-mm, not SOVDd (the three-layer rule, like `csr_router`).\n`POST /vehicle/v1/operations/x-ota-commit-trials/executions` — the node\ncommit verdict; see [`node_verdict_router`] for the wire contract.",
         "operationId": "commit_trials",
         "requestBody": {
           "description": "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape).",
@@ -318,10 +318,10 @@
         }
       }
     },
-    "/vehicle/v1/operations/x-sumo-pull-update/executions": {
+    "/vehicle/v1/operations/x-ota-pull-update/executions": {
       "post": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
         "summary": "The POST handler: synchronous pre-flight (auth / anchor / L1 signature /\nintegrated-dep dispatch plan / busy check — every 4xx surfaces BEFORE the\n202), then spawn the install task and reply `202 + Location`.",
         "operationId": "handle_post",
@@ -402,12 +402,12 @@
         ]
       }
     },
-    "/vehicle/v1/operations/x-sumo-pull-update/executions/{execution_id}": {
+    "/vehicle/v1/operations/x-ota-pull-update/executions/{execution_id}": {
       "get": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
-        "summary": "`GET /vehicle/v1/operations/x-sumo-pull-update/executions/{execution_id}` —\npoll a pull-update execution; see [`pull_update_router`].",
+        "summary": "`GET /vehicle/v1/operations/x-ota-pull-update/executions/{execution_id}` —\npoll a pull-update execution; see [`pull_update_router`].",
         "operationId": "get_pull_update_status",
         "parameters": [
           {
@@ -444,12 +444,12 @@
         }
       }
     },
-    "/vehicle/v1/operations/x-sumo-rollback-trials/executions": {
+    "/vehicle/v1/operations/x-ota-rollback-trials/executions": {
       "post": {
         "tags": [
-          "x-sumo-vendor-extension"
+          "x-extensions"
         ],
-        "summary": "`POST /vehicle/v1/operations/x-sumo-rollback-trials/executions` — the node\nrollback verdict; see [`node_verdict_router`] for the wire contract.",
+        "summary": "`POST /vehicle/v1/operations/x-ota-rollback-trials/executions` — the node\nrollback verdict; see [`node_verdict_router`] for the wire contract.",
         "operationId": "rollback_trials",
         "requestBody": {
           "description": "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape).",
@@ -491,7 +491,7 @@
     "schemas": {
       "CsrRequest": {
         "type": "object",
-        "description": "Body of the `x-sumo-csr` operation: which key slot to generate a CSR for.",
+        "description": "Body of the `x-csr` operation: which key slot to generate a CSR for.",
         "required": [
           "key_id"
         ],
@@ -503,7 +503,7 @@
       },
       "CsrResult": {
         "type": "object",
-        "description": "The `result` of a successful `x-sumo-csr` execution: the requested slot and\nits PKCS#10 CSR (DER, base64).",
+        "description": "The `result` of a successful `x-csr` execution: the requested slot and\nits PKCS#10 CSR (DER, base64).",
         "required": [
           "key_id",
           "csr_der_base64"
@@ -631,7 +631,7 @@
       },
       "PullUpdateRequest": {
         "type": "object",
-        "description": "Body of the `x-sumo-pull-update` operation.",
+        "description": "Body of the `x-ota-pull-update` operation.",
         "required": [
           "l1_base64",
           "cas_base_url"
@@ -656,7 +656,7 @@
       },
       "UpdateStateResponse": {
         "type": "object",
-        "description": "The `x-sumo-update-state` resource body — the node's update-transaction\nphase plus the component ids the transaction covers.",
+        "description": "The `x-ota-update-state` resource body — the node's update-transaction\nphase plus the component ids the transaction covers.",
         "required": [
           "phase",
           "components"
@@ -715,8 +715,8 @@
   },
   "tags": [
     {
-      "name": "x-sumo-vendor-extension",
-      "description": "sumo vendor extensions to ISO 17978-3 (the x-sumo-* operations)."
+      "name": "x-extensions",
+      "description": "vendor extensions to ISO 17978-3 (the x-* operations)."
     }
   ]
 }

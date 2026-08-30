@@ -44,7 +44,7 @@ sovd-proxy = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "ma
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 
 [features]
-# Contribute the x-sumo vendor OpenAPI paths to SOVDd's §7.5 capability
+# Contribute the vendor OpenAPI paths to SOVDd's §7.5 capability
 # description (GET /vehicle/v1/docs). Default-on since sovd-api c33a01d carries
 # the CapabilityExtensions hook; the flag remains so a build against an older
 # pin can opt out with --no-default-features.

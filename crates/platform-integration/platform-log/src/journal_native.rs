@@ -165,7 +165,7 @@ impl JournalHandle {
     }
 
     /// Monotonic runtime of the current entry, SECONDS since the entry's boot
-    /// (journald `__MONOTONIC_TIMESTAMP`). The jump-proof `x-sumo-runtime` axis.
+    /// (journald `__MONOTONIC_TIMESTAMP`). The jump-proof `x-log-runtime` axis.
     /// `None` on error (kept off the runtime axis).
     fn monotonic_secs(&self) -> Option<u64> {
         let mut usec: u64 = 0;

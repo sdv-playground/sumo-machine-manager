@@ -776,7 +776,7 @@ This design balances simplicity (reuses existing bank model), safety (host autho
 
 ---
 
-## 17. Reading the installed inventory — `x-sumo-installed-manifest` (implemented)
+## 17. Reading the installed inventory — `x-ota-installed-manifest` (implemented)
 
 The sections above describe *what* is composed into a bank. A SW-mapping / update
 tool also needs to read *what is actually installed right now*, per VM, file by
@@ -785,7 +785,7 @@ IVD manifest** (`ivd-manifest.cbor` + `ivd-signature.bin`, see §4.4). component
 exposes it, signature-verified, as a single vendor SOVD data read — no new route,
 no SOVDd change (SOVDd routes `/data` generically and stays spec-pure).
 
-**`GET /vehicle/v1/components/{vm}/data/x-sumo-installed-manifest`** →
+**`GET /vehicle/v1/components/{vm}/data/x-ota-installed-manifest`** →
 
 ```json
 {
@@ -806,7 +806,7 @@ no SOVDd change (SOVDd routes `/data` generically and stays spec-pure).
   identData DIDs, so the manifest and the DIDs can never disagree.
 - **Signature-verified server-side** before return; **404** when the bank has no
   signed manifest (never flashed / no-HSM smoke path) — never fabricated.
-- **Vendor (`x-sumo-`)**: lives entirely in component-mgr; SOVDd carries no vendor name.
+- **Vendor (`x-`)**: lives entirely in component-mgr; SOVDd carries no vendor name.
 - **Independent verification**: a consumer re-verifies `signature_b64` over
   `manifest_b64` with the **`ivd-signing` public key** (the key the device signs
   banks with at provision/flash time). `files[]` then proves the exact installed
@@ -821,4 +821,4 @@ no SOVDd change (SOVDd routes `/data` generically and stays spec-pure).
   invalidated on every NV write (the same funnel as the identity-DID cache).
 - Advertised in `list_parameters` (only when a committed manifest exists) and
   served in `read_data`; id const `INSTALLED_MANIFEST_PARAM_ID =
-  "x-sumo-installed-manifest"`, category `identData`.
+  "x-ota-installed-manifest"`, category `identData`.

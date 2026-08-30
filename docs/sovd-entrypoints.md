@@ -4,7 +4,7 @@
 diagnostics-and-OTA HTTP API the sumo stack exposes under `/vehicle/v1/...`
 (components, data, operations, modes, faults, logs, and the `/updates` flash
 wire). The wire is built from the **SOVDd library** (`sovd-core` traits +
-`sovd-api` router); sumo-mm adds the `x-sumo-*` vendor routes on top (the
+`sovd-api` router); sumo-mm adds the `x-*` vendor routes on top (the
 three-layer rule — SOVDd stays spec-pure, vendor extensions live here in
 `component_mgr::sovd::routes`). This doc inventories every place in the
 workspace that **binds a port and serves** that API, so "which server is this?"
@@ -51,8 +51,8 @@ repo — that serve the **same** wire from the **same** route library.
 - **Serves:** the host-owned components `host-os`, `vm1`, `vm2`, `hsm` (built via
   `component_factory::build_component`), the standard SOVD surface from
   `sovd_api::create_router`, plus the sumo vendor routes —
-  `hsm_router` (HSM key inventory + `x-sumo-csr`) and `update_state_router`
-  (`x-sumo-update-state`). See `crates/vm-sovd/src/main.rs`.
+  `hsm_router` (HSM key inventory + `x-csr`) and `update_state_router`
+  (`x-ota-update-state`). See `crates/vm-sovd/src/main.rs`.
 - **Bind / port:** `0.0.0.0:4000` by default; override with `--bind <addr>` or a
   positional bind-addr (`crates/vm-sovd/src/main.rs`).
 - **Launched by:** `example/run.sh` (alongside the `hsm-sim-service` link-B
@@ -73,7 +73,7 @@ repo — that serve the **same** wire from the **same** route library.
   entry (`component_mgr::sovd::pull_update` — async `202` + status polling;
   the sw-authority anchor resolves per-POST, so an unprovisioned device
   answers 503 on that route and starts serving pulls right after
-  provisioning), plus `x-sumo-boot-id` and `/factory_reset`. It is **host-only — no gateway
+  provisioning), plus `x-boot-id` and `/factory_reset`. It is **host-only — no gateway
   mode** (the "proxy" in its code is the *vhsm-ssd* HSM proxy, not SOVD
   proxying). Secure-by-default authorizer is always wired (`src/main.rs`).
 - **Bind / port:** `cfg.bind`, default `0.0.0.0:4000` (`src/config.rs`);
@@ -95,7 +95,7 @@ gateway router (`build_gateway_router` → `component_mgr::sovd::gateway::gatewa
 It serves:
 
 - the guest's **own** components (its local `Machine`),
-- the **onboard pull-update** operation `POST /vehicle/v1/operations/x-sumo-pull-update/executions`
+- the **onboard pull-update** operation `POST /vehicle/v1/operations/x-ota-pull-update/executions`
   with **route-scoped** Operational `update:execute` authz, re-checked per
   targeted component (`pull_update_router` — async: `202` + `Location`, poll
   `GET .../executions/{id}`; multi-component campaigns dispatch each L2 to its

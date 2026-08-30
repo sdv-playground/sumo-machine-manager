@@ -262,7 +262,7 @@ async fn non_disableable_component_omits_admin_state() {
 
     // No admin_state field in /status (tri-state read-back), no advertised op.
     let status = b.read_entity_status().await.unwrap();
-    let runtime = &status.extensions["x-sumo-runtime"];
+    let runtime = &status.extensions["x-runtime"];
     assert!(
         runtime.get("admin_state").is_none(),
         "non-disableable components must omit admin_state entirely"
@@ -303,7 +303,7 @@ async fn read_entity_status_tri_state_and_probe_skip() {
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::NotReady);
     assert_eq!(
-        status.extensions["x-sumo-runtime"]["admin_state"], "disabled",
+        status.extensions["x-runtime"]["admin_state"], "disabled",
         "disabled read-back"
     );
     assert_eq!(probes.load(Ordering::SeqCst), 0, "probe must be skipped");
@@ -313,7 +313,7 @@ async fn read_entity_status_tri_state_and_probe_skip() {
     set_selector_disabled(&sel, BankSet::Vm1, false);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(
-        status.extensions["x-sumo-runtime"]["admin_state"], "enabled",
+        status.extensions["x-runtime"]["admin_state"], "enabled",
         "enabled read-back"
     );
     assert!(
@@ -326,7 +326,7 @@ async fn read_entity_status_tri_state_and_probe_skip() {
 async fn probe_component_status_rides_the_uniform_node() {
     // rt-style component: no vm-service, an injected HealthProbe. The probe
     // drives the STANDARD status field and its extensions ride the SAME
-    // x-sumo-runtime node as every other component's metadata — never a
+    // x-runtime node as every other component's metadata — never a
     // bespoke per-component route.
     let nv = make_nv();
     let b = vm_backend(&nv, BankSet::Rt, None)
@@ -334,7 +334,7 @@ async fn probe_component_status_rides_the_uniform_node() {
         .with_health_probe(Arc::new(MockProbe { running: true }));
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::Ready, "probe running ⇒ ready");
-    let rt = &status.extensions["x-sumo-runtime"];
+    let rt = &status.extensions["x-runtime"];
     assert_eq!(rt["admin_state"], "enabled");
     assert_eq!(rt["m7_total_startup"], 86, "probe extension merged");
     assert_eq!(rt["boot_count"], 0, "standard field wins the collision");
@@ -358,7 +358,7 @@ async fn probe_component_status_rides_the_uniform_node() {
     set_selector_disabled(&sel, BankSet::Rt, true);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::NotReady);
-    let rt = &status.extensions["x-sumo-runtime"];
+    let rt = &status.extensions["x-runtime"];
     assert_eq!(rt["admin_state"], "disabled");
     assert!(
         rt.get("m7_total_startup").is_none(),
@@ -384,7 +384,7 @@ async fn probe_component_status_rides_the_uniform_node() {
         EntityStatus::NotReady,
         "disabled stays notReady"
     );
-    let rt = &status.extensions["x-sumo-runtime"];
+    let rt = &status.extensions["x-runtime"];
     assert_eq!(rt["admin_state"], "disabled");
     assert_eq!(
         rt["reboot_pending"], true,

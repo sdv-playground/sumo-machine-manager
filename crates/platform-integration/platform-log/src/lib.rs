@@ -85,13 +85,13 @@ pub struct LogRecord {
     /// unit (journald).
     pub source: String,
     /// Monotonic runtime, seconds since boot — jump-proof, the axis the
-    /// `x-sumo-runtime` window filters on. `None` for sources without a monotonic
+    /// `x-log-runtime` window filters on. `None` for sources without a monotonic
     /// clock (plain files, or a ring packet with no captured uptime). Serialized
-    /// `x-sumo-uptime-secs` to match the host wire contract.
+    /// `x-log-uptime-secs` to match the host wire contract.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        rename = "x-sumo-uptime-secs"
+        rename = "x-log-uptime-secs"
     )]
     pub uptime_secs: Option<u64>,
 }
@@ -184,8 +184,8 @@ impl LogQuery {
             match k {
                 "tail" | "limit" => q.tail = v.parse().ok(),
                 "source" => q.source = Some(v),
-                "x-sumo-emitter" => q.emitter = Some(v),
-                "x-sumo-emitter-exclude" => q.emitter_exclude = Some(v),
+                "x-log-emitter" => q.emitter = Some(v),
+                "x-log-emitter-exclude" => q.emitter_exclude = Some(v),
                 "pattern" => q.pattern = Some(v),
                 "priority" => q.priority = Some(v),
                 "since" => q.since = Some(v),
@@ -193,7 +193,7 @@ impl LogQuery {
                 "after" => q.after = Some(v),
                 // Runtime window: `<N>{s,m,h,d}` → seconds (also accept a bare
                 // integer as seconds). The host proxy forwards this verbatim.
-                "x-sumo-runtime" => q.runtime_secs = parse_duration_secs(&v),
+                "x-log-runtime" => q.runtime_secs = parse_duration_secs(&v),
                 _ => {}
             }
         }
@@ -272,7 +272,7 @@ impl LogQuery {
 
 /// Parse a duration `<N>{s,m,h,d}` (e.g. `3h`, `90s`) — or a bare integer taken as
 /// seconds — into seconds. `None` if malformed. Mirrors sovd-api's
-/// `parse_duration_secs` so the `x-sumo-runtime` value means the same host-side
+/// `parse_duration_secs` so the `x-log-runtime` value means the same host-side
 /// and in-guest.
 fn parse_duration_secs(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -1016,14 +1016,14 @@ mod tests {
         };
 
         // exclude drops the firehose (prefix-matched), keeps the rest.
-        let q = LogQuery::parse("x-sumo-emitter-exclude=devb_,CAM");
+        let q = LogQuery::parse("x-log-emitter-exclude=devb_,CAM");
         assert_eq!(q.emitter_exclude.as_deref(), Some("devb_,CAM"));
         let out = q.apply(all());
         let srcs: Vec<_> = out.iter().map(|r| r.source.as_str()).collect();
         assert_eq!(srcs, ["snova", "vhsm"]);
 
         // include narrows to the named emitters only.
-        let q = LogQuery::parse("x-sumo-emitter=snova,vhsm");
+        let q = LogQuery::parse("x-log-emitter=snova,vhsm");
         let out = q.apply(all());
         let srcs: Vec<_> = out.iter().map(|r| r.source.as_str()).collect();
         assert_eq!(srcs, ["snova", "vhsm"]);
@@ -1563,7 +1563,7 @@ pub struct DrainRecord {
     /// drainer stamps it honestly, the segment SEQ is the ordering spine).
     pub epoch_secs: u64,
     /// Monotonic runtime, seconds since boot (CLOCK_MONOTONIC), read at drain
-    /// time. Jump-proof (unlike `epoch_secs`) — the axis the `x-sumo-runtime`
+    /// time. Jump-proof (unlike `epoch_secs`) — the axis the `x-log-runtime`
     /// window filters on. The drainer follows near-live, so this is the drain
     /// instant, not the packet's exact emit-uptime (slog2 packets carry no
     /// monotonic field); the small skew is immaterial for minute/hour windows.
@@ -1622,7 +1622,7 @@ pub fn file_dirs() -> &'static [&'static str] {
 /// layers' services.conf — so the live file set IS the dynamic, declared source
 /// list; a freshly-mounted layer's source shows up on the next call, no restart).
 /// Sub-sources WITHIN a stream (slog2 per-buffer emitters) are NOT sources — the
-/// `x-sumo-emitter` filter handles those. Deduped by stem (svclog segments
+/// `x-log-emitter` filter handles those. Deduped by stem (svclog segments
 /// `<stem>.<seq>.log` collapse to one `<stem>` source).
 #[cfg(target_os = "nto")]
 pub fn list_sources() -> Vec<SourceInfo> {
@@ -1743,7 +1743,7 @@ fn after_at_or_past_tip(after: Option<&str>, tip: &Option<String>) -> bool {
 
 /// Monotonic runtime (seconds since boot) of a journald JSON entry, from
 /// `__MONOTONIC_TIMESTAMP` (µs since the entry's boot). The jump-proof
-/// `x-sumo-runtime` axis. `None` when absent/unparseable.
+/// `x-log-runtime` axis. `None` when absent/unparseable.
 #[cfg(not(target_os = "nto"))]
 fn journald_monotonic_secs(v: &serde_json::Value) -> Option<u64> {
     v.get("__MONOTONIC_TIMESTAMP")

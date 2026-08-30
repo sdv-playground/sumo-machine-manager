@@ -765,7 +765,7 @@ pub struct VerifiedManifest {
 /// for the *caller/client* to verify independently.
 ///
 /// This is the **report-only** read backing the diagnostic
-/// `x-sumo-installed-manifest` SOVD parameter. By design it answers "what
+/// `x-ota-installed-manifest` SOVD parameter. By design it answers "what
 /// is this bank supposed to have installed?" — it surfaces the on-disk
 /// signed inventory + identity and the device signature, but it is **never
 /// a gate**: it deliberately does NOT call `hsm.verify`, so a diagnostic

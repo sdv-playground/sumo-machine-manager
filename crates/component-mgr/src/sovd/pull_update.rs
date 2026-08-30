@@ -1,7 +1,7 @@
 //! Onboard PULL update — the device-side campaign entry (the pull-path
 //! counterpart of the push `/updates` wire).
 //!
-//! `POST /vehicle/v1/operations/x-sumo-pull-update/executions` receives a
+//! `POST /vehicle/v1/operations/x-ota-pull-update/executions` receives a
 //! T2-signed L1 campaign manifest (base64) + the (untrusted) CAS base URL,
 //! validates the L1 against the device's pinned sw-authority anchor, resolves
 //! the campaign's per-component L2 dependencies, and installs each into ITS
@@ -16,7 +16,7 @@
 //! caller is untrusted plumbing. Every fetched byte is bound to a
 //! content-address the signed manifest committed to. Finalize stages AND
 //! activates ("stage + activate, defer reboot"); the reboot and the trial
-//! verdict stay with their own triggers (`x-sumo-commit-trials`).
+//! verdict stay with their own triggers (`x-ota-commit-trials`).
 //!
 //! Vendor extension in sumo-mm, not SOVDd (the three-layer rule).
 
@@ -34,10 +34,10 @@ use puller::Puller;
 use sha2::{Digest, Sha256};
 use sovd_core::{OperationExecution, OperationStatus};
 
-pub const PULL_OP_ID: &str = "x-sumo-pull-update";
-pub const PULL_OP_PATH: &str = "/vehicle/v1/operations/x-sumo-pull-update/executions";
+pub const PULL_OP_ID: &str = "x-ota-pull-update";
+pub const PULL_OP_PATH: &str = "/vehicle/v1/operations/x-ota-pull-update/executions";
 
-/// Body of the `x-sumo-pull-update` operation.
+/// Body of the `x-ota-pull-update` operation.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
 pub struct PullUpdateRequest {
     /// Optional target assertion: when set, every dependency in the signed
@@ -62,7 +62,7 @@ pub struct PullUpdateRequest {
 pub type TrustAnchorSource = Arc<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
 
 /// In-memory ledger for the async executions. Operator plumbing, not durable
-/// state — the durable truth is NV (`x-sumo-update-state` + per-component
+/// state — the durable truth is NV (`x-ota-update-state` + per-component
 /// activation), which a restarted orchestrator polls to re-derive where it is.
 #[derive(Default)]
 pub(crate) struct Executions {
@@ -150,12 +150,12 @@ pub fn pull_update_router(
         )
 }
 
-/// `GET /vehicle/v1/operations/x-sumo-pull-update/executions/{execution_id}` —
+/// `GET /vehicle/v1/operations/x-ota-pull-update/executions/{execution_id}` —
 /// poll a pull-update execution; see [`pull_update_router`].
 #[utoipa::path(
     get,
-    path = "/vehicle/v1/operations/x-sumo-pull-update/executions/{execution_id}",
-    tag = "x-sumo-vendor-extension",
+    path = "/vehicle/v1/operations/x-ota-pull-update/executions/{execution_id}",
+    tag = "x-extensions",
     params(("execution_id" = String, Path, description = "The execution id returned by the POST.")),
     responses(
         (status = 200, description = "The execution's current status (running / completed / failed).", body = sovd_core::OperationExecution),
@@ -181,8 +181,8 @@ pub(crate) async fn get_pull_update_status(
 /// 202), then spawn the install task and reply `202 + Location`.
 #[utoipa::path(
     post,
-    path = "/vehicle/v1/operations/x-sumo-pull-update/executions",
-    tag = "x-sumo-vendor-extension",
+    path = "/vehicle/v1/operations/x-ota-pull-update/executions",
+    tag = "x-extensions",
     request_body = PullUpdateRequest,
     security(("bearer" = [])),
     responses(

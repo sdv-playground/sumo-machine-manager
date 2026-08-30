@@ -54,7 +54,7 @@ Per-variant detail:
   client selects "all raw host-bus logs" by `source=slog2-ring`; the whole ring is one
   source, many emitters. QNX-only in effect (empty off-QNX; a Linux host would
   use a journald source).
-  Narrow to / exclude an emitter with the `x-sumo-emitter` / `x-sumo-emitter-exclude`
+  Narrow to / exclude an emitter with the `x-log-emitter` / `x-log-emitter-exclude`
   query params (comma-separated, prefix-matched — `LogFilter::{emitter,
   emitter_exclude}`). The exclude is applied in the slog2 reader callback BEFORE
   the gather cap, so muting a high-volume emitter (the `devb_*` eMMC/CAM

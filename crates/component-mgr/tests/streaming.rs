@@ -1060,7 +1060,7 @@ async fn campaign_rejects_non_content_addressed_dep() {
 }
 
 // =============================================================================
-// Onboard PULL update route (x-sumo-pull-update) — authorize → resolve → install
+// Onboard PULL update route (x-ota-pull-update) — authorize → resolve → install
 // =============================================================================
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1269,7 +1269,7 @@ fn pull_body(component: Option<&str>, l1: &[u8], cas_base_url: &str) -> String {
     .unwrap()
 }
 
-const PULL_PATH: &str = "/vehicle/v1/operations/x-sumo-pull-update/executions";
+const PULL_PATH: &str = "/vehicle/v1/operations/x-ota-pull-update/executions";
 
 /// POST the pull op; returns (status, Location header, body bytes).
 async fn post_pull(

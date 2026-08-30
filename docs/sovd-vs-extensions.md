@@ -1,7 +1,7 @@
 # SOVD standard vs. sumo extensions
 
 What of the ASAM SOVD / ISO 17978-3 standard the sumo stack **implements**, and
-what it **extends** with vendor (`x-sumo-*`) routes, params, and behaviour. The
+what it **extends** with vendor (`x-*`) routes, params, and behaviour. The
 goal is one clear line between "spec" and "ours" — so a client (or an integrator
 building a compatible endpoint) knows exactly which assumptions are portable and
 which are sumo-specific.
@@ -17,7 +17,7 @@ to provide a compatible log endpoint).
   SOVDd (sovd-core traits + sovd-api router)   ← spec-pure; no vendor knowledge
         ▲
         │  merged into the router at bind time
-  component_mgr::sovd::routes (sumo-mm)         ← the x-sumo-* vendor layer
+  component_mgr::sovd::routes (sumo-mm)         ← the x-* vendor layer
         ▲
   the deployed server (vm-sovd / production host)
 ```
@@ -30,7 +30,7 @@ VERBS on the standard `/updates` resource are baked into the SOVDd router itself
 vendor-neutral `x-ota-*` — a generic API feature, not a sumo one — so they stay
 in `sovd-api` without breaking purity. The one deliberate vendor-name residual
 there is a commented arm in `sovd-api/auth.rs::route_capability` mapping sumo's
-`x-sumo-{commit,rollback}-trials` node operations (§2) to `UpdateVerdict`: SOVDd
+`x-ota-{commit,rollback}-trials` node operations (§2) to `UpdateVerdict`: SOVDd
 serves no such route, but they ride its auth middleware in the merged router.
 
 Everything vendor is an `x-` extension per ISO 17978-3 §6.2.7 / §5.3.6, so a
@@ -64,35 +64,34 @@ scripts §7.15.
 
 ---
 
-## 2. Vendor extension routes (`x-sumo-*`)
+## 2. Vendor extension routes (`x-*`)
 
 Added by sumo-mm (`component_mgr::sovd::routes` + siblings). None are in the SOVD
 spec; all are `x-`-namespaced.
 
 | Route | Method | Purpose |
 |---|---|---|
-| `/data/x-sumo-update-state` | GET | node update-transaction state (phase + per-component), polled between campaign steps |
+| `/data/x-ota-update-state` | GET | node update-transaction state (phase + per-component), polled between campaign steps |
 | `/components/hsm/data/keys` | GET | HSM key-slot inventory (public metadata only) |
-| `/components/hsm/operations/x-sumo-csr/executions` | POST | generate a PKCS#10 CSR for a key slot |
-| `/components/hsm/x-sumo-id` | GET | ECU id = HSM device-key thumbprint (the token `aud`); `text/plain` |
-| `/operations/x-sumo-commit-trials/executions` | POST | node-level commit of all in-trial banked components |
-| `/operations/x-sumo-rollback-trials/executions` | POST | node-level rollback of in-trial components |
-| `/components/{id}/operations/x-sumo-admin-state/executions` | POST | per-component administrative disable/enable |
-| `/operations/x-sumo-pull-update/executions` | POST | onboard pull-update (gateway mode); async 202 + poll |
+| `/components/hsm/operations/x-csr/executions` | POST | generate a PKCS#10 CSR for a key slot |
+| `/components/hsm/x-ecu-id` | GET | ECU id = HSM device-key thumbprint (the token `aud`); `text/plain` |
+| `/operations/x-ota-commit-trials/executions` | POST | node-level commit of all in-trial banked components |
+| `/operations/x-ota-rollback-trials/executions` | POST | node-level rollback of in-trial components |
+| `/operations/x-ota-pull-update/executions` | POST | onboard pull-update (gateway mode); async 202 + poll |
 
 Vendor DATA params (served through the standard `/data/{param_id}` route, not
 new routes):
-- `x-sumo-installed-manifest` — installed SUIT manifest JSON for the serving bank.
-- `x-sumo-id` (also the route above) — the ECU thumbprint.
+- `x-ota-installed-manifest` — installed SUIT manifest JSON for the serving bank.
+- `x-ecu-id` (also the route above) — the ECU thumbprint.
 
 Verbs baked into the STANDARD `/updates` router: `PUT /updates/{id}/x-ota-commit`,
 `/x-ota-rollback`, `PUT /components/{id}/x-ota-force-rollback` — vendor-neutral
 since C-026, so no longer vendor extensions — plus the still-vendor query param
-`PUT /execute?x-sumo-control=orchestrated`.
+`PUT /execute?x-ota-control=orchestrated`.
 
 Production-only (a vendor-private sibling server, not this tree):
-`GET /status/x-sumo-boot-id` and `POST /factory_reset`. In this tree the boot id
-exists as `node_boot_id` feeding `x-sumo-runtime` (below).
+`GET /status/x-boot-id` and `POST /factory_reset`. In this tree the boot id
+exists as `node_boot_id` feeding `x-runtime` (below).
 
 ---
 
@@ -101,7 +100,7 @@ exists as `node_boot_id` feeding `x-sumo-runtime` (below).
 Standard routes that carry vendor semantics or fields a pure-spec client wouldn't
 expect. **This is the part that matters most for building a compatible endpoint.**
 
-### Per-source log routes (x-sumo) — `sovd-api/lib.rs` + `handlers/logs_ext.rs`
+### Per-source log routes (vendor extension) — `sovd-api/lib.rs` + `handlers/logs_ext.rs`
 
 Distinct log sources are NEVER merged/time-sorted (independent clocks — a live
 journal at real time vs. a boot file stamped 1970). So a source is a resource you
@@ -132,18 +131,18 @@ oldest→now). Tier-1 (provisioning MM) shows only `slog2-ring`. See
 
 | Param | Type | Definition |
 |---|---|---|
-| `x-sumo-after` | opaque string | Cursor. Return entries strictly after this position, oldest→newest. Omit ⇒ start at oldest available. Never parsed by the client. |
-| `x-sumo-emitter` | csv, prefix | INCLUDE only these emitters (sub-sources); comma-separated, prefix-matched (`devb` ⇒ `devb_sdmmc_mx8x`). Narrows within a multi-emitter source (the slog2 ring). Empty/absent ⇒ all. |
-| `x-sumo-emitter-exclude` | csv, prefix | DROP these emitters (same form), applied after the include. Mutes a high-volume sub-source (e.g. the `devb_` eMMC/CAM firehose). The device still SERVES them. |
+| `x-log-after` | opaque string | Cursor. Return entries strictly after this position, oldest→newest. Omit ⇒ start at oldest available. Never parsed by the client. |
+| `x-log-emitter` | csv, prefix | INCLUDE only these emitters (sub-sources); comma-separated, prefix-matched (`devb` ⇒ `devb_sdmmc_mx8x`). Narrows within a multi-emitter source (the slog2 ring). Empty/absent ⇒ all. |
+| `x-log-emitter-exclude` | csv, prefix | DROP these emitters (same form), applied after the include. Mutes a high-volume sub-source (e.g. the `devb_` eMMC/CAM firehose). The device still SERVES them. |
 | `since` / `until` | RFC 3339 \| sentinel | Sentinels: `BEGIN` (no bound), `END`\|`NOW` (device now), `END-<N>{s,m,h,d}` \| `NOW-<N>{s,m,h,d}` (now minus duration). Resolved server-side vs. device clock. Malformed ⇒ 400. |
 
 **Extra response fields** on the list body (all `skip_if_none`):
 
 | Field | Definition |
 |---|---|
-| `x-sumo-next-cursor` | Cursor for the next page; feed back as `x-sumo-after`. `null`/absent ⇒ head reached. |
-| `x-sumo-oldest-cursor` | Oldest position still available; an `x-sumo-after` older than this ⇒ history rotated away (gap). |
-| `x-sumo-tip-cursor` | Cursor at the current head; poll `x-sumo-after=<this>` to follow only new entries. Present even at head. |
+| `x-log-next-cursor` | Cursor for the next page; feed back as `x-log-after`. `null`/absent ⇒ head reached. |
+| `x-log-oldest-cursor` | Oldest position still available; an `x-log-after` older than this ⇒ history rotated away (gap). |
+| `x-log-tip-cursor` | Cursor at the current head; poll `x-log-after=<this>` to follow only new entries. Present even at head. |
 
 **Extra `LogEntry` fields / vendored value domains:**
 
@@ -167,14 +166,14 @@ fills it with one vendor key:
 
 | Key | Value |
 |---|---|
-| `x-sumo-runtime` | `{ boot_count, uptime_s, node_boot_id, admin_state }` |
+| `x-runtime` | `{ boot_count, uptime_s, node_boot_id, admin_state }` |
 
 ### Scripts (§7.15)
-A test execution records an `x-sumo` log-cursor bracket:
+A test execution records an `x-log` log-cursor bracket:
 
 | Field | Meaning |
 |---|---|
-| `log_from` | log tip cursor at run start; the run's window is `GET /logs?x-sumo-after=<log_from>` |
+| `log_from` | log tip cursor at run start; the run's window is `GET /logs?x-log-after=<log_from>` |
 
 ### Bulk-data (§7.20)
 Spec-native shape; listed here only for completeness (no vendor deltas):
@@ -216,8 +215,8 @@ boot (§7.1); vehicle-wide tokens' `epoch` claim MUST be ≥ the device epoch fl
 
 | Step | Call | Yields |
 |---|---|---|
-| 1 | `GET .../components/hsm/x-sumo-id` | device id → token `aud` |
-| 2 | `GET .../status/x-sumo-boot-id` | boot nonce → token `boot_id` |
+| 1 | `GET .../components/hsm/x-ecu-id` | device id → token `aud` |
+| 2 | `GET .../status/x-boot-id` | boot nonce → token `boot_id` |
 | 3 | `POST <minter>/mint` (operator bearer) | short-lived boot-bound JWT |
 
 ---
@@ -225,11 +224,11 @@ boot (§7.1); vehicle-wide tokens' `epoch` claim MUST be ≥ the device epoch fl
 ## Summary: the sumo "SOVD (extended)" profile
 
 A sumo-compatible SOVD endpoint = standard SOVD **plus**: the `/logs/sources`
-catalog + `/logs/sources/{name}` per-source reads; the `x-sumo-after` cursor +
+catalog + `/logs/sources/{name}` per-source reads; the `x-log-after` cursor +
 three response cursors on `/logs`; the `END[-N]`/`BEGIN` time sentinels;
 reboot-safe (non-timestamp) ordering; `fields.emitter` on log entries; the
-`x-sumo-runtime` status block; and the boot-bound JWT freshness model. The
-`x-sumo-*` OTA/HSM routes are needed only for a device that participates in OTA —
+`x-runtime` status block; and the boot-bound JWT freshness model. The
+`x-ota-*` / `x-csr` OTA/HSM routes are needed only for a device that participates in OTA —
 a pure log/diagnostics endpoint doesn't need them. See
 [log-integration-contract.md](log-integration-contract.md) for exactly what a
 log endpoint must implement.

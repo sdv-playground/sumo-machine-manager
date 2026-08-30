@@ -2,7 +2,7 @@
 //!
 //! `ComponentBackend` (`backend.rs`) is already a complete, standalone
 //! `DiagnosticBackend` — it owns the data engine (DIDs, the
-//! `x-sumo-installed-manifest` intercept, the F187–F19E identity overlay,
+//! `x-ota-installed-manifest` intercept, the F187–F19E identity overlay,
 //! health DIDs), the fault/DTC store, the full OTA flash lifecycle, and the
 //! modes. So wherever a component's install/flash lifecycle IS the engine's,
 //! the engine is wired straight into SOVD with no wrapper.
@@ -91,7 +91,7 @@ impl DiagnosticBackend for InstallRouterDiag {
 
     // -----------------------------------------------------------------
     // Data — delegated to the engine (the single authority that owns the
-    // DID registry, identity overlay, and x-sumo-installed-manifest).
+    // DID registry, identity overlay, and x-ota-installed-manifest).
     // -----------------------------------------------------------------
 
     async fn list_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {
@@ -130,7 +130,7 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.ecu_reset(reset_type).await
     }
 
-    // Entity status (§7.19.2: ready/notReady + x-sumo-runtime boot_count) —
+    // Entity status (§7.19.2: ready/notReady + x-runtime boot_count) —
     // delegated to the engine, which owns the heartbeat + NV boot counter.
     async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {
         self.engine.read_entity_status().await

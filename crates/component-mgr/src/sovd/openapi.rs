@@ -1,5 +1,5 @@
-//! Code-first OpenAPI 3.1 document for the sumo VENDOR EXTENSION surface
-//! (`x-sumo-*`) of the machine-manager SOVD servers.
+//! Code-first OpenAPI 3.1 document for the VENDOR EXTENSION surface
+//! (`x-*`) of the machine-manager SOVD servers.
 //!
 //! Generated with `utoipa` from the actual handlers/types in [`super::routes`]
 //! and [`super::pull_update`] (plus the three SOVDd-resident `x-ota-*` update
@@ -8,13 +8,13 @@
 //! document delegates it by reference (see the `info.description`).
 //!
 //! Two consumers:
-//!   * `docs/openapi-x-sumo.json` — the committed, reviewable subset, kept
+//!   * `docs/openapi-extensions.json` — the committed, reviewable subset, kept
 //!     current by `tests/openapi_current.rs` (`UPDATE_OPENAPI=1` rewrites it).
 //!   * the live `GET /vehicle/v1/docs` capability description — the vendor
 //!     paths + schemas are contributed to SOVDd's §7.5 document via its neutral
 //!     `CapabilityExtensions` hook (see [`capability_extensions`]).
 
-/// The bearer security scheme (`x-sumo-pull-update` is the only op that
+/// The bearer security scheme (`x-ota-pull-update` is the only op that
 /// requires it; the dev/sim binary defaults to open auth).
 struct SecurityAddon;
 
@@ -37,20 +37,20 @@ impl utoipa::Modify for SecurityAddon {
 #[derive(utoipa::OpenApi)]
 #[openapi(
     info(
-        title = "sumo-machine-manager SOVD — vendor extensions (x-sumo-*)",
-        description = "OpenAPI 3.1 description of the sumo VENDOR EXTENSION surface (the `x-sumo-*` \
+        title = "sumo-machine-manager SOVD — vendor extensions (x-*)",
+        description = "OpenAPI 3.1 description of the VENDOR EXTENSION surface (the `x-*` \
 operations) exposed by the sumo-machine-manager SOVD servers. Every operation here is a vendor \
 extension per the ISO 17978-1 extension rules — none is part of the ISO 17978-3 base surface, \
 which this document deliberately does NOT annotate. For the ISO 17978-3 surface see the standard's \
 own OpenAPI artifact (ISO 17978-3 ed.1 `openapi-specification-1.1.0-rc1.zip`, \
 https://standards.iso.org/iso/17978/-3/ed-1/en/) and the sumo conformance file \
 `docs/sovd_iso17978_spec.yaml` in the sumo-workspace (the 42/57 baseline). Auth: only \
-`x-sumo-pull-update` (POST) requires a bearer token (an Operational `update:execute` JWT bound to \
+`x-ota-pull-update` (POST) requires a bearer token (an Operational `update:execute` JWT bound to \
 the device); the dev/sim `vm-sovd` binary defaults to open auth, so the requirement is advisory \
 there."
     ),
     tags(
-        (name = "x-sumo-vendor-extension", description = "sumo vendor extensions to ISO 17978-3 (the x-sumo-* operations).")
+        (name = "x-extensions", description = "vendor extensions to ISO 17978-3 (the x-* operations).")
     ),
     paths(
         super::routes::update_state,
@@ -79,12 +79,12 @@ there."
     )),
     modifiers(&SecurityAddon)
 )]
-struct XSumoApi;
+struct XExtensionsApi;
 
 /// The in-process vendor-extension OpenAPI document; `info.version` is pinned to
 /// the crate version.
 pub fn openapi() -> utoipa::openapi::OpenApi {
-    let mut doc = <XSumoApi as utoipa::OpenApi>::openapi();
+    let mut doc = <XExtensionsApi as utoipa::OpenApi>::openapi();
     doc.info.version = env!("CARGO_PKG_VERSION").to_string();
     // The crate declares no license; drop the empty `license.name` utoipa
     // synthesizes from Cargo metadata rather than ship it in the artifact.
@@ -123,7 +123,7 @@ pub(crate) mod doc {
     #[utoipa::path(
         put,
         path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-ota-commit",
-        tag = "x-sumo-vendor-extension",
+        tag = "x-extensions",
         params(
             ("component_id" = String, Path, description = "Target component."),
             ("update_id" = String, Path, description = "The /updates entry; must be paused at execute/awaiting-verdict."),
@@ -139,7 +139,7 @@ pub(crate) mod doc {
     #[utoipa::path(
         put,
         path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-ota-rollback",
-        tag = "x-sumo-vendor-extension",
+        tag = "x-extensions",
         params(
             ("component_id" = String, Path, description = "Target component."),
             ("update_id" = String, Path, description = "The /updates entry; must be paused at execute/awaiting-verdict."),
@@ -155,7 +155,7 @@ pub(crate) mod doc {
     #[utoipa::path(
         put,
         path = "/vehicle/v1/components/{component_id}/x-ota-force-rollback",
-        tag = "x-sumo-vendor-extension",
+        tag = "x-extensions",
         params(
             ("component_id" = String, Path, description = "Target component."),
         ),

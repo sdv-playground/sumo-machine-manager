@@ -148,7 +148,7 @@ states at once.
 But activation and commit are **one machine-wide update session**, not per-bank. The set of
 banks a session staged — the trial **boot vector** — activates together, trial-boots together,
 and is **committed together** as the new state or **rolled back together** on any failure; the
-node advances its boot vector atomically (the node-level `x-sumo-commit-trials` / rollback
+node advances its boot vector atomically (the node-level `x-ota-commit-trials` / rollback
 verdict fans out across the component registry to the banks in trial). There is no per-bank
 independent commit. *Future:* the session widens to the whole vehicle — one update session
 spanning multiple machines/ECUs, where staged per-ECU rollouts do apply.

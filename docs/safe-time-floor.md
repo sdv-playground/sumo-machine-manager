@@ -112,16 +112,16 @@ execution.**
 | Attack | Defense |
 |---|---|
 | Rewind the persisted floor on disk | HSM monotonicity — the NV counter can't go backward |
-| Call `raise` with a bogus far-future value (auth DoS) | The raw `raise` op is **host-only link-B**, never exposed over the guest `vhsm-ssd` channel. The only *remote* path that advances it — the `x-sumo-attest-time` SOVD op — takes NO caller-supplied number: it accepts a **SoftwareAuthority-signed SUIT manifest** and ratchets to the manifest's own signature-covered `signing_time`. An attacker cannot forge a far-future time without the sw-authority key. |
+| Call `raise` with a bogus far-future value (auth DoS) | The raw `raise` op is **host-only link-B**, never exposed over the guest `vhsm-ssd` channel. The only *remote* path that advances it — the `x-attest-time` SOVD op — takes NO caller-supplied number: it accepts a **SoftwareAuthority-signed SUIT manifest** and ratchets to the manifest's own signature-covered `signing_time`. An attacker cannot forge a far-future time without the sw-authority key. |
 | Feed an unsigned timestamp to the floor | The caller only ratchets from signature-verified sources |
-| Replay an old signed manifest to `x-sumo-attest-time` | Monotonic — an `iat` at/below the floor is a no-op. Worst case: no change. |
+| Replay an old signed manifest to `x-attest-time` | Monotonic — an `iat` at/below the floor is a no-op. Worst case: no change. |
 
 The host callers that advance the floor are the OTA engine (`component-mgr`, on
-every trust-root-verified manifest — see Provenance) and the `x-sumo-attest-time`
+every trust-root-verified manifest — see Provenance) and the `x-attest-time`
 operator operation (below). Both ratchet only from a SoftwareAuthority-signed
 `signing_time`; neither takes a raw number.
 
-## Operator-pushed time: the `x-sumo-attest-time` operation
+## Operator-pushed time: the `x-attest-time` operation
 
 Ratcheting the floor during an OTA install has a bootstrap gap: a device whose
 clock lags real time rejects a freshly-minted **workshop-delegate cert**
@@ -130,10 +130,10 @@ manifest is uploaded, so nothing has advanced the floor yet. The delegate cert's
 validity window is checked against `max(wall_clock, floor)`, and the floor is
 still stale.
 
-`x-sumo-attest-time` breaks that deadlock **without widening any cert window**:
+`x-attest-time` breaks that deadlock **without widening any cert window**:
 
 ```
-POST /vehicle/v1/components/<host>/operations/x-sumo-attest-time/executions
+POST /vehicle/v1/components/<host>/operations/x-attest-time/executions
   body { "parameters": "<hex of a SoftwareAuthority-signed SUIT manifest>" }
   → device verifies the signature to its pinned SoftwareAuthority root  (clock-free)
   → ratchets the safe-time floor to the manifest's signed signing_time  (monotonic)

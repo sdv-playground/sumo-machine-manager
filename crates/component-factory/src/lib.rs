@@ -225,8 +225,8 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// (e.g. RT/M7 surfaces `guest_state` via `m7loader -q`). VMs leave
     /// this empty and use vm-service over loopback HTTP instead.
     pub health_probes: HashMap<String, Arc<dyn component_mgr::backend::HealthProbe>>,
-    /// The node's per-boot nonce (`/vehicle/v1/status/x-sumo-boot-id`). When
-    /// `Some`, every built component surfaces it in `x-sumo-runtime.node_boot_id`
+    /// The node's per-boot nonce (`/vehicle/v1/status/x-boot-id`). When
+    /// `Some`, every built component surfaces it in `x-runtime.node_boot_id`
     /// so the offboard flash gate has an unmissable reboot witness (see
     /// `ComponentBackend::with_node_boot_id`). `None` in tests / vm-sovd.
     pub node_boot_id: Option<String>,

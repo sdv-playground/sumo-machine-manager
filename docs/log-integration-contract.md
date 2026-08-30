@@ -43,8 +43,8 @@ Bind refuses plain HTTP unless transport security is explicitly waived (dev only
 Request query params you MUST honour:
 | Param | Meaning |
 |---|---|
-| `x-sumo-after=<cursor>` | opaque resume token — return entries strictly AFTER it, oldest→newest. Omit = start at oldest available. |
-| `x-sumo-emitter` / `x-sumo-emitter-exclude` | include / exclude emitters (sub-sources) — comma-separated, prefix-matched; exclude applied after include. Only meaningful if one `source` multiplexes emitters; otherwise return everything. |
+| `x-log-after=<cursor>` | opaque resume token — return entries strictly AFTER it, oldest→newest. Omit = start at oldest available. |
+| `x-log-emitter` / `x-log-emitter-exclude` | include / exclude emitters (sub-sources) — comma-separated, prefix-matched; exclude applied after include. Only meaningful if one `source` multiplexes emitters; otherwise return everything. |
 | `since` / `until` | RFC 3339 **or** a sentinel: `BEGIN`, `END`/`NOW`, `END-<N>{s,m,h,d}` / `NOW-<N>…`. Resolve server-side against YOUR clock. Malformed → **400**. |
 | `priority` | one of the 8 lowercase syslog levels (below) — return that level and higher. |
 | `source` | filter to one physical source string. |
@@ -56,9 +56,9 @@ Response body (`LogsResponse`):
 {
   "items": [ /* LogEntry, oldest→newest */ ],
   "total_count": 123,
-  "x-sumo-next-cursor":   "<opaque>",   // feed back as x-sumo-after; null/absent = head reached
-  "x-sumo-oldest-cursor": "<opaque>",   // earliest still-available position (gap detection)
-  "x-sumo-tip-cursor":    "<opaque>"    // "now" — poll x-sumo-after=<this> to follow the tail
+  "x-log-next-cursor":   "<opaque>",   // feed back as x-log-after; null/absent = head reached
+  "x-log-oldest-cursor": "<opaque>",   // earliest still-available position (gap detection)
+  "x-log-tip-cursor":    "<opaque>"    // "now" — poll x-log-after=<this> to follow the tail
 }
 ```
 Each `LogEntry`:
@@ -77,10 +77,10 @@ Each `LogEntry`:
 - The cursor is OPAQUE to the client — you define its bytes. It MUST be
   **reboot-safe**: encode a monotonic key (byte offset, generation, journald
   `__CURSOR`), NEVER a wall-clock timestamp (A.3).
-- `x-sumo-next-cursor` advances; `null`/absent means "head reached" — a paging
-  loop stops there. `x-sumo-tip-cursor` is present EVEN at head, so a follower
+- `x-log-next-cursor` advances; `null`/absent means "head reached" — a paging
+  loop stops there. `x-log-tip-cursor` is present EVEN at head, so a follower
   has a resume point.
-- If a caller's `x-sumo-after` predates `x-sumo-oldest-cursor`, history rotated
+- If a caller's `x-log-after` predates `x-log-oldest-cursor`, history rotated
   away — surface the gap via `oldest-cursor` rather than silently skipping.
 
 ### A.3 Non-monotonic clock (required assumption)
@@ -92,10 +92,10 @@ safe-time floor, then reset on the next boot). Therefore:
   advisory, not authoritative.
 
 ### A.4 Status extension (required)
-`GET .../status` returns §7.19.2 status with a flattened `x-sumo-runtime` object:
+`GET .../status` returns §7.19.2 status with a flattened `x-runtime` object:
 ```jsonc
 { "...standard status...": "…",
-  "x-sumo-runtime": { "boot_count": 12, "uptime_s": 3400, "node_boot_id": "<uuid>", "admin_state": "enabled" } }
+  "x-runtime": { "boot_count": 12, "uptime_s": 3400, "node_boot_id": "<uuid>", "admin_state": "enabled" } }
 ```
 `node_boot_id` (the current boot nonce) is required — it's what freshness-bound
 tokens (A.5) and cross-boot cursor logic key on.
@@ -116,16 +116,16 @@ tokens (A.5) and cross-boot cursor logic key on.
   `logs` is the conventional first category.
 - **`DELETE .../logs/{id}`** + `status` (`pending|retrieved|processed`): only if
   you model the acknowledge / message-passing pattern.
-- The `x-sumo-*` OTA/HSM routes (commit/rollback/CSR/pull-update) are NOT needed
+- The `x-ota-*` / `x-csr` OTA/HSM routes (commit/rollback/CSR/pull-update) are NOT needed
   for a log/diagnostics endpoint — omit them.
 
 ### A.7 Conformance checklist (Path A)
-- [ ] `/logs` accepts `x-sumo-after` and returns the three `x-sumo-*` cursors.
+- [ ] `/logs` accepts `x-log-after` and returns the three `x-log-*` cursors.
 - [ ] Cursor is opaque + reboot-safe (no timestamp inside).
 - [ ] `since`/`until` accept `BEGIN`/`END`/`END-<N>{s,m,h,d}` + RFC 3339; bad → 400.
 - [ ] Each entry has a stable content-addressed `id`, `priority` from the 8-level
       set, one physical `source`, sub-source in `fields.emitter`.
-- [ ] `/status` carries `x-sumo-runtime` incl. `node_boot_id`.
+- [ ] `/status` carries `x-runtime` incl. `node_boot_id`.
 - [ ] JWT bearer with `workshop-ca` + boot/epoch freshness binding; no plain HTTP.
 - [ ] Capabilities advertise `logs` (and `bulk_data` iff files are downloadable).
 
@@ -157,7 +157,7 @@ over the per-component private /30 (never the public network). Endpoints:
 | `GET /files/{id}` | raw bytes (`application/octet-stream`); `{id}` re-validated against the live `/files` catalog, else 404 |
 
 Query params (percent-decoded; unknown keys ignored): `tail`|`limit`, `source`,
-`x-sumo-emitter`, `x-sumo-emitter-exclude` (include/exclude emitters —
+`x-log-emitter`, `x-log-emitter-exclude` (include/exclude emitters —
 comma-separated, prefix-matched), `pattern`, `priority`, `since`, `until`,
 `after` (cursor — only `/logs/page` reads it; `/logs` ignores it).
 
@@ -193,8 +193,8 @@ paths. Apply a read/size cap.
 
 **What the host does for you:** maps `/logs/page` → the SOVD `/logs` paged read,
 `/files`+`/files/{id}` → §7.20 bulk-data (namespacing your ids so they can't
-collide with host-file ids), supplies the `x-sumo-*` cursors, the `END[-N]`
-sentinels, `x-sumo-runtime`, and all auth/freshness. You implement none of that.
+collide with host-file ids), supplies the `x-log-*` cursors, the `END[-N]`
+sentinels, `x-runtime`, and all auth/freshness. You implement none of that.
 
 ### B2 — implement the backend trait directly
 
@@ -239,9 +239,9 @@ gives no cursor. Wire types: `LogFilter`/`LogPage`/`LogEntry`/`LogPriority`/
 | | Path A (own SOVD server) | Path B (aggregator behind our server) |
 |---|---|---|
 | You expose | full SOVD-extended HTTP surface | a GET-only log-agent (or the backend trait) |
-| Cursors / sentinels / `x-sumo-*` | **you implement** | we implement; you page forward only |
+| Cursors / sentinels / `x-log-*` | **you implement** | we implement; you page forward only |
 | Auth + freshness | **you implement** (JWT, boot/epoch binding) | we implement |
-| Status `x-sumo-runtime` | **you implement** | we implement |
+| Status `x-runtime` | **you implement** | we implement |
 | Wire shape owner | you | us |
 | Effort | high | low |
 | Use when | you need to own the endpoint / federate a full server | you just have logs to surface |
