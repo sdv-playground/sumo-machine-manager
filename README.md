@@ -161,8 +161,8 @@ PUT      /vehicle/v1/components/{id}/updates/{uid}/bulk-data/manifest  # Upload 
 PUT      /vehicle/v1/components/{id}/updates/{uid}/prepare             # Validate (signature + digest + security version)
 PUT      /vehicle/v1/components/{id}/updates/{uid}/execute             # Finalize + activate (flip bank, await reboot)
 GET      /vehicle/v1/components/{id}/updates/{uid}/status              # Poll flash state
-PUT      /vehicle/v1/components/{id}/updates/{uid}/x-sumo-commit       # Commit trial
-PUT      /vehicle/v1/components/{id}/updates/{uid}/x-sumo-rollback     # Rollback trial
+PUT      /vehicle/v1/components/{id}/updates/{uid}/x-ota-commit        # Commit trial
+PUT      /vehicle/v1/components/{id}/updates/{uid}/x-ota-rollback      # Rollback trial
 POST     /vehicle/v1/components/{id}/reset                             # ECU reset
 ```
 
@@ -214,7 +214,7 @@ Register update (POST /updates) → Upload SUIT envelope (PUT …/bulk-data/mani
   → Prepare: validate (signature + digest + security_version)
   → Execute: finalize → install (decrypt + decompress → target bank) → activate (flip bank)
   → Reset → Trial (activated, not committed)
-  → Health check → Commit (x-sumo-commit, permanent) or Rollback (x-sumo-rollback)
+  → Health check → Commit (x-ota-commit, permanent) or Rollback (x-ota-rollback)
 ```
 
 For CRL manifests: Upload → Apply floor → Done (no flash/reset/commit).

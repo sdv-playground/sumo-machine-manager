@@ -24,10 +24,14 @@ to provide a compatible log endpoint).
 
 SOVDd stays spec-pure; every sumo-specific route lives in
 `component_mgr::sovd::{routes, admin_state, pull_update}` and is merged onto the
-router at bind time (`vm-sovd/src/main.rs`, `gateway.rs`). One documented seam
-breaks the purity: a few `x-sumo-*` VERBS on the standard `/updates` resource are
-baked into the SOVDd router itself (OTA orchestration was co-designed) — noted
-below.
+router at bind time (`vm-sovd/src/main.rs`, `gateway.rs`). The update-verdict
+VERBS on the standard `/updates` resource are baked into the SOVDd router itself
+(OTA orchestration was co-designed); C-026 closed that seam by renaming them
+vendor-neutral `x-ota-*` — a generic API feature, not a sumo one — so they stay
+in `sovd-api` without breaking purity. The one deliberate vendor-name residual
+there is a commented arm in `sovd-api/auth.rs::route_capability` mapping sumo's
+`x-sumo-{commit,rollback}-trials` node operations (§2) to `UpdateVerdict`: SOVDd
+serves no such route, but they ride its auth middleware in the merged router.
 
 Everything vendor is an `x-` extension per ISO 17978-3 §6.2.7 / §5.3.6, so a
 spec-conformant client that ignores unknown `x-*` names still works.
@@ -81,9 +85,10 @@ new routes):
 - `x-sumo-installed-manifest` — installed SUIT manifest JSON for the serving bank.
 - `x-sumo-id` (also the route above) — the ECU thumbprint.
 
-Vendor verbs baked into the STANDARD `/updates` router (the documented
-purity break): `PUT /updates/{id}/x-sumo-commit`, `/x-sumo-rollback`,
-`PUT /components/{id}/x-sumo-force-rollback`, and `PUT /execute?x-sumo-control=orchestrated`.
+Verbs baked into the STANDARD `/updates` router: `PUT /updates/{id}/x-ota-commit`,
+`/x-ota-rollback`, `PUT /components/{id}/x-ota-force-rollback` — vendor-neutral
+since C-026, so no longer vendor extensions — plus the still-vendor query param
+`PUT /execute?x-sumo-control=orchestrated`.
 
 Production-only (a vendor-private sibling server, not this tree):
 `GET /status/x-sumo-boot-id` and `POST /factory_reset`. In this tree the boot id

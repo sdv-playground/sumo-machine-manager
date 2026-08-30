@@ -2,7 +2,7 @@
 //! (`x-sumo-*`) of the machine-manager SOVD servers.
 //!
 //! Generated with `utoipa` from the actual handlers/types in [`super::routes`]
-//! and [`super::pull_update`] (plus the three SOVDd-resident `x-sumo-*` update
+//! and [`super::pull_update`] (plus the three SOVDd-resident `x-ota-*` update
 //! verbs, declared here as path carriers because their handlers live in
 //! SOVDd). The ISO 17978-3 base surface is deliberately NOT annotated — the
 //! document delegates it by reference (see the `info.description`).
@@ -61,9 +61,9 @@ there."
         super::routes::rollback_trials,
         super::pull_update::handle_post,
         super::pull_update::get_pull_update_status,
-        doc::x_sumo_commit,
-        doc::x_sumo_rollback,
-        doc::x_sumo_force_rollback,
+        doc::x_ota_commit,
+        doc::x_ota_rollback,
+        doc::x_ota_force_rollback,
     ),
     components(schemas(
         super::routes::UpdateStateResponse,
@@ -122,7 +122,7 @@ pub(crate) mod doc {
     /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).
     #[utoipa::path(
         put,
-        path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-sumo-commit",
+        path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-ota-commit",
         tag = "x-sumo-vendor-extension",
         params(
             ("component_id" = String, Path, description = "Target component."),
@@ -133,12 +133,12 @@ pub(crate) mod doc {
             (status = 409, description = "The update is not paused at awaiting-verdict."),
         ),
     )]
-    pub(crate) fn x_sumo_commit() {}
+    pub(crate) fn x_ota_commit() {}
 
     /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).
     #[utoipa::path(
         put,
-        path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-sumo-rollback",
+        path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-ota-rollback",
         tag = "x-sumo-vendor-extension",
         params(
             ("component_id" = String, Path, description = "Target component."),
@@ -149,12 +149,12 @@ pub(crate) mod doc {
             (status = 409, description = "The update is not paused at awaiting-verdict."),
         ),
     )]
-    pub(crate) fn x_sumo_rollback() {}
+    pub(crate) fn x_ota_rollback() {}
 
     /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).
     #[utoipa::path(
         put,
-        path = "/vehicle/v1/components/{component_id}/x-sumo-force-rollback",
+        path = "/vehicle/v1/components/{component_id}/x-ota-force-rollback",
         tag = "x-sumo-vendor-extension",
         params(
             ("component_id" = String, Path, description = "Target component."),
@@ -163,5 +163,5 @@ pub(crate) mod doc {
             (status = 204, description = "Backend trial state cleared unconditionally (idempotent)."),
         ),
     )]
-    pub(crate) fn x_sumo_force_rollback() {}
+    pub(crate) fn x_ota_force_rollback() {}
 }

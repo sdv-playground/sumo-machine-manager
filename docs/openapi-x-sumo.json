@@ -129,13 +129,13 @@
         }
       }
     },
-    "/vehicle/v1/components/{component_id}/updates/{update_id}/x-sumo-commit": {
+    "/vehicle/v1/components/{component_id}/updates/{update_id}/x-ota-commit": {
       "put": {
         "tags": [
           "x-sumo-vendor-extension"
         ],
         "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).",
-        "operationId": "x_sumo_commit",
+        "operationId": "x_ota_commit",
         "parameters": [
           {
             "name": "component_id",
@@ -174,13 +174,13 @@
         }
       }
     },
-    "/vehicle/v1/components/{component_id}/updates/{update_id}/x-sumo-rollback": {
+    "/vehicle/v1/components/{component_id}/updates/{update_id}/x-ota-rollback": {
       "put": {
         "tags": [
           "x-sumo-vendor-extension"
         ],
         "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).",
-        "operationId": "x_sumo_rollback",
+        "operationId": "x_ota_rollback",
         "parameters": [
           {
             "name": "component_id",
@@ -219,13 +219,13 @@
         }
       }
     },
-    "/vehicle/v1/components/{component_id}/x-sumo-force-rollback": {
+    "/vehicle/v1/components/{component_id}/x-ota-force-rollback": {
       "put": {
         "tags": [
           "x-sumo-vendor-extension"
         ],
         "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs).",
-        "operationId": "x_sumo_force_rollback",
+        "operationId": "x_ota_force_rollback",
         "parameters": [
           {
             "name": "component_id",

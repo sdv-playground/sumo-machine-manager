@@ -486,12 +486,12 @@ async fn flash_full_suit_flow() {
     assert_eq!(paused["status"], "inProgress");
     assert_eq!(paused["x-sumo-substate"], "awaiting-verdict");
 
-    // 5. PUT /x-sumo-commit — Phase B vendor verb.  Wakes the paused
+    // 5. PUT /x-ota-commit — Phase B vendor verb.  Wakes the paused
     //    execute task; calls backend.commit_flash; transitions to
     //    execute/completed.
     let (status, _) = put_empty(
         &router,
-        &format!("/vehicle/v1/components/vm1/updates/{update_id}/x-sumo-commit"),
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/x-ota-commit"),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -620,7 +620,7 @@ async fn faults_and_clear() {
 
 /// Drive a full prepare+execute+verdict cycle and return the
 /// post-verdict `UpdateStatusBody`.  `verdict_verb` is one of
-/// `x-sumo-commit` / `x-sumo-rollback`.
+/// `x-ota-commit` / `x-ota-rollback`.
 async fn run_spec_cycle(
     router: &axum::Router,
     component: &str,
@@ -677,7 +677,7 @@ async fn run_spec_cycle(
 async fn ota_commit_via_sovd() {
     let (router, _, keys) = make_router();
     let envelope = make_test_suit_envelope(&keys, "vm1", 3, &vec![0xCC; 1024]);
-    let final_body = run_spec_cycle(&router, "vm1", envelope, "x-sumo-commit").await;
+    let final_body = run_spec_cycle(&router, "vm1", envelope, "x-ota-commit").await;
     assert_eq!(final_body["phase"], "execute");
     assert_eq!(final_body["status"], "completed");
     assert!(final_body.get("error").is_none());
@@ -687,7 +687,7 @@ async fn ota_commit_via_sovd() {
 async fn ota_rollback_via_sovd() {
     let (router, _, keys) = make_router();
     let envelope = make_test_suit_envelope(&keys, "vm1", 4, &vec![0xDD; 1024]);
-    let final_body = run_spec_cycle(&router, "vm1", envelope, "x-sumo-rollback").await;
+    let final_body = run_spec_cycle(&router, "vm1", envelope, "x-ota-rollback").await;
     assert_eq!(final_body["phase"], "execute");
     assert_eq!(final_body["status"], "failed");
     assert_eq!(
