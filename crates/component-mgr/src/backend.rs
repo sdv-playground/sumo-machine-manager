@@ -1753,15 +1753,16 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // transaction is still unresolved on this node — either it owes an
         // activation reboot (the durable half — survives a power cycle, unlike the
         // in-memory flash state, which is how a singleshot rt slipped through) OR
-        // it owes a commit/rollback verdict for a component still in trial. Both
-        // sets are derived from the same NV facts the `x-ota-update-state` wire
-        // reports (`node_reboot_owed` + `node_in_trial_labels`), so the gate
-        // refuses exactly what that resource shows unresolved — with reboot-owed
-        // taking precedence, so an armed-but-not-yet-rebooted component refuses as
-        // reboot-owed, not in-trial. A sibling joining the SAME transaction
-        // (matching session id) is admitted, so the banked group can stage
-        // together; the orchestrator stages every component before any finalize,
-        // so no owed/in-trial bit is set while a sibling is still being admitted.
+        // it owes a commit/rollback verdict for a component whose trial is LIVE.
+        // Both sets come from NV (`node_reboot_owed` + `node_live_trial_labels`).
+        // Live-trial, not the wider `x-ota-update-state` Trial set: a component
+        // that is armed but has not yet taken the coalesced activation reboot owes
+        // nothing yet, and refusing for it would break the engine's one-reboot
+        // coalescing of a banked campaign step (it 409'd the second component of a
+        // ["vm1","vm2"] step). A sibling joining the SAME transaction (matching
+        // session id) is admitted, so the banked group can stage together; the
+        // orchestrator stages every component before any finalize, so no
+        // owed/live-trial bit is set while a sibling is still being admitted.
         // On admit, this component joins the staging set. No-op until `vm-sovd`
         // injects the coordinator. The session id is zero for the push path; the
         // pull route stamps the L1 campaign id via `install_source`, so one
@@ -1774,7 +1775,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     .nv
                     .lock()
                     .map_err(|_| BackendError::Internal("nv lock".into()))?;
-                node_in_trial_labels(&nv, coord)
+                node_live_trial_labels(&nv, coord)
             };
             let session_id = self
                 .install_source
@@ -2562,21 +2563,58 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 }
 
 /// The node's in-trial component set — every bank set whose active bank is not
-/// yet committed (`committed == false`), labelled via the coordinator. Shared by
-/// the `x-ota-update-state` wire (`sovd::routes::derive_node_update_state`) and
-/// the node flash gate (`ComponentBackend::ensure_flash_can_start`) so both name
-/// exactly the same in-trial components — the gate refuses precisely what that
-/// resource reports unresolved. The reboot-owed precedence inside
-/// `machine_mgr::node_update::admit` keeps an armed-but-not-yet-rebooted
-/// `RequiresEcuReset` component in the owed-reboot refusal, not this Trial set.
+/// yet committed (`committed == false`), labelled via the coordinator. This is
+/// the `x-ota-update-state` wire's Trial set — `sovd::routes::derive_node_update_state`,
+/// which the commit gate also reads for its `RebootPending` check. A component
+/// belongs from the moment its bank is armed, which is the phase the engine and
+/// the UIs report on.
+///
+/// The node flash gate uses the narrower [`node_live_trial_labels`] instead —
+/// see there for why the two must differ.
 pub(crate) fn node_in_trial_labels<D: BlockDevice>(
     nv: &NvStore<D>,
     coord: &machine_mgr::node_update::NodeCoordinator,
 ) -> Vec<String> {
+    trial_labels(nv, coord, |b| !b.committed)
+}
+
+/// The node's LIVE-trial set — the components the open-a-new-flash gate
+/// (`ComponentBackend::ensure_flash_can_start`) refuses for. Narrower than
+/// [`node_in_trial_labels`]: a bank set counts only once the activation reboot
+/// has actually happened — the armed bank IS the running bank and a verdict is
+/// genuinely owed. `boot_count` is that event's durable witness: `ota::install`
+/// zeroes it when it arms the bank, and only a boot into the armed bank while
+/// uncommitted raises it (the boot manager's `process_boot`; `ecu_reset` for a
+/// Local-reset VM). Commit / rollback / auto-rollback all re-commit the set, so
+/// a trial that fell back never lingers here.
+///
+/// Why the gate must NOT use the wider wire set: the engine coalesces one
+/// campaign step into flash-all-banked → ONE reboot → trial-all → ONE
+/// commit-trials, so between two banked flashes the first component is
+/// armed-but-not-yet-rebooted. Counting it as in-trial refused its own sibling's
+/// `open_update` with `Refused::Trial` (409) and broke the coalescing. An
+/// armed-pre-reboot `RequiresEcuReset` component is still kept out of a new
+/// flash's way — by its durable reboot-owed bit, which `admit` refuses on with
+/// precedence; a Local-reset VM never sets that bit, which is why the
+/// armed-pre-reboot window was only ever visible through this set.
+pub(crate) fn node_live_trial_labels<D: BlockDevice>(
+    nv: &NvStore<D>,
+    coord: &machine_mgr::node_update::NodeCoordinator,
+) -> Vec<String> {
+    trial_labels(nv, coord, |b| !b.committed && b.boot_count > 0)
+}
+
+/// Label every bank set matching `is_member` via the coordinator's id map — the
+/// shared body of the two trial-set derivations above.
+fn trial_labels<D: BlockDevice>(
+    nv: &NvStore<D>,
+    coord: &machine_mgr::node_update::NodeCoordinator,
+    is_member: impl Fn(&BankBootState) -> bool,
+) -> Vec<String> {
     nv.read_boot_state()
         .map(|s| {
             (0..NUM_BANK_SETS)
-                .filter(|&i| !s.banks[i].committed)
+                .filter(|&i| is_member(&s.banks[i]))
                 .map(|i| coord.label(i))
                 .collect()
         })
@@ -11089,10 +11127,11 @@ mod copy_forward_tests {
         assert_eq!(st.phase, machine_mgr::node_update::NodePhase::Idle);
     }
 
-    /// The in-trial verdict gate: while a sibling is in trial (its armed bank is
-    /// uncommitted and NO node reboot is owed — a Local-reset VM never sets the
-    /// owed bit, so the node phase is Trial, not RebootPending), a NEW flash of a
-    /// DIFFERENT component is refused with `Refused::Trial` — the node owes a
+    /// The in-trial verdict gate: while a sibling's trial is LIVE (its armed bank
+    /// is uncommitted, the activation reboot has happened — `boot_count > 0` — and
+    /// NO node reboot is owed, since a Local-reset VM never sets the owed bit, so
+    /// the node phase is Trial, not RebootPending), a NEW flash of a DIFFERENT
+    /// component is refused with `Refused::Trial` — the node owes a
     /// commit/rollback verdict first. Committing the in-trial component clears it.
     /// The same-component case is caught one layer earlier by the per-bank-set
     /// committed check ("in trial mode"), never the node gate.
@@ -11101,12 +11140,14 @@ mod copy_forward_tests {
         let tmp = tempfile::tempdir().unwrap();
         let images_dir = tmp.path().to_path_buf();
 
-        // vm1 in trial: active bank B, uncommitted, no reboot owed. vm2 fully
-        // committed, so it clears its own bank-set check and reaches the node gate.
+        // vm1 in a live trial: active bank B, uncommitted, booted into it once, no
+        // reboot owed. vm2 fully committed, so it clears its own bank-set check and
+        // reaches the node gate.
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
         boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::B;
         boot.banks[BankSet::Vm1.as_index()].committed = false;
+        boot.banks[BankSet::Vm1.as_index()].boot_count = 1;
         boot.banks[BankSet::Vm2.as_index()].active_bank = Bank::A;
         boot.banks[BankSet::Vm2.as_index()].committed = true;
         nv.write_boot_state(&mut boot).unwrap();
@@ -11160,10 +11201,11 @@ mod copy_forward_tests {
             "expected the per-bank-set committed refusal, got: {msg}"
         );
 
-        // Commit vm1 — the gate's only in-trial input is the NV committed flag, so
-        // flipping it to committed is exactly what a commit verdict does here (no
-        // reboot owed and no staging entry for a Local-reset VM). The node returns
-        // to Idle and a new flash of vm2 is admitted.
+        // Commit vm1 — the gate's live-trial input is the NV committed flag (plus
+        // the boot_count that says the trial went live), so flipping it to
+        // committed is exactly what a commit verdict does here (no reboot owed and
+        // no staging entry for a Local-reset VM). The node returns to Idle and a
+        // new flash of vm2 is admitted.
         {
             let mut guard = nv.lock().unwrap();
             let mut boot = guard.read_boot_state().unwrap();

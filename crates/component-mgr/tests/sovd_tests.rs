@@ -13,9 +13,10 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use machine_mgr::node_update::NodeCoordinator;
 use machine_mgr::{
-    DeactivateError, DeactivateOutcome, Deactivator, InMemorySelectorStore, SharedSystemBankState,
-    SystemBankManager, TestSigner,
+    DeactivateError, DeactivateOutcome, Deactivator, EntityInfo, InMemorySelectorStore,
+    MachineRegistry, SharedSystemBankState, SystemBankManager, TestSigner,
 };
 use nv_store::block::MemBlockDevice;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
@@ -25,6 +26,7 @@ use sovd_core::{DiagnosticBackend, FlashState};
 
 use component_mgr::backend::{ComponentBackend, ComponentConfig};
 use component_mgr::bank_provider::IvdBankProvider;
+use component_mgr::component_adapter::ComponentAdapter;
 use component_mgr::manifest_provider::ManifestProvider;
 use component_mgr::suit_provider::SuitProvider;
 
@@ -624,15 +626,15 @@ async fn faults_and_clear() {
 // OTA via direct API (commit/rollback without flash upload)
 // ============================================================
 
-/// Drive a full prepare+execute+verdict cycle and return the
-/// post-verdict `UpdateStatusBody`.  `verdict_verb` is one of
-/// `x-ota-commit` / `x-ota-rollback`.
-async fn run_spec_cycle(
+/// Drive register + manifest upload + prepare + orchestrated execute, leaving
+/// the component paused at `awaiting-verdict`: its bank is ARMED (uncommitted,
+/// next-boot pointer flipped) and the activation reboot has NOT happened yet.
+/// Returns the update id, for the verdict verb that follows.
+async fn flash_to_awaiting_verdict(
     router: &axum::Router,
     component: &str,
     envelope: Vec<u8>,
-    verdict_verb: &str,
-) -> serde_json::Value {
+) -> String {
     let (status, body) = post_json(
         router,
         &format!("/vehicle/v1/components/{component}/updates"),
@@ -669,6 +671,19 @@ async fn run_spec_cycle(
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     poll_status_until_awaiting_verdict(router, component, &update_id).await;
+    update_id
+}
+
+/// Drive a full prepare+execute+verdict cycle and return the
+/// post-verdict `UpdateStatusBody`.  `verdict_verb` is one of
+/// `x-ota-commit` / `x-ota-rollback`.
+async fn run_spec_cycle(
+    router: &axum::Router,
+    component: &str,
+    envelope: Vec<u8>,
+    verdict_verb: &str,
+) -> serde_json::Value {
+    let update_id = flash_to_awaiting_verdict(router, component, envelope).await;
 
     let (status, _) = put_empty(
         router,
@@ -929,7 +944,7 @@ async fn disable_manifest_settles_prepare_and_enacts_at_execute() {
     // so nothing would ever arrive to move `flash_transfer.state` off
     // Transferring. Drives the real router end to end: upload → prepare (must
     // settle at once) → execute (must enact the disable).
-    let (router, keys, selector, deact, _backend) =
+    let (router, keys, selector, deact, backend) =
         make_disable_router("vm1", BankSet::Vm1, ComponentConfig::default());
     assert!(
         !selector.read().unwrap().disabled(BankSet::Vm1),
@@ -978,6 +993,15 @@ async fn disable_manifest_settles_prepare_and_enacts_at_execute() {
     assert!(
         selector.read().unwrap().disabled(BankSet::Vm1),
         "record_disabled(true) persisted in the signed selector"
+    );
+    // A disable stages no bank content, so it must never open a trial: the bank
+    // set stays committed and the component therefore enters NEITHER the
+    // `x-ota-update-state` Trial set nor the node flash gate's live-trial set.
+    let bank = backend.nv_lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
+        .clone();
+    assert!(
+        bank.committed,
+        "a disable owes no verdict — it must not put the bank set in trial: {bank:?}"
     );
     // And it is visible on the wire the operator reads.
     let (status, body) = get(&router, "/vehicle/v1/components/vm1/status").await;
@@ -1070,4 +1094,207 @@ async fn singleshot_disable_settles_prepare_and_enacts_at_execute() {
         selector.read().unwrap().disabled(BankSet::Rt),
         "record_disabled(true) persisted in the signed selector"
     );
+}
+
+// =============================================================================
+// Node update-transaction gate over the real wire — ONE banked campaign step
+// ["vm1","vm2"]: flash both, ONE activation reboot, ONE commit-trials
+// =============================================================================
+
+/// vm1 + vm2 sharing ONE node update coordinator (the gate every deployment
+/// binary wires) plus the node-level verdict routes. Mirrors `vm-sovd`'s
+/// wiring: the same backends serve the SOVD component routes and, through
+/// `ComponentAdapter`, the `Machine` the node verdict fans out over. Hands back
+/// the NV store so a test can read the armed / live-trial facts the gate
+/// decides on.
+fn make_node_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys) {
+    let keys = generate_test_keys();
+    let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
+    suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
+    let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
+
+    let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+    let mut boot_state = NvBootState::default();
+    nv.write_boot_state(&mut boot_state).unwrap();
+    let nv = Arc::new(Mutex::new(nv));
+
+    let coord = Arc::new(NodeCoordinator::new(vec![
+        (BankSet::Vm1.as_index(), "vm1".to_string()),
+        (BankSet::Vm2.as_index(), "vm2".to_string()),
+    ]));
+
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    let mut machine = MachineRegistry::builder(EntityInfo {
+        id: "vehicle".into(),
+        name: "vehicle".into(),
+        entity_type: "vehicle".into(),
+        description: None,
+        href: "/vehicle/v1".into(),
+        status: None,
+    });
+    for (id, set) in [("vm1", BankSet::Vm1), ("vm2", BankSet::Vm2)] {
+        let backend = Arc::new(
+            ComponentBackend::new(
+                set,
+                nv.clone(),
+                manifest_provider.clone(),
+                ComponentConfig::default(),
+            )
+            .with_id(id.to_string())
+            .with_node_coordinator(coord.clone()),
+        );
+        backends.insert(id.to_string(), backend.clone());
+        machine = machine.with(ComponentAdapter::new(backend));
+    }
+
+    let router = sovd_api::create_router(sovd_api::AppState::new(backends)).merge(
+        component_mgr::sovd::routes::node_verdict_router(
+            Arc::new(machine.build()),
+            nv.clone(),
+            coord,
+        ),
+    );
+    (router, nv, keys)
+}
+
+/// The bank-set boot state the node gate reads (active bank, committed,
+/// boot_count).
+fn bank_state(nv: &Arc<Mutex<NvStore<MemBlockDevice>>>, set: BankSet) -> BankBootState {
+    nv.lock().unwrap().read_boot_state().unwrap().banks[set.as_index()].clone()
+}
+
+/// The coalesced activation reboot for one component, over the real §7.19
+/// restart route — the orchestrator's reset step. Switches the running bank to
+/// the armed bank and raises the trial `boot_count`.
+async fn activation_reset(router: &axum::Router, component: &str) {
+    let (status, body) = put_json(
+        router,
+        &format!("/vehicle/v1/components/{component}/status/restart"),
+        serde_json::json!({ "reset_type": "hard" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "restart {component}: {body}");
+}
+
+#[tokio::test]
+async fn armed_pre_reboot_component_does_not_block_a_sibling_open() {
+    // FIELD REPRO (S32G3, one banked campaign step ["vm1","vm2"]): vm1 staged and
+    // executed to awaiting-verdict — armed, but the coalesced activation reboot
+    // has NOT run — and vm2's open_update came back 409 "node owes a verdict for
+    // in-trial [\"vm1\"]". That broke the engine's designed one-trial-step
+    // coalescing (flash all banked -> ONE reboot -> trial all -> ONE
+    // commit-trials). vm1 owes no verdict yet, so vm2 must be admitted.
+    let (router, nv, keys) = make_node_router();
+
+    flash_to_awaiting_verdict(
+        &router,
+        "vm1",
+        make_test_suit_envelope(&keys, "vm1", 2, &vec![0xBB; 2048]),
+    )
+    .await;
+
+    // The armed-pre-reboot fact the gate must distinguish: trial content staged
+    // (uncommitted) but never booted into (`boot_count == 0`).
+    let vm1_bank = bank_state(&nv, BankSet::Vm1);
+    assert!(!vm1_bank.committed, "vm1 is armed: {vm1_bank:?}");
+    assert_eq!(
+        vm1_bank.boot_count, 0,
+        "…and has NOT taken the activation reboot: {vm1_bank:?}"
+    );
+
+    let (status, body) = post_json(
+        &router,
+        "/vehicle/v1/components/vm2/updates",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "vm2 must join the campaign step while vm1 is armed-pre-reboot: {body}"
+    );
+}
+
+#[tokio::test]
+async fn live_trial_still_refuses_a_new_flash() {
+    // The gate's genuine case, unchanged: once the activation reboot HAS happened
+    // (running == armed, still uncommitted) the node owes a verdict, and a new
+    // flash is refused 409 with the owes-a-verdict message — the engine's
+    // state-gated recovery keys off exactly this refusal.
+    let (router, nv, keys) = make_node_router();
+
+    flash_to_awaiting_verdict(
+        &router,
+        "vm1",
+        make_test_suit_envelope(&keys, "vm1", 2, &vec![0xBB; 2048]),
+    )
+    .await;
+    activation_reset(&router, "vm1").await;
+
+    let vm1_bank = bank_state(&nv, BankSet::Vm1);
+    assert!(
+        !vm1_bank.committed,
+        "vm1 still owes a verdict: {vm1_bank:?}"
+    );
+    assert!(
+        vm1_bank.boot_count > 0,
+        "…and its trial is now LIVE — it booted the armed bank: {vm1_bank:?}"
+    );
+
+    let (status, body) = post_json(
+        &router,
+        "/vehicle/v1/components/vm2/updates",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "open_update: {body}");
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("owes a verdict for in-trial") && msg.contains("vm1"),
+        "expected the node-gate Trial refusal naming vm1, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn commit_trials_resolves_both_components_after_one_coalesced_reboot() {
+    // The whole banked step end to end: flash BOTH components (the sibling open
+    // that used to 409), take ONE activation reboot, then ONE node commit-trials
+    // resolves the pair — the multi-component node verdict the engine issues.
+    let (router, nv, keys) = make_node_router();
+
+    flash_to_awaiting_verdict(
+        &router,
+        "vm1",
+        make_test_suit_envelope(&keys, "vm1", 2, &vec![0xBB; 2048]),
+    )
+    .await;
+    flash_to_awaiting_verdict(
+        &router,
+        "vm2",
+        make_test_suit_envelope(&keys, "vm2", 2, &vec![0xCC; 2048]),
+    )
+    .await;
+
+    for component in ["vm1", "vm2"] {
+        activation_reset(&router, component).await;
+    }
+
+    let (status, body) = post_json(
+        &router,
+        "/vehicle/v1/operations/x-ota-commit-trials/executions",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "commit-trials: {body}");
+    let committed = body["result"]["committed"].as_array().unwrap();
+    assert!(
+        committed.contains(&serde_json::json!("vm1"))
+            && committed.contains(&serde_json::json!("vm2")),
+        "one node verdict must resolve the whole step: {body}"
+    );
+
+    for set in [BankSet::Vm1, BankSet::Vm2] {
+        let bank = bank_state(&nv, set);
+        assert!(bank.committed, "{set:?} committed in NV: {bank:?}");
+    }
 }
