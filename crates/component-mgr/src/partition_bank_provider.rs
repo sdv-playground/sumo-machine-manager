@@ -265,8 +265,16 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
 
     /// Seal by hashing the written partition(s) BACK and signing an IVD manifest
     /// over those digests. No dir-walk (there are no staged files); the manifest
-    /// + signature are written into the small metadata dir.
-    fn seal(&self, bank: Bank, identity: FirmwareIdentity, gen: u64) -> Result<(), BankError> {
+    /// and its signature are written into the small metadata dir. `required` is
+    /// unused: the inventory is `self.parts` (raw devices, nothing to seed from
+    /// a peer bank dir).
+    fn seal(
+        &self,
+        bank: Bank,
+        identity: FirmwareIdentity,
+        gen: u64,
+        _required: &[String],
+    ) -> Result<(), BankError> {
         let metadata_dir = self.metadata_dir(bank)?;
         std::fs::create_dir_all(&metadata_dir).map_err(|e| {
             BankError::Failed(format!(
@@ -488,7 +496,8 @@ mod tests {
         let p = build(base.join("images"), parts, "seal");
 
         // Seal → hashes dev_a back, signs a manifest into the metadata dir.
-        p.seal(Bank::A, FirmwareIdentity::default(), 1).unwrap();
+        p.seal(Bank::A, FirmwareIdentity::default(), 1, &[])
+            .unwrap();
 
         // The IVD artefacts landed in the metadata dir (NOT a 133MB staging file).
         let md = p.metadata_dir(Bank::A).unwrap();

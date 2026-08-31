@@ -1233,15 +1233,42 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// rather than silently shipping an unsigned bank.
     fn ivd_sign_staged_bank(&self, target: Bank) -> BackendResult<()> {
         // Bank mechanics (seed → skip-checks → HSM-provisioned gate → sign)
-        // moved to `IvdBankProvider::seal`. The engine still owns the two
-        // inputs that come from its OTA state: the install-time `gen` (from NV)
-        // and the firmware SW identity (from the package the flash transfer
-        // points at, mapped to the kind-agnostic `FirmwareIdentity`).
+        // moved to `IvdBankProvider::seal`. The engine still owns the three
+        // inputs that come from its OTA state: the install-time `gen` (from NV),
+        // the firmware SW identity (from the package the flash transfer points
+        // at, mapped to the kind-agnostic `FirmwareIdentity`), and the part
+        // inventory this install's manifest declares.
         let gen = self.install_gen_for(target)?;
         let identity = self.current_install_identity();
+        let required = self.declared_bank_parts();
         self.bank_provider
-            .seal(target, identity, gen)
+            .seal(target, identity, gen, &required)
             .map_err(|e| BackendError::Internal(e.to_string()))
+    }
+
+    /// The part names the bank being sealed must hold: the inventory this
+    /// install's manifest declares. That is exactly the flash transfer's
+    /// accumulated file list — every declared component reaches it either by
+    /// being streamed in (`handle_payload_upload`) or by being reconciled from
+    /// the active bank / CAS (`reconcile_unpushed`, folded in at transferexit).
+    ///
+    /// The provider's seed uses it as the REQUIRED set: anything the active
+    /// bank holds outside it belongs to a different manifest (a cross-channel
+    /// flash) and must never be copied — nor even opened, since a running guest
+    /// may hold it through devb-loopback. Empty when the install declares no
+    /// payloads (CRL / disable / HSM keystore / buffered no-transfer paths),
+    /// which makes the seed a no-op.
+    fn declared_bank_parts(&self) -> Vec<String> {
+        let ft = self.flash_transfer.lock().ok();
+        ft.and_then(|g| {
+            g.as_ref().map(|t| {
+                t.streamed_files
+                    .iter()
+                    .map(|f| f.relative_path.clone())
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
     }
 
     /// Compute the install-time generation counter (`gen`) directly from NV
@@ -4648,9 +4675,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 .reconcile_unpushed(&manifest_bytes, next_component, total_components, target)
                 .await?;
             // Fold the reconciled files into the transfer inventory (parity with
-            // the streamed path), then seal the now-complete bank. `seal`'s own
-            // presence-based seed no-ops the just-written files and IVD-signs the
-            // full bank so external secure boot / commit accept it.
+            // the streamed path) — that inventory IS the declared part list the
+            // seal below settles — then seal the now-complete bank. `seal`'s own
+            // seed no-ops the just-written files and IVD-signs the full bank so
+            // external secure boot / commit accept it.
             {
                 let mut ft = self.flash_transfer.lock().unwrap();
                 if let Some(ref mut t) = *ft {
@@ -8442,7 +8470,13 @@ mod bank_provider_injection_tests {
         ) -> Result<Box<dyn std::io::Write + Send>, BankError> {
             Err(BankError::Failed("sentinel".into()))
         }
-        fn seal(&self, _b: Bank, _i: FirmwareIdentity, _g: u64) -> Result<(), BankError> {
+        fn seal(
+            &self,
+            _b: Bank,
+            _i: FirmwareIdentity,
+            _g: u64,
+            _r: &[String],
+        ) -> Result<(), BankError> {
             Ok(())
         }
         fn read_installed(&self, _bank: Bank) -> Result<InstalledFirmware, BankError> {

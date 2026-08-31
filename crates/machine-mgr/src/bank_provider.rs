@@ -151,7 +151,20 @@ pub trait BankProvider: Send + Sync {
     /// Finalize `bank` after the payloads are written: build + seal the
     /// installed-firmware record (IVD: hash the files, sign the CBOR with the
     /// `ivd-signing` key; raw kinds: write the selector/SHA sectors).
-    fn seal(&self, bank: Bank, identity: FirmwareIdentity, gen: u64) -> Result<(), BankError>;
+    ///
+    /// `required` is the part names this install's manifest DECLARES — the
+    /// complete inventory the sealed bank must hold. A provider that stages
+    /// into a bank dir uses it to settle each declared part Ship-or-Reuse
+    /// (already streamed in, else copied from the active bank); parts outside
+    /// it are never copied, since they belong to a different manifest. Empty
+    /// when the install declares no payloads (CRL / disable / HSM keystore).
+    fn seal(
+        &self,
+        bank: Bank,
+        identity: FirmwareIdentity,
+        gen: u64,
+        required: &[String],
+    ) -> Result<(), BankError>;
 
     /// Read + verify the installed firmware for `bank`. `Err(NotInstalled)` when
     /// the bank was never flashed.

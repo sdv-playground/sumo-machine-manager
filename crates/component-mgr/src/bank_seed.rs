@@ -9,12 +9,19 @@
 //! `policy.sqfs` is the new payload.
 //!
 //! The mechanism: after all streaming is done but before the bank
-//! gets signed by IVD + activated, copy any files from the active
-//! bank to the target bank that the streaming step didn't write.
-//! "Didn't write" = "the path doesn't exist in target yet". This
-//! cleanly handles full updates (target has everything → seed copies
-//! nothing) and partial updates (target has only the new bits →
-//! seed fills in the rest).
+//! gets signed by IVD + activated, take the part list the sealed
+//! manifest DECLARES and settle each part Ship-or-Reuse — either the
+//! streaming step already shipped it into the target (skip) or it is
+//! copied from the active bank (Reuse). A declared part in neither
+//! place is a hard error: the bank cannot be completed.
+//!
+//! What this deliberately does NOT do is walk the active bank. Files
+//! the active bank holds that the sealed manifest does not declare
+//! belong to a DIFFERENT manifest — a cross-channel flash leaves
+//! exactly that — so copying them would contaminate the target bank
+//! with parts outside its own manifest. Worse, merely opening one is
+//! enough to fail the whole seal: on QNX an image a running guest
+//! holds through devb-loopback rejects the second opener with EBUSY.
 //!
 //! This module provides the pure mechanism; wiring it into the OTA
 //! state machine is a separate decision (always-on vs manifest-flag
@@ -25,26 +32,45 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-/// Walk `source_dir` and copy every file that doesn't already exist
-/// in `target_dir` (relative to its source-side path). Subdirectories
-/// recursive. Symlinks preserved (read + recreate). File modes
-/// preserved (mode bits propagated through `std::fs::copy` + an
-/// explicit `set_permissions` to cover the cases where the target
-/// FS doesn't preserve them automatically).
+/// What one seed pass over the sealed manifest's required parts did.
+#[derive(Debug, Default)]
+pub struct SeedOutcome {
+    /// Required parts the streaming step didn't ship, copied from the
+    /// active bank (genuine Reuse). Useful for audit / diagnostic logging.
+    pub copied: Vec<PathBuf>,
+    /// Names the active bank holds that this manifest does NOT declare —
+    /// never touched, reported so a cross-channel leftover is visible in
+    /// the log. Empty when nothing is required (nothing to compare against).
+    pub foreign: Vec<String>,
+}
+
+/// Settle every part `required` by the manifest being sealed: skip the ones
+/// the streaming step already shipped into `target_dir`, copy the rest from
+/// `source_dir` (the active bank). Symlinks preserved (read + recreate). File
+/// modes preserved (mode bits propagated through `std::fs::copy` + an explicit
+/// `set_permissions` to cover the cases where the target FS doesn't preserve
+/// them automatically). Parent directories of a `sub/dir/part` name are created.
 ///
-/// Returns the relative paths of files that were created in the
-/// target. Useful for audit / diagnostic logging.
+/// A required part present in NEITHER place is an error naming it — the bank
+/// cannot be completed, and sealing a partial bank is never the answer.
 ///
-/// Idempotent for the partial-update case: if every file in source
-/// already exists in target, returns an empty Vec and touches nothing.
+/// Only `required` is ever read from the source: everything else the active
+/// bank holds is left alone (and only listed, for the caller's summary log).
+/// A manifest that ships every part it declares therefore makes this a
+/// provable no-op — no source file is opened at all, which is what keeps a
+/// full flash clear of the devb-loopback EBUSY on the running bank's images.
 ///
-/// `target_dir` must already exist (the caller's
-/// `prepare_target_bank_dir` is responsible for that).
-pub fn seed_missing_files(source_dir: &Path, target_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    if !source_dir.is_dir() {
-        // No source = nothing to seed. Not an error — the active bank
-        // is allowed to be empty (factory state, e.g.).
-        return Ok(Vec::new());
+/// `target_dir` must already exist (the caller's `prepare_target_bank_dir` is
+/// responsible for that).
+pub fn seed_missing_files(
+    source_dir: &Path,
+    target_dir: &Path,
+    required: &[String],
+) -> io::Result<SeedOutcome> {
+    let mut outcome = SeedOutcome::default();
+    if required.is_empty() {
+        // Nothing declared ⇒ nothing to settle. Don't even list the source.
+        return Ok(outcome);
     }
     if !target_dir.is_dir() {
         return Err(io::Error::new(
@@ -53,84 +79,94 @@ pub fn seed_missing_files(source_dir: &Path, target_dir: &Path) -> io::Result<Ve
         ));
     }
 
-    let mut copied = Vec::new();
-    walk_and_seed(source_dir, target_dir, Path::new(""), &mut copied)?;
-    Ok(copied)
+    for name in required {
+        let target_path = target_dir.join(name);
+        // Ship: the streaming step (or the copy-forward reconcile) already put
+        // this part in the target. Leave it, and never open the active bank's
+        // copy — that open is what EBUSYs on a devb-attached image.
+        if target_path.symlink_metadata().is_ok() {
+            continue;
+        }
+
+        // Reuse: the manifest declares this part but nothing shipped it, so it
+        // comes from the active bank verbatim.
+        //
+        // KNOWN LIMITATION (out of scope here): a genuine Reuse of an image a
+        // RUNNING guest holds through devb-loopback can still fail on this read
+        // — QNX refuses the second opener with EBUSY. Read-open semantics for a
+        // devb-attached source are settled on the bench, not here.
+        let source_path = source_dir.join(name);
+        let meta = match source_path.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "required file {name:?} is in neither the target bank ({}) nor the \
+                         active bank ({}) — the bank cannot be completed",
+                        target_dir.display(),
+                        source_dir.display(),
+                    ),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            let link_dest = fs::read_link(&source_path)?;
+            std::os::unix::fs::symlink(&link_dest, &target_path)?;
+        } else if ft.is_file() {
+            fs::copy(&source_path, &target_path)?;
+            // Explicitly carry mode bits forward. std::fs::copy does this on
+            // Unix already, but being explicit costs nothing and survives
+            // future portability.
+            let _ = fs::set_permissions(
+                &target_path,
+                fs::Permissions::from_mode(meta.permissions().mode()),
+            );
+        } else {
+            // A directory / socket / fifo under a declared part's name. A bank
+            // shouldn't contain those; refuse rather than seal something the
+            // manifest can't describe.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "required file {name:?} in the active bank ({}) is neither a file nor a symlink",
+                    source_dir.display(),
+                ),
+            ));
+        }
+        outcome.copied.push(PathBuf::from(name));
+    }
+
+    outcome.foreign = foreign_entries(source_dir, required);
+    Ok(outcome)
 }
 
-fn walk_and_seed(
-    source_root: &Path,
-    target_root: &Path,
-    rel: &Path,
-    copied: &mut Vec<PathBuf>,
-) -> io::Result<()> {
-    let source_dir = source_root.join(rel);
-    let target_dir = target_root.join(rel);
-
-    // Ensure the target subdirectory exists. For the rel="" case this
-    // is a no-op (caller already created it).
-    if !target_dir.exists() {
-        fs::create_dir_all(&target_dir)?;
-        // Mirror the source dir's mode so executable / RX bits on
-        // policy/roots/ (rare but allowed) survive.
-        if let Ok(meta) = source_dir.metadata() {
-            let _ = fs::set_permissions(&target_dir, meta.permissions());
-        }
-    }
-
-    for entry in fs::read_dir(&source_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let rel_entry = rel.join(&name);
-        let target_path = target_root.join(&rel_entry);
-
-        let ft = entry.file_type()?;
-        if ft.is_symlink() {
-            // Skip if target already has this name — preserves
-            // anything the streaming step put there.
-            if target_path.symlink_metadata().is_ok() {
-                continue;
-            }
-            let link_dest = fs::read_link(entry.path())?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&link_dest, &target_path)?;
-            #[cfg(not(unix))]
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "symlink seed not supported on this platform",
-            ));
-            copied.push(rel_entry);
-        } else if ft.is_dir() {
-            // Recurse — subdirectory contents are seeded individually,
-            // not as a block. This lets a partial update overwrite a
-            // single file inside a subdir (e.g. policy.sqfs is a
-            // file, but a future tree-of-files component could
-            // partially overlap).
-            walk_and_seed(source_root, target_root, &rel_entry, copied)?;
-        } else if ft.is_file() {
-            // Streaming-wrote-this check — if the target already
-            // has it, leave the streaming result alone.
-            if target_path.exists() {
-                continue;
-            }
-            fs::copy(entry.path(), &target_path)?;
-            // Explicitly carry mode bits forward. std::fs::copy
-            // does this on Unix already, but being explicit costs
-            // nothing and survives future portability.
-            if let Ok(meta) = entry.metadata() {
-                let _ = fs::set_permissions(
-                    &target_path,
-                    fs::Permissions::from_mode(meta.permissions().mode()),
-                );
-            }
-            copied.push(rel_entry);
-        }
-        // Anything else (sockets, fifos, devices) — ignored. A
-        // bank shouldn't contain those; if it does, the operator
-        // has bigger problems than partial-update semantics.
-    }
-
-    Ok(())
+/// Top-level names in `source_dir` that no `required` part claims — the parts
+/// of a DIFFERENT manifest (what a cross-channel flash leaves behind in the
+/// active bank). Diagnostic only; these are never copied. IVD's own artefacts
+/// aren't parts, so they don't count. A missing/unreadable source dir (factory
+/// first-flash) simply has nothing to report.
+fn foreign_entries(source_dir: &Path, required: &[String]) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(source_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| {
+            name != hsm::ivd::IVD_MANIFEST_FILE
+                && name != hsm::ivd::IVD_SIGNATURE_FILE
+                // `sub/dir/part` names are claimed by their first segment.
+                && !required
+                    .iter()
+                    .any(|r| r.split('/').next() == Some(name.as_str()))
+        })
+        .collect()
 }
 
 /// Error from a digest-verified copy-forward of one bank file.
@@ -280,173 +316,188 @@ mod tests {
         buf
     }
 
-    #[test]
-    fn empty_source_is_noop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source");
-        let target = tmp.path().join("target");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&target).unwrap();
-
-        let copied = seed_missing_files(&source, &target).unwrap();
-        assert!(copied.is_empty());
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn missing_source_is_noop() {
-        // A bank with no active predecessor (factory first-flash)
-        // should not error. seed_missing_files quietly returns empty.
+    fn nothing_required_is_noop() {
+        // CRL / disable / HSM-keystore installs declare no payloads. Nothing to
+        // settle ⇒ the source is never even listed, and a target dir that isn't
+        // there yet is not an error.
         let tmp = tempfile::tempdir().unwrap();
-        let nonexistent = tmp.path().join("never-existed");
-        let target = tmp.path().join("target");
-        fs::create_dir_all(&target).unwrap();
-        let copied = seed_missing_files(&nonexistent, &target).unwrap();
-        assert!(copied.is_empty());
+        let source = tmp.path().join("source");
+        write_file(&source.join("kernel"), b"old kernel");
+
+        let outcome = seed_missing_files(&source, &tmp.path().join("no-target"), &[]).unwrap();
+        assert!(outcome.copied.is_empty());
+        assert!(outcome.foreign.is_empty());
     }
 
     #[test]
-    fn missing_target_errors() {
+    fn cross_channel_flash_copies_nothing_from_the_active_bank() {
+        // The field failure: a cicd→skan8f vm1 flash ships all the parts its
+        // manifest declares, while the active bank still holds cicd-only images
+        // the RUNNING guest has open via devb-loopback. Seed must not go near
+        // them — reading one is what raised EBUSY and failed the seal.
         let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source");
-        fs::create_dir_all(&source).unwrap();
-        let err = seed_missing_files(&source, &tmp.path().join("does-not-exist")).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
-    }
+        let source = tmp.path().join("bank_b");
+        let target = tmp.path().join("bank_a");
+        write_file(&source.join("kernel"), b"cicd kernel");
+        write_file(&source.join("rootfs.img"), b"cicd rootfs");
+        write_file(&source.join("rt-link"), b"cicd-only image");
+        write_file(&source.join("diagnostics"), b"cicd-only image");
+        // Every declared part was streamed into the target.
+        write_file(&target.join("kernel"), b"skan8f kernel");
+        write_file(&target.join("rootfs.img"), b"skan8f rootfs");
 
-    #[test]
-    fn empty_target_gets_full_source() {
-        // "Source has files, target is empty" = full update, but the
-        // SUIT envelope had no components. Result: target ends up
-        // identical to source. (This is the degenerate full-seed case.)
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source");
-        let target = tmp.path().join("target");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        write_file(&source.join("kernel"), b"kernel bytes");
-        write_file(&source.join("rootfs.img"), &vec![0xAB; 4096]);
-        write_file(&source.join("policy.sqfs"), b"squashfs goes here");
+        let outcome =
+            seed_missing_files(&source, &target, &names(&["kernel", "rootfs.img"])).unwrap();
 
-        let copied = seed_missing_files(&source, &target).unwrap();
-        assert_eq!(copied.len(), 3);
-        assert_eq!(read_file(&target.join("kernel")), b"kernel bytes");
-        assert_eq!(
-            read_file(&target.join("policy.sqfs")),
-            b"squashfs goes here"
+        assert!(outcome.copied.is_empty(), "a full ship seeds nothing");
+        assert!(
+            !target.join("rt-link").exists() && !target.join("diagnostics").exists(),
+            "parts outside the manifest must never reach the target bank"
         );
+        // Streamed bytes untouched.
+        assert_eq!(read_file(&target.join("kernel")), b"skan8f kernel");
+        // …and the leftovers are reported so the operator can see them.
+        let mut foreign = outcome.foreign.clone();
+        foreign.sort();
+        assert_eq!(foreign, vec!["diagnostics".to_string(), "rt-link".into()]);
     }
 
     #[test]
-    fn target_with_overlapping_files_keeps_target_version() {
-        // The canonical partial-update case:
-        //   source (active bank): kernel, rootfs.img, policy.sqfs (old)
-        //   target (post-stream): policy.sqfs (NEW)
-        // After seed: target has kernel + rootfs.img from source,
-        // policy.sqfs from the streaming step.
+    fn declared_part_the_stream_did_not_ship_is_reused_from_active() {
+        // Genuine Reuse: the manifest declares vm-config.yaml, the push didn't
+        // carry it, the active bank has it → copy, mode and all.
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
         let target = tmp.path().join("target");
-        fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&target).unwrap();
         write_file(&source.join("kernel"), b"old kernel");
-        write_file(&source.join("rootfs.img"), b"old rootfs");
-        write_file(&source.join("policy.sqfs"), b"OLD policy");
-        // Target only has the new policy.sqfs — the streaming step.
-        write_file(&target.join("policy.sqfs"), b"NEW policy");
+        let cfg = source.join("vm-config.yaml");
+        write_file(&cfg, b"old: config");
+        fs::set_permissions(&cfg, fs::Permissions::from_mode(0o755)).unwrap();
+        write_file(&target.join("kernel"), b"new kernel");
 
-        let copied = seed_missing_files(&source, &target).unwrap();
-        assert_eq!(copied.len(), 2, "should seed kernel + rootfs.img only");
-        // Streaming result preserved.
-        assert_eq!(read_file(&target.join("policy.sqfs")), b"NEW policy");
-        // Seed brought in the rest.
-        assert_eq!(read_file(&target.join("kernel")), b"old kernel");
-        assert_eq!(read_file(&target.join("rootfs.img")), b"old rootfs");
-    }
+        let outcome =
+            seed_missing_files(&source, &target, &names(&["kernel", "vm-config.yaml"])).unwrap();
 
-    #[test]
-    fn fully_overlapping_target_seeds_nothing() {
-        // SUIT envelope had every component → target already has
-        // everything → seed is a no-op. The full-update case must
-        // still work after wiring this in.
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source");
-        let target = tmp.path().join("target");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        write_file(&source.join("kernel"), b"old");
-        write_file(&source.join("rootfs.img"), b"old");
-        write_file(&target.join("kernel"), b"new");
-        write_file(&target.join("rootfs.img"), b"new");
-
-        let copied = seed_missing_files(&source, &target).unwrap();
-        assert!(copied.is_empty());
-        assert_eq!(read_file(&target.join("kernel")), b"new");
-    }
-
-    #[test]
-    fn subdirectories_recursively_seeded() {
-        // Forward-looking: a future bank component might be a
-        // directory tree (not just a single .sqfs file).
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source");
-        let target = tmp.path().join("target");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        write_file(&source.join("sub/a.bin"), b"A");
-        write_file(&source.join("sub/b.bin"), b"B");
-        write_file(&source.join("sub/deeper/c.bin"), b"C");
-
-        let copied = seed_missing_files(&source, &target).unwrap();
-        assert_eq!(copied.len(), 3);
-        assert_eq!(read_file(&target.join("sub/a.bin")), b"A");
-        assert_eq!(read_file(&target.join("sub/deeper/c.bin")), b"C");
-    }
-
-    #[test]
-    fn nested_partial_overlap_seeds_only_missing_subtree_files() {
-        // Target has sub/a.bin (streaming), source has sub/a.bin
-        // and sub/b.bin. After seed: target has the streaming
-        // a.bin + the seeded b.bin.
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source");
-        let target = tmp.path().join("target");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        write_file(&source.join("sub/a.bin"), b"old A");
-        write_file(&source.join("sub/b.bin"), b"old B");
-        write_file(&target.join("sub/a.bin"), b"new A");
-
-        let copied = seed_missing_files(&source, &target).unwrap();
-        assert_eq!(copied.len(), 1);
-        assert_eq!(read_file(&target.join("sub/a.bin")), b"new A");
-        assert_eq!(read_file(&target.join("sub/b.bin")), b"old B");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn file_mode_preserved() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source");
-        let target = tmp.path().join("target");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        let p = source.join("script.sh");
-        write_file(&p, b"#!/bin/sh\necho hi\n");
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
-
-        seed_missing_files(&source, &target).unwrap();
-
-        let mode = fs::metadata(target.join("script.sh"))
+        assert_eq!(outcome.copied, vec![PathBuf::from("vm-config.yaml")]);
+        assert_eq!(read_file(&target.join("kernel")), b"new kernel");
+        assert_eq!(read_file(&target.join("vm-config.yaml")), b"old: config");
+        let mode = fs::metadata(target.join("vm-config.yaml"))
             .unwrap()
             .permissions()
             .mode();
         // Mask off type bits; the perms portion is the low 12 bits.
-        assert_eq!(mode & 0o7777, 0o755, "executable bit must survive seed");
+        assert_eq!(mode & 0o7777, 0o755, "mode bits must survive the reuse");
+    }
+
+    #[test]
+    fn declared_part_missing_everywhere_errors_naming_it() {
+        // Neither shipped nor reusable — the bank cannot be completed, and
+        // sealing a partial one is never the answer.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        write_file(&source.join("kernel"), b"old kernel");
+
+        let err = seed_missing_files(&source, &target, &names(&["kernel", "rootfs.img"]))
+            .expect_err("a part in neither bank must fail the seal");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("rootfs.img"),
+            "the error must name the missing part, got: {err}"
+        );
+    }
+
+    #[test]
+    fn foreign_files_stay_put_even_when_a_reuse_happens() {
+        // Reuse of a declared part must not drag the rest of the active bank
+        // along with it.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        write_file(&source.join("kernel"), b"old kernel");
+        write_file(&source.join("rt-link"), b"cicd-only image");
+        write_file(&target.join("rootfs.img"), b"new rootfs");
+
+        let outcome =
+            seed_missing_files(&source, &target, &names(&["kernel", "rootfs.img"])).unwrap();
+
+        assert_eq!(outcome.copied, vec![PathBuf::from("kernel")]);
+        assert_eq!(read_file(&target.join("kernel")), b"old kernel");
+        assert!(
+            !target.join("rt-link").exists(),
+            "an undeclared file must not ride along with a reuse"
+        );
+        assert_eq!(outcome.foreign, vec!["rt-link".to_string()]);
+    }
+
+    #[test]
+    fn missing_target_dir_errors_when_parts_are_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        write_file(&source.join("kernel"), b"old kernel");
+        let err = seed_missing_files(&source, &tmp.path().join("no-target"), &names(&["kernel"]))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn factory_first_flash_has_no_active_bank_to_reuse_from() {
+        // No active predecessor on disk. Everything the manifest declares was
+        // streamed, so the seed succeeds without touching the missing source.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        write_file(&target.join("policy.sqfs"), b"new");
+
+        let outcome = seed_missing_files(
+            &tmp.path().join("never-existed"),
+            &target,
+            &names(&["policy.sqfs"]),
+        )
+        .unwrap();
+        assert!(outcome.copied.is_empty());
+        assert!(outcome.foreign.is_empty());
+    }
+
+    #[test]
+    fn required_subpath_creates_its_parent_dirs() {
+        // A declared part may live in a subdirectory of the bank.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        write_file(&source.join("policy/policy.yaml"), b"version: 1");
+        write_file(&source.join("policy/roots/sumo-sign.pem"), b"pem");
+
+        let outcome = seed_missing_files(
+            &source,
+            &target,
+            &names(&["policy/policy.yaml", "policy/roots/sumo-sign.pem"]),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.copied.len(), 2);
+        assert_eq!(read_file(&target.join("policy/policy.yaml")), b"version: 1");
+        assert_eq!(
+            read_file(&target.join("policy/roots/sumo-sign.pem")),
+            b"pem"
+        );
+        assert!(
+            outcome.foreign.is_empty(),
+            "`policy/...` parts claim the `policy` dir — not a leftover"
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn symlink_in_source_recreated_in_target() {
+    fn required_symlink_recreated_in_target() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
         let target = tmp.path().join("target");
@@ -455,11 +506,12 @@ mod tests {
         write_file(&source.join("target.bin"), b"linkdest");
         std::os::unix::fs::symlink("target.bin", source.join("link")).unwrap();
 
-        let copied = seed_missing_files(&source, &target).unwrap();
-        assert!(copied.iter().any(|p| p == Path::new("link")));
-
-        let link_target = fs::read_link(target.join("link")).unwrap();
-        assert_eq!(link_target, Path::new("target.bin"));
+        let outcome = seed_missing_files(&source, &target, &names(&["link"])).unwrap();
+        assert_eq!(outcome.copied, vec![PathBuf::from("link")]);
+        assert_eq!(
+            fs::read_link(target.join("link")).unwrap(),
+            Path::new("target.bin")
+        );
     }
 
     #[cfg(unix)]
@@ -475,7 +527,7 @@ mod tests {
         std::os::unix::fs::symlink("old", source.join("link")).unwrap();
         std::os::unix::fs::symlink("new", target.join("link")).unwrap();
 
-        seed_missing_files(&source, &target).unwrap();
+        seed_missing_files(&source, &target, &names(&["link"])).unwrap();
 
         assert_eq!(
             fs::read_link(target.join("link")).unwrap(),

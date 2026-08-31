@@ -231,13 +231,19 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         Ok(())
     }
 
-    /// Copy any files in the active bank that don't already exist in the
-    /// target bank, so a partial OTA ends with a complete target bank. Runs
-    /// AFTER streaming finishes and BEFORE IVD signing so the signature covers
-    /// the final bank contents. `pub` so the engine's `seed_target_from_active`
-    /// delegator (used directly by `bank_seed_integration_tests`) can reach it;
-    /// `seal` also calls it just before signing.
-    pub fn seed_target_from_active(&self, target: Bank) -> Result<(), BankError> {
+    /// Settle the parts `required` by the manifest being sealed: the ones the
+    /// streaming step didn't ship are copied from the active bank, so a partial
+    /// OTA ends with a complete target bank. Runs AFTER streaming finishes and
+    /// BEFORE IVD signing so the signature covers the final bank contents.
+    /// Files outside `required` are NEVER copied — they belong to a different
+    /// manifest. `pub` so the engine's `seed_target_from_active` delegator (used
+    /// directly by `bank_seed_integration_tests`) can reach it; `seal` also
+    /// calls it just before signing.
+    pub fn seed_target_from_active(
+        &self,
+        target: Bank,
+        required: &[String],
+    ) -> Result<(), BankError> {
         if self.single_bank {
             return Ok(());
         }
@@ -265,23 +271,34 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         let source_dir = images_dir.join(set_name).join(bank_dir_name(active));
         let target_dir = images_dir.join(set_name).join(bank_dir_name(target));
 
-        match crate::bank_seed::seed_missing_files(&source_dir, &target_dir) {
-            Ok(seeded) if seeded.is_empty() => {
-                tracing::debug!(
-                    target = %target_dir.display(),
-                    source = %source_dir.display(),
-                    "bank seed: no files copied (full update or empty active)"
-                );
-                Ok(())
-            }
-            Ok(seeded) => {
-                tracing::info!(
-                    target = %target_dir.display(),
-                    source = %source_dir.display(),
-                    count = seeded.len(),
-                    paths = ?seeded,
-                    "bank seed: copied unstreamed files from active bank"
-                );
+        match crate::bank_seed::seed_missing_files(&source_dir, &target_dir, required) {
+            Ok(outcome) => {
+                if let Some(example) = outcome.foreign.first() {
+                    // Cross-channel leftovers: the active bank was built from a
+                    // manifest declaring other parts. Visible, never copied.
+                    tracing::info!(
+                        source = %source_dir.display(),
+                        count = outcome.foreign.len(),
+                        example = %example,
+                        "bank seed: active bank holds files this manifest does not declare — left untouched"
+                    );
+                }
+                if outcome.copied.is_empty() {
+                    tracing::debug!(
+                        target = %target_dir.display(),
+                        source = %source_dir.display(),
+                        required = required.len(),
+                        "bank seed: no files copied (every declared part was shipped)"
+                    );
+                } else {
+                    tracing::info!(
+                        target = %target_dir.display(),
+                        source = %source_dir.display(),
+                        count = outcome.copied.len(),
+                        paths = ?outcome.copied,
+                        "bank seed: reused declared parts the stream didn't ship"
+                    );
+                }
                 Ok(())
             }
             Err(e) => {
@@ -425,12 +442,19 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         Ok(Box::new(BufWriter::with_capacity(WRITE_BUF, file)))
     }
 
-    fn seal(&self, bank: Bank, identity: FirmwareIdentity, gen: u64) -> Result<(), BankError> {
-        // Seed unstreamed files from the active bank so the signature below
-        // covers a complete bank, not a partial one. No-op for full updates /
-        // single-bank / factory. This is the seed step that used to sit right
-        // before `ivd_sign_staged_bank` at every engine call site.
-        self.seed_target_from_active(bank)?;
+    fn seal(
+        &self,
+        bank: Bank,
+        identity: FirmwareIdentity,
+        gen: u64,
+        required: &[String],
+    ) -> Result<(), BankError> {
+        // Settle the declared parts the stream didn't ship, from the active
+        // bank, so the signature below covers a complete bank, not a partial
+        // one. No-op for full updates / single-bank / factory. This is the seed
+        // step that used to sit right before `ivd_sign_staged_bank` at every
+        // engine call site.
+        self.seed_target_from_active(bank, required)?;
 
         // (1) Test-mode / legitimate no-op skips first — independent of HSM
         //     state (mirrors `ivd_sign_staged_bank`).
@@ -1008,6 +1032,35 @@ mod tests {
             Err(BankError::NotInstalled) => {}
             other => panic!("expected NotInstalled, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+    }
+
+    /// A zero-payload manifest (administrative disable / CRL) declares no parts.
+    /// `seal` must still succeed — and must leave the active bank's files right
+    /// where they are: the pre-fix seed blanket-walked them into the target
+    /// bank, which contaminated it with parts outside its manifest and, on the
+    /// rig, failed the seal outright when a running guest held one of those
+    /// images through devb-loopback (QNX second-opener EBUSY).
+    #[test]
+    fn seal_with_no_declared_parts_never_touches_the_active_bank() {
+        let images_dir = std::env::temp_dir().join("component-mgr-seal-zero-payload");
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let active_dir = images_dir.join("vm1").join("bank_a");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::write(active_dir.join("kernel"), b"running kernel").unwrap();
+        std::fs::write(active_dir.join("rootfs.img"), b"running rootfs").unwrap();
+
+        // NV active is A (see `nv_with_active`), so the seal targets sibling B.
+        let p = disk_provider_no_hsm(images_dir.clone());
+        p.seal(Bank::B, FirmwareIdentity::default(), 1, &[])
+            .expect("a payload-less manifest must seal cleanly");
+
+        let target_dir = images_dir.join("vm1").join("bank_b");
+        assert!(
+            !target_dir.join("kernel").exists() && !target_dir.join("rootfs.img").exists(),
+            "nothing declared ⇒ nothing seeded into the target bank"
+        );
 
         let _ = std::fs::remove_dir_all(&images_dir);
     }
