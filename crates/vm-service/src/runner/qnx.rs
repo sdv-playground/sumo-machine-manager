@@ -11,12 +11,39 @@
 
 use std::path::Path;
 use std::process::{Child, Command};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 
 /// Timeout waiting for devb-loopback to create the device node.
 const LOOPBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`QnxRunner::kill_child`] waits for a SIGKILLed child to be reaped
+/// before walking away from it. QNX blocks the reap UNINTERRUPTIBLY when the
+/// child is demand-paged from a devb-loopback whose pager is already gone (the
+/// same dead-pager trap that made `shutdown` hang) — and `kill_child` runs on
+/// the reboot path, where an unbounded `wait()` is fatal: field 2026-08-30, a
+/// reboot with both guests up never returned from `stop_all_for_reboot`, so the
+/// reset was never even scheduled and the board had to be power-cut. Bounded ⇒
+/// worst case we leave a zombie behind, which the imminent reset collects.
+const REAP_GRACE: Duration = Duration::from_secs(2);
+
+/// Poll `reaped` until it reports the child collected or `grace` expires.
+/// Returns `true` if it was collected. Takes the poll as a closure rather than
+/// the `Child` itself so the bound is testable — only QNX's dead-pager case
+/// produces a child that never reaps, and that can't be staged in a unit test.
+fn reap_within(grace: Duration, mut reaped: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        if reaped() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 pub struct QnxRunner {
     /// devb-loopback spawn parents for rootfs + every extra disk. Each held
@@ -48,10 +75,21 @@ impl QnxRunner {
         }
     }
 
-    /// Kill a child process if it's still alive.
+    /// Kill a child process if it's still alive, then reap it — bounded by
+    /// [`REAP_GRACE`], never forever (see that constant for why).
     fn kill_child(child: &mut Child) {
         let _ = child.kill();
-        let _ = child.wait();
+        let pid = child.id();
+        if !reap_within(REAP_GRACE, || {
+            matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+        }) {
+            tracing::warn!(
+                pid,
+                grace_secs = REAP_GRACE.as_secs(),
+                "child not reaped after SIGKILL (uninterruptible on a dead pager?) — \
+                 leaving it and proceeding"
+            );
+        }
     }
 
     /// Prefix the rootfs devb-loopback registers under in `/dev`.
@@ -532,6 +570,60 @@ impl VmRunner for QnxRunner {
 impl Drop for QnxRunner {
     fn drop(&mut self) {
         self.cleanup();
+    }
+}
+
+#[cfg(test)]
+mod reap_tests {
+    use super::{reap_within, QnxRunner, REAP_GRACE};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn reap_within_returns_as_soon_as_the_child_is_collected() {
+        let mut polls = 0;
+        let started = Instant::now();
+        assert!(reap_within(Duration::from_secs(30), || {
+            polls += 1;
+            polls >= 3
+        }));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "returned on the third poll, not at the grace deadline"
+        );
+    }
+
+    #[test]
+    fn reap_within_gives_up_at_the_grace_deadline() {
+        // The dead-pager case: the child never reaps. Must return, not hang —
+        // this is the bound the reboot path depends on.
+        let started = Instant::now();
+        assert!(!reap_within(Duration::from_millis(100), || false));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(100), "waited the grace");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "gave up promptly: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn kill_child_reaps_a_live_child_well_inside_the_grace() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let started = Instant::now();
+        QnxRunner::kill_child(&mut child);
+        assert!(
+            started.elapsed() < REAP_GRACE,
+            "a killable child reaps immediately: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "child was reaped, not left behind"
+        );
     }
 }
 
