@@ -631,6 +631,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 status: None,
             },
             capabilities: Capabilities {
+                configurations: false,
                 read_data: true,
                 write_data: true,
                 faults: true,

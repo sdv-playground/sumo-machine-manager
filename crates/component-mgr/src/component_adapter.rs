@@ -510,5 +510,8 @@ fn map_backend_error(e: BackendError) -> MachineError {
         )),
         BackendError::UpdateInProgress(s) => MachineError::Busy(s),
         BackendError::UnsupportedMediaType(s) => MachineError::WrongTarget(s),
+        BackendError::ConfigurationNotFound(s) => MachineError::NotFound(s),
+        BackendError::PreconditionFailed(s) => MachineError::PolicyRejected(s),
+        BackendError::NotAcceptable(s) => MachineError::WrongTarget(s),
     }
 }
