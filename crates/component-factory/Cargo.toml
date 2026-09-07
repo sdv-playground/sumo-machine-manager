@@ -13,6 +13,14 @@ hsm = { path = "../hsm", features = ["crypto"] }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 
+[features]
+# Forward container/OCI support to the crates that own it, so a binary composed
+# through this factory can turn containers on with a single flag. Nothing in the
+# factory itself is gated — it builds no container component today; the
+# container-image route lives in component-mgr's app install router. OFF by
+# default — see app-mgr's `container` comment for why.
+container = ["component-mgr/container", "app-mgr/container"]
+
 [dependencies.sovd-core]
 git = "https://github.com/sdv-playground/SOVDd.git"
 branch = "main"

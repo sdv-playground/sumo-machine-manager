@@ -12,8 +12,16 @@ use crate::manifest_provider::ManifestProvider;
 
 const CONTAINER_IMAGE_COMPONENT: &str = "container_image";
 
+/// Refusal for a container-image manifest on a build without the `container`
+/// feature: the route simply isn't compiled in, so name the feature instead of
+/// letting the manifest fall through to the VM bank flow.
+#[cfg(not(feature = "container"))]
+const CONTAINER_FEATURE_DISABLED: &str =
+    "container-image targets require this build to enable the `container` feature";
+
 enum InstallTarget {
     Vm,
+    #[cfg(feature = "container")]
     ContainerImage,
 }
 
@@ -25,6 +33,7 @@ struct ActiveInstall {
 pub struct AppInstallRouterComponent {
     vm_id: String,
     vm: Arc<dyn Component>,
+    #[cfg(feature = "container")]
     container_image: Arc<dyn Component>,
     manifest_provider: Arc<dyn ManifestProvider>,
     active_install: Mutex<Option<ActiveInstall>>,
@@ -34,12 +43,13 @@ impl AppInstallRouterComponent {
     pub fn new(
         vm_id: impl Into<String>,
         vm: Arc<dyn Component>,
-        container_image: Arc<dyn Component>,
+        #[cfg(feature = "container")] container_image: Arc<dyn Component>,
         manifest_provider: Arc<dyn ManifestProvider>,
     ) -> Self {
         Self {
             vm_id: vm_id.into(),
             vm,
+            #[cfg(feature = "container")]
             container_image,
             manifest_provider,
             active_install: Mutex::new(None),
@@ -55,6 +65,7 @@ impl AppInstallRouterComponent {
             .map(|a| &a.target)
         {
             Some(InstallTarget::Vm) => Ok(self.vm.clone()),
+            #[cfg(feature = "container")]
             Some(InstallTarget::ContainerImage) => Ok(self.container_image.clone()),
             None => Err(MachineError::UnknownFlashSession(
                 "no active app install route".into(),
@@ -72,13 +83,22 @@ impl AppInstallRouterComponent {
     }
 
     async fn select_component(&self, manifest: &[u8]) -> MachineResult<Arc<dyn Component>> {
-        let target = if self.is_valid_container_image_manifest_for_vm(manifest)? {
+        let is_container_image = self.is_valid_container_image_manifest_for_vm(manifest)?;
+        #[cfg(not(feature = "container"))]
+        if is_container_image {
+            return Err(MachineError::WrongTarget(CONTAINER_FEATURE_DISABLED.into()));
+        }
+        #[cfg(feature = "container")]
+        let target = if is_container_image {
             InstallTarget::ContainerImage
         } else {
             InstallTarget::Vm
         };
+        #[cfg(not(feature = "container"))]
+        let target = InstallTarget::Vm;
         let component = match target {
             InstallTarget::Vm => self.vm.clone(),
+            #[cfg(feature = "container")]
             InstallTarget::ContainerImage => self.container_image.clone(),
         };
         let session = component.start_install().await?;
@@ -329,8 +349,10 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "container")]
     struct RejectingManifestProvider;
 
+    #[cfg(feature = "container")]
     impl ManifestProvider for RejectingManifestProvider {
         fn validate(
             &self,
@@ -365,6 +387,26 @@ mod tests {
         }
     }
 
+    /// Build the router under test. `new` takes the container component only
+    /// on a build with the `container` feature.
+    #[cfg(feature = "container")]
+    fn new_router(
+        vm: Arc<StubComponent>,
+        container: Arc<StubComponent>,
+        manifest_provider: Arc<dyn ManifestProvider>,
+    ) -> AppInstallRouterComponent {
+        AppInstallRouterComponent::new("vm2", vm, container, manifest_provider)
+    }
+
+    #[cfg(not(feature = "container"))]
+    fn new_router(
+        vm: Arc<StubComponent>,
+        _container: Arc<StubComponent>,
+        manifest_provider: Arc<dyn ManifestProvider>,
+    ) -> AppInstallRouterComponent {
+        AppInstallRouterComponent::new("vm2", vm, manifest_provider)
+    }
+
     fn container_image_manifest() -> Vec<u8> {
         let signing_key = keygen::generate_signing_key(ES256).unwrap();
         ImageManifestBuilder::new()
@@ -385,27 +427,18 @@ mod tests {
             Err(MachineError::PolicyRejected("locked".into())),
         ));
         let container = Arc::new(StubComponent::new("container_image", Ok(())));
-        let router = AppInstallRouterComponent::new(
-            "vm2",
-            vm,
-            container,
-            Arc::new(AcceptingManifestProvider),
-        );
+        let router = new_router(vm, container, Arc::new(AcceptingManifestProvider));
 
         let err = router.start_install().await.unwrap_err();
         assert!(err.to_string().contains("locked"), "{err}");
     }
 
+    #[cfg(feature = "container")]
     #[tokio::test]
     async fn container_route_rejects_manifest_that_provider_does_not_validate() {
         let vm = Arc::new(StubComponent::new("vm2", Ok(())));
         let container = Arc::new(StubComponent::new("container_image", Ok(())));
-        let router = AppInstallRouterComponent::new(
-            "vm2",
-            vm,
-            container.clone(),
-            Arc::new(RejectingManifestProvider),
-        );
+        let router = new_router(vm, container.clone(), Arc::new(RejectingManifestProvider));
 
         router.start_install().await.unwrap();
         let err = router
@@ -421,5 +454,32 @@ mod tests {
             "{err}"
         );
         assert_eq!(container.start_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// Without the `container` feature the route is gone, so a container-image
+    /// manifest must be refused by name — never silently flashed as a VM image.
+    #[cfg(not(feature = "container"))]
+    #[tokio::test]
+    async fn container_manifest_refused_when_feature_is_disabled() {
+        let vm = Arc::new(StubComponent::new("vm2", Ok(())));
+        let container = Arc::new(StubComponent::new("container_image", Ok(())));
+        let router = new_router(vm.clone(), container, Arc::new(AcceptingManifestProvider));
+
+        router.start_install().await.unwrap();
+        let err = router
+            .upload_envelope(
+                &FlashId::new("vm2-install"),
+                bytes_to_stream(container_image_manifest()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "container-image targets require this build to enable the `container` feature"
+            ),
+            "{err}"
+        );
+        assert_eq!(vm.start_count.load(Ordering::SeqCst), 0);
     }
 }

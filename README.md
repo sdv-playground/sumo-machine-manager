@@ -180,7 +180,7 @@ the UDS-device handler (SOVDd) — never by the client.
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA via SOVD)
 - **Per-bank VM config**: vm-config.yaml in bank directories, delivered alongside firmware via OTA
 - **Multi-payload SUIT**: host-os carries IFS + rootfs; VMs carry kernel + rootfs + config
-- **Container image updates**: `app-mgr` accepts detached `#container-image` payloads and imports them into Docker, Podman, or containerd through the normal Component flash lifecycle
+- **Container image updates**: `app-mgr` accepts detached `#container-image` payloads and imports them into Docker, Podman, or containerd through the normal Component flash lifecycle — opt-in, off by default: build with `--features container` (see [docs/features.md](docs/features.md) for the workspace feature policy)
 - **Trial boot**: Up to 10 reboots before auto-rollback to previous bank
 - **Copy-on-update**: Runtime DIDs/DTCs cloned to target bank before OTA write
 - **NV persistence**: Boot state, security floor survive power cycles (sector-rotated, CRC-protected)
