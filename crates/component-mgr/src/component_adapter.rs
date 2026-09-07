@@ -490,7 +490,8 @@ fn map_backend_error(e: BackendError) -> MachineError {
         BackendError::EntityNotFound(s)
         | BackendError::ParameterNotFound(s)
         | BackendError::OperationNotFound(s)
-        | BackendError::OutputNotFound(s) => MachineError::NotFound(s),
+        | BackendError::OutputNotFound(s)
+        | BackendError::ConfigurationNotFound(s) => MachineError::NotFound(s),
         BackendError::SecurityRequired(level) => {
             MachineError::PolicyRejected(format!("security level {level} required"))
         }
@@ -509,6 +510,16 @@ fn map_backend_error(e: BackendError) -> MachineError {
             "ECU error NRC=0x{nrc:02X} SID=0x{sid:02X}: {message}"
         )),
         BackendError::UpdateInProgress(s) => MachineError::Busy(s),
+        // §7.12 precondition (vehicle in motion, non-resettable config, ...):
+        // the entity's state refuses the op right now, which is exactly
+        // MachineError::Busy — and `map_machine_error` sends it back out as
+        // BackendError::Busy, preserving the 409 both variants carry.
+        BackendError::PreconditionFailed(s) => MachineError::Busy(s),
+        // 406: the resource can't be rendered in any MIME type the caller's
+        // Accept header admits — a bad request from our side of the boundary,
+        // not a component fault. (Contrast UnsupportedMediaType/415 below,
+        // which is about the request PAYLOAD's target.)
+        BackendError::NotAcceptable(s) => MachineError::InvalidArgument(s),
         BackendError::UnsupportedMediaType(s) => MachineError::WrongTarget(s),
     }
 }

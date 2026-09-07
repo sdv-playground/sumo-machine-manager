@@ -664,6 +664,12 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 // (host_diagnostics, the host itself). Either turns the
                 // capability on.
                 diagnostics: config.diag_agent_url.is_some() || config.host_diagnostics,
+                // §7.12: no configuration resources on a banked component —
+                // its settable state is DIDs (§7.5 data) and the update
+                // lifecycle, not a `/configurations` collection. The trait
+                // defaults answer "not supported"; keep the capability off so
+                // the routes are never advertised.
+                configurations: false,
             },
             bank_set,
             bank_spec,
