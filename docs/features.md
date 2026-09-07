@@ -61,6 +61,12 @@ doesn't have to guess.
 
 ## Open items
 
+- **A follow-up proposal would replace rule 4 outright**: see
+  [componentization.md](componentization.md) — every feature off by default
+  (VMs, logging, the vendor extensions, the docs hook, the HSM simulator), with
+  named deployment profiles instead of per-crate "is this core?" judgements.
+  The table above is its starting inventory.
+
 - **`vm-service/qnx` is vestigial**: no `#[cfg(feature = "qnx")]` exists
   anywhere in the workspace, so the flag gates nothing. Candidate for removal —
   deliberately left in place here so the container work stays a single concern.
