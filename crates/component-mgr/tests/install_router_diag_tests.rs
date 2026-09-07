@@ -164,6 +164,7 @@ fn engine_backend() -> Arc<ComponentBackend<MemBlockDevice>> {
     ))
 }
 
+#[cfg(feature = "container")]
 fn container_image_manifest() -> Vec<u8> {
     let signing_key = keygen::generate_signing_key(ES256).unwrap();
     ImageManifestBuilder::new()
@@ -175,6 +176,26 @@ fn container_image_manifest() -> Vec<u8> {
         .security_version(1)
         .build(&signing_key)
         .unwrap()
+}
+
+/// Build the router under test. `new` takes the container component only on a
+/// build with the `container` feature.
+#[cfg(feature = "container")]
+fn new_router(
+    vm: Arc<dyn Component>,
+    container: Arc<dyn Component>,
+    manifest_provider: Arc<dyn ManifestProvider>,
+) -> AppInstallRouterComponent {
+    AppInstallRouterComponent::new("vm2", vm, container, manifest_provider)
+}
+
+#[cfg(not(feature = "container"))]
+fn new_router(
+    vm: Arc<dyn Component>,
+    _container: Arc<dyn Component>,
+    manifest_provider: Arc<dyn ManifestProvider>,
+) -> AppInstallRouterComponent {
+    AppInstallRouterComponent::new("vm2", vm, manifest_provider)
 }
 
 fn vm_manifest() -> Vec<u8> {
@@ -194,6 +215,7 @@ fn vm_manifest() -> Vec<u8> {
 /// A container-image manifest (component-id `[vm2, container_image]`) routes
 /// the upload through the container path — proven by the container spy seeing
 /// the bytes and the VM spy seeing none.
+#[cfg(feature = "container")]
 #[tokio::test]
 async fn container_manifest_routes_to_container_path() {
     let vm = Arc::new(UploadSpy::new("vm2"));
@@ -201,8 +223,7 @@ async fn container_manifest_routes_to_container_path() {
     let vm_bytes = vm.bytes_seen.clone();
     let container_bytes = container.bytes_seen.clone();
 
-    let router: Arc<dyn Component> = Arc::new(AppInstallRouterComponent::new(
-        "vm2",
+    let router: Arc<dyn Component> = Arc::new(new_router(
         vm,
         container,
         Arc::new(AcceptingManifestProvider),
@@ -228,8 +249,7 @@ async fn vm_manifest_routes_to_vm_path() {
     let vm_bytes = vm.bytes_seen.clone();
     let container_bytes = container.bytes_seen.clone();
 
-    let router: Arc<dyn Component> = Arc::new(AppInstallRouterComponent::new(
-        "vm2",
+    let router: Arc<dyn Component> = Arc::new(new_router(
         vm,
         container,
         Arc::new(AcceptingManifestProvider),
@@ -284,8 +304,7 @@ fn router_diag_with_factory(
     let vm: Arc<dyn Component> = Arc::new(component_mgr::component_adapter::ComponentAdapter::new(
         backend.clone(),
     ));
-    let router: Arc<dyn Component> = Arc::new(AppInstallRouterComponent::new(
-        "vm2",
+    let router: Arc<dyn Component> = Arc::new(new_router(
         vm,
         container,
         Arc::new(AcceptingManifestProvider),

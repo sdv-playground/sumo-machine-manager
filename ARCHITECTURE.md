@@ -183,6 +183,8 @@ the seams above are the supported extension points.
   `PartitionBankActivator` (raw partition write) impl `machine_mgr::BankActivator`.
 - **app-mgr** (lib): `AppComponent` (Banked) + `ContainerImageComponent` (Singleshot —
   imports detached `#container-image` payloads into Docker/Podman/containerd).
+  `ContainerImageComponent` and the container-image install route are behind the
+  opt-in `container` feature (default OFF) — see `docs/features.md`.
 - **component-factory** (lib): `build_component(ComponentSpec, FactoryDeps)` — builds the
   right backend + adapter per component kind (incl. the install router for app-capable VMs).
 - **vm-service** (lib + bin): QEMU/`qvm` lifecycle, per-bank VM config, the pre-launch

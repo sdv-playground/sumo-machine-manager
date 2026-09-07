@@ -69,6 +69,11 @@ libc = "0.2"
 # consumers pinned to an older sovd-api opt out with --no-default-features.
 default = ["sovd-docs-hook"]
 sovd-docs-hook = []
+# Forward app-mgr's container/OCI support. Adds the container-image install
+# route to `app_install_router` (the vm2 install router); without it a
+# container-image manifest is refused by name instead of being routed. OFF by
+# default — see app-mgr's `container` comment for why.
+container = ["app-mgr/container"]
 
 [dev-dependencies]
 http-body-util = "0.1"

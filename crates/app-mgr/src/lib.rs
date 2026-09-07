@@ -1,8 +1,12 @@
 mod boot;
+// Container/OCI image updates — opt-in, see the `container` feature comment in
+// Cargo.toml.
+#[cfg(feature = "container")]
 pub mod docker_image;
 mod install;
 mod state;
 
+#[cfg(feature = "container")]
 pub use docker_image::{ContainerImageComponent, ContainerImageConfig, ContainerRuntimeKind};
 pub use state::AppConfig;
 

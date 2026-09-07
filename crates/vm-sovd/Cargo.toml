@@ -50,3 +50,7 @@ sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v
 # pin can opt out with --no-default-features.
 default = ["sovd-docs-hook"]
 sovd-docs-hook = ["component-mgr/sovd-docs-hook"]
+# Container/OCI image updates, forwarded through the factory to app-mgr /
+# component-mgr. NOT in `default`: the server only needs it where the target
+# actually runs a container runtime (`--features container`).
+container = ["component-factory/container"]
