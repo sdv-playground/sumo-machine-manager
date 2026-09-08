@@ -567,8 +567,8 @@ there. Three buckets:
 | `tools/` | host-side CLIs, build-time and dev/test tools | someone runs it on a workstation or in CI |
 
 - [ ] **The pure executables move as-is** — `vm-sovd` (→ 3c's two halves),
-      `sumo-verify`, `slog2-drainer`, `sumo-factory-reset-mint`. No lib, no
-      consumers, nothing to untangle.
+      `sumo-verify`, ~~`slog2-drainer`~~ (**done — the pilot, `b4c8df7`**),
+      `sumo-factory-reset-mint`. No lib, no consumers, nothing to untangle.
 - [ ] **The nine mixed lib+bin crates are the actual work**: `component-mgr`
       (+`vm-diagserver`), `vhsm-ssd`, `vm-service`, `vm-boot`, `host-metrics`,
       `hsm-sim-backend` (+`hsm-sim-service`), `hsm-conformance`, `policy-build`,
@@ -635,13 +635,41 @@ right:
   unconsumed code drifting out of sync with the script that does the job. Decide
   that on its merits; do not let the directory move imply an answer.
 
-**Feasibility, measured 2026-09-08 — this is cheap:**
+**Feasibility — no longer inferred. PROVEN by a one-crate pilot, 2026-09-08
+(`b4c8df7`, branch `chore/3d-pilot-slog2-drainer`):**
 
-- **External consumers are unaffected.** `supernova-machine-manager` (16 deps),
-  `sumo-provision` and `guest-vm-sdk` all depend by
-  `git = "…sumo-machine-manager.git"` + *package name*. Cargo resolves those by
-  name against the repo's workspace, not by directory, so moving a crate is
-  invisible to them — no lock churn, no coordinated bump.
+- **External consumers are unaffected — executed, not reasoned about.**
+  `supernova-machine-manager` (16 deps), `sumo-provision` and `guest-vm-sdk` all
+  depend by `git = "…sumo-machine-manager.git"` + *package name*, so cargo
+  resolves against the repo's workspace, not by directory. `slog2-drainer` was
+  moved to `services/` and supernova's own CI line was then run verbatim from
+  outside the repo against the pilot branch:
+
+  ```
+  cargo +nightly install --git https://github.com/sdv-playground/sumo-machine-manager.git \
+    --branch chore/3d-pilot-slog2-drainer --target aarch64-unknown-nto-qnx710 \
+    -Z build-std=std,panic_abort --root /tmp/… slog2-drainer
+  ```
+
+  It resolved the package name to its **new** directory
+  (`…/checkouts/…/b4c8df7/services/slog2-drainer`) with no path in the command,
+  and produced a working aarch64 QNX binary — `ELF 64-bit … ARM aarch64,
+  interpreter /usr/lib/ldqnx-64.so.2`, `NEEDED libslog2parse.so.1`, so even the
+  transitive nto FFI link through `platform-log` survived the move. Same result
+  on the host target. **A consumer needs no change whatsoever.**
+- **`Cargo.lock` is byte-UNCHANGED by the move** — `git status` on it is empty
+  after the pilot. That is the same fact from the other side: the lock records
+  package names and versions, nothing about directories. So there is no lock
+  churn to propagate through the wave (see the Build & Artifact Order) and no
+  coordinated bump owed to any consumer.
+- **Pilot design note, for the moves still to come.** The pilot was chosen to be
+  falsifiable: a *pure* executable (nothing to untangle, so a failure could only
+  be about resolution) with exactly **one** inbound edge in-repo — the root
+  `members` line, no crate path-depends on it — so nothing could mask a failure.
+  `hsm-sim-backend` was explicitly *rejected* as the pilot: `cargo install …
+  hsm-sim-backend` is what produces the `hsm-sim-service` binary, so extracting
+  that bin does change what a consumer must install. That one is 3c-shaped
+  (cross-repo coordinated) and must not be filed under "mechanical".
 - **No scripts or CI reference crate directories.** Every build line addresses
   packages by name (`cargo install … vhsm-ssd hsm-sim-backend slog2-drainer`,
   `cargo build -p vm-sovd`). The only path-addressed list is the root
@@ -671,17 +699,31 @@ What is **already** generic, and needs nothing:
 | Dispatch loop | `hsm::link_b::serve<B> where B: HsmCryptoProvider + HsmProvider` (`link_b.rs:880`); `serve_crypto(&dyn HsmCryptoProvider)` (`:784`) | yes — neither mentions `SimHsm` |
 | Backend selection | `vhsm-ssd --backend-cmd`, default = sibling binary (`backend.rs:23`), spawned via `link_b::spawn_and_connect` (`:706`) | yes — selects by *which process runs*, not by compiled-in code |
 
-- [ ] **Extract the accept loop into `hsm::link_b`** — `serve_listener(listener,
-      backend)` (or a `link_b::Service`) owning stale-socket removal, `bind`,
-      accept, and thread-per-connection. This is the only part that is *not*
-      already generic, and it is **already duplicated**: hand-rolled
-      `UnixListener::bind` + accept loops at `link_b.rs:1103`,
-      `hsm-sim-service.rs:125` and `:186`, `link_b_provisioning.rs:73` and
-      `:184` — five sites, four of them the same loop rewritten because no
-      helper exists. After the extraction, `hsm-sim-service` is ~30 lines: parse
-      `--keystore`, `SimHsm::new`, `ensure_device_keys()`, hand it to
-      `serve_listener`. Those three lines are the *entire* sim-specific surface
-      of the binary today.
+- [ ] **The accept loop is NOT worth extracting yet — correction 2026-09-08.**
+      An earlier draft of this item claimed "five sites, four of them the same
+      loop rewritten because no helper exists" and proposed a
+      `serve_listener(listener, backend)` helper. **That count was wrong.** Of
+      the five `UnixListener::bind` sites, only **one** is an accept loop
+      (`hsm-sim-service`'s local `serve` fn, reached from `main` and from its own
+      detached-thread test). The other three are deliberately **accept-once and
+      joined** — `link_b.rs:1104` (joined `:1202`),
+      `link_b_provisioning.rs:75` (joined `:168`) and `:186` (joined `:254`).
+      A test that serves one connection and then joins **cannot** be rewritten
+      onto an infinite loop; it would hang the suite. What those four sites
+      genuinely share is one line of `bind`, which is not duplication.
+      So the extraction would collapse exactly one call site, for zero current
+      callers beyond it — speculative generality, and rejected by the *same*
+      argument this item makes against a backend-selector binary below. Revisit
+      when a second Rust link-B backend actually exists; until then the
+      reusable part of the service is `hsm::link_b::serve` (already generic) and
+      the reusable part of the *contract* is `hsm-link-b` + the C skeleton.
+- [ ] If a second Rust backend does appear, the two pieces worth lifting are
+      (a) **stale-socket removal before `bind`** — `bind()` fails `EADDRINUSE` on
+      a path that still has a dead socket file, a correctness detail currently
+      known only inside `hsm-sim-service`, and (b) the **lock-per-op** rule,
+      since a naive backend would hold the `Mutex` for a whole connection and
+      deadlock provisioning behind an idle peer. Both are one-site today;
+      neither is a reason to build the helper now.
 - [ ] **Do NOT build a generic service binary** with a `--backend {sim,pkcs11,…}`
       selector. Two reasons, and the second is decisive:
       1. *The vendor case is C.* A vendor implements `hsm_link_b.h` in their own
