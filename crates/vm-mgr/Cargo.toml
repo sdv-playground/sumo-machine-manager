@@ -1,0 +1,29 @@
+[package]
+name = "vm-mgr"
+version = "0.1.0"
+edition = "2021"
+# Renamed from `vm-service` (docs/componentization.md item 3d follow-up).
+# `vm-service` is a PROCESS name, and using it for a library is what forced the
+# runner to be called `vm-service-standalone`. The process now owns the name
+# (tools/crates/vm-service); this is the library it drives, and `-mgr` puts it
+# in the family it belongs to: component-mgr, host-os-mgr, app-mgr, machine-mgr.
+# Its central type is `VmManager`.
+description = "VM lifecycle management — QEMU/qvm runners, per-bank VM config, ivshmem-server management, QMP integration and the VM control API. Embedded in-process by the host machine manager; the standalone process that drives it is tools/crates/vm-service."
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "process", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+libc = "0.2"
+tracing = "0.1"
+vm-devices = { path = "../vm-devices", features = ["http-transport"] }
+
+[features]
+qnx = []
+
+[dev-dependencies]
+tempfile = "3"
+

@@ -111,7 +111,7 @@ pub fn read_did<D: BlockDevice>(
     //    doesn't have), the ComponentBackend layer intercepts these DIDs from a
     //    cached, signature-verified identity before consulting `read_did`
     //    (see `backend.rs::identity_did_bytes`). If `read_did` is reached
-    //    for one of them (e.g. the standalone `vm-diagserver read-did`
+    //    for one of them (e.g. the standalone `vm-diagctl read-did`
     //    CLI with no HSM), it falls through to NotFound below — correct,
     //    since this path can't authenticate the manifest.
 

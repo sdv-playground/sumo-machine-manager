@@ -9,7 +9,7 @@ use component_mgr::ota;
 use std::path::PathBuf;
 
 fn usage() -> ! {
-    eprintln!("Usage: vm-diagserver <nv-store-path> <command> [args...]");
+    eprintln!("Usage: vm-diagctl <nv-store-path> <command> [args...]");
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  status <set>                     Show bank status (hypervisor|vm1|vm2|hsm)");

@@ -107,7 +107,7 @@ else
 fi
 
 RUNNER="$ROOT_DIR/target/debug/vm-runner"
-DIAGSERVER="$ROOT_DIR/target/debug/vm-diagserver"
+DIAGSERVER="$ROOT_DIR/target/debug/vm-diagctl"
 SOVD="$ROOT_DIR/target/debug/vm-sovd"
 BACKEND="$ROOT_DIR/target/debug/hsm-sim-service"
 VHSM_SSD="$ROOT_DIR/target/debug/vhsm-ssd"

@@ -172,7 +172,7 @@ The core update/diagnostics path:
   `Capabilities`/`FlashCaps`; the `BankActivator` seam; `system_bank_state`
   (`SystemBankManager` + `BootSelector` — the node boot-authority engine, re-exporting
   the nv-store selector primitives). Platform-independent.
-- **component-mgr** (lib only; the `vm-diagserver` CLI over it is `tools/crates/vm-diagserver`,
+- **component-mgr** (lib only; the `vm-diagctl` CLI over it is `tools/crates/vm-diagctl`,
   and the SOVD/OTA **server** `vm-sovd` is its own crate in `services/`): the OTA engine + SOVD wire. `ComponentBackend` (the
   per-component state machine — DIDs, faults, the full install/flash lifecycle, modes);
   `ComponentAdapter` (exposes it as a `Component`); `install_router_diag`
@@ -190,7 +190,8 @@ The core update/diagnostics path:
   opt-in `container` feature (default OFF) — see `docs/features.md`.
 - **component-factory** (lib): `build_component(ComponentSpec, FactoryDeps)` — builds the
   right backend + adapter per component kind (incl. the install router for app-capable VMs).
-- **vm-service** (lib; the standalone dev binary is `tools/crates/vm-service-standalone`):
+- **vm-mgr** (lib, was `vm-service`; the `vm-service` PROCESS that drives it is
+  `tools/crates/vm-service`):
   QEMU/`qvm` lifecycle, per-bank VM config, the pre-launch
   IVD verify hook, IPC to vm-sovd. `runner/{qemu,qnx,dummy}`. Launches the VM **from the
   selector-chosen bank dir** (cwd=bank_dir) so the per-bank qvm.conf's relative
@@ -214,7 +215,8 @@ The core update/diagnostics path:
 Support crates: **policy-eval** /
 **policy-partition** / **policy-build** (guest IAM policy), **ca-bundle-build**,
 **vm-wire**, **host-metrics** (OpenTelemetry/Prometheus host sensors — the library
-supernova embeds; the standalone runner is `tools/crates/host-metrics-serve`),
+supernova embeds; the Prometheus exporter process is
+`tools/crates/host-metrics-exporter`),
 **log-rotate**, **puller**.
 
 Deployables in `services/`: **vm-sovd** (the SOVD/OTA server process),

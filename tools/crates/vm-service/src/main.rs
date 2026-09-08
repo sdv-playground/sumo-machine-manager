@@ -8,7 +8,7 @@
 /// The modules below used to be re-declared here (`mod api; mod config; …`),
 /// which compiled the WHOLE crate a second time inside the binary. Taking them
 /// from the library instead is the point of the split (item 3d).
-use vm_service::{api, config, manager};
+use vm_mgr::{api, config, manager};
 
 use std::path::PathBuf;
 use std::sync::Arc;

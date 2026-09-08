@@ -7,7 +7,7 @@ members = [
     "crates/host-os-mgr",
     "crates/app-mgr",
     "crates/machine-mgr",
-    "crates/vm-service",
+    "crates/vm-mgr",          # VM lifecycle library (was `vm-service` — that name is the PROCESS)
     "crates/hsm",
     "crates/hsm-contract",
     "crates/hsm-link-b",
@@ -69,21 +69,25 @@ members = [
     # Build read-only CA-bundle images shipped as per-VM SUIT components.
     "tools/crates/ca-bundle-build",
     "tools/crates/hsm-conformance",
-    # Standalone runner for the host-metrics LIBRARY (dev/standalone only — in
-    # production supernova embeds the library). Split out by item 3d: the runner
-    # owns the tokio runtime + signal handling + sumo-log init, none of which a
-    # library consumer should inherit.
-    "tools/crates/host-metrics-serve",
-    # Standalone runner for the vm-service LIBRARY — the dev/Linux path
-    # (example/dummy-vm/run-vm.sh). On a device supernova embeds VmManager
-    # in-process, so no vm-service binary is deployed. Split out by item 3d:
-    # the old bin re-declared every library module, compiling the crate twice.
-    "tools/crates/vm-service-standalone",
+    # Prometheus EXPORTER over the host-metrics library (dev/standalone only — in
+    # production supernova embeds the library and serves on its own bind). Split
+    # out by item 3d: the runner owns the tokio runtime + signal handling +
+    # sumo-log init, none of which a library consumer should inherit.
+    "tools/crates/host-metrics-exporter",
+    # The `vm-service` PROCESS — runner over the vm-mgr library, the dev/Linux
+    # path (example/dummy-vm/run-vm.sh). On a device supernova embeds VmManager
+    # in-process, so this binary is not deployed. Split out by item 3d (the old
+    # bin re-declared every library module, compiling the crate twice); the
+    # follow-up rename gave the process the name and the library `vm-mgr`, so
+    # neither needs a suffix to disambiguate from the other.
+    "tools/crates/vm-service",
     # The NV/bank + factory-ops CLI over the component-mgr library (dev/CI only:
     # build-all.sh and example/run.sh run it from target/debug). Split out by
     # item 3d for the bucket rule — measured closure win here is ZERO, the bin
-    # uses nothing the library does not already need.
-    "tools/crates/vm-diagserver",
+    # uses nothing the library does not already need. Renamed from
+    # `vm-diagserver`: it is a CLI, not a server, and the old name needed a
+    # footnote in two docs to undo.
+    "tools/crates/vm-diagctl",
     # Software-HSM (SimHsm) backend + the `hsm-sim-service` link-B bin (was the
     # sim half of the `hsm` crate; S7b relocated it here). Not merely test
     # tooling: sim/dev deployments run it as their HSM — see its crate docs.

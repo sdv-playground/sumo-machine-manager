@@ -30,7 +30,7 @@ Plus one **SOVD-adjacent helper server** (HTTP, but not the `/vehicle/v1` API):
 Servers 1–3 are the sumo-stack deployments and share the same route library;
 4–5 are the upstream reference servers shipped with the SOVDd library itself.
 
-> Note: `vm-diagserver` (its own crate, `tools/crates/vm-diagserver`, over the
+> Note: `vm-diagctl` (its own crate, `tools/crates/vm-diagctl`, over the
 > `component-mgr` library) is **not** an HTTP
 > server — it is a local CLI for NV-store / bank / factory operations
 > (`status`, `install`, `commit`, `rollback`, `read-did`, `factory-init`). It
@@ -209,7 +209,7 @@ unlock for real ECUs is transparent server-side in the UDS-device handler.)
 - **sumo-sovd** (`components/sumo-sovd`) — the campaign **client/orchestrator**
   CLIs (`sumo-campaign`, `sumo-map`); drives SOVD servers over `sovd-client`,
   does not serve.
-- **`vm-diagserver`** (`component-mgr`) and **`sovd-cli`** (SOVDd) — **CLIs**, not
+- **`vm-diagctl`** (over `component-mgr`) and **`sovd-cli`** (SOVDd) — **CLIs**, not
   servers.
 
 ### Other (non-SOVD) HTTP servers in the workspace

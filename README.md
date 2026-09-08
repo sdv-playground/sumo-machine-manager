@@ -85,11 +85,11 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `hsm` | — | HSM **contract**: `HsmProvider` (keystore/provisioning, 8 methods) + re-exported `HsmCryptoProvider`; `ivd` sign/verify; `LinkBClient` bridge — no in-process HSM |
 | `services/vhsm-ssd` (daemon) + `vhsm-server` (lib) | `vhsm-ssd` | Host-side vHSM v3 daemon — TCP on the private `vbr-vhsm` bridge; identity = CWT/IAM handshake (source-IP static pre-gate) |
 | `vm-devices` | — | CAN / health / time simulators (host-side) |
-| `vm-service` | — (lib; `tools/crates/vm-service-standalone` builds the `vm-service` dev binary) | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config, ivshmem |
+| `vm-mgr` | — (lib, was `vm-service`; `tools/crates/vm-service` builds the `vm-service` dev binary) | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config, ivshmem |
 | `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic) |
 | `host-os-mgr` | — | Host OS Component: IFS activation, A/B partition, reboot |
 | `app-mgr` | — | App/container Component: local container image import for Docker, Podman, or containerd |
-| `component-mgr` | — (lib; `tools/crates/vm-diagserver` builds the CLI) | SUIT + SOVD: validation, OTA engine, DID resolution, `/updates` wire; `vm-diagserver` is the NV/bank + factory CLI over it |
+| `component-mgr` | — (lib; `tools/crates/vm-diagctl` builds the CLI) | SUIT + SOVD: validation, OTA engine, DID resolution, `/updates` wire; `vm-diagctl` is the NV/bank + factory CLI over it |
 | `services/vm-sovd` | `vm-sovd` | The SOVD/OTA server process — wires the machine registry, components, and the `/updates` wire |
 | `component-factory` | — | `build_component(ComponentSpec, FactoryDeps)` — per-kind backend + adapter builder |
 | `hsm-contract` | — | Shared handle-addressed HSM crypto contract (`HsmCryptoProvider`, `KeyHandle` / `SlotInfo` / `SlotKind` / `KeyType`) |
@@ -103,7 +103,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `vhsm-crossnode-client` | — | Cross-node vHSM connector (reach another node's vHSM) |
 | `services/sumo-verify` | `sumo-verify` | Bank IVD signature validator for external secure boot |
 | `sumo-factory-reset-mint` | `sumo-factory-reset-mint` | Dev SOVD capability-token minter (well-known P-256 dev key) |
-| `host-metrics` | — (lib; `tools/crates/host-metrics-serve` builds the `host-metrics` binary) | Host hardware metrics — Prometheus exposition, pluggable `SensorReader` |
+| `host-metrics` | — (lib; `tools/crates/host-metrics-exporter` builds the exporter) | Host hardware metrics — Prometheus exposition, pluggable `SensorReader` |
 
 ### Separation of concerns
 

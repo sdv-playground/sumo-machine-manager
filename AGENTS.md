@@ -17,7 +17,7 @@ Rust workspace for platform-agnostic A/B bank management, VM lifecycle, SUIT OTA
 - `docs/` — design docs, incl. `sovd-entrypoints.md` (every SOVD server entrypoint in the workspace, classified), `hsm-backend-architecture.md` (the HSM link-B contract + the C vendor handoff) and `vhsm-integration-path.md`.
 - `crates/hsm-link-b/` — the frozen HSM link-B wire + C header (`include/`) + `reference/` C skeleton.
 - `services/` — the on-device deployables: `vm-sovd`, `vhsm-ssd` (the daemon over `crates/vhsm-server`), `sumo-verify`, `slog2-drainer`. Not SDK surface; see `docs/componentization.md` item 3d for the three-bucket rule.
-- `tools/crates/` — host-side CLIs and build/dev tooling: `hsm-conformance`, `hsm-sim-backend` (the `SimHsm` backend), `vm-diagserver`, `vm-service-standalone`, `host-metrics-serve`, `policy-build`, `ca-bundle-build`, `sumo-factory-reset-mint`.
+- `tools/crates/` — host-side CLIs and build/dev tooling: `hsm-conformance`, `hsm-sim-backend` (the `SimHsm` backend), `vm-diagctl`, `vm-service` (the process; its library is `crates/vm-mgr`), `host-metrics-exporter`, `policy-build`, `ca-bundle-build`, `sumo-factory-reset-mint`.
 
 ## Essential commands
 

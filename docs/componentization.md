@@ -334,7 +334,7 @@ constructs an in-process `SimHsm` in non-test code —
   `get_device_id` fallback when no `csr_crypto` provider is injected
   (`csr_crypto` is only ever wired for `BankSet::Hsm`, and only when
   `FactoryDeps.hsm_crypto` is `Some` — `component-factory/src/lib.rs:625-627`)
-- `main.rs:276` — the `vm-diagserver` CLI's factory-init `--hsm-keystore`
+- `main.rs:276` — the `vm-diagctl` CLI's factory-init `--hsm-keystore`
   bring-up
 
 `partition_bank_provider.rs:413, 442, 444` are inside `mod tests` (line 380) and
@@ -584,9 +584,9 @@ there. Three buckets:
 
       | Crate | Lib stays | Bin becomes | Measured direct-dep win on the lib |
       |---|---|---|---|
-      | `host-metrics` | `crates/host-metrics` | `tools/crates/host-metrics-serve` (bin still named `host-metrics`) | 5 → **3** (drops `tokio`, `sumo-log`) |
-      | `vm-service` | `crates/vm-service` | `tools/crates/vm-service-standalone` (bin still named `vm-service`) | 11 → **8** (drops `sumo-log`, `hyper`, `hyper-util`) |
-      | `component-mgr` | `crates/component-mgr` | `tools/crates/vm-diagserver` | **0** — see below |
+      | `host-metrics` | `crates/host-metrics` | `tools/crates/host-metrics-exporter` | 5 → **3** (drops `tokio`, `sumo-log`) |
+      | `vm-service` | `crates/vm-mgr` (lib **renamed**) | `tools/crates/vm-service` (process keeps the name) | 11 → **8** (drops `sumo-log`, `hyper`, `hyper-util`) |
+      | `component-mgr` | `crates/component-mgr` | `tools/crates/vm-diagctl` | **0** — see below |
       | `vhsm-ssd` | `crates/vhsm-server` (lib **renamed**) | `services/vhsm-ssd` (package keeps the name) | 24 → **22** (drops `libc`, `sumo-log`) |
 
       and one deferred: `hsm-sim-backend` (+`hsm-sim-service`) — see below.
@@ -598,7 +598,7 @@ there. Three buckets:
       `tokio`. That is worth having (a *library* has no business initialising
       fleet logging or owning a runtime; that is the process's job) but it is
       not the "8 linked-and-unusable crates" of the rp5 case, and this document
-      should stop implying it is. For `vm-diagserver` the win is **exactly
+      should stop implying it is. For `vm-diagctl` the win is **exactly
       zero** — the bin uses nothing `component-mgr` does not already need — so
       that one split is justified by the bucket rule alone, and its manifest
       says so.
@@ -621,7 +621,7 @@ there. Three buckets:
 - [x] **The other defect the split exposed: `vm-service` was compiling twice.**
       Its `main.rs` re-declared all seven modules that `lib.rs` already declares
       `pub mod`, so the binary built the entire crate a second time as private
-      modules of itself. `tools/crates/vm-service-standalone` takes them from
+      modules of itself. `tools/crates/vm-service` takes them from
       the library (`use vm_service::{api, config, manager};`). This is a better
       argument for 3d than the dep-closure one: a `[[bin]]` inside a lib crate
       invites exactly this, and nothing warns you.
@@ -766,8 +766,8 @@ move that buys nothing:
   cross-build-environment requirement, already documented in the QNX build
   scripts.
 - **A rename or a new package DOES change locks — check which consumers.** This
-  wave added four package names (`vhsm-server`, `vm-diagserver`,
-  `vm-service-standalone`, `host-metrics-serve`) and renamed one library. It is
+  wave added four package names (`vhsm-server`, `vm-diagctl`, `vm-service`,
+  `host-metrics-exporter`) and renamed two libraries. It is
   still zero-churn for consumers, but by *verification*, not by the move
   argument: `vhsm-ssd` appears **nowhere** in supernova's `Cargo.lock` (it was
   only ever `cargo install`ed as a binary), and the three new `tools/` packages
@@ -798,20 +798,60 @@ move that buys nothing:
 - **…but "by name" cuts both ways, and that is the part a *move* proof does not
   cover.** A directory move is invisible; a **bin extraction is not**, because
   `-p <pkg> --bin <bin>` names the package that *owns* the bin. Three in-repo
-  build lines needed editing for that reason and no other:
-  `build-all.sh:208` (`-p vm-service` → `-p vm-service-standalone`, `--bin
-  vm-service` unchanged), `build-all.sh:210` (`-p component-mgr --bin
-  vm-diagserver` → `-p vm-diagserver`), and `example/dummy-vm/run-vm.sh:58`.
-  **Every extracted bin kept its binary name**, so nothing that consumes the
-  *artifact* (`target/debug/vm-diagserver`, the packaged `host-metrics`,
-  `example/run.sh:110`) changed at all. Keep that invariant in the remaining
-  extractions: rename packages freely, never the `[[bin]] name`.
+  build lines needed editing for that reason and no other — `build-all.sh:208`,
+  `build-all.sh:210` and `example/dummy-vm/run-vm.sh:58`.
+- **Whether a `[[bin]]` may be renamed is a question about the ARTIFACT's
+  consumers, and it is worth asking per bin rather than adopting a blanket
+  rule.** The extraction wave kept every binary name, and for two of them that
+  is *mandatory*: `vhsm-ssd` and `hsm-sim-service` are installed by name and
+  packaged (`assemble-package.sh`), so their artifacts are an external contract.
+  For the other three it turned out to be optional — priced by grep, the
+  artifact consumers are `target/debug/vm-service` (2 sites:
+  `example/dummy-vm/run-vm.sh:27`, `build-all.sh:208`),
+  `target/debug/vm-diagserver` (2 sites: `example/run.sh:110`,
+  `build-all.sh:210`) and `host-metrics` (**zero** — in neither supernova
+  package, built by no script). So the naming follow-up below could rename two
+  of them for four lines total. **Rule: price the artifact's consumers, then
+  rename; a bin name is only frozen when something outside the repo installs,
+  packages or execs it.**
 - Churn is therefore confined to `members` plus the in-repo `path = "../x"` dep
   lines, which are mechanical. (Actual count for this wave: far below the ~80
   estimated — a moved crate rewrites only *its own* dep lines, and only in-repo
   consumers of a *renamed* package are touched.)
 - [x] Do it as its own commit wave, separate from any behaviour change, so the
       diff is reviewable as a pure move.
+
+### 3d follow-up — the names the split exposed (done 2026-09-08)
+
+Splitting a lib from its bin forces you to name the halves, and three of the
+four new names came out bad. Awkward wrapper names are a *symptom*: they appear
+when the library is already holding a name that belongs to the process.
+
+| Was | Now | Why |
+|---|---|---|
+| lib `vm-service` | lib **`vm-mgr`** | `vm-service` names a PROCESS. Holding it hostage in the library is what forced the wrapper to be called `vm-service-standalone`. `-mgr` puts it in the family it belongs to (`component-mgr`, `host-os-mgr`, `app-mgr`, `machine-mgr`) and names its central type, `VmManager`. |
+| `vm-service-standalone` | **`vm-service`** (pkg + bin) | The process takes the name back, so neither half needs a suffix. |
+| `vm-diagserver` | **`vm-diagctl`** (pkg + bin) | It is not a server — a fact this repo's docs had to state twice to undo the name (`docs/sovd-entrypoints.md:33`, `:212`). A name that needs a footnote is the wrong name. |
+| `host-metrics-serve` | **`host-metrics-exporter`** (pkg + bin) | "Exporter" is the Prometheus term of art for a process that exposes `/metrics`; `-serve` was an invented verb. Zero artifact consumers, so the bin moved too. |
+
+`vhsm-server` was kept as-is — it already slots into the `vhsm-proto` /
+`vhsm-client` / `vhsm-provider` / `vhsm-crossnode-client` family.
+
+Two notes worth carrying:
+
+- **`vm-runtime` was the first candidate for the library and is wrong**, because
+  `supernova-machine-manager` already uses `vm-runtime` as a *feature* name
+  (`Cargo.toml:27`, `vm-runtime = ["dep:vm-service"]`). A crate name that
+  collides with a consumer's feature name is a trap; check the consumer's
+  `[features]` table, not just its `[dependencies]`.
+- **Renaming a library is a cross-repo edit; renaming an identifier that merely
+  *contains* the old name usually is not.** In supernova the string `vm_service`
+  appears 41 times, but only **15** are crate paths. The other 26 are the config
+  key `vm_service:` (a device-config contract — `provisioned-cvc/config/config.yaml`,
+  `qnx-host-app-bank/.gitlab-ci.yml` read it) and `vm_service_addr` fields naming
+  the *process's* address. Those stay correct precisely *because* the process
+  kept the name. A blind `sed s/vm_service/vm_mgr/` would have broken the device
+  config contract.
 
 **Payoff for work item 1:** profiles map one-to-one onto deployables, so
 `services/` becomes the legible list of what the five profiles actually build.

@@ -1,14 +1,14 @@
 [package]
-name = "host-metrics-serve"
+name = "host-metrics-exporter"
 version = "0.1.0"
 edition = "2021"
-description = "Standalone runner for the host-metrics library — serves Prometheus /metrics on its own bind. Dev / standalone deployments only: in production the host machine manager embeds the host-metrics LIBRARY and serves on its own bind with a board-specific reader, and this binary is in neither supernova package. Split out of the library crate by docs/componentization.md item 3d so a library consumer no longer inherits the runner's dependencies."
+description = "Prometheus exporter over the host-metrics library — serves /metrics on its own bind. Named for what it is: `exporter` is the Prometheus term of art for a process that exposes metrics. Dev / standalone deployments only: in production the host machine manager embeds the host-metrics LIBRARY and serves on its own bind with a board-specific reader, and this binary is in neither supernova package. Split out of the library crate by docs/componentization.md item 3d so a library consumer no longer inherits the runner's dependencies."
 license = "MIT"
 
-# The binary keeps its name — only the PACKAGE it lives in changed, so
-# `host-metrics --bind …` on a workstation is untouched.
+# Bin renamed with the package. Free to do: this artifact has ZERO consumers —
+# it is in neither supernova package and no script builds or runs it.
 [[bin]]
-name = "host-metrics"
+name = "host-metrics-exporter"
 path = "src/main.rs"
 
 [dependencies]

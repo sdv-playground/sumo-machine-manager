@@ -63,10 +63,11 @@ The load-bearing ones, bottom-up:
   static pre-gate.
 - **vm-devices** (lib): virtual CAN, health, and time simulators running
   on shared memory (ivshmem vs QNX native shm).
-- **vm-service** (lib): QEMU / `qvm` lifecycle, per-bank VM config,
+- **vm-mgr** (lib, was `vm-service`): QEMU / `qvm` lifecycle, per-bank VM config,
   ivshmem-server management, QMP integration, IPC to the diagnostics daemon.
   On a device supernova embeds `VmManager` in-process; the standalone `vm-service`
-  binary is the dev/Linux path and lives in `tools/crates/vm-service-standalone`.
+  binary is the dev/Linux path and lives in `tools/crates/vm-service` — the
+  PROCESS owns that name, the library is `vm-mgr`.
 - **machine-mgr** (lib): platform-agnostic `Machine` / `Component` trait
   layer. Connects all updatable things under a single registry. Also owns
   the `BankActivator` trait + `BankActivatorError` enum.
@@ -77,8 +78,8 @@ The load-bearing ones, bottom-up:
   `Component` lifecycle. `ContainerImageComponent` validates detached
   `#container-image` payloads and imports them into Docker, Podman, or
   containerd.
-- **component-mgr** (lib; the `vm-diagserver` CLI over it is
-  `tools/crates/vm-diagserver`): SUIT validation, encrypted firmware
+- **component-mgr** (lib; the `vm-diagctl` CLI over it is
+  `tools/crates/vm-diagctl`): SUIT validation, encrypted firmware
   streaming pipeline, OTA engine (install/commit/rollback), DID resolution,
   and the SOVD wire adapter. `ComponentBackend` is the per-component state machine
   and *is* the `DiagnosticBackend` — wired straight into SOVD (the old
@@ -142,8 +143,8 @@ crates/component-mgr/src/
   streaming.rs            — upload pipeline (decrypt + decompress + hash)
   did.rs                  — UDS DID resolution (F187-F19E + custom)
 
-tools/crates/vm-diagserver/src/
-  main.rs                 — vm-diagserver CLI over the component-mgr lib (NV/bank + factory ops; NOT an HTTP server — the SOVD/OTA server is the vm-sovd crate in services/)
+tools/crates/vm-diagctl/src/
+  main.rs                 — vm-diagctl CLI over the component-mgr lib (NV/bank + factory ops; NOT an HTTP server — the SOVD/OTA server is the vm-sovd crate in services/)
 
 crates/host-os-mgr/src/
   component.rs            — HostOsComponent (implements machine_mgr::Component)
