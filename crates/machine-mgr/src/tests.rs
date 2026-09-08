@@ -141,6 +141,30 @@ async fn component_defaults_return_not_supported() {
 }
 
 #[tokio::test]
+async fn commit_preflight_default_fails_closed_for_banked_components_only() {
+    let banked = BareComponent {
+        id: "banked".into(),
+        caps: Capabilities {
+            flash: Some(FlashCaps {
+                dual_bank: true,
+                supports_rollback: false,
+                supports_trial_boot: true,
+                abortable_after_finalize: false,
+                reset_kind: ResetKind::Local,
+            }),
+            ..Default::default()
+        },
+    };
+    assert!(matches!(
+        banked.preflight_commit().await,
+        Err(MachineError::Internal(_))
+    ));
+
+    let singleshot = bare("singleshot");
+    assert!(singleshot.preflight_commit().await.is_ok());
+}
+
+#[tokio::test]
 async fn component_overrides_take_precedence() {
     // If a component overrides a default, that method should work.
     struct RestartComp {

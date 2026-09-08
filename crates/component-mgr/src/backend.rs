@@ -240,6 +240,10 @@ struct FlashTransferState {
     transfer_id: String,
     package_id: String,
     state: FlashState,
+    /// Guest state observed before a queued VM restart. While `Verifying`, a
+    /// running guest requires a changed boot id; confirmed absence accepts the
+    /// first later ready boot.
+    pre_reset_health: Option<PreResetHealth>,
     image_size: u64,
     /// `(relative_path, size, sha256)` for each payload as the streaming
     /// pipeline wrote it into the target bank dir. Lets
@@ -1844,6 +1848,70 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             nv.write_update_session(&mut s)
                 .map_err(|e| BackendError::Internal(format!("nv write update-session: {e:?}")))?;
         }
+        Ok(())
+    }
+
+    /// Refuse a banked commit until the activated bank is proven to be running.
+    /// This is deliberately read-only so a node verdict can preflight every
+    /// candidate before allowing any candidate to mutate durable state.
+    pub fn preflight_commit(&self) -> BackendResult<()> {
+        if self.config.single_bank {
+            return Ok(());
+        }
+
+        if self
+            .flash_transfer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|transfer| transfer.state == FlashState::AwaitingReboot)
+        {
+            return Err(BackendError::Busy(
+                "commit refused: component is awaiting reboot".into(),
+            ));
+        }
+
+        if !self.node_reboot_owed()?.reboot_owed.is_empty() {
+            return Err(BackendError::Busy(
+                "commit refused: durable node reboot is still owed".into(),
+            ));
+        }
+
+        let boot = self
+            .nv
+            .lock()
+            .map_err(|_| BackendError::Internal("nv lock".into()))?
+            .read_boot_state()
+            .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+        let bank = &boot.banks[self.bank_set.as_index()];
+        let selected = self
+            .bank_provider
+            .selected_bank()
+            .unwrap_or(bank.active_bank);
+        if !bank.committed && selected != bank.active_bank {
+            return Err(BackendError::Busy(format!(
+                "commit refused: selected bank {selected:?} does not match durable active bank {:?}",
+                bank.active_bank
+            )));
+        }
+        if !bank.committed && bank.boot_count == 0 {
+            return Err(BackendError::Busy(format!(
+                "commit refused: selected bank {selected:?} has no durable boot witness"
+            )));
+        }
+
+        let running = *self.running_bank.lock().unwrap();
+        if selected != running {
+            return Err(BackendError::Busy(format!(
+                "commit refused: selected bank {selected:?} does not match running bank {running:?}"
+            )));
+        }
+        if self.bank_provider.pending_reboot() {
+            return Err(BackendError::Busy(
+                "commit refused: bank provider reports a pending reboot".into(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -4085,6 +4153,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 transfer_id: transfer_id.clone(),
                 package_id: String::new(),
                 state: FlashState::Transferring,
+                pre_reset_health: None,
                 image_size: content_length.unwrap_or(0),
                 streamed_files: Vec::new(),
             });
@@ -4350,6 +4419,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 transfer_id: transfer_id.clone(),
                 package_id: String::new(),
                 state: FlashState::Transferring,
+                pre_reset_health: None,
                 image_size: 0,
                 streamed_files: Vec::new(),
             });
@@ -4455,6 +4525,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     transfer_id: transfer_id.clone(),
                     package_id: package_id.to_string(),
                     state: FlashState::AwaitingActivation,
+                    pre_reset_health: None,
                     image_size: 0,
                     streamed_files: Vec::new(),
                 });
@@ -4597,6 +4668,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                         transfer_id: id.clone(),
                         package_id: package_id.to_string(),
                         state: FlashState::AwaitingActivation,
+                        pre_reset_health: None,
                         image_size,
                         streamed_files: Vec::new(),
                     });
@@ -5037,8 +5109,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// the heartbeat `boot_id` (a per-lifetime nonce — the orchestrator's reboot
     /// witness: a *changed* boot_id proves a fresh guest lifetime, including a
     /// node reboot, which `boot_count` cannot witness), the heartbeat `hb_seq`
-    /// (liveness), and `boot_count` (the NV trial counter — a metric, bumped only
-    /// by a per-component `ecu_reset`).
+    /// (liveness), and `boot_count` (the NV trial counter — a metric, bumped after
+    /// a reset is witnessed).
     async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {
         // Administratively disabled ⇒ skip the vm-service probe entirely (the
         // VM is down BY DESIGN — probing would only burn the health timeout)
@@ -5148,27 +5220,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     }
 
     async fn ecu_reset(&self, _reset_type: u8) -> BackendResult<Option<u8>> {
-        // VM "reset" — simulate reboot:
-        // 1. Switch running_bank to NV active_bank (the bank install() staged)
-        // 2. Increment boot_count for trial mode (like process_boot())
-        // 3. Advance flash state to Activated
-        // 4. Reset session and security (ISO 14229)
-
-        if !self.config.single_bank {
-            let idx = self.bank_set.as_index();
-            let mut nv = self.nv_write()?;
-            if let Some(mut state) = nv.read_boot_state() {
-                // Switch to the staged bank
-                *self.running_bank.lock().unwrap() = state.banks[idx].active_bank;
-
-                // Simulate process_boot(): increment boot_count in trial mode
-                if !state.banks[idx].committed {
-                    state.banks[idx].boot_count += 1;
-                    let _ = nv.write_boot_state(&mut state);
-                }
-            }
-        }
-        // Single-bank components: no bank switch, always bank A, always committed
+        // A VM reset queues the relaunch and enters Verifying; health polling
+        // records the bank switch and boot witness only after a fresh ready boot.
+        // Components without vm-service keep the explicit simulation path.
 
         // A reset must never resurrect an administratively disabled component
         // — skip the pre-reset health probe AND the vm-service (re)start
@@ -5177,37 +5231,33 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // phantom probe timeout against a deliberately-stopped guest.)
         let admin_disabled = self.admin_disabled();
 
-        // Was the guest running before this reset? Used ONLY to pick the
-        // vm-service "restart" vs "start" intent (a never-started guest
-        // shouldn't render as "Shutting Down"). The activation verdict is the
-        // orchestrator's job now: it reads `/status` and confirms the guest's
-        // heartbeat `boot_id` changed (a fresh lifetime) AND status==ready.
-        // The device no longer keeps an in-memory boot_id baseline.
-        let was_running = if self.config.single_bank || admin_disabled {
-            false
+        // Establish the pre-reset witness before issuing any runtime request.
+        // A running guest supplies the boot-id baseline and uses "restart";
+        // confirmed absence uses "start". Query failure must abort rather than
+        // create a baseline-free reset that could accept an old guest later.
+        let pre_reset_health = if self.config.single_bank || admin_disabled {
+            None
         } else {
             match self.vm_service_addr.as_ref() {
-                Some(sock) => query_vm_health(sock, &self.entity_info.id).await.is_some(),
-                None => false,
+                Some(sock) => Some(
+                    query_vm_health_state(sock, &self.entity_info.id)
+                        .await
+                        .map_err(|e| {
+                            BackendError::Transport(format!(
+                                "failed to query vm-service health for {}: {e}",
+                                self.entity_info.id
+                            ))
+                        })?
+                        .baseline(),
+                ),
+                None => None,
             }
         };
-
-        // Advance flash state to Activated — the bank is flipped and the trial
-        // is armed. The device reports the NV/bank truth; it no longer does its
-        // own in-memory "is the guest healthy" promotion (that was the
-        // `verify_baseline_boot_id`/`guest_is_running` path, the source of the
-        // original "promoted too soon → commit 404" bug). The orchestrator owns
-        // the health verdict now, confirming the guest's heartbeat `boot_id`
-        // changed AND status==ready via `/status` before it commits.
-        {
-            let mut ft = self.flash_transfer.lock().unwrap();
-            if let Some(ref mut t) = *ft {
-                t.state = FlashState::Activated;
-            }
-        }
+        let was_running = matches!(pre_reset_health, Some(PreResetHealth::Running(_)));
 
         // Bank activation happens at install-finalize (finalize_flash),
-        // not here. ecu_reset just transitions the flash state machine.
+        // not here. ecu_reset requests the runtime launch, then records its
+        // durable simulated boot witness and transitions the flash state.
 
         // Pick "restart" vs "start" based on whether the guest was actually
         // running pre-reset (the `was_running` probe above). For an offline
@@ -5217,6 +5267,18 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // "restart", so the cluster tile doesn't display "Shutting Down" for a
         // guest that never ran.
         let action = if was_running { "restart" } else { "start" };
+
+        let target_bank = if self.config.single_bank {
+            Bank::A
+        } else {
+            self.nv
+                .lock()
+                .map_err(|_| BackendError::Internal("nv lock".into()))?
+                .read_boot_state()
+                .ok_or_else(|| BackendError::Internal("no boot state".into()))?
+                .banks[self.bank_set.as_index()]
+            .active_bank
+        };
 
         // Notify vm-service to (re)launch the guest on the just-activated bank.
         // The boot selector is the authority for which bank actually boots; we
@@ -5230,12 +5292,51 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     "administratively disabled — skipping the vm-service relaunch after reset"
                 );
             } else {
-                let target_bank = *self.running_bank.lock().unwrap();
                 let id = &self.entity_info.id;
-                match Self::notify_vm_service(socket_path, id, action, Some(target_bank)).await {
-                    Ok(()) => tracing::info!("vm-service {action} requested for {id}"),
-                    Err(e) => tracing::warn!("failed to notify vm-service for {id}: {e}"),
+                Self::notify_vm_service(socket_path, id, action, Some(target_bank))
+                    .await
+                    .map_err(|e| {
+                        BackendError::Transport(format!(
+                            "failed to notify vm-service for {id}: {e}"
+                        ))
+                    })?;
+                tracing::info!("vm-service {action} requested for {id}");
+            }
+        }
+
+        if !self.config.single_bank && self.vm_service_addr.is_some() {
+            if !admin_disabled {
+                let mut ft = self.flash_transfer.lock().unwrap();
+                if let Some(ref mut transfer) = *ft {
+                    transfer.pre_reset_health = pre_reset_health;
+                    transfer.state = FlashState::Verifying;
                 }
+            }
+            return Ok(None);
+        }
+
+        // Components without vm-service use an explicit simulation witness.
+        if !self.config.single_bank {
+            let idx = self.bank_set.as_index();
+            let mut nv = self.nv_write()?;
+            let mut state = nv
+                .read_boot_state()
+                .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+            if !state.banks[idx].committed {
+                state.banks[idx].boot_count += 1;
+                nv.write_boot_state(&mut state)
+                    .map_err(|e| BackendError::Internal(format!("nv write boot state: {e}")))?;
+            }
+            *self.running_bank.lock().unwrap() = target_bank;
+        }
+
+        // Single-bank components have no bank switch or durable boot witness.
+
+        // Advance only after the runtime request and durable witness succeeded.
+        {
+            let mut ft = self.flash_transfer.lock().unwrap();
+            if let Some(ref mut t) = *ft {
+                t.state = FlashState::Activated;
             }
         }
 
@@ -5266,11 +5367,54 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // Check upload phase first (streaming firmware download in progress)
         let upload_state = *self.upload_phase.lock().unwrap();
 
-        // The device no longer promotes Verifying→Activated from its own
-        // in-memory guest-health check (the retired `guest_is_running` /
-        // `verify_baseline_boot_id` path). `ecu_reset` sets Activated directly
-        // (bank flipped + trial armed); the orchestrator confirms the guest is
-        // actually healthy via `/status` (boot_id changed + ready).
+        let verification = {
+            let ft = self.flash_transfer.lock().unwrap();
+            ft.as_ref()
+                .filter(|transfer| transfer.state == FlashState::Verifying)
+                .map(|transfer| (transfer.transfer_id.clone(), transfer.pre_reset_health))
+        };
+        if let (Some((transfer_id, baseline)), Some(socket)) =
+            (verification, self.vm_service_addr.as_ref())
+        {
+            let fresh_health = query_vm_health_state(socket, &self.entity_info.id)
+                .await
+                .ok()
+                .and_then(VmHealthState::running)
+                .filter(|health| health.status == "running" && health.guest_state == 1)
+                .filter(|health| match baseline {
+                    Some(PreResetHealth::Running(boot_id)) => boot_id != health.boot_id,
+                    Some(PreResetHealth::NotRunning) => true,
+                    None => false,
+                });
+            if fresh_health.is_some() {
+                // NV first matches verdict/rollback lock order. Re-check the
+                // transfer under the lock before recording a polled response.
+                let mut nv = self.nv_write()?;
+                let mut ft = self.flash_transfer.lock().unwrap();
+                let transfer = ft.as_mut().filter(|transfer| {
+                    transfer.transfer_id == transfer_id
+                        && transfer.state == FlashState::Verifying
+                        && transfer.pre_reset_health == baseline
+                });
+                if let Some(transfer) = transfer {
+                    let idx = self.bank_set.as_index();
+                    let mut state = nv
+                        .read_boot_state()
+                        .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
+                    let target_bank = state.banks[idx].active_bank;
+                    if !state.banks[idx].committed {
+                        state.banks[idx].boot_count += 1;
+                        nv.write_boot_state(&mut state).map_err(|e| {
+                            BackendError::Internal(format!("nv write boot state: {e}"))
+                        })?;
+                    }
+                    *self.running_bank.lock().unwrap() = target_bank;
+                    transfer.state = FlashState::Activated;
+                    transfer.pre_reset_health = None;
+                }
+            }
+        }
+
         let flash_state = {
             let ft = self.flash_transfer.lock().unwrap();
             ft.as_ref().map(|t| t.state)
@@ -5329,6 +5473,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     }
 
     async fn commit_flash(&self) -> BackendResult<()> {
+        self.preflight_commit()?;
         // NV commit routed through the bank provider (it folds AlreadyCommitted
         // into Ok for CRL / idempotent commits). The provider writes NV with a
         // plain lock, so refresh the DID cache afterwards — the `nv_write()`
@@ -5844,6 +5989,33 @@ pub struct GuestHealth {
     pub status: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreResetHealth {
+    Running(u32),
+    NotRunning,
+}
+
+enum VmHealthState {
+    Running(GuestHealth),
+    NotRunning,
+}
+
+impl VmHealthState {
+    fn baseline(&self) -> PreResetHealth {
+        match self {
+            Self::Running(health) => PreResetHealth::Running(health.boot_id),
+            Self::NotRunning => PreResetHealth::NotRunning,
+        }
+    }
+
+    fn running(self) -> Option<GuestHealth> {
+        match self {
+            Self::Running(health) => Some(health),
+            Self::NotRunning => None,
+        }
+    }
+}
+
 /// Synthesise a [`GuestHealth`] snapshot for a component that has no
 /// vm-service backing (e.g. activator-backed components like RT/M7).
 /// Called from `ComponentBackend::read_data` when `vm_service_addr` is None.
@@ -5876,6 +6048,13 @@ pub trait HealthProbe: Send + Sync {
 /// Using `tokio::net::TcpStream` keeps the worker available — the await
 /// suspension lets other futures run while we wait on I/O.
 async fn query_vm_health(addr: &str, vm_name: &str) -> Option<GuestHealth> {
+    query_vm_health_state(addr, vm_name)
+        .await
+        .ok()
+        .and_then(VmHealthState::running)
+}
+
+async fn query_vm_health_state(addr: &str, vm_name: &str) -> Result<VmHealthState, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -5886,8 +6065,8 @@ async fn query_vm_health(addr: &str, vm_name: &str) -> Option<GuestHealth> {
 
     let mut stream = tokio::time::timeout(deadline, TcpStream::connect(addr))
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| "connect timed out".to_string())?
+        .map_err(|e| format!("connect failed: {e}"))?;
 
     let request = format!(
         "GET /vms/{vm_name}/health HTTP/1.1\r\n\
@@ -5897,34 +6076,62 @@ async fn query_vm_health(addr: &str, vm_name: &str) -> Option<GuestHealth> {
     );
     tokio::time::timeout(deadline, stream.write_all(request.as_bytes()))
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| "write timed out".to_string())?
+        .map_err(|e| format!("write failed: {e}"))?;
 
     let mut buf = Vec::with_capacity(1024);
     tokio::time::timeout(deadline, stream.read_to_end(&mut buf))
         .await
-        .ok()?
-        .ok()?;
-    let response = std::str::from_utf8(&buf).ok()?;
+        .map_err(|_| "read timed out".to_string())?
+        .map_err(|e| format!("read failed: {e}"))?;
+    let response = std::str::from_utf8(&buf).map_err(|e| format!("invalid HTTP response: {e}"))?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "invalid HTTP response: missing header terminator".to_string())?;
+    let status_code = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| "invalid HTTP response status".to_string())?;
+    if status_code == 404 {
+        return Ok(VmHealthState::NotRunning);
+    }
+    if status_code != 200 {
+        return Err(format!("health endpoint returned HTTP {status_code}"));
+    }
 
-    let body = response.split("\r\n\r\n").nth(1)?;
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
-
-    let guest_state = json.get("guest_state")?.as_u64()? as u32;
-    let hb_seq = json.get("hb_seq")?.as_u64()? as u32;
-    let boot_id = json.get("boot_id")?.as_u64()? as u32;
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid health JSON: {e}"))?;
     let status = json
         .get("status")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
+        .ok_or_else(|| "health response missing status".to_string())?
         .to_string();
+    if status == "stopped" {
+        return Ok(VmHealthState::NotRunning);
+    }
 
-    Some(GuestHealth {
+    let guest_state = json
+        .get("guest_state")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "running health response missing guest_state".to_string())?
+        as u32;
+    let hb_seq =
+        json.get("hb_seq")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "running health response missing hb_seq".to_string())? as u32;
+    let boot_id =
+        json.get("boot_id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "running health response missing boot_id".to_string())? as u32;
+
+    Ok(VmHealthState::Running(GuestHealth {
         guest_state,
         hb_seq,
         boot_id,
         status,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -7924,6 +8131,7 @@ mod identity_tests {
             transfer_id: "t1".into(),
             package_id: pkg_id,
             state: FlashState::AwaitingActivation,
+            pre_reset_health: None,
             image_size: 16,
             streamed_files: Vec::new(),
         });
@@ -8483,6 +8691,7 @@ mod bank_provider_injection_tests {
     use machine_mgr::ResetKind;
     use nv_store::block::MemBlockDevice;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct NoopManifest;
     impl ManifestProvider for NoopManifest {
@@ -8496,13 +8705,36 @@ mod bank_provider_injection_tests {
     /// `Local`, so observing `RequiresEcuReset` through `ComponentBackend`
     /// proves the injected provider is the one in use. Every other method is an
     /// unreachable stub: the test only exercises the dispatch.
-    struct SentinelProvider;
+    struct SentinelProvider {
+        selected: Mutex<Option<Bank>>,
+        pending_reboot: AtomicBool,
+        commits: AtomicUsize,
+        rollbacks: AtomicUsize,
+    }
+
+    impl SentinelProvider {
+        fn new(selected: Option<Bank>) -> Self {
+            Self {
+                selected: Mutex::new(selected),
+                pending_reboot: AtomicBool::new(false),
+                commits: AtomicUsize::new(0),
+                rollbacks: AtomicUsize::new(0),
+            }
+        }
+    }
+
     impl BankProvider for SentinelProvider {
         fn active_bank(&self) -> Bank {
             Bank::B
         }
+        fn selected_bank(&self) -> Option<Bank> {
+            *self.selected.lock().unwrap()
+        }
         fn target_bank(&self) -> Bank {
             Bank::A
+        }
+        fn pending_reboot(&self) -> bool {
+            self.pending_reboot.load(Ordering::SeqCst)
         }
         fn prepare_target(&self, _bank: Bank) -> Result<(), BankError> {
             Ok(())
@@ -8533,9 +8765,11 @@ mod bank_provider_injection_tests {
             Ok(ResetKind::RequiresEcuReset)
         }
         fn commit(&self) -> Result<(), BankError> {
+            self.commits.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn rollback(&self) -> Result<(), BankError> {
+            self.rollbacks.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn reset_kind(&self) -> ResetKind {
@@ -8556,6 +8790,375 @@ mod bank_provider_injection_tests {
             None,
             None,
         )
+    }
+
+    fn backend_with_commit_provider(
+        provider: Arc<SentinelProvider>,
+        single_bank: bool,
+    ) -> ComponentBackend<MemBlockDevice> {
+        let mut b = backend();
+        b.config.single_bank = single_bank;
+        b.with_bank_provider(provider)
+    }
+
+    fn set_transfer_state(b: &ComponentBackend<MemBlockDevice>, state: FlashState) {
+        *b.flash_transfer.lock().unwrap() = Some(FlashTransferState {
+            transfer_id: "t1".into(),
+            package_id: "pkg-1".into(),
+            state,
+            pre_reset_health: None,
+            image_size: 0,
+            streamed_files: Vec::new(),
+        });
+    }
+
+    fn queued_restart_server(post_reset_boot_id: u32) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            for (index, expected_path) in [
+                "/vms/vm1/health",
+                "/vms/vm1/restart?bank=b",
+                "/vms/vm1/health",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 1024];
+                let size = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(request.lines().next().unwrap().contains(expected_path));
+
+                let body = if index == 1 {
+                    String::new()
+                } else {
+                    let boot_id = if index == 0 { 7 } else { post_reset_boot_id };
+                    format!(
+                        r#"{{"guest_state":1,"hb_seq":10,"boot_id":{boot_id},"status":"running"}}"#
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (addr, handle)
+    }
+
+    fn absent_then_healthy_server() -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            for (index, expected_path) in [
+                "/vms/vm1/health",
+                "/vms/vm1/start?bank=b",
+                "/vms/vm1/health",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 1024];
+                let size = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(request.lines().next().unwrap().contains(expected_path));
+
+                let (status, body) = match index {
+                    0 => (
+                        "404 Not Found",
+                        r#"{"error":"VM not found: vm1"}"#.to_string(),
+                    ),
+                    1 => ("200 OK", String::new()),
+                    _ => (
+                        "200 OK",
+                        r#"{"guest_state":1,"hb_seq":1,"boot_id":7,"status":"running"}"#
+                            .to_string(),
+                    ),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (addr, handle)
+    }
+
+    fn arm_bank_b_trial(b: &ComponentBackend<MemBlockDevice>) {
+        set_transfer_state(b, FlashState::AwaitingReboot);
+        let mut nv = b.nv.lock().unwrap();
+        let mut boot = nv.read_boot_state().unwrap();
+        let bank = &mut boot.banks[BankSet::Vm1.as_index()];
+        bank.active_bank = Bank::B;
+        bank.committed = false;
+        bank.boot_count = 0;
+        nv.write_boot_state(&mut boot).unwrap();
+    }
+
+    #[tokio::test]
+    async fn banked_commit_preflight_rejects_awaiting_reboot_without_mutation() {
+        let provider = Arc::new(SentinelProvider::new(Some(Bank::A)));
+        let b = backend_with_commit_provider(provider.clone(), false);
+        set_transfer_state(&b, FlashState::AwaitingReboot);
+        let before_boot = b.nv.lock().unwrap().read_boot_state().unwrap();
+        let before_session = b.nv.lock().unwrap().read_update_session();
+
+        let err = b.commit_flash().await.unwrap_err();
+
+        assert!(matches!(err, BackendError::Busy(_)));
+        assert_eq!(err.status_code(), 409);
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            b.flash_transfer.lock().unwrap().as_ref().unwrap().state,
+            FlashState::AwaitingReboot
+        );
+        assert_eq!(b.nv.lock().unwrap().read_boot_state().unwrap(), before_boot);
+        assert_eq!(b.nv.lock().unwrap().read_update_session(), before_session);
+    }
+
+    #[tokio::test]
+    async fn banked_commit_preflight_rejects_durable_reboot_and_bank_mismatch() {
+        let provider = Arc::new(SentinelProvider::new(Some(Bank::A)));
+        let b = backend_with_commit_provider(provider.clone(), false);
+        {
+            let mut nv = b.nv.lock().unwrap();
+            let mut boot = nv.read_boot_state().unwrap();
+            let bank = &mut boot.banks[BankSet::Vm1.as_index()];
+            bank.active_bank = Bank::B;
+            bank.committed = false;
+            bank.boot_count = 0;
+            nv.write_boot_state(&mut boot).unwrap();
+        }
+        b.set_reboot_owed(true).unwrap();
+        let reconstructed = ComponentBackend::with_options(
+            BankSet::Vm1,
+            b.nv.clone(),
+            Arc::new(NoopManifest),
+            ComponentConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .with_bank_provider(provider.clone());
+        let err = reconstructed.commit_flash().await.unwrap_err();
+        assert!(matches!(err, BackendError::Busy(_)));
+        assert!(err.to_string().contains("durable node reboot"));
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+
+        // Clearing reboot_owed after reconstruction is not sufficient when
+        // the provider and durable selector disagree.
+        reconstructed.set_reboot_owed(false).unwrap();
+        let err = reconstructed.commit_flash().await.unwrap_err();
+        assert!(matches!(err, BackendError::Busy(_)));
+        assert!(err.to_string().contains("durable active bank"));
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+
+        // Once the provider agrees, the armed bank still needs durable proof
+        // that it actually booted.
+        *provider.selected.lock().unwrap() = Some(Bank::B);
+        let err = reconstructed.commit_flash().await.unwrap_err();
+        assert!(matches!(err, BackendError::Busy(_)));
+        assert!(err.to_string().contains("no durable boot witness"));
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+
+        {
+            let mut nv = b.nv.lock().unwrap();
+            let mut boot = nv.read_boot_state().unwrap();
+            boot.banks[BankSet::Vm1.as_index()].boot_count = 1;
+            nv.write_boot_state(&mut boot).unwrap();
+        }
+        assert!(matches!(b.commit_flash().await, Err(BackendError::Busy(_))));
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn banked_commit_succeeds_with_matching_boot_witness() {
+        let provider = Arc::new(SentinelProvider::new(Some(Bank::A)));
+        let b = backend_with_commit_provider(provider.clone(), false);
+        {
+            let mut nv = b.nv.lock().unwrap();
+            let mut boot = nv.read_boot_state().unwrap();
+            let bank = &mut boot.banks[BankSet::Vm1.as_index()];
+            bank.committed = false;
+            bank.boot_count = 1;
+            nv.write_boot_state(&mut boot).unwrap();
+        }
+
+        b.commit_flash().await.unwrap();
+
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_vm_restart_does_not_record_boot_or_activation_or_advance_state() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let mut b = backend();
+        b.vm_service_addr = Some(addr);
+        set_transfer_state(&b, FlashState::AwaitingReboot);
+        {
+            let mut nv = b.nv.lock().unwrap();
+            let mut boot = nv.read_boot_state().unwrap();
+            let bank = &mut boot.banks[BankSet::Vm1.as_index()];
+            bank.active_bank = Bank::B;
+            bank.committed = false;
+            bank.boot_count = 0;
+            nv.write_boot_state(&mut boot).unwrap();
+        }
+
+        let err = b.ecu_reset(0).await.unwrap_err();
+
+        assert!(matches!(err, BackendError::Transport(_)));
+        assert_eq!(b.running_bank().unwrap(), Bank::A);
+        let boot = b.nv.lock().unwrap().read_boot_state().unwrap();
+        assert_eq!(boot.banks[BankSet::Vm1.as_index()].boot_count, 0);
+        assert_eq!(
+            b.flash_transfer.lock().unwrap().as_ref().unwrap().state,
+            FlashState::AwaitingReboot
+        );
+        assert!(matches!(b.commit_flash().await, Err(BackendError::Busy(_))));
+        b.rollback_flash().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vm_health_query_failure_does_not_queue_reset() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let size = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.lines().next().unwrap().contains("/vms/vm1/health"));
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let mut b = backend();
+        b.vm_service_addr = Some(addr);
+        arm_bank_b_trial(&b);
+
+        let err = b.ecu_reset(0).await.unwrap_err();
+
+        assert!(matches!(err, BackendError::Transport(_)));
+        assert_eq!(
+            b.flash_transfer.lock().unwrap().as_ref().unwrap().state,
+            FlashState::AwaitingReboot
+        );
+        assert_eq!(b.running_bank().unwrap(), Bank::A);
+        assert_eq!(
+            b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
+                .boot_count,
+            0
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirmed_absent_vm_accepts_first_later_healthy_boot() {
+        let (addr, server) = absent_then_healthy_server();
+        let mut b = backend();
+        b.vm_service_addr = Some(addr);
+        arm_bank_b_trial(&b);
+
+        b.ecu_reset(0).await.unwrap();
+        let activation = b.get_activation_state().await.unwrap();
+
+        assert_eq!(activation.state, FlashState::Activated);
+        assert_eq!(b.running_bank().unwrap(), Bank::B);
+        assert_eq!(
+            b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
+                .boot_count,
+            1
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_vm_restart_without_fresh_boot_stays_verifying_and_unwitnessed() {
+        let (addr, server) = queued_restart_server(7);
+        let mut b = backend();
+        b.vm_service_addr = Some(addr);
+        arm_bank_b_trial(&b);
+
+        b.ecu_reset(0).await.unwrap();
+
+        assert_eq!(b.running_bank().unwrap(), Bank::A);
+        assert_eq!(
+            b.flash_transfer.lock().unwrap().as_ref().unwrap().state,
+            FlashState::Verifying
+        );
+        assert_eq!(
+            b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
+                .boot_count,
+            0
+        );
+
+        let activation = b.get_activation_state().await.unwrap();
+
+        assert_eq!(activation.state, FlashState::Verifying);
+        assert_eq!(b.running_bank().unwrap(), Bank::A);
+        assert_eq!(
+            b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
+                .boot_count,
+            0
+        );
+        assert!(matches!(b.commit_flash().await, Err(BackendError::Busy(_))));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_healthy_vm_boot_promotes_and_persists_witness() {
+        let (addr, server) = queued_restart_server(8);
+        let mut b = backend();
+        b.vm_service_addr = Some(addr);
+        arm_bank_b_trial(&b);
+
+        b.ecu_reset(0).await.unwrap();
+        let activation = b.get_activation_state().await.unwrap();
+
+        assert_eq!(activation.state, FlashState::Activated);
+        assert_eq!(b.running_bank().unwrap(), Bank::B);
+        assert_eq!(
+            b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
+                .boot_count,
+            1
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollback_is_ungated_and_singleshot_commit_is_unchanged() {
+        let banked_provider = Arc::new(SentinelProvider::new(Some(Bank::B)));
+        banked_provider.pending_reboot.store(true, Ordering::SeqCst);
+        let banked = backend_with_commit_provider(banked_provider.clone(), false);
+        set_transfer_state(&banked, FlashState::AwaitingReboot);
+        banked.set_reboot_owed(true).unwrap();
+
+        banked.rollback_flash().await.unwrap();
+        assert_eq!(banked_provider.rollbacks.load(Ordering::SeqCst), 1);
+
+        let singleshot_provider = Arc::new(SentinelProvider::new(Some(Bank::B)));
+        singleshot_provider
+            .pending_reboot
+            .store(true, Ordering::SeqCst);
+        let singleshot = backend_with_commit_provider(singleshot_provider.clone(), true);
+        set_transfer_state(&singleshot, FlashState::AwaitingReboot);
+        singleshot.set_reboot_owed(true).unwrap();
+
+        singleshot.commit_flash().await.unwrap();
+        assert_eq!(singleshot_provider.commits.load(Ordering::SeqCst), 1);
     }
 
     /// Single-bank (HSM-style), irreversible backend for update-mode tests.
@@ -10432,7 +11035,7 @@ mod bank_provider_injection_tests {
         assert_eq!(b.reset_kind(), ResetKind::Local);
 
         // After injection, the backend routes through the sentinel.
-        let b = b.with_bank_provider(Arc::new(SentinelProvider));
+        let b = b.with_bank_provider(Arc::new(SentinelProvider::new(None)));
         assert_eq!(
             b.reset_kind(),
             ResetKind::RequiresEcuReset,
@@ -10446,7 +11049,7 @@ mod bank_provider_injection_tests {
         // override flag must make those no-op on the provider so the injected
         // one is NOT clobbered.
         let b = backend()
-            .with_bank_provider(Arc::new(SentinelProvider))
+            .with_bank_provider(Arc::new(SentinelProvider::new(None)))
             .with_bank_spec(crate::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1));
         assert_eq!(
             b.reset_kind(),
@@ -10528,6 +11131,7 @@ mod abort_flash_tests {
             transfer_id: "t1".into(),
             package_id: "pkg-1".into(),
             state,
+            pre_reset_health: None,
             image_size: 0,
             streamed_files: Vec::new(),
         });
@@ -11324,6 +11928,7 @@ mod copy_forward_tests {
             transfer_id: "t1".into(),
             package_id: "m1".into(),
             state: FlashState::AwaitingActivation,
+            pre_reset_health: None,
             image_size: 0,
             streamed_files: Vec::new(),
         });
@@ -11451,6 +12056,7 @@ mod copy_forward_tests {
             transfer_id: "t1".into(),
             package_id: "m1".into(),
             state: FlashState::AwaitingActivation,
+            pre_reset_health: None,
             image_size: 0,
             streamed_files: Vec::new(),
         });
@@ -11546,6 +12152,7 @@ mod copy_forward_tests {
             transfer_id: "t1".into(),
             package_id: "m1".into(),
             state: FlashState::AwaitingActivation,
+            pre_reset_health: None,
             image_size: 0,
             streamed_files: Vec::new(),
         });

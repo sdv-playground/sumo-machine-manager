@@ -494,7 +494,10 @@ async fn flash_full_suit_flow() {
     assert_eq!(paused["status"], "inProgress");
     assert_eq!(paused["x-ota-substate"], "awaiting-verdict");
 
-    // 5. PUT /x-ota-commit — Phase B vendor verb.  Wakes the paused
+    // 5. Restart into the selected bank, providing the commit boot witness.
+    activation_reset(&router, "vm1").await;
+
+    // 6. PUT /x-ota-commit — Phase B vendor verb.  Wakes the paused
     //    execute task; calls backend.commit_flash; transitions to
     //    execute/completed.
     let (status, _) = put_empty(
@@ -684,6 +687,12 @@ async fn run_spec_cycle(
     verdict_verb: &str,
 ) -> serde_json::Value {
     let update_id = flash_to_awaiting_verdict(router, component, envelope).await;
+
+    // Commit requires proof that the selected bank actually became the running
+    // bank. Rollback deliberately remains available before that witness.
+    if verdict_verb == "x-ota-commit" {
+        activation_reset(router, component).await;
+    }
 
     let (status, _) = put_empty(
         router,

@@ -281,6 +281,10 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
             .map_err(map_backend_error)
     }
 
+    async fn preflight_commit(&self) -> MachineResult<()> {
+        self.inner.preflight_commit().map_err(map_backend_error)
+    }
+
     async fn commit_install(&self, _id: &FlashId) -> MachineResult<()> {
         DiagnosticBackend::commit_flash(&*self.inner)
             .await

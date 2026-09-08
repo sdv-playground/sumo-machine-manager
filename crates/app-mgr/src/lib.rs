@@ -193,6 +193,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
     }
 
     async fn commit_install(&self, _id: &FlashId) -> MachineResult<()> {
+        self.preflight_commit().await?;
         let mut nv = self.nv.lock().unwrap();
         let mut state = nv
             .read_boot_state()
@@ -218,6 +219,27 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
         }
 
         tracing::info!("app: boot committed");
+        Ok(())
+    }
+
+    async fn preflight_commit(&self) -> MachineResult<()> {
+        let nv = self.nv.lock().unwrap();
+        let state = nv
+            .read_boot_state()
+            .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
+        let bank = &state.banks[BankSet::Os.as_index()];
+        if !bank.committed && bank.boot_count == 0 {
+            return Err(MachineError::Busy(
+                "commit refused: app trial has no durable boot witness".into(),
+            ));
+        }
+        if !bank.committed && bank.active_bank != self.active_bank() {
+            return Err(MachineError::Busy(format!(
+                "commit refused: selected bank {:?} does not match running bank {:?}",
+                bank.active_bank,
+                self.active_bank()
+            )));
+        }
         Ok(())
     }
 

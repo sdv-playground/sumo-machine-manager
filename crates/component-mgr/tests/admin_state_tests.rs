@@ -232,10 +232,18 @@ async fn counting_server() -> (String, Arc<AtomicUsize>) {
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = [0u8; 512];
-                let _ = stream.read(&mut buf).await;
-                let _ = stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await;
+                let size = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..size]);
+                let body = if request.starts_with("GET ") {
+                    r#"{"status":"stopped","guest_state":null,"hb_seq":null,"boot_id":null}"#
+                } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
             });
         }
     });

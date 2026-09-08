@@ -11,7 +11,7 @@ use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
 use nv_store::types::{Bank, BankSet};
 
-use machine_mgr::BankActivator;
+use machine_mgr::{ActivationState, BankActivator, FlashState};
 
 pub struct HostOsComponent<D: BlockDevice> {
     nv: Arc<Mutex<NvStore<D>>>,
@@ -98,6 +98,7 @@ impl<D: BlockDevice + Send + 'static> Component for HostOsComponent<D> {
     }
 
     async fn commit_install(&self, _id: &machine_mgr::types::FlashId) -> MachineResult<()> {
+        self.preflight_commit().await?;
         let mut nv = self.nv.lock().unwrap();
         let mut state = nv
             .read_boot_state()
@@ -115,6 +116,57 @@ impl<D: BlockDevice + Send + 'static> Component for HostOsComponent<D> {
 
         tracing::info!("host-os: boot committed");
         Ok(())
+    }
+
+    async fn preflight_commit(&self) -> MachineResult<()> {
+        let nv = self.nv.lock().unwrap();
+        let state = nv
+            .read_boot_state()
+            .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
+        let bank = &state.banks[BankSet::Os.as_index()];
+        if !bank.committed && bank.boot_count == 0 {
+            return Err(MachineError::Busy(
+                "commit refused: host OS trial has no durable boot witness".into(),
+            ));
+        }
+        if !bank.committed
+            && nv
+                .read_update_session()
+                .unwrap_or_default()
+                .owes(BankSet::Os)
+        {
+            return Err(MachineError::Busy(
+                "commit refused: host OS reboot is still owed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn activation_state(&self) -> MachineResult<Option<ActivationState>> {
+        let nv = self.nv.lock().unwrap();
+        let state = nv
+            .read_boot_state()
+            .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
+        let bank = &state.banks[BankSet::Os.as_index()];
+        let reboot_owed = nv
+            .read_update_session()
+            .unwrap_or_default()
+            .owes(BankSet::Os);
+        let state = if bank.committed {
+            FlashState::Complete
+        } else if reboot_owed || bank.boot_count == 0 {
+            FlashState::AwaitingReboot
+        } else {
+            FlashState::Activated
+        };
+
+        Ok(Some(ActivationState {
+            supports_rollback: true,
+            state,
+            active_version: None,
+            previous_version: None,
+            reset_kind: self.capabilities.flash.as_ref().unwrap().reset_kind,
+        }))
     }
 
     async fn rollback_install(&self, _id: &machine_mgr::types::FlashId) -> MachineResult<()> {

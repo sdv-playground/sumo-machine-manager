@@ -117,6 +117,23 @@ pub trait Component: Send + Sync {
         Err(MachineError::NotSupported("finalize_install"))
     }
 
+    /// Check whether a commit may proceed without changing component state.
+    /// Node-level verdicts call this for every candidate before committing any.
+    async fn preflight_commit(&self) -> MachineResult<()> {
+        if self
+            .capabilities()
+            .flash
+            .as_ref()
+            .is_some_and(|flash| flash.dual_bank || flash.supports_trial_boot)
+        {
+            Err(MachineError::Internal(
+                "banked component does not implement commit preflight".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Post-reboot (or post-finalize for single-bank): raise the security
     /// version floor and mark this install permanent. The orchestrator calls
     /// this after verifying the new code is healthy.

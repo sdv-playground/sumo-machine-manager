@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use machine_mgr::{
-    Component, DidKind, DtcFilter, EntityInfo, FlashId, MachineError, MachineRegistry,
+    Component, DidKind, DtcFilter, EntityInfo, FlashId, FlashState, MachineError, MachineRegistry,
 };
 
 use nv_store::block::MemBlockDevice;
@@ -19,6 +19,14 @@ use component_mgr::component_adapter::ComponentAdapter;
 use component_mgr::did::{DID_SERIAL_NUMBER, DID_VIN};
 use component_mgr::manifest_provider::ManifestProvider;
 use component_mgr::suit_provider::SuitProvider;
+
+struct NoopActivator;
+
+impl machine_mgr::BankActivator for NoopActivator {
+    fn activate(&self, _bank_dir: &std::path::Path) -> Result<(), machine_mgr::BankActivatorError> {
+        Ok(())
+    }
+}
 
 fn make_nv() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
@@ -78,6 +86,85 @@ async fn component_id_and_capabilities() {
     assert!(lc.restartable);
     assert!(!lc.has_runtime_state); // no vm-service socket configured
     assert!(caps.hsm.is_none()); // no hsm provider configured
+}
+
+#[tokio::test]
+async fn app_and_host_preflights_require_durable_boot_evidence() {
+    let app_nv = make_nv();
+    {
+        let mut nv = app_nv.lock().unwrap();
+        let mut boot = nv.read_boot_state().unwrap();
+        boot.banks[BankSet::Os.as_index()].committed = false;
+        nv.write_boot_state(&mut boot).unwrap();
+    }
+    let app = app_mgr::AppComponent::new(
+        app_mgr::AppConfig {
+            id: "app".into(),
+            base_path: "/unused".into(),
+        },
+        app_nv.clone(),
+    );
+    assert!(matches!(
+        app.preflight_commit().await,
+        Err(MachineError::Busy(_))
+    ));
+    {
+        let mut nv = app_nv.lock().unwrap();
+        let mut boot = nv.read_boot_state().unwrap();
+        boot.banks[BankSet::Os.as_index()].boot_count = 1;
+        nv.write_boot_state(&mut boot).unwrap();
+    }
+    app.preflight_commit().await.unwrap();
+
+    let host_nv = make_nv();
+    {
+        let mut nv = host_nv.lock().unwrap();
+        let mut boot = nv.read_boot_state().unwrap();
+        boot.banks[BankSet::Os.as_index()].committed = false;
+        boot.banks[BankSet::Os.as_index()].boot_count = 1;
+        nv.write_boot_state(&mut boot).unwrap();
+        let mut session = NvUpdateSession {
+            reboot_owed: 1 << BankSet::Os.as_index(),
+            ..Default::default()
+        };
+        nv.write_update_session(&mut session).unwrap();
+    }
+    let host = host_os_mgr::HostOsComponent::new(host_nv.clone(), Arc::new(NoopActivator));
+    assert!(matches!(
+        host.preflight_commit().await,
+        Err(MachineError::Busy(_))
+    ));
+    host_nv.lock().unwrap().clear_update_session().unwrap();
+    host.preflight_commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn host_activation_state_uses_durable_reboot_and_boot_witness() {
+    let nv = make_nv();
+    {
+        let mut nv = nv.lock().unwrap();
+        let mut boot = nv.read_boot_state().unwrap();
+        boot.banks[BankSet::Os.as_index()].committed = false;
+        nv.write_boot_state(&mut boot).unwrap();
+    }
+    let host = host_os_mgr::HostOsComponent::new(nv.clone(), Arc::new(NoopActivator));
+
+    assert_eq!(
+        host.activation_state().await.unwrap().unwrap().state,
+        FlashState::AwaitingReboot
+    );
+
+    {
+        let mut nv = nv.lock().unwrap();
+        let mut boot = nv.read_boot_state().unwrap();
+        boot.banks[BankSet::Os.as_index()].boot_count = 1;
+        nv.write_boot_state(&mut boot).unwrap();
+    }
+
+    assert_eq!(
+        host.activation_state().await.unwrap().unwrap().state,
+        FlashState::Activated
+    );
 }
 
 #[tokio::test]
