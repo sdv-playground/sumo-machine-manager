@@ -744,6 +744,27 @@ move that buys nothing:
   perturb. And a *consumer's* lock (supernova's, which **is** tracked) records
   `git+…?branch=main#<sha>` keyed by package name — so a move changes nothing
   there either beyond the sha that every commit changes anyway.
+- **The rename case was then proven the same way, on `main` after the merge.**
+  The pilot only proved a *move*, and `vhsm-ssd` is the harder shape: the
+  package moved to `services/` **and** its library was renamed. Same mechanism,
+  same command, against merged `main` (`6c68113`):
+
+  ```
+  source /opt/qnx710/qnxsdp-env.sh
+  export CFLAGS_aarch64_unknown_nto_qnx710="-Wa,-march=armv8-a+crypto"
+  cargo +nightly install --git …/sumo-machine-manager.git --branch main \
+    --target aarch64-unknown-nto-qnx710 -Z build-std=std,panic_abort \
+    --root /tmp/… vhsm-ssd
+  ```
+
+  → `ELF 64-bit … ARM aarch64, interpreter /usr/lib/ldqnx-64.so.2`, `NEEDED
+  libslog2.so.1`. Also installs clean on the host target. The `CFLAGS_…` export
+  is **not** related to this work — `crates/hsm` takes `sha2` with
+  `features = ["asm"]`, and `sha2-asm`'s aarch64 source needs the crypto
+  extensions passed through to the *assembler* (`-Wa,`), not just to `qcc`.
+  Without it the build fails identically on pre-3d `main`; it is a
+  cross-build-environment requirement, already documented in the QNX build
+  scripts.
 - **A rename or a new package DOES change locks — check which consumers.** This
   wave added four package names (`vhsm-server`, `vm-diagserver`,
   `vm-service-standalone`, `host-metrics-serve`) and renamed one library. It is
