@@ -677,3 +677,50 @@ fn file_block_device_roundtrip() {
 
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn confirmed_running_trial_persists_boot_witness_before_clearing_reboot_owed() {
+    let mut store = make_store();
+    let mut state = NvBootState::default();
+    let index = BankSet::Os.as_index();
+    state.banks[index].active_bank = Bank::B;
+    state.banks[index].committed = false;
+    state.banks[index].boot_count = 0;
+    store.write_boot_state(&mut state).unwrap();
+
+    let mut session = NvUpdateSession {
+        reboot_owed: 1 << index,
+        ..Default::default()
+    };
+    store.write_update_session(&mut session).unwrap();
+
+    assert_eq!(
+        store.confirm_running_bank(BankSet::Os, Bank::B).unwrap(),
+        RunningBankVerdict::Confirmed { bank: Bank::B }
+    );
+    assert_eq!(store.read_boot_state().unwrap().banks[index].boot_count, 1);
+    assert_eq!(
+        store.read_update_session().unwrap().reboot_owed & (1 << index),
+        0
+    );
+}
+
+#[test]
+fn running_bank_mismatch_records_no_boot_witness() {
+    let mut store = make_store();
+    let mut state = NvBootState::default();
+    let index = BankSet::Os.as_index();
+    state.banks[index].active_bank = Bank::B;
+    state.banks[index].committed = false;
+    state.banks[index].boot_count = 0;
+    store.write_boot_state(&mut state).unwrap();
+
+    assert_eq!(
+        store.confirm_running_bank(BankSet::Os, Bank::A).unwrap(),
+        RunningBankVerdict::Mismatch {
+            running: Bank::A,
+            armed: Bank::B,
+        }
+    );
+    assert_eq!(store.read_boot_state().unwrap().banks[index].boot_count, 0);
+}

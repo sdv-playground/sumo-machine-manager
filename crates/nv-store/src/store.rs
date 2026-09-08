@@ -323,16 +323,28 @@ impl<D: BlockDevice> NvStore<D> {
         bank_set: BankSet,
         running_bank: Bank,
     ) -> Result<RunningBankVerdict, BlockError> {
-        let Some(state) = self.read_boot_state() else {
+        let Some(mut state) = self.read_boot_state() else {
             return Ok(RunningBankVerdict::NoBootState);
         };
-        let armed = state.banks[bank_set.as_index()].active_bank;
+        let bank_index = bank_set.as_index();
+        let armed = state.banks[bank_index].active_bank;
         if running_bank != armed {
             return Ok(RunningBankVerdict::Mismatch {
                 running: running_bank,
                 armed,
             });
         }
+
+        // Persist the positive boot witness before clearing reboot_owed. The
+        // component commit gate requires this counter after process restart;
+        // clearing the reboot marker first could otherwise make a witnessed
+        // hardware trial permanently uncommittable if the boot-state write
+        // failed.
+        if !state.banks[bank_index].committed && state.banks[bank_index].boot_count == 0 {
+            state.banks[bank_index].boot_count = 1;
+            self.write_boot_state(&mut state)?;
+        }
+
         let mut s = self.read_update_session().unwrap_or_default();
         let bit = 1u16 << bank_set.as_index();
         if s.reboot_owed & bit != 0 {
