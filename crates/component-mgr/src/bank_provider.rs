@@ -34,6 +34,61 @@ use machine_mgr::ResetKind;
 
 use crate::ota;
 
+/// A sink whose terminal `flush` forces its accumulated writes DURABLE to the
+/// medium (`sync_all` = fsync). The OTA streaming pipeline calls `flush()` once
+/// when the payload is fully written, so wrapping the sink guarantees the bytes
+/// are on the eMMC before `seal` hashes them back, before the readback-verify,
+/// and before any post-flash reboot/reset — a bank left with dirty pages either
+/// wedges the node on reboot (the kernel flushes the whole image on the way
+/// down) or, worse, is TRUNCATED when a post-"staged" node reset races the
+/// write-behind flush (observed twice on RDB3 for the host partition).
+/// `BufWriter` calls this inner `flush` when the buffer drains, so a
+/// `BufWriter<SyncingWriter>` fsyncs on its terminal flush.
+///
+/// Used by BOTH bank sinks, and the barrier is the same; only the write mode
+/// differs. A raw partition ([`PartitionBankProvider::open_payload_writer`]) is
+/// additionally opened `O_SYNC`, because there the write-behind cache is the
+/// documented truncation hazard and the device is written once end-to-end. A
+/// staging FILE ([`IvdBankProvider::open_payload_writer`]) is NOT `O_SYNC` — a
+/// write-through regular file would make every 64 KiB pipeline chunk a
+/// synchronous flash write and gut upload throughput — so for files this
+/// terminal fsync IS the barrier, not a belt-and-suspenders extra.
+///
+/// The [`DurableSink`] seam keeps the barrier unit-testable: production wraps a
+/// `std::fs::File` (fsync); a test double substitutes a recorder that observes
+/// the sync fires AFTER the last write.
+///
+/// [`PartitionBankProvider::open_payload_writer`]: crate::partition_bank_provider::PartitionBankProvider
+pub(crate) trait DurableSink: std::io::Write {
+    fn sync(&self) -> std::io::Result<()>;
+}
+
+impl DurableSink for std::fs::File {
+    fn sync(&self) -> std::io::Result<()> {
+        self.sync_all()
+    }
+}
+
+pub(crate) struct SyncingWriter<W: DurableSink> {
+    pub(crate) inner: W,
+    /// Device or file path — log context only.
+    pub(crate) path: String,
+}
+
+impl<W: DurableSink> std::io::Write for SyncingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        // fsync — the whole point. A sync (not just a buffer drain) forces dirty
+        // pages out to the eMMC so a subsequent reboot/reset has nothing to drain
+        // and cannot truncate the just-written bank.
+        self.inner.sync()?;
+        tracing::info!(sink = %self.path, "bank sink: fsync'd (payload durable)");
+        Ok(())
+    }
+}
+
 /// The IVD/A-B [`BankProvider`]: signed CBOR manifest in a bank dir, optional
 /// activator, NV boot-state + boot selector. Backs VMs, host-os and hsm bank
 /// sets.
@@ -437,9 +492,24 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // decompressed bank in 64 KiB chunks, and after the decrypt+decompress
         // speedups the eMMC write became the #1 upload stage (~80 MB/s). Larger,
         // fewer write() syscalls give the device better sequential-write
-        // throughput. Flushed by the pipeline before the sink is dropped.
+        // throughput.
+        //
+        // Wrapped in a `SyncingWriter` so the pipeline's terminal `flush()`
+        // FSYNCS the staged file. Without it the pipeline's flush only drained
+        // this BufWriter into the page cache (`File::flush` is a no-op and `drop`
+        // closes without fsync), leaving hundreds of MB of a VM bank dirty on
+        // `/mnt/common-rw` at the moment the post-flash reset fires — the same
+        // wedge/truncation hazard `PartitionBankProvider` was given `O_SYNC` for.
+        // It also makes `backend.rs`'s readback-verify meaningful here: before
+        // this, the re-hash read straight back through the cache it had just
+        // filled and passed with every byte still dirty. Not `O_SYNC` — see
+        // [`SyncingWriter`] for why write-through is wrong for a regular file.
         const WRITE_BUF: usize = 4 * 1024 * 1024;
-        Ok(Box::new(BufWriter::with_capacity(WRITE_BUF, file)))
+        let sink = SyncingWriter {
+            inner: file,
+            path: path.display().to_string(),
+        };
+        Ok(Box::new(BufWriter::with_capacity(WRITE_BUF, sink)))
     }
 
     fn seal(

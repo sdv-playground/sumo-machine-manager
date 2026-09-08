@@ -43,7 +43,10 @@ use nv_store::types::{Bank, BankSet};
 use machine_mgr::bank_provider::{BankError, BankProvider, FirmwareIdentity, InstalledFirmware};
 use machine_mgr::ResetKind;
 
-use crate::bank_provider::{firmware_to_ivd_identity, IvdBankProvider};
+// The durability barrier is SHARED with the staging-file sink — one fsync
+// implementation for both bank paths. See `bank_provider::SyncingWriter` for why
+// the partition sink adds `O_SYNC` on top and the file sink deliberately does not.
+use crate::bank_provider::{firmware_to_ivd_identity, IvdBankProvider, SyncingWriter};
 
 /// One part of a raw-partition bank: its on-disk payload name (the SUIT
 /// component-id's last segment, e.g. `application.img`) and the A/B eMMC device
@@ -66,53 +69,6 @@ impl PartitionPart {
             Bank::A => &self.partition_a,
             Bank::B => &self.partition_b,
         }
-    }
-}
-
-/// A sink whose terminal `flush` forces its accumulated writes DURABLE to the
-/// medium (`sync_all` = fsync). The OTA streaming pipeline calls `flush()` once
-/// when the payload is fully written, so wrapping the device file guarantees the
-/// bytes are on the eMMC before `seal` hashes the partition back, before the
-/// readback-verify, and before any post-flash reboot/reset — a raw partition left
-/// with dirty pages either wedges the node on reboot (the kernel flushes 133 MB
-/// on the way down) or, worse, is TRUNCATED when a post-"staged" node reset races
-/// the write-behind flush (observed twice on RDB3). `BufWriter` calls this inner
-/// `flush` when the buffer drains, so a `BufWriter<SyncingWriter>` fsyncs on its
-/// terminal flush.
-///
-/// The device is also opened `O_SYNC` (see [`open_payload_writer`]), so in
-/// production every write is already write-through and this `flush` is a
-/// belt-and-suspenders barrier. The [`DurableSink`] seam keeps the barrier
-/// unit-testable: production wraps a `std::fs::File` (fsync); a test double
-/// substitutes a recorder that observes the sync fires AFTER the last write.
-///
-/// [`open_payload_writer`]: PartitionBankProvider::open_payload_writer
-trait DurableSink: std::io::Write {
-    fn sync(&self) -> std::io::Result<()>;
-}
-
-impl DurableSink for std::fs::File {
-    fn sync(&self) -> std::io::Result<()> {
-        self.sync_all()
-    }
-}
-
-struct SyncingWriter<W: DurableSink> {
-    inner: W,
-    path: String,
-}
-
-impl<W: DurableSink> std::io::Write for SyncingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        // fsync the device — the whole point. sync (not just a buffer drain)
-        // forces dirty pages out to the eMMC so a subsequent reboot/reset has
-        // nothing to drain and cannot truncate the just-written partition.
-        self.inner.sync()?;
-        tracing::info!(device = %self.path, "partition bank: fsync'd device (payload durable)");
-        Ok(())
     }
 }
 
@@ -548,6 +504,8 @@ mod tests {
         let w = p.open_payload_writer(Bank::A, "ifs");
         assert!(w.is_ok(), "unmapped name should fall back, not error");
     }
+
+    use crate::bank_provider::DurableSink;
 
     // A DurableSink double that records the order of writes vs the durability
     // barrier (sync), so we can assert the fsync fires only AFTER the last byte is

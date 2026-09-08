@@ -1894,7 +1894,25 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 bank.active_bank
             )));
         }
-        if !bank.committed && bank.boot_count == 0 {
+        // No boot-counter gate for a vm-service-backed guest. Who writes that
+        // counter decides whether it can gate: the boot manager
+        // (`vm-boot::process_boot`) for a bank set the host itself boots, or
+        // `ecu_reset`'s simulation witness for a component with no vm-service. A
+        // guest reboots INSIDE the hypervisor, so the only writer is supernova's
+        // `confirm_started_vm_trial`, and it only writes after the GUEST produces
+        // two progressing healthy heartbeats within 120 s. Gate the commit on that
+        // and a guest whose heartbeat chain is not up (vm2 on the rig) is
+        // permanently uncommittable — "no durable boot witness" on
+        // `x-ota-commit-trials` even though the node came up by itself. The
+        // heartbeat is a health signal; making it a commit precondition is the ECU
+        // contesting a commit on evidence it cannot reliably obtain.
+        //
+        // The reboot check belongs to the ORCHESTRATOR, which holds the boot id it
+        // saw before the reset and compares it with the one this component now
+        // reports (`x-runtime.node_boot_id` / the heartbeat `boot_id`). The ECU
+        // reports facts and runs the health check (`VmHeartbeatProgress`, which
+        // drives the Verifying→Activated promotion); it does not veto.
+        if self.vm_service_addr.is_none() && !bank.committed && bank.boot_count == 0 {
             return Err(BackendError::Busy(format!(
                 "commit refused: selected bank {selected:?} has no durable boot witness"
             )));
@@ -2455,12 +2473,16 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
         // Durable readback-verify BEFORE this upload is acked: re-hash the bytes
         // now on the medium and confirm they match what the streaming pipeline
-        // wrote. The sink is opened write-through (O_SYNC) and fsync'd on its
-        // terminal flush, so this readback reflects the eMMC — not a write-behind
-        // cache. A short/interrupted write (e.g. the node reset that raced the
-        // "staged" ack on the rig) is caught HERE as a staging failure, so we
-        // never seal + ack a partition the post-reset boot can't mount. Mirrors
-        // `verify_part`'s mapping: wrong bytes on disk = 4xx, read fault = 5xx.
+        // wrote. Both sinks fsync on their terminal flush before we get here
+        // (`bank_provider::SyncingWriter`; the raw-partition sink is additionally
+        // `O_SYNC`), so this readback reflects the eMMC — not a write-behind cache.
+        // That fsync is load-bearing for THIS check, not just for the reboot: until
+        // the VM/file sink got the barrier, this re-hash read straight back through
+        // the page cache it had just filled and passed with every byte still dirty.
+        // A short/interrupted write (e.g. the node reset that raced the "staged"
+        // ack on the rig) is caught HERE as a staging failure, so we never seal +
+        // ack a bank the post-reset boot can't mount. Mirrors `verify_part`'s
+        // mapping: wrong bytes on disk = 4xx, read fault = 5xx.
         self.bank_provider
             .verify_payload(target_bank, &target_name, &image_hash)
             .map_err(|e| match e {
@@ -2658,9 +2680,20 @@ pub(crate) fn node_in_trial_labels<D: BlockDevice>(
 /// has actually happened — the armed bank IS the running bank and a verdict is
 /// genuinely owed. `boot_count` is that event's durable witness: `ota::install`
 /// zeroes it when it arms the bank, and only a boot into the armed bank while
-/// uncommitted raises it (the boot manager's `process_boot`; `ecu_reset` for a
-/// Local-reset VM). Commit / rollback / auto-rollback all re-commit the set, so
-/// a trial that fell back never lingers here.
+/// uncommitted raises it — the boot manager's `process_boot`, or `ecu_reset`'s
+/// simulation witness for a component with no vm-service behind it. Commit /
+/// rollback / auto-rollback all re-commit the set, so a trial that fell back
+/// never lingers here.
+///
+/// For a vm-service-backed guest the only writer is supernova's
+/// `confirm_started_vm_trial` (heartbeat-confirmed, durable). `get_activation_state`
+/// used to bump the counter too, from its in-memory Verifying→Activated promotion —
+/// removed, because that made a process-lifetime fact look durable and it is not
+/// what this set is for (see `preflight_commit`). Consequence: a guest whose
+/// heartbeat chain is not up never joins this set, so an UNRELATED component's
+/// flash is not node-gated on its live trial. A re-flash of that guest itself is
+/// still refused one layer up, by `ensure_flash_can_start`'s per-bank-set
+/// committed check.
 ///
 /// Why the gate must NOT use the wider wire set: the engine coalesces one
 /// campaign step into flash-all-banked → ONE reboot → trial-all → ONE
@@ -5109,8 +5142,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// the heartbeat `boot_id` (a per-lifetime nonce — the orchestrator's reboot
     /// witness: a *changed* boot_id proves a fresh guest lifetime, including a
     /// node reboot, which `boot_count` cannot witness), the heartbeat `hb_seq`
-    /// (liveness), and `boot_count` (the NV trial counter — a metric, bumped after
-    /// a reset is witnessed).
+    /// (liveness), and `boot_count` (the NV trial counter — a metric only, written
+    /// by whatever observes the boot: the boot manager, `ecu_reset` for a component
+    /// with no vm-service, or supernova's heartbeat-confirmed VM witness. It stays
+    /// 0 for a guest whose heartbeat never progressed, so read `boot_id` for the
+    /// reboot question, not this).
     async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {
         // Administratively disabled ⇒ skip the vm-service probe entirely (the
         // VM is down BY DESIGN — probing would only burn the health timeout)
@@ -5389,7 +5425,18 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             if fresh_health.is_some() {
                 // NV first matches verdict/rollback lock order. Re-check the
                 // transfer under the lock before recording a polled response.
-                let mut nv = self.nv_write()?;
+                //
+                // NV is READ ONLY here: the promotion no longer bumps the boot
+                // counter. Writing one from this in-memory promotion made the
+                // counter look durable while it was really just "this process
+                // stayed alive across the guest reboot" — see `preflight_commit`.
+                // The guest's own fresh `boot_id` (checked above against the
+                // pre-reset baseline) is the reboot evidence; the orchestrator
+                // owns the durable half of that comparison.
+                let nv = self
+                    .nv
+                    .lock()
+                    .map_err(|_| BackendError::Internal("nv lock".into()))?;
                 let mut ft = self.flash_transfer.lock().unwrap();
                 let transfer = ft.as_mut().filter(|transfer| {
                     transfer.transfer_id == transfer_id
@@ -5398,16 +5445,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 });
                 if let Some(transfer) = transfer {
                     let idx = self.bank_set.as_index();
-                    let mut state = nv
+                    let state = nv
                         .read_boot_state()
                         .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
                     let target_bank = state.banks[idx].active_bank;
-                    if !state.banks[idx].committed {
-                        state.banks[idx].boot_count += 1;
-                        nv.write_boot_state(&mut state).map_err(|e| {
-                            BackendError::Internal(format!("nv write boot state: {e}"))
-                        })?;
-                    }
+                    drop(nv);
                     *self.running_bank.lock().unwrap() = target_bank;
                     transfer.state = FlashState::Activated;
                     transfer.pre_reset_health = None;
@@ -9077,11 +9119,6 @@ mod bank_provider_injection_tests {
 
         assert_eq!(activation.state, FlashState::Activated);
         assert_eq!(b.running_bank().unwrap(), Bank::B);
-        assert_eq!(
-            b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
-                .boot_count,
-            1
-        );
         server.join().unwrap();
     }
 
@@ -9118,10 +9155,20 @@ mod bank_provider_injection_tests {
         server.join().unwrap();
     }
 
+    /// A fresh healthy guest boot promotes the trial to Activated and the commit
+    /// goes through — with the NV boot counter still 0. The promotion no longer
+    /// writes one (it was a process-lifetime fact dressed up as durable), and the
+    /// commit gate no longer asks for one on a vm-service-backed guest: the only
+    /// durable writer there is supernova's heartbeat-confirmed witness, so gating
+    /// on it made a guest with a broken heartbeat chain permanently uncommittable
+    /// ("no durable boot witness" on the rig). The reboot evidence is the guest's
+    /// fresh heartbeat `boot_id` versus the pre-reset baseline — checked in the
+    /// promotion — and the durable half of that comparison is the orchestrator's.
     #[tokio::test]
-    async fn fresh_healthy_vm_boot_promotes_and_persists_witness() {
+    async fn fresh_healthy_vm_boot_promotes_and_commits_without_a_boot_counter() {
         let (addr, server) = queued_restart_server(8);
-        let mut b = backend();
+        let provider = Arc::new(SentinelProvider::new(Some(Bank::B)));
+        let mut b = backend_with_commit_provider(provider.clone(), false);
         b.vm_service_addr = Some(addr);
         arm_bank_b_trial(&b);
 
@@ -9133,8 +9180,12 @@ mod bank_provider_injection_tests {
         assert_eq!(
             b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
                 .boot_count,
-            1
+            0,
+            "the promotion must not write a boot counter for a vm-service guest"
         );
+
+        b.commit_flash().await.unwrap();
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
         server.join().unwrap();
     }
 
