@@ -281,26 +281,129 @@ So there are two different things, and only one is a defect:
 | `hsm-sim-service` over link-B | a deliberately selected soft-HSM **deployment** | legitimate — keep, and name it honestly |
 | in-process `SimHsm::new()` inside `component-mgr` | an **implicit fallback** when no `csr_crypto` is injected | the defect |
 
+**Deployment reality, verified 2026-09-08 — the soft HSM is the production HSM.**
+Not a dev convenience that leaked; the only HSM the fleet has:
+
+- `hsm-sim-service` ships in **both** supernova packages (provisioning *and*
+  full) — `assemble-package.sh:71, 89` — reaches the device in the deploy tar
+  (`provisioned-cvc/prepare-device.sh:80`), and is spawned by `vhsm-ssd` via
+  `--backend-cmd`, whose default is the sibling binary. **No vendor bridge
+  exists yet**; `hsm.backend_cmd` is the config seam that will select one.
+- The device's real private keys are **generated on the device at first boot**
+  by `SimHsm::ensure_device_keys()` (`sim.rs:136+`) with
+  `p256::ecdsa::SigningKey::random(OsRng)`, written as PEM under
+  `/mnt/common-rw/vhsm/keys` (`managed-qnx71/config.yaml:40`, mode 700). That
+  covers every device-generated role — `DeviceDecryption`, `IamSigning`,
+  `IvdSigning`, `JwtSigning`, `TlsIdentity`, `Storage` (`hsm/types.rs:184-193`).
+
+Two consequences for this work item:
+
+1. **The out-of-process shape is already what we want.** A separate binary, an
+   explicit packaging line, a config-selected `backend_cmd` — the soft HSM is
+   *already* a separately stated deployment entity on the host path.
+   `vhsm-ssd` completed this migration (`vhsm-ssd/src/backend.rs:1-11`: "no
+   longer owns an in-process `SimHsm`; instead it spawns a backend *service*").
+   `component-mgr` is the sole holdout, and its injection point already accepts
+   a `LinkBClient` (`bank_provider.rs:54`). So this item **finishes** a
+   migration rather than starting one.
+2. **Flag-off must genuinely produce a soft-HSM-free artifact** — that is the
+   whole purpose of the gate, so the claim has to be made true rather than
+   qualified away. It needs gating at **two layers**, because the soft HSM
+   exists at two:
+   - *linked code* — `component-mgr`'s in-process `SimHsm` (the defect below).
+     Already clean in `supernova`: `hsm-sim-backend` sits in
+     `[dev-dependencies]` (`Cargo.toml:110`), its only use is under
+     `#[cfg(test)] mod tests` (`boot_selector_signer.rs:79-81`), and production
+     crypto is `Arc<hsm::link_b::LinkBClient>` (`main.rs:819, 1878`) —
+     `LinkBClient` implements `HsmCryptoProvider` (`hsm/src/link_b.rs:436`).
+   - *packaged binary* — `hsm-sim-service`, copied into every package
+     unconditionally (`assemble-package.sh:71` **dies** if it is absent, `:89`
+     copies it), installed unconditionally by CI (`.gitlab-ci.yml:208, 232`),
+     and reached by `backend_cmd`'s silent sibling-binary default
+     (`main.rs:1264`).
+
+   Gate only the first and the flag becomes theatre: a supernova with no soft
+   crypto compiled in still ships the soft HSM beside it and spawns it by
+   default. **Layer 2 is the actual work of this item, and the line to delete
+   when the vendor bridge lands.**
+
 The defect: `component-mgr` depends on `hsm-sim-backend` unconditionally and
-constructs `SimHsm` in **non-test** code —
+constructs an in-process `SimHsm` in non-test code —
 
 - `component_adapter.rs:377, 443, 473` — the `get_csr` / `list_keys` /
   `get_device_id` fallback when no `csr_crypto` provider is injected
-- `main.rs:276`, `partition_bank_provider.rs:413, 442, 444`
+  (`csr_crypto` is only ever wired for `BankSet::Hsm`, and only when
+  `FactoryDeps.hsm_crypto` is `Some` — `component-factory/src/lib.rs:625-627`)
+- `main.rs:276` — the `vm-diagserver` CLI's factory-init `--hsm-keystore`
+  bring-up
 
-— so a build that *intended* hardware silently signs with a software key, and it
-does so **behind the link-B boundary that `hsm-conformance` validates**. The
-contract-in/impl-out convention is inverted: the contract crate (`hsm`) is
-correctly separate, but an implementation is a hard dependency of the production
-component, reached by a code path no deployment asked for.
+`partition_bank_provider.rs:413, 442, 444` are inside `mod tests` (line 380) and
+are not part of this — an earlier draft listed them as non-test. Corrected.
+
+**Which binary actually takes the fallback (verified 2026-09-08) — the answer is
+not the same for both servers:**
+
+| Server | `FactoryDeps.hsm_crypto` | So `get_csr` uses | Soft HSM reached |
+|---|---|---|---|
+| `supernova` (deployed host MM) | `Some(LinkBClient)` — `main.rs:2367`, built at `main.rs:1881` | the injected link-B handle | **out of process only**, over link-B |
+| `vm-sovd` (dev / sim / the rp5 server) | **`None`** — `main.rs:445`, with `hsm_keystore: Some(..)` | `SimHsm::new(keystore)`, transient, per call | **in process, directly** |
+
+So the earlier claim that "a build that intended hardware silently signs with a
+software key" is **wrong for supernova**: it injects the link-B client, the
+`if let Some(ref crypto)` arm always wins, and the fallback is unreachable in the
+deployed artifact. There the defect is *build surface* — a non-optional
+dependency and a code path no deployment takes — not a live crypto substitution.
+
+In `vm-sovd` the fallback is the live and deliberately chosen path
+(`main.rs:443-445`: "No crypto-only handle in the dev vm-sovd binary — keeps the
+`dyn HsmProvider` path for seal / unwrap / CSR"). That is the real finding, and it
+is what makes this item a prerequisite for `soft-node` rather than a tidy-up:
+**deleting the fallback breaks `vm-sovd` unless `vm-sovd` starts injecting.**
+It already holds a `LinkBClient` for the pre-spawned backend
+(`vm-sovd/src/main.rs:180`), so the fix is small — pass it as `hsm_crypto` — and
+it converges with work item (b): every server reaches the soft HSM over link-B,
+as a separately stated process, and then the in-process path can be deleted
+outright instead of gated.
+
+Either way the contract-in/impl-out convention is inverted while the dependency
+stands: the contract crate (`hsm`) is correctly separate, but an implementation
+is a hard dependency of the production component.
 
 - [ ] **Delete the implicit in-process fallback.** Selecting a backend becomes
       explicit; an un-injected `csr_crypto` must fail naming what is missing
       (rule 6), never substitute software crypto. This is the security-relevant
       half and it is independent of any feature flag.
-- [ ] `hsm-soft` feature, off by default, gating the `hsm-sim-backend`
-      dependency — for the deployments that *choose* the soft HSM. `soft-node`
-      and `emulated` carry it; `rig-qnx` does not.
+- [ ] **The flag already exists in `supernova` — finish it, don't invent it.**
+      `supernova`'s `hsm-sim` feature gates 5 sites, and flag-off already fails
+      loudly instead of degrading: `#[cfg(not(feature = "hsm-sim"))]` on
+      `HsmBackend::Sim` logs "HSM backend 'sim' not compiled in" and
+      `exit(1)` (`main.rs:1869-1873`) — rule 6, already implemented. It is also
+      already named explicitly in every build line
+      (`.gitlab-ci.yml:193, 196, 230`, `build-qemu.sh`, `build-target.sh`), so
+      it is already the visible, removable statement of deployment intent.
+      **Decision (2026-09-08): keep it declared in supernova today; the point is
+      that removing it later is a small, reviewable diff.** Three gaps remain:
+      - [ ] It is in `default` (`default = ["hsm-sim", "ifs-dev", "vm-runtime"]`),
+            so it is not yet a gate that must be turned *on*. Removing it from
+            `default` should change **no shipped artifact** — every real build
+            already passes `--no-default-features --features hsm-sim,…`. Verify
+            that claim against all three CI build lines before flipping; if it
+            holds, this is the cheapest of the six default flips in work item 4.
+      - [ ] Gate layer 2 from the same decision: make the `hsm-sim-service`
+            build/copy/`die` in `assemble-package.sh` and the CI `cargo install`
+            conditional, and make `backend_cmd` require explicit config instead
+            of silently resolving a sibling binary — so a hardware node fails
+            loudly rather than quietly spawning a soft HSM.
+      - [ ] Build the flag-off variant in CI (work item 0's matrix) or
+            "removable later" rots into "unbuildable later".
+- [ ] **Split the factory-reset dev backdoor off this flag.** `hsm-sim` also
+      gates `factory_recovery_issuer_spki()` (`main.rs:579-585`, used at `:532`),
+      which returns the hardcoded `hsm::payload::FACTORY_SIGNING_PUBLIC` —
+      P-256 `scalar = 1` — as the factory-reset issuer anchor when the device has
+      no provisioned keystore. That is a well-known-key recovery path riding the
+      same switch as "which HSM backend", so any node that still needs a soft
+      HSM also gets the backdoor. Two unrelated concerns, one flag: give the
+      recovery path its own (`factory-recovery-anchor`), off by default.
 - [ ] **Rename to match reality**: `hsm-sim-backend` → a soft-HSM name,
       `SimHsm` → `SoftHsm`. The word "sim" is what made an in-process fallback
       look acceptable, and it understates a backend that holds real keys with no
@@ -310,6 +413,34 @@ component, reached by a code path no deployment asked for.
       `hsm-conformance` tests is the boundary every deployment actually uses,
       and the soft/hard swap is a config change rather than a rebuild.
 - [ ] Test targets keep it via `dev-dependencies` (no feature needed for tests).
+      Four crates already have it that way and need nothing: `vhsm-client`,
+      `vhsm-crossnode-client`, `hsm-rustls`, `vhsm-ssd`.
+- [ ] **`sumo-verify` — free to fix, because it is not deployed.** An earlier
+      draft of this bullet claimed its runtime dependency on `hsm-sim-backend`
+      was legitimate and load-bearing in production. It is not: `sumo-verify` is
+      **deliberately excluded** from both supernova packages
+      (`assemble-package.sh:69` — "sumo-verify is NOT shipped") and absent from
+      the device tar (`prepare-device.sh:80`). The verify-then-start orchestrator
+      that invoked it was removed and "verification will move to the RT side"
+      (`start-managed.sh:257-262`). It survives only in the `managed-qnx71` dev
+      example. So changing it carries no deployment risk.
+      What it actually needs is **not an HSM backend**: verification uses the
+      *public* half only — `SimHsm::verify` → `load_ec_verifying_key` reads
+      `keys/{key_id}.pub` and never opens `.priv`
+      (`hsm-sim-backend/src/crypto.rs:108, 622-630`). It reaches for `SimHsm`
+      purely because `ivd::verify_bank_crypto` demands
+      `&dyn HsmCryptoProvider`. Give it a verify-only public-key source (or a
+      `verify_bank_with`-shaped closure, which `ivd.rs:568` already exposes) and
+      the dependency disappears — no feature flag needed.
+- [ ] **Record why verification left the host, so it does not come back wrong.**
+      A host-side launch gate that reads its trust anchor from
+      `keys/ivd-signing.pub` — a PEM on the same writable partition as the banks
+      it gates — is not a secure-boot gate: whoever can rewrite a bank can
+      rewrite the anchor beside it and re-sign. Moving verification to the RT
+      side is therefore the right call, not just a scheduling fix. If it ever
+      returns host-side, the anchor must be HSM-held or in signed read-only
+      storage. (Not a componentization item; it belongs to whoever owns the RT
+      verify design, and this note exists so the constraint travels with it.)
 - [ ] `supernova-machine-manager` declares `hsm-sim-backend` directly too
       (`Cargo.toml:110`) — decide in the same wave whether the rig runs
       `hsm-sim-service` deliberately or must inject a real `csr_crypto`. With
@@ -337,12 +468,238 @@ whose components are all Singleshot.
         whether a component is Banked or Singleshot.
       - **Minimal second server** — a `soft-node` binary composing only the
         Singleshot components. Cheaper to reach, but forks the wire surface
-        and risks the two drifting.
+        and risks the two drifting. **Superseded in part by work item 3c**,
+        which picks this shape but splits by *role* rather than by feature —
+        that avoids the wire-fork risk, because the gateway already serves a
+        different surface (proxy + onboard pull-update) rather than a subset
+        of the host one.
 - [ ] Whichever shape: `component-factory`'s unconditional edge to
       `component-mgr` has to become conditional, or the factory splits.
 - [ ] Work item 2's per-profile goldens are the safety net — the `rig-qnx`
       capability description must be byte-identical across this refactor.
 - [ ] Only then can `soft-node` be built rather than merely declared.
+
+---
+
+## Work item 3c — split `vm-sovd` by role, and rename both halves
+
+**Decision, 2026-09-08.** `vm-sovd` becomes two binaries:
+
+1. a **reference vendor machine manager** — the worked example of how to vendor
+   an MM: which components to compose, where they go, which artifacts are
+   updatable;
+2. an **example vehicle gateway** — which also talks to an HSM, but **as a
+   client, not a controller**.
+
+`vm-sovd` is the wrong name for both. "vm" is wrong in each case — role 1 serves
+*host*-owned components (`host-os`, `vm1`, `vm2`, `hsm`), and role 2 merely
+*runs* in a VM, which describes where it lives rather than what it serves. "sovd"
+names the protocol, not the role, which is exactly how one name came to cover
+two unrelated jobs.
+
+- [ ] **Gateway → `vehicle-gateway`.** Not an invention: the deployment already
+      uses that name in five places — `examples/t2-seed-*/services/vehicle-gateway/`,
+      `channels/*/layers/vehicle-gateway/`, `/opt/vehicle-gateway`,
+      `/var/sumo/vehicle-gateway-nv.bin`, the `[vehicle-gateway]` log prefix —
+      and `docs/sovd-entrypoints.md` calls server #2 "the vehicle gateway". Only
+      the binary is misnamed.
+- [ ] **Reference MM → `example-host-mm`.** Matches the convention SOVDd already
+      ships upstream (`sovdd` = reference server, `example-app` = reference
+      app-entity), and reads as non-production next to
+      `docs/sovd-entrypoints.md`'s #3, "the production host server".
+- [ ] **This is a template, not a demo.** rp5 wants the *host-MM* role — it owns
+      its own components — so `soft-node` derives from this half, not from the
+      gateway. Which is why it stays a product-grade crate and does not move to
+      `examples/`: a reference impl is normative, and whatever it models is what
+      the next vendor copies.
+
+### HSM as client, not controller — the seam already exists
+
+The split the gateway needs is already carved into the trait layer, and even the
+bounds encode it:
+
+| | Trait | Crate | Shape | Who needs it |
+|---|---|---|---|---|
+| **client** | `HsmCryptoProvider` | `hsm-contract` | `&self`, `Send + Sync` — `sign`, `verify`, `get_public_key_der` | the gateway |
+| **controller** | `HsmProvider` | `hsm` | `&mut self`, `Send` — `is_provisioned`, `provision(suit_envelope)`, `list_slots` | the host MM |
+
+The controller takes `&mut` because it *installs keystores*; the client is
+shareable and operation-only. Keystore install is a Singleshot `Upgradable` and
+belongs to the host MM — a guest gateway has no business owning it.
+
+- [ ] **Today the gateway has it exactly backwards.** The shared `FactoryDeps`
+      (`vm-sovd/src/main.rs:441-446`) passes `hsm_provider: Some(..)` and
+      `hsm_keystore: Some(..)` while `hsm_crypto: None` — it takes the
+      controller and withholds the client. Target for the gateway half:
+      `hsm_crypto: Some(gw_crypto)`, `hsm_provider: None`, `hsm_keystore: None`.
+- [ ] The deployed gateway **already intends to be a client**: its command line
+      is `--gateway --guest-vhsm --host-sovd-url … --proxy-component host-os`
+      with **no `--hsm-keystore` and no `--backend-socket`**
+      (`t2-seed-dev/…/vehicle-gateway/autostart.sh:27-32`); crypto arrives from
+      `VhsmProvider` over the wire. The controller-shaped deps are inherited
+      from the shared `FactoryDeps`, not asked for — the split is what stops
+      them being inherited.
+- [ ] Consequence to enforce, not just document: the gateway must be **unable**
+      to build a `BankSet::Hsm` component. Today it could, if a config declared
+      one, and it would reach the in-process `SimHsm` fallback while doing it.
+- [ ] Dependency fallout for the gateway half: `hsm-contract` (+ `vhsm-provider`
+      / `vhsm-client`) instead of `hsm` with `crypto`+`suit`, and no edge to
+      `component-mgr`'s HSM bank component. This is the first concrete
+      measurement of the rp5 closure shrinking.
+
+Two settled details: **no `--gateway` flag** on either half — a flag that
+switches role is what fused them in the first place — and the gateway **keeps
+its own NV store** (a pure HSM client still owns local component state).
+
+---
+
+## Work item 3d — deployables leave `crates/`
+
+**Decision, 2026-09-08.** `crates/` is for things other code *consumes*. A
+server is not one of those, so `soft-node` does not get filed next to
+`nv-store` and `machine-mgr`, and neither do the executables already sitting
+there. Three buckets:
+
+| Directory | Holds | Rule |
+|---|---|---|
+| `crates/` | consumable libraries — the SDK surface | someone `depends on` it |
+| `services/` | on-device deployables | someone *runs* it on a target |
+| `tools/` | host-side CLIs, build-time and dev/test tools | someone runs it on a workstation or in CI |
+
+- [ ] **The pure executables move as-is** — `vm-sovd` (→ 3c's two halves),
+      `sumo-verify`, `slog2-drainer`, `sumo-factory-reset-mint`. No lib, no
+      consumers, nothing to untangle.
+- [ ] **The nine mixed lib+bin crates are the actual work**: `component-mgr`
+      (+`vm-diagserver`), `vhsm-ssd`, `vm-service`, `vm-boot`, `host-metrics`,
+      `hsm-sim-backend` (+`hsm-sim-service`), `hsm-conformance`, `policy-build`,
+      `ca-bundle-build`. Each is *both* a consumable and a deployable, which the
+      rule forbids. Extract the bin into a thin crate in `services/` or `tools/`
+      that depends on the lib.
+- [ ] **This is not cosmetic — it makes library closures honest.** A `[[bin]]`
+      shares its crate's `[dependencies]`, so a consumer taking `vm-service` or
+      `component-mgr` as a *library* today also inherits everything its
+      **binary** needs. That is the same class of over-linking this whole
+      document is trying to measure (see "The rp5 case" — 8 linked-and-unusable
+      crates). Size it per crate as the bins are extracted; do not assume the
+      win is uniform.
+- [ ] **Existing miscategorisation to fix in the same pass**: `hsm-sim-service`
+      is a *deployed production service* — it ships in both supernova packages
+      (`assemble-package.sh:71, 89`) and lands on the device — but lives under
+      `tools/crates/hsm-sim-backend`. Same category error, opposite direction.
+
+**Three cases that looked ambiguous and are not (checked 2026-09-08).**
+`vm-boot`, `host-metrics` and `hsm-sim-service` all read as hard calls until you
+stop treating each crate as one thing. Every one of them is lib-primary with a
+thin bin, so the rule above already decides them: the lib stays in `crates/`,
+the bin moves. No new judgement needed. What the check *did* surface is that
+each has a different reason, and two of those reasons are findings in their own
+right:
+
+- **`host-metrics` — the clean case, and the model for the others.** supernova
+  takes the lib as a plain `[dependencies]` entry (`Cargo.toml:65`) and embeds
+  it; the bin is documented as "For dev / standalone deployments. In production,
+  the host machine manager embeds the same library" and is in **neither**
+  supernova package. Real consumer for the lib, dev convenience for the bin, and
+  a 5-dep closure (axum, tokio, tracing, sumo-log, libc) that already honours
+  its own header: "Lives at the workspace root so any host … can embed it
+  without dragging vm-\* dependencies." Lib stays, bin → `tools/`.
+- **`hsm-sim-service` — the split is the whole point.** supernova has
+  `hsm-sim-backend` in **`[dev-dependencies]`** (`Cargo.toml:110`) yet
+  **packages its bin** (`assemble-package.sh:71, 89`). Both are right: the
+  `SimHsm` library genuinely is dev-only *to supernova*, and the binary
+  genuinely is production. One crate cannot be in two dependency sections, so
+  today the packaging line silently contradicts the manifest. Extracting the bin
+  is what makes the manifest tell the truth — `services/hsm-sim-service`
+  depending on `crates/hsm-sim-backend`, which supernova then keeps as a
+  dev-dependency without also shipping it. Note also the naming: `SimHsm` in
+  `hsm-sim-backend` *is* the soft HSM; `hsm-sim-service` is only its ~241-line
+  link-B process wrapper (`hsm::link_b::serve`, crypto **and** provisioning).
+  Work item 3's rename has to keep those two levels distinct.
+- **`vm-boot` — has zero consumers, and its real-world counterpart is a shell
+  script.** Nothing in this repo or any sibling depends on the `vm-boot` lib and
+  nothing invokes the bin; the only workspace-wide hits are its own
+  `Cargo.toml`. It is a decision function, not a service — it reads the boot
+  selection (signed `SelectorBlob` PRIMARY when a `SelectorStore` is attached,
+  else NV `NvBootState`), counts trial boots, auto-rolls-back past
+  `MAX_TRIAL_BOOTS`, verifies SHA-256 image hashes from FW Meta, and returns one
+  `BootAction` per bank set **for the caller to execute**. On the device that
+  decision is actually taken by
+  `host-platforms/provisioned-cvc/config/host-boot.sh` ("Interim host bootloader
+  stand-in — A/B selection for the supernova OS bank"), reading the same signed
+  selector. So `vm-boot` is the Rust reference implementation of a contract
+  currently implemented in bash. Move the bin to `tools/` with the others, but
+  the open question is about the **lib**, and it is not a layout question:
+  either it is declared SDK surface — the executable spec of the selector
+  contract that a real bootloader or vendor MM is expected to embed, in which
+  case `host-boot.sh` is the thing that should eventually call it — or it is
+  unconsumed code drifting out of sync with the script that does the job. Decide
+  that on its merits; do not let the directory move imply an answer.
+
+**Feasibility, measured 2026-09-08 — this is cheap:**
+
+- **External consumers are unaffected.** `supernova-machine-manager` (16 deps),
+  `sumo-provision` and `guest-vm-sdk` all depend by
+  `git = "…sumo-machine-manager.git"` + *package name*. Cargo resolves those by
+  name against the repo's workspace, not by directory, so moving a crate is
+  invisible to them — no lock churn, no coordinated bump.
+- **No scripts or CI reference crate directories.** Every build line addresses
+  packages by name (`cargo install … vhsm-ssd hsm-sim-backend slog2-drainer`,
+  `cargo build -p vm-sovd`). The only path-addressed list is the root
+  `Cargo.toml` `members`.
+- Churn is therefore confined to `members` plus the ~80 in-repo
+  `path = "../x"` dep lines, which are mechanical.
+- [ ] Do it as its own commit wave, separate from any behaviour change, so the
+      diff is reviewable as a pure move.
+
+**Payoff for work item 1:** profiles map one-to-one onto deployables, so
+`services/` becomes the legible list of what the five profiles actually build.
+
+---
+
+## Work item 3e — the link-B service is already generic; finish the last 30 lines
+
+*Asked 2026-09-08: "do we not have a generic link-B service to the soft HSM or
+any other compliant HSM?" Answer: yes, in three layers — and `hsm-sim-service`
+is not a sim-specific service, it is a sim-specific `main()` around a generic
+one.*
+
+What is **already** generic, and needs nothing:
+
+| Layer | Where | Backend-agnostic? |
+|---|---|---|
+| Wire contract | `crates/hsm-link-b` (zero deps) + `include/hsm_link_b.h` + `reference/hse_service_skeleton.c` — "a complete, compilable C skeleton of the full Link-B surface", the vendor handoff | yes — "the vendor implements **Link B and nothing else**" |
+| Dispatch loop | `hsm::link_b::serve<B> where B: HsmCryptoProvider + HsmProvider` (`link_b.rs:880`); `serve_crypto(&dyn HsmCryptoProvider)` (`:784`) | yes — neither mentions `SimHsm` |
+| Backend selection | `vhsm-ssd --backend-cmd`, default = sibling binary (`backend.rs:23`), spawned via `link_b::spawn_and_connect` (`:706`) | yes — selects by *which process runs*, not by compiled-in code |
+
+- [ ] **Extract the accept loop into `hsm::link_b`** — `serve_listener(listener,
+      backend)` (or a `link_b::Service`) owning stale-socket removal, `bind`,
+      accept, and thread-per-connection. This is the only part that is *not*
+      already generic, and it is **already duplicated**: hand-rolled
+      `UnixListener::bind` + accept loops at `link_b.rs:1103`,
+      `hsm-sim-service.rs:125` and `:186`, `link_b_provisioning.rs:73` and
+      `:184` — five sites, four of them the same loop rewritten because no
+      helper exists. After the extraction, `hsm-sim-service` is ~30 lines: parse
+      `--keystore`, `SimHsm::new`, `ensure_device_keys()`, hand it to
+      `serve_listener`. Those three lines are the *entire* sim-specific surface
+      of the binary today.
+- [ ] **Do NOT build a generic service binary** with a `--backend {sim,pkcs11,…}`
+      selector. Two reasons, and the second is decisive:
+      1. *The vendor case is C.* A vendor implements `hsm_link_b.h` in their own
+         process and never links a Rust host, so a generic Rust binary would
+         serve only future **Rust** backends — of which there are zero. The only
+         non-test `impl HsmCryptoProvider` in the workspace besides
+         `LinkBClient` (the client half) is `SimHsm`
+         (`hsm-sim-backend/src/crypto.rs:69`).
+      2. *It would undo work item 3.* A binary that can **become** the soft HSM
+         at runtime cannot be excluded from the image at build time — the same
+         defect as the in-process `SimHsm` fallback, promoted one level. One
+         thin binary per backend makes "don't ship the soft HSM" mean "don't
+         ship this file", checkable by `ls` on the package. This is exactly why
+         work item 3's layer 2 is a **packaging line** and not a `cfg`.
+- [ ] **Consequence for the rename**: the generic/specific boundary is the thing
+      the names must express. `hsm::link_b` = the service; `SimHsm` = one
+      backend; the binary = that backend's `main()`. "sim" is the wrong word at
+      every level for something that ships in both supernova packages today.
 
 ---
 
