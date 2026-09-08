@@ -38,15 +38,20 @@ the normal case, so the error naming the feature is the primary UX.
 - **The implicit subset is already wrong somewhere and we can't see it.** One
   tree serves the QNX rig host, QEMU dev, the emulated container, and the guest
   SDK. Each wants a different subset. There is no artifact that says which.
-- **Features exist that nothing owns.** `container` is enabled by **no consumer
-  in the workspace** — `grep -rn 'features = \[.*"container"' --include=Cargo.toml`
-  across `components/`, `host-platforms/`, `guest-platforms/` returns 0 hits. It
-  is built only by `feature-matrix.sh`'s fourth run. A feature with no declared
-  consumer is exactly what a profile list would make visible.
+- **A real deployment already wants a subset this tree cannot express.** A
+  minimal mmgr on a Raspberry Pi 5 — no HSM silicon, no hypervisor, no banks —
+  wants exactly `container` + a software HSM. `container` is enabled by **no
+  consumer in the workspace** (`grep -rn 'features = \[.*"container"'
+  --include=Cargo.toml` across `components/`, `host-platforms/`,
+  `guest-platforms/` returns 0 hits), which invites the conclusion that the
+  feature is speculative. **That conclusion is wrong** — the consumer is real,
+  it is just outside this workspace, and the tree gives it no way to say what it
+  wants. This is the thesis of the whole document, with a name attached; see
+  "The rp5 case" below and work item 3b.
 - **A combination nothing builds.** `container` ON with `sovd-docs-hook` OFF is
-  covered by no run today (see work item 0). No consumer is in that
-  configuration *yet* — but nothing stops one, and the forwarding chain has
-  never been compiled that way.
+  covered by no run today (see work item 0), and it is the rp5 configuration —
+  a headless node has no use for the vendor docs surface. The forwarding chain
+  has never been compiled that way.
 - **Dead flags accumulate unnoticed.** `vm-service/qnx` gates nothing:
   `git grep -n 'feature = "qnx"' -- '*.rs'` returns **0 sites**.
 - **Binary size and dependency surface on a bank-constrained target.** The
@@ -89,6 +94,51 @@ workspace's `scripts/bump-submodules.sh`, so a flip is visible in a diff.
 fresh at build time, so a capability change there lands with **no diff
 anywhere**. It has zero exposure to the six, but any later item that gates a
 contract crate (`vhsm-client`, `vhsm-provider`, `vm-wire`) hits this.
+
+---
+
+## The rp5 case — the subset the tree cannot express
+
+A minimal machine manager on a Raspberry Pi 5: **no HSM silicon, no hypervisor,
+no A/B banks.** Its whole job is container updates plus a software HSM, i.e.
+`container` + `hsm`. Both of that node's components are *Singleshot* in the
+`Upgradable` model (CLAUDE.md): `ContainerImageComponent` (app-mgr) and the HSM
+keystore (hsm crate). It needs no banked component at all.
+
+Transitive in-repo closure, computed from the `path` dependency edges:
+
+| Set | Count | Crates |
+|---|---|---|
+| Domain logic it needs | **11** | `app-mgr`, `hsm`, `hsm-contract`, `hsm-link-b`, `hsm-sim-backend`, `machine-mgr`, `nv-store`, `vhsm-proto`, `sumo-log`, `score-log-tracing`, `score-log-slog2` |
+| What `vm-sovd` links | **20** | the 11 above, `vm-sovd` itself, and the 8 below |
+| Linked, unusable on rp5 | **8** | `component-mgr`, `component-factory`, `host-os-mgr`, `platform-log`, `puller`, `vhsm-client`, `vhsm-provider`, `hsm-rustls` |
+
+The good news: **`app-mgr` does not depend on `component-mgr`** (only `nv-store`
++ `machine-mgr`), so the container component is already cleanly separable. The
+`vm` gate of work item 5 would drop `vm-service` + `vm-devices` for free.
+
+The blocker is not a feature flag:
+
+- **`DiagnosticBackend` is implemented only in `component-mgr`** —
+  `backend.rs:2680` on `ComponentBackend<D>` (the *banked VM* state machine) and
+  `install_router_diag.rs:75`. The SOVD wire surface is fused to the banked
+  implementation.
+- **`vm-sovd` is the only SOVD server in this repo** (docs/sovd-entrypoints.md
+  rows 1–2), and it depends unconditionally on `component-mgr`,
+  `component-factory`, `host-os-mgr`, `hsm-rustls`, `vhsm-provider` and
+  `sumo-log`. `component-factory` in turn depends unconditionally on
+  `component-mgr`.
+- The container SOVD route itself lives in
+  `component_mgr::app_install_router`, gated by `container`.
+
+So serving SOVD for containers + a soft HSM today means linking `host-os-mgr`'s
+IFS/partition activators, `platform-log`'s QNX slog2 reader, and the guest vHSM
+client/provider — none of which that node can use. **No `default = []` sweep
+fixes this**; it needs the adapter separated from the banked impl (work item 3b).
+
+`app-mgr`'s own deps are a smaller version of the same smell: `sha2`, `bytes`,
+`sumo-codec` and `sumo-onboard` are used only by the container module and are
+not `optional` (features.md already flags this).
 
 ---
 
@@ -137,9 +187,18 @@ flip moves a consumer onto a profile in one edit.
 Rule 1 permits bundles (they are additive); it forbids negative flags, so "no
 hypervisor" is the absence of `vm-*`, not a `no-vm`.
 
-- [ ] Define `rig-qnx`, `dev-qemu`, `emulated`, `guest-sdk` as bundles on the
-      top crates. Each is a *name for a shipping configuration*, so the profile
-      list becomes the contract with the deploy side.
+- [ ] Define `rig-qnx`, `dev-qemu`, `emulated`, `guest-sdk` and **`soft-node`**
+      as bundles on the top crates. Each is a *name for a shipping
+      configuration*, so the profile list becomes the contract with the deploy
+      side.
+      - `soft-node` is the rp5 case above: `container` + a software HSM, no
+        hypervisor, no banks, no QNX. It is the **fifth** profile — an earlier
+        draft had four and none of them describes it. `emulated` is the closest
+        and is still not it: `emulated` is about supernova-mm's runtime
+        "no activator / no raw host bank" branches on an otherwise full build,
+        whereas `soft-node` wants those crates *absent*.
+      - `soft-node` is also the profile that work item 3b unblocks; until then
+        it can only be declared, not honestly built.
 - [ ] Seed each bundle with today's effective feature set, so adopting a profile
       is provably a no-op before any default moves. This is what makes the
       flips reviewable: profile adoption and capability change never land in the
@@ -177,34 +236,97 @@ byte-equality regen test. Generalize it:
 
 ---
 
-## Work item 3 — the HSM simulator out of the production path
+## Work item 3 — the implicit in-process HSM fallback (not "the simulator")
 
 **Promoted from last to third**: it is the only item with a security
 consequence, it is small and self-contained, and like work item 0 it does not
 depend on the policy change at all.
 
-`component-mgr` depends on `hsm-sim-backend` unconditionally, and constructs
-`SimHsm` in **non-test** code:
+**First, a correction of framing.** An earlier draft titled this "the HSM
+simulator out of the production path". That is wrong, and the crate says so
+itself — `tools/crates/hsm-sim-backend/Cargo.toml`'s own `description` reads:
+
+> Software HSM backend (SimHsm): file keystore + RustCrypto, served over link-B
+> by the `hsm-sim-service` bin. The HSM for sim/dev deployments … Provides no
+> hardware key protection. Verified by `hsm-conformance`.
+
+It is a **soft HSM**, not a test double: real RustCrypto (p256, ed25519,
+aes-gcm, hkdf, hmac, cmac, x509-cert — it issues certs), a file keystore, served
+**over the same link-B wire as the vendor C hardware backend**, and validated by
+the same `hsm-conformance` suite. For any platform with no secure element —
+rp5, dev boxes, `emulated` — it is the *correct and intended* backend, not a
+degradation. Removing it from the production path would break the `soft-node`
+profile.
+
+So there are two different things, and only one is a defect:
+
+| | What it is | Verdict |
+|---|---|---|
+| `hsm-sim-service` over link-B | a deliberately selected soft-HSM **deployment** | legitimate — keep, and name it honestly |
+| in-process `SimHsm::new()` inside `component-mgr` | an **implicit fallback** when no `csr_crypto` is injected | the defect |
+
+The defect: `component-mgr` depends on `hsm-sim-backend` unconditionally and
+constructs `SimHsm` in **non-test** code —
 
 - `component_adapter.rs:377, 443, 473` — the `get_csr` / `list_keys` /
   `get_device_id` fallback when no `csr_crypto` provider is injected
 - `main.rs:276`, `partition_bank_provider.rs:413, 442, 444`
 
-So the shipped Tier-2 image links a simulator and can fall back to it for CSR
-signing. This is the contract-in/impl-out convention inverted: the contract
-crate (`hsm`) is correctly separate, but the *simulator* is a hard dependency of
-the production component.
+— so a build that *intended* hardware silently signs with a software key, and it
+does so **behind the link-B boundary that `hsm-conformance` validates**. The
+contract-in/impl-out convention is inverted: the contract crate (`hsm`) is
+correctly separate, but an implementation is a hard dependency of the production
+component, reached by a code path no deployment asked for.
 
-- [ ] `hsm-sim` feature, off by default, gating the `hsm-sim-backend` dependency
-      and every fallback construction site.
-- [ ] Without it, the fallback path must fail naming the feature rather than
-      silently signing with a simulated key — this one is a security-relevant
-      "say no clearly".
+- [ ] **Delete the implicit in-process fallback.** Selecting a backend becomes
+      explicit; an un-injected `csr_crypto` must fail naming what is missing
+      (rule 6), never substitute software crypto. This is the security-relevant
+      half and it is independent of any feature flag.
+- [ ] `hsm-soft` feature, off by default, gating the `hsm-sim-backend`
+      dependency — for the deployments that *choose* the soft HSM. `soft-node`
+      and `emulated` carry it; `rig-qnx` does not.
+- [ ] **Rename to match reality**: `hsm-sim-backend` → a soft-HSM name,
+      `SimHsm` → `SoftHsm`. The word "sim" is what made an in-process fallback
+      look acceptable, and it understates a backend that holds real keys with no
+      hardware protection. Cheap now, load-bearing for how the next reader
+      reasons about it.
+- [ ] Prefer link-B even when the soft HSM is selected, so the boundary
+      `hsm-conformance` tests is the boundary every deployment actually uses,
+      and the soft/hard swap is a config change rather than a rebuild.
 - [ ] Test targets keep it via `dev-dependencies` (no feature needed for tests).
 - [ ] `supernova-machine-manager` declares `hsm-sim-backend` directly too
-      (`Cargo.toml:110`) — decide in the same wave whether `rig-qnx` carries
-      `hsm-sim` at all, or whether the rig must inject a real `csr_crypto`.
-      That decision is the point of the item.
+      (`Cargo.toml:110`) — decide in the same wave whether the rig runs
+      `hsm-sim-service` deliberately or must inject a real `csr_crypto`. With
+      the implicit fallback gone, that becomes a visible choice instead of a
+      default.
+
+---
+
+## Work item 3b — unfuse the SOVD adapter from the banked implementation
+
+**The largest item, and the only blocker no feature flag can lift.** Scope it
+before committing to it; everything else here is additive, this one moves code.
+
+From "The rp5 case" above: `DiagnosticBackend` exists only in `component-mgr`
+(`backend.rs:2680` on the banked `ComponentBackend<D>`, and
+`install_router_diag.rs:75`), and `vm-sovd` is the only SOVD server. So the
+SOVD wire surface cannot be served without the banked VM stack, even for a node
+whose components are all Singleshot.
+
+- [ ] Decide the shape. Two candidates:
+      - **Generic adapter** — a `DiagnosticBackend` over
+        `MachineRegistry`/`dyn Component`, in `machine-mgr` or a new
+        `sovd-adapter` crate, with `ComponentBackend`'s banked specifics
+        behind it. Matches the `Upgradable` model: the wire should not know
+        whether a component is Banked or Singleshot.
+      - **Minimal second server** — a `soft-node` binary composing only the
+        Singleshot components. Cheaper to reach, but forks the wire surface
+        and risks the two drifting.
+- [ ] Whichever shape: `component-factory`'s unconditional edge to
+      `component-mgr` has to become conditional, or the factory splits.
+- [ ] Work item 2's per-profile goldens are the safety net — the `rig-qnx`
+      capability description must be byte-identical across this refactor.
+- [ ] Only then can `soft-node` be built rather than merely declared.
 
 ---
 
@@ -364,3 +486,11 @@ Full powerset does not survive this change. A top binary with ~8 features is
       `guest-vm-sdk` — and that list is checked, not assumed.
 - [ ] Each capability that can be absent fails loudly, naming its feature.
 - [ ] A golden capability description exists per profile, and CI diffs it.
+- [ ] **No implicit backend substitution anywhere.** In particular no in-process
+      HSM fallback: an un-injected `csr_crypto` fails naming what is missing,
+      and a soft HSM is only ever reached because a profile selected it.
+- [ ] **`soft-node` builds and serves SOVD** without linking `host-os-mgr`,
+      `platform-log`'s slog2 reader, or the guest vHSM crates. This is the
+      acceptance test for work item 3b, and the one that proves the whole
+      exercise was worth doing — it is a deployment that exists today and that
+      the tree currently cannot express.
