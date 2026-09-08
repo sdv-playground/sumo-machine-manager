@@ -36,7 +36,6 @@ members = [
     "crates/platform-integration/score-log-slog2",   # score_log → QNX slog2 recorder
     "crates/platform-integration/sumo-log",          # fleet logging init (env-selected recorder)
     "crates/platform-integration/platform-log",      # shared log readers (files, journald, bulk-data)
-    "crates/platform-integration/slog2-drainer",      # Tier-2 host: drain slog2 ring → sealed disk segments
     # -------------------------------------------------------------------------
     "crates/puller",
     "crates/hsm-rustls",
@@ -45,6 +44,22 @@ members = [
     "crates/vhsm-provider",
     "crates/vhsm-crossnode-client",
     "crates/vm-sovd",
+
+    # --- services/ — ON-DEVICE DEPLOYABLES (docs/componentization.md item 3d) --
+    # Three buckets: crates/ = consumable libraries (someone DEPENDS on it),
+    # services/ = on-device deployables (someone RUNS it on a target), tools/ =
+    # host-side CLIs and build/dev tooling (someone runs it on a workstation or
+    # in CI). A deployable is not SDK surface, so it does not belong next to
+    # nv-store and machine-mgr — and a `[[bin]]` sharing its crate's
+    # [dependencies] is how library consumers silently inherit binary deps.
+    #
+    # PILOT: slog2-drainer moved here first, alone, to prove the claim the rest
+    # of 3d rests on — supernova installs it BY PACKAGE NAME over git
+    # (`cargo install --git … slog2-drainer`), so cargo resolves it against the
+    # workspace, not the directory, and the move is invisible to consumers. No
+    # lock churn, no coordinated bump. The remaining moves follow once proven.
+    "services/slog2-drainer",                        # Tier-2 host: drain slog2 ring → sealed disk segments
+    # -------------------------------------------------------------------------
 
     # Dev / offboard tooling, grouped under tools/crates/ to keep it separate
     # from the runtime crates/ above. Of the once-pending relocation candidates,
