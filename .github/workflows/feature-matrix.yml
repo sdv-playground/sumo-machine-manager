@@ -1,0 +1,60 @@
+# Feature matrix — enforce docs/features.md in CI.
+#
+# Until this landed, CI ran rustfmt ONLY: every feature combination was
+# unverified, and the `cargo hack` powerset had in fact never worked (its
+# `--all-targets` sat before the subcommand, so cargo-hack handed it to `cargo`
+# itself). Both are fixed; this job keeps them fixed.
+#
+# Split into two jobs because cost differs by ~10x:
+#   fixed    — 5 combinations, every push/PR
+#   powerset — 10 more via cargo-hack, nightly + on demand
+# See docs/componentization.md work item 0 (and work item 8 for the tiered
+# strategy this grows into once `default = []` lands).
+#
+# NOTE (unlike fmt.yml) this job runs cargo, so it must resolve the git deps
+# (SOVDd, sumo-rs). fmt.yml sidesteps cargo entirely with a comment about
+# sibling PATH deps — that comment is stale, every `path =` dep now resolves
+# inside this repo, so `cargo metadata` is fine. If a runner cannot reach a
+# private git dep, that surfaces here first.
+name: feature-matrix
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 03:17 UTC — off the hour to avoid the scheduler's peak queue.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fixed:
+    name: fixed combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/feature-matrix.sh --fixed-only
+
+  powerset:
+    name: cargo-hack powerset
+    # Nightly and on demand only — 10 extra clippy passes over the workspace.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Prebuilt binary — `cargo install cargo-hack` from source costs minutes.
+      - uses: taiki-e/install-action@cargo-hack
+      - run: bash scripts/feature-matrix.sh

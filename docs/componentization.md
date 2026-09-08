@@ -142,36 +142,52 @@ not `optional` (features.md already flags this).
 
 ---
 
-## Work item 0 — close the known hole (small; do this first)
+## Work item 0 — close the known hole — **DONE 2026-09-08**
 
-Independent of the policy change, worth landing on its own.
+Independent of the policy change, landed on its own.
 
-- [ ] `cargo install cargo-hack` documented as a dev prerequisite (README +
-      `install-deps.sh` in the workspace). **Not installed today**, so the
-      powerset block in `feature-matrix.sh` prints SKIP and covers **0**
-      combinations — the script's coverage claim is currently aspirational.
-- [ ] Add `scripts/feature-matrix.sh` as a CI job. features.md already flags
-      this: "CI runs rustfmt only today". Everything below hangs off this job
-      existing.
-- [ ] Add the missing fixed point: `component-mgr` / `vm-sovd` with `container`
-      ON and `sovd-docs-hook` OFF. The four current runs cover
-      (hook off, container off), (hook on, container off), (hook on, container
-      on) twice — never (hook off, container on).
-- [ ] Fix the stale TODO at `crates/component-mgr/src/sovd/openapi.rs:107-109`.
-      It says the hook "is gated off by default; drop the gate after the SOVDd
-      lock bump lands the hook" — but the bump landed and `Cargo.toml` has
-      `default = ["sovd-docs-hook"]`. The comment documents the opposite of the
-      code. Still present as of 2026-09-08.
+- [x] `cargo-hack` installed and added to `install-deps.sh --check` (workspace
+      root, under "Rust toolchain"). It was **absent**, so the powerset block
+      printed SKIP and covered **0** combinations — the script's coverage claim
+      was aspirational.
+- [x] **The powerset block had never worked.** `--all-targets` sat *before* the
+      subcommand, so cargo-hack treated it as its own flag and built the invalid
+      `cargo --all-targets clippy …`; every powerset run died on combination 1
+      of N. Latent precisely because cargo-hack was never installed — the SKIP
+      path masked a broken command. Moved after `clippy`; all 10 combinations
+      now pass. **The instrument this document leans on was broken, and the
+      thing hiding it was the missing prerequisite.**
+- [x] `scripts/feature-matrix.sh` wired into CI as
+      `.github/workflows/feature-matrix.yml`, split by cost: `fixed` (5
+      combinations) on every push/PR, `powerset` (10 more) nightly +
+      `workflow_dispatch`. The script takes `--fixed-only` for that split.
+      features.md's "CI runs rustfmt only today" is now stale.
+- [x] Added the missing fixed point: `vm-sovd` with `container` ON and
+      `sovd-docs-hook` OFF — the fourth corner, and the rp5 configuration.
+      **It compiles clean.** Never tested before; no latent breakage found.
+- [x] Fixed the stale comment at `crates/component-mgr/src/sovd/openapi.rs`.
+      Note what it actually said: *"drop the gate after the SOVDd lock bump
+      lands the hook"* — an instruction to **delete** the gate. The bump landed,
+      so a reader following that note would have removed exactly the gate work
+      items 4 and 7 depend on. Replaced with why the gate stays, and a "do not
+      delete it".
+
+**Open, deliberately not blocking:** whether a GitHub runner can resolve the git
+deps (SOVDd, sumo-rs) is unverified — `fmt.yml` sidesteps cargo entirely, citing
+sibling PATH deps, and *that comment is stale* (every `path =` dep now resolves
+inside this repo, so `cargo metadata` is fine locally). The first CI run answers
+it. Also unmeasured: cold-cache wall time for the powerset job.
 
 **Combination math for context.** 13 crates own 20 features = **48** real
 per-crate combinations (verified: 2+2+4+4+2+2+2+2+2+16+2+4+4). The powerset
-block in `feature-matrix.sh` covers `app-mgr` (2) + `component-mgr` (4) +
-`component-factory` (2) = **8** of them, and only once `cargo-hack` is
-installed. The four workspace-wide runs cannot substitute, because **Cargo
-unifies features across a build graph**: once any workspace member enables
-`component-mgr/container`, `component-mgr` is compiled with it on for *every*
-member. Testing "off" requires per-package runs. This is the whole reason the
-script switches to `--package` for the powerset.
+block covers `app-mgr` + `component-mgr` + `component-factory`. Conceptually
+that is 2+4+2 = 8; cargo-hack actually runs **10** (2, 6, 2) because it
+enumerates `default` as a feature in its own right, so `component-mgr`'s two
+features yield six runs rather than 2². Either way the four workspace-wide runs
+cannot substitute, because **Cargo unifies features across a build graph**: once
+any workspace member enables `component-mgr/container`, `component-mgr` is
+compiled with it on for *every* member. Testing "off" requires per-package runs.
+This is the whole reason the script switches to `--package` for the powerset.
 
 ---
 

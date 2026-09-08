@@ -104,9 +104,13 @@ pub fn openapi_json_pretty() -> String {
 /// The vendor paths + schemas as a SOVDd capability-description extension,
 /// registered on `sovd_api::AppState` so the merged `GET /vehicle/v1/docs`
 /// advertises them.
-// TODO(openapi-docs): the pinned `sovd-api` git dep does not yet carry the
-// `CapabilityExtensions` hook, so this is gated off by default; drop the gate
-// after the SOVDd lock bump lands the hook.
+// The gate is NOT a workaround for a missing upstream hook — that landed, and
+// `sovd-docs-hook` is on by default today. It stays because advertising the
+// vendor surface is a *capability*, not a given: a headless node that compiles
+// only some vendor route groups must not publish a document promising all of
+// them, or `GET /vehicle/v1/docs` advertises routes that answer 404. Keep this
+// gate and tie it to the route groups it describes — see
+// docs/componentization.md work item 7. Do not delete it.
 #[cfg(feature = "sovd-docs-hook")]
 pub fn capability_extensions() -> sovd_api::CapabilityExtensions {
     let doc = serde_json::to_value(openapi()).expect("OpenApi serializes to JSON");

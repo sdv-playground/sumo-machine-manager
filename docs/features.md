@@ -74,4 +74,6 @@ doesn't have to guess.
   and `sumo-onboard` are used only by the container module, so they could
   become `optional = true` with `container = ["dep:sha2", …]` and drop two git
   dependencies from a default build.
-- CI runs rustfmt only today; `scripts/feature-matrix.sh` is the job to add.
+- CI runs rustfmt **and** `scripts/feature-matrix.sh` (.github/workflows/feature-matrix.yml,
+  since 2026-09-08): fixed combinations every push/PR, the cargo-hack powerset
+  nightly. `cargo-hack` is a dev prerequisite — `install-deps.sh --check` reports it.
