@@ -79,6 +79,12 @@ spec; all are `x-`-namespaced.
 | `/operations/x-ota-rollback-trials/executions` | POST | node-level rollback of in-trial components |
 | `/operations/x-ota-pull-update/executions` | POST | onboard pull-update (gateway mode); async 202 + poll |
 
+Residual concurrency limitation: the node commit/rollback routes serialize
+against each other inside sumo-mm, but SOVDd's component-level verdict routes do
+not share that mutex. Closing that cross-route TOCTOU window requires a shared
+guard in the upstream SOVDd API and is intentionally outside this repository's
+patch.
+
 Vendor DATA params (served through the standard `/data/{param_id}` route, not
 new routes):
 - `x-ota-installed-manifest` — installed SUIT manifest JSON for the serving bank.

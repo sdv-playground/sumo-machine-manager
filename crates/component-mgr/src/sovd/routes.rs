@@ -430,25 +430,26 @@ struct VerdictOutcome {
     skipped: Vec<String>,
     /// Per-component failures, `"{id}: {err}"`.
     errors: Vec<String>,
+    /// Every failure was a transient Busy/precondition refusal.
+    all_errors_busy: bool,
 }
 
 /// Fan a commit/rollback verdict out across a node's components.
 ///
-/// A component is part of the node's update *session* iff it is currently in
-/// trial — `supports_rollback && state == Activated`. That predicate is
-/// derived from NV (`activation_state` reports `Activated` for an uncommitted
-/// banked component even after the node reboot that wiped the in-memory
-/// `/updates` sessions), so the set is identical before and after the reboot —
-/// which is why a post-reboot verdict needs no per-component session to
-/// re-attach. Singleshot / HSM components report `supports_rollback == false`
-/// (or no activation state) and are skipped. Idempotent: an already-committed
-/// component is no longer `Activated`, so a re-issued verdict skips it.
+/// A component is a commit candidate when its capabilities describe a banked
+/// or trial lifecycle and its activation state is `Activated`. Rollback uses
+/// the same set but skips candidates without rollback capability. The state is
+/// derived from durable bank facts after reboot, so a verdict needs no lost
+/// per-component `/updates` session. Singleshot and already-committed components
+/// are skipped.
 async fn run_verdict(components: &[Arc<dyn Component>], verdict: Verdict) -> VerdictOutcome {
     let mut out = VerdictOutcome {
         acted: Vec::new(),
         skipped: Vec::new(),
         errors: Vec::new(),
+        all_errors_busy: true,
     };
+    let mut candidates = Vec::new();
     for comp in components {
         let st = match comp.activation_state().await {
             Ok(Some(st)) => st,
@@ -457,15 +458,40 @@ async fn run_verdict(components: &[Arc<dyn Component>], verdict: Verdict) -> Ver
                 continue;
             }
             Err(e) => {
+                out.all_errors_busy &= matches!(e, MachineError::Busy(_));
                 out.errors
                     .push(format!("{}: activation_state: {e}", comp.id()));
                 continue;
             }
         };
-        if !(st.supports_rollback && st.state == FlashState::Activated) {
+        let Some(flash) = comp.capabilities().flash.as_ref() else {
+            out.skipped.push(comp.id().to_string());
+            continue;
+        };
+        let banked_trial = flash.dual_bank || flash.supports_trial_boot;
+        if !banked_trial
+            || st.state != FlashState::Activated
+            || (matches!(verdict, Verdict::Rollback) && !flash.supports_rollback)
+        {
             out.skipped.push(comp.id().to_string());
             continue;
         }
+        candidates.push(comp);
+    }
+
+    if let Verdict::Commit = verdict {
+        for comp in &candidates {
+            if let Err(e) = comp.preflight_commit().await {
+                out.all_errors_busy &= matches!(e, MachineError::Busy(_));
+                out.errors.push(format!("{}: {e}", comp.id()));
+            }
+        }
+        if !out.errors.is_empty() {
+            return out;
+        }
+    }
+
+    for comp in candidates {
         // commit/rollback act on the active bank from NV; the per-component
         // session id is gone after the reboot, so the FlashId is advisory.
         let id = FlashId::new("");
@@ -475,7 +501,10 @@ async fn run_verdict(components: &[Arc<dyn Component>], verdict: Verdict) -> Ver
         };
         match res {
             Ok(()) => out.acted.push(comp.id().to_string()),
-            Err(e) => out.errors.push(format!("{}: {e}", comp.id())),
+            Err(e) => {
+                out.all_errors_busy &= matches!(e, MachineError::Busy(_));
+                out.errors.push(format!("{}: {e}", comp.id()));
+            }
         }
     }
     out
@@ -511,7 +540,9 @@ fn verdict_response(
         started_at: now,
         completed_at: Some(now),
     };
-    let code = if failed {
+    let code = if failed && out.all_errors_busy {
+        StatusCode::CONFLICT
+    } else if failed {
         StatusCode::INTERNAL_SERVER_ERROR
     } else {
         StatusCode::OK
@@ -552,7 +583,12 @@ async fn handle_verdict<D: BlockDevice>(
     coord: Arc<NodeCoordinator>,
     verdict: Verdict,
     req: Option<VerdictRequest>,
+    verdict_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> axum::response::Response {
+    // Serializes this router's node commit/rollback preflight+mutation window.
+    // Component-level SOVDd verdict routes do not share this lock, so they can
+    // still race this extension until the upstream API exposes a common guard.
+    let _guard = verdict_lock.lock().await;
     let nonce = req.and_then(|r| r.nonce);
     let execution_id = uuid::Uuid::new_v4().to_string();
 
@@ -615,8 +651,9 @@ pub(crate) async fn commit_trials<D: BlockDevice>(
     nv: Arc<Mutex<NvStore<D>>>,
     coord: Arc<NodeCoordinator>,
     req: Option<VerdictRequest>,
+    verdict_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> axum::response::Response {
-    handle_verdict(machine, nv, coord, Verdict::Commit, req).await
+    handle_verdict(machine, nv, coord, Verdict::Commit, req, verdict_lock).await
 }
 
 /// `POST /vehicle/v1/operations/x-ota-rollback-trials/executions` — the node
@@ -628,6 +665,7 @@ pub(crate) async fn commit_trials<D: BlockDevice>(
     request_body(content = VerdictRequest, description = "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape)."),
     responses(
         (status = 200, description = "Verdict applied across the node's in-trial components (`result.rolled_back` / `skipped`).", body = VerdictExecution),
+        (status = 409, description = "Rollback was transiently refused by one or more components.", body = VerdictExecution),
         (status = 500, description = "One or more components failed to roll back (failed execution).", body = VerdictExecution),
     ),
 )]
@@ -636,8 +674,9 @@ pub(crate) async fn rollback_trials<D: BlockDevice>(
     nv: Arc<Mutex<NvStore<D>>>,
     coord: Arc<NodeCoordinator>,
     req: Option<VerdictRequest>,
+    verdict_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> axum::response::Response {
-    handle_verdict(machine, nv, coord, Verdict::Rollback, req).await
+    handle_verdict(machine, nv, coord, Verdict::Rollback, req, verdict_lock).await
 }
 
 pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
@@ -645,9 +684,11 @@ pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
     nv: Arc<Mutex<NvStore<D>>>,
     coord: Arc<NodeCoordinator>,
 ) -> Router {
+    let verdict_lock = Arc::new(tokio::sync::Mutex::new(()));
     let commit_machine = machine.clone();
     let commit_nv = nv.clone();
     let commit_coord = coord.clone();
+    let commit_lock = verdict_lock.clone();
     Router::new()
         .route(
             "/vehicle/v1/operations/x-ota-commit-trials/executions",
@@ -655,7 +696,10 @@ pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
                 let machine = commit_machine.clone();
                 let nv = commit_nv.clone();
                 let coord = commit_coord.clone();
-                async move { commit_trials(machine, nv, coord, req.map(|Json(r)| r)).await }
+                let verdict_lock = commit_lock.clone();
+                async move {
+                    commit_trials(machine, nv, coord, req.map(|Json(r)| r), verdict_lock).await
+                }
             }),
         )
         .route(
@@ -664,7 +708,10 @@ pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
                 let machine = machine.clone();
                 let nv = nv.clone();
                 let coord = coord.clone();
-                async move { rollback_trials(machine, nv, coord, req.map(|Json(r)| r)).await }
+                let verdict_lock = verdict_lock.clone();
+                async move {
+                    rollback_trials(machine, nv, coord, req.map(|Json(r)| r), verdict_lock).await
+                }
             }),
         )
 }
@@ -692,6 +739,7 @@ mod tests {
     use tower::ServiceExt;
 
     const COMMIT_URI: &str = "/vehicle/v1/operations/x-ota-commit-trials/executions";
+    const ROLLBACK_URI: &str = "/vehicle/v1/operations/x-ota-rollback-trials/executions";
 
     /// Minimal `Component` whose `activation_state` is fixed at construction
     /// and which counts commit/rollback calls. Only `id` + `capabilities` are
@@ -699,8 +747,15 @@ mod tests {
     struct VerdictStub {
         id: &'static str,
         state: Option<ActivationState>,
+        preflights: AtomicUsize,
+        refuse_preflight: bool,
+        fail_preflight_internal: bool,
         commits: AtomicUsize,
         rollbacks: AtomicUsize,
+        refuse_rollback: bool,
+        verdict_delay_ms: u64,
+        verdicts_in_flight: AtomicUsize,
+        max_verdicts_in_flight: AtomicUsize,
         capabilities: Capabilities,
     }
 
@@ -715,8 +770,15 @@ mod tests {
                     previous_version: None,
                     reset_kind: ResetKind::Local,
                 }),
+                preflights: AtomicUsize::new(0),
+                refuse_preflight: false,
+                fail_preflight_internal: false,
                 commits: AtomicUsize::new(0),
                 rollbacks: AtomicUsize::new(0),
+                refuse_rollback: false,
+                verdict_delay_ms: 0,
+                verdicts_in_flight: AtomicUsize::new(0),
+                max_verdicts_in_flight: AtomicUsize::new(0),
                 capabilities: Capabilities {
                     did_store: false,
                     flash: Some(FlashCaps {
@@ -736,6 +798,48 @@ mod tests {
                 },
             }
         }
+
+        fn refusing_commit(id: &'static str) -> Self {
+            let mut stub = Self::new(id, true, Some(FlashState::Activated));
+            stub.refuse_preflight = true;
+            stub
+        }
+
+        fn failing_commit_preflight(id: &'static str) -> Self {
+            let mut stub = Self::new(id, true, Some(FlashState::Activated));
+            stub.fail_preflight_internal = true;
+            stub
+        }
+
+        fn refusing_rollback(id: &'static str) -> Self {
+            let mut stub = Self::new(id, true, Some(FlashState::Activated));
+            stub.refuse_rollback = true;
+            stub
+        }
+
+        fn trial_without_rollback(id: &'static str) -> Self {
+            let mut stub = Self::new(id, false, Some(FlashState::Activated));
+            let flash = stub.capabilities.flash.as_mut().unwrap();
+            flash.dual_bank = true;
+            flash.supports_trial_boot = true;
+            stub
+        }
+
+        fn slow(id: &'static str) -> Self {
+            let mut stub = Self::new(id, true, Some(FlashState::Activated));
+            stub.verdict_delay_ms = 25;
+            stub
+        }
+
+        async fn record_verdict(&self) {
+            let active = self.verdicts_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_verdicts_in_flight
+                .fetch_max(active, Ordering::SeqCst);
+            if self.verdict_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.verdict_delay_ms)).await;
+            }
+            self.verdicts_in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -749,11 +853,26 @@ mod tests {
         async fn activation_state(&self) -> MachineResult<Option<ActivationState>> {
             Ok(self.state.clone())
         }
+        async fn preflight_commit(&self) -> MachineResult<()> {
+            self.preflights.fetch_add(1, Ordering::SeqCst);
+            if self.refuse_preflight {
+                Err(MachineError::Busy("boot witness missing".into()))
+            } else if self.fail_preflight_internal {
+                Err(MachineError::Internal("witness read failed".into()))
+            } else {
+                Ok(())
+            }
+        }
         async fn commit_install(&self, _id: &FlashId) -> MachineResult<()> {
+            self.record_verdict().await;
             self.commits.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn rollback_install(&self, _id: &FlashId) -> MachineResult<()> {
+            self.record_verdict().await;
+            if self.refuse_rollback {
+                return Err(MachineError::Busy("rollback temporarily blocked".into()));
+            }
             self.rollbacks.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -815,6 +934,7 @@ mod tests {
     fn nv_trial() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
         let mut boot = NvBootState::default();
         boot.banks[4].committed = false;
+        boot.banks[4].boot_count = 1;
         nv_with(boot, None)
     }
 
@@ -902,6 +1022,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_uses_trial_capability_and_rollback_skips_unsupported_candidate() {
+        let component = Arc::new(VerdictStub::trial_without_rollback("forward-only"));
+        let comps = components(std::slice::from_ref(&component));
+
+        let committed = run_verdict(&comps, Verdict::Commit).await;
+        assert_eq!(committed.acted, vec!["forward-only"]);
+        assert_eq!(component.commits.load(Ordering::SeqCst), 1);
+
+        let rolled_back = run_verdict(&comps, Verdict::Rollback).await;
+        assert!(rolled_back.acted.is_empty());
+        assert_eq!(rolled_back.skipped, vec!["forward-only"]);
+        assert_eq!(component.rollbacks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn commit_refused_while_reboot_pending() {
         // The node owes an activation reboot: the armed bank hasn't been booted,
         // so a commit must be refused (409) with the phase named — never acting
@@ -940,6 +1075,84 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(stub.commits.load(Ordering::SeqCst), 1);
         assert_eq!(body_json(resp).await["result"]["committed"][0], "vm1");
+    }
+
+    #[tokio::test]
+    async fn commit_preflights_all_candidates_before_mutating_any() {
+        let first = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let refusing = Arc::new(VerdictStub::refusing_commit("vm2"));
+        let router = node_verdict_router(
+            machine_with(&[first.clone(), refusing.clone()]),
+            nv_trial(),
+            coord(),
+        );
+
+        let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(first.preflights.load(Ordering::SeqCst), 1);
+        assert_eq!(refusing.preflights.load(Ordering::SeqCst), 1);
+        assert_eq!(first.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(refusing.commits.load(Ordering::SeqCst), 0);
+        assert!(body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("boot witness missing"));
+    }
+
+    #[tokio::test]
+    async fn mixed_preflight_failures_return_500_not_409() {
+        let busy = Arc::new(VerdictStub::refusing_commit("vm1"));
+        let internal = Arc::new(VerdictStub::failing_commit_preflight("vm2"));
+        let router = node_verdict_router(
+            machine_with(&[busy.clone(), internal.clone()]),
+            nv_trial(),
+            coord(),
+        );
+
+        let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(busy.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(internal.commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rollback_busy_failure_returns_documented_409() {
+        let refusing = Arc::new(VerdictStub::refusing_rollback("vm1"));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&refusing)),
+            nv_trial(),
+            coord(),
+        );
+
+        let resp = router.oneshot(post(ROLLBACK_URI, None)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(refusing.rollbacks.load(Ordering::SeqCst), 0);
+        assert!(body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("rollback temporarily blocked"));
+    }
+
+    #[tokio::test]
+    async fn node_verdict_router_serializes_commit_and_rollback() {
+        let component = Arc::new(VerdictStub::slow("vm1"));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&component)),
+            nv_trial(),
+            coord(),
+        );
+
+        let (commit, rollback) = tokio::join!(
+            router.clone().oneshot(post(COMMIT_URI, None)),
+            router.oneshot(post(ROLLBACK_URI, None))
+        );
+
+        assert!(commit.unwrap().status().is_success());
+        assert!(rollback.unwrap().status().is_success());
+        assert_eq!(component.max_verdicts_in_flight.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

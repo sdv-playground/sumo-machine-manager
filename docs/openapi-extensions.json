@@ -473,6 +473,16 @@
               }
             }
           },
+          "409": {
+            "description": "Rollback was transiently refused by one or more components.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          },
           "500": {
             "description": "One or more components failed to roll back (failed execution).",
             "content": {
