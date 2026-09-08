@@ -91,6 +91,9 @@ struct ManagedVm {
     time: Option<TimeDevice>,
     /// Liveness state for the heartbeat seq counter.
     liveness: HeartbeatLiveness,
+    /// Bank and manager-local generation bound to the currently running
+    /// process. Set only after runner.start succeeds and cleared on every stop.
+    runtime_identity: Option<VmRuntimeIdentity>,
 }
 
 pub struct VmManager {
@@ -132,6 +135,9 @@ pub struct VmManager {
     /// the persisted admin flag lives in its NV, which vm-service doesn't
     /// depend on. Default `None` (no gate).
     admin_gate: Option<AdminGate>,
+    /// Optional notification emitted after a process has started successfully.
+    post_launch: Option<PostLaunchHook>,
+    next_launch_generation: u64,
 }
 
 /// Closure type for [`VmManager::with_pre_launch_verify`].
@@ -150,6 +156,16 @@ pub type PreLaunchVerify = Arc<dyn Fn(&str, &std::path::Path) -> Result<(), Stri
 /// often (every start attempt) — implementations should be cheap (an NV
 /// bitmask read).
 pub type AdminGate = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// Identity of one successfully launched VM process lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmRuntimeIdentity {
+    pub bank: Bank,
+    pub generation: u64,
+}
+
+/// Closure called after a VM process starts and its runtime identity is stored.
+pub type PostLaunchHook = Arc<dyn Fn(&str, VmRuntimeIdentity) + Send + Sync>;
 
 /// Returned by `initiate_stop` — carries enough info to wait for exit
 /// without holding the manager lock.
@@ -277,6 +293,7 @@ impl VmManager {
                     power: None,
                     time: None,
                     liveness: HeartbeatLiveness::new(),
+                    runtime_identity: None,
                 },
             );
         }
@@ -288,6 +305,8 @@ impl VmManager {
             time_floor: None,
             pre_launch_verify: None,
             admin_gate: None,
+            post_launch: None,
+            next_launch_generation: 0,
         }
     }
 
@@ -325,6 +344,12 @@ impl VmManager {
         self
     }
 
+    /// Install a notification for every successful VM process launch.
+    pub fn with_post_launch(mut self, hook: PostLaunchHook) -> Self {
+        self.post_launch = Some(hook);
+        self
+    }
+
     /// Consult the admin gate for `name` without starting anything. Used by
     /// the HTTP layer as a synchronous pre-check so the caller of
     /// `POST /vms/{name}/start` gets the 409 on the request instead of a
@@ -352,9 +377,11 @@ impl VmManager {
         Ok(())
     }
 
-    /// Test-only: read a VM's currently-selected launch bank (`def.bank`).
-    /// Lets api-level tests assert that a `?bank=` query reached `set_vm_bank`
-    /// before launch without exposing the private `ManagedVm` shape.
+    /// Read the bank and generation bound to the currently running process.
+    pub fn runtime_identity(&self, name: &str) -> Option<VmRuntimeIdentity> {
+        self.vms.get(name).and_then(|vm| vm.runtime_identity)
+    }
+
     #[cfg(test)]
     pub fn vm_bank(&self, name: &str) -> Option<Bank> {
         self.vms.get(name).and_then(|vm| vm.def.bank)
@@ -394,6 +421,7 @@ impl VmManager {
             // Was running but exited — clean up
             vm.runner.cleanup();
             vm.handle = None;
+            vm.runtime_identity = None;
         }
 
         // Defense in depth: drop any device channels left from a previous
@@ -592,6 +620,15 @@ impl VmManager {
         let handle = vm.runner.start(name, &effective_def)?;
         tracing::info!("started VM {name} (pid: {:?})", handle.pid);
         vm.handle = Some(handle);
+        self.next_launch_generation = self.next_launch_generation.wrapping_add(1);
+        let identity = VmRuntimeIdentity {
+            bank,
+            generation: self.next_launch_generation,
+        };
+        vm.runtime_identity = Some(identity);
+        if let Some(ref post_launch) = self.post_launch {
+            post_launch(name, identity);
+        }
         Ok(())
     }
 
@@ -611,12 +648,18 @@ impl VmManager {
         if !vm.runner.is_running(handle) {
             vm.runner.cleanup();
             vm.handle = None;
+            vm.runtime_identity = None;
             return Ok(StopHandle {
                 name: name.to_string(),
                 pid: None,
                 timeout_secs: 0,
             });
         }
+
+        // A graceful stop releases the manager lock while waiting for process
+        // exit. Invalidate the launch identity before that window so no
+        // post-launch observer can witness a process whose shutdown has begun.
+        vm.runtime_identity = None;
 
         // Send PowerCommand::Shutdown via the host→guest power channel.
         // If no power device exists (no transport configured / no health
@@ -663,6 +706,7 @@ impl VmManager {
             }
             vm.runner.cleanup();
             vm.handle = None;
+            vm.runtime_identity = None;
 
             // Drop the device channels — the VM process is gone, so any
             // libhyp Region handles bound to it are stale. Order matters:
@@ -901,6 +945,40 @@ vms:
             observed,
             std::path::PathBuf::from("/var/lib/vms/vm1/bank_a")
         );
+    }
+
+    #[test]
+    fn successful_launch_records_identity_notifies_and_stop_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let events_for_hook = Arc::clone(&events);
+        let mut mgr =
+            VmManager::with_device_transport(dummy_config(dir.path().to_str().unwrap()), None)
+                .with_post_launch(Arc::new(move |name, identity| {
+                    events_for_hook
+                        .lock()
+                        .unwrap()
+                        .push((name.to_string(), identity));
+                }));
+
+        mgr.set_vm_bank("vm1", Some(Bank::B)).unwrap();
+        mgr.start_vm("vm1").unwrap();
+        let identity = mgr.runtime_identity("vm1").unwrap();
+        assert_eq!(identity.bank, Bank::B);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[("vm1".to_string(), identity)]
+        );
+
+        let _ = mgr.initiate_stop("vm1").unwrap();
+        assert_eq!(mgr.runtime_identity("vm1"), None);
+        mgr.finalize_stop("vm1");
+
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        mgr.start_vm("vm1").unwrap();
+        let next = mgr.runtime_identity("vm1").unwrap();
+        assert_eq!(next.bank, Bank::A);
+        assert_ne!(next.generation, identity.generation);
     }
 
     #[test]
