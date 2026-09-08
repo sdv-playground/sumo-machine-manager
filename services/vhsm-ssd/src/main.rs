@@ -2,8 +2,8 @@
 //!
 //! Listens on TCP on a private host bridge (`vbr-vhsm`, 10.0.200.0/24).
 //! Identity is established by a cert-based handshake on each accepted
-//! connection (see [`vhsm_ssd::auth`]): HELLO → AUTH (or ENROLL on first
-//! boot). Authorisation is statement-based; see [`vhsm_ssd::iam`].
+//! connection (see [`vhsm_server::auth`]): HELLO → AUTH (or ENROLL on first
+//! boot). Authorisation is statement-based; see [`vhsm_server::iam`].
 //!
 //! Usage:
 //!   vhsm-ssd --keystore <path>
@@ -38,20 +38,20 @@ use std::time::SystemTime;
 
 use hsm::{HsmCryptoProvider, KeyRole};
 
-use vhsm_ssd::audit::AuditLogger;
-use vhsm_ssd::auth::{self, EnrollContext, HandshakeState, IpResolver, Principal};
-use vhsm_ssd::backend;
-use vhsm_ssd::bootstrap::BootstrapState;
-use vhsm_ssd::cert::EcuSigner;
-use vhsm_ssd::codec;
-use vhsm_ssd::crossnode;
-use vhsm_ssd::handle_table::HandleTable;
-use vhsm_ssd::handler::CallerId;
-use vhsm_ssd::iam::IamPolicy;
-use vhsm_ssd::proto::*;
-use vhsm_ssd::serve::{self, Dispatch};
-use vhsm_ssd::tls;
-use vhsm_ssd::transport::{Connection, TcpListener};
+use vhsm_server::audit::AuditLogger;
+use vhsm_server::auth::{self, EnrollContext, HandshakeState, IpResolver, Principal};
+use vhsm_server::backend;
+use vhsm_server::bootstrap::BootstrapState;
+use vhsm_server::cert::EcuSigner;
+use vhsm_server::codec;
+use vhsm_server::crossnode;
+use vhsm_server::handle_table::HandleTable;
+use vhsm_server::handler::CallerId;
+use vhsm_server::iam::IamPolicy;
+use vhsm_server::proto::*;
+use vhsm_server::serve::{self, Dispatch};
+use vhsm_server::tls;
+use vhsm_server::transport::{Connection, TcpListener};
 
 use rustls::pki_types::CertificateDer;
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -130,8 +130,8 @@ fn main() {
     let mut persist_dir: Option<PathBuf> = None;
     let mut extension_handles: Option<PathBuf> = None;
     let mut audit_log_path: Option<PathBuf> = None;
-    let mut audit_log_max_bytes: u64 = vhsm_ssd::audit::DEFAULT_MAX_BYTES;
-    let mut audit_log_max_rotated: u32 = vhsm_ssd::audit::DEFAULT_MAX_ROTATED;
+    let mut audit_log_max_bytes: u64 = vhsm_server::audit::DEFAULT_MAX_BYTES;
+    let mut audit_log_max_rotated: u32 = vhsm_server::audit::DEFAULT_MAX_ROTATED;
     let mut issuer: String = DEFAULT_ISSUER.to_string();
     let mut ip_map: Vec<(IpAddr, String)> = Vec::new();
     let mut cross_node_listen: Option<SocketAddr> = None;
@@ -378,7 +378,7 @@ fn main() {
     // Load IAM policy from the in-bank policy directory. Default-deny
     // if the file declares no statements — operator's intent. Refuse
     // to start on parse error / missing file.
-    let iam = match vhsm_ssd::iam::load_iam_from_partition(&policy_dir) {
+    let iam = match vhsm_server::iam::load_iam_from_partition(&policy_dir) {
         Ok((iam, statements, partition_loaded_other)) => {
             tracing::info!(
                 path = %policy_dir.display(),
@@ -471,9 +471,9 @@ fn main() {
     // address them. Missing keystore keys are skipped (same policy as
     // the core init_handle_table).
     if let Some(ref path) = extension_handles {
-        match vhsm_ssd::extension_manifest::load_from_file(path) {
+        match vhsm_server::extension_manifest::load_from_file(path) {
             Ok(entries) => {
-                let n = vhsm_ssd::extension_manifest::apply(&mut table, &entries, &*crypto);
+                let n = vhsm_server::extension_manifest::apply(&mut table, &entries, &*crypto);
                 tracing::info!(
                     path = %path.display(),
                     declared = entries.len(),
@@ -526,7 +526,7 @@ fn main() {
     // error: an operator who passed --audit-log expects audit; a
     // silently-disabled logger would be the worst kind of bug.
     let audit = match audit_log_path.as_ref() {
-        Some(path) => match vhsm_ssd::audit::AuditLogger::open(
+        Some(path) => match vhsm_server::audit::AuditLogger::open(
             path,
             audit_log_max_bytes,
             audit_log_max_rotated,
@@ -547,7 +547,7 @@ fn main() {
         },
         None => {
             tracing::info!("audit log disabled (no --audit-log path supplied)");
-            vhsm_ssd::audit::AuditLogger::disabled()
+            vhsm_server::audit::AuditLogger::disabled()
         }
     };
     let audit = Arc::new(Mutex::new(audit));
@@ -814,7 +814,7 @@ fn serve_connection(
     handle_table: &Arc<Mutex<HandleTable>>,
     crypto: &dyn HsmCryptoProvider,
     store: Option<&Secstore<LinuxSimEncryptor, FileBackend>>,
-    audit: &Arc<Mutex<vhsm_ssd::audit::AuditLogger>>,
+    audit: &Arc<Mutex<vhsm_server::audit::AuditLogger>>,
 ) {
     tracing::info!(peer = %peer_ip, "vhsm v3 connection accepted; awaiting HELLO");
 

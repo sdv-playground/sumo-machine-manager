@@ -1,0 +1,20 @@
+[package]
+name = "vm-service-standalone"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone runner for the vm-service library — loads a YAML config, auto-starts VMs and serves the VM control API. The DEV/Linux path: on a device supernova embeds VmManager in-process (start-managed.sh never launches this binary), so this is what a developer runs on a workstation (example/dummy-vm/run-vm.sh). Split out by docs/componentization.md item 3d — the old src/main.rs re-declared all seven of the library's modules, so the crate was compiled TWICE."
+license = "MIT"
+
+# The binary keeps its name — only the package it lives in changed.
+[[bin]]
+name = "vm-service"
+path = "src/main.rs"
+
+[dependencies]
+vm-service = { path = "../../../crates/vm-service" }
+# The runner owns the async runtime, the listener and signal handling.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
+axum = "0.8"
+tracing = "0.1"
+# Fleet logging init — a PROCESS concern, not a library one.
+sumo-log = { path = "../../../crates/platform-integration/sumo-log" }

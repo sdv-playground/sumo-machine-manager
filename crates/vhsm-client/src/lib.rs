@@ -428,9 +428,9 @@ mod tests {
     use hsm_sim_backend::SimHsm;
     use vhsm_proto::codec::{read_request, write_response};
     use vhsm_proto::{ALG_ECC_P256, PERM_GET_PUBKEY, PERM_SIGN, PERM_VERIFY};
-    use vhsm_ssd::handle_table::HandleTable;
-    use vhsm_ssd::handler::{handle_request, CallerId};
-    use vhsm_ssd::iam::IamPolicy;
+    use vhsm_server::handle_table::HandleTable;
+    use vhsm_server::handler::{handle_request, CallerId};
+    use vhsm_server::iam::IamPolicy;
 
     // A well-known handle slot reused as a test EC-P256 signer.
     const TEST_HANDLE: u32 = 0x0002;

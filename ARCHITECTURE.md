@@ -155,7 +155,10 @@ the seams above are the supported extension points.
 
 ## Workspace crates
 
-30 runtime crates (+ 2 tools crates under `tools/crates/`). The core update/diagnostics path:
+Three buckets (`docs/componentization.md` item 3d): **29 libraries** in `crates/`
+(the consumable surface), **4 deployables** in `services/` (`vm-sovd`, `vhsm-ssd`,
+`sumo-verify`, `slog2-drainer`), **8 host-side tools** in `tools/crates/`.
+The core update/diagnostics path:
 
 - **nv-store** (lib): sector-rotated NV regions (boot state, factory, FW meta, runtime
   DIDs) with CRC-32 + monotonic `write_seq`, over a pluggable `BlockDevice`. Also owns
@@ -169,8 +172,8 @@ the seams above are the supported extension points.
   `Capabilities`/`FlashCaps`; the `BankActivator` seam; `system_bank_state`
   (`SystemBankManager` + `BootSelector` — the node boot-authority engine, re-exporting
   the nv-store selector primitives). Platform-independent.
-- **component-mgr** (lib + the `vm-diagserver` CLI bin; the SOVD/OTA **server** bin `vm-sovd` is
-  its own crate): the OTA engine + SOVD wire. `ComponentBackend` (the
+- **component-mgr** (lib only; the `vm-diagserver` CLI over it is `tools/crates/vm-diagserver`,
+  and the SOVD/OTA **server** `vm-sovd` is its own crate in `services/`): the OTA engine + SOVD wire. `ComponentBackend` (the
   per-component state machine — DIDs, faults, the full install/flash lifecycle, modes);
   `ComponentAdapter` (exposes it as a `Component`); `install_router_diag`
   (`InstallRouterDiag` — routes a VM's install methods to its container-vs-VM router,
@@ -187,7 +190,8 @@ the seams above are the supported extension points.
   opt-in `container` feature (default OFF) — see `docs/features.md`.
 - **component-factory** (lib): `build_component(ComponentSpec, FactoryDeps)` — builds the
   right backend + adapter per component kind (incl. the install router for app-capable VMs).
-- **vm-service** (lib + bin): QEMU/`qvm` lifecycle, per-bank VM config, the pre-launch
+- **vm-service** (lib; the standalone dev binary is `tools/crates/vm-service-standalone`):
+  QEMU/`qvm` lifecycle, per-bank VM config, the pre-launch
   IVD verify hook, IPC to vm-sovd. `runner/{qemu,qnx,dummy}`. Launches the VM **from the
   selector-chosen bank dir** (cwd=bank_dir) so the per-bank qvm.conf's relative
   `load kernel` resolves there (no `current` symlink).
@@ -200,15 +204,24 @@ the seams above are the supported extension points.
   `tools/crates/hsm-conformance`); `ivd` (per-bank IVD manifest sign/verify with the
   `ivd-signing` key — the same key that signs the boot selector). 11 mandatory `KeyRole`s.
   Contract-only — no in-process HSM lives here; see `docs/hsm-backend-architecture.md`.
-- **vhsm-ssd** (lib + bin): host daemon terminating the guest `/dev/vhsm` v3 handle
+- **vhsm-server** (lib, `crates/`) + **vhsm-ssd** (the daemon, `services/` — it keeps the
+  package name, which is what `cargo install`, the device process and the CWT `aud` claim
+  all address): host daemon terminating the guest `/dev/vhsm` v3 handle
   protocol over TCP on a private host bridge; identity = CWT/IAM handshake (source-IP pre-gate).
 - **secstore** (lib): encrypted key-metadata persistence (`SecstoreEncryptor` +
   `SecstoreBackend`).
 
-Support crates: **sumo-verify** (management-path SUIT/IVD verify), **policy-eval** /
+Support crates: **policy-eval** /
 **policy-partition** / **policy-build** (guest IAM policy), **ca-bundle-build**,
-**vm-wire**, **host-metrics** (OpenTelemetry/Prometheus host sensors), **log-rotate**,
-**puller**.
+**vm-wire**, **host-metrics** (OpenTelemetry/Prometheus host sensors — the library
+supernova embeds; the standalone runner is `tools/crates/host-metrics-serve`),
+**log-rotate**, **puller**.
+
+Deployables in `services/`: **vm-sovd** (the SOVD/OTA server process),
+**vhsm-ssd** (the vHSM daemon, above), **sumo-verify** (the launch gate — external
+secure boot / the start script runs it per component, on the management path
+SUIT/IVD verify), **slog2-drainer** (Tier-2 host: drains the QNX slog2 ring into
+sealed disk segments).
 
 ### Crate composition (bottom-up)
 

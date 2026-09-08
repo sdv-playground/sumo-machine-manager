@@ -6,18 +6,10 @@ description = "Host hardware metrics — Prometheus endpoint with pluggable Sens
 
 [dependencies]
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tracing = "0.1"
-# Fleet logging init: sumo_log::init_tracing installs the recorder + the
-# tracing→score_log capture bridge. Sibling crate → path dep.
-sumo-log = { path = "../platform-integration/sumo-log" }
 # Used by the QNX reader for `sysconf` / `getloadavg`. Tiny on Linux too.
 libc = "0.2"
 
 [lib]
 name = "host_metrics"
 path = "src/lib.rs"
-
-[[bin]]
-name = "host-metrics"
-path = "src/main.rs"

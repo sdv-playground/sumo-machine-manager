@@ -5,14 +5,10 @@
 ///
 /// Usage:
 ///   vm-service --config /etc/vm-service/config.yaml
-mod api;
-mod config;
-mod health_status;
-#[cfg(target_os = "linux")]
-mod ivshmem;
-mod manager;
-mod runner;
-mod transport_setup;
+/// The modules below used to be re-declared here (`mod api; mod config; …`),
+/// which compiled the WHOLE crate a second time inside the binary. Taking them
+/// from the library instead is the point of the split (item 3d).
+use vm_service::{api, config, manager};
 
 use std::path::PathBuf;
 use std::sync::Arc;

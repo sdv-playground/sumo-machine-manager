@@ -11,31 +11,31 @@ path = "src/main.rs"
 # component-factory so it can compose components through the SAME factory
 # the host machine manager uses — no hand-rolled, double-maintained composition.
 [dependencies]
-component-mgr = { path = "../component-mgr" }
-component-factory = { path = "../component-factory" }
-nv-store = { path = "../nv-store" }
-machine-mgr = { path = "../machine-mgr" }
-hsm = { path = "../hsm", features = ["crypto"] }
+component-mgr = { path = "../../crates/component-mgr" }
+component-factory = { path = "../../crates/component-factory" }
+nv-store = { path = "../../crates/nv-store" }
+machine-mgr = { path = "../../crates/machine-mgr" }
+hsm = { path = "../../crates/hsm", features = ["crypto"] }
 # --tls: HSM-backed rustls server identity (the tls-identity key never leaves the
 # HSM) + the TLS-terminating axum server. `tls-rustls-no-provider` (not
 # `tls-rustls`): the latter pulls rustls's aws-lc-rs default → aws-lc-sys (C/asm),
 # which doesn't cross-build to QNX (only ring is patched there) and is dead weight —
 # hsm-rustls installs the ring provider, so axum-server needs none.
-hsm-rustls = { path = "../hsm-rustls" }
+hsm-rustls = { path = "../../crates/hsm-rustls" }
 # mDNS / DNS-SD advertiser for the SOVD endpoint (ISO 17978-3 §5.11). Active on
 # the provisioned HTTPS path; advertises `<id>.local` derived from the tls-identity
 # leaf so discovery clients verify the cert by hostname.
 sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 # Guest gateway (--guest-vhsm): the vHSM-backed HsmCryptoProvider.
-vhsm-provider = { path = "../vhsm-provider" }
-host-os-mgr = { path = "../host-os-mgr" }
+vhsm-provider = { path = "../../crates/vhsm-provider" }
+host-os-mgr = { path = "../../crates/host-os-mgr" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 tracing = "0.1"
 # Fleet logging init: sumo_log::init_tracing installs the recorder + the
 # tracing→score_log capture bridge. Sibling crate → path dep.
-sumo-log = { path = "../platform-integration/sumo-log" }
+sumo-log = { path = "../../crates/platform-integration/sumo-log" }
 serde_yaml = "0.9"
 sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }

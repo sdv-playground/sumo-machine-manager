@@ -48,14 +48,14 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  hsm             HSM contract: HsmProvider (keystore) +    │
 │  (lib)           HsmCryptoProvider; backend out-of-process │
 │                                                            │
-│  vhsm-ssd        vHSM v3 daemon (handle-based protocol)    │
-│  (lib+bin)       terminating guest /dev/vhsm               │
+│  vhsm-server     vHSM v3 daemon (handle-based proto) —     │
+│  (lib)           daemon = services/vhsm-ssd                │
 │                                                            │
 │  vm-devices      Virtual CAN/health/time device simulators │
 │  (lib)           on shared memory (ivshmem/QNX shm)        │
 │                                                            │
 │  vm-service      QEMU/qvm lifecycle, per-bank VM config,   │
-│  (lib+bin)       ivshmem server, IPC to diagnostics daemon │
+│  (lib)           ivshmem server, IPC to diag daemon        │
 │                                                            │
 │  machine-mgr     Platform-agnostic Machine/Component       │
 │  (lib)           trait — host-os / vm1 / vm2 / hsm         │
@@ -67,12 +67,11 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  (lib)           container image import for local runtimes  │
 │                                                            │
 │  component-mgr          SUIT validation, OTA engine, DID          │
-│  (lib+bins)      resolution, SOVD wire adapter             │
+│  (lib)           resolution, SOVD wire adapter             │
 │       │                                                    │
 │       ├── sovd-core     (DiagnosticBackend trait)          │
 │       ├── sovd-api      (HTTP routing)                     │
-│       ├── sumo-onboard  (SUIT validation)                  │
-│       └── sumo-processor (command sequences)               │
+│       └── sumo-onboard  (SUIT validation)                  │
 └───────────────────────────────────────────────────────────┘
 ```
 
@@ -84,14 +83,14 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `secstore` | — | Encrypted key-metadata persistence, pluggable encryptor + backend |
 | `vm-boot` | `vm-boot` | Boot decisions, trial counting, auto-rollback (all bank sets) |
 | `hsm` | — | HSM **contract**: `HsmProvider` (keystore/provisioning, 8 methods) + re-exported `HsmCryptoProvider`; `ivd` sign/verify; `LinkBClient` bridge — no in-process HSM |
-| `vhsm-ssd` | `vhsm-ssd` | Host-side vHSM v3 daemon — TCP on the private `vbr-vhsm` bridge; identity = CWT/IAM handshake (source-IP static pre-gate) |
+| `services/vhsm-ssd` (daemon) + `vhsm-server` (lib) | `vhsm-ssd` | Host-side vHSM v3 daemon — TCP on the private `vbr-vhsm` bridge; identity = CWT/IAM handshake (source-IP static pre-gate) |
 | `vm-devices` | — | CAN / health / time simulators (host-side) |
-| `vm-service` | `vm-service` | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config, ivshmem |
+| `vm-service` | — (lib; `tools/crates/vm-service-standalone` builds the `vm-service` dev binary) | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config, ivshmem |
 | `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic) |
 | `host-os-mgr` | — | Host OS Component: IFS activation, A/B partition, reboot |
 | `app-mgr` | — | App/container Component: local container image import for Docker, Podman, or containerd |
-| `component-mgr` | `vm-diagserver` | SUIT + SOVD: validation, OTA engine, DID resolution, `/updates` wire (lib); `vm-diagserver` is the NV/bank + factory CLI |
-| `vm-sovd` | `vm-sovd` | The SOVD/OTA server process — wires the machine registry, components, and the `/updates` wire |
+| `component-mgr` | — (lib; `tools/crates/vm-diagserver` builds the CLI) | SUIT + SOVD: validation, OTA engine, DID resolution, `/updates` wire; `vm-diagserver` is the NV/bank + factory CLI over it |
+| `services/vm-sovd` | `vm-sovd` | The SOVD/OTA server process — wires the machine registry, components, and the `/updates` wire |
 | `component-factory` | — | `build_component(ComponentSpec, FactoryDeps)` — per-kind backend + adapter builder |
 | `hsm-contract` | — | Shared handle-addressed HSM crypto contract (`HsmCryptoProvider`, `KeyHandle` / `SlotInfo` / `SlotKind` / `KeyType`) |
 | `hsm-link-b` | — | Frozen link-B wire + C header: the host↔backend service protocol a hardware-HSE vendor implements; C skeleton in `reference/` |
@@ -102,9 +101,9 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `vhsm-client` | — | The v3 vHSM wire client |
 | `vhsm-provider` | — | Guest-side `HsmCryptoProvider` forwarding over the vHSM wire |
 | `vhsm-crossnode-client` | — | Cross-node vHSM connector (reach another node's vHSM) |
-| `sumo-verify` | `sumo-verify` | Bank IVD signature validator for external secure boot |
+| `services/sumo-verify` | `sumo-verify` | Bank IVD signature validator for external secure boot |
 | `sumo-factory-reset-mint` | `sumo-factory-reset-mint` | Dev SOVD capability-token minter (well-known P-256 dev key) |
-| `host-metrics` | `host-metrics` | Host hardware metrics — Prometheus exposition, pluggable `SensorReader` |
+| `host-metrics` | — (lib; `tools/crates/host-metrics-serve` builds the `host-metrics` binary) | Host hardware metrics — Prometheus exposition, pluggable `SensorReader` |
 
 ### Separation of concerns
 

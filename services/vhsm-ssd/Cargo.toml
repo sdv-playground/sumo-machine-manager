@@ -1,0 +1,48 @@
+[package]
+name = "vhsm-ssd"
+version = "0.1.0"
+edition = "2021"
+description = "vHSM Secure Storage Daemon — the host-side crypto service guest VMs reach over /dev/vhsm. Terminates the v3 handle-based wire protocol on the private vbr-vhsm bridge, establishes guest identity by CWT/IAM handshake, and delegates crypto to an HsmCryptoProvider (a link-B vendor service, or the software HSM). The reusable server half is the vhsm-server library; this package is the process that wires it to a backend, a secstore, TLS and the signal reaper."
+license = "MIT"
+
+# PACKAGE NAME IS LOAD-BEARING: supernova-machine-manager installs this by name
+# (`cargo install --git … vhsm-ssd`, .gitlab-ci.yml) and builds it by name
+# (`cargo build -p vhsm-ssd --target aarch64-unknown-nto-qnx710`). The pilot
+# proved directory moves are invisible to that; a package RENAME would not be.
+# So the daemon kept the name and the library became vhsm-server.
+[[bin]]
+name = "vhsm-ssd"
+path = "src/main.rs"
+
+[dependencies]
+vhsm-server = { path = "../../crates/vhsm-server" }
+hsm = { path = "../../crates/hsm", features = ["crypto"] }
+vhsm-proto = { path = "../../crates/vhsm-proto" }
+secstore = { path = "../../crates/secstore" }
+policy-eval = { path = "../../crates/policy-eval" }
+policy-partition = { path = "../../crates/policy-partition" }
+hsm-rustls = { path = "../../crates/hsm-rustls" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+tracing = "0.1"
+serde_yaml = "0.9"
+serde_json = "1"
+sha2 = "0.10"
+# SIGTERM/SIGINT backend reaper: block the signals, then `sigwait` in a
+# dedicated thread that owns the spawned link-B backend `Child` and kills +
+# reaps it before exit so a clean stop doesn't orphan it. A PROCESS concern —
+# measured as one of the two deps this split removes from the library.
+libc = "0.2"
+# Fleet logging init — the other one. Never a library concern.
+sumo-log = { path = "../../crates/platform-integration/sumo-log" }
+
+[dev-dependencies]
+# The two e2e tests here drive the REAL binary via CARGO_BIN_EXE_vhsm-ssd — which
+# is why they live with the daemon and not with the library. `guest-auth` pulls in
+# the HELLO/AUTH/ENROLL layer so the test speaks the v3 handshake a guest speaks.
+vhsm-client = { path = "../../crates/vhsm-client", features = ["guest-auth"] }
+hsm-sim-backend = { path = "../../tools/crates/hsm-sim-backend" }
+tempfile = "3"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+rand = { version = "0.8", features = ["std"] }

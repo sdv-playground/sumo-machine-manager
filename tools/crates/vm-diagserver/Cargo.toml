@@ -1,0 +1,26 @@
+[package]
+name = "vm-diagserver"
+version = "0.1.0"
+edition = "2021"
+description = "NV/bank + factory-ops CLI over the component-mgr library (read/write NV regions, inspect banks, factory-init an HSM keystore). NOT an HTTP server despite the name — the SOVD/OTA server is services/vm-sovd. A developer/CI tool: build-all.sh and example/run.sh run it from target/debug, and it is in neither supernova package. Split out of component-mgr by docs/componentization.md item 3d."
+license = "MIT"
+
+# The binary keeps its name — only the package it lives in changed, so
+# `target/debug/vm-diagserver` (example/run.sh, build-all.sh) is untouched.
+[[bin]]
+name = "vm-diagserver"
+path = "src/main.rs"
+
+[dependencies]
+# Measured, and worth stating plainly: this bin uses NOTHING that the library
+# does not already need (component_mgr::{did,manifest,ota}, nv_store, sha2), so
+# unlike host-metrics/vm-service the split drops ZERO dependencies from the
+# library. It is done for the bucket rule — a crate that is both a consumable
+# and a deployable is what item 3d forbids — not for a closure win.
+component-mgr = { path = "../../../crates/component-mgr" }
+nv-store = { path = "../../../crates/nv-store" }
+sha2 = "0.10"
+crc32fast = "1"
+hsm = { path = "../../../crates/hsm", features = ["crypto"] }
+# factory-init's `--hsm-keystore` bring-up mints keys with the software HSM.
+hsm-sim-backend = { path = "../hsm-sim-backend" }

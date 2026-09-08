@@ -83,11 +83,11 @@ mod tests {
     use rand::rngs::OsRng;
     use rustls::ServerConnection;
     use vhsm_proto::{ALG_ECC_P256, HANDLE_SW_AUTHORITY, PERM_GET_PUBKEY, PERM_SIGN, PERM_VERIFY};
-    use vhsm_ssd::audit::AuditLogger;
-    use vhsm_ssd::crossnode::{principal_from_client_cert, serve_crossnode_connection};
-    use vhsm_ssd::handle_table::HandleTable;
-    use vhsm_ssd::iam::IamPolicy;
-    use vhsm_ssd::tls::server_config;
+    use vhsm_server::audit::AuditLogger;
+    use vhsm_server::crossnode::{principal_from_client_cert, serve_crossnode_connection};
+    use vhsm_server::handle_table::HandleTable;
+    use vhsm_server::iam::IamPolicy;
+    use vhsm_server::tls::server_config;
     use x509_cert::builder::{Builder, CertificateBuilder, Profile};
     use x509_cert::der::asn1::Ia5String;
     use x509_cert::der::{Decode, Encode, EncodePem};
@@ -186,7 +186,7 @@ mod tests {
             2,
         );
         let server_hsm: Arc<dyn HsmCryptoProvider> = Arc::new(server_hsm);
-        let client_roots = vhsm_ssd::tls::identity_root_store(&root_pem).unwrap();
+        let client_roots = vhsm_server::tls::identity_root_store(&root_pem).unwrap();
         let server_cfg = Arc::new(
             server_config(server_hsm.clone(), tls_kid, vec![server_leaf], client_roots).unwrap(),
         );

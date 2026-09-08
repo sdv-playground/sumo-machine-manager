@@ -566,26 +566,92 @@ there. Three buckets:
 | `services/` | on-device deployables | someone *runs* it on a target |
 | `tools/` | host-side CLIs, build-time and dev/test tools | someone runs it on a workstation or in CI |
 
-- [ ] **The pure executables move as-is** — `vm-sovd` (→ 3c's two halves),
-      `sumo-verify`, ~~`slog2-drainer`~~ (**done — the pilot, `b4c8df7`**),
-      `sumo-factory-reset-mint`. No lib, no consumers, nothing to untangle.
-- [ ] **The nine mixed lib+bin crates are the actual work**: `component-mgr`
-      (+`vm-diagserver`), `vhsm-ssd`, `vm-service`, `vm-boot`, `host-metrics`,
-      `hsm-sim-backend` (+`hsm-sim-service`), `hsm-conformance`, `policy-build`,
-      `ca-bundle-build`. Each is *both* a consumable and a deployable, which the
-      rule forbids. Extract the bin into a thin crate in `services/` or `tools/`
-      that depends on the lib.
-- [ ] **This is not cosmetic — it makes library closures honest.** A `[[bin]]`
-      shares its crate's `[dependencies]`, so a consumer taking `vm-service` or
-      `component-mgr` as a *library* today also inherits everything its
-      **binary** needs. That is the same class of over-linking this whole
-      document is trying to measure (see "The rp5 case" — 8 linked-and-unusable
-      crates). Size it per crate as the bins are extracted; do not assume the
-      win is uniform.
-- [ ] **Existing miscategorisation to fix in the same pass**: `hsm-sim-service`
-      is a *deployed production service* — it ships in both supernova packages
-      (`assemble-package.sh:71, 89`) and lands on the device — but lives under
-      `tools/crates/hsm-sim-backend`. Same category error, opposite direction.
+- [x] **The pure executables move as-is** — `slog2-drainer` (the pilot,
+      `b4c8df7`), `sumo-verify`, `vm-sovd` → `services/`. `vm-sovd` moved as
+      *one* crate; 3c still owes the split into its two halves, and moving it
+      first makes that diff smaller, not larger. `sumo-factory-reset-mint`
+      needed **no** move — it was already in `tools/crates/`, which is its
+      correct bucket (a dev token minter is not a deployable).
+- [x] ~~**The nine mixed lib+bin crates are the actual work**~~ — **wrong, and
+      the measurement is what showed it (2026-09-08).** Four of the nine have
+      **zero library consumers** anywhere in this repo or any sibling:
+      `vm-boot`, `hsm-conformance`, `policy-build`, `ca-bundle-build`. For those
+      an extraction moves code without making any closure honest — there is no
+      consumer inheriting anything — so it is pure churn. They stay whole:
+      `hsm-conformance`, `policy-build` and `ca-bundle-build` are already in
+      `tools/crates/`; `vm-boot` is the open question below. That leaves
+      **four** genuine extractions, done in this wave:
+
+      | Crate | Lib stays | Bin becomes | Measured direct-dep win on the lib |
+      |---|---|---|---|
+      | `host-metrics` | `crates/host-metrics` | `tools/crates/host-metrics-serve` (bin still named `host-metrics`) | 5 → **3** (drops `tokio`, `sumo-log`) |
+      | `vm-service` | `crates/vm-service` | `tools/crates/vm-service-standalone` (bin still named `vm-service`) | 11 → **8** (drops `sumo-log`, `hyper`, `hyper-util`) |
+      | `component-mgr` | `crates/component-mgr` | `tools/crates/vm-diagserver` | **0** — see below |
+      | `vhsm-ssd` | `crates/vhsm-server` (lib **renamed**) | `services/vhsm-ssd` (package keeps the name) | 24 → **22** (drops `libc`, `sumo-log`) |
+
+      and one deferred: `hsm-sim-backend` (+`hsm-sim-service`) — see below.
+- [x] **The bin/lib closure win is real but it is not rp5-class — it is one
+      crate leaking five times.** (The rp5-class win in this wave came from
+      somewhere else entirely; see the dead-dependency bullet below.)
+      Netted out across the four extractions the bin-only
+      dependency set is essentially **`sumo-log` ×5**, plus `libc` and a direct
+      `tokio`. That is worth having (a *library* has no business initialising
+      fleet logging or owning a runtime; that is the process's job) but it is
+      not the "8 linked-and-unusable crates" of the rp5 case, and this document
+      should stop implying it is. For `vm-diagserver` the win is **exactly
+      zero** — the bin uses nothing `component-mgr` does not already need — so
+      that one split is justified by the bucket rule alone, and its manifest
+      says so.
+- [x] **What the measurement *did* find was worse than the bin/lib leak, and
+      unrelated to it.** Sizing the closures per crate — the thing this item
+      told itself not to assume — turned up dependencies no target used at all:
+      `component-mgr` carried `sumo-processor` and `tracing-subscriber`
+      referenced by **no** target, and `host-os-mgr` referenced **only** by
+      `tests/component_adapter_tests.rs` (now a `[dev-dependency]`). Every
+      consumer of `component-mgr`, supernova included, had been linking the
+      host OS manager and a SUIT interpreter for nothing. `vm-service` likewise
+      carried `hyper` + `hyper-util` unused. **`sumo-processor` is now gone from
+      the resolved graph entirely** — this workspace's *and* supernova's, which
+      reached it only through `component-mgr` (see the Feasibility block). Three
+      dead deps on the repo's most widely consumed library dwarf the
+      `sumo-log`-per-bin finding, and this one is genuinely rp5-class: a whole
+      crate linked and unusable. **Lesson for the remaining items: "measure it"
+      means read every target, including `tests/` and `examples/`, not just
+      `src/` — and check the consumer's lock, not only your own manifest.**
+- [x] **The other defect the split exposed: `vm-service` was compiling twice.**
+      Its `main.rs` re-declared all seven modules that `lib.rs` already declares
+      `pub mod`, so the binary built the entire crate a second time as private
+      modules of itself. `tools/crates/vm-service-standalone` takes them from
+      the library (`use vm_service::{api, config, manager};`). This is a better
+      argument for 3d than the dep-closure one: a `[[bin]]` inside a lib crate
+      invites exactly this, and nothing warns you.
+- [x] **`vhsm-ssd` shows how to extract a bin whose *package name* is
+      load-bearing, with zero cross-repo churn.** supernova installs the
+      *binary* by package name (`cargo install … vhsm-ssd`), the device process
+      is called `vhsm-ssd`, and `vhsm-proto`'s CWT `aud` claim is the string
+      `"vhsm-ssd"` — so the deployable is what owns that name. The naive
+      extraction (lib keeps the name, bin gets a new one) would have needed
+      edits in supernova's CI plus two example build scripts. Inverting it
+      costs nothing: **the bin keeps the package name and moves to
+      `services/vhsm-ssd`; the library is renamed `vhsm-server`** — safe
+      precisely because the lib's consumers are all in-repo (`vhsm-client`,
+      `vhsm-crossnode-client`), so the rename is 42 refs across 7 files and
+      stops at the repo boundary. Generalisation: **rename the half whose
+      consumers you own.** The integration tests that use
+      `env!("CARGO_BIN_EXE_vhsm-ssd")` move with the bin; the rest stay with the
+      lib.
+- [ ] **The one case that cannot land mechanically — deferred, needs a paired
+      supernova edit.** `hsm-sim-service` is a *deployed production service* —
+      it ships in both supernova packages (`assemble-package.sh:71, 89`) and
+      lands on the device — but lives under `tools/crates/hsm-sim-backend`. Same
+      category error as the rest, opposite direction. It is nonetheless **not**
+      mechanical, and the `vhsm-ssd` trick does not rescue it: supernova needs
+      the **lib** by name (`[dev-dependencies]`, `Cargo.toml:110`) *and*
+      installs the **bin** by that same name (`.gitlab-ci.yml:208`, `:232`, plus
+      two example `build.sh`), so whichever half is renamed, a consumer edit is
+      owed. That makes it 3c-shaped — a coordinated cross-repo bump with the
+      full artifact cascade behind it — and it must not be filed under this
+      item's "mechanical" heading.
 
 **Three cases that looked ambiguous and are not (checked 2026-09-08).**
 `vm-boot`, `host-metrics` and `hsm-sim-service` all read as hard calls until you
@@ -593,7 +659,10 @@ stop treating each crate as one thing. Every one of them is lib-primary with a
 thin bin, so the rule above already decides them: the lib stays in `crates/`,
 the bin moves. No new judgement needed. What the check *did* surface is that
 each has a different reason, and two of those reasons are findings in their own
-right:
+right. *Amended after execution:* the rule decides them, but only `host-metrics`
+was **actionable** — `hsm-sim-service` turned out to need a paired supernova
+edit, and `vm-boot` has no consumer to make honest, so for it the rule decides a
+move that buys nothing:
 
 - **`host-metrics` — the clean case, and the model for the others.** supernova
   takes the lib as a plain `[dependencies]` entry (`Cargo.toml:65`) and embeds
@@ -611,7 +680,11 @@ right:
   today the packaging line silently contradicts the manifest. Extracting the bin
   is what makes the manifest tell the truth — `services/hsm-sim-service`
   depending on `crates/hsm-sim-backend`, which supernova then keeps as a
-  dev-dependency without also shipping it. Note also the naming: `SimHsm` in
+  dev-dependency without also shipping it. **But not in this wave** — supernova
+  addresses `hsm-sim-backend` by that name in *both* roles at once
+  (`[dev-dependencies]` for the lib, `cargo install` for the bin), so the split
+  cannot be zero-churn in either direction; see the deferred bullet above.
+  Note also the naming: `SimHsm` in
   `hsm-sim-backend` *is* the soft HSM; `hsm-sim-service` is only its ~241-line
   link-B process wrapper (`hsm::link_b::serve`, crypto **and** provisioning).
   Work item 3's rename has to keep those two levels distinct.
@@ -627,8 +700,12 @@ right:
   `host-platforms/provisioned-cvc/config/host-boot.sh` ("Interim host bootloader
   stand-in — A/B selection for the supernova OS bank"), reading the same signed
   selector. So `vm-boot` is the Rust reference implementation of a contract
-  currently implemented in bash. Move the bin to `tools/` with the others, but
-  the open question is about the **lib**, and it is not a layout question:
+  currently implemented in bash. **Left whole in this wave** (user: "leave
+  vm-boot for now") — and the zero-consumer finding is why that is the right
+  call rather than a postponement: with no library consumer, extracting the bin
+  makes no closure honest, so the move would be churn taken *before* the
+  question it depends on is answered. The open question is about the **lib**,
+  and it is not a layout question:
   either it is declared SDK surface — the executable spec of the selector
   contract that a real bootloader or vendor MM is expected to embed, in which
   case `host-boot.sh` is the thing that should eventually call it — or it is
@@ -657,11 +734,34 @@ right:
   interpreter /usr/lib/ldqnx-64.so.2`, `NEEDED libslog2parse.so.1`, so even the
   transitive nto FFI link through `platform-log` survived the move. Same result
   on the host target. **A consumer needs no change whatsoever.**
-- **`Cargo.lock` is byte-UNCHANGED by the move** — `git status` on it is empty
-  after the pilot. That is the same fact from the other side: the lock records
-  package names and versions, nothing about directories. So there is no lock
-  churn to propagate through the wave (see the Build & Artifact Order) and no
-  coordinated bump owed to any consumer.
+- **A move cannot change any `Cargo.lock`, and here is the argument that
+  actually holds.** *Corrected 2026-09-08: the original evidence for this was
+  "`git status Cargo.lock` is empty after the pilot", which proves nothing —
+  `Cargo.lock` is **gitignored** in this repo (`.gitignore:4`), so it is empty
+  for every change.* The real reason is structural: a lock entry for a
+  workspace-local package is `name` + `version` + `dependencies` with **no
+  `source` and no path**, so there is nothing in it for a directory move to
+  perturb. And a *consumer's* lock (supernova's, which **is** tracked) records
+  `git+…?branch=main#<sha>` keyed by package name — so a move changes nothing
+  there either beyond the sha that every commit changes anyway.
+- **A rename or a new package DOES change locks — check which consumers.** This
+  wave added four package names (`vhsm-server`, `vm-diagserver`,
+  `vm-service-standalone`, `host-metrics-serve`) and renamed one library. It is
+  still zero-churn for consumers, but by *verification*, not by the move
+  argument: `vhsm-ssd` appears **nowhere** in supernova's `Cargo.lock` (it was
+  only ever `cargo install`ed as a binary), and the three new `tools/` packages
+  are workspace-local with no external consumer. Do that check per rename; do
+  not inherit the move proof.
+- **The wave's real de-linking win is in a consumer's graph, and it is one whole
+  crate.** Removing the unreferenced `sumo-processor` from `component-mgr`
+  removes it from **this** workspace's resolved graph entirely (`Cargo.lock`:
+  0 entries) *and* from supernova's — supernova has it in its lock with no
+  direct dependency and no `sumo_processor` reference in its sources, reached
+  **only** via `component-mgr`. So a whole SUIT command-sequence interpreter was
+  linked into the host machine manager and unusable from it: precisely the rp5
+  pattern this document set out to measure, found in the repo's most widely
+  consumed library rather than in a feature flag. It materialises in supernova
+  on its next `cargo update -p component-mgr` wave, not on this merge.
 - **Pilot design note, for the moves still to come.** The pilot was chosen to be
   falsifiable: a *pure* executable (nothing to untangle, so a failure could only
   be about resolution) with exactly **one** inbound edge in-repo — the root
@@ -674,9 +774,22 @@ right:
   packages by name (`cargo install … vhsm-ssd hsm-sim-backend slog2-drainer`,
   `cargo build -p vm-sovd`). The only path-addressed list is the root
   `Cargo.toml` `members`.
-- Churn is therefore confined to `members` plus the ~80 in-repo
-  `path = "../x"` dep lines, which are mechanical.
-- [ ] Do it as its own commit wave, separate from any behaviour change, so the
+- **…but "by name" cuts both ways, and that is the part a *move* proof does not
+  cover.** A directory move is invisible; a **bin extraction is not**, because
+  `-p <pkg> --bin <bin>` names the package that *owns* the bin. Three in-repo
+  build lines needed editing for that reason and no other:
+  `build-all.sh:208` (`-p vm-service` → `-p vm-service-standalone`, `--bin
+  vm-service` unchanged), `build-all.sh:210` (`-p component-mgr --bin
+  vm-diagserver` → `-p vm-diagserver`), and `example/dummy-vm/run-vm.sh:58`.
+  **Every extracted bin kept its binary name**, so nothing that consumes the
+  *artifact* (`target/debug/vm-diagserver`, the packaged `host-metrics`,
+  `example/run.sh:110`) changed at all. Keep that invariant in the remaining
+  extractions: rename packages freely, never the `[[bin]] name`.
+- Churn is therefore confined to `members` plus the in-repo `path = "../x"` dep
+  lines, which are mechanical. (Actual count for this wave: far below the ~80
+  estimated — a moved crate rewrites only *its own* dep lines, and only in-repo
+  consumers of a *renamed* package are touched.)
+- [x] Do it as its own commit wave, separate from any behaviour change, so the
       diff is reviewable as a pure move.
 
 **Payoff for work item 1:** profiles map one-to-one onto deployables, so

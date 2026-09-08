@@ -14,7 +14,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [dev-dependencies]
 # e2e: dial the REAL vhsm-ssd cross-node listener with an HSM-backed identity.
-vhsm-ssd = { path = "../vhsm-ssd" }
+vhsm-server = { path = "../vhsm-server" }
 vhsm-proto = { path = "../vhsm-proto" }
 hsm = { path = "../hsm", features = ["crypto"] }
 hsm-sim-backend = { path = "../../tools/crates/hsm-sim-backend" }

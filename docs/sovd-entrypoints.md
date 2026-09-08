@@ -30,7 +30,8 @@ Plus one **SOVD-adjacent helper server** (HTTP, but not the `/vehicle/v1` API):
 Servers 1–3 are the sumo-stack deployments and share the same route library;
 4–5 are the upstream reference servers shipped with the SOVDd library itself.
 
-> Note: `vm-diagserver` (the second binary in `component-mgr`) is **not** an HTTP
+> Note: `vm-diagserver` (its own crate, `tools/crates/vm-diagserver`, over the
+> `component-mgr` library) is **not** an HTTP
 > server — it is a local CLI for NV-store / bank / factory operations
 > (`status`, `install`, `commit`, `rollback`, `read-did`, `factory-init`). It
 > never binds a port. The host SOVD HTTP server is `vm-sovd`.
@@ -46,15 +47,15 @@ repo — that serve the **same** wire from the **same** route library.
 
 ### `vm-sovd` (dev / simulation) — this repo
 
-- **Crate / bin:** `vm-sovd` (`crates/vm-sovd/src/main.rs`).
+- **Crate / bin:** `vm-sovd` (`services/vm-sovd/src/main.rs`).
 - **Runs on:** the host, Linux dev with file-backed NV + QEMU.
 - **Serves:** the host-owned components `host-os`, `vm1`, `vm2`, `hsm` (built via
   `component_factory::build_component`), the standard SOVD surface from
   `sovd_api::create_router`, plus the sumo vendor routes —
   `hsm_router` (HSM key inventory + `x-csr`) and `update_state_router`
-  (`x-ota-update-state`). See `crates/vm-sovd/src/main.rs`.
+  (`x-ota-update-state`). See `services/vm-sovd/src/main.rs`.
 - **Bind / port:** `0.0.0.0:4000` by default; override with `--bind <addr>` or a
-  positional bind-addr (`crates/vm-sovd/src/main.rs`).
+  positional bind-addr (`services/vm-sovd/src/main.rs`).
 - **Launched by:** `example/run.sh` (alongside the `hsm-sim-service` link-B
   backend and `vhsm-ssd`). Connect-only to the
   pre-spawned link-B HSM backend via `--backend-socket`. Also run in host mode
@@ -90,7 +91,7 @@ repo — that serve the **same** wire from the **same** route library.
 The guest's single SOVD front door. **Not a separate binary** — it is the same
 `vm-sovd` with `--gateway`, which swaps the default router for the federating
 gateway router (`build_gateway_router` → `component_mgr::sovd::gateway::gateway_router`,
-`crates/vm-sovd/src/main.rs`).
+`services/vm-sovd/src/main.rs`).
 
 It serves:
 
@@ -105,7 +106,7 @@ It serves:
   proxied host component is just another entry in the SOVD entity map — that is
   the federation.
 
-Flags (`crates/vm-sovd/src/main.rs`):
+Flags (`services/vm-sovd/src/main.rs`):
 
 - `--gateway` — enable gateway mode.
 - `--host-sovd-url <url>` — the host SOVD to proxy host components to.
@@ -122,7 +123,7 @@ the pull-update trust anchor (the sw-authority key). The mode is chosen by
 
 - **In-VM (`--guest-vhsm`)** — crypto comes from the guest vHSM via
   `vhsm_provider::VhsmProvider::connect_local()`, which forwards over the vHSM
-  wire to the host `vhsm-ssd` (`crates/vm-sovd/src/main.rs`). This is the
+  wire to the host `vhsm-ssd` (`services/vm-sovd/src/main.rs`). This is the
   deployed variant: it runs **inside a guest VM** (vm1) as the
   `vehicle-gateway` layer. Example launch
   (`examples/t2-seed-dev/channels/dev/layers/vehicle-gateway/autostart.sh`):
@@ -138,7 +139,7 @@ the pull-update trust anchor (the sw-authority key). The mode is chosen by
 
 - **On-host (no `--guest-vhsm`)** — crypto comes from the host link-B HSM backend
   client (`--backend-socket`); the same gateway router runs on the host
-  (`crates/vm-sovd/src/main.rs`). Supported by the same binary; used when
+  (`services/vm-sovd/src/main.rs`). Supported by the same binary; used when
   the gateway is co-located with the host rather than inside a VM.
 
 - **Runs on:** in-VM (guest) or on-host, per the mode above.

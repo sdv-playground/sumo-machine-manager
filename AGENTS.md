@@ -11,12 +11,13 @@ Rust workspace for platform-agnostic A/B bank management, VM lifecycle, SUIT OTA
 - `crates/machine-mgr/` — `Component` trait and registry abstraction.
 - `crates/component-mgr/` — SUIT validation, OTA engine, SOVD adapter.
 - `crates/vm-service/` — QEMU/qvm lifecycle and VM config.
-- `crates/nv-store/`, `crates/hsm/`, `crates/vhsm-ssd/` — persistence and crypto/HSM layers.
+- `crates/nv-store/`, `crates/hsm/`, `crates/vhsm-server/` — persistence and crypto/HSM layers.
 - `example/` — local generated firmware/server smoke flow.
 - `specs/` — bank state, disk layout, nv-store and app-installation specs.
 - `docs/` — design docs, incl. `sovd-entrypoints.md` (every SOVD server entrypoint in the workspace, classified), `hsm-backend-architecture.md` (the HSM link-B contract + the C vendor handoff) and `vhsm-integration-path.md`.
 - `crates/hsm-link-b/` — the frozen HSM link-B wire + C header (`include/`) + `reference/` C skeleton.
-- `tools/crates/` — `hsm-conformance` (backend conformance suite) and `hsm-sim-backend` (the `SimHsm` backend).
+- `services/` — the on-device deployables: `vm-sovd`, `vhsm-ssd` (the daemon over `crates/vhsm-server`), `sumo-verify`, `slog2-drainer`. Not SDK surface; see `docs/componentization.md` item 3d for the three-bucket rule.
+- `tools/crates/` — host-side CLIs and build/dev tooling: `hsm-conformance`, `hsm-sim-backend` (the `SimHsm` backend), `vm-diagserver`, `vm-service-standalone`, `host-metrics-serve`, `policy-build`, `ca-bundle-build`, `sumo-factory-reset-mint`.
 
 ## Essential commands
 

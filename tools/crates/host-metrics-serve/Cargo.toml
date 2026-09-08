@@ -1,0 +1,26 @@
+[package]
+name = "host-metrics-serve"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone runner for the host-metrics library — serves Prometheus /metrics on its own bind. Dev / standalone deployments only: in production the host machine manager embeds the host-metrics LIBRARY and serves on its own bind with a board-specific reader, and this binary is in neither supernova package. Split out of the library crate by docs/componentization.md item 3d so a library consumer no longer inherits the runner's dependencies."
+license = "MIT"
+
+# The binary keeps its name — only the PACKAGE it lives in changed, so
+# `host-metrics --bind …` on a workstation is untouched.
+[[bin]]
+name = "host-metrics"
+path = "src/main.rs"
+
+[dependencies]
+host-metrics = { path = "../../../crates/host-metrics" }
+# The runner owns the async runtime and the signal handling: `#[tokio::main]`,
+# tokio::net::TcpListener and the SIGTERM/SIGINT graceful-shutdown select.
+# These features (rt-multi-thread, macros, signal) were the library's problem
+# only because the bin shared its [dependencies] — the library itself needs no
+# tokio dependency of its own.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+axum = "0.8"
+tracing = "0.1"
+# Fleet logging init — a PROCESS concern, never a library one. This is the dep
+# that item 3d's measurement found leaking into five libraries.
+sumo-log = { path = "../../../crates/platform-integration/sumo-log" }

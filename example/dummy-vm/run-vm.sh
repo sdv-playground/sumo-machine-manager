@@ -55,7 +55,7 @@ trap cleanup EXIT INT TERM
 
 # --- Build ---
 echo "[run-vm] building vm-service..."
-cargo build --manifest-path "$ROOT_DIR/Cargo.toml" -p vm-service --quiet
+cargo build --manifest-path "$ROOT_DIR/Cargo.toml" -p vm-service-standalone --quiet
 
 # --- Create dummy image dir (so config is valid) ---
 IMAGE_DIR=$(grep 'image_dir:' "$CONFIG" | head -1 | awk '{print $2}')

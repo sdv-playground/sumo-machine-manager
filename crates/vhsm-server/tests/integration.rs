@@ -13,10 +13,10 @@ use std::sync::Arc;
 use hsm::HsmCryptoProvider;
 use hsm_sim_backend::SimHsm;
 
-use vhsm_ssd::handle_table::HandleTable;
-use vhsm_ssd::handler::{self, CallerId};
-use vhsm_ssd::iam::IamPolicy;
-use vhsm_ssd::proto::*;
+use vhsm_server::handle_table::HandleTable;
+use vhsm_server::handler::{self, CallerId};
+use vhsm_server::iam::IamPolicy;
+use vhsm_server::proto::*;
 
 static TEST_ID: AtomicU32 = AtomicU32::new(0);
 

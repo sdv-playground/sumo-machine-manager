@@ -1,8 +1,17 @@
 [package]
-name = "vhsm-ssd"
+name = "vhsm-server"
 version = "0.1.0"
 edition = "2021"
-description = "vHSM Secure Storage Daemon — host-side crypto service for guest VMs"
+# Renamed from `vhsm-ssd` by docs/componentization.md item 3d. The DAEMON keeps
+# that name — it is what consumers address (`cargo install … vhsm-ssd`, the
+# process on the device, the `aud` claim "vhsm-ssd" in vhsm-proto) and it now
+# lives in services/vhsm-ssd. This crate is the reusable server half: the v3
+# wire codec, handle table, CWT/IAM auth, dispatch, transport and TLS. Naming it
+# for the family it belongs to (vhsm-proto / vhsm-client / vhsm-provider /
+# vhsm-crossnode-client) is what let the split happen with ZERO churn for any
+# consumer — the alternative, renaming the binary's package, would have needed a
+# coordinated edit in supernova-machine-manager's CI.
+description = "vHSM server library — v3 handle-based wire protocol, CWT/IAM identity, dispatch and transport for the host-side crypto service. The daemon that runs it is services/vhsm-ssd."
 
 [dependencies]
 hsm = { path = "../hsm", features = ["crypto"] }
@@ -12,9 +21,6 @@ policy-partition = { path = "../policy-partition" }
 secstore = { path = "../secstore" }
 log-rotate = { path = "../log-rotate" }
 tracing = "0.1"
-# Fleet logging init: sumo_log::init_tracing installs the recorder + the
-# tracing→score_log capture bridge. Sibling crate → path dep.
-sumo-log = { path = "../platform-integration/sumo-log" }
 p256 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["verifying", "der"] }
 rand = "0.8"
@@ -29,11 +35,6 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 ciborium = "0.2"
 coset = "0.3"
 sha2 = "0.10"
-# SIGTERM/SIGINT backend reaper (main.rs): block the signals, then `sigwait`
-# in a dedicated thread that owns the spawned link-B backend `Child` and
-# kills + reaps it before exit so a clean stop doesn't orphan it. Already in
-# the dependency tree transitively; named directly so main can call it.
-libc = "0.2"
 # Cross-node mTLS transport (tls.rs): HSM-backed server identity via hsm-rustls,
 # sync rustls (ring) to match the std::net accept loop.
 hsm-rustls = { path = "../hsm-rustls" }
@@ -53,16 +54,7 @@ tempfile = "3"
 x509-cert = { version = "0.2", features = ["std", "pem", "builder"] }
 const-oid = { version = "0.9", features = ["db"] }
 sha2 = { version = "0.10", features = ["oid"] }
-# Full-daemon e2e (tests/full_daemon_e2e.rs): drive the REAL vhsm-ssd binary
-# the way a guest does — the v3 CWT handshake (enroll → authenticate) plus
-# crypto ops — through the actual guest wire client. `guest-auth` pulls in the
-# HELLO/AUTH/ENROLL layer. (The dev-dependency cycle vhsm-ssd <-> vhsm-client
-# is permitted by Cargo since the normal dependency graph stays acyclic.)
-vhsm-client = { path = "../vhsm-client", features = ["guest-auth"] }
-# SimHsm backend for the in-process tests + the full-daemon e2e (which also
-# spawns the `hsm-sim-service` bin from this crate).
+# SimHsm backend for the in-process tests + tests/backend_link_b.rs, which
+# spawns the `hsm-sim-service` bin. (The two binary-driven e2e tests moved to
+# services/vhsm-ssd with the daemon — they need CARGO_BIN_EXE_vhsm-ssd.)
 hsm-sim-backend = { path = "../../tools/crates/hsm-sim-backend" }
-
-[[bin]]
-name = "vhsm-ssd"
-path = "src/main.rs"

@@ -11,14 +11,8 @@ members = [
     "crates/hsm",
     "crates/hsm-contract",
     "crates/hsm-link-b",
-    # sumo-verify deliberately STAYS in runtime crates/ — it is a DEPLOYED
-    # launch gate (the supernova CI runtime bundle ships it next to vhsm-ssd,
-    # and the start script invokes it before launching each component), not
-    # developer tooling.
-    "crates/sumo-verify",
     "crates/policy-eval",
     "crates/policy-partition",
-    "crates/vhsm-ssd",
     "crates/vm-wire",
     "crates/vm-devices",
     "crates/secstore",
@@ -40,10 +34,12 @@ members = [
     "crates/puller",
     "crates/hsm-rustls",
     "crates/vhsm-proto",
+    # The vHSM server LIBRARY (was `vhsm-ssd`, which is now the daemon in
+    # services/ — see that crate's note on why the daemon kept the name).
+    "crates/vhsm-server",
     "crates/vhsm-client",
     "crates/vhsm-provider",
     "crates/vhsm-crossnode-client",
-    "crates/vm-sovd",
 
     # --- services/ — ON-DEVICE DEPLOYABLES (docs/componentization.md item 3d) --
     # Three buckets: crates/ = consumable libraries (someone DEPENDS on it),
@@ -53,22 +49,41 @@ members = [
     # nv-store and machine-mgr — and a `[[bin]]` sharing its crate's
     # [dependencies] is how library consumers silently inherit binary deps.
     #
-    # PILOT: slog2-drainer moved here first, alone, to prove the claim the rest
-    # of 3d rests on — supernova installs it BY PACKAGE NAME over git
-    # (`cargo install --git … slog2-drainer`), so cargo resolves it against the
-    # workspace, not the directory, and the move is invisible to consumers. No
-    # lock churn, no coordinated bump. The remaining moves follow once proven.
+    # slog2-drainer was the PILOT that proved the premise: supernova installs it
+    # BY PACKAGE NAME over git (`cargo install --git … slog2-drainer`), so cargo
+    # resolves against the workspace, not the directory — the move is invisible
+    # to consumers, and Cargo.lock is byte-unchanged by it. Every move below
+    # rides on that proof (docs/componentization.md, item 3d Feasibility).
     "services/slog2-drainer",                        # Tier-2 host: drain slog2 ring → sealed disk segments
+    "services/sumo-verify",                          # launch gate: external secure boot / start script runs it per component
+    "services/vhsm-ssd",                             # the vHSM daemon guests reach over /dev/vhsm (supernova installs it BY NAME)
+    "services/vm-sovd",                              # the SOVD/OTA HTTP server (3c splits it into its two halves)
     # -------------------------------------------------------------------------
 
     # Dev / offboard tooling, grouped under tools/crates/ to keep it separate
     # from the runtime crates/ above. Of the once-pending relocation candidates,
     # ca-bundle-build, policy-build and sumo-factory-reset-mint moved here
     # (offboard image builders / dev token minter, run by developers and CI);
-    # sumo-verify stayed in crates/ — see its note above.
+    # sumo-verify has since moved to services/ (item 3d) — it is a DEPLOYED launch
+    # gate, which is a third bucket, not "not developer tooling".
     # Build read-only CA-bundle images shipped as per-VM SUIT components.
     "tools/crates/ca-bundle-build",
     "tools/crates/hsm-conformance",
+    # Standalone runner for the host-metrics LIBRARY (dev/standalone only — in
+    # production supernova embeds the library). Split out by item 3d: the runner
+    # owns the tokio runtime + signal handling + sumo-log init, none of which a
+    # library consumer should inherit.
+    "tools/crates/host-metrics-serve",
+    # Standalone runner for the vm-service LIBRARY — the dev/Linux path
+    # (example/dummy-vm/run-vm.sh). On a device supernova embeds VmManager
+    # in-process, so no vm-service binary is deployed. Split out by item 3d:
+    # the old bin re-declared every library module, compiling the crate twice.
+    "tools/crates/vm-service-standalone",
+    # The NV/bank + factory-ops CLI over the component-mgr library (dev/CI only:
+    # build-all.sh and example/run.sh run it from target/debug). Split out by
+    # item 3d for the bucket rule — measured closure win here is ZERO, the bin
+    # uses nothing the library does not already need.
+    "tools/crates/vm-diagserver",
     # Software-HSM (SimHsm) backend + the `hsm-sim-service` link-B bin (was the
     # sim half of the `hsm` crate; S7b relocated it here). Not merely test
     # tooling: sim/dev deployments run it as their HSM — see its crate docs.

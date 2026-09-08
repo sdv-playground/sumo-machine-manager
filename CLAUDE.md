@@ -33,7 +33,10 @@ open question #1) — capability-only discrimination works today.
 
 ### Architecture
 
-Cargo workspace with 30 runtime crates (+ 2 tools crates under `tools/crates/`).
+Cargo workspace, three buckets (`docs/componentization.md` item 3d):
+**29 libraries** in `crates/` (the consumable surface — someone *depends on* it),
+**4 deployables** in `services/` (someone *runs* it on a target), **8 host-side
+tools** in `tools/crates/` (someone runs it on a workstation or in CI).
 The load-bearing ones, bottom-up:
 
 - **nv-store** (lib): sector-rotated NV regions (boot state, factory,
@@ -49,7 +52,10 @@ The load-bearing ones, bottom-up:
   `tools/crates/hsm-sim-backend` (`hsm_sim_backend::SimHsm`), and the hardware backend
   is an out-of-process link-B service (`hsm-link-b`), reached via `LinkBClient` — not an
   in-process Rust provider.
-- **vhsm-ssd** (lib+bin): host-side daemon terminating the v3 handle-based
+- **vhsm-server** (lib, in `crates/`) + **vhsm-ssd** (the daemon, in
+  `services/` — it keeps the package name because that is what consumers
+  address: `cargo install … vhsm-ssd`, the device process, and the CWT `aud`
+  claim): host-side daemon terminating the v3 handle-based
   vHSM wire protocol from guest `/dev/vhsm`. Transport is TCP on a
   private host bridge (`vbr-vhsm`, 10.0.200.0/24, default bind
   `10.0.200.1:5100`); guest identity is established by a CWT/IAM handshake
@@ -57,8 +63,10 @@ The load-bearing ones, bottom-up:
   static pre-gate.
 - **vm-devices** (lib): virtual CAN, health, and time simulators running
   on shared memory (ivshmem vs QNX native shm).
-- **vm-service** (lib+bin): QEMU / `qvm` lifecycle, per-bank VM config,
+- **vm-service** (lib): QEMU / `qvm` lifecycle, per-bank VM config,
   ivshmem-server management, QMP integration, IPC to the diagnostics daemon.
+  On a device supernova embeds `VmManager` in-process; the standalone `vm-service`
+  binary is the dev/Linux path and lives in `tools/crates/vm-service-standalone`.
 - **machine-mgr** (lib): platform-agnostic `Machine` / `Component` trait
   layer. Connects all updatable things under a single registry. Also owns
   the `BankActivator` trait + `BankActivatorError` enum.
@@ -69,7 +77,8 @@ The load-bearing ones, bottom-up:
   `Component` lifecycle. `ContainerImageComponent` validates detached
   `#container-image` payloads and imports them into Docker, Podman, or
   containerd.
-- **component-mgr** (lib + `vm-diagserver` bin): SUIT validation, encrypted firmware
+- **component-mgr** (lib; the `vm-diagserver` CLI over it is
+  `tools/crates/vm-diagserver`): SUIT validation, encrypted firmware
   streaming pipeline, OTA engine (install/commit/rollback), DID resolution,
   and the SOVD wire adapter. `ComponentBackend` is the per-component state machine
   and *is* the `DiagnosticBackend` — wired straight into SOVD (the old
@@ -99,7 +108,11 @@ machine-mgr    — Abstract trait layer connecting them all
   routing. Wire-format compatible with `sovd-client` and SOVD Explorer.
 - **sumo-onboard / sumo-crypto / sumo-codec** (from sumo-rs): SUIT manifest
   validation, streaming decryption (AES-GCM + ECDH-ES+A128KW), decompression.
-- **sumo-processor**: SUIT command-sequence interpreter.
+- ~~**sumo-processor**~~ (SUIT command-sequence interpreter): **no longer a
+  dependency.** It was listed in `component-mgr` but referenced by no target;
+  removed 2026-09-08 (`docs/componentization.md` item 3d), which drops it from
+  this workspace's resolved graph entirely — and from every consumer's, since
+  `component-mgr` was the only path to it.
 
 ### Key Concepts
 
@@ -128,7 +141,9 @@ crates/component-mgr/src/
   ota.rs                  — OTA engine: install, commit, rollback
   streaming.rs            — upload pipeline (decrypt + decompress + hash)
   did.rs                  — UDS DID resolution (F187-F19E + custom)
-  main.rs                 — vm-diagserver CLI (NV/bank + factory ops; NOT an HTTP server — the SOVD/OTA server is the vm-sovd crate)
+
+tools/crates/vm-diagserver/src/
+  main.rs                 — vm-diagserver CLI over the component-mgr lib (NV/bank + factory ops; NOT an HTTP server — the SOVD/OTA server is the vm-sovd crate in services/)
 
 crates/host-os-mgr/src/
   component.rs            — HostOsComponent (implements machine_mgr::Component)
@@ -151,12 +166,15 @@ tools/crates/hsm-sim-backend/src/
   crypto.rs               — SimHsm HsmCryptoProvider (RustCrypto)
   sim.rs                  — SimHsm backend (orchestrator spawns/owns it + vhsm-ssd)
 
-crates/vhsm-ssd/src/
+crates/vhsm-server/src/       (the LIBRARY — was crates/vhsm-ssd)
   proto.rs + codec.rs     — wire format (v3, handle-based)
   handle_table.rs         — dynamic handle allocator (0x0100+)
   auth.rs / iam.rs        — CWT handshake (Principal) + statement-based authz
   handler.rs              — op dispatch -> HsmCryptoProvider
   transport.rs            — TCP on `vbr-vhsm` private bridge
+
+services/vhsm-ssd/src/        (the DAEMON — keeps the package name)
+  main.rs                 — CLI, config, backend selection, listener wiring
 
 example/
   build_hsm_keys.rs       — Generate keys, encrypted firmware, CRL manifests

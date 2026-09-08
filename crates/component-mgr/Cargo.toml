@@ -25,7 +25,6 @@ utoipa = { version = "5", features = ["chrono"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_yaml = "0.9"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -34,7 +33,6 @@ chrono = { version = "0.4", features = ["serde"] }
 sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main", features = ["openapi"] }
 sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
-sumo-processor = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 hsm = { path = "../hsm", features = ["crypto"] }
@@ -42,7 +40,6 @@ hsm = { path = "../hsm", features = ["crypto"] }
 # factory-init's `--hsm-keystore` bring-up (main.rs) — the sim/dev HSM mode.
 # Hardware production reaches a vendor HSM service over link-B instead.
 hsm-sim-backend = { path = "../../tools/crates/hsm-sim-backend" }
-host-os-mgr = { path = "../host-os-mgr" }
 app-mgr = { path = "../app-mgr" }
 # Content-addressed fleet-repo pull (onboard/fleet PULL payload fetch).
 puller = { path = "../puller" }
@@ -76,6 +73,12 @@ sovd-docs-hook = []
 container = ["app-mgr/container"]
 
 [dev-dependencies]
+# Used by tests/component_adapter_tests.rs ONLY — the library itself never
+# names host_os_mgr. It sat in [dependencies] until item 3d measured the
+# closure, so every consumer of component-mgr (supernova included) linked the
+# host OS manager for nothing. Same pass dropped sumo-processor and
+# tracing-subscriber, which no target referenced at all.
+host-os-mgr = { path = "../host-os-mgr" }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 hyper = "1"
@@ -88,10 +91,6 @@ rand = "0.8"
 # machine-mgr; the re-declaration enables them for test builds only (cargo
 # unifies dev-features there).
 machine-mgr = { path = "../machine-mgr", features = ["test-seams"] }
-
-[[bin]]
-name = "vm-diagserver"
-path = "src/main.rs"
 
 [[example]]
 name = "build_hsm_keys"

@@ -26,7 +26,7 @@ guest-auth = ["dep:p256", "dep:sha2", "dep:rand"]
 [dev-dependencies]
 # The interop test drives the REAL daemon dispatch over a loopback TCP socket,
 # so the client's framing is proven byte-exact against the server it talks to.
-vhsm-ssd = { path = "../vhsm-ssd" }
+vhsm-server = { path = "../vhsm-server" }
 hsm = { path = "../hsm", features = ["crypto"] }
 hsm-sim-backend = { path = "../../tools/crates/hsm-sim-backend" }
 tempfile = "3"

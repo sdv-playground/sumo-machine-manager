@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use hsm::vhsm_proto;
 use hsm::{HsmCryptoProvider, KeyHandle};
 
-use vhsm_ssd::backend;
+use vhsm_server::backend;
 
 /// Locate the `hsm-sim-service` binary built into `target/<profile>/`. It's a
 /// bin of the sibling `hsm-sim-backend` crate, so `env!("CARGO_BIN_EXE_…")` can't name it;

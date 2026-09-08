@@ -46,8 +46,10 @@ use hsm_sim_backend::SimHsm;
 use vhsm_client::auth::{authenticate, enroll, AuthConfig};
 use vhsm_client::VhsmClient;
 
-use vhsm_ssd::bootstrap::BootstrapState;
-use vhsm_ssd::proto::{ALG_ECC_P256, HANDLE_JWT_SIGNING, PERM_GET_PUBKEY, PERM_SIGN, PERM_VERIFY};
+use vhsm_server::bootstrap::BootstrapState;
+use vhsm_server::proto::{
+    ALG_ECC_P256, HANDLE_JWT_SIGNING, PERM_GET_PUBKEY, PERM_SIGN, PERM_VERIFY,
+};
 
 /// Locate the `hsm-sim-service` binary built into `target/<profile>/` — a bin of
 /// the sibling `hsm-sim-backend` crate, so `env!("CARGO_BIN_EXE_…")` can't name it. Walk our
