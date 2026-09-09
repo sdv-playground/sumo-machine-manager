@@ -250,6 +250,15 @@ async fn health_vm(
                 "guest_state": detail.guest_state,
                 "hb_seq": detail.hb_seq,
                 "boot_id": detail.boot_id,
+                // Lifecycle observation. `for_ms` is the monotonic dwell time in
+                // `status` — the caller's deadline input ("started but not up"
+                // is `starting` held too long, and only the caller knows what
+                // "too long" is). `reason` explains a `stopped` / `failed`.
+                // Added fields, never renamed: component-mgr parses them
+                // optionally so a newer host tolerates an older vm-service.
+                "for_ms": detail.for_ms,
+                "since_unix_secs": detail.since_unix_secs,
+                "reason": detail.reason,
             })),
         ),
         Err(e) => error_response(e),

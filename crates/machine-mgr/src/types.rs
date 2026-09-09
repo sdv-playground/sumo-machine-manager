@@ -157,12 +157,26 @@ pub struct RuntimeState {
     pub detail: serde_json::Value,
 }
 
+/// Coarse runtime classification for a component.
+///
+/// Intentionally coarse: the precise observed status, how long it has been
+/// held, and why, ride in [`RuntimeState::detail`] (see
+/// `component_mgr::lifecycle::GuestLifecycle`). Adding resolution here would
+/// duplicate a vocabulary that already exists one layer down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeStatus {
     Running,
     Stopped,
     Booting,
+    /// Shutting down: signalled to stop, process still alive. Neither `Running`
+    /// nor `Stopped`, and NOT a fault — an observer waiting for the component
+    /// to go down should keep waiting, and one waiting for it to come up should
+    /// not. Without this the trait layer had to pick a wrong answer for a state
+    /// vm-service could already see.
+    ShuttingDown,
+    /// Not usable: a stale/degraded heartbeat while running, or down when
+    /// nobody asked for it (launch refused, spawn failed, unexpected exit).
     Faulted,
     Unknown,
 }

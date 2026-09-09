@@ -37,6 +37,8 @@ use machine_mgr::bank_provider::{BankProvider, FirmwareIdentity, InstalledFirmwa
 
 use crate::bank_provider::IvdBankProvider;
 use crate::did;
+use crate::lifecycle::GuestLifecycle;
+use machine_mgr::types::{RuntimeState, RuntimeStatus};
 use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware};
 use crate::ota;
 
@@ -1161,6 +1163,66 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
     pub fn has_vm_service(&self) -> bool {
         self.vm_service_addr.is_some()
+    }
+
+    /// A `HealthProbe` is the health source for components with no vm-service
+    /// behind them (RT/M7 via `m7loader -q`). Runtime state is observable for
+    /// those too, which is why `derive_capabilities` must not key
+    /// `has_runtime_state` on vm-service alone.
+    pub fn has_health_probe(&self) -> bool {
+        self.health_probe.is_some()
+    }
+
+    /// The component's observed lifecycle, from whichever health source backs
+    /// it. `None` when there is no health source at all (app-style components),
+    /// or when the query failed — a failed probe is deliberately not
+    /// synthesised into a state, because "I could not ask" is not an
+    /// observation about the component.
+    async fn query_lifecycle(&self) -> Option<GuestLifecycle> {
+        match &self.vm_service_addr {
+            Some(socket) => query_vm_lifecycle(socket, &self.entity_info.id)
+                .await
+                .ok()
+                .flatten(),
+            // No vm-service backing: an injected HealthProbe (e.g. RT/M7) is
+            // the health source — cheap by trait contract (cached).
+            None => self
+                .health_probe
+                .as_ref()
+                .and_then(|p| p.probe())
+                .as_ref()
+                .map(GuestLifecycle::from_probe),
+        }
+    }
+
+    /// `Component::runtime_state` for this backend — the coarse status plus
+    /// every observed fact as detail.
+    ///
+    /// Administratively disabled short-circuits to `Stopped`: the component is
+    /// down BY DESIGN, so probing would only burn the health timeout, and
+    /// `Faulted` would be a lie. (The *intent* axis that makes this a first-class
+    /// answer rather than a special case is step 2; `x-runtime.admin_state`
+    /// already carries the operator's decision.)
+    pub async fn runtime_state_snapshot(&self) -> RuntimeState {
+        if self.admin_disabled() {
+            let mut detail = serde_json::Map::new();
+            detail.insert("lifecycle_status".into(), serde_json::json!("stopped"));
+            detail.insert(
+                "lifecycle_reason".into(),
+                serde_json::json!("administratively disabled"),
+            );
+            return RuntimeState {
+                status: RuntimeStatus::Stopped,
+                detail: serde_json::Value::Object(detail),
+            };
+        }
+        match self.query_lifecycle().await {
+            Some(lc) => lc.runtime_state(),
+            None => RuntimeState {
+                status: RuntimeStatus::Unknown,
+                detail: serde_json::Value::Null,
+            },
+        }
     }
 
     /// Reset kind declared by this component's bank provider (folds in the
@@ -5163,22 +5225,14 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         let health = if admin_disabled {
             None
         } else {
-            match &self.vm_service_addr {
-                Some(socket) => query_vm_health(socket, &self.entity_info.id).await,
-                // No vm-service backing: an injected HealthProbe (e.g. RT/M7)
-                // is the health source — cheap by trait contract (cached).
-                None => self.health_probe.as_ref().and_then(|p| p.probe()),
-            }
+            self.query_lifecycle().await
         };
         let status = if admin_disabled {
             EntityStatus::NotReady
         } else if self.vm_service_addr.is_none() && self.health_probe.is_none() {
             // No health source at all (app-style components): presence = ready.
             EntityStatus::Ready
-        } else if health
-            .as_ref()
-            .is_some_and(|h| h.status == "running" && h.guest_state == 1)
-        {
+        } else if health.as_ref().is_some_and(|lc| lc.is_up()) {
             EntityStatus::Ready
         } else {
             EntityStatus::NotReady
@@ -5205,15 +5259,24 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         if let Some(nb) = &self.node_boot_id {
             runtime.insert("node_boot_id".into(), serde_json::json!(nb));
         }
-        if let Some(h) = &health {
-            runtime.insert("hb_seq".into(), serde_json::json!(h.hb_seq));
-            // Per-lifetime nonce — changes on every guest (re)boot (node reboot
-            // OR per-VM relaunch). The orchestrator's reboot witness: a changed
-            // boot_id proves a fresh guest lifetime and can't be faked by a
-            // stale heartbeat (which carries the OLD boot_id). Unlike boot_count
-            // (bumped only by a per-component ecu_reset), this also witnesses a
-            // node reboot.
-            runtime.insert("boot_id".into(), serde_json::json!(h.boot_id));
+        // The observed lifecycle: `hb_seq`, `boot_id`, `guest_state`, plus the
+        // `lifecycle_*` block (status, monotonic dwell time, wall-clock
+        // transition, reason). One writer for this and `runtime_state`, so
+        // /status and the trait layer cannot drift.
+        //
+        // `boot_id` is a per-lifetime nonce — it changes on every guest (re)boot
+        // (node reboot OR per-VM relaunch). The orchestrator's reboot witness: a
+        // changed boot_id proves a fresh guest lifetime and can't be faked by a
+        // stale heartbeat (which carries the OLD boot_id). Unlike boot_count
+        // (bumped only by a per-component ecu_reset), this also witnesses a node
+        // reboot.
+        //
+        // `lifecycle_for_ms` is the field an offboard waiter needs and never
+        // had: "starting" alone can't distinguish a guest 2s into boot from one
+        // wedged for 10 minutes, and no threshold is applied here — the
+        // observer owns the deadline.
+        if let Some(lc) = &health {
+            lc.insert_runtime_fields(&mut runtime);
         }
         // Tri-state admin read-back: disableable components carry
         // `admin_state: "enabled" | "disabled"`; non-disableable ones omit
@@ -6102,7 +6165,53 @@ async fn query_vm_health(addr: &str, vm_name: &str) -> Option<GuestHealth> {
         .and_then(VmHealthState::running)
 }
 
+/// Query the same endpoint as [`query_vm_health`] but keep the FULL observation
+/// — including the not-running cases, which `VmHealthState` collapses to a unit
+/// variant and `query_vm_health` drops entirely.
+///
+/// `Ok(None)` = vm-service does not know this VM (HTTP 404). That is distinct
+/// from `Ok(Some(lifecycle))` where the lifecycle says `stopped`: one means
+/// "not configured", the other "configured and deliberately down".
+async fn query_vm_lifecycle(addr: &str, vm_name: &str) -> Result<Option<GuestLifecycle>, String> {
+    match health_response(addr, vm_name).await? {
+        Some(json) => GuestLifecycle::from_json(&json).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Legacy strict view, kept bit-for-bit: `NotRunning` for a stopped VM or a
+/// 404, `Err` when a VM that reports itself non-stopped is missing any part of
+/// the heartbeat triple.
+///
+/// That last rule looks like an accident but is load-bearing at exactly one
+/// call site — `ecu_reset` refuses to establish a reset baseline it cannot
+/// trust (a `starting` guest with no heartbeat yet has no `boot_id`, so there
+/// is nothing to compare a post-reset reading against). Preserved here rather
+/// than "fixed" so this change alters no control flow; revisit it with the
+/// orchestrator wait in step 4.
 async fn query_vm_health_state(addr: &str, vm_name: &str) -> Result<VmHealthState, String> {
+    let Some(lifecycle) = query_vm_lifecycle(addr, vm_name).await? else {
+        return Ok(VmHealthState::NotRunning);
+    };
+    if lifecycle.is_down() {
+        return Ok(VmHealthState::NotRunning);
+    }
+    Ok(VmHealthState::Running(GuestHealth {
+        guest_state: lifecycle
+            .guest_state
+            .ok_or_else(|| "running health response missing guest_state".to_string())?,
+        hb_seq: lifecycle
+            .hb_seq
+            .ok_or_else(|| "running health response missing hb_seq".to_string())?,
+        boot_id: lifecycle
+            .boot_id
+            .ok_or_else(|| "running health response missing boot_id".to_string())?,
+        status: lifecycle.status,
+    }))
+}
+
+/// `GET /vms/{name}/health` over TCP loopback. `Ok(None)` on HTTP 404.
+async fn health_response(addr: &str, vm_name: &str) -> Result<Option<serde_json::Value>, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -6143,43 +6252,15 @@ async fn query_vm_health_state(addr: &str, vm_name: &str) -> Result<VmHealthStat
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| "invalid HTTP response status".to_string())?;
     if status_code == 404 {
-        return Ok(VmHealthState::NotRunning);
+        return Ok(None);
     }
     if status_code != 200 {
         return Err(format!("health endpoint returned HTTP {status_code}"));
     }
 
-    let json: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("invalid health JSON: {e}"))?;
-    let status = json
-        .get("status")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "health response missing status".to_string())?
-        .to_string();
-    if status == "stopped" {
-        return Ok(VmHealthState::NotRunning);
-    }
-
-    let guest_state = json
-        .get("guest_state")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| "running health response missing guest_state".to_string())?
-        as u32;
-    let hb_seq =
-        json.get("hb_seq")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| "running health response missing hb_seq".to_string())? as u32;
-    let boot_id =
-        json.get("boot_id")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| "running health response missing boot_id".to_string())? as u32;
-
-    Ok(VmHealthState::Running(GuestHealth {
-        guest_state,
-        hb_seq,
-        boot_id,
-        status,
-    }))
+    serde_json::from_str(body)
+        .map(Some)
+        .map_err(|e| format!("invalid health JSON: {e}"))
 }
 
 // ---------------------------------------------------------------------------

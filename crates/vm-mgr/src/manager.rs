@@ -26,7 +26,7 @@ use vm_devices::time::{TimeDevice, TIME_DEFAULT_INTERVAL};
 use vm_devices::transport::DeviceTransport;
 
 use crate::config::{BackendType, Bank, VmBankConfig, VmDefinition, VmServiceConfig};
-use crate::health_status::{HealthDetail, HealthStatus};
+use crate::health_status::{HealthDetail, HealthStatus, Lifecycle};
 use crate::runner::dummy::DummyRunner;
 #[cfg(target_os = "linux")]
 use crate::runner::qemu::QemuRunner;
@@ -94,6 +94,9 @@ struct ManagedVm {
     /// Bank and manager-local generation bound to the currently running
     /// process. Set only after runner.start succeeds and cleared on every stop.
     runtime_identity: Option<VmRuntimeIdentity>,
+    /// Observed lifecycle: which status this VM holds, since when, and why.
+    /// In-RAM only — see [`Lifecycle`].
+    lifecycle: Lifecycle,
 }
 
 pub struct VmManager {
@@ -294,6 +297,7 @@ impl VmManager {
                     time: None,
                     liveness: HeartbeatLiveness::new(),
                     runtime_identity: None,
+                    lifecycle: Lifecycle::default(),
                 },
             );
         }
@@ -449,6 +453,10 @@ impl VmManager {
                 "no active bank selected for VM — skipping launch (boot selector \
                  has no selection for this set)"
             );
+            // Not a failure: there is no code to run, so nothing failed. An
+            // observer needs the reason to tell this apart from a crash — the
+            // remedy is a flash, not a retry.
+            vm.lifecycle.note("no active bank selected", false);
             return Ok(());
         };
         let bank_dir = vm.def.resolved_bank_dir(bank);
@@ -492,6 +500,8 @@ impl VmManager {
                     "VM {name}: kernel not found: {} — deferring start",
                     kernel.display()
                 );
+                vm.lifecycle
+                    .note(format!("kernel not found: {}", kernel.display()), true);
                 return Err(ManagerError::Runner(crate::runner::RunnerError::Config(
                     format!("kernel not found: {}", kernel.display()),
                 )));
@@ -530,6 +540,11 @@ impl VmManager {
                         error = %e,
                         "pre-launch verify FAILED — refusing to launch (fail-closed)",
                     );
+                    // The single most important reason to publish: the guest is
+                    // down because its bank does not verify. Nothing about
+                    // waiting longer will fix it, and an orchestrator that
+                    // could only see `stopped` had no way to know that.
+                    vm.lifecycle.note(format!("pre-launch verify failed: {e}"), true);
                     return Err(ManagerError::VerifyRefused(e));
                 }
             }
@@ -617,8 +632,15 @@ impl VmManager {
             }
         }
 
-        let handle = vm.runner.start(name, &effective_def)?;
+        let handle = match vm.runner.start(name, &effective_def) {
+            Ok(h) => h,
+            Err(e) => {
+                vm.lifecycle.note(format!("launch failed: {e}"), true);
+                return Err(e.into());
+            }
+        };
         tracing::info!("started VM {name} (pid: {:?})", handle.pid);
+        vm.lifecycle.note_started();
         vm.handle = Some(handle);
         self.next_launch_generation = self.next_launch_generation.wrapping_add(1);
         let identity = VmRuntimeIdentity {
@@ -640,12 +662,19 @@ impl VmManager {
             .get_mut(name)
             .ok_or_else(|| ManagerError::NotFound(name.to_string()))?;
 
+        // NOTE the stop request only when there is something to stop. A VM that
+        // is already down keeps whatever reason put it there — `stop_all_for_reboot`
+        // calls this for EVERY VM, and a guest that was refused a launch (bank
+        // failed to verify) must not have that erased by the reboot sweep.
         let handle = vm
             .handle
             .as_ref()
             .ok_or_else(|| ManagerError::NotRunning(name.to_string()))?;
 
         if !vm.runner.is_running(handle) {
+            // Already gone. The operator asked for a stop and the VM is
+            // stopped — the outcome is intended even if the exit wasn't.
+            vm.lifecycle.note_stop_requested();
             vm.runner.cleanup();
             vm.handle = None;
             vm.runtime_identity = None;
@@ -660,6 +689,9 @@ impl VmManager {
         // exit. Invalidate the launch identity before that window so no
         // post-launch observer can witness a process whose shutdown has begun.
         vm.runtime_identity = None;
+        // Same window, same reason: an observer polling health during the
+        // graceful wait must read `shutting_down` → `stopped`, never `failed`.
+        vm.lifecycle.note_stop_requested();
 
         // Send PowerCommand::Shutdown via the host→guest power channel.
         // If no power device exists (no transport configured / no health
@@ -771,11 +803,10 @@ impl VmManager {
                 VmInfo {
                     name: name.clone(),
                     status: detail.status,
-                    pid: if matches!(detail.status, HealthStatus::Stopped) {
-                        None
-                    } else {
-                        pid
-                    },
+                    // No pid for a down VM — `Failed` included. Reporting the
+                    // pid of a process that already exited makes a UI show a
+                    // live-looking tile for a guest that is gone.
+                    pid: if detail.status.is_down() { None } else { pid },
                     backend: vm.def.backend,
                 }
             })
@@ -839,40 +870,79 @@ impl VmManager {
 
 /// Compute current `HealthDetail`. Pulled out so `health_detail` and `list`
 /// share one mapping and the same liveness-tracker mutation rules.
+///
+/// Two-part: [`observe_status`] derives the status from process state +
+/// heartbeat (stateless), then the VM's [`Lifecycle`] stamps *since when* and
+/// *why* onto it. Splitting them keeps the derivation testable and guarantees
+/// every reported status carries its evidence.
 fn read_health(vm: &mut ManagedVm) -> HealthDetail {
-    let empty = HealthDetail {
-        status: HealthStatus::Stopped,
-        guest_state: None,
-        hb_seq: None,
-        boot_id: None,
+    let now = Instant::now();
+    let (status, guest_state, hb_seq, boot_id) = observe_status(vm, now);
+    let (for_ms, since_unix_secs) = vm.lifecycle.observe(status, now);
+    HealthDetail {
+        status,
+        guest_state,
+        hb_seq,
+        boot_id,
+        for_ms,
+        since_unix_secs,
+        // Only meaningful while it explains the current status. A `Running` VM
+        // reporting "kernel not found" from two lifetimes ago would be worse
+        // than no reason at all.
+        reason: match status {
+            HealthStatus::Stopped | HealthStatus::Failed => vm.lifecycle.reason(),
+            _ => None,
+        },
+    }
+}
+
+/// Derive the coarse status plus the heartbeat observation that justifies it.
+/// Mutates only the liveness tracker (its whole job is remembering the last
+/// seq) — the lifecycle record is stamped by the caller.
+fn observe_status(
+    vm: &mut ManagedVm,
+    now: Instant,
+) -> (HealthStatus, Option<u32>, Option<u32>, Option<u32>) {
+    // Process state takes precedence — a down VM has no live heartbeat.
+    // `Failed` vs `Stopped` is not derivable from the process (there is no
+    // process); it comes from whether anyone asked for this.
+    let down = |vm: &ManagedVm| {
+        let status = if vm.lifecycle.is_failed() {
+            HealthStatus::Failed
+        } else {
+            HealthStatus::Stopped
+        };
+        (status, None, None, None)
     };
 
-    // Process state takes precedence — a Stopped VM has no live heartbeat.
     let handle = match &vm.handle {
         Some(h) => h,
-        None => return empty,
+        None => return down(vm),
     };
     if !vm.runner.is_running(handle) {
-        return empty;
+        // The process is gone but the handle is still here: it exited on its
+        // own. If nobody requested a stop, that is a fault — record it once so
+        // it survives the handle being cleared by the next start/stop path.
+        if !vm.lifecycle.stop_requested() && !vm.lifecycle.is_failed() {
+            vm.lifecycle
+                .note("process exited without a stop request", true);
+        }
+        return down(vm);
     }
 
-    // No heartbeat device wired up — process is up, can't say more.
+    // No heartbeat device wired up — the process is up and that is ALL we
+    // know. Reported `Running` before, which was a guess: process liveness
+    // says nothing about whether the guest reached userspace.
     let Some(ref hb_dev) = vm.heartbeat else {
-        return HealthDetail {
-            status: HealthStatus::Running,
-            ..empty
-        };
+        return (HealthStatus::Unknown, None, None, None);
     };
 
     // Read heartbeat. None = guest hasn't written yet, or wire is bad.
     let Some(hb) = hb_dev.read() else {
-        return HealthDetail {
-            status: HealthStatus::Starting,
-            ..empty
-        };
+        return (HealthStatus::Starting, None, None, None);
     };
 
-    let stale = vm.liveness.observe(hb.seq, Instant::now());
+    let stale = vm.liveness.observe(hb.seq, now);
     let status = if stale {
         HealthStatus::Unhealthy
     } else {
@@ -884,12 +954,12 @@ fn read_health(vm: &mut ManagedVm) -> HealthDetail {
         }
     };
 
-    HealthDetail {
+    (
         status,
-        guest_state: Some(hb.state as u32),
-        hb_seq: Some(hb.seq),
-        boot_id: Some(hb.boot_id),
-    }
+        Some(hb.state as u32),
+        Some(hb.seq),
+        Some(hb.boot_id),
+    )
 }
 
 #[cfg(test)]
@@ -1029,12 +1099,98 @@ vms:
             "expected VerifyRefused(\"bad signature\"), got {err:?}",
         );
 
-        // Refused before the runner started ⇒ nothing running.
-        let running = mgr
-            .list()
-            .iter()
-            .any(|v| !matches!(v.status, HealthStatus::Stopped));
+        // Refused before the runner started ⇒ nothing running, and the refusal
+        // is OBSERVABLE: `Failed` (not `Stopped` — nobody asked for this) with
+        // the verify message as the reason. This is the case an orchestrator
+        // previously had to wait out a full timeout to distinguish from a
+        // deliberately-stopped guest.
+        let running = mgr.list().iter().any(|v| !v.status.is_down());
         assert!(!running, "no VM should be running after a refused launch");
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.status, HealthStatus::Failed);
+        assert_eq!(
+            detail.reason.as_deref(),
+            Some("pre-launch verify failed: bad signature")
+        );
+        assert!(detail.since_unix_secs.is_some(), "the transition is stamped");
+    }
+
+    #[test]
+    fn a_skipped_launch_is_stopped_with_a_reason_not_failed() {
+        // No bank selected: nothing to run, so nothing FAILED. The distinction
+        // matters — `Failed` tells an orchestrator to stop waiting and report a
+        // fault, while this is an unprovisioned set awaiting a flash.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
+        mgr.set_vm_bank("vm1", None).unwrap();
+        mgr.start_vm("vm1").expect("a skipped launch is not an error");
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.status, HealthStatus::Stopped);
+        assert_eq!(detail.reason.as_deref(), Some("no active bank selected"));
+    }
+
+    #[test]
+    fn a_stop_request_makes_the_down_state_stopped_not_failed() {
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        mgr.start_vm("vm1").unwrap();
+        mgr.stop_vm("vm1").unwrap();
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.status, HealthStatus::Stopped);
+        assert_eq!(detail.reason.as_deref(), Some("stop requested"));
+    }
+
+    #[test]
+    fn a_reboot_sweep_does_not_erase_an_earlier_launch_failure() {
+        // stop_all_for_reboot calls initiate_stop for EVERY VM. A guest that
+        // was refused a launch has no process to stop, and its failure reason
+        // is exactly what an operator needs after the reboot — the sweep must
+        // not overwrite it with "stop requested".
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
+        mgr = mgr.with_pre_launch_verify(Arc::new(|_n, _d| Err("bad signature".to_string())));
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        let _ = mgr.start_vm("vm1");
+
+        mgr.stop_all_for_reboot(0);
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.status, HealthStatus::Failed);
+        assert_eq!(
+            detail.reason.as_deref(),
+            Some("pre-launch verify failed: bad signature"),
+        );
+    }
+
+    #[test]
+    fn a_launched_process_that_is_already_gone_reads_failed() {
+        // The DummyRunner's `is_running` is always false — i.e. it models a
+        // process that vanished immediately after a successful spawn. That is
+        // precisely the qvm-died-on-launch case, and it must read as `Failed`
+        // (nobody asked for it) rather than `Stopped`, with the reason saying
+        // the process left on its own.
+        //
+        // It also pins that a start clears the PREVIOUS lifetime's reason: the
+        // stale "no active bank selected" must not follow the VM forward.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
+        mgr.set_vm_bank("vm1", None).unwrap();
+        mgr.start_vm("vm1").unwrap(); // skipped: no bank ⇒ reason recorded
+        assert_eq!(
+            mgr.health_detail("vm1").unwrap().reason.as_deref(),
+            Some("no active bank selected")
+        );
+
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        mgr.start_vm("vm1").unwrap();
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.status, HealthStatus::Failed);
+        assert_eq!(
+            detail.reason.as_deref(),
+            Some("process exited without a stop request"),
+            "the reason must describe THIS lifetime, not the previous one"
+        );
     }
 
     #[test]

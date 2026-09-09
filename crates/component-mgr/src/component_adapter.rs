@@ -19,7 +19,7 @@ use machine_mgr::{
     ActivationState, Capabilities, ClearFaultsResult, Component, Csr, DidFilter, DidKind,
     DtcFilter, EnvelopeStream, Fault, FlashCaps, FlashId, FlashSession, FlashStatus, HsmCaps,
     KeyDescriptor, KeyInventory, LifecycleCaps, MachineError, MachineResult, RuntimeState,
-    RuntimeStatus, SlotKind,
+    SlotKind,
 };
 
 use crate::backend::{ComponentBackend, DID_REGISTRY};
@@ -122,7 +122,11 @@ fn derive_capabilities<D: BlockDevice + Send + 'static>(b: &ComponentBackend<D>)
         }),
         lifecycle: Some(LifecycleCaps {
             restartable: true,
-            has_runtime_state: b.has_vm_service(),
+            // Any health source makes runtime state observable — vm-service for
+            // guests, an injected HealthProbe for activator-backed components
+            // (RT/M7). Keying this on vm-service alone under-reported rt, whose
+            // `/status` has carried probe-derived health all along.
+            has_runtime_state: b.has_vm_service() || b.has_health_probe(),
         }),
         hsm: b.has_hsm_provider().then_some(HsmCaps {
             supports_csr: true,
@@ -340,11 +344,16 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
     }
 
     async fn runtime_state(&self) -> MachineResult<RuntimeState> {
-        // PR 2: stub. PR 3 will wire vm-service health query and parse it.
-        Ok(RuntimeState {
-            status: RuntimeStatus::Unknown,
-            detail: serde_json::Value::Null,
-        })
+        // The observed lifecycle from whichever health source backs this
+        // component (vm-service HTTP, or a HealthProbe for RT/M7). `detail`
+        // carries the precise status, its monotonic dwell time, and the reason
+        // — the resolution `RuntimeStatus` deliberately doesn't have.
+        //
+        // Infallible on purpose: a health source that can't be reached yields
+        // `Unknown`, not an error. "I could not ask" is a fact about the query,
+        // not about the component, and turning it into an Err would make a
+        // status read fail exactly when an operator most needs an answer.
+        Ok(self.inner.runtime_state_snapshot().await)
     }
 
     // ---------------------------------------------------------------

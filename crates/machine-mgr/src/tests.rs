@@ -575,6 +575,7 @@ fn runtime_status_all_snake_case() {
         RuntimeStatus::Running,
         RuntimeStatus::Stopped,
         RuntimeStatus::Booting,
+        RuntimeStatus::ShuttingDown,
         RuntimeStatus::Faulted,
         RuntimeStatus::Unknown,
     ] {
@@ -582,6 +583,11 @@ fn runtime_status_all_snake_case() {
         let back: RuntimeStatus = serde_json::from_str(&j).unwrap();
         assert_eq!(back, s);
     }
+    // Multi-word variants are where rename_all slips show up.
+    assert_eq!(
+        serde_json::to_string(&RuntimeStatus::ShuttingDown).unwrap(),
+        "\"shutting_down\""
+    );
 }
 
 #[test]

@@ -57,6 +57,7 @@ pub mod component_adapter;
 pub mod did;
 pub mod dispatcher;
 pub mod install_router_diag;
+pub mod lifecycle;
 pub mod manifest;
 pub mod manifest_provider;
 pub mod ota;
