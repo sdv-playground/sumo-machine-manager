@@ -39,6 +39,129 @@ use serde_json::{Map, Value};
 
 use crate::backend::GuestHealth;
 
+/// What a component is *supposed* to be doing — the declared-intent axis.
+///
+/// Redefined here rather than imported from `vm-mgr` for the same reason
+/// `status` is kept as a string: this crate must degrade, not error, when a
+/// newer source publishes a word it does not know. Parsing lives in
+/// [`parse_expected`], and everything it cannot recognise — including the
+/// absence of the field and vm-service's own "no intent recorded" — arrives as
+/// `None`, which yields no verdict at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedState {
+    Running,
+    Stopped,
+}
+
+impl ExpectedState {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExpectedState::Running => "running",
+            ExpectedState::Stopped => "stopped",
+        }
+    }
+}
+
+/// Whether the observation agrees with the declared intent — the verdict that
+/// used to be re-guessed by every consumer, computed once, here.
+///
+/// Three invariants an observer may rely on, and which keep this from growing
+/// into a policy engine:
+///
+/// * **No clock is read.** The verdict is a function of the two state words
+///   alone. How long a disagreement has lasted, and how long is too long, stay
+///   with the observer — `min(for_ms, expected_for_ms)` is the dwell, and only
+///   the caller's campaign knows the deadline.
+/// * **`Diverged` is not a prediction.** It says the observation contradicts
+///   the recorded intent *right now*, nothing about whether it will resolve:
+///   intent `stopped` + observed `running` is self-resolving (a shutdown in
+///   flight), while intent `running` + observed `failed` is terminal — because
+///   `failed` already is, not because of this verdict.
+/// * **It is recomputable.** Every input is published in the same body, so a
+///   client can derive the same answer and explain it. Nothing here is a
+///   judgement only the device could make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Convergence {
+    /// Observation matches intent. Note that this is not the same as *usable*:
+    /// a component converged on `stopped` is working as asked and still cannot
+    /// serve a request.
+    Converged,
+    /// On its way — the disagreement is expected to resolve without action.
+    Transitioning,
+    /// The observation contradicts the intent. Something asked for this
+    /// component's state and did not get it.
+    Diverged,
+}
+
+impl Convergence {
+    fn as_str(self) -> &'static str {
+        match self {
+            Convergence::Converged => "converged",
+            Convergence::Transitioning => "transitioning",
+            Convergence::Diverged => "diverged",
+        }
+    }
+}
+
+/// Parse the intent word from a health body. Unrecognised values — including
+/// vm-service's `null` for "nothing has asked", and any word a newer source
+/// invents — degrade to `None`, i.e. no basis for a verdict.
+fn parse_expected(json: &Value) -> Option<ExpectedState> {
+    match json.get("expected").and_then(|v| v.as_str()) {
+        Some("running") => Some(ExpectedState::Running),
+        Some("stopped") => Some(ExpectedState::Stopped),
+        _ => None,
+    }
+}
+
+/// The reason string a disabled component reports, shared by both views so they
+/// cannot word it differently.
+pub const ADMIN_DISABLED_REASON: &str = "administratively disabled";
+
+/// Write the three intent keys, omitting whatever is unknown.
+fn insert_expectation(
+    runtime: &mut Map<String, Value>,
+    expected: Option<ExpectedState>,
+    expected_by: Option<&str>,
+    expected_for_ms: Option<u64>,
+) {
+    if let Some(expected) = expected {
+        runtime.insert("lifecycle_expected".into(), Value::from(expected.as_str()));
+    }
+    if let Some(by) = expected_by {
+        runtime.insert("lifecycle_expected_by".into(), Value::from(by));
+    }
+    if let Some(for_ms) = expected_for_ms {
+        runtime.insert("lifecycle_expected_for_ms".into(), Value::from(for_ms));
+    }
+}
+
+/// The `x-runtime` / `RuntimeState::detail` body for an administratively
+/// disabled component — the one case with an intent but no observation.
+///
+/// Both views go through here so they cannot drift, which they already had:
+/// `runtime_state_snapshot` hand-built `lifecycle_status: "stopped"` while
+/// `read_entity_status` published no `lifecycle_*` at all.
+///
+/// Deliberately **no** `lifecycle_convergence`: nothing was polled (probing a
+/// component that is down by design would only burn the health timeout), so
+/// there is no observation to compare the intent against. Claiming `converged`
+/// here would assert a check that never happened — exactly the dishonesty the
+/// two-axis model exists to remove.
+pub fn insert_admin_disabled_fields(runtime: &mut Map<String, Value>) {
+    runtime.insert("lifecycle_status".into(), Value::from("stopped"));
+    runtime.insert(
+        "lifecycle_reason".into(),
+        Value::from(ADMIN_DISABLED_REASON),
+    );
+    insert_expectation(
+        runtime,
+        Some(ExpectedState::Stopped),
+        Some("admin_disable"),
+        None,
+    );
+}
+
 /// A component's observed runtime lifecycle at one instant.
 ///
 /// Mirrors the JSON of vm-service's `GET /vms/{name}/health`. Every field
@@ -75,6 +198,23 @@ pub struct GuestLifecycle {
     /// the verify refusal, the missing kernel, "no active bank selected",
     /// "stop requested", "process exited without a stop request".
     pub reason: Option<String>,
+    /// The declared intent. `None` when the source publishes none — an older
+    /// vm-service, a probe, or a VM nothing has ever asked to run. **Not** the
+    /// same as `Some(Stopped)`: no request is not a request to stay down, and
+    /// collapsing the two is what would let a node whose start orchestrator
+    /// died report as healthy and settled.
+    pub expected: Option<ExpectedState>,
+    /// Who asked — `autostart`, `api`, `stop_api`, `reboot_sweep`,
+    /// `admin_disable`. Kept as a string for the same forward-compatibility
+    /// reason as `status`: provenance is for a human to read, and an unknown
+    /// word must pass through rather than be dropped.
+    pub expected_by: Option<String>,
+    /// How long the intent has held, in milliseconds on the source's MONOTONIC
+    /// clock. Not redundant with `for_ms`: that one restarts on every observed
+    /// transition, so a flapping guest keeps resetting it. A disagreement starts
+    /// at the later of the two transitions, which makes
+    /// `min(for_ms, expected_for_ms)` exactly the divergence dwell.
+    pub expected_for_ms: Option<u64>,
 }
 
 impl GuestLifecycle {
@@ -99,6 +239,12 @@ impl GuestLifecycle {
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            expected: parse_expected(json),
+            expected_by: json
+                .get("expected_by")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            expected_for_ms: json.get("expected_for_ms").and_then(|v| v.as_u64()),
         })
     }
 
@@ -117,6 +263,14 @@ impl GuestLifecycle {
             for_ms: None,
             since_unix_secs: None,
             reason: None,
+            // A probe observes; it does not decide. The only intent this crate
+            // holds for a probe-backed component is the negative-polarity
+            // `admin_disabled()`, and inferring "enabled ⇒ expected running"
+            // from it would smuggle config-derived intent back in — wrong for a
+            // node whose M7 is deliberately unflashed.
+            expected: None,
+            expected_by: None,
+            expected_for_ms: None,
         }
     }
 
@@ -143,6 +297,60 @@ impl GuestLifecycle {
     /// a component that can answer requests.
     pub fn is_up(&self) -> bool {
         self.status == "running" && self.guest_state == Some(1)
+    }
+
+    /// Compare the two axes. `None` whenever a verdict would have no basis —
+    /// see [`Convergence`] for the invariants this upholds.
+    ///
+    /// | intent | observed | verdict |
+    /// |---|---|---|
+    /// | `running` | up (`running` + guest state 1) | converged |
+    /// | `running` | `stopped`, `failed` | **diverged** |
+    /// | `running` | `starting`, `shutting_down`, `unhealthy`, `running` not yet up | transitioning |
+    /// | `running` | `unknown` | *no verdict* |
+    /// | `stopped` | down (`stopped` or `failed`) | converged |
+    /// | `stopped` | `starting`, `shutting_down` | transitioning |
+    /// | `stopped` | `running`, `unhealthy`, `unknown` | **diverged** |
+    /// | absent | anything | *no verdict* |
+    ///
+    /// `unknown` is asymmetric on purpose. It means "the process is up but there
+    /// is no heartbeat device to ask", which is *no evidence* about readiness
+    /// under intent `running` (so: omit — `Option` is already this type's word
+    /// for "cannot tell") but *positive evidence of contradiction* under intent
+    /// `stopped`, where a live process is the whole question. The consequence is
+    /// deliberate and visible in the status word itself: a VM configured with no
+    /// health device never gets a readiness verdict.
+    ///
+    /// `failed` under intent `stopped` is converged, not diverged: down is what
+    /// was asked for, and how it got there is what `lifecycle_reason` is for.
+    pub fn convergence(&self) -> Option<Convergence> {
+        let expected = self.expected?;
+        let status = self.status.as_str();
+        match expected {
+            ExpectedState::Running => {
+                if self.is_up() {
+                    Some(Convergence::Converged)
+                } else {
+                    match status {
+                        "stopped" | "failed" => Some(Convergence::Diverged),
+                        // `running` without a healthy guest state lands here:
+                        // the process is up and the guest has not arrived yet.
+                        "starting" | "shutting_down" | "unhealthy" | "running" => {
+                            Some(Convergence::Transitioning)
+                        }
+                        // `unknown`, and anything a newer source invents: no
+                        // evidence, so no verdict.
+                        _ => None,
+                    }
+                }
+            }
+            ExpectedState::Stopped => match status {
+                "stopped" | "failed" => Some(Convergence::Converged),
+                "starting" | "shutting_down" => Some(Convergence::Transitioning),
+                "running" | "unhealthy" | "unknown" => Some(Convergence::Diverged),
+                _ => None,
+            },
+        }
     }
 
     /// Map onto the coarse `Component`-trait status. Lossy by design: the
@@ -197,6 +405,31 @@ impl GuestLifecycle {
         }
         if let Some(reason) = &self.reason {
             runtime.insert("lifecycle_reason".into(), Value::from(reason.clone()));
+        }
+        self.insert_expectation_fields(runtime);
+    }
+
+    /// Write the intent axis and the verdict derived from both axes.
+    ///
+    /// The `lifecycle_` prefix is deliberate: the observed half is uniformly
+    /// prefixed, and a bare `expected_state` would sit next to `admin_state`
+    /// meaning something entirely different (that one is the persisted operator
+    /// decision, this one is what the running system was last asked to do).
+    pub fn insert_expectation_fields(&self, runtime: &mut Map<String, Value>) {
+        insert_expectation(
+            runtime,
+            self.expected,
+            self.expected_by.as_deref(),
+            self.expected_for_ms,
+        );
+        // Omitted, never `null`, and never invented: no intent (or no evidence)
+        // means no verdict, which a reader must be able to tell apart from
+        // "checked, and it disagrees".
+        if let Some(convergence) = self.convergence() {
+            runtime.insert(
+                "lifecycle_convergence".into(),
+                Value::from(convergence.as_str()),
+            );
         }
     }
 }
@@ -347,6 +580,209 @@ mod tests {
         assert!(lc.is_up());
         assert_eq!(lc.for_ms, None, "a probe has no dwell clock — don't invent 0");
         assert_eq!(lc.runtime_status(), RuntimeStatus::Running);
+    }
+
+    /// Recompute the verdict from a published body, using only the keys a
+    /// remote client can see. Invariant (c) on [`Convergence`]: no input to the
+    /// verdict is private to the device.
+    fn recompute(runtime: &Map<String, Value>) -> Option<Convergence> {
+        let expected = runtime.get("lifecycle_expected")?.as_str()?;
+        let status = runtime.get("lifecycle_status")?.as_str()?;
+        let up =
+            status == "running" && runtime.get("guest_state").and_then(Value::as_u64) == Some(1);
+        match expected {
+            "running" if up => Some(Convergence::Converged),
+            "running" => match status {
+                "stopped" | "failed" => Some(Convergence::Diverged),
+                "starting" | "shutting_down" | "unhealthy" | "running" => {
+                    Some(Convergence::Transitioning)
+                }
+                _ => None,
+            },
+            "stopped" => match status {
+                "stopped" | "failed" => Some(Convergence::Converged),
+                "starting" | "shutting_down" => Some(Convergence::Transitioning),
+                "running" | "unhealthy" | "unknown" => Some(Convergence::Diverged),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn convergence_table_covers_every_status_under_both_intents() {
+        use Convergence::*;
+        // Every observed status against both intents, including the omissions.
+        // This table IS the contract — the reason the device publishes a verdict
+        // at all is that each consumer was deriving a different one of these.
+        let cases: &[(&str, &str, Option<u32>, Option<Convergence>)] = &[
+            // Asked to run.
+            ("running", "running", Some(1), Some(Converged)),
+            // Process up, guest not there yet (or degraded): on its way, and NOT
+            // converged — "the process exists" was never the question.
+            ("running", "running", Some(2), Some(Transitioning)),
+            ("running", "running", None, Some(Transitioning)),
+            ("running", "starting", None, Some(Transitioning)),
+            ("running", "unhealthy", None, Some(Transitioning)),
+            ("running", "shutting_down", None, Some(Transitioning)),
+            // The two that used to be indistinguishable from a deliberate stop.
+            ("running", "stopped", None, Some(Diverged)),
+            ("running", "failed", None, Some(Diverged)),
+            // `unknown` = no heartbeat device to ask. No evidence about
+            // readiness ⇒ no verdict, rather than a guess in either direction.
+            ("running", "unknown", None, None),
+            ("running", "hibernating", None, None),
+            // Asked to stay down.
+            ("stopped", "stopped", None, Some(Converged)),
+            // `failed` under intent `stopped` is converged: down is what was
+            // asked for. HOW it got down is what `lifecycle_reason` carries.
+            ("stopped", "failed", None, Some(Converged)),
+            ("stopped", "shutting_down", None, Some(Transitioning)),
+            ("stopped", "starting", None, Some(Transitioning)),
+            // A live process is exactly the contradiction here — which is why
+            // `unknown` diverges under this intent while omitting under the
+            // other one.
+            ("stopped", "running", Some(1), Some(Diverged)),
+            ("stopped", "unhealthy", None, Some(Diverged)),
+            ("stopped", "unknown", None, Some(Diverged)),
+            ("stopped", "hibernating", None, None),
+        ];
+
+        for (expected, status, guest_state, want) in cases {
+            let mut body = serde_json::json!({"status": status, "expected": expected});
+            if let Some(gs) = guest_state {
+                body["guest_state"] = Value::from(*gs);
+            }
+            let lc = GuestLifecycle::from_json(&body).unwrap();
+            assert_eq!(
+                lc.convergence(),
+                *want,
+                "expected={expected} status={status} guest_state={guest_state:?}"
+            );
+
+            // And the same verdict falls out of the published body alone.
+            let mut runtime = Map::new();
+            lc.insert_runtime_fields(&mut runtime);
+            assert_eq!(
+                recompute(&runtime),
+                *want,
+                "a client must reach the same verdict from the body: {runtime:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn convergence_is_absent_when_the_source_publishes_no_expectation() {
+        // Three shapes of "no intent", all of which must yield no verdict:
+        // an older vm-service (no key), an explicit null, and a word this
+        // version does not know.
+        for body in [
+            serde_json::json!({"status": "stopped"}),
+            serde_json::json!({"status": "stopped", "expected": null}),
+            serde_json::json!({"status": "stopped", "expected": "quiesced"}),
+        ] {
+            let lc = GuestLifecycle::from_json(&body).unwrap();
+            assert_eq!(lc.expected, None);
+            assert_eq!(
+                lc.convergence(),
+                None,
+                "no intent is NOT 'expected stopped' — a stopped component whose \
+                 starter never ran must not read as converged: {body}"
+            );
+
+            let mut runtime = Map::new();
+            lc.insert_runtime_fields(&mut runtime);
+            assert!(!runtime.contains_key("lifecycle_expected"));
+            assert!(
+                !runtime.contains_key("lifecycle_convergence"),
+                "an absent verdict is omitted, never null"
+            );
+        }
+    }
+
+    #[test]
+    fn an_intent_body_publishes_its_provenance_and_its_own_clock() {
+        let lc = GuestLifecycle::from_json(&serde_json::json!({
+            "status": "stopped",
+            "reason": "no active bank selected",
+            "for_ms": 90_000,
+            "expected": "running",
+            "expected_by": "autostart",
+            "expected_for_ms": 30_000,
+        }))
+        .unwrap();
+
+        assert_eq!(lc.convergence(), Some(Convergence::Diverged));
+        let mut runtime = Map::new();
+        lc.insert_runtime_fields(&mut runtime);
+        assert_eq!(runtime["lifecycle_convergence"], "diverged");
+        assert_eq!(runtime["lifecycle_expected"], "running");
+        assert_eq!(runtime["lifecycle_expected_by"], "autostart");
+        // Both clocks ride along so the observer can take the shorter one: the
+        // component has been down for 90 s but only WRONGLY down for 30 s.
+        assert_eq!(runtime["lifecycle_for_ms"], 90_000);
+        assert_eq!(runtime["lifecycle_expected_for_ms"], 30_000);
+        assert_eq!(
+            lc.for_ms.unwrap().min(lc.expected_for_ms.unwrap()),
+            30_000,
+            "the divergence is bounded by the younger of the two transitions"
+        );
+    }
+
+    #[test]
+    fn an_unobservable_guest_gets_no_readiness_verdict_but_a_stopped_intent_diverges() {
+        // `unknown`: the process is up, no heartbeat device to ask. Under intent
+        // `running` that is no evidence at all; under intent `stopped` the live
+        // process IS the contradiction. The cost of the asymmetry is explicit —
+        // a VM with no health device never gets a readiness verdict — and the
+        // status word says why.
+        let running = GuestLifecycle::from_json(
+            &serde_json::json!({"status": "unknown", "expected": "running"}),
+        )
+        .unwrap();
+        assert_eq!(running.convergence(), None);
+
+        let stopped = GuestLifecycle::from_json(
+            &serde_json::json!({"status": "unknown", "expected": "stopped"}),
+        )
+        .unwrap();
+        assert_eq!(stopped.convergence(), Some(Convergence::Diverged));
+    }
+
+    #[test]
+    fn a_probe_snapshot_has_no_intent() {
+        // The only intent this crate holds for a probe-backed component is the
+        // negative `admin_disabled()`. Turning "not disabled" into "expected
+        // running" would be config-derived intent by the back door, and wrong
+        // for a node whose M7 is deliberately unflashed.
+        let lc = GuestLifecycle::from_probe(&GuestHealth {
+            guest_state: 1,
+            hb_seq: 11,
+            boot_id: 22,
+            status: "running".into(),
+        });
+        assert_eq!(lc.expected, None);
+        assert_eq!(lc.convergence(), None);
+    }
+
+    #[test]
+    fn the_disabled_body_states_an_intent_and_claims_no_observation() {
+        let mut runtime = Map::new();
+        insert_admin_disabled_fields(&mut runtime);
+
+        assert_eq!(runtime["lifecycle_status"], "stopped");
+        assert_eq!(runtime["lifecycle_reason"], ADMIN_DISABLED_REASON);
+        assert_eq!(runtime["lifecycle_expected"], "stopped");
+        assert_eq!(runtime["lifecycle_expected_by"], "admin_disable");
+        assert!(
+            !runtime.contains_key("lifecycle_convergence"),
+            "nothing was polled, so there is no observation to compare against — \
+             'converged' would assert a check that never happened"
+        );
+        assert!(
+            !runtime.contains_key("lifecycle_expected_for_ms"),
+            "the disable is persisted, not clocked by this process"
+        );
     }
 
     #[test]

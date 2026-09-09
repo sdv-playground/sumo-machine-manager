@@ -216,9 +216,21 @@ fn vm_backend_with_selector(
     vm_backend(nv, set, vm_service_addr).with_bank_provider(Arc::new(provider))
 }
 
+/// The pre-step-2 health body: an older vm-service that reports no intent at
+/// all. Kept as the default so the mixed-pin case (newer host, older
+/// vm-service) is what most tests exercise.
+const HEALTH_WITHOUT_INTENT: &str =
+    r#"{"status":"stopped","guest_state":null,"hb_seq":null,"boot_id":null}"#;
+
 /// Serve canned `200 OK`s on an ephemeral loopback port, counting accepted
 /// connections — the observable for "did anything talk to vm-service?".
 async fn counting_server() -> (String, Arc<AtomicUsize>) {
+    counting_server_with_health(HEALTH_WITHOUT_INTENT).await
+}
+
+/// As [`counting_server`], with the health body to serve — so a test can pin
+/// what a host does with an intent-carrying body and with one lacking it.
+async fn counting_server_with_health(health: &'static str) -> (String, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let count = Arc::new(AtomicUsize::new(0));
@@ -235,7 +247,7 @@ async fn counting_server() -> (String, Arc<AtomicUsize>) {
                 let size = stream.read(&mut buf).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..size]);
                 let body = if request.starts_with("GET ") {
-                    r#"{"status":"stopped","guest_state":null,"hb_seq":null,"boot_id":null}"#
+                    health
                 } else {
                     ""
                 };
@@ -310,24 +322,103 @@ async fn read_entity_status_tri_state_and_probe_skip() {
     set_selector_disabled(&sel, BankSet::Vm1, true);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::NotReady);
-    assert_eq!(
-        status.extensions["x-runtime"]["admin_state"], "disabled",
-        "disabled read-back"
-    );
+    let rt = &status.extensions["x-runtime"];
+    assert_eq!(rt["admin_state"], "disabled", "disabled read-back");
     assert_eq!(probes.load(Ordering::SeqCst), 0, "probe must be skipped");
+    // Down by design now SAYS so on the intent axis, instead of leaving every
+    // reader to infer it from `admin_state`. `lifecycle_status` used to be
+    // missing here entirely while `runtime_state` published one.
+    assert_eq!(rt["lifecycle_status"], "stopped");
+    assert_eq!(rt["lifecycle_expected"], "stopped");
+    assert_eq!(rt["lifecycle_expected_by"], "admin_disable");
+    assert!(
+        rt.get("lifecycle_convergence").is_none(),
+        "nothing was polled, so no verdict may be claimed: {rt}"
+    );
 
     // Enabled again: the probe runs (our canned server is not a healthy
     // guest, so spec status stays notReady — honesty), admin_state "enabled".
     set_selector_disabled(&sel, BankSet::Vm1, false);
     let status = b.read_entity_status().await.unwrap();
-    assert_eq!(
-        status.extensions["x-runtime"]["admin_state"], "enabled",
-        "enabled read-back"
-    );
+    let rt = &status.extensions["x-runtime"];
+    assert_eq!(rt["admin_state"], "enabled", "enabled read-back");
     assert!(
         probes.load(Ordering::SeqCst) > 0,
         "enabled components are probed"
     );
+    // The mixed-pin case: a step-2 host against a vm-service that publishes no
+    // intent. It must not invent one — no intent, no verdict.
+    assert_eq!(rt["lifecycle_status"], "stopped");
+    assert!(rt.get("lifecycle_expected").is_none(), "{rt}");
+    assert!(rt.get("lifecycle_convergence").is_none(), "{rt}");
+    // And the spec field is untouched by any of this: adding the axis changed no
+    // gate. `EntityStatus` still answers only "can this serve requests".
+    assert_eq!(status.status, EntityStatus::NotReady);
+}
+
+#[tokio::test]
+async fn disabled_status_and_runtime_state_agree() {
+    // These two views of the same component used to disagree: /status published
+    // no `lifecycle_*` for a disabled component (health = None ⇒ the writer
+    // never ran) while `runtime_state` hand-built its own `lifecycle_status` +
+    // reason. One writer now — this test is what keeps them from drifting apart
+    // again.
+    let nv = make_nv();
+    let (addr, _probes) = counting_server().await;
+    let sel = selector_for(BankSet::Vm1);
+    let b = vm_backend_with_selector(&nv, BankSet::Vm1, Some(addr), sel.clone())
+        .with_deactivator(Arc::new(MockDeactivator::ok()));
+    set_selector_disabled(&sel, BankSet::Vm1, true);
+
+    let status = b.read_entity_status().await.unwrap();
+    let rt = status.extensions["x-runtime"].as_object().unwrap().clone();
+    let detail = b.runtime_state_snapshot().await.detail;
+    let detail = detail.as_object().unwrap();
+
+    for key in [
+        "lifecycle_status",
+        "lifecycle_reason",
+        "lifecycle_expected",
+        "lifecycle_expected_by",
+    ] {
+        assert_eq!(
+            rt.get(key),
+            detail.get(key),
+            "/status and runtime_state disagree about {key}"
+        );
+    }
+    assert!(
+        !rt.contains_key("lifecycle_convergence") && !detail.contains_key("lifecycle_convergence"),
+        "neither view may claim a verdict it did not observe"
+    );
+}
+
+#[tokio::test]
+async fn a_guest_that_was_asked_to_run_and_is_not_reads_diverged() {
+    // The case step 1 could publish but not judge: down with a reason, which is
+    // indistinguishable from a deliberate stop until the intent axis says a
+    // start was requested. Now one key answers it — and the two clocks let the
+    // observer see the component has been down 90 s but only WRONGLY down 30 s.
+    let nv = make_nv();
+    let (addr, _probes) = counting_server_with_health(
+        r#"{"status":"stopped","reason":"no active bank selected","for_ms":90000,
+            "expected":"running","expected_by":"autostart","expected_for_ms":30000}"#,
+    )
+    .await;
+    let b = vm_backend(&nv, BankSet::Vm1, Some(addr));
+
+    let status = b.read_entity_status().await.unwrap();
+    let rt = &status.extensions["x-runtime"];
+    assert_eq!(rt["lifecycle_convergence"], "diverged");
+    assert_eq!(rt["lifecycle_expected"], "running");
+    assert_eq!(rt["lifecycle_expected_by"], "autostart");
+    assert_eq!(rt["lifecycle_for_ms"], 90000);
+    assert_eq!(rt["lifecycle_expected_for_ms"], 30000);
+    assert_eq!(rt["lifecycle_reason"], "no active bank selected");
+    // A divergence is not a gate: `EntityStatus` was already notReady for this
+    // guest and nothing about the verdict changes it. Retargeting waits onto the
+    // verdict is a separate, deliberate step.
+    assert_eq!(status.status, EntityStatus::NotReady);
 }
 
 #[tokio::test]

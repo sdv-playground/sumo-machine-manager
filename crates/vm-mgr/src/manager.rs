@@ -26,7 +26,7 @@ use vm_devices::time::{TimeDevice, TIME_DEFAULT_INTERVAL};
 use vm_devices::transport::DeviceTransport;
 
 use crate::config::{BackendType, Bank, VmBankConfig, VmDefinition, VmServiceConfig};
-use crate::health_status::{HealthDetail, HealthStatus, Lifecycle};
+use crate::health_status::{ExpectedBy, ExpectedState, HealthDetail, HealthStatus, Lifecycle};
 use crate::runner::dummy::DummyRunner;
 #[cfg(target_os = "linux")]
 use crate::runner::qemu::QemuRunner;
@@ -42,6 +42,9 @@ pub struct VmInfo {
     pub status: HealthStatus,
     pub pid: Option<u32>,
     pub backend: BackendType,
+    /// What this VM is *supposed* to be doing. `status` alone can't say
+    /// whether `stopped` is a fault; the pair can.
+    pub expected: ExpectedState,
 }
 
 /// Per-VM liveness tracker: detects the heartbeat seq counter standing still.
@@ -392,6 +395,25 @@ impl VmManager {
     }
 
     pub fn start_vm(&mut self, name: &str) -> Result<(), ManagerError> {
+        self.start_vm_with_source(name, ExpectedBy::Unspecified)
+    }
+
+    /// Record that `name` is expected to be running, without starting it.
+    ///
+    /// For callers that stop-then-start out of band (`ensure_vm_running`'s
+    /// restart path): the stop is synchronous while the start happens later in
+    /// a spawned task, so without stamping the intent up front a poller
+    /// observes `stopped` + intent `stopped` and reads a *settled* stop in the
+    /// middle of a relaunch. Unknown names are ignored — this only annotates.
+    pub fn note_expected_running(&mut self, name: &str, by: ExpectedBy) {
+        if let Some(vm) = self.vms.get_mut(name) {
+            vm.lifecycle.expect(ExpectedState::Running, by);
+        }
+    }
+
+    /// `start_vm` plus the provenance of the decision, recorded on the intent
+    /// axis. `start_vm` delegates here with [`ExpectedBy::Unspecified`].
+    pub fn start_vm_with_source(&mut self, name: &str, by: ExpectedBy) -> Result<(), ManagerError> {
         // Admin gate — THE start choke point for per-component administrative
         // disable. Checked before ANY side effect (channel teardown, bank
         // resolution) and before the pre-launch verify: a disabled VM is
@@ -406,6 +428,14 @@ impl VmManager {
                     %reason,
                     "admin gate refused start — VM is administratively disabled"
                 );
+                // The refusal arm does its OWN lookup rather than hoisting the
+                // one below: the gate must stay ahead of it, or an
+                // unknown-and-disabled name would answer `NotFound` (404)
+                // where it answers `AdminDisabled` (409) today.
+                if let Some(vm) = self.vms.get_mut(name) {
+                    vm.lifecycle
+                        .expect(ExpectedState::Stopped, ExpectedBy::AdminDisable);
+                }
                 return Err(ManagerError::AdminDisabled(reason));
             }
         }
@@ -414,6 +444,13 @@ impl VmManager {
             .vms
             .get_mut(name)
             .ok_or_else(|| ManagerError::NotFound(name.to_string()))?;
+
+        // Someone asked for this VM to run. Every exit below this line keeps
+        // that expectation — a refused launch is a divergence, not a new
+        // intent. Recorded here rather than derived from config at read time:
+        // `auto_start` is a trigger acted on outside this crate, so a
+        // config-derived intent would claim a decision nobody made.
+        vm.lifecycle.expect(ExpectedState::Running, by);
 
         if vm.handle.is_some() {
             // Check if still actually running
@@ -456,6 +493,12 @@ impl VmManager {
             // Not a failure: there is no code to run, so nothing failed. An
             // observer needs the reason to tell this apart from a crash — the
             // remedy is a flash, not a retry.
+            //
+            // The expectation stays `Running` on purpose. "Someone asked me to
+            // run this and there is no code to run" is a provisioning gap, not
+            // an intended state; recording `Stopped` here would launder it into
+            // "as intended" and hide the one case the intent axis exists to
+            // expose. This is the primary `diverged` producer.
             vm.lifecycle.note("no active bank selected", false);
             return Ok(());
         };
@@ -657,15 +700,27 @@ impl VmManager {
     /// Signal a VM to stop. Returns the PID and timeout for the caller to
     /// wait on *without* holding the manager lock. Call `finalize_stop` after.
     pub fn initiate_stop(&mut self, name: &str) -> Result<StopHandle, ManagerError> {
+        self.initiate_stop_with_source(name, ExpectedBy::StopApi)
+    }
+
+    /// `initiate_stop` plus the provenance of the decision, recorded on the
+    /// intent axis. `initiate_stop` delegates here with [`ExpectedBy::StopApi`].
+    pub fn initiate_stop_with_source(
+        &mut self,
+        name: &str,
+        by: ExpectedBy,
+    ) -> Result<StopHandle, ManagerError> {
         let vm = self
             .vms
             .get_mut(name)
             .ok_or_else(|| ManagerError::NotFound(name.to_string()))?;
 
         // NOTE the stop request only when there is something to stop. A VM that
-        // is already down keeps whatever reason put it there — `stop_all_for_reboot`
-        // calls this for EVERY VM, and a guest that was refused a launch (bank
-        // failed to verify) must not have that erased by the reboot sweep.
+        // is already down keeps whatever reason put it there — and, since
+        // `note_stop_requested` is also what records the `Stopped` intent,
+        // whatever expectation put it there. `stop_all_for_reboot` calls this
+        // for EVERY VM, and a guest that was refused a launch (bank failed to
+        // verify) must not have either erased by the reboot sweep.
         let handle = vm
             .handle
             .as_ref()
@@ -674,7 +729,7 @@ impl VmManager {
         if !vm.runner.is_running(handle) {
             // Already gone. The operator asked for a stop and the VM is
             // stopped — the outcome is intended even if the exit wasn't.
-            vm.lifecycle.note_stop_requested();
+            vm.lifecycle.note_stop_requested(by);
             vm.runner.cleanup();
             vm.handle = None;
             vm.runtime_identity = None;
@@ -691,7 +746,7 @@ impl VmManager {
         vm.runtime_identity = None;
         // Same window, same reason: an observer polling health during the
         // graceful wait must read `shutting_down` → `stopped`, never `failed`.
-        vm.lifecycle.note_stop_requested();
+        vm.lifecycle.note_stop_requested(by);
 
         // Send PowerCommand::Shutdown via the host→guest power channel.
         // If no power device exists (no transport configured / no health
@@ -808,6 +863,7 @@ impl VmManager {
                     // live-looking tile for a guest that is gone.
                     pid: if detail.status.is_down() { None } else { pid },
                     backend: vm.def.backend,
+                    expected: detail.expected,
                 }
             })
             .collect()
@@ -837,7 +893,7 @@ impl VmManager {
         // 1. Signal graceful shutdown to ALL at once (parallel, not sequential).
         let mut pids: Vec<(String, u32)> = Vec::new();
         for name in &names {
-            match self.initiate_stop(name) {
+            match self.initiate_stop_with_source(name, ExpectedBy::RebootSweep) {
                 Ok(sh) => {
                     if let Some(pid) = sh.pid {
                         pids.push((name.clone(), pid));
@@ -893,6 +949,16 @@ fn read_health(vm: &mut ManagedVm) -> HealthDetail {
             HealthStatus::Stopped | HealthStatus::Failed => vm.lifecycle.reason(),
             _ => None,
         },
+        // The second axis, published raw. This layer computes no verdict: the
+        // pair (+ the two dwell clocks) is what an observer needs, and
+        // `expected_for_ms` is the one `for_ms` cannot replace — `for_ms`
+        // restarts on every OBSERVED transition, so a guest flapping
+        // starting → failed → starting resets it and nobody can accumulate
+        // "wrong for N ms". `min(for_ms, expected_for_ms)` is exactly the
+        // divergence dwell.
+        expected: vm.lifecycle.expected(),
+        expected_by: vm.lifecycle.expected_by(),
+        expected_for_ms: vm.lifecycle.expected_for_ms(now),
     }
 }
 
@@ -1128,6 +1194,181 @@ vms:
         let detail = mgr.health_detail("vm1").unwrap();
         assert_eq!(detail.status, HealthStatus::Stopped);
         assert_eq!(detail.reason.as_deref(), Some("no active bank selected"));
+    }
+
+    #[test]
+    fn no_active_bank_keeps_the_expectation_running() {
+        // THE case this axis exists for. A start was requested and there is no
+        // code to run: observed `stopped` (nothing failed), intent `running`
+        // (the request happened). The pair is a divergence — a provisioning
+        // gap — and recording `stopped` here instead would launder it into
+        // "as intended", which is exactly the false all-clear step 1 could not
+        // rule out.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
+        mgr.set_vm_bank("vm1", None).unwrap();
+        mgr.start_vm_with_source("vm1", ExpectedBy::Autostart)
+            .expect("a skipped launch is not an error");
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.status, HealthStatus::Stopped);
+        assert_eq!(detail.expected, ExpectedState::Running);
+        assert_eq!(detail.expected_by, ExpectedBy::Autostart);
+        // ...and `list` carries the same axis, so a UI needs no second call.
+        assert_eq!(
+            mgr.list()
+                .iter()
+                .find(|v| v.name == "vm1")
+                .map(|v| v.expected),
+            Some(ExpectedState::Running)
+        );
+    }
+
+    #[test]
+    fn verify_refusal_keeps_the_expectation_running() {
+        // Same rule for every other launch refusal: the request was made, so
+        // the expectation stands and the gap is reportable. (Here the observed
+        // side is `failed`, which already said something was wrong — the intent
+        // axis adds *what was wanted instead*.)
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None)
+            .with_pre_launch_verify(Arc::new(|_n, _d| Err("bad signature".to_string())));
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        let _ = mgr.start_vm("vm1");
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.status, HealthStatus::Failed);
+        assert_eq!(detail.expected, ExpectedState::Running);
+    }
+
+    #[test]
+    fn admin_refusal_records_a_stopped_intent_without_reordering_the_errors() {
+        // A refused start IS a recorded decision: down on purpose, provenance
+        // `admin_disable` — no second `admin_state` channel needed to tell it
+        // apart from a crash.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None)
+            .with_admin_gate(Arc::new(|name| Err(format!("{name} is disabled"))));
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        assert!(matches!(
+            mgr.start_vm("vm1"),
+            Err(ManagerError::AdminDisabled(_))
+        ));
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.expected, ExpectedState::Stopped);
+        assert_eq!(detail.expected_by, ExpectedBy::AdminDisable);
+
+        // The refusal arm does its own lookup precisely so the gate can stay
+        // ahead of it. Pinned here: an UNKNOWN name under a refusing gate must
+        // still answer AdminDisabled (409), not NotFound (404) — recording
+        // intent must not become a wire change.
+        assert!(
+            matches!(mgr.start_vm("nope"), Err(ManagerError::AdminDisabled(_))),
+            "the admin gate must still precede the VM lookup"
+        );
+    }
+
+    #[test]
+    fn stop_all_for_reboot_does_not_rewrite_the_intent_of_an_already_down_vm() {
+        // The sweep calls initiate_stop for EVERY VM. A guest that never
+        // launched has no process to stop, and turning its `running` intent
+        // into `stopped` would erase the divergence a reboot is supposed to
+        // preserve for the operator — the same rule that protects its `reason`.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
+        mgr.set_vm_bank("vm1", None).unwrap();
+        mgr.start_vm_with_source("vm1", ExpectedBy::Autostart)
+            .unwrap();
+
+        mgr.stop_all_for_reboot(0);
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(
+            detail.expected,
+            ExpectedState::Running,
+            "the sweep must not claim the operator wanted this VM down"
+        );
+        assert_eq!(detail.expected_by, ExpectedBy::Autostart);
+    }
+
+    #[test]
+    fn a_reboot_sweep_of_a_running_vm_records_its_own_provenance() {
+        // ...but where there IS something to stop, the sweep says so: `stopped`
+        // by `reboot_sweep` reads very differently from `stop_api` on one VM.
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr =
+            VmManager::with_device_transport(dummy_config(dir.path().to_str().unwrap()), None);
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        mgr.start_vm("vm1").unwrap();
+
+        mgr.stop_all_for_reboot(0);
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.expected, ExpectedState::Stopped);
+        assert_eq!(detail.expected_by, ExpectedBy::RebootSweep);
+    }
+
+    #[test]
+    fn note_expected_running_undoes_the_stop_half_of_a_restart() {
+        // The two halves of what `ensure_vm_running` does under a single lock.
+        // Pinned here because the second call is easy to mistake for
+        // redundant — the background `start_vm` will stamp `Running` anyway,
+        // just up to a whole `shutdown_timeout_secs` (~60 s) later. In between,
+        // intent `stopped` + observed `stopped` reads as a *settled* stop in
+        // the middle of a relaunch.
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr =
+            VmManager::with_device_transport(dummy_config(dir.path().to_str().unwrap()), None);
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        mgr.start_vm("vm1").unwrap();
+
+        // The stop half on its own really does declare a settled stop...
+        let _ = mgr.initiate_stop("vm1");
+        assert_eq!(
+            mgr.health_detail("vm1").unwrap().expected,
+            ExpectedState::Stopped
+        );
+
+        // ...and the re-assert is what keeps the restart honest.
+        mgr.note_expected_running("vm1", ExpectedBy::Api);
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.expected, ExpectedState::Running);
+        assert_eq!(detail.expected_by, ExpectedBy::Api);
+
+        // Annotating an unknown VM is a no-op, not a panic or a phantom record.
+        mgr.note_expected_running("nope", ExpectedBy::Api);
+        assert!(mgr.health_detail("nope").is_err());
+    }
+
+    #[test]
+    fn expected_for_ms_and_for_ms_bound_the_divergence() {
+        // A divergence begins at max(intent_since, status_since), so
+        // min(for_ms, expected_for_ms) is exactly its duration. Here the VM has
+        // been observed `stopped` since the manager was built and expected
+        // `running` only since the start request, so the intent clock is the
+        // binding one — an observer applying a deadline needs it, and `for_ms`
+        // alone would have over-reported the divergence by the whole idle
+        // period before anyone asked.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
+        mgr.set_vm_bank("vm1", None).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        mgr.start_vm("vm1").unwrap();
+
+        let first = mgr.health_detail("vm1").unwrap();
+        assert!(
+            first.for_ms >= 30,
+            "the VM has been observed down since before the request"
+        );
+        assert!(
+            first.expected_for_ms < first.for_ms,
+            "the intent is younger than the status, so it bounds the divergence"
+        );
+
+        // Both clocks are monotonic across polls in a steady state.
+        std::thread::sleep(Duration::from_millis(30));
+        let later = mgr.health_detail("vm1").unwrap();
+        assert!(later.expected_for_ms >= first.expected_for_ms + 20);
+        assert_eq!(
+            later.expected_for_ms.min(later.for_ms),
+            later.expected_for_ms
+        );
     }
 
     #[test]

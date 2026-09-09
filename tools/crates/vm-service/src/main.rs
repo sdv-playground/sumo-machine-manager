@@ -8,6 +8,7 @@
 /// The modules below used to be re-declared here (`mod api; mod config; …`),
 /// which compiled the WHOLE crate a second time inside the binary. Taking them
 /// from the library instead is the point of the split (item 3d).
+use vm_mgr::health_status::ExpectedBy;
 use vm_mgr::{api, config, manager};
 
 use std::path::PathBuf;
@@ -82,7 +83,11 @@ async fn main() {
         let mut mgr = manager.lock().await;
         for name in &auto_start_vms {
             tracing::info!("auto-starting VM {name}");
-            if let Err(e) = mgr.start_vm(name) {
+            // `Autostart` provenance, so a guest that never came up says *who*
+            // asked for it — `auto_start` in config is only the trigger, and
+            // reading intent back from config would claim a decision this loop
+            // may never have taken.
+            if let Err(e) = mgr.start_vm_with_source(name, ExpectedBy::Autostart) {
                 tracing::warn!("auto-start {name} failed: {e}");
             }
         }

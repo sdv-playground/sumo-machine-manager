@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::config::Bank;
-use crate::health_status::HealthStatus;
+use crate::health_status::{ExpectedBy, ExpectedState, HealthStatus};
 use crate::manager::{self, ManagerError, VmManager};
 
 type SharedManager = Arc<Mutex<VmManager>>;
@@ -58,6 +58,18 @@ struct VmInfoResponse {
     status: HealthStatus,
     pid: Option<u32>,
     backend: String,
+    /// The declared intent, `None` when nothing has ever asked this VM to run
+    /// or stop. Absent intent is NOT "expected stopped" — see [`ExpectedState`].
+    expected: Option<ExpectedState>,
+}
+
+/// `Unset` is the absence of an intent, so it goes on the wire as `null`
+/// rather than as a third word every reader would have to learn.
+fn wire_expected(expected: ExpectedState) -> Option<ExpectedState> {
+    match expected {
+        ExpectedState::Unset => None,
+        set => Some(set),
+    }
 }
 
 async fn list_vms(State(mgr): State<SharedManager>) -> Json<Vec<VmInfoResponse>> {
@@ -70,6 +82,7 @@ async fn list_vms(State(mgr): State<SharedManager>) -> Json<Vec<VmInfoResponse>>
             status: v.status,
             pid: v.pid,
             backend: format!("{:?}", v.backend).to_lowercase(),
+            expected: wire_expected(v.expected),
         })
         .collect();
     Json(vms)
@@ -157,11 +170,24 @@ async fn ensure_vm_running(
         if let Err(e) = mgr.check_admin_gate(&name) {
             return error_response(e);
         }
-        match mgr.initiate_stop(&name) {
+        let stop_handle = match mgr.initiate_stop(&name) {
             Ok(sh) => Some(sh),
             Err(ManagerError::NotRunning(_)) => None,
             Err(e) => return error_response(e),
-        }
+        };
+        // Re-assert the intent the stop just overwrote — a restart's stop is a
+        // means, not the goal. Still inside the same lock scope, so no reader
+        // can observe the `Stopped` intent in between: `health_detail` needs
+        // this mutex.
+        //
+        // It has to happen here and not at `start_vm` below, because the start
+        // runs in a spawned task after a `wait_for_exit` that can take the
+        // guest's full `shutdown_timeout_secs` (~60 s). Leaving intent
+        // `stopped` for that window would publish a *settled* stop in the
+        // middle of a relaunch — precisely the window an OTA activation poller
+        // watches, and it would read it as converged-and-done.
+        mgr.note_expected_running(&name, ExpectedBy::Api);
+        stop_handle
     };
 
     let mgr_clone = mgr.clone();
@@ -209,7 +235,7 @@ async fn ensure_vm_running(
             if let Some(b) = bank {
                 let _ = mgr.set_vm_bank(&start_name, Some(b));
             }
-            mgr.start_vm(&start_name)
+            mgr.start_vm_with_source(&start_name, ExpectedBy::Api)
         })
         .await;
         let start_elapsed_secs = phase_started.elapsed().as_secs();
@@ -243,24 +269,45 @@ async fn health_vm(
 ) -> impl IntoResponse {
     let mut mgr = mgr.lock().await;
     match mgr.health_detail(&name) {
-        Ok(detail) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": detail.status,
-                "guest_state": detail.guest_state,
-                "hb_seq": detail.hb_seq,
-                "boot_id": detail.boot_id,
-                // Lifecycle observation. `for_ms` is the monotonic dwell time in
-                // `status` — the caller's deadline input ("started but not up"
-                // is `starting` held too long, and only the caller knows what
-                // "too long" is). `reason` explains a `stopped` / `failed`.
-                // Added fields, never renamed: component-mgr parses them
-                // optionally so a newer host tolerates an older vm-service.
-                "for_ms": detail.for_ms,
-                "since_unix_secs": detail.since_unix_secs,
-                "reason": detail.reason,
-            })),
-        ),
+        Ok(detail) => {
+            // Two axes, both raw: what the VM is doing, and what it was asked
+            // to do. Neither side computes the verdict — see
+            // `component_mgr::lifecycle::Convergence`, which derives it from
+            // exactly these fields.
+            let expected = wire_expected(detail.expected);
+            let expected_by = match detail.expected_by {
+                ExpectedBy::Unspecified => None,
+                by => Some(by.to_string()),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": detail.status,
+                    "guest_state": detail.guest_state,
+                    "hb_seq": detail.hb_seq,
+                    "boot_id": detail.boot_id,
+                    // Lifecycle observation. `for_ms` is the monotonic dwell time in
+                    // `status` — the caller's deadline input ("started but not up"
+                    // is `starting` held too long, and only the caller knows what
+                    // "too long" is). `reason` explains a `stopped` / `failed`.
+                    // Added fields, never renamed: component-mgr parses them
+                    // optionally so a newer host tolerates an older vm-service.
+                    "for_ms": detail.for_ms,
+                    "since_unix_secs": detail.since_unix_secs,
+                    "reason": detail.reason,
+                    // Declared intent + its own dwell clock. `expected_for_ms`
+                    // is NOT redundant with `for_ms`: that one restarts on every
+                    // observed transition, so a guest flapping
+                    // starting → failed → starting resets it. Divergence begins
+                    // at max(intent_since, status_since), which makes
+                    // min(for_ms, expected_for_ms) exactly the divergence dwell
+                    // — the observer applies the deadline, the device never does.
+                    "expected": expected,
+                    "expected_by": expected_by,
+                    "expected_for_ms": expected.map(|_| detail.expected_for_ms),
+                })),
+            )
+        }
         Err(e) => error_response(e),
     }
 }
@@ -346,6 +393,21 @@ vms:
             .next()
             .unwrap_or("")
             .to_string()
+    }
+
+    /// Fire a raw `GET {path}` and return the parsed JSON body.
+    async fn get_json(addr: std::net::SocketAddr, path: &str) -> serde_json::Value {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .expect("response has a body");
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("body is not JSON ({e}): {body}"))
     }
 
     /// Poll a closure until it returns true or the deadline passes. The route
@@ -439,5 +501,73 @@ vms:
             seen.lock().unwrap().clone(),
             Some(std::path::PathBuf::from("/var/lib/vms/vm1/bank_a")),
         );
+    }
+
+    #[tokio::test]
+    async fn health_body_carries_the_expectation() {
+        let (mgr, _seen) = manager_with_seen();
+        let addr = serve(mgr.clone()).await;
+
+        // Nothing has asked for anything yet: the intent keys are `null`, NOT
+        // "stopped". A reader that saw `expected: "stopped"` here would call a
+        // node whose start orchestrator never ran "converged".
+        let body = get_json(addr, "/vms/vm1/health").await;
+        assert_eq!(body["status"], "stopped");
+        assert!(body["expected"].is_null(), "absent intent is null: {body}");
+        assert!(body["expected_by"].is_null());
+        assert!(body["expected_for_ms"].is_null());
+        assert!(
+            get_json(addr, "/vms").await[0]["expected"].is_null(),
+            "the list view agrees with the health view"
+        );
+
+        // A start request with no bank to boot: down, nothing failed, and now
+        // the body says what was wanted instead. This pair is the divergence
+        // no single field could express.
+        mgr.lock()
+            .await
+            .start_vm_with_source("vm1", ExpectedBy::Autostart)
+            .unwrap();
+        let body = get_json(addr, "/vms/vm1/health").await;
+        assert_eq!(body["status"], "stopped");
+        assert_eq!(body["reason"], "no active bank selected");
+        assert_eq!(body["expected"], "running");
+        assert_eq!(body["expected_by"], "autostart");
+        assert!(
+            body["expected_for_ms"].is_u64(),
+            "an intent that exists has a dwell clock: {body}"
+        );
+        assert_eq!(get_json(addr, "/vms").await[0]["expected"], "running");
+    }
+
+    #[tokio::test]
+    async fn a_restart_never_publishes_a_settled_stopped_intent() {
+        // A restart's stop is a means, not the goal. `initiate_stop` records a
+        // `Stopped` intent (see the manager-side test that pins it), so the
+        // handler must re-assert `Running` in the same lock scope — otherwise
+        // the pair (stopped, stopped) reads as *settled* for the whole
+        // shutdown wait, which is the window an OTA activation poller samples.
+        let (mgr, seen) = manager_with_seen();
+        {
+            let mut g = mgr.lock().await;
+            g.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+            // A handle must exist for the restart to take its stop path at all.
+            g.start_vm("vm1").unwrap();
+        }
+        let addr = serve(mgr.clone()).await;
+
+        let status = post(addr, "/vms/vm1/restart").await;
+        assert!(status.contains("200"), "queued 200, got: {status}");
+        assert!(
+            wait_until(|| seen.lock().unwrap().is_some()).await,
+            "background launch should have run"
+        );
+
+        let body = get_json(addr, "/vms/vm1/health").await;
+        assert_eq!(
+            body["expected"], "running",
+            "a restart leaves no stopped intent behind: {body}"
+        );
+        assert_eq!(body["expected_by"], "api");
     }
 }

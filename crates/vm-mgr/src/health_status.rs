@@ -73,6 +73,88 @@ impl HealthStatus {
     }
 }
 
+/// What the VM is *supposed* to be doing — the declared-intent axis, orthogonal
+/// to the observed [`HealthStatus`].
+///
+/// Without it, "down" is one word for three unrelated situations: an operator
+/// stopped it, nothing ever asked it to run, or it should be running and is not.
+/// An observer that cannot tell those apart cannot decide whether a node is
+/// healthy, which is why every consumer grew its own guess.
+///
+/// Derived from the **actions actually taken**, never from config. `auto_start`
+/// is only a trigger, and it is acted on outside this crate (the standalone
+/// `vm-service` binary, supernova's own `auto_start_vms` toggle) — a host
+/// configured not to start anything would make a config-derived intent lie on
+/// its very first read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedState {
+    /// Nothing has asked this VM to run or to stop. **Not** the same as
+    /// `Stopped`, and the distinction is load-bearing: with `auto_start_vms:
+    /// false`, or with an external start orchestrator, no action is ever
+    /// recorded — and if that defaulted to `Stopped` the pair
+    /// (expected stopped, observed stopped) would read as "healthy and settled"
+    /// for a node whose starter died. `Unset` yields no verdict at all.
+    #[default]
+    Unset,
+    /// A start was requested. Stays `Running` through every refusal (no bank
+    /// selected, verify refused, spawn failed) — the request happened, so the
+    /// gap between it and reality is exactly what needs reporting.
+    Running,
+    /// A stop was requested, or the admin gate refused the start.
+    Stopped,
+}
+
+impl std::fmt::Display for ExpectedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExpectedState::Unset => write!(f, "unset"),
+            ExpectedState::Running => write!(f, "running"),
+            ExpectedState::Stopped => write!(f, "stopped"),
+        }
+    }
+}
+
+/// Who asked — the provenance of the current [`ExpectedState`].
+///
+/// Answers the question no existing field can: *why is this thing up (or down)?*
+/// An operator stop, a reboot sweep and an administrative disable all produce
+/// `Stopped`, and they call for entirely different responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedBy {
+    /// A caller that did not say. The default for `start_vm`, so adding this
+    /// axis broke no existing call site.
+    #[default]
+    Unspecified,
+    /// The host's boot-time auto-start sweep.
+    Autostart,
+    /// `POST /vms/{name}/start` or `/restart` — a manual poke, or component-mgr
+    /// relaunching after an OTA bank flip.
+    Api,
+    /// `POST /vms/{name}/stop`.
+    StopApi,
+    /// `stop_all_for_reboot` — every guest signalled at once for a node reboot,
+    /// which is a very different thing from an operator stopping one VM.
+    RebootSweep,
+    /// The admin gate refused the start: persisted operator intent, read from
+    /// the signed boot selector.
+    AdminDisable,
+}
+
+impl std::fmt::Display for ExpectedBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExpectedBy::Unspecified => write!(f, "unspecified"),
+            ExpectedBy::Autostart => write!(f, "autostart"),
+            ExpectedBy::Api => write!(f, "api"),
+            ExpectedBy::StopApi => write!(f, "stop_api"),
+            ExpectedBy::RebootSweep => write!(f, "reboot_sweep"),
+            ExpectedBy::AdminDisable => write!(f, "admin_disable"),
+        }
+    }
+}
+
 /// Detailed health snapshot — adds raw guest-state and seq counter so SOVD
 /// callers can show finer-grained info than just `HealthStatus`.
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +193,21 @@ pub struct HealthDetail {
     /// stop requested", "process exited without a stop request". `None` means
     /// nothing was recorded — a VM that simply came up and stayed up.
     pub reason: Option<String>,
+    /// The declared-intent axis: what this VM is *supposed* to be doing. Read
+    /// together with `status` — the pair is what makes "healthy" computable.
+    pub expected: ExpectedState,
+    /// Who asked for `expected`.
+    pub expected_by: ExpectedBy,
+    /// How long `expected` has held, in milliseconds on the MONOTONIC clock.
+    ///
+    /// The clock the intent axis needs and `for_ms` cannot supply: `for_ms`
+    /// restarts on every OBSERVED transition, so a guest flapping
+    /// `starting → failed → starting` resets it and no observer can accumulate
+    /// "wrong for N ms". A disagreement begins at `max(expected_since,
+    /// status_since)`, so `min(for_ms, expected_for_ms)` is exactly its
+    /// duration — computed by the observer, from published facts, with no
+    /// threshold anywhere in here.
+    pub expected_for_ms: u64,
 }
 
 /// Per-VM observed lifecycle record: the current [`HealthStatus`], when it was
@@ -139,6 +236,14 @@ pub(crate) struct Lifecycle {
     /// "the operator stopped it" and "it died" are the same observation: no
     /// process, no handle.
     stop_requested: bool,
+    /// The declared-intent axis. Recorded from decisions, not read from config —
+    /// see [`ExpectedState`].
+    expected: ExpectedState,
+    expected_by: ExpectedBy,
+    /// When `expected` last CHANGED VALUE. A second start request while already
+    /// expected-running must not restart this clock, or an observer loses the
+    /// only measure of how long a disagreement has lasted.
+    expected_since: Instant,
 }
 
 impl Default for Lifecycle {
@@ -151,6 +256,11 @@ impl Default for Lifecycle {
             reason: None,
             failed: false,
             stop_requested: false,
+            // ...and "nothing has been asked" is its own answer on the intent
+            // axis, distinct from "asked to stay down".
+            expected: ExpectedState::Unset,
+            expected_by: ExpectedBy::Unspecified,
+            expected_since: Instant::now(),
         }
     }
 }
@@ -167,17 +277,47 @@ impl Lifecycle {
     /// A stop was requested — a subsequent "not running" is `Stopped`, not
     /// `Failed`. Clears any earlier failure: the operator's intent supersedes
     /// whatever the previous lifetime ended with.
-    pub(crate) fn note_stop_requested(&mut self) {
+    pub(crate) fn note_stop_requested(&mut self, by: ExpectedBy) {
         self.stop_requested = true;
         self.failed = false;
         self.reason = Some("stop requested".to_string());
+        self.expect(ExpectedState::Stopped, by);
     }
 
-    /// A launch succeeded — the record starts clean for the new lifetime.
+    /// A launch succeeded — the observed record starts clean for the new
+    /// lifetime. Deliberately does NOT touch the intent axis: a successful
+    /// launch is not a new request, and resetting `expected_since` here would
+    /// destroy the dwell clock for the state that was just reached.
     pub(crate) fn note_started(&mut self) {
         self.stop_requested = false;
         self.failed = false;
         self.reason = None;
+    }
+
+    /// Record the declared intent. The `expected_since` clock restarts only on
+    /// a real change of value, so a repeated request (the API's synchronous
+    /// pre-note followed by the background `start_vm`, or a poll-driven retry)
+    /// does not keep zeroing it.
+    pub(crate) fn expect(&mut self, expected: ExpectedState, by: ExpectedBy) {
+        if self.expected != expected {
+            self.expected = expected;
+            self.expected_since = Instant::now();
+        }
+        self.expected_by = by;
+    }
+
+    pub(crate) fn expected(&self) -> ExpectedState {
+        self.expected
+    }
+
+    pub(crate) fn expected_by(&self) -> ExpectedBy {
+        self.expected_by
+    }
+
+    /// Monotonic dwell on the intent axis, in milliseconds.
+    pub(crate) fn expected_for_ms(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.expected_since)
+            .as_millis() as u64
     }
 
     pub(crate) fn stop_requested(&self) -> bool {
@@ -235,6 +375,69 @@ mod tests {
             // cross-crate break.
             assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{want}\""));
         }
+        // Same contract for the intent axis: component-mgr parses these as
+        // strings too, so a casing slip breaks the wire silently.
+        for (s, want) in [
+            (ExpectedState::Unset, "unset"),
+            (ExpectedState::Running, "running"),
+            (ExpectedState::Stopped, "stopped"),
+        ] {
+            assert_eq!(format!("{s}"), want);
+            assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{want}\""));
+        }
+        for (s, want) in [
+            (ExpectedBy::Unspecified, "unspecified"),
+            (ExpectedBy::Autostart, "autostart"),
+            (ExpectedBy::Api, "api"),
+            (ExpectedBy::StopApi, "stop_api"),
+            (ExpectedBy::RebootSweep, "reboot_sweep"),
+            (ExpectedBy::AdminDisable, "admin_disable"),
+        ] {
+            assert_eq!(format!("{s}"), want);
+            assert_eq!(serde_json::to_string(&s).unwrap(), format!("\"{want}\""));
+        }
+    }
+
+    #[test]
+    fn expected_defaults_to_unset_not_stopped() {
+        // The whole reason for the third value: a node whose external start
+        // orchestrator never ran must not read as "stopped, as intended".
+        let lc = Lifecycle::default();
+        assert_eq!(lc.expected(), ExpectedState::Unset);
+        assert_eq!(lc.expected_by(), ExpectedBy::Unspecified);
+    }
+
+    #[test]
+    fn expected_clock_restarts_only_when_the_intent_changes() {
+        let mut lc = Lifecycle::default();
+        lc.expect(ExpectedState::Running, ExpectedBy::Api);
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Re-stating the same intent (the API's pre-note, then the background
+        // start_vm) must not zero the dwell clock...
+        let before = lc.expected_for_ms(Instant::now());
+        lc.expect(ExpectedState::Running, ExpectedBy::Api);
+        assert!(
+            lc.expected_for_ms(Instant::now()) >= before,
+            "a repeated request must not restart the intent clock"
+        );
+
+        // ...but a real change does.
+        lc.expect(ExpectedState::Stopped, ExpectedBy::StopApi);
+        assert!(lc.expected_for_ms(Instant::now()) < 10);
+        assert_eq!(lc.expected_by(), ExpectedBy::StopApi);
+    }
+
+    #[test]
+    fn note_started_does_not_clear_the_expectation() {
+        // note_started resets the OBSERVED record for a fresh lifetime. Touching
+        // the intent axis there would both lose the provenance and zero the
+        // dwell clock for the state just reached.
+        let mut lc = Lifecycle::default();
+        lc.expect(ExpectedState::Running, ExpectedBy::Autostart);
+        lc.note_started();
+        assert_eq!(lc.expected(), ExpectedState::Running);
+        assert_eq!(lc.expected_by(), ExpectedBy::Autostart);
     }
 
     #[test]
@@ -259,9 +462,10 @@ mod tests {
         lc.note("pre-launch verify failed", true);
         assert!(lc.is_failed());
 
-        lc.note_stop_requested();
+        lc.note_stop_requested(ExpectedBy::StopApi);
         assert!(!lc.is_failed(), "an operator stop is not a fault");
         assert!(lc.stop_requested());
+        assert_eq!(lc.expected(), ExpectedState::Stopped);
 
         // ...and a successful start clears everything for the new lifetime.
         lc.note_started();

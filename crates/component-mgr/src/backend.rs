@@ -1200,17 +1200,14 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     ///
     /// Administratively disabled short-circuits to `Stopped`: the component is
     /// down BY DESIGN, so probing would only burn the health timeout, and
-    /// `Faulted` would be a lie. (The *intent* axis that makes this a first-class
-    /// answer rather than a special case is step 2; `x-runtime.admin_state`
-    /// already carries the operator's decision.)
+    /// `Faulted` would be a lie. It is no longer a special case in the body,
+    /// though — the intent axis says `expected: stopped` by `admin_disable`,
+    /// which is what makes "down and fine" a first-class answer instead of
+    /// something every reader had to infer from `admin_state`.
     pub async fn runtime_state_snapshot(&self) -> RuntimeState {
         if self.admin_disabled() {
             let mut detail = serde_json::Map::new();
-            detail.insert("lifecycle_status".into(), serde_json::json!("stopped"));
-            detail.insert(
-                "lifecycle_reason".into(),
-                serde_json::json!("administratively disabled"),
-            );
+            crate::lifecycle::insert_admin_disabled_fields(&mut detail);
             return RuntimeState {
                 status: RuntimeStatus::Stopped,
                 detail: serde_json::Value::Object(detail),
@@ -5277,6 +5274,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // observer owns the deadline.
         if let Some(lc) = &health {
             lc.insert_runtime_fields(&mut runtime);
+        } else if admin_disabled {
+            // Disabled ⇒ nothing was polled, so there is no observation to
+            // publish — but there IS an intent, and it is the whole answer:
+            // `expected: stopped` by `admin_disable`. This used to emit no
+            // `lifecycle_*` at all while `runtime_state` hand-built a
+            // `lifecycle_status`, so the two views of the same component
+            // disagreed. One writer now, and it also supplies the
+            // `lifecycle_status: "stopped"` this body was missing.
+            crate::lifecycle::insert_admin_disabled_fields(&mut runtime);
         }
         // Tri-state admin read-back: disableable components carry
         // `admin_state: "enabled" | "disabled"`; non-disableable ones omit

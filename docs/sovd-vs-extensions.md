@@ -172,7 +172,36 @@ fills it with one vendor key:
 
 | Key | Value |
 |---|---|
-| `x-runtime` | `{ boot_count, uptime_s, node_boot_id, admin_state }` |
+| `x-runtime` | The per-component runtime facts, flattened into one object — see below. |
+
+**`x-runtime` keys.** Every key is **omitted when unknown, never `null`**: a
+reader must be able to tell "no heartbeat" from "heartbeat seq 0", and "no
+verdict" from "checked, and it disagrees". Readers therefore key off the map
+(`.get("…")`) and treat additions as inert — the map is untyped
+(`serde_json::Map`) on both sides of the wire.
+
+| Key | Present when | Value |
+|---|---|---|
+| `boot_count` | always | Trial/boot counter for this component's bank set, from NV. |
+| `node_boot_id` | node knows it | Node-wide per-boot nonce — stamped on EVERY component, since host-os has no heartbeat of its own. The offboard reboot witness compares it. |
+| `admin_state` | component is disableable | `enabled`\|`disabled`. Tri-state by omission: a non-disableable component omits it, so a UI can tell "cannot be disabled" from "enabled". The **persisted operator decision**. |
+| `reboot_pending` | `true` only | An admin change needs a reboot to take effect. |
+| `hb_seq`, `boot_id`, `guest_state` | health source reports them | Raw heartbeat facts: liveness counter, per-lifetime nonce, guest-reported readiness (`1` = up). |
+| `lifecycle_status` | a health source exists | **Observed axis** — `starting`\|`running`\|`unhealthy`\|`shutting_down`\|`stopped`\|`failed`\|`unknown`. |
+| `lifecycle_for_ms` | ↑ | Monotonic dwell in the observed state; restarts on **every** observed transition (a `starting → failed → starting` flap zeroes it). |
+| `lifecycle_since` | ↑ | Wall-clock unix secs of that transition. Advisory only — device wall-clock is non-monotonic. |
+| `lifecycle_reason` | there is one | Free text, e.g. `administratively disabled`, `no active bank selected`. |
+| `lifecycle_expected` | intent was recorded | **Intent axis** — `running`\|`stopped`. Absent means *nothing asked*, which is not the same as "asked to stay down"; it is derived from decisions actually taken, never read back from config. |
+| `lifecycle_expected_by` | provenance known | Who asked: `autostart`\|`api`\|`stop_api`\|`reboot_sweep`\|`admin_disable`. |
+| `lifecycle_expected_for_ms` | intent was recorded | Monotonic dwell of the intent; restarts only when the intent **value** changes. `min(lifecycle_for_ms, lifecycle_expected_for_ms)` is exactly the divergence dwell, so the observer owns the deadline and the device holds no threshold. |
+| `lifecycle_convergence` | both axes have a basis | `converged`\|`transitioning`\|`diverged` — the verdict, computed in one place from fields published in this same body (so any client can recompute and explain it). No cell of that table reads a clock, and `diverged` is a statement about *now*, not a prediction. |
+
+Administratively disabled components carry `lifecycle_status: "stopped"`,
+`lifecycle_reason`, `lifecycle_expected: "stopped"` and
+`lifecycle_expected_by: "admin_disable"` but deliberately **no**
+`lifecycle_convergence`: the intent is known and nothing is observed, so a
+verdict there would be invented. The same writer fills this map and
+`RuntimeState::detail`, so `/status` and the trait layer cannot drift.
 
 ### Scripts (§7.15)
 A test execution records an `x-log` log-cursor bracket:
