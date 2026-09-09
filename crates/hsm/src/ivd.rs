@@ -490,21 +490,6 @@ pub fn sign_bank_with_files_crypto(
     )
 }
 
-/// Write `bytes` to `path` and fsync the file before returning, so the content is
-/// durable against a kernel-direct reset rather than sitting in the page cache.
-/// (Does NOT fsync the parent directory — the bank dir already exists by the time
-/// the seal is written, so only the file content is at risk here.)
-#[cfg(feature = "crypto")]
-fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), IvdError> {
-    use std::io::Write;
-    let mut f = fs::File::create(path).map_err(|e| IvdError::Io(e, path.to_path_buf()))?;
-    f.write_all(bytes)
-        .map_err(|e| IvdError::Io(e, path.to_path_buf()))?;
-    f.sync_all()
-        .map_err(|e| IvdError::Io(e, path.to_path_buf()))?;
-    Ok(())
-}
-
 /// Shared body behind [`sign_bank_crypto`] / [`sign_bank_with_files_crypto`]:
 /// build + encode the manifest, `sign` its bytes (the lone HSM op, supplied as a
 /// closure over [`HsmCryptoProvider::sign`]), and write the two artefacts into
@@ -528,13 +513,10 @@ fn sign_bank_with_files_inner(
     let sig = sign(KeyRole::IvdSigning.handle(), &manifest_bytes)?;
     let sig_ms = sig_start.elapsed().as_millis() as u64;
 
-    // fsync both artefacts. These two files ARE the bank's seal, and the
-    // pre-launch verify is fail-closed on them: losing them to a kernel-direct
-    // reset (`sysmgr_reboot` runs no shutdown sync path) means the guest refuses
-    // to launch even when every payload byte survived. `fs::write` alone leaves
-    // them in the page cache, so write them explicitly and sync.
-    write_durable(&bank_dir.join(IVD_MANIFEST_FILE), &manifest_bytes)?;
-    write_durable(&bank_dir.join(IVD_SIGNATURE_FILE), &sig)?;
+    fs::write(bank_dir.join(IVD_MANIFEST_FILE), &manifest_bytes)
+        .map_err(|e| IvdError::Io(e, bank_dir.join(IVD_MANIFEST_FILE)))?;
+    fs::write(bank_dir.join(IVD_SIGNATURE_FILE), &sig)
+        .map_err(|e| IvdError::Io(e, bank_dir.join(IVD_SIGNATURE_FILE)))?;
 
     let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
     tracing::info!(

@@ -2471,18 +2471,24 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         .await?;
         let process_elapsed = process_started.elapsed();
 
-        // Durable readback-verify BEFORE this upload is acked: re-hash the bytes
-        // now on the medium and confirm they match what the streaming pipeline
-        // wrote. Both sinks fsync on their terminal flush before we get here
-        // (`bank_provider::SyncingWriter`; the raw-partition sink is additionally
-        // `O_SYNC`), so this readback reflects the eMMC — not a write-behind cache.
-        // That fsync is load-bearing for THIS check, not just for the reboot: until
-        // the VM/file sink got the barrier, this re-hash read straight back through
-        // the page cache it had just filled and passed with every byte still dirty.
+        // Readback-verify BEFORE this upload is acked: re-hash the bytes now on
+        // the medium and confirm they match what the streaming pipeline wrote.
         // A short/interrupted write (e.g. the node reset that raced the "staged"
         // ack on the rig) is caught HERE as a staging failure, so we never seal +
         // ack a bank the post-reset boot can't mount. Mirrors `verify_part`'s
         // mapping: wrong bytes on disk = 4xx, read fault = 5xx.
+        //
+        // How much this proves DEPENDS ON THE SINK. The raw-partition sink is
+        // `O_SYNC` + fsync (`PartitionBankProvider`), so there the re-hash really
+        // does read the eMMC. The staging-FILE sink (VMs, hsm, rt) has no barrier,
+        // so this re-hash can read straight back through the page cache it just
+        // filled and pass with dirty bytes. Adding a per-file `fsync` here was
+        // tried (sumo-machine-manager 26fc2d9) and REVERTED: it made rig reboots
+        // hang far more often, and it turned an infallible `File::flush` into a
+        // fallible one, so an `fsync` refusal failed the upload outright. The
+        // durability barrier for file-backed banks is still an OPEN QUESTION and
+        // belongs at ONE point before the reset, not interleaved per file here —
+        // see tasks/vm-flash-durability-and-commit-witness.md.
         self.bank_provider
             .verify_payload(target_bank, &target_name, &image_hash)
             .map_err(|e| match e {

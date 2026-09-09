@@ -127,15 +127,6 @@ pub fn seed_missing_files(
                 &target_path,
                 fs::Permissions::from_mode(meta.permissions().mode()),
             );
-            // fsync — `fs::copy` leaves the destination in the page cache. These
-            // seeded files are covered by the IVD manifest the seal signs, so a
-            // kernel-direct reset that loses them yields a bank whose pre-launch
-            // verify fails closed. Reopen for WRITE (not read): POSIX allows
-            // `fsync` to reject a read-only descriptor with EBADF, and QNX does.
-            fs::OpenOptions::new()
-                .write(true)
-                .open(&target_path)?
-                .sync_all()?;
         } else {
             // A directory / socket / fifo under a declared part's name. A bank
             // shouldn't contain those; refuse rather than seal something the
@@ -279,15 +270,8 @@ pub fn copy_forward_file(
             .map_err(|e| CopyForwardError::Io(e, dst.clone()))?;
         size += n as u64;
     }
-    // `File::flush` is a NO-OP (there is no userspace buffer here) — the bytes are
-    // in the page cache, not on flash. fsync explicitly: a copy-forward can be a
-    // whole rootfs, and the seal below hashes what we just wrote from memory, so
-    // nothing else would ever force it out before the post-flash reset.
     output
         .flush()
-        .map_err(|e| CopyForwardError::Io(e, dst.clone()))?;
-    output
-        .sync_all()
         .map_err(|e| CopyForwardError::Io(e, dst.clone()))?;
 
     let actual: [u8; 32] = hasher.finalize().into();
