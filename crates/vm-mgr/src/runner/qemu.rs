@@ -10,6 +10,23 @@ use super::*;
 use crate::config::*;
 use crate::ivshmem::{self, HostProcess, IvshmemSockets};
 
+// QNX 7.1's devnp-virtio driver does not reliably handle all optional
+// virtio-net features advertised by QEMU on the x86_64 PCI path.  In
+// particular, leaving these at their QEMU defaults can wedge the control
+// queue while the guest is programming its MAC filter, leaving the guest
+// NIC up but unusable.  Keep the control virtqueue enabled: QNX needs it for
+// the driver to start correctly.
+const QNX_X86_VIRTIO_NET_FEATURES: &str =
+    ",event_idx=off,mrg_rxbuf=off,indirect_desc=off,rx_queue_size=1024,ctrl_rx=off,ctrl_rx_extra=off,ctrl_vlan=off,ctrl_mac_addr=off,ctrl_guest_offloads=off";
+
+fn virtio_net_compat_features(os_type: OsType, arch: Arch) -> &'static str {
+    if matches!(os_type, OsType::Qnx) && matches!(arch, Arch::X86_64) {
+        QNX_X86_VIRTIO_NET_FEATURES
+    } else {
+        ""
+    }
+}
+
 pub struct QemuRunner {
     /// Override QEMU binary path. If None, resolved from arch.
     qemu_bin: Option<PathBuf>,
@@ -392,6 +409,7 @@ impl QemuRunner {
             .filter(|d| matches!(d, DeviceConfig::Network { .. }))
             .collect();
         let net_device = arch.virtio_device("net");
+        let virtio_net_features = virtio_net_compat_features(def.os_type, arch);
 
         let net_iter: Box<dyn Iterator<Item = (usize, &&DeviceConfig)>> =
             if arch.reverse_disk_order() {
@@ -415,7 +433,7 @@ impl QemuRunner {
                     ));
                 }
                 args.extend_from_slice(&["-netdev".into(), netdev]);
-                let mut dev_str = format!("{net_device},netdev={id}");
+                let mut dev_str = format!("{net_device},netdev={id}{virtio_net_features}");
                 if let Some(m) = mac {
                     dev_str.push_str(&format!(",mac={m}"));
                 }
@@ -434,7 +452,7 @@ impl QemuRunner {
                     "-netdev".into(),
                     format!("bridge,id={id},br={bridge}"),
                     "-device".into(),
-                    format!("{net_device},netdev={id},mac={mac}"),
+                    format!("{net_device},netdev={id},mac={mac}{virtio_net_features}"),
                 ]);
                 net_idx += 1;
             }
@@ -678,5 +696,24 @@ impl VmRunner for QemuRunner {
 impl Drop for QemuRunner {
     fn drop(&mut self) {
         self.cleanup();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qnx_x86_gets_virtio_net_compatibility_features() {
+        assert_eq!(
+            virtio_net_compat_features(OsType::Qnx, Arch::X86_64),
+            QNX_X86_VIRTIO_NET_FEATURES
+        );
+    }
+
+    #[test]
+    fn other_guest_profiles_keep_default_virtio_net_features() {
+        assert_eq!(virtio_net_compat_features(OsType::Linux, Arch::X86_64), "");
+        assert_eq!(virtio_net_compat_features(OsType::Qnx, Arch::Aarch64), "");
     }
 }
