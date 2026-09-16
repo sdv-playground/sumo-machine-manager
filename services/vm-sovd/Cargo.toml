@@ -25,7 +25,7 @@ hsm-rustls = { path = "../../crates/hsm-rustls" }
 # mDNS / DNS-SD advertiser for the SOVD endpoint (ISO 17978-3 §5.11). Active on
 # the provisioned HTTPS path; advertises `<id>.local` derived from the tls-identity
 # leaf so discovery clients verify the cert by hostname.
-sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 # Guest gateway (--guest-vhsm): the vHSM-backed HsmCryptoProvider.
 vhsm-provider = { path = "../../crates/vhsm-provider" }
@@ -37,10 +37,10 @@ tracing = "0.1"
 # tracing→score_log capture bridge. Sibling crate → path dep.
 sumo-log = { path = "../../crates/platform-integration/sumo-log" }
 serde_yaml = "0.9"
-sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
-sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
+sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
 # Gateway mode: proxies host-owned components to the host SOVD.
-sovd-proxy = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-proxy = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 
 [features]

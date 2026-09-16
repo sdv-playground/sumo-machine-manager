@@ -30,8 +30,8 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 # `openapi` = the feature-gated utoipa::ToSchema derives on OperationExecution /
 # OperationStatus, so sovd::openapi references the real wire types (no mirror).
-sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main", features = ["openapi"] }
-sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0", features = ["openapi"] }
+sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }

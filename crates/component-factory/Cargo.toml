@@ -10,6 +10,10 @@ nv-store = { path = "../nv-store" }
 component-mgr = { path = "../component-mgr" }
 app-mgr = { path = "../app-mgr" }
 hsm = { path = "../hsm", features = ["crypto"] }
+# Inline (not a [dependencies.sovd-core] table) on purpose: the workspace
+# tag-consistency guard matches `git = "…", tag = "…"` on ONE line, so a
+# multi-line table would be invisible to it and could drift off the pin.
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 
@@ -20,7 +24,3 @@ tracing = "0.1"
 # container-image route lives in component-mgr's app install router. OFF by
 # default — see app-mgr's `container` comment for why.
 container = ["component-mgr/container", "app-mgr/container"]
-
-[dependencies.sovd-core]
-git = "https://github.com/sdv-playground/SOVDd.git"
-branch = "main"
