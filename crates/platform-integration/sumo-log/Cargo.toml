@@ -19,8 +19,8 @@ tracing = ["dep:tracing-subscriber", "dep:score-log-tracing"]
 [dependencies]
 # The S-CORE facade + its stdout recorder (plain cargo git-deps from
 # eclipse-score/baselibs; no Bazel).
-score_log = { git = "https://github.com/eclipse-score/baselibs.git", branch = "main" }
-stdout_logger = { git = "https://github.com/eclipse-score/baselibs.git", branch = "main" }
+score_log = { git = "https://github.com/eclipse-score/baselibs.git", rev = "4205339b7ad57a65c4f00eace323a6bea444b810" }
+stdout_logger = { git = "https://github.com/eclipse-score/baselibs.git", rev = "4205339b7ad57a65c4f00eace323a6bea444b810" }
 # Our slog2 recorder — logs to the QNX slogger2 ring (the "normal QNX way"). It is
 # a no-op stub off QNX, so this dep is harmless on Linux; the crate builds
 # everywhere and `init` only routes to it when asked / on QNX. Sibling crate in

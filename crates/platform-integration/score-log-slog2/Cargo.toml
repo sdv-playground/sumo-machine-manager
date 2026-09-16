@@ -9,4 +9,4 @@ license = "MIT"
 path = "src/lib.rs"
 
 [dependencies]
-score_log = { git = "https://github.com/eclipse-score/baselibs.git", branch = "main" }
+score_log = { git = "https://github.com/eclipse-score/baselibs.git", rev = "4205339b7ad57a65c4f00eace323a6bea444b810" }

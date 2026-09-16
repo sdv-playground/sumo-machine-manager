@@ -12,7 +12,7 @@ path = "src/lib.rs"
 # The S-CORE logging facade (adopted as our producer contract — see the design
 # doc). Plain cargo git-dep; no Bazel. baselibs is a cargo workspace, score_log
 # resolves its .workspace inheritance fine as a git-dep.
-score_log = { git = "https://github.com/eclipse-score/baselibs.git", branch = "main" }
+score_log = { git = "https://github.com/eclipse-score/baselibs.git", rev = "4205339b7ad57a65c4f00eace323a6bea444b810" }
 
 tracing-core = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
