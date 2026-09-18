@@ -1766,9 +1766,25 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Terminal session teardown shared by every abort path: drop the staging
     /// session AND resolve this component's node-transaction membership (the
     /// gate staged it at `start_flash`). Pre-finalize only — callers reject
-    /// post-finalize aborts first.
+    /// post-finalize aborts first. Also wipes the staging bank dir: a failed
+    /// upload (e.g. ENOSPC mid-payload) leaves partial files behind that
+    /// nothing else reclaims until the NEXT flash's `prepare_target` — on a
+    /// space-constrained partition that partial is what makes the retry fail
+    /// again. Best-effort: a wipe error logs but doesn't mask the abort.
     pub fn abort_session(&self) -> BackendResult<()> {
+        let had_session = self.flash_session.lock().unwrap().is_some();
         self.clear_flash_session();
+        // Only wipe when a session was actually in flight: with no session,
+        // target_bank() may be the LIVE bank (single-bank components target
+        // their only bank) and this is called as a stale-DELETE no-op.
+        if had_session {
+            if let Err(e) = self.bank_provider.prepare_target(self.bank_provider.target_bank()) {
+                tracing::warn!(
+                    error = %e,
+                    "abort: staging bank dir not wiped — space reclaims at next flash"
+                );
+            }
+        }
         self.resolve_node_transaction()
     }
 
@@ -5659,6 +5675,21 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         self.bank_provider
             .rollback()
             .map_err(|e| BackendError::Internal(e.to_string()))?;
+        // The rolled-back trial bank is dead content: wipe it now instead of
+        // leaving hundreds of MB staged until the next flash's `prepare_target`
+        // — on a space-constrained partition those leftovers are what turn the
+        // next in-place update into an ENOSPC. Must run AFTER the NV/selector
+        // rollback above so `target_bank()` flips back to the (now dead) trial
+        // bank. Best-effort: a wipe failure logs, it doesn't fail the rollback.
+        if let Err(e) = self
+            .bank_provider
+            .prepare_target(self.bank_provider.target_bank())
+        {
+            tracing::warn!(
+                error = %e,
+                "rollback: trial bank dir not wiped — space reclaims at next flash"
+            );
+        }
         // Transaction resolved (reverted) — return the node toward Idle, same as
         // commit. Without this a rolled-back banked component stays in the
         // coordinator's staging and the node never leaves Staging/Trial.
@@ -11330,6 +11361,73 @@ mod abort_flash_tests {
             // Refused → the finalized transfer is left intact, not cleared.
             assert!(b.flash_transfer.lock().unwrap().is_some(), "{st:?}");
         }
+    }
+
+    /// Abort with a session in flight wipes the staging bank dir — the ENOSPC
+    /// incident left a 394 MB partial rootfs in the target bank that nothing
+    /// reclaimed until the NEXT flash, which then failed again on a full disk.
+    /// With a real images_dir-backed provider, the partial must be gone.
+    #[tokio::test]
+    async fn abort_session_with_staged_partial_wipes_target_bank() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
+        nv.write_boot_state(&mut boot).unwrap();
+        let b = ComponentBackend::with_options(
+            BankSet::Vm1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig::default(),
+            None,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+        // Active = A ⇒ target = B. Stage a partial file in bank_b.
+        let bank_b = dir.path().join("vm1").join("bank_b");
+        std::fs::create_dir_all(&bank_b).unwrap();
+        std::fs::write(bank_b.join("rootfs.img"), vec![0u8; 1024]).unwrap();
+
+        *b.flash_session.lock().unwrap() = Some(FlashSessionState::Complete);
+        b.abort_session().unwrap();
+
+        assert!(b.flash_session.lock().unwrap().is_none());
+        assert!(
+            !bank_b.join("rootfs.img").exists(),
+            "abort must wipe the staged partial from the target bank"
+        );
+    }
+
+    /// Abort with NO session in flight must NOT touch the target bank — with
+    /// nothing staged, `target_bank()` is just the next install's destination
+    /// (and for single-bank components it IS the live bank). A stale wire
+    /// DELETE arrives as a no-op, not a wipe.
+    #[tokio::test]
+    async fn abort_session_without_session_leaves_banks_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot = NvBootState::default();
+        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
+        nv.write_boot_state(&mut boot).unwrap();
+        let b = ComponentBackend::with_options(
+            BankSet::Vm1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig::default(),
+            None,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+        let bank_b = dir.path().join("vm1").join("bank_b");
+        std::fs::create_dir_all(&bank_b).unwrap();
+        std::fs::write(bank_b.join("rootfs.img"), vec![0u8; 1024]).unwrap();
+
+        b.abort_session().unwrap();
+
+        assert!(
+            bank_b.join("rootfs.img").exists(),
+            "abort with no session in flight must not wipe the target bank"
+        );
     }
 }
 
