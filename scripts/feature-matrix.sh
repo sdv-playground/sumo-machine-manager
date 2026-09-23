@@ -5,9 +5,11 @@
 #     bash scripts/feature-matrix.sh                 # fixed runs + powerset
 #     bash scripts/feature-matrix.sh --fixed-only    # fixed runs only
 #
-# Every combination is clippy-with-`-D warnings` (not a bare build): a feature
-# that is off must not leave dead code, unused imports or unreachable arms
-# behind. The policy these combinations enforce is in docs/features.md.
+# Every feature combination is clippy-with-`-D warnings` (not a bare build): a
+# feature that is off must not leave dead code, unused imports or unreachable
+# arms behind; one default-features `cargo test` run executes the tests those
+# clippy passes only compile. The policy these combinations enforce is in
+# docs/features.md.
 #
 # The fixed runs are cheap enough for every push; the powerset multiplies the
 # build by ~10, so CI runs it on a schedule instead (.github/workflows/
@@ -46,6 +48,14 @@ run "default features" \
     cargo clippy --workspace --all-targets -- -D warnings
 run "all features" \
     cargo clippy --workspace --all-targets --all-features -- -D warnings
+# The tests themselves. Clippy `--all-targets` above COMPILES every test but
+# never runs one — until 2026-09-23 no CI job executed `#[test]` functions at
+# all, so a test could fail on main for weeks unnoticed. One run, default
+# features (the shape every deployment ships); the feature corners above stay
+# clippy-only to bound the wall clock.
+run "tests (default features)" \
+    cargo test --workspace
+
 # The opt-in container/OCI server build — the one deployments with a container
 # runtime ship. Proves the forwarding chain vm-sovd -> component-factory ->
 # component-mgr -> app-mgr actually resolves.
