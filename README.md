@@ -129,7 +129,7 @@ Firmware updates use [RFC 9124 SUIT](https://datatracker.ietf.org/doc/draft-ietf
 - **Compressed payloads** — zstd compression before encryption
 - **Security version** — custom parameter (-257), separate from sequence_number
 - **CRL manifests** — policy-only (no firmware), raises anti-rollback floor
-- **Multi-payload** — host-os carries `#ifs` + `#rootfs` in one envelope
+- **Multi-payload** — one payload per declared part; for a raw-partition bank each payload streams straight to that part's A/B device and the signed IVD lists exactly the parts the install shipped
 - **SUIT command sequences** — manifests declare the update flow
 
 ### Security Version Model
@@ -150,7 +150,7 @@ Uses [sovd-core](https://github.com/sdv-playground/SOVDd) `DiagnosticBackend` tr
 
 | Component | Description |
 |-----------|-------------|
-| `host-os` | Host OS (IFS + rootfs), updated atomically |
+| `host-os` | Host OS — raw A/B partitions, one per part declared by the platform profile |
 | `vm1` | Primary OS VM (Linux) |
 | `vm2` | Secondary OS VM (QNX) |
 | `hsm` | HSM firmware (single-bank, no rollback) |
@@ -187,7 +187,7 @@ the UDS-device handler (SOVDd) — never by the client.
 - **Bank sets**: a runtime slot count derived from the NV device size (`slot_count()`, default 16, max 32 — the width of the u32 reboot-owed mask); a slot is a *number*, nothing more — a component's slot comes from its spec (`slot: N`, written by the platform profile) and the library names no slot (the old names live on only as `test-seams` fixtures, `nv_store::slots::*`). Storage dir = `storage_subdir` if set, else the component id
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA via SOVD)
 - **Per-bank VM config**: vm-config.yaml in bank directories, delivered alongside firmware via OTA
-- **Multi-payload SUIT**: host-os carries IFS + rootfs; VMs carry kernel + rootfs + config
+- **Multi-payload SUIT**: one payload per declared part — VMs carry kernel + rootfs + config; a raw-partition bank carries one payload per `parts:` entry, each streamed straight to that part's A/B device
 - **Container image updates**: `app-mgr` accepts detached `#container-image` payloads and imports them into Docker, Podman, or containerd through the normal Component flash lifecycle — opt-in, off by default: build with `--features container` (see [docs/features.md](docs/features.md) for the workspace feature policy)
 - **Trial boot**: Up to 10 reboots before auto-rollback to previous bank
 - **Copy-on-update**: Runtime DIDs/DTCs cloned to target bank before OTA write

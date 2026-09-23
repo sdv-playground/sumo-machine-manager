@@ -158,7 +158,7 @@ pub async fn process_envelope_stream(
         let writer =
             match bank_provider {
                 Some(bp) => Some(bp.open_payload_writer(target_bank, &target_name).map_err(
-                    |e| BackendError::Internal(format!("open payload sink {target_name}: {e}")),
+                    |e| crate::backend::sink_error(&format!("open payload sink {target_name}"), e),
                 )?),
                 None => None,
             };

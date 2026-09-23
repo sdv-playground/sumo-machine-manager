@@ -25,10 +25,17 @@
 //! methods:
 //! - [`open_payload_writer`](PartitionBankProvider::open_payload_writer) → opens the
 //!   A/B partition device as the write sink (not a staging file).
-//! - [`seal`](PartitionBankProvider::seal) → hashes each written partition back and
-//!   signs an IVD manifest over that digest (no dir-walk).
+//! - [`seal`](PartitionBankProvider::seal) → hashes back exactly the partitions the
+//!   install DELIVERED and signs an IVD manifest over those digests (no dir-walk).
 //! - [`verify_payload`](PartitionBankProvider::verify_payload) → re-hashes the
 //!   partition device (partition-exact ⇒ hash-to-EOF == image hash).
+//!
+//! All three are **fail-closed on the part map**: a name it does not hold is
+//! refused ([`BankError::UnknownPart`]), never staged as a file. And the seal
+//! attests the install's own inventory (`required`), never the whole map —
+//! nothing copies an unchanged part between raw partitions, so hashing a
+//! sibling the manifest never named would sign for whatever happens to be on
+//! it (a stale image under the new bank's signature).
 //!
 //! Per-consumer variance is only the part→partition A/B path map ([`PartitionPart`],
 //! data). host/rt/bootloader each construct the provider with their own map.
@@ -268,19 +275,16 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
     /// Open the A/B partition device for `name` as the payload sink. `File::create`
     /// on a block device does NOT truncate/resize the partition (the kernel
     /// ignores O_TRUNC on block devices); it opens the node for writing. A name
-    /// not in the part map falls back to the inner's staging-file sink (defensive
-    /// — shouldn't happen for a configured raw-partition bank).
+    /// not in the part map is REFUSED: this bank has no place to put those bytes,
+    /// and staging them as a file in the metadata dir would ack an install
+    /// nothing ever boots (and fill the small side dir with a full image).
     fn open_payload_writer(
         &self,
         bank: Bank,
         name: &str,
     ) -> Result<Box<dyn std::io::Write + Send>, BankError> {
         let Some(part) = self.parts.iter().find(|p| p.file == name) else {
-            tracing::warn!(
-                part = %name,
-                "partition bank: part not in the partition map — falling back to staging-file sink"
-            );
-            return self.inner.open_payload_writer(bank, name);
+            return Err(BankError::UnknownPart(name.into()));
         };
         let device = part.device(bank);
         // Open write-through (`O_SYNC`): each write reaches the eMMC before it
@@ -312,18 +316,36 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         Ok(Box::new(std::io::BufWriter::with_capacity(WRITE_BUF, sink)))
     }
 
-    /// Seal by hashing the written partition(s) BACK and signing an IVD manifest
+    /// Seal by hashing BACK exactly the partitions `required` names — the part
+    /// inventory this install's manifest declared — and signing an IVD manifest
     /// over those digests. No dir-walk (there are no staged files); the manifest
-    /// and its signature are written into the small metadata dir. `required` is
-    /// unused: the inventory is `self.parts` (raw devices, nothing to seed from
-    /// a peer bank dir).
+    /// and its signature are written into the small metadata dir.
+    ///
+    /// `required` IS the inventory, not a filter over `self.parts`: a raw
+    /// partition has no Ship-or-Reuse seam (nothing copies an unchanged part
+    /// from the peer bank), so a mapped part this install did not deliver holds
+    /// whatever it held before and must not be signed for.
     fn seal(
         &self,
         bank: Bank,
         identity: FirmwareIdentity,
         gen: u64,
-        _required: &[String],
+        required: &[String],
     ) -> Result<(), BankError> {
+        // The engine's list may name a part twice (a manifest can declare the
+        // same part in two components); the IVD names each part once.
+        let mut inventory: Vec<&String> = Vec::with_capacity(required.len());
+        for name in required {
+            if !inventory.contains(&name) {
+                inventory.push(name);
+            }
+        }
+        if inventory.is_empty() {
+            return Err(BankError::Failed(
+                "partition bank seal: the install declared no parts — nothing to attest".into(),
+            ));
+        }
+
         let metadata_dir = self.metadata_dir(bank)?;
         std::fs::create_dir_all(&metadata_dir).map_err(|e| {
             BankError::Failed(format!(
@@ -332,18 +354,38 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
             ))
         })?;
 
-        // Build the IVD file list by hashing each present partition device.
-        let mut files = Vec::with_capacity(self.parts.len());
-        for part in &self.parts {
+        // Build the IVD file list by hashing back the device behind each
+        // declared part. Every one of them must be mapped and present — this
+        // install claimed to deliver it, so a missing map entry or absent
+        // device is a hard failure, not something to skip past.
+        let mut files = Vec::with_capacity(inventory.len());
+        for name in &inventory {
+            let part = self
+                .parts
+                .iter()
+                .find(|p| &p.file == *name)
+                .ok_or_else(|| BankError::UnknownPart((*name).clone()))?;
             let device = part.device(bank);
-            // A part whose device is absent (e.g. #ifs/#rootfs not yet produced)
-            // is skipped — a 1-part (#application-only) bank is normal today.
             if !std::path::Path::new(device).exists() {
-                tracing::debug!(part = %part.file, device = %device, "partition bank: device absent — skipping in seal");
-                continue;
+                return Err(BankError::Failed(format!(
+                    "partition bank seal: part '{name}' declared by the install but its device \
+                     {device} does not exist"
+                )));
+            }
+            // A regular file under the metadata dir named like a part is a
+            // payload an older build staged as a FILE (the retired unmapped
+            // fallback): the device was never written, so signing here would
+            // attest the previous image. The operator deletes it and re-flashes.
+            let residue = metadata_dir.join(name.as_str());
+            if residue.is_file() {
+                return Err(BankError::Failed(format!(
+                    "partition bank seal: staging-file residue {} — this payload was staged as a \
+                     file, so {device} was never written; delete it and re-flash",
+                    residue.display()
+                )));
             }
             let (size, sha) = Self::hash_device(device)?;
-            tracing::info!(part = %part.file, device = %device, size, "partition bank: hashed partition for IVD");
+            tracing::info!(part = %name, device = %device, size, "partition bank: hashed partition for IVD");
             // The record learns the image from the medium BEFORE the bank is
             // signed: a refusal aborts here, with no IvdFile pushed for the
             // parts after this one and nothing signed below.
@@ -351,15 +393,26 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
                 r.sealed(bank, size, &sha)?;
             }
             files.push(hsm::ivd::IvdFile {
-                relative_path: part.file.clone(),
+                relative_path: (*name).clone(),
                 sha256: sha.to_vec(),
                 size,
             });
         }
-        if files.is_empty() {
-            return Err(BankError::Failed(
-                "partition bank seal: no partition device present to hash — nothing to sign".into(),
-            ));
+
+        // Mapped parts outside the install's inventory are neither hashed nor
+        // attested — say so once, so a partial flash is legible in the log.
+        let unattested: Vec<&str> = self
+            .parts
+            .iter()
+            .map(|p| p.file.as_str())
+            .filter(|f| !inventory.iter().any(|n| n.as_str() == *f))
+            .collect();
+        if !unattested.is_empty() {
+            tracing::warn!(
+                "partition bank seal: sealed without: {} — this install did not deliver them, so \
+                 the IVD does not attest them",
+                unattested.join(", ")
+            );
         }
 
         // Provisioning gate — mirror IvdBankProvider::seal: HSM must be present +
@@ -407,7 +460,8 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
     }
 
     /// Verify a part by re-hashing its partition device (partition-exact ⇒
-    /// hash-to-EOF == the image hash).
+    /// hash-to-EOF == the image hash). A name not in the part map is refused,
+    /// for the same reason the sink refuses it: there is no such part here.
     fn verify_payload(
         &self,
         bank: Bank,
@@ -415,7 +469,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         expected_sha256: &[u8; 32],
     ) -> Result<(), BankError> {
         let Some(part) = self.parts.iter().find(|p| p.file == name) else {
-            return self.inner.verify_payload(bank, name, expected_sha256);
+            return Err(BankError::UnknownPart(name.into()));
         };
         let device = part.device(bank);
         let (_len, recomputed) = Self::hash_device(device)?;
@@ -570,8 +624,13 @@ mod tests {
         let p = build(base.join("images"), parts, "seal");
 
         // Seal → hashes dev_a back, signs a manifest into the metadata dir.
-        p.seal(Bank::A, FirmwareIdentity::default(), 1, &[])
-            .unwrap();
+        p.seal(
+            Bank::A,
+            FirmwareIdentity::default(),
+            1,
+            &["application.img".to_string()],
+        )
+        .unwrap();
 
         // The IVD artefacts landed in the metadata dir (NOT a 133MB staging file).
         let md = p.metadata_dir(Bank::A).unwrap();
@@ -608,20 +667,169 @@ mod tests {
     }
 
     #[test]
-    fn unmapped_part_name_falls_back_to_inner() {
-        // A name not in the partition map must not panic — it delegates to the
-        // inner staging-file sink (which, with an images_dir, opens a file).
-        let base = tmp("fallback");
+    fn unmapped_part_name_is_refused_and_nothing_is_staged() {
+        // A name not in the partition map has nowhere to go on this bank. The
+        // old fallback staged it as a FILE in the metadata dir: the payload was
+        // ack'd, the device never written, and the bank sealed over the PREVIOUS
+        // image. Both device-facing entry points must refuse it instead, and
+        // leave no artifact behind.
+        let base = tmp("unmapped");
+        let images = base.join("images");
         let parts = vec![PartitionPart {
             file: "application.img".into(),
             partition_a: base.join("a.img").to_string_lossy().into(),
             partition_b: base.join("b.img").to_string_lossy().into(),
             record: None,
         }];
-        let p = build(base.join("images"), parts, "fallback");
-        // "ifs" is not mapped → inner opens images/os/bank_a/ifs
-        let w = p.open_payload_writer(Bank::A, "ifs");
-        assert!(w.is_ok(), "unmapped name should fall back, not error");
+        let p = build(images.clone(), parts, "unmapped");
+
+        match p.open_payload_writer(Bank::A, "ifs").err() {
+            Some(BankError::UnknownPart(name)) => assert_eq!(name, "ifs"),
+            other => panic!("an unmapped part must be refused, got {other:?}"),
+        }
+        match p.verify_payload(Bank::A, "ifs", &[0u8; 32]) {
+            Err(BankError::UnknownPart(name)) => assert_eq!(name, "ifs"),
+            other => panic!("an unmapped part must be refused, got {other:?}"),
+        }
+        assert!(
+            !images.join("os").join("bank_a").join("ifs").exists(),
+            "a refused part leaves NO staged file under images/"
+        );
+    }
+
+    #[test]
+    fn seal_attests_exactly_the_required_parts() {
+        // Two mapped parts, both devices present, but the install delivered only
+        // one. The IVD must name that one: the other partition still holds the
+        // PREVIOUS image (nothing copies a raw partition forward), so attesting
+        // it would sign stale bytes into the new bank's manifest.
+        let base = tmp("seal-required");
+        let appl = base.join("bankA-appl.img");
+        let ifs = base.join("bankA-ifs.img");
+        std::fs::write(&appl, b"the delivered application image").unwrap();
+        std::fs::write(&ifs, b"the PREVIOUS ifs image, untouched by this install").unwrap();
+        let parts = vec![
+            part("application.img", &appl, &base.join("bankB-appl.img")),
+            part("ifs", &ifs, &base.join("bankB-ifs.img")),
+        ];
+        let p = build(base.join("images"), parts, "seal-required");
+
+        p.seal(
+            Bank::A,
+            FirmwareIdentity::default(),
+            1,
+            &["application.img".to_string()],
+        )
+        .unwrap();
+
+        let names: Vec<String> = p
+            .read_installed(Bank::A)
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(
+            names,
+            ["application.img"],
+            "the IVD attests exactly what the install delivered"
+        );
+    }
+
+    #[test]
+    fn seal_refuses_a_required_part_with_no_mapping() {
+        let base = tmp("seal-unmapped");
+        let appl = base.join("bankA-appl.img");
+        std::fs::write(&appl, b"application image").unwrap();
+        let parts = vec![part("application.img", &appl, &base.join("bankB-appl.img"))];
+        let p = build(base.join("images"), parts, "seal-unmapped");
+
+        match p.seal(
+            Bank::A,
+            FirmwareIdentity::default(),
+            1,
+            &["ifs".to_string()],
+        ) {
+            Err(BankError::UnknownPart(name)) => assert_eq!(name, "ifs"),
+            other => panic!("a required part with no mapping must be refused, got {other:?}"),
+        }
+        assert!(matches!(
+            p.read_installed(Bank::A),
+            Err(BankError::NotInstalled)
+        ));
+    }
+
+    #[test]
+    fn seal_refuses_a_required_part_whose_device_is_absent() {
+        // The install claimed to deliver this part, so an absent device means
+        // the write never landed — sign nothing.
+        let base = tmp("seal-absent");
+        let parts = vec![part(
+            "application.img",
+            &base.join("absent-a"),
+            &base.join("absent-b"),
+        )];
+        let p = build(base.join("images"), parts, "seal-absent");
+
+        match p.seal(
+            Bank::A,
+            FirmwareIdentity::default(),
+            1,
+            &["application.img".to_string()],
+        ) {
+            Err(BankError::Failed(msg)) => assert!(
+                msg.contains("absent-a"),
+                "the failure names the missing device: {msg}"
+            ),
+            other => panic!("an absent device must fail the seal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_refuses_an_empty_inventory() {
+        // Nothing declared ⇒ nothing to attest. Sealing the whole part map here
+        // is exactly the stale-sibling bug; an empty inventory is a wiring error.
+        let base = tmp("seal-empty");
+        let appl = base.join("bankA-appl.img");
+        std::fs::write(&appl, b"application image").unwrap();
+        let parts = vec![part("application.img", &appl, &base.join("bankB-appl.img"))];
+        let p = build(base.join("images"), parts, "seal-empty");
+
+        match p.seal(Bank::A, FirmwareIdentity::default(), 1, &[]) {
+            Err(BankError::Failed(msg)) => assert!(
+                msg.contains("declared no parts"),
+                "the failure says the install declared nothing: {msg}"
+            ),
+            other => panic!("an empty inventory must fail the seal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_refuses_staging_file_residue() {
+        // A payload an older build staged as a FILE under the metadata dir: the
+        // partition was never written, so hashing it back would attest the
+        // previous image under this install's signature.
+        let base = tmp("seal-residue");
+        let appl = base.join("bankA-appl.img");
+        std::fs::write(&appl, b"the PREVIOUS application image").unwrap();
+        let parts = vec![part("application.img", &appl, &base.join("bankB-appl.img"))];
+        let p = build(base.join("images"), parts, "seal-residue");
+        let md = p.metadata_dir(Bank::A).unwrap();
+        std::fs::create_dir_all(&md).unwrap();
+        std::fs::write(md.join("application.img"), b"the payload, staged as a file").unwrap();
+
+        match p.seal(
+            Bank::A,
+            FirmwareIdentity::default(),
+            1,
+            &["application.img".to_string()],
+        ) {
+            Err(BankError::Failed(msg)) => assert!(
+                msg.contains("staging-file residue"),
+                "the failure names the residue: {msg}"
+            ),
+            other => panic!("staging-file residue must fail the seal, got {other:?}"),
+        }
     }
 
     // A DurableSink double that records the order of writes vs the durability
@@ -865,19 +1073,25 @@ mod tests {
         let parts = vec![
             part("application.img", &appl, &base.join("bankB-appl.img")).with_record(rec.clone()),
             part("ifs", &ifs, &base.join("bankB-ifs.img")).with_record(rec.clone()),
-            // Absent device → skipped before hashing, so never recorded either.
+            // Mapped but NOT delivered by this install → never hashed, so never
+            // recorded either (and its device need not even exist).
             part("rootfs", &base.join("absent-a"), &base.join("absent-b")).with_record(rec.clone()),
         ];
         let p = build(base.join("images"), parts, "rec-sealed");
 
-        p.seal(Bank::A, FirmwareIdentity::default(), 1, &[])
-            .unwrap();
+        p.seal(
+            Bank::A,
+            FirmwareIdentity::default(),
+            1,
+            &["application.img".to_string(), "ifs".to_string()],
+        )
+        .unwrap();
 
         let calls = rec.calls.lock().unwrap().clone();
         assert_eq!(
             calls.len(),
             2,
-            "one `sealed` per PRESENT mapped part (the absent device stays skipped): {calls:?}"
+            "one `sealed` per DELIVERED part (the undelivered one stays untouched): {calls:?}"
         );
         // The values are what an independent read+hash of the partition gives —
         // i.e. what came BACK off the medium, not what the wire claimed.
@@ -917,7 +1131,12 @@ mod tests {
         let p = build(base.join("images"), parts, "rec-sealed-err");
 
         assert!(matches!(
-            p.seal(Bank::A, FirmwareIdentity::default(), 1, &[]),
+            p.seal(
+                Bank::A,
+                FirmwareIdentity::default(),
+                1,
+                &["application.img".to_string(), "ifs".to_string()],
+            ),
             Err(BankError::Failed(_))
         ));
 
@@ -1024,8 +1243,13 @@ mod tests {
             Some(selector),
         );
 
-        p.seal(Bank::A, FirmwareIdentity::default(), 1, &[])
-            .unwrap();
+        p.seal(
+            Bank::A,
+            FirmwareIdentity::default(),
+            1,
+            &["application.img".to_string()],
+        )
+        .unwrap();
         p.activate(Bank::A).unwrap();
         let routes_before = rec.routes().len();
         p.commit().unwrap();

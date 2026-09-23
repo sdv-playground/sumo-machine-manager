@@ -70,6 +70,10 @@ pub enum BankError {
     NotInstalled,
     /// The installed firmware exists but failed verification.
     Unverifiable(String),
+    /// The payload names a part this bank does not declare. Fail-closed: a
+    /// provider with a fixed part map (a raw-partition bank) refuses the name
+    /// rather than staging the bytes somewhere nothing will ever read them.
+    UnknownPart(String),
     /// Any other kind-specific failure.
     Failed(String),
 }
@@ -80,6 +84,7 @@ impl std::fmt::Display for BankError {
             BankError::Io(e) => write!(f, "bank I/O error: {e}"),
             BankError::NotInstalled => write!(f, "bank not installed"),
             BankError::Unverifiable(m) => write!(f, "bank firmware unverifiable: {m}"),
+            BankError::UnknownPart(p) => write!(f, "part not declared for this bank: {p}"),
             BankError::Failed(m) => write!(f, "bank operation failed: {m}"),
         }
     }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use machine_mgr::Component;
 use nv_store::block::BlockDevice;
@@ -12,6 +12,18 @@ use nv_store::types::BankSet;
 use component_mgr::backend::{ComponentBackend, ComponentConfig};
 use component_mgr::component_adapter::ComponentAdapter;
 use component_mgr::manifest_provider::ManifestProvider;
+
+/// One raw A/B partition pair behind a bank part. `name` is the payload name as it
+/// arrives on the wire (the SUIT component-id's last segment); `a`/`b` are the
+/// device paths of the two banks. What a part MEANS is the platform's business;
+/// the library only needs the list to be well-formed ([`validate_parts`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartSpec {
+    pub name: String,
+    pub a: String,
+    pub b: String,
+}
 
 /// Declarative component specification — parsed from YAML config.
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +66,15 @@ pub struct ComponentSpec {
     /// Override when a component's bank dirs don't live under its own id.
     #[serde(default)]
     pub storage_subdir: Option<String>,
+
+    /// The raw A/B partition pairs this component's bank is made of — one entry
+    /// per payload a manifest may name for it. Declaring them is what makes the
+    /// bank fail closed: a manifest naming anything else is refused before a
+    /// payload byte is uploaded, and the signed IVD attests exactly the parts an
+    /// install delivered. Empty (the default) ⇒ NOT a raw-partition bank: the
+    /// component stages payloads as files in its bank dir.
+    #[serde(default)]
+    pub parts: Vec<PartSpec>,
 
     /// Bank-activator marker. When set, the caller constructs the
     /// appropriate activator and inserts it into `FactoryDeps::bank_activators`.
@@ -298,6 +319,66 @@ pub fn resolve_bank_set(spec: &ComponentSpec) -> Result<BankSet, String> {
     }
 }
 
+/// Check a spec's raw-partition [`parts`](ComponentSpec::parts) list is
+/// well-formed: every `name` is non-empty and path-free (it is a payload's last
+/// id segment, not a path) and unique; every device path is non-empty; `a` and
+/// `b` differ; and no device is claimed by two parts. The factory has no opinion
+/// on what a part means — only that a malformed list can never reach the
+/// provider, where a duplicate name silently shadows and a shared device has one
+/// part overwriting another.
+///
+/// Called first thing in [`build_component`], so a platform that never calls it
+/// still fails closed.
+pub fn validate_parts(spec: &ComponentSpec) -> Result<(), String> {
+    let mut names: Vec<&str> = Vec::with_capacity(spec.parts.len());
+    let mut devices: Vec<&str> = Vec::with_capacity(spec.parts.len() * 2);
+    for part in &spec.parts {
+        if part.name.is_empty() {
+            return Err(format!(
+                "component '{}' declares a part with an empty name",
+                spec.id,
+            ));
+        }
+        if part.name.contains('/') {
+            return Err(format!(
+                "component '{}' part '{}' has a '/' in its name — a part name is the payload's \
+                 last id segment, not a path",
+                spec.id, part.name,
+            ));
+        }
+        if names.contains(&part.name.as_str()) {
+            return Err(format!(
+                "component '{}' declares part '{}' twice",
+                spec.id, part.name,
+            ));
+        }
+        names.push(&part.name);
+        if part.a.is_empty() || part.b.is_empty() {
+            return Err(format!(
+                "component '{}' part '{}' has an empty device path",
+                spec.id, part.name,
+            ));
+        }
+        if part.a == part.b {
+            return Err(format!(
+                "component '{}' part '{}' points both banks at '{}' — A and B must differ",
+                spec.id, part.name, part.a,
+            ));
+        }
+        for device in [&part.a, &part.b] {
+            if devices.contains(&device.as_str()) {
+                return Err(format!(
+                    "component '{}' part '{}' reuses device '{device}' — each partition backs \
+                     exactly one part",
+                    spec.id, part.name,
+                ));
+            }
+            devices.push(device);
+        }
+    }
+    Ok(())
+}
+
 /// Resolve both the bank-set slot AND its spec (on-disk dir name)
 /// from a `ComponentSpec`. The slot comes from [`resolve_bank_set`];
 /// the dir name is the explicit `storage_subdir` when present, else
@@ -411,6 +492,11 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
     spec: &ComponentSpec,
     deps: &FactoryDeps<D>,
 ) -> Option<BuiltComponent> {
+    if let Err(msg) = validate_parts(spec) {
+        tracing::error!("{msg}");
+        return None;
+    }
+
     let (bank_set, bank_spec) = match resolve_bank_set_spec(spec) {
         Ok(resolved) => resolved,
         Err(msg) => {
@@ -476,6 +562,12 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 None,
             ) {
                 backend = backend.with_bank_provider(provider);
+                // A raw-partition provider accepts only its mapped parts. Tell
+                // the engine the same list so a manifest naming another one is
+                // refused at manifest time, not after the upload.
+                if let Some(parts) = deps.partition_parts.get(&spec.id) {
+                    backend = backend.with_declared_parts(parts.iter().map(|p| p.file.clone()));
+                }
             }
             backend = backend
                 .with_display_name(spec.display_name.clone().unwrap_or_else(|| spec.id.clone()));
@@ -628,6 +720,12 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 activator,
             ) {
                 backend = backend.with_bank_provider(provider);
+                // A raw-partition provider accepts only its mapped parts. Tell
+                // the engine the same list so a manifest naming another one is
+                // refused at manifest time, not after the upload.
+                if let Some(parts) = deps.partition_parts.get(&spec.id) {
+                    backend = backend.with_declared_parts(parts.iter().map(|p| p.file.clone()));
+                }
             }
 
             backend = backend
@@ -724,6 +822,7 @@ mod tests {
             bank_set: None,
             slot: Some(slot),
             storage_subdir: None,
+            parts: Vec::new(),
             activator: None,
             display_name: None,
             entity_type: None,
@@ -861,6 +960,171 @@ mod tests {
         .unwrap();
         assert!(set.attest_time);
         assert!(set.vm_principal);
+    }
+
+    /// A raw-partition bank is declared in the platform profile's YAML, so the
+    /// wire format is the contract: the three keys land as written, and nothing
+    /// is a raw-partition bank unless it says so.
+    #[test]
+    fn parts_round_trip_through_yaml_and_default_to_empty() {
+        let bare: ComponentSpec = serde_yaml::from_str("id: host\ntype: hpc\nslot: 2\n").unwrap();
+        assert!(bare.parts.is_empty(), "no parts: ⇒ not a partition bank");
+
+        let spec: ComponentSpec = serde_yaml::from_str(
+            "id: host\ntype: hpc\nslot: 2\nparts:\n  - name: application.img\n    \
+             a: /dev/blk0p3\n    b: /dev/blk0p4\n  - name: boot.ifs\n    a: /dev/blk0p5\n    \
+             b: /dev/blk0p6\n",
+        )
+        .unwrap();
+        assert_eq!(
+            spec.parts,
+            vec![
+                PartSpec {
+                    name: "application.img".into(),
+                    a: "/dev/blk0p3".into(),
+                    b: "/dev/blk0p4".into(),
+                },
+                PartSpec {
+                    name: "boot.ifs".into(),
+                    a: "/dev/blk0p5".into(),
+                    b: "/dev/blk0p6".into(),
+                },
+            ]
+        );
+        // Serialize → parse gives the same list back.
+        let yaml = serde_yaml::to_string(&spec.parts).unwrap();
+        assert_eq!(
+            serde_yaml::from_str::<Vec<PartSpec>>(&yaml).unwrap(),
+            spec.parts
+        );
+    }
+
+    /// A key this struct does not know must fail the parse, not be dropped: a
+    /// part is a device map, and silently ignoring `partition_a:` would point
+    /// the bank at whatever `a:` happened to say (or nothing at all).
+    #[test]
+    fn an_unknown_part_key_is_refused_at_parse_time() {
+        let parse = |parts: &str| {
+            serde_yaml::from_str::<ComponentSpec>(&format!(
+                "id: host\ntype: hpc\nslot: 2\nparts:\n{parts}"
+            ))
+        };
+        // The realistic operator error: the old key name in place of `a:`.
+        let err =
+            parse("  - name: application.img\n    partition_a: /dev/blk0p3\n    b: /dev/blk0p4\n")
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("partition_a"),
+            "the parse error names the unknown key: {err}"
+        );
+        // And a key ALONGSIDE a complete part — which would otherwise parse
+        // cleanly and quietly drop whatever the operator meant by it.
+        let err = parse(
+            "  - name: application.img\n    a: /dev/blk0p3\n    b: /dev/blk0p4\n    \
+             partition_a: /dev/blk0p9\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("partition_a"),
+            "the parse error names the unknown key: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_parts_refuses_a_malformed_list() {
+        let with_parts = |parts: Vec<PartSpec>| {
+            let mut spec = spec_on_slot("host", 2);
+            spec.parts = parts;
+            spec
+        };
+        let part = |name: &str, a: &str, b: &str| PartSpec {
+            name: name.into(),
+            a: a.into(),
+            b: b.into(),
+        };
+
+        // Well-formed (and an empty list — a file-backed bank) is accepted.
+        assert!(validate_parts(&spec_on_slot("vm1", 4)).is_ok());
+        assert!(validate_parts(&with_parts(vec![
+            part("application.img", "/dev/blk0p3", "/dev/blk0p4"),
+            part("boot.ifs", "/dev/blk0p5", "/dev/blk0p6"),
+        ]))
+        .is_ok());
+
+        assert_eq!(
+            validate_parts(&with_parts(vec![part("", "/dev/blk0p3", "/dev/blk0p4")])).unwrap_err(),
+            "component 'host' declares a part with an empty name"
+        );
+        assert_eq!(
+            validate_parts(&with_parts(vec![part(
+                "boot/application.img",
+                "/dev/blk0p3",
+                "/dev/blk0p4"
+            )]))
+            .unwrap_err(),
+            "component 'host' part 'boot/application.img' has a '/' in its name — a part name \
+             is the payload's last id segment, not a path"
+        );
+        assert_eq!(
+            validate_parts(&with_parts(vec![
+                part("application.img", "/dev/blk0p3", "/dev/blk0p4"),
+                part("application.img", "/dev/blk0p5", "/dev/blk0p6"),
+            ]))
+            .unwrap_err(),
+            "component 'host' declares part 'application.img' twice"
+        );
+        assert_eq!(
+            validate_parts(&with_parts(vec![part(
+                "application.img",
+                "",
+                "/dev/blk0p4"
+            )]))
+            .unwrap_err(),
+            "component 'host' part 'application.img' has an empty device path"
+        );
+        assert_eq!(
+            validate_parts(&with_parts(vec![part(
+                "application.img",
+                "/dev/blk0p3",
+                "/dev/blk0p3"
+            )]))
+            .unwrap_err(),
+            "component 'host' part 'application.img' points both banks at '/dev/blk0p3' — A and \
+             B must differ"
+        );
+        assert_eq!(
+            validate_parts(&with_parts(vec![
+                part("application.img", "/dev/blk0p3", "/dev/blk0p4"),
+                part("boot.ifs", "/dev/blk0p4", "/dev/blk0p6"),
+            ]))
+            .unwrap_err(),
+            "component 'host' part 'boot.ifs' reuses device '/dev/blk0p4' — each partition \
+             backs exactly one part"
+        );
+    }
+
+    /// The validation is not advisory: a platform that never calls it still gets
+    /// a refused component rather than a bank whose parts collide.
+    #[test]
+    fn build_component_refuses_a_spec_with_duplicate_part_names() {
+        let mut spec = spec_on_slot("host", 2);
+        spec.parts = vec![
+            PartSpec {
+                name: "application.img".into(),
+                a: "/dev/blk0p3".into(),
+                b: "/dev/blk0p4".into(),
+            },
+            PartSpec {
+                name: "application.img".into(),
+                a: "/dev/blk0p5".into(),
+                b: "/dev/blk0p6".into(),
+            },
+        ];
+        assert!(build_component(&spec, &ten_slot_deps()).is_none());
+
+        // The same spec with the duplicate renamed builds.
+        spec.parts[1].name = "boot.ifs".into();
+        assert!(build_component(&spec, &ten_slot_deps()).is_some());
     }
 
     /// The HSM CSR/keystore wiring follows the DECLARED component type, not the

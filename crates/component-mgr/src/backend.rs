@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 // `OnceLock` caches the process-wide boot_epoch (read+bumped once at first
 // paged-log request); `Path`/`BTreeMap` back the reboot-safe log cursor below.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -33,7 +33,7 @@ use sovd_core::error::{BackendError, BackendResult};
 use sovd_core::models::*;
 use sovd_core::PackageStream;
 
-use machine_mgr::bank_provider::{BankProvider, FirmwareIdentity, InstalledFirmware};
+use machine_mgr::bank_provider::{BankError, BankProvider, FirmwareIdentity, InstalledFirmware};
 
 use crate::bank_provider::IvdBankProvider;
 use crate::did;
@@ -65,6 +65,24 @@ pub const UPDATE_MODE_PARAM_ID: &str = "x-ota-update-mode";
 /// so an older-than-floor manifest is a harmless no-op. Device-global — advertised
 /// on the host/device component (the floor + clock are shared singletons).
 pub const ATTEST_TIME_OP_ID: &str = "x-attest-time";
+
+/// Map a [`BankError`] raised by a bank-provider payload sink / readback onto
+/// the SOVD wire, prefixed with the call site's `context`.
+///
+/// - `UnknownPart` — the payload names a part this bank does not have. That is
+///   the wrong PACKAGE for this component, the same class the F.D3 dispatcher
+///   answers with 415 (`UnsupportedMediaType`); retrying the same bytes can
+///   never help.
+/// - `Unverifiable` — the bytes on the medium are wrong: a bad request (400),
+///   as the inline verify path has always reported it.
+/// - anything else — a read/write fault on our side (500).
+pub(crate) fn sink_error(context: &str, e: BankError) -> BackendError {
+    match e {
+        BankError::UnknownPart(_) => BackendError::UnsupportedMediaType(format!("{context}: {e}")),
+        BankError::Unverifiable(_) => BackendError::InvalidRequest(format!("{context}: {e}")),
+        _ => BackendError::Internal(format!("{context}: {e}")),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Stored package (validated SUIT envelope)
@@ -512,6 +530,14 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// replace the whole provider — anything after `with_bank_provider` that
     /// would rebuild is intentionally ignored.
     bank_provider_override: bool,
+    /// The part names this component's bank DECLARES, when its provider holds a
+    /// fixed set (a raw-partition bank's `parts:` map). `Some` ⇒ a manifest
+    /// naming anything else is refused at MANIFEST time, before a payload byte
+    /// is uploaded — the provider would refuse the sink anyway, but only after
+    /// the operator had pushed the whole image. `None` (file-backed banks) ⇒
+    /// the provider takes any name and nothing is pre-checked. Injected by
+    /// component-factory alongside the partition provider.
+    declared_parts: Option<BTreeSet<String>>,
     /// The bank activator the (non-overridden) default `IvdBankProvider` is
     /// rebuilt with. Stored so a later `with_hsm_crypto` rebuild (which threads
     /// the crypto handle into the default provider) preserves the activator set
@@ -713,6 +739,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             verified_manifest_cache: Mutex::new(None),
             bank_provider,
             bank_provider_override: false,
+            declared_parts: None,
             bank_activator: None,
             node_coordinator: None,
             post_provision_reload: None,
@@ -1008,6 +1035,16 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     pub fn with_bank_provider(mut self, provider: Arc<dyn BankProvider>) -> Self {
         self.bank_provider = provider;
         self.bank_provider_override = true;
+        self
+    }
+
+    /// Declare the parts this component's bank holds — the names its provider
+    /// will accept as payload sinks (a raw-partition bank's `parts:` map).
+    /// Paired with a provider that refuses anything else, so the manifest-time
+    /// refusal and the sink-time refusal agree. Leaving it unset keeps the
+    /// take-any-name behaviour file-backed banks rely on.
+    pub fn with_declared_parts(mut self, parts: impl IntoIterator<Item = String>) -> Self {
+        self.declared_parts = Some(parts.into_iter().collect());
         self
     }
 
@@ -1565,9 +1602,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                         .bank_provider
                         .open_payload_writer(target, &name)
                         .map_err(|e| {
-                            BackendError::Internal(format!(
-                                "reconcile: open bank writer for {name}: {e}"
-                            ))
+                            sink_error(&format!("reconcile: open bank writer for {name}"), e)
                         })?;
                     let key_unwrap = self.manifest_provider.key_unwrap_for_decryption();
                     let fetched = crate::streaming::fetch_and_install_component(
@@ -2247,7 +2282,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             let writer = self
                 .bank_provider
                 .open_payload_writer(target_bank, &target_name)
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
+                .map_err(|e| sink_error(&format!("open payload sink {target_name}"), e))?;
 
             tracing::info!(
                 uri = %uri,
@@ -2357,6 +2392,32 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         let payload_parts = (0..total_components)
             .filter(|i| manifest.image_digest(*i).is_some())
             .count();
+        // Fail-closed pre-flight for a bank that declares its parts (a
+        // raw-partition bank): a manifest naming a part this bank does not have
+        // is refused HERE — before the session moves out of AwaitingManifest and
+        // before the operator uploads a single payload byte. The provider would
+        // refuse the sink anyway, but only after the whole image had crossed the
+        // link. 415 is the same answer the F.D3 dispatcher gives a package
+        // addressed to the wrong component: retrying these bytes cannot help.
+        if let Some(declared) = &self.declared_parts {
+            for i in 0..total_components {
+                if manifest.image_digest(i).is_none() {
+                    continue; // no payload owed (disable / policy component)
+                }
+                let name = crate::bank_spec::payload_target_name_for_id(manifest.component_id(i));
+                if !declared.contains(&name) {
+                    return Err(BackendError::UnsupportedMediaType(format!(
+                        "manifest part '{name}' is not a part of bank '{}' (declared: {})",
+                        self.entity_info.id,
+                        declared
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+            }
+        }
         // Header-only validation is the SHARED metadata extraction and leaves
         // `disable_target` to whoever has the parsed manifest in hand (as
         // `SuitProvider::validate` and the streaming path both do). Fill it in
@@ -2548,7 +2609,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         let writer = self
             .bank_provider
             .open_payload_writer(target_bank, &target_name)
-            .map_err(|e| BackendError::Internal(e.to_string()))?;
+            .map_err(|e| sink_error(&format!("open payload sink {target_name}"), e))?;
 
         tracing::info!(
             component = comp_idx,
@@ -2594,12 +2655,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // see tasks/vm-flash-durability-and-commit-witness.md.
         self.bank_provider
             .verify_payload(target_bank, &target_name, &image_hash)
-            .map_err(|e| match e {
-                machine_mgr::bank_provider::BankError::Unverifiable(_) => {
-                    BackendError::InvalidRequest(format!("staging verify {target_name}: {e}"))
-                }
-                _ => BackendError::Internal(format!("staging verify {target_name}: {e}")),
-            })?;
+            .map_err(|e| sink_error(&format!("staging verify {target_name}"), e))?;
 
         // Record the freshly-hashed file for `ivd_sign_staged_bank` so
         // it doesn't need to re-walk + re-hash this payload from disk
@@ -4494,12 +4550,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 // disk is wrong), a read failure is our-fault internal.
                 self.bank_provider
                     .verify_payload(bank, &name, &inner_sha256)
-                    .map_err(|e| match e {
-                        machine_mgr::bank_provider::BankError::Unverifiable(_) => {
-                            BackendError::InvalidRequest(format!("verify_part {file_id}: {e}"))
-                        }
-                        _ => BackendError::Internal(format!("verify_part {file_id}: {e}")),
-                    })
+                    .map_err(|e| sink_error(&format!("verify_part {file_id}"), e))
             }
         }
     }
@@ -12823,5 +12874,197 @@ mod time_floor_ratchet_tests {
             "a manifest not signed by the trusted root is rejected"
         );
         assert_eq!(floor(&hsm), 0, "a forged manifest never moves the floor");
+    }
+}
+
+// ===========================================================================
+// Declared parts — a bank that knows which parts it holds refuses the rest
+// ===========================================================================
+#[cfg(test)]
+mod declared_parts_tests {
+    use super::*;
+    use crate::manifest_provider::{ManifestError, ManifestProvider, ValidatedFirmware};
+    use machine_mgr::bank_provider::{BankError, BankProvider};
+    use machine_mgr::ResetKind;
+    use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
+    use nv_store::store::MIN_NV_DEVICE_SIZE;
+    use sumo_offboard::image_builder::{ComponentSpec as SuitComponentSpec, MultiComponentBuilder};
+    use sumo_offboard::keygen;
+
+    /// A manifest provider that validates anything — these tests are about what
+    /// happens AFTER validation, and the SUIT signature is checked elsewhere.
+    struct CannedManifest;
+    impl ManifestProvider for CannedManifest {
+        fn validate(&self, _d: &[u8], _m: u32) -> Result<ValidatedFirmware, ManifestError> {
+            Ok(ValidatedFirmware {
+                component_name: "host".into(),
+                manifest_type: ManifestType::Firmware,
+                image_meta: crate::ota::ImageMeta::default(),
+                image_data: Vec::new(),
+                version_display: "1.0.0".into(),
+                image_sha256: None,
+                image_size: None,
+                raw_envelope: None,
+                streamed_files: Vec::new(),
+                signing_time_secs: None,
+                disable_target: None,
+            })
+        }
+    }
+
+    /// A raw-partition-shaped provider: every payload sink is refused with
+    /// `UnknownPart`, the way `PartitionBankProvider` refuses a name outside its
+    /// map. Everything else is an unreachable stub.
+    struct UnknownPartProvider;
+    impl BankProvider for UnknownPartProvider {
+        fn active_bank(&self) -> Bank {
+            Bank::A
+        }
+        fn target_bank(&self) -> Bank {
+            Bank::B
+        }
+        fn prepare_target(&self, _bank: Bank) -> Result<(), BankError> {
+            Ok(())
+        }
+        fn open_payload_writer(
+            &self,
+            _bank: Bank,
+            name: &str,
+        ) -> Result<Box<dyn std::io::Write + Send>, BankError> {
+            Err(BankError::UnknownPart(name.into()))
+        }
+        fn seal(
+            &self,
+            _b: Bank,
+            _i: FirmwareIdentity,
+            _g: u64,
+            _r: &[String],
+        ) -> Result<(), BankError> {
+            Ok(())
+        }
+        fn read_installed(&self, _bank: Bank) -> Result<InstalledFirmware, BankError> {
+            Err(BankError::NotInstalled)
+        }
+        fn verify_payload(&self, _b: Bank, name: &str, _s: &[u8; 32]) -> Result<(), BankError> {
+            Err(BankError::UnknownPart(name.into()))
+        }
+        fn activate(&self, _bank: Bank) -> Result<ResetKind, BankError> {
+            Ok(ResetKind::RequiresEcuReset)
+        }
+        fn commit(&self) -> Result<(), BankError> {
+            Ok(())
+        }
+        fn rollback(&self) -> Result<(), BankError> {
+            Ok(())
+        }
+    }
+
+    fn host_backend() -> ComponentBackend<MemBlockDevice> {
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        nv.write_boot_state(&mut NvBootState::default()).unwrap();
+        ComponentBackend::with_options(
+            slots::OS,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(CannedManifest),
+            ComponentConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .with_id("host".into())
+    }
+
+    /// A detached manifest declaring one payload per `part`, addressed to `host`.
+    fn manifest_for(parts: &[&str]) -> Vec<u8> {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let mut builder = MultiComponentBuilder::new()
+            .signing_time(1_700_000_000)
+            .sequence_number(2);
+        for (i, part) in parts.iter().enumerate() {
+            builder = builder.add_component(SuitComponentSpec {
+                id: vec!["host".into(), (*part).into()],
+                digest: vec![i as u8 + 1; 32],
+                size: 16,
+                uri: format!("#{part}"),
+                encryption_info: None,
+            });
+        }
+        builder.build(&key).unwrap()
+    }
+
+    fn stream_of(data: Vec<u8>) -> PackageStream {
+        Box::pin(futures::stream::iter(vec![Ok::<
+            bytes::Bytes,
+            Box<dyn std::error::Error + Send + Sync>,
+        >(bytes::Bytes::from(
+            data,
+        ))]))
+    }
+
+    /// The sink-level refusal: a provider with a fixed part map says
+    /// `UnknownPart`, and the wire must answer 415 — the wrong PACKAGE for this
+    /// component, not a 500 the operator would read as "retry".
+    #[tokio::test]
+    async fn payload_naming_an_undeclared_part_is_refused_with_415() {
+        let manifest = manifest_for(&["x"]);
+        let backend = host_backend().with_bank_provider(Arc::new(UnknownPartProvider));
+        *backend.flash_session.lock().unwrap() = Some(FlashSessionState::AwaitingPayload {
+            manifest_bytes: manifest,
+            validated: CannedManifest.validate(&[], 0).unwrap(),
+            next_component: 0,
+            total_components: 1,
+        });
+
+        let err = backend
+            .handle_payload_upload(stream_of(b"payload bytes".to_vec()), None)
+            .await
+            .expect_err("a part the bank does not hold must be refused");
+        assert_eq!(err.status_code(), 415, "got {err:?}");
+        assert!(
+            matches!(err, BackendError::UnsupportedMediaType(ref m) if m.contains("open payload sink x")),
+            "the refusal names the sink it refused: {err:?}"
+        );
+    }
+
+    /// The whole point of declaring parts: the refusal lands at MANIFEST time,
+    /// before a payload byte crosses the link, and leaves the session exactly
+    /// where it was — nothing staged, nothing to abort.
+    #[tokio::test]
+    async fn manifest_naming_an_undeclared_part_is_refused_before_any_payload() {
+        let backend = host_backend().with_declared_parts(["application.img".to_string()]);
+        *backend.flash_session.lock().unwrap() = Some(FlashSessionState::AwaitingManifest);
+
+        let err = backend
+            .handle_manifest_upload(stream_of(manifest_for(&["x", "kernel"])), None)
+            .await
+            .expect_err("a manifest naming an undeclared part must be refused");
+        assert_eq!(err.status_code(), 415, "got {err:?}");
+        assert!(
+            matches!(err, BackendError::UnsupportedMediaType(ref m)
+                if m == "manifest part 'x' is not a part of bank 'host' \
+                         (declared: application.img)"),
+            "the refusal names the part, the bank and what the bank DOES hold: {err:?}"
+        );
+        assert!(
+            matches!(
+                *backend.flash_session.lock().unwrap(),
+                Some(FlashSessionState::AwaitingManifest)
+            ),
+            "the refused manifest moved nothing — the session still awaits one"
+        );
+
+        // A manifest naming only declared parts goes through untouched.
+        backend
+            .handle_manifest_upload(stream_of(manifest_for(&["application.img"])), None)
+            .await
+            .expect("a manifest within the declared parts is accepted");
+        assert!(
+            matches!(
+                *backend.flash_session.lock().unwrap(),
+                Some(FlashSessionState::AwaitingPayload { .. })
+            ),
+            "…and the session advanced to awaiting its payload"
+        );
     }
 }

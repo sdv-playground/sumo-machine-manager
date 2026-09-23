@@ -130,7 +130,8 @@ machine-mgr    — Abstract trait layer connecting them all
 - **Bank sets**: a runtime slot count derived from the NV device size (`slot_count()`, default 16, max 32 — the width of the u32 reboot-owed mask); a slot is a *number*, nothing more — a component's slot comes from its spec (`slot: N`, written by the platform profile) and the library names no slot (the old names live on only as `test-seams` fixtures, `nv_store::slots::*`). Storage dir = `storage_subdir` if set, else the component id
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA)
 - **Per-bank VM config**: `vm-config.yaml` in bank directories, delivered alongside firmware
-- **Multi-payload SUIT**: host-os carries `#ifs` + `#rootfs` in one envelope; VMs carry kernel + rootfs + config
+- **Multi-payload SUIT**: one payload per declared part — VMs carry kernel + rootfs + config; a raw-partition bank carries one payload per `parts:` entry
+- **Raw-partition banks**: the platform profile declares `parts: [{name, a, b}]` on the component spec — one raw A/B partition pair per part, `name` = the payload name on the wire (the SUIT component-id's last segment). Fail-closed: a manifest naming an undeclared part is rejected 415 at manifest time, before a payload byte is uploaded, and an unknown payload is never staged as a file; the signed IVD attests exactly the parts the install delivered — nothing copies an unchanged part between raw partitions, so a partial manifest must not vouch for a stale sibling
 - **Container image payloads**: app updates use detached `#container-image` payloads imported by Docker, Podman, or containerd
 - **Trial boot**: up to 10 reboots before auto-rollback to previous bank
 - **Copy-on-update**: clone runtime DIDs to target bank before OTA write
@@ -151,6 +152,7 @@ crates/component-mgr/src/
   manifest_provider.rs    — ManifestProvider trait
   ota.rs                  — OTA engine: install, commit, rollback
   streaming.rs            — upload pipeline (decrypt + decompress + hash)
+  partition_bank_provider.rs — PartitionBankProvider: raw A/B partition bank (stream-to-device, fail-closed seal)
   did.rs                  — UDS DID resolution (F187-F19E + custom)
 
 tools/crates/vm-diagctl/src/

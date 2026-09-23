@@ -148,8 +148,10 @@ classDiagram
 ```
 
 Integrators can add further impls outside this repo (e.g. a hardware-HSE
-`HsmProvider`, a raw-partition RT `BankProvider`, platform device transports) —
-the seams above are the supported extension points.
+`HsmProvider`, platform device transports) — the seams above are the supported
+extension points. The raw-partition `BankProvider` ships in-tree
+(`PartitionBankProvider`); a consumer only declares its parts in the platform
+profile.
 
 Since v0.1.3 the four **synchronous** seams — `BankProvider`, `BankActivator`,
 `Deactivator`, `ImageRecord` — plus `ResetKind` live in their own crate,
@@ -323,8 +325,9 @@ flowchart LR
 The `BankProvider` seam (`component_mgr::bank_provider`) routes *every* bank touch (stage /
 activate / commit / rollback / selected-bank) through one trait per kind, so the boot
 selector + NV stay consistent. `IvdBankProvider` is the default (signed CBOR manifest in
-the bank dir + NV boot-state); alternative providers (e.g. raw-partition RT) plug in at
-the same seam.
+the bank dir + NV boot-state); `PartitionBankProvider` is the shipped raw-partition
+provider — one raw A/B partition pair per part, the parts declared by the platform
+profile (`parts:` on the component spec) — and plugs in at the same seam.
 
 ## OTA update flow (SOVD `/updates` wire)
 
@@ -363,9 +366,12 @@ The engine steps (`ComponentBackend` + `ota.rs`):
 1. **Upload + validate**: `suit_provider` checks the COSE_Sign1 signature against the
    provisioning authority, the security version against the per-bank anti-rollback floor
    (`min_security_ver`), and `streaming` decrypts (AES-128-GCM + ECDH-ES+A128KW per-device)
-   + decompresses (zstd) payloads into the target (inactive) bank dir. Multi-payload:
-   VMs carry `#kernel` + `#firmware` (rootfs) + `#config` + partitions; host-os carries
-   `#ifs` + `#rootfs`; the HSM carries `["hsm","keys"]`.
+   + decompresses (zstd) payloads into the target (inactive) bank: a file-backed bank
+   takes one file per payload in the bank dir; a raw-partition bank streams each payload
+   straight to that part's A/B device. Multi-payload = one payload per declared part:
+   VMs carry `#kernel` + `#firmware` (rootfs) + `#config` + partitions; a raw-partition
+   bank carries one per `parts:` entry; the HSM carries `["hsm","keys"]`. Fail-closed: a
+   manifest naming an undeclared part is rejected (415) at manifest time, never staged.
 2. **Copy-on-update**: runtime DIDs/DTCs are cloned active→target bank before write.
 3. **Finalize**: dual-bank flips the boot pointer (via the selector / NV) and needs a
    reboot (`AwaitingReboot`); single-bank (HSM) writes live and is immediately `Activated`.
