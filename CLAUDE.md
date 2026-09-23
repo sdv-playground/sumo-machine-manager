@@ -28,13 +28,14 @@ trait; `MachineRegistry` (`crates/machine-mgr/src/machine.rs`) holds
 them as `dyn Component` and routes by `component_id`.
 
 The compile-time `Banked: Upgradable` / `Singleshot: Upgradable`
-trait split is a deferred refactor (see `tasks/sw-update-architecture.md`
-open question #1) — capability-only discrimination works today.
+trait split was considered and dropped (ARCHITECTURE.md, "The update model";
+`docs/reusable-component-convention.md`, "Deferred work") — capability-only
+discrimination is the design, not a stopgap.
 
 ### Architecture
 
 Cargo workspace, three buckets (`docs/componentization.md` item 3d):
-**29 libraries** in `crates/` (the consumable surface — someone *depends on* it),
+**27 libraries** in `crates/` (the consumable surface — someone *depends on* it),
 **4 deployables** in `services/` (someone *runs* it on a target), **8 host-side
 tools** in `tools/crates/` (someone runs it on a workstation or in CI).
 The load-bearing ones, bottom-up:
@@ -68,9 +69,16 @@ The load-bearing ones, bottom-up:
   On a device supernova embeds `VmManager` in-process; the standalone `vm-service`
   binary is the dev/Linux path and lives in `tools/crates/vm-service` — the
   PROCESS owns that name, the library is `vm-mgr`.
+- **machine-contract** (lib): the out-of-tree implementer's surface — the four
+  synchronous bank traits (`BankProvider`, `BankActivator`, `Deactivator`,
+  `ImageRecord`) + `ResetKind`. Depends on `nv-store` + `serde` and nothing
+  else, so a per-board manager can implement a bank activator without taking a
+  dependency on SOVDd. See `docs/reusable-component-convention.md`.
 - **machine-mgr** (lib): platform-agnostic `Machine` / `Component` trait
-  layer. Connects all updatable things under a single registry. Also owns
-  the `BankActivator` trait + `BankActivatorError` enum.
+  layer. Connects all updatable things under a single registry. Since v0.1.3
+  the bank traits above live in `machine-contract`; machine-mgr depends on it
+  and re-exports every name (flat and via `bank_provider` / `bank_activator` /
+  `deactivator` / `image_record`), so import paths are unchanged.
 - **host-os-mgr** (lib): bank activators only — `DevBankActivator` (mount+copy)
   and `PartitionBankActivator` (raw partition write) implement `machine_mgr::BankActivator`.
   No `Component` impl of its own: the host OS is a `ComponentAdapter` like every
@@ -156,8 +164,15 @@ crates/host-os-mgr/src/
 crates/app-mgr/src/
   docker_image.rs         — ContainerImageComponent and runtime import backends
 
+crates/machine-contract/src/   (the out-of-tree implementer's surface — nv-store + serde only)
+  bank_provider.rs        — BankProvider trait + BankError, FirmwareIdentity, InstalledFile, InstalledFirmware
+  bank_activator.rs       — BankActivator trait + BankActivatorError
+  deactivator.rs          — Deactivator trait + DeactivateError, DeactivateOutcome
+  image_record.rs         — ImageRecord trait
+  reset_kind.rs           — ResetKind, the wire enum ("none"/"local"/"requires_ecu_reset")
+
 crates/machine-mgr/src/
-  component.rs            — Component trait (async, ~35 methods)
+  component.rs            — Component trait (async, 23 methods)
   machine.rs              — Machine + MachineRegistry (composition)
   types.rs                — Capabilities, RuntimeState, FlashId, ...
 

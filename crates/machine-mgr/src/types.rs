@@ -7,11 +7,41 @@
 
 use serde::{Deserialize, Serialize};
 
-// `ResetKind` is part of the SOVD wire (ActivationState carries it), so the
-// canonical definition lives in sovd-core. We re-export here so existing
-// `machine_mgr::ResetKind` import paths keep working and BankActivator's
-// trait method can reference it without an extra dep edge for callers.
-pub use sovd_core::ResetKind;
+// `ResetKind` is the return of `BankProvider::activate`, so it is defined in
+// `machine-contract` — naming a reset kind must not cost an out-of-tree
+// implementer a dependency on SOVDd. Re-exported here so existing
+// `machine_mgr::ResetKind` import paths keep working. The canonical SOVD wire
+// enum is still `sovd_core::ResetKind`; machine-mgr is the edge that converts
+// between the two (below), and the two enums share the wire strings.
+pub use machine_contract::ResetKind;
+
+// The conversions are free functions, not `From` impls: both enums are foreign
+// to this crate (`machine_contract::ResetKind` and `sovd_core::ResetKind`), and
+// the orphan rule refuses `impl From<Foreign> for Foreign` (E0117). Putting the
+// impls in machine-contract instead would give it a sovd-core dependency, which
+// is exactly what that crate exists to avoid. The matches are EXHAUSTIVE on
+// purpose — no `_ =>` arm — so a fourth variant on either side is a compile
+// error here rather than a silently wrong wire value.
+
+/// The contract enum as the canonical SOVD wire enum (`ActivationState` carries it).
+pub fn reset_kind_to_sovd(k: ResetKind) -> sovd_core::ResetKind {
+    match k {
+        ResetKind::None => sovd_core::ResetKind::None,
+        ResetKind::Local => sovd_core::ResetKind::Local,
+        ResetKind::RequiresEcuReset => sovd_core::ResetKind::RequiresEcuReset,
+    }
+}
+
+/// The canonical SOVD wire enum as the contract enum. No in-tree caller today;
+/// it exists so that a variant added on the SOVDd side also fails to compile
+/// here instead of drifting from the contract enum unnoticed.
+pub fn reset_kind_from_sovd(k: sovd_core::ResetKind) -> ResetKind {
+    match k {
+        sovd_core::ResetKind::None => ResetKind::None,
+        sovd_core::ResetKind::Local => ResetKind::Local,
+        sovd_core::ResetKind::RequiresEcuReset => ResetKind::RequiresEcuReset,
+    }
+}
 
 /// Capability descriptor for a `Component`.
 ///
@@ -58,7 +88,6 @@ pub struct FlashCaps {
     /// `PUT {ecu-path}/status/restart` instead of N per-component restarts.
     /// `#[serde(default)]` keeps older JSON payloads (pre-Phase-1) deserialising
     /// — they get `Local` which matches their actual behaviour today.
-    /// See `tasks/reset-kind-and-status-restart.md` for the full design.
     #[serde(default)]
     pub reset_kind: ResetKind,
 }

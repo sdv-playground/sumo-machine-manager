@@ -25,6 +25,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 - **[HSM backend architecture](docs/hsm-backend-architecture.md)** — the open-core HSM contract: the three seams (transport · link-A vHSM wire · link-B backend) and how a vendor integrates a hardware HSM. **Start here for the HSM.**
 - **[vHSM integration path](docs/vhsm-integration-path.md)** — the end-to-end guest → host → device crypto path + how to verify a backend.
 - **[Simulation stepping](docs/simulation-stepping.md)** — deterministic VM time / sim clock control.
+- **[Reusable-component convention](docs/reusable-component-convention.md)** — what goes in `machine-contract` and what stays here, the `ResetKind` decision, and the checklist for adding a contract trait. **Read before adding a trait an out-of-tree board manager will implement.**
 - **[SOVD server entrypoints](docs/sovd-entrypoints.md)** — every SOVD server in the workspace, classified: the host machine-manager (`vm-sovd`), the in-VM/on-host vehicle gateway (`vm-sovd --gateway`), the production `supernova` server, the SOVDd reference servers, and the library-vs-clients distinction.
 - **Link-B contract** — `crates/hsm-link-b/` (frozen wire + C header) with the C vendor skeleton at [`crates/hsm-link-b/reference/`](crates/hsm-link-b/reference/) — the hardware-HSM integration example.
 - **HSM tooling** — `tools/crates/hsm-conformance` (the suite a vendor backend must pass) · `tools/crates/hsm-sim-backend` (the non-production reference backend).
@@ -57,6 +58,9 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  vm-service      QEMU/qvm lifecycle, per-bank VM config,   │
 │  (lib)           ivshmem server, IPC to diag daemon        │
 │                                                            │
+│  machine-contract Bank traits an out-of-tree board manager │
+│  (lib)            implements — nv-store + serde only       │
+│                                                            │
 │  machine-mgr     Platform-agnostic Machine/Component       │
 │  (lib)           trait — host-os / vm1 / vm2 / hsm         │
 │                                                            │
@@ -86,7 +90,8 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `services/vhsm-ssd` (daemon) + `vhsm-server` (lib) | `vhsm-ssd` | Host-side vHSM v3 daemon — TCP on the private `vbr-vhsm` bridge; identity = CWT/IAM handshake (source-IP static pre-gate) |
 | `vm-devices` | — | CAN / health / time simulators (host-side) |
 | `vm-mgr` | — (lib, was `vm-service`; `tools/crates/vm-service` builds the `vm-service` dev binary) | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config, ivshmem |
-| `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic) |
+| `machine-contract` | — | The out-of-tree implementer's surface: the four synchronous bank traits (`BankProvider`, `BankActivator`, `Deactivator`, `ImageRecord`) + `ResetKind`. Depends on `nv-store` + `serde` only — see [docs/reusable-component-convention.md](docs/reusable-component-convention.md) |
+| `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic); depends on `machine-contract` and re-exports every name from it, so import paths are unchanged |
 | `host-os-mgr` | — | Host OS bank activators: IFS write, A/B partition swap |
 | `app-mgr` | — | App/container Component: local container image import for Docker, Podman, or containerd |
 | `component-mgr` | — (lib; `tools/crates/vm-diagctl` builds the CLI) | SUIT + SOVD: validation, OTA engine, DID resolution, `/updates` wire; `vm-diagctl` is the NV/bank + factory CLI over it |

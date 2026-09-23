@@ -455,8 +455,8 @@ fn capabilities_json_roundtrip() {
 // ---------------------------------------------------------------------------
 // ResetKind — capability declared by BankActivator implementations,
 // surfaced via FlashCaps so the orchestrator can coalesce per-component
-// restarts into one ECU-level reboot when required.
-// See tasks/reset-kind-and-status-restart.md (Phase 1).
+// restarts into one ECU-level reboot when required. The enum itself lives in
+// machine-contract; these tests pin that the re-export carries the same wire.
 // ---------------------------------------------------------------------------
 
 #[test]

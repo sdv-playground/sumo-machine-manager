@@ -319,7 +319,9 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             active_version: None,
             previous_version: None,
             // Container image import + service restart — local-only.
-            reset_kind: ResetKind::Local,
+            // `ActivationState` is the SOVD wire type, so the contract enum
+            // crosses the edge here.
+            reset_kind: machine_mgr::reset_kind_to_sovd(ResetKind::Local),
         }))
     }
 

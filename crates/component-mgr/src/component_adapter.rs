@@ -117,7 +117,7 @@ fn derive_capabilities<D: BlockDevice + Send + 'static>(b: &ComponentBackend<D>)
             // so the orchestrator can coalesce per-component restarts into a
             // single ECU-level `PUT status/restart` when needed. RT and host-os
             // activators override to `RequiresEcuReset`; everything else gets
-            // the default `Local`. See tasks/reset-kind-and-status-restart.md.
+            // the default `Local`.
             reset_kind: b.reset_kind(),
         }),
         lifecycle: Some(LifecycleCaps {

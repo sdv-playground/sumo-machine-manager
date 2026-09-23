@@ -39,7 +39,7 @@ until then the selector is a human-inspectable JSON store, with a real HSM signa
 ## The update abstraction (lead with this)
 
 The conceptual base is **"a thing that can be updated"** — `machine_mgr::Component`
-(`crates/machine-mgr/src/component.rs`, ~35 async methods, mostly `NotSupported`
+(`crates/machine-mgr/src/component.rs`, 23 async methods, mostly `NotSupported`
 defaults). Two structural shapes, discriminated at runtime via `Capabilities`:
 
 | Shape | Lifecycle | Implementors |
@@ -91,7 +91,7 @@ classDiagram
         +restart / runtime_state / list_faults
     }
     class BankProvider {
-        <<trait, machine-mgr>>
+        <<trait, machine-contract>>
         +active_bank / selected_bank
         +prepare_target / open_payload_writer
         +seal(InstalledFirmware)
@@ -99,7 +99,7 @@ classDiagram
         +activate / commit / rollback
     }
     class BankActivator {
-        <<trait, machine-mgr>>
+        <<trait, machine-contract>>
         +activate(bank_dir)
         +reset_kind() Local or RequiresEcuReset
     }
@@ -151,9 +151,20 @@ Integrators can add further impls outside this repo (e.g. a hardware-HSE
 `HsmProvider`, a raw-partition RT `BankProvider`, platform device transports) —
 the seams above are the supported extension points.
 
+Since v0.1.3 the four **synchronous** seams — `BankProvider`, `BankActivator`,
+`Deactivator`, `ImageRecord` — plus `ResetKind` live in their own crate,
+**`machine-contract`** (`nv-store` + `serde` and nothing else), so an
+out-of-tree board manager can implement one without depending on SOVDd.
+`machine-mgr` depends on that crate and re-exports every name from it, flat and
+through the original module paths, so `machine_mgr::BankActivator` and friends
+still resolve. `Component` stays in `machine-mgr` — it is async and speaks
+`sovd-core` types throughout. The rule, the `ResetKind` decision and the
+checklist for adding a contract trait are in
+[`docs/reusable-component-convention.md`](docs/reusable-component-convention.md).
+
 ## Workspace crates
 
-Three buckets (`docs/componentization.md` item 3d): **29 libraries** in `crates/`
+Three buckets (`docs/componentization.md` item 3d): **27 libraries** in `crates/`
 (the consumable surface), **4 deployables** in `services/` (`vm-sovd`, `vhsm-ssd`,
 `sumo-verify`, `slog2-drainer`), **8 host-side tools** in `tools/crates/`.
 The core update/diagnostics path:
@@ -166,8 +177,15 @@ The core update/diagnostics path:
 - **vm-boot** (`crates/boot`, bin+lib): boot-time decision logic for all bank sets.
   Reads the **selector** (PRIMARY/SECONDARY) when present, else NV boot state; counts
   trial boots; global (whole-blob) auto-rollback. Dev/sim stand-in for the C bootloader.
+- **machine-contract** (lib): the out-of-tree implementer's surface — the four
+  synchronous bank seams (`BankProvider`, `BankActivator`, `Deactivator`,
+  `ImageRecord`) + `ResetKind`, over `nv-store` + `serde` and nothing else (a
+  `cargo tree` guard in `scripts/feature-matrix.sh` keeps it that way).
+  Extracted in v0.1.3 ahead of the per-board split of the platform manager; see
+  `docs/reusable-component-convention.md`.
 - **machine-mgr** (lib): the `Component` + `Machine`/`MachineRegistry` trait layer;
-  `Capabilities`/`FlashCaps`; the `BankActivator` seam; `system_bank_state`
+  `Capabilities`/`FlashCaps`; re-exports the `machine-contract` seams
+  (unchanged import paths); `system_bank_state`
   (`SystemBankManager` + `BootSelector` — the node boot-authority engine, re-exporting
   the nv-store selector primitives). Platform-independent.
 - **component-mgr** (lib only; the `vm-diagctl` CLI over it is `tools/crates/vm-diagctl`,
@@ -231,7 +249,9 @@ sealed disk segments).
 graph BT
     nv[nv-store<br/>NV + selector primitives]
     boot[vm-boot] --> nv
-    mm[machine-mgr<br/>Component / Registry / selector engine] --> nv
+    mc[machine-contract<br/>bank seams + ResetKind] --> nv
+    mm[machine-mgr<br/>Component / Registry / selector engine] --> mc
+    mm --> nv
     hsm[hsm<br/>HsmProvider + ivd] --> nv
     vhsm[vhsm-ssd] --> hsm
     sec[secstore] --> hsm

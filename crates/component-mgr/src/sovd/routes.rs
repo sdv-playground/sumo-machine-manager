@@ -767,7 +767,7 @@ mod tests {
                     state: s,
                     active_version: None,
                     previous_version: None,
-                    reset_kind: ResetKind::Local,
+                    reset_kind: machine_mgr::reset_kind_to_sovd(ResetKind::Local),
                 }),
                 preflights: AtomicUsize::new(0),
                 refuse_preflight: false,

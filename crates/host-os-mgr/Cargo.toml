@@ -9,4 +9,8 @@ description = "Host OS update manager — A/B boot partition, IFS activation, re
 # nv-store/sha2/async-trait/serde_json went out with `HostOsComponent` — the
 # dead `Component` impl no production wiring ever constructed.
 machine-mgr = { path = "../machine-mgr" }
+# The trait itself now lives in the contract crate; `ifs/mod.rs` re-exports it
+# from there (the activators still name it through machine-mgr, which re-exports
+# the same items).
+machine-contract = { path = "../machine-contract" }
 tracing = "0.1"

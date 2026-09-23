@@ -10,5 +10,5 @@
 pub mod dev;
 pub mod partition;
 
-// Re-export the trait and error from machine-mgr for convenience.
-pub use machine_mgr::{BankActivator, BankActivatorError};
+// Re-export the trait and error from machine-contract for convenience.
+pub use machine_contract::{BankActivator, BankActivatorError};

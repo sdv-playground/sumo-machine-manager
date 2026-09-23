@@ -5627,10 +5627,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             active_version,
             previous_version,
             // Surface the activator's declared reset kind on the wire so the
-            // orchestrator can route restarts correctly (Phase 2 of
-            // tasks/reset-kind-and-status-restart.md). Default Local when no
-            // activator is configured.
-            reset_kind: self.reset_kind(),
+            // orchestrator can route restarts correctly. Default Local when no
+            // activator is configured. `ActivationState` is the SOVD wire
+            // type, so the contract enum crosses the edge here.
+            reset_kind: machine_mgr::reset_kind_to_sovd(self.reset_kind()),
         })
     }
 

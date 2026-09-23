@@ -7,6 +7,7 @@ members = [
     "crates/host-os-mgr",
     "crates/app-mgr",
     "crates/machine-mgr",
+    "crates/machine-contract", # the four synchronous bank traits + ResetKind (nv-store + serde only)
     "crates/vm-mgr",          # VM lifecycle library (was `vm-service` — that name is the PROCESS)
     "crates/hsm",
     "crates/hsm-contract",

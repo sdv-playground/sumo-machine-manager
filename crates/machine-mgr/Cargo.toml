@@ -15,6 +15,10 @@ hex = "0.4"
 tracing = "0.1"
 sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
 nv-store = { path = "../nv-store" }
+# The synchronous bank traits + `ResetKind`. Re-exported wholesale below the
+# `bank_provider` / `bank_activator` / `deactivator` / `image_record` module
+# names, so this crate stays the single import surface for consumers.
+machine-contract = { path = "../machine-contract" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

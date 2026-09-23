@@ -65,6 +65,18 @@ run "tests (default features)" \
 run "no slot vocabulary in the library" \
     bash -c '! git grep -n -E "BankSet::(Hsm|Bootloader|Os|Rt|Vm1|Vm2)\b|pub const (Hsm|Bootloader|Os|Rt|Vm1|Vm2): BankSet|BankSet::from_str|bank_set_for_id|for_well_known|component_aliases" -- crates services tools'
 
+# machine-contract must stay thin: the contract every out-of-tree implementer
+# builds against may depend on nv-store and serde and nothing else — no
+# sovd-core, tracing, async-trait, tokio, serde_json, bytes, futures.
+# `--depth 1` is load-bearing: nv-store's OWN closure legitimately contains
+# tracing / serde_json / sha2 / hex, and an implementer takes nv-store anyway
+# (that is where `Bank` / `BankSet` come from). What this guards is what
+# machine-contract itself declares, as an ALLOWLIST: the crate itself,
+# nv-store and serde. Any other direct dependency — whatever its name — is
+# printed and fails the run; a failing `cargo tree` fails it too.
+run "machine-contract stays dep-light" \
+    bash -c 'out=$(cargo tree -p machine-contract -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -v -E "^(machine-contract|nv-store|serde) "'
+
 # The opt-in container/OCI server build — the one deployments with a container
 # runtime ship. Proves the forwarding chain vm-sovd -> component-factory ->
 # component-mgr -> app-mgr actually resolves.
