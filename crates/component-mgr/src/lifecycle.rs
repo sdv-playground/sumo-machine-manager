@@ -578,7 +578,10 @@ mod tests {
             status: "running".into(),
         });
         assert!(lc.is_up());
-        assert_eq!(lc.for_ms, None, "a probe has no dwell clock — don't invent 0");
+        assert_eq!(
+            lc.for_ms, None,
+            "a probe has no dwell clock — don't invent 0"
+        );
         assert_eq!(lc.runtime_status(), RuntimeStatus::Running);
     }
 

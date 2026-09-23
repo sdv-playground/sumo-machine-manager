@@ -587,7 +587,8 @@ impl VmManager {
                     // down because its bank does not verify. Nothing about
                     // waiting longer will fix it, and an orchestrator that
                     // could only see `stopped` had no way to know that.
-                    vm.lifecycle.note(format!("pre-launch verify failed: {e}"), true);
+                    vm.lifecycle
+                        .note(format!("pre-launch verify failed: {e}"), true);
                     return Err(ManagerError::VerifyRefused(e));
                 }
             }
@@ -1179,7 +1180,10 @@ vms:
             detail.reason.as_deref(),
             Some("pre-launch verify failed: bad signature")
         );
-        assert!(detail.since_unix_secs.is_some(), "the transition is stamped");
+        assert!(
+            detail.since_unix_secs.is_some(),
+            "the transition is stamped"
+        );
     }
 
     #[test]
@@ -1189,7 +1193,8 @@ vms:
         // fault, while this is an unprovisioned set awaiting a flash.
         let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
         mgr.set_vm_bank("vm1", None).unwrap();
-        mgr.start_vm("vm1").expect("a skipped launch is not an error");
+        mgr.start_vm("vm1")
+            .expect("a skipped launch is not an error");
 
         let detail = mgr.health_detail("vm1").unwrap();
         assert_eq!(detail.status, HealthStatus::Stopped);
