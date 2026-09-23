@@ -260,11 +260,124 @@ async fn main() {
         );
     }
 
+    // One backend per bank set, built through the shared component-factory — the
+    // same path the host machine manager uses, no hand-rolled composition. vm2 is a plain bank:
+    // installing containers *inside* vm2 is the guest's own SOVD server's job, not
+    // the host vm-manager's. `entity_type` is pinned to vm-sovd's historical values
+    // (the factory would otherwise report the routing key). `slot` is this dev
+    // server's own platform profile: the numbers the six retired slot names used
+    // to stand for.
+    let mut specs: Vec<ComponentSpec> = vec![
+        ComponentSpec {
+            id: "host".into(),
+            component_type: "hpc".into(),
+            rollback: true,
+            single_bank: false,
+            storage_path: images_dir.clone(),
+            base_path: None,
+            bank_set: None,
+            slot: Some(2),
+            storage_subdir: None,
+            activator: boot_device.as_ref().map(|_| "ifs".to_string()),
+            display_name: None,
+            entity_type: Some("host_os".into()),
+            log_agent_url: None,
+            host_log_globs: None,
+            host_dump_dir: None,
+            host_slog2: true,
+            // dev host mode has no slog2-drainer running → no persisted segments.
+            host_slog2_segments_dir: None,
+            host_slog2_live_dir: component_factory::default_slog2_live_dir(),
+            test_agent_url: None,
+            diag_agent_url: None,
+            // host-os IS the host: gather §7.9 probes in-process (disk/mem/du).
+            host_diagnostics: true,
+            attest_time: false,
+            vm_principal: false,
+        },
+        ComponentSpec {
+            id: "vm1".into(),
+            component_type: "bank".into(),
+            rollback: true,
+            single_bank: false,
+            storage_path: images_dir.clone(),
+            base_path: None,
+            bank_set: None,
+            slot: Some(4),
+            storage_subdir: None,
+            activator: None,
+            display_name: None,
+            entity_type: Some("vm".into()),
+            log_agent_url: None,
+            host_log_globs: None,
+            host_dump_dir: None,
+            host_slog2: false,
+            host_slog2_segments_dir: None,
+            host_slog2_live_dir: component_factory::default_slog2_live_dir(),
+            test_agent_url: None,
+            diag_agent_url: None,
+            host_diagnostics: false,
+            attest_time: false,
+            vm_principal: false,
+        },
+        ComponentSpec {
+            id: "vm2".into(),
+            component_type: "bank".into(),
+            rollback: true,
+            single_bank: false,
+            storage_path: images_dir.clone(),
+            base_path: None,
+            bank_set: None,
+            slot: Some(5),
+            storage_subdir: None,
+            activator: None,
+            display_name: None,
+            entity_type: Some("vm".into()),
+            log_agent_url: None,
+            host_log_globs: None,
+            host_dump_dir: None,
+            host_slog2: false,
+            host_slog2_segments_dir: None,
+            host_slog2_live_dir: component_factory::default_slog2_live_dir(),
+            test_agent_url: None,
+            diag_agent_url: None,
+            host_diagnostics: false,
+            attest_time: false,
+            vm_principal: false,
+        },
+        ComponentSpec {
+            id: "hsm".into(),
+            component_type: "hsm".into(),
+            rollback: false,
+            single_bank: true,
+            storage_path: images_dir.clone(),
+            base_path: None,
+            bank_set: None,
+            slot: Some(0),
+            storage_subdir: None,
+            activator: None,
+            display_name: None,
+            entity_type: Some("hsm".into()),
+            log_agent_url: None,
+            host_log_globs: None,
+            host_dump_dir: None,
+            host_slog2: false,
+            host_slog2_segments_dir: None,
+            host_slog2_live_dir: component_factory::default_slog2_live_dir(),
+            test_agent_url: None,
+            diag_agent_url: None,
+            host_diagnostics: false,
+            attest_time: false,
+            vm_principal: false,
+        },
+    ];
+
     // Read display_name from the active bank's vm-config.yaml (best-effort):
     // resolve the active bank from NV, falling back to probing bank_a then bank_b
     // (display_name is the same in both). File I/O stays in the binary — the
-    // factory just applies whatever name the spec carries.
-    let (hostos_name, vm1_name, vm2_name) = {
+    // factory just applies whatever name the spec carries. Every configured
+    // component is probed by id; one without a name keeps the factory default.
+    {
         let read_display_name = |id: &str, set: BankSet| -> Option<String> {
             let dir = images_dir.as_ref()?;
             let set_dir = dir.join(id);
@@ -292,114 +405,13 @@ async fn main() {
             }
             None
         };
-        (
-            read_display_name("host", BankSet::Os),
-            read_display_name("vm1", BankSet::Vm1),
-            read_display_name("vm2", BankSet::Vm2),
-        )
-    };
-
-    // One backend per bank set, built through the shared component-factory — the
-    // same path the host machine manager uses, no hand-rolled composition. vm2 is a plain bank:
-    // installing containers *inside* vm2 is the guest's own SOVD server's job, not
-    // the host vm-manager's. `entity_type` is pinned to vm-sovd's historical values
-    // (the factory would otherwise report the routing key).
-    let specs: Vec<ComponentSpec> = vec![
-        ComponentSpec {
-            id: "host".into(),
-            component_type: "hpc".into(),
-            rollback: true,
-            single_bank: false,
-            storage_path: images_dir.clone(),
-            base_path: None,
-            bank_set: None,
-            slot: None,
-            storage_subdir: None,
-            activator: boot_device.as_ref().map(|_| "ifs".to_string()),
-            display_name: hostos_name,
-            entity_type: Some("host_os".into()),
-            log_agent_url: None,
-            host_log_globs: None,
-            host_dump_dir: None,
-            host_slog2: true,
-            // dev host mode has no slog2-drainer running → no persisted segments.
-            host_slog2_segments_dir: None,
-            host_slog2_live_dir: component_factory::default_slog2_live_dir(),
-            test_agent_url: None,
-            diag_agent_url: None,
-            // host-os IS the host: gather §7.9 probes in-process (disk/mem/du).
-            host_diagnostics: true,
-        },
-        ComponentSpec {
-            id: "vm1".into(),
-            component_type: "bank".into(),
-            rollback: true,
-            single_bank: false,
-            storage_path: images_dir.clone(),
-            base_path: None,
-            bank_set: None,
-            slot: None,
-            storage_subdir: None,
-            activator: None,
-            display_name: vm1_name,
-            entity_type: Some("vm".into()),
-            log_agent_url: None,
-            host_log_globs: None,
-            host_dump_dir: None,
-            host_slog2: false,
-            host_slog2_segments_dir: None,
-            host_slog2_live_dir: component_factory::default_slog2_live_dir(),
-            test_agent_url: None,
-            diag_agent_url: None,
-            host_diagnostics: false,
-        },
-        ComponentSpec {
-            id: "vm2".into(),
-            component_type: "bank".into(),
-            rollback: true,
-            single_bank: false,
-            storage_path: images_dir.clone(),
-            base_path: None,
-            bank_set: None,
-            slot: None,
-            storage_subdir: None,
-            activator: None,
-            display_name: vm2_name,
-            entity_type: Some("vm".into()),
-            log_agent_url: None,
-            host_log_globs: None,
-            host_dump_dir: None,
-            host_slog2: false,
-            host_slog2_segments_dir: None,
-            host_slog2_live_dir: component_factory::default_slog2_live_dir(),
-            test_agent_url: None,
-            diag_agent_url: None,
-            host_diagnostics: false,
-        },
-        ComponentSpec {
-            id: "hsm".into(),
-            component_type: "hsm".into(),
-            rollback: false,
-            single_bank: true,
-            storage_path: images_dir.clone(),
-            base_path: None,
-            bank_set: None,
-            slot: None,
-            storage_subdir: None,
-            activator: None,
-            display_name: None,
-            entity_type: Some("hsm".into()),
-            log_agent_url: None,
-            host_log_globs: None,
-            host_dump_dir: None,
-            host_slog2: false,
-            host_slog2_segments_dir: None,
-            host_slog2_live_dir: component_factory::default_slog2_live_dir(),
-            test_agent_url: None,
-            diag_agent_url: None,
-            host_diagnostics: false,
-        },
-    ];
+        for spec in &mut specs {
+            match component_factory::resolve_bank_set(spec) {
+                Ok(slot) => spec.display_name = read_display_name(&spec.id, slot),
+                Err(msg) => tracing::warn!("{msg} — no display name read"),
+            }
+        }
+    }
 
     // Host-os bank activator (raw IFS write), keyed by id for the factory to wire.
     // Only when a boot device is configured.
@@ -430,8 +442,12 @@ async fn main() {
     // gate's refusal name the components (not "bank-set N").
     let id_map: Vec<(usize, String)> = specs
         .iter()
-        .filter_map(|s| {
-            component_factory::resolve_bank_set(s).map(|bs| (bs.as_index(), s.id.clone()))
+        .filter_map(|s| match component_factory::resolve_bank_set(s) {
+            Ok(bs) => Some((bs.as_index(), s.id.clone())),
+            Err(msg) => {
+                tracing::error!("{msg}");
+                None
+            }
         })
         .collect();
     let node_coordinator = Arc::new(machine_mgr::node_update::NodeCoordinator::new(id_map));

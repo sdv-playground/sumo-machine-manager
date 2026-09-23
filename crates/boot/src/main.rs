@@ -3,7 +3,7 @@ use nv_store::selector::FileSelectorStore;
 use nv_store::store::nv_device_size;
 use nv_store::types::{BankSet, DEFAULT_SLOTS};
 use std::path::PathBuf;
-use vm_boot::{BootAction, BootManager, HashCheck};
+use vm_boot::{BootAction, BootManager};
 
 fn usage() -> ! {
     eprintln!("Usage: vm-boot <nv-store-path> [--selector <dir>] [--init]");
@@ -94,89 +94,63 @@ fn main() {
         }
     };
 
-    // (name, NV slot index, BankSet). `idx` selects this set's entry
-    // in the `actions` array (indexed by `BankSet::as_index()`), so it
-    // tracks the fixed semantic slot layout. `name` is the boot-script
-    // contract (`ACTIVE_HOST-OS=`/`ACTIVE_VM1=`/`ACTIVE_VM2=`) and is
-    // kept stable across the slot renumber.
-    let output_sets: &[(&str, usize, BankSet)] = &[
-        ("host-os", BankSet::Os.as_index(), BankSet::Os),
-        ("vm1", BankSet::Vm1.as_index(), BankSet::Vm1),
-        ("vm2", BankSet::Vm2.as_index(), BankSet::Vm2),
-    ];
-
-    for &(name, idx, set) in output_sets {
-        // `actions` is one entry per ADDRESSABLE slot, so an undersized store
-        // can simply not have this set. Say so rather than panicking.
-        let Some(action) = actions.get(idx) else {
-            eprintln!(
-                "[bootmgr] {name}: NV slot {idx} is beyond this store's {} slots",
-                actions.len()
-            );
-            continue;
-        };
+    // A slot is a number: a component's slot comes from the platform
+    // profile, so this tool has no name to print for one. `actions` is
+    // one entry per ADDRESSABLE slot, indexed by `BankSet::as_index()`,
+    // so the index IS the slot.
+    for (idx, action) in actions.iter().enumerate() {
         match action {
             BootAction::FirstBoot => {
-                println!("[bootmgr] {name}: first boot, initialized to bank A");
+                println!("[bootmgr] slot {idx}: first boot, initialized to bank A");
             }
             BootAction::Boot { bank } => {
-                println!("[bootmgr] {name}: boot bank {bank:?} (committed)");
+                println!("[bootmgr] slot {idx}: boot bank {bank:?} (committed)");
             }
             BootAction::TrialBoot { bank, boot_count } => {
                 println!(
-                    "[bootmgr] {name}: trial boot bank {bank:?} ({boot_count}/{})",
+                    "[bootmgr] slot {idx}: trial boot bank {bank:?} ({boot_count}/{})",
                     nv_store::types::MAX_TRIAL_BOOTS
                 );
             }
             BootAction::AutoRollback { from, to } => {
                 eprintln!(
-                    "[bootmgr] {name}: AUTO-ROLLBACK from bank {from:?} to {to:?} \
+                    "[bootmgr] slot {idx}: AUTO-ROLLBACK from bank {from:?} to {to:?} \
                      (exceeded {} trial boots)",
                     nv_store::types::MAX_TRIAL_BOOTS
                 );
             }
             BootAction::HashRollback { from, to } => {
-                eprintln!("[bootmgr] {name}: HASH ROLLBACK from bank {from:?} to {to:?}");
+                eprintln!("[bootmgr] slot {idx}: HASH ROLLBACK from bank {from:?} to {to:?}");
             }
             BootAction::HashFatal { bank } => {
                 eprintln!(
-                    "[bootmgr] {name}: FATAL — committed bank {bank:?} hash verification failed!"
+                    "[bootmgr] slot {idx}: FATAL — committed bank {bank:?} hash verification failed!"
                 );
             }
         }
 
-        // Verify image hash if we have a bank to boot
-        let bank = match action {
-            BootAction::Boot { bank } | BootAction::TrialBoot { bank, .. } => Some(*bank),
-            _ => None,
-        };
-        if let Some(bank) = bank {
-            let check = mgr.verify_image(set, bank, &[]); // placeholder: no image data in CLI mode
-            match check {
-                HashCheck::NoMeta => {} // no hash stored, skip
-                HashCheck::Ok => println!("[bootmgr] {name}: image hash verified"),
-                HashCheck::Mismatch { .. } => {
-                    eprintln!("[bootmgr] {name}: IMAGE HASH MISMATCH");
-                    match mgr.handle_hash_failure(set) {
-                        Ok(recovery) => {
-                            eprintln!("[bootmgr] {name}: recovery action: {recovery:?}")
-                        }
-                        Err(e) => eprintln!("[bootmgr] {name}: recovery failed: {e}"),
-                    }
-                }
-            }
-        }
+        // No image verification here. This CLI holds no image bytes, so the
+        // former "placeholder" check hashed EMPTY data: for any slot whose FW
+        // meta carries a real hash it could only ever mismatch — and a
+        // mismatch writes NV (rollback, or FATAL on a committed bank). With
+        // every addressable slot in this loop that latent hazard would have
+        // covered the whole store. Verification belongs to the process that
+        // has the image: the host's pre-launch verify.
     }
 
-    // Output active banks as machine-readable line for scripts
+    // Output active banks as machine-readable lines for scripts. Numeric,
+    // one per slot: no consumer parses these (host-boot.sh reads the boot
+    // selector by numeric slot), and the `ACTIVE_HOST-OS=`/`ACTIVE_VM1=`/
+    // `ACTIVE_VM2=` triple they replace was platform vocabulary leaking
+    // out of a slot-generic tool.
     println!();
-    for &(name, _, set) in output_sets {
-        if let Some(bank) = mgr.active_bank(set) {
+    for idx in 0..actions.len() {
+        if let Some(bank) = mgr.active_bank(BankSet(idx as u8)) {
             let letter = match bank {
                 nv_store::types::Bank::A => "A",
                 nv_store::types::Bank::B => "B",
             };
-            println!("ACTIVE_{}={}", name.to_uppercase(), letter);
+            println!("ACTIVE_SLOT_{idx}={letter}");
         }
     }
 }

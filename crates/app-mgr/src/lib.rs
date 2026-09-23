@@ -24,7 +24,7 @@ use machine_mgr::types::{
 use machine_mgr::{ActivationState, FlashState};
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
-use nv_store::types::{Bank, BankSet};
+use nv_store::types::Bank;
 
 use crate::install::InstallSession;
 
@@ -42,7 +42,7 @@ impl<D: BlockDevice + Send + 'static> AppComponent<D> {
             let nv_guard = nv.lock().unwrap();
             nv_guard
                 .read_boot_state()
-                .map(|s| s.banks[BankSet::Os.as_index()].active_bank)
+                .map(|s| s.banks[config.slot.as_index()].active_bank)
                 .unwrap_or(Bank::A)
         };
 
@@ -86,7 +86,7 @@ impl<D: BlockDevice + Send + 'static> AppComponent<D> {
     fn is_trial(&self) -> bool {
         let nv = self.nv.lock().unwrap();
         nv.read_boot_state()
-            .map(|s| !s.banks[BankSet::Os.as_index()].committed)
+            .map(|s| !s.banks[self.config.slot.as_index()].committed)
             .unwrap_or(false)
     }
 
@@ -181,7 +181,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
 
-        let idx = BankSet::Os.as_index();
+        let idx = self.config.slot.as_index();
         boot_state.banks[idx].active_bank = target_bank;
         boot_state.banks[idx].committed = false;
         boot_state.banks[idx].boot_count = 0;
@@ -199,7 +199,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
 
-        let idx = BankSet::Os.as_index();
+        let idx = self.config.slot.as_index();
         if state.banks[idx].committed {
             return Err(MachineError::InvalidArgument("already committed".into()));
         }
@@ -211,10 +211,10 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
 
         // Raise security version floor
         let active = state.banks[idx].active_bank;
-        if let Some(mut meta) = nv.read_fw_meta(BankSet::Os, active) {
+        if let Some(mut meta) = nv.read_fw_meta(self.config.slot, active) {
             if meta.fw_secver > meta.min_security_ver {
                 meta.min_security_ver = meta.fw_secver;
-                let _ = nv.write_fw_meta(BankSet::Os, active, &mut meta);
+                let _ = nv.write_fw_meta(self.config.slot, active, &mut meta);
             }
         }
 
@@ -227,7 +227,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
         let state = nv
             .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
-        let bank = &state.banks[BankSet::Os.as_index()];
+        let bank = &state.banks[self.config.slot.as_index()];
         if !bank.committed && bank.boot_count == 0 {
             return Err(MachineError::Busy(
                 "commit refused: app trial has no durable boot witness".into(),
@@ -249,7 +249,7 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
             .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
 
-        let idx = BankSet::Os.as_index();
+        let idx = self.config.slot.as_index();
         if boot_state.banks[idx].committed {
             return Err(MachineError::PolicyRejected(
                 "cannot rollback committed boot".into(),
@@ -287,12 +287,12 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
         let nv = self.nv.lock().unwrap();
         let boot_state = nv.read_boot_state();
         let active_bank = self.active_bank();
-        let active_meta = nv.read_fw_meta(BankSet::Os, active_bank);
-        let previous_meta = nv.read_fw_meta(BankSet::Os, active_bank.other());
+        let active_meta = nv.read_fw_meta(self.config.slot, active_bank);
+        let previous_meta = nv.read_fw_meta(self.config.slot, active_bank.other());
 
         let committed = boot_state
             .as_ref()
-            .map(|s| s.banks[BankSet::Os.as_index()].committed)
+            .map(|s| s.banks[self.config.slot.as_index()].committed)
             .unwrap_or(true);
 
         // The firmware version string moved out of NvFwMeta into the

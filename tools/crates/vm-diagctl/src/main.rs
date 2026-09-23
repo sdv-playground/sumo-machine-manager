@@ -12,22 +12,28 @@ fn usage() -> ! {
     eprintln!("Usage: vm-diagctl <nv-store-path> <command> [args...]");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  status <set>                     Show bank status (hypervisor|vm1|vm2|hsm)");
-    eprintln!("  install <set> <image-path> <ver> <secver>  Install OTA image");
-    eprintln!("  commit <set>                     Commit trial bank");
-    eprintln!("  rollback <set>                   Rollback to previous bank");
-    eprintln!("  read-did <set> <did-hex>         Read a DID (e.g. F189)");
-    eprintln!("  write-did <set> <did-hex> <val>  Write a runtime DID");
+    eprintln!("  status <slot>                    Show bank status (slot number)");
+    eprintln!("  install <slot> <image-path> <ver> <secver>  Install OTA image");
+    eprintln!("  commit <slot>                    Commit trial bank");
+    eprintln!("  rollback <slot>                  Rollback to previous bank");
+    eprintln!("  read-did <slot> <did-hex>        Read a DID (e.g. F189)");
+    eprintln!("  write-did <slot> <did-hex> <val> Write a runtime DID");
     eprintln!("  provision <serial> <vin>         Write factory data (once)");
     eprintln!("  factory-init <dir> [--runner-path <path>]  Initialize from manifests");
     std::process::exit(1);
 }
 
+/// A slot is a number — the platform profile assigns a component its slot,
+/// so there is no name for this CLI to look up. Bounded by `MAX_SLOTS`;
+/// whether the *opened* store addresses the slot is checked downstream.
 fn parse_set(s: &str) -> BankSet {
-    BankSet::from_str(s).unwrap_or_else(|| {
-        eprintln!("Invalid bank set '{s}'. Use: hypervisor, vm1, vm2, hsm");
-        std::process::exit(1);
-    })
+    match s.parse::<u8>() {
+        Ok(n) if usize::from(n) < MAX_SLOTS => BankSet(n),
+        _ => {
+            eprintln!("Invalid slot '{s}'. Use a number in 0..={}", MAX_SLOTS - 1);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn parse_did(s: &str) -> u16 {
@@ -312,10 +318,27 @@ fn main() {
                     eprintln!("[factory] {e}");
                     std::process::exit(1);
                 });
-                let set = manifest.resolve_bank_set().unwrap_or_else(|| {
-                    eprintln!("[factory] cannot resolve bank set from {name}.yaml");
-                    std::process::exit(1);
-                });
+                // The factory manifest states the NV slot explicitly — the
+                // platform profile's assignment. Nothing derives a slot from
+                // the component name any more (slot names were retired in
+                // v0.1.2), so a manifest without one is a hard error.
+                let set = match manifest.slot {
+                    Some(n) if usize::from(n) < MAX_SLOTS => BankSet(n),
+                    Some(n) => {
+                        eprintln!(
+                            "[factory] {name}.yaml: slot {n} is out of range (0..={})",
+                            MAX_SLOTS - 1
+                        );
+                        std::process::exit(1);
+                    }
+                    None => {
+                        eprintln!(
+                            "[factory] {name}.yaml has no `slot:` — the factory manifest must \
+                             state the NV slot (slot names were retired in v0.1.2)"
+                        );
+                        std::process::exit(1);
+                    }
+                };
 
                 // Get image data for hashing
                 let image_sha256: [u8; 32];

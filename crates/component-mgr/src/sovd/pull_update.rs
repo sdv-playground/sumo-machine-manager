@@ -366,12 +366,13 @@ fn plan_dep(
         .component(&target)
         .cloned()
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no component '{target}'")))?;
-    if let Some(expected) = comp.bank_set() {
-        crate::dispatcher::check_target(l2_bytes, expected).map_err(|e| match e {
-            MachineError::WrongTarget(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg),
-            other => (StatusCode::BAD_REQUEST, other.to_string()),
-        })?;
-    }
+    // `target` is only entry 0's name; the check re-reads the whole component
+    // list and rejects an envelope whose entries name two different
+    // components — no single component can install that.
+    crate::dispatcher::check_target(l2_bytes, comp.id()).map_err(|e| match e {
+        MachineError::WrongTarget(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, msg),
+        other => (StatusCode::BAD_REQUEST, other.to_string()),
+    })?;
     Ok((target, comp))
 }
 

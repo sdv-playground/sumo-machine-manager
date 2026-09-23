@@ -13,6 +13,8 @@ tracing = "0.1"
 
 [features]
 # Expose the in-memory selector test seams (`InMemorySelectorStore` /
-# `TestSigner`). For test builds only — downstream crates enable it via a
-# [dev-dependencies] re-declaration, so production builds never see the seams.
+# `TestSigner`), and also the `slots` fixture names (`slots::OS` &c — the
+# reference slot layout tests read by name). For test builds only — downstream
+# crates enable it via a [dev-dependencies] re-declaration, so production
+# builds never see the seams.
 test-seams = []

@@ -19,12 +19,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use nv_store::block::MemBlockDevice;
+use nv_store::slots;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
 use component_mgr::backend::ComponentConfig;
 use component_mgr::bank_provider::IvdBankProvider;
-use component_mgr::bank_spec::BankSetSpec;
 
 fn make_nv() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
@@ -47,16 +47,16 @@ fn set_active_bank(nv: &Arc<Mutex<NvStore<MemBlockDevice>>>, set: BankSet, activ
 fn make_backend(
     nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
     set: BankSet,
+    dir_name: &str,
     config: ComponentConfig,
     images_dir: Option<PathBuf>,
 ) -> IvdBankProvider<MemBlockDevice> {
-    let dir_name = BankSetSpec::for_well_known(set).dir_name;
     IvdBankProvider::new(
         nv,
         set,
         config.single_bank,
         images_dir,
-        dir_name,
+        dir_name.to_string(),
         None,
         None,
         None,
@@ -86,7 +86,7 @@ fn partial_flash_seeds_unstreamed_components_from_active() {
     let tmp = tempfile::tempdir().unwrap();
     let images_dir = tmp.path().to_path_buf();
     let nv = make_nv();
-    set_active_bank(&nv, BankSet::Vm1, Bank::A);
+    set_active_bank(&nv, slots::VM1, Bank::A);
 
     // Populate the "active" bank (bank_a) with a full set of files.
     let active_dir = images_dir.join("vm1/bank_a");
@@ -103,7 +103,8 @@ fn partial_flash_seeds_unstreamed_components_from_active() {
 
     let backend = make_backend(
         nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         ComponentConfig::default(),
         Some(images_dir.clone()),
     );
@@ -143,7 +144,7 @@ fn full_flash_seed_is_noop() {
     let tmp = tempfile::tempdir().unwrap();
     let images_dir = tmp.path().to_path_buf();
     let nv = make_nv();
-    set_active_bank(&nv, BankSet::Vm1, Bank::A);
+    set_active_bank(&nv, slots::VM1, Bank::A);
 
     let active_dir = images_dir.join("vm1/bank_a");
     write_file(&active_dir.join("kernel"), b"old");
@@ -159,7 +160,8 @@ fn full_flash_seed_is_noop() {
 
     let backend = make_backend(
         nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         ComponentConfig::default(),
         Some(images_dir.clone()),
     );
@@ -188,7 +190,7 @@ fn missing_active_bank_dir_is_noop() {
     let tmp = tempfile::tempdir().unwrap();
     let images_dir = tmp.path().to_path_buf();
     let nv = make_nv();
-    set_active_bank(&nv, BankSet::Vm1, Bank::A);
+    set_active_bank(&nv, slots::VM1, Bank::A);
 
     // active dir never created — that's the factory state.
     let target_dir = images_dir.join("vm1/bank_b");
@@ -196,7 +198,8 @@ fn missing_active_bank_dir_is_noop() {
 
     let backend = make_backend(
         nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         ComponentConfig::default(),
         Some(images_dir.clone()),
     );
@@ -226,7 +229,7 @@ fn single_bank_short_circuits() {
         entity_type: "hsm".into(),
         ..ComponentConfig::default()
     };
-    let backend = make_backend(nv, BankSet::Hsm, cfg, Some(images_dir.clone()));
+    let backend = make_backend(nv, slots::HSM, "hsm", cfg, Some(images_dir.clone()));
 
     // Target == Bank::A (the only one); seed should be a no-op.
     backend
@@ -245,8 +248,8 @@ fn single_bank_short_circuits() {
 #[test]
 fn no_images_dir_is_noop() {
     let nv = make_nv();
-    set_active_bank(&nv, BankSet::Vm1, Bank::A);
-    let backend = make_backend(nv, BankSet::Vm1, ComponentConfig::default(), None);
+    set_active_bank(&nv, slots::VM1, Bank::A);
+    let backend = make_backend(nv, slots::VM1, "vm1", ComponentConfig::default(), None);
     backend
         .seed_target_from_active(Bank::B, &declared(&["kernel"]))
         .expect("seed is a no-op without images_dir");
@@ -261,14 +264,15 @@ fn target_equals_active_is_noop_not_self_corruption() {
     let tmp = tempfile::tempdir().unwrap();
     let images_dir = tmp.path().to_path_buf();
     let nv = make_nv();
-    set_active_bank(&nv, BankSet::Vm1, Bank::A);
+    set_active_bank(&nv, slots::VM1, Bank::A);
 
     let active_dir = images_dir.join("vm1/bank_a");
     write_file(&active_dir.join("kernel"), b"running kernel");
 
     let backend = make_backend(
         nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         ComponentConfig::default(),
         Some(images_dir.clone()),
     );
@@ -294,7 +298,7 @@ fn seeds_subdirectories_from_active() {
     let tmp = tempfile::tempdir().unwrap();
     let images_dir = tmp.path().to_path_buf();
     let nv = make_nv();
-    set_active_bank(&nv, BankSet::Vm1, Bank::A);
+    set_active_bank(&nv, slots::VM1, Bank::A);
 
     let active_dir = images_dir.join("vm1/bank_a");
     write_file(&active_dir.join("kernel"), b"k");
@@ -308,7 +312,8 @@ fn seeds_subdirectories_from_active() {
 
     let backend = make_backend(
         nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         ComponentConfig::default(),
         Some(images_dir.clone()),
     );
@@ -343,7 +348,7 @@ fn cross_channel_flash_leaves_undeclared_active_files_alone() {
     let images_dir = tmp.path().to_path_buf();
     let nv = make_nv();
     // The device is running bank_b; the flash targets bank_a.
-    set_active_bank(&nv, BankSet::Vm1, Bank::B);
+    set_active_bank(&nv, slots::VM1, Bank::B);
 
     let active_dir = images_dir.join("vm1/bank_b");
     write_file(&active_dir.join("kernel"), b"cicd kernel");
@@ -358,7 +363,8 @@ fn cross_channel_flash_leaves_undeclared_active_files_alone() {
 
     let backend = make_backend(
         nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         ComponentConfig::default(),
         Some(images_dir.clone()),
     );

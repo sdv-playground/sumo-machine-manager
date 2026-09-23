@@ -23,6 +23,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use nv_store::block::MemBlockDevice;
+use nv_store::slots;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
@@ -58,10 +59,10 @@ fn make_wrapper_router() -> axum::Router {
     let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(trust_anchor));
 
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
-        ("vm1", BankSet::Vm1, ComponentConfig::default()),
+        ("vm1", slots::VM1, ComponentConfig::default()),
         (
             "hsm",
-            BankSet::Hsm,
+            slots::HSM,
             ComponentConfig {
                 supports_rollback: false,
                 single_bank: true,

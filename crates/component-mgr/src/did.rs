@@ -205,6 +205,7 @@ pub fn write_did<D: BlockDevice>(
 mod tests {
     use super::*;
     use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
 
     fn make_nv() -> NvStore<MemBlockDevice> {
@@ -250,10 +251,7 @@ mod tests {
     fn read_did_with_uninitialized_nv_returns_notfound() {
         // No boot state written yet — every read should short-circuit.
         let nv = make_nv();
-        assert_eq!(
-            read_did(&nv, BankSet::Vm1, DID_VIN, None),
-            DidValue::NotFound
-        );
+        assert_eq!(read_did(&nv, slots::VM1, DID_VIN, None), DidValue::NotFound);
     }
 
     #[test]
@@ -268,7 +266,7 @@ mod tests {
         // Even with FW Meta present, the identity DIDs are NotFound here.
         let mut meta = NvFwMeta::default();
         meta.fw_seq = 5;
-        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+        nv.write_fw_meta(slots::VM1, Bank::A, &mut meta).unwrap();
 
         for did in [
             DID_SPARE_PART_NUMBER,
@@ -282,7 +280,7 @@ mod tests {
             DID_ODX_FILE_ID,
         ] {
             assert_eq!(
-                read_did(&nv, BankSet::Vm1, did, None),
+                read_did(&nv, slots::VM1, did, None),
                 DidValue::NotFound,
                 "DID {did:#06X} must not be served from NvFwMeta anymore"
             );
@@ -298,7 +296,7 @@ mod tests {
         f.vin[..17].copy_from_slice(b"WBALI00000TEST001");
         nv.write_factory(&mut f).unwrap();
 
-        match read_did(&nv, BankSet::Vm1, DID_VIN, None) {
+        match read_did(&nv, slots::VM1, DID_VIN, None) {
             DidValue::Bytes(b) => assert_eq!(&b, b"WBALI00000TEST001"),
             DidValue::NotFound => panic!("expected VIN bytes"),
         }
@@ -309,11 +307,11 @@ mod tests {
         let mut nv = make_nv();
         init_boot_state(&mut nv);
 
-        match read_did(&nv, BankSet::Vm1, DID_ACTIVE_BANK, None) {
+        match read_did(&nv, slots::VM1, DID_ACTIVE_BANK, None) {
             DidValue::Bytes(b) => assert_eq!(b, b"A"),
             DidValue::NotFound => panic!("expected active bank letter"),
         }
-        match read_did(&nv, BankSet::Vm1, DID_ACTIVE_BANK, Some(Bank::B)) {
+        match read_did(&nv, slots::VM1, DID_ACTIVE_BANK, Some(Bank::B)) {
             DidValue::Bytes(b) => assert_eq!(b, b"B"),
             DidValue::NotFound => panic!("expected B"),
         }
@@ -323,16 +321,16 @@ mod tests {
     fn read_did_dynamic_committed_reflects_flag() {
         let mut nv = make_nv();
         let mut state = NvBootState::default();
-        let idx = BankSet::Vm1.as_index();
+        let idx = slots::VM1.as_index();
         state.banks[idx].active_bank = Bank::A;
         state.banks[idx].committed = false;
         state.banks[idx].boot_count = 3;
         nv.write_boot_state(&mut state).unwrap();
 
-        let committed = read_did(&nv, BankSet::Vm1, DID_COMMITTED, None);
+        let committed = read_did(&nv, slots::VM1, DID_COMMITTED, None);
         assert_eq!(committed, DidValue::Bytes(vec![0]));
 
-        let boot_count = read_did(&nv, BankSet::Vm1, DID_BOOT_COUNT, None);
+        let boot_count = read_did(&nv, slots::VM1, DID_BOOT_COUNT, None);
         assert_eq!(boot_count, DidValue::Bytes(vec![3]));
     }
 
@@ -340,7 +338,7 @@ mod tests {
     fn read_did_dynamic_security_ver_without_fw_meta_is_zero() {
         let mut nv = make_nv();
         init_boot_state(&mut nv);
-        let v = read_did(&nv, BankSet::Vm1, DID_CURRENT_SECURITY_VER, None);
+        let v = read_did(&nv, slots::VM1, DID_CURRENT_SECURITY_VER, None);
         assert_eq!(v, DidValue::Bytes(0u32.to_le_bytes().to_vec()));
     }
 
@@ -351,12 +349,12 @@ mod tests {
         let mut meta = NvFwMeta::default();
         meta.fw_secver = 0x1234_5678;
         meta.min_security_ver = 0x0000_00AB;
-        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut meta).unwrap();
+        nv.write_fw_meta(slots::VM1, Bank::A, &mut meta).unwrap();
 
-        let cur = read_did(&nv, BankSet::Vm1, DID_CURRENT_SECURITY_VER, None);
+        let cur = read_did(&nv, slots::VM1, DID_CURRENT_SECURITY_VER, None);
         assert_eq!(cur, DidValue::Bytes(0x1234_5678u32.to_le_bytes().to_vec()));
 
-        let min = read_did(&nv, BankSet::Vm1, DID_MIN_SECURITY_VER, None);
+        let min = read_did(&nv, slots::VM1, DID_MIN_SECURITY_VER, None);
         assert_eq!(min, DidValue::Bytes(0x0000_00ABu32.to_le_bytes().to_vec()));
     }
 
@@ -364,7 +362,7 @@ mod tests {
     fn read_did_unknown_did_returns_notfound() {
         let mut nv = make_nv();
         init_boot_state(&mut nv);
-        let v = read_did(&nv, BankSet::Vm1, 0x1234, None);
+        let v = read_did(&nv, slots::VM1, 0x1234, None);
         assert_eq!(v, DidValue::NotFound);
     }
 
@@ -373,10 +371,10 @@ mod tests {
         let mut nv = make_nv();
         init_boot_state(&mut nv);
 
-        let ok = write_did(&mut nv, BankSet::Vm1, DID_SYSTEM_NAME, b"vm1-linux").unwrap();
+        let ok = write_did(&mut nv, slots::VM1, DID_SYSTEM_NAME, b"vm1-linux").unwrap();
         assert!(ok);
 
-        match read_did(&nv, BankSet::Vm1, DID_SYSTEM_NAME, None) {
+        match read_did(&nv, slots::VM1, DID_SYSTEM_NAME, None) {
             DidValue::Bytes(b) => assert_eq!(&b, b"vm1-linux"),
             DidValue::NotFound => panic!("runtime did not mask fw_meta read"),
         }
@@ -387,14 +385,14 @@ mod tests {
         let mut nv = make_nv();
         init_boot_state(&mut nv);
 
-        write_did(&mut nv, BankSet::Vm1, 0xFD10, b"old").unwrap();
-        write_did(&mut nv, BankSet::Vm1, 0xFD10, b"newer-value").unwrap();
+        write_did(&mut nv, slots::VM1, 0xFD10, b"old").unwrap();
+        write_did(&mut nv, slots::VM1, 0xFD10, b"newer-value").unwrap();
 
-        let v = read_did(&nv, BankSet::Vm1, 0xFD10, None);
+        let v = read_did(&nv, slots::VM1, 0xFD10, None);
         assert_eq!(v, DidValue::Bytes(b"newer-value".to_vec()));
 
         // Should still be a single DID (update in place, not append).
-        let rt = nv.read_runtime(BankSet::Vm1, Bank::A).unwrap();
+        let rt = nv.read_runtime(slots::VM1, Bank::A).unwrap();
         let count = (0..rt.did_count as usize)
             .filter(|i| rt.dids[*i].did == 0xFD10)
             .count();
@@ -406,8 +404,8 @@ mod tests {
         let mut nv = make_nv();
         init_boot_state(&mut nv);
         let payload = vec![0xAAu8; 50];
-        write_did(&mut nv, BankSet::Vm1, 0xFD11, &payload).unwrap();
-        match read_did(&nv, BankSet::Vm1, 0xFD11, None) {
+        write_did(&mut nv, slots::VM1, 0xFD11, &payload).unwrap();
+        match read_did(&nv, slots::VM1, 0xFD11, None) {
             DidValue::Bytes(b) => assert_eq!(b.len(), 32),
             DidValue::NotFound => panic!("expected truncated bytes"),
         }
@@ -416,7 +414,7 @@ mod tests {
     #[test]
     fn write_did_without_boot_state_returns_false() {
         let mut nv = make_nv();
-        let ok = write_did(&mut nv, BankSet::Vm1, 0xFD12, b"x").unwrap();
+        let ok = write_did(&mut nv, slots::VM1, 0xFD12, b"x").unwrap();
         assert!(!ok);
     }
 }

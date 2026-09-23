@@ -384,6 +384,7 @@ impl BootSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nv_store::slots;
 
     fn mgr() -> SystemBankManager {
         SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner))
@@ -395,23 +396,23 @@ mod tests {
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
         // Establish a committed floor at A so the staged change is observable.
-        m.stage(BankSet::Vm1, Bank::A);
+        m.stage(slots::VM1, Bank::A);
         assert!(m.seal());
         m.commit();
         assert!(!m.is_trial());
 
         // Stage B, seal.
-        m.stage(BankSet::Vm1, Bank::B);
+        m.stage(slots::VM1, Bank::B);
         assert!(m.seal());
 
-        assert_eq!(m.active_bank(BankSet::Vm1), Some(Bank::B));
+        assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
         assert!(m.is_trial(), "current(B) != committed(A) => trial");
 
         // In-memory sectors: PRIMARY == new (B), SECONDARY == old (A).
         let primary = store.read_primary().expect("primary written");
         let secondary = store.read_secondary().expect("secondary written");
-        assert_eq!(primary.selectors[&BankSet::Vm1].bank, Bank::B);
-        assert_eq!(secondary.selectors[&BankSet::Vm1].bank, Bank::A);
+        assert_eq!(primary.selectors[&slots::VM1].bank, Bank::B);
+        assert_eq!(secondary.selectors[&slots::VM1].bank, Bank::A);
     }
 
     #[test]
@@ -419,19 +420,19 @@ mod tests {
         let store = InMemorySelectorStore::new();
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
-        m.stage(BankSet::Vm1, Bank::A);
+        m.stage(slots::VM1, Bank::A);
         m.seal();
         m.commit();
 
-        m.stage(BankSet::Vm1, Bank::B);
+        m.stage(slots::VM1, Bank::B);
         m.seal();
         m.commit();
 
         assert!(!m.is_trial());
         let primary = store.read_primary().unwrap();
         let secondary = store.read_secondary().unwrap();
-        assert_eq!(primary.selectors[&BankSet::Vm1].bank, Bank::B);
-        assert_eq!(secondary.selectors[&BankSet::Vm1].bank, Bank::B);
+        assert_eq!(primary.selectors[&slots::VM1].bank, Bank::B);
+        assert_eq!(secondary.selectors[&slots::VM1].bank, Bank::B);
     }
 
     #[test]
@@ -439,20 +440,20 @@ mod tests {
         let store = InMemorySelectorStore::new();
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
-        m.stage(BankSet::Vm1, Bank::A);
+        m.stage(slots::VM1, Bank::A);
         m.seal();
         m.commit(); // floor = A
 
-        m.stage(BankSet::Vm1, Bank::B);
+        m.stage(slots::VM1, Bank::B);
         m.seal(); // trial = B
-        assert_eq!(m.active_bank(BankSet::Vm1), Some(Bank::B));
+        assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
 
         m.rollback();
-        assert_eq!(m.active_bank(BankSet::Vm1), Some(Bank::A));
+        assert_eq!(m.active_bank(slots::VM1), Some(Bank::A));
         assert!(!m.is_trial());
         let primary = store.read_primary().unwrap();
         assert_eq!(
-            primary.selectors[&BankSet::Vm1].bank,
+            primary.selectors[&slots::VM1].bank,
             Bank::A,
             "PRIMARY rewritten to floor on rollback"
         );
@@ -466,14 +467,14 @@ mod tests {
 
         {
             let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-            m.stage(BankSet::Vm1, Bank::A);
+            m.stage(slots::VM1, Bank::A);
             m.seal();
             m.commit(); // committed floor = A, PRIMARY = A
 
             // Stage B but DO NOT seal, then drop the manager (== reboot).
-            m.stage(BankSet::Vm1, Bank::B);
+            m.stage(slots::VM1, Bank::B);
             assert_eq!(
-                m.active_bank(BankSet::Vm1),
+                m.active_bank(slots::VM1),
                 Some(Bank::A),
                 "pre-seal, current still reflects A"
             );
@@ -483,7 +484,7 @@ mod tests {
         // because the staged B was never persisted.
         let m2 = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
         assert_eq!(
-            m2.active_bank(BankSet::Vm1),
+            m2.active_bank(slots::VM1),
             Some(Bank::A),
             "reboot mid-stage boots old selection"
         );
@@ -495,11 +496,11 @@ mod tests {
         let mut m = mgr();
         assert_eq!(m.generation(), 0);
 
-        m.stage(BankSet::Vm1, Bank::A);
+        m.stage(slots::VM1, Bank::A);
         m.seal();
         assert_eq!(m.generation(), 1);
 
-        m.stage(BankSet::Vm2, Bank::B);
+        m.stage(slots::VM2, Bank::B);
         m.seal();
         assert_eq!(m.generation(), 2);
 
@@ -515,7 +516,7 @@ mod tests {
         // Plant a PRIMARY blob whose signature doesn't verify under TestSigner
         // (empty sig — StubSigner would have produced this).
         let mut selectors = BTreeMap::new();
-        selectors.insert(BankSet::Vm1, SlotSelect::enabled(Bank::B));
+        selectors.insert(slots::VM1, SlotSelect::enabled(Bank::B));
         let generation = 9;
         let bad = SelectorBlob {
             generation,
@@ -527,7 +528,7 @@ mod tests {
 
         let m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
         // Rejected => treated as absent => empty maps, generation 0.
-        assert_eq!(m.active_bank(BankSet::Vm1), None);
+        assert_eq!(m.active_bank(slots::VM1), None);
         assert_eq!(m.generation(), 0);
 
         // Also reject a blob with a tampered digest (sig over a different sha).
@@ -539,7 +540,7 @@ mod tests {
         };
         store.write_primary(&tampered);
         let m2 = SystemBankManager::load(Box::new(store), Box::new(TestSigner));
-        assert_eq!(m2.active_bank(BankSet::Vm1), None);
+        assert_eq!(m2.active_bank(slots::VM1), None);
     }
 
     #[test]
@@ -548,12 +549,12 @@ mod tests {
         // accept-all": load yields empty/gen-0, seal no-ops to a None read.
         let mut m = SystemBankManager::load(Box::new(StubSelectorStore), Box::new(StubSigner));
         assert_eq!(m.generation(), 0);
-        assert_eq!(m.active_bank(BankSet::Vm1), None);
+        assert_eq!(m.active_bank(slots::VM1), None);
         assert!(!m.seal(), "nothing staged => seal is a no-op");
 
-        m.stage(BankSet::Vm1, Bank::B);
+        m.stage(slots::VM1, Bank::B);
         assert!(m.seal()); // writes are dropped by the stub, but in-mem state advances
-        assert_eq!(m.active_bank(BankSet::Vm1), Some(Bank::B));
+        assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
         assert_eq!(m.generation(), 1);
     }
 
@@ -578,8 +579,8 @@ mod tests {
                 .as_nanos()
         ));
 
-        let primary = blob(7, BankSet::Vm1, Bank::B);
-        let secondary = blob(3, BankSet::Vm2, Bank::A);
+        let primary = blob(7, slots::VM1, Bank::B);
+        let secondary = blob(3, slots::VM2, Bank::A);
 
         // Write through one store...
         let writer = FileSelectorStore::new(&dir);
@@ -622,10 +623,10 @@ mod tests {
         // of folding disable INTO the signed selector.
         let generation: u64 = 7;
         let mut enabled = BTreeMap::new();
-        enabled.insert(BankSet::Vm1, SlotSelect::enabled(Bank::A));
+        enabled.insert(slots::VM1, SlotSelect::enabled(Bank::A));
         let mut disabled = BTreeMap::new();
         disabled.insert(
-            BankSet::Vm1,
+            slots::VM1,
             SlotSelect {
                 bank: Bank::A,
                 enabled: false,
@@ -651,32 +652,32 @@ mod tests {
 
         let store = InMemorySelectorStore::new();
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-        m.stage(BankSet::Vm1, Bank::A);
+        m.stage(slots::VM1, Bank::A);
         m.seal();
         m.commit(); // establish the committed floor so PRIMARY == SECONDARY
 
-        m.stage_disabled(BankSet::Vm1, true);
-        assert!(m.disabled(BankSet::Vm1));
-        assert!(!m.disabled(BankSet::Vm2));
+        m.stage_disabled(slots::VM1, true);
+        assert!(m.disabled(slots::VM1));
+        assert!(!m.disabled(slots::VM2));
         assert!(!m.is_trial(), "an idle disable is not a trial");
-        m.stage_disabled(BankSet::Vm1, false);
-        assert!(!m.disabled(BankSet::Vm1), "clearing re-enables the slot");
-        m.stage_disabled(BankSet::Vm1, true);
+        m.stage_disabled(slots::VM1, false);
+        assert!(!m.disabled(slots::VM1), "clearing re-enables the slot");
+        m.stage_disabled(slots::VM1, true);
 
         // Re-sealed into PRIMARY, so a fresh load sees the disable and the
         // selection is intact.
         let m2 = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-        assert!(m2.disabled(BankSet::Vm1), "disable survives reload");
+        assert!(m2.disabled(slots::VM1), "disable survives reload");
         assert_eq!(
-            m2.active_bank(BankSet::Vm1),
+            m2.active_bank(slots::VM1),
             Some(Bank::A),
             "selection intact"
         );
 
         // Visible through the read-only BootSelector view.
         let selector = BootSelector::new(Arc::new(RwLock::new(m)));
-        assert!(selector.disabled(BankSet::Vm1));
-        assert!(!selector.disabled(BankSet::Vm2));
+        assert!(selector.disabled(slots::VM1));
+        assert!(!selector.disabled(slots::VM2));
     }
 
     #[test]
@@ -685,7 +686,7 @@ mod tests {
         let generation: u64 = 3;
         let mut selectors = BTreeMap::new();
         selectors.insert(
-            BankSet::Vm1,
+            slots::VM1,
             SlotSelect {
                 bank: Bank::B,
                 enabled: false,

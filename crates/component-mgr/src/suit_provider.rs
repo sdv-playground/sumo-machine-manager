@@ -14,11 +14,9 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use coset::{iana, CborSerializable, CoseKeyBuilder};
-use nv_store::types::BankSet;
 use sumo_crypto::{CryptoBackend, RustCryptoBackend};
 use sumo_onboard::error::Sum2Error;
 use sumo_onboard::orchestrator;
@@ -94,10 +92,6 @@ pub struct SuitProvider {
     /// hood so the EC private scalar never reaches host memory. Old
     /// design held the raw bytes here; the HSE refactor inverted that.
     device_unwrap: Arc<RwLock<Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>>>,
-    /// Deployment-specific component-ID → BankSet aliases. Lets custom
-    /// slot names (e.g. "rt") resolve without polluting nv-store's
-    /// well-known list.
-    component_aliases: HashMap<String, BankSet>,
 }
 
 impl SuitProvider {
@@ -107,20 +101,11 @@ impl SuitProvider {
             key_authority: Arc::new(RwLock::new(None)),
             software_authority: Arc::new(RwLock::new(None)),
             device_unwrap: Arc::new(RwLock::new(None)),
-            component_aliases: HashMap::new(),
         }
     }
 
     pub fn with_factory_authority() -> Self {
         Self::new(factory_provisioning_authority())
-    }
-
-    /// Register deployment-specific component-ID → BankSet mappings
-    /// so SUIT manifests with custom component IDs (e.g. `["rt", "firmware"]`)
-    /// resolve to the correct NV slot.
-    pub fn with_component_aliases(mut self, aliases: HashMap<String, BankSet>) -> Self {
-        self.component_aliases = aliases;
-        self
     }
 
     /// Load all trust keys from HSM after provisioning.
@@ -239,22 +224,10 @@ impl SuitProvider {
             .component_id(0)
             .ok_or_else(|| ManifestError::ComponentUnknown("missing component_id".into()))?;
 
-        // Resolve bank_set from the first segment that matches a BankSet,
-        // falling back to deployment-registered component aliases.
-        let bank_set = segments
-            .iter()
-            .find_map(|seg| {
-                let s = std::str::from_utf8(seg).ok()?;
-                BankSet::from_str(s).or_else(|| self.component_aliases.get(s).copied())
-            })
-            .ok_or_else(|| {
-                let comp_str = segments
-                    .iter()
-                    .map(|s| String::from_utf8_lossy(s).to_string())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                ManifestError::ComponentUnknown(comp_str)
-            })?;
+        // The component this manifest addresses, verbatim — no name table and
+        // no slot in between. The receiving component compares it against its
+        // own id.
+        let component_name = crate::dispatcher::target_component(manifest)?;
 
         // Detect manifest sub-type from component_id path.
         let manifest_type = {
@@ -309,7 +282,7 @@ impl SuitProvider {
         copy_to_nv("SOVD-OTA", &mut meta.tester_serial);
 
         Ok(ValidatedFirmware {
-            bank_set,
+            component_name,
             manifest_type,
             image_meta: meta,
             image_data: Vec::new(),
@@ -532,4 +505,38 @@ impl PlatformOps for VmPlatformOps {
 fn copy_to_nv(s: &str, dst: &mut [u8]) {
     let n = s.len().min(dst.len());
     dst[..n].copy_from_slice(&s.as_bytes()[..n]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sumo_offboard::{keygen, ImageManifestBuilder};
+
+    /// A component name no slot vocabulary ever knew validates like any other.
+    /// The provider derives nothing from the name — there is no table left to
+    /// call it "unknown"; what components exist is the platform profile's
+    /// answer, and the receiving component's own id is what it's checked
+    /// against.
+    #[test]
+    fn validates_a_component_name_no_table_ever_knew() {
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let provider = SuitProvider::new(key.public_key_bytes());
+        provider.update_keys(key.public_key_bytes(), None, None);
+
+        let image = b"co-processor firmware";
+        let digest = RustCryptoBackend::new().sha256(image);
+        let envelope = ImageManifestBuilder::new()
+            .signing_time(1_700_000_000)
+            .component_id(vec!["co-processor".into(), "firmware.bin".into()])
+            .sequence_number(1)
+            .payload_digest(&digest, image.len() as u64)
+            .payload_uri("#firmware".into())
+            .integrated_payload("#firmware".into(), image.to_vec())
+            .build(&key)
+            .unwrap();
+
+        let validated = provider.validate(&envelope, 0).expect("validates");
+        assert_eq!(validated.component_name, "co-processor");
+        assert_eq!(validated.manifest_type, ManifestType::Firmware);
+    }
 }

@@ -2,9 +2,12 @@
 //!
 //! `BankSet` (a numeric slot index) names a slot; `BankSetSpec` carries
 //! the behavior that used to be hard-coded in `match bank_set { … }`
-//! helpers — today just the on-disk directory name. Each component
-//! supplies its own `BankSetSpec` at construction time; the bank-set
-//! machinery in component-mgr stays generic.
+//! helpers — today just the on-disk directory name. The name comes from
+//! the platform, which is the only thing that knows what a slot holds:
+//! the component's `storage_subdir` when deployment config sets one,
+//! else its component id. Each component supplies its own `BankSetSpec`
+//! at construction time; the bank-set machinery in component-mgr stays
+//! generic and derives no directory from a slot.
 //!
 //! On-disk bank filenames are the SUIT component-id's last segment
 //! **verbatim**: the manifest author picks the real filename
@@ -13,43 +16,14 @@
 //! naming keys off the stable component-id part, never the (possibly
 //! content-addressed) payload uri.
 
-use nv_store::types::BankSet;
-
 /// Per-bank-set spec attached to each ComponentBackend at construction.
 #[derive(Debug, Clone)]
 pub struct BankSetSpec {
-    /// On-disk subdirectory under `images_dir`. E.g. "vm1" or "os" for a
-    /// named slot, `set<N>` for an unnamed one, or whatever deployment
-    /// config sets via `storage_subdir`.
+    /// On-disk subdirectory under `images_dir`, supplied by the platform:
+    /// the component's `storage_subdir` when deployment config sets one,
+    /// else its component id. `images_dir/<dir_name>/<bank>` is where the
+    /// banked payloads live, so every component needs its own.
     pub dir_name: String,
-}
-
-impl BankSetSpec {
-    /// Build the default spec for a BankSet slot — the on-disk directory
-    /// name that slot lives under. Every existing ComponentBackend
-    /// constructor goes through here; component-factory overrides
-    /// `dir_name` from deployment config (`storage_subdir`) when a slot
-    /// needs a distinct directory.
-    pub fn for_well_known(bs: BankSet) -> Self {
-        let dir_name = match bs {
-            BankSet::Hsm => "hsm".to_string(),
-            BankSet::Bootloader => "bootloader".to_string(),
-            BankSet::Os => "os".to_string(),
-            BankSet::Rt => "rt".to_string(),
-            BankSet::Vm1 => "vm1".to_string(),
-            BankSet::Vm2 => "vm2".to_string(),
-            // Unnamed slots get an index-derived directory. Until 2026-09-23
-            // every slot past the named ones fell through to ONE constant
-            // ("custom") — and `images_dir/<dir_name>/<bank>` is where the
-            // banked payloads live, so two components on extra slots would
-            // have shared, and overwritten, a single directory. `set<N>` is
-            // unique for every slot a store can address and needs no slot
-            // vocabulary; deployment config still renames via `storage_subdir`.
-            _ => format!("set{}", bs.as_index()),
-        };
-
-        Self { dir_name }
-    }
 }
 
 /// The on-disk bank filename for a SUIT component: its component-id's last
@@ -72,38 +46,6 @@ pub fn payload_target_name_for_id(component_id: Option<&[Vec<u8>]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn for_well_known_vm_slots() {
-        assert_eq!(BankSetSpec::for_well_known(BankSet::Vm1).dir_name, "vm1");
-        assert_eq!(BankSetSpec::for_well_known(BankSet::Vm2).dir_name, "vm2");
-    }
-
-    #[test]
-    fn for_well_known_os_hsm_dir_names() {
-        assert_eq!(BankSetSpec::for_well_known(BankSet::Os).dir_name, "os");
-        assert_eq!(BankSetSpec::for_well_known(BankSet::Hsm).dir_name, "hsm");
-    }
-
-    #[test]
-    fn for_well_known_rt_dir_name() {
-        assert_eq!(BankSetSpec::for_well_known(BankSet::Rt).dir_name, "rt");
-    }
-
-    #[test]
-    fn unnamed_slots_get_unique_index_derived_dirs() {
-        // An unnamed slot's directory is derived from its index, so no two
-        // slots can ever share `images_dir/<dir>` — the previous constant
-        // fallback ("custom") was a live collision between any two extra
-        // slots. Checked over the whole addressable range (32 = the u32
-        // reboot-mask bound), named slots included.
-        assert_eq!(BankSetSpec::for_well_known(BankSet(6)).dir_name, "set6");
-        assert_eq!(BankSetSpec::for_well_known(BankSet(31)).dir_name, "set31");
-        let dirs: std::collections::BTreeSet<String> = (0..32u8)
-            .map(|i| BankSetSpec::for_well_known(BankSet(i)).dir_name)
-            .collect();
-        assert_eq!(dirs.len(), 32, "every slot must map to a distinct dir");
-    }
 
     #[test]
     fn payload_name_from_component_id_not_uri() {

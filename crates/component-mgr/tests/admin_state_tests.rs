@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nv_store::block::MemBlockDevice;
+use nv_store::slots;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
@@ -41,13 +42,13 @@ impl ManifestProvider for StubManifests {
 /// `None`. The raw upload bytes are ignored — the disable routing keys off the
 /// flag the real `SuitProvider` sets from the manifest's shared sequence.
 struct CannedManifest {
-    bank_set: BankSet,
+    component_name: String,
     disable_target: Option<usize>,
 }
 impl ManifestProvider for CannedManifest {
     fn validate(&self, _data: &[u8], _min: u32) -> Result<ValidatedFirmware, ManifestError> {
         Ok(ValidatedFirmware {
-            bank_set: self.bank_set,
+            component_name: self.component_name.clone(),
             manifest_type: ManifestType::Firmware,
             image_meta: ImageMeta::default(),
             image_data: Vec::new(),
@@ -161,6 +162,7 @@ fn vm_backend(
 fn backend_with_manifests(
     nv: &SharedNv,
     set: BankSet,
+    id: &str,
     manifests: Arc<dyn ManifestProvider>,
 ) -> ComponentBackend<MemBlockDevice> {
     ComponentBackend::with_options(
@@ -172,6 +174,9 @@ fn backend_with_manifests(
         None,
         None,
     )
+    // The manifest names a COMPONENT; the backend's own id is what it's
+    // checked against, so the fixture threads it like the factory does.
+    .with_id(id.to_string())
 }
 
 /// A shared boot selector with a booted selection for `set` (so the provider
@@ -270,11 +275,11 @@ async fn non_disableable_component_omits_admin_state() {
     // `is_disableable()`, so even a disable bit set in the signed selector reads
     // as enabled — the equipped deactivator is the authority.
     let nv = make_nv();
-    let sel = selector_for(BankSet::Vm1);
-    let b = vm_backend_with_selector(&nv, BankSet::Vm1, None, sel.clone());
+    let sel = selector_for(slots::VM1);
+    let b = vm_backend_with_selector(&nv, slots::VM1, None, sel.clone());
     assert!(!b.is_disableable());
 
-    set_selector_disabled(&sel, BankSet::Vm1, true);
+    set_selector_disabled(&sel, slots::VM1, true);
     assert!(
         !b.admin_disabled(),
         "a disable bit on a non-disableable component reads as enabled"
@@ -297,13 +302,13 @@ async fn ensure_flash_can_start_admits_disabled() {
     // so the gate must admit it. The "disabled ⇒ never uncommitted" invariant is
     // preserved by clearing before trial, not by refusing at this gate.
     let nv = make_nv();
-    let sel = selector_for(BankSet::Vm1);
-    let b = vm_backend_with_selector(&nv, BankSet::Vm1, None, sel.clone())
+    let sel = selector_for(slots::VM1);
+    let b = vm_backend_with_selector(&nv, slots::VM1, None, sel.clone())
         .with_deactivator(Arc::new(MockDeactivator::ok()));
     b.ensure_flash_can_start()
         .expect("enabled component is flashable");
 
-    set_selector_disabled(&sel, BankSet::Vm1, true);
+    set_selector_disabled(&sel, slots::VM1, true);
     b.ensure_flash_can_start()
         .expect("a disabled component is now admitted (re-enabled at flash admission)");
 }
@@ -312,14 +317,14 @@ async fn ensure_flash_can_start_admits_disabled() {
 async fn read_entity_status_tri_state_and_probe_skip() {
     let nv = make_nv();
     let (addr, probes) = counting_server().await;
-    let sel = selector_for(BankSet::Vm1);
-    let b = vm_backend_with_selector(&nv, BankSet::Vm1, Some(addr), sel.clone())
+    let sel = selector_for(slots::VM1);
+    let b = vm_backend_with_selector(&nv, slots::VM1, Some(addr), sel.clone())
         .with_deactivator(Arc::new(MockDeactivator::ok()));
 
     // Disabled: NotReady, admin_state "disabled", and the vm-service probe
     // is SKIPPED (zero connections — no phantom health traffic to a VM that
     // is down by design).
-    set_selector_disabled(&sel, BankSet::Vm1, true);
+    set_selector_disabled(&sel, slots::VM1, true);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::NotReady);
     let rt = &status.extensions["x-runtime"];
@@ -338,7 +343,7 @@ async fn read_entity_status_tri_state_and_probe_skip() {
 
     // Enabled again: the probe runs (our canned server is not a healthy
     // guest, so spec status stays notReady — honesty), admin_state "enabled".
-    set_selector_disabled(&sel, BankSet::Vm1, false);
+    set_selector_disabled(&sel, slots::VM1, false);
     let status = b.read_entity_status().await.unwrap();
     let rt = &status.extensions["x-runtime"];
     assert_eq!(rt["admin_state"], "enabled", "enabled read-back");
@@ -365,10 +370,10 @@ async fn disabled_status_and_runtime_state_agree() {
     // again.
     let nv = make_nv();
     let (addr, _probes) = counting_server().await;
-    let sel = selector_for(BankSet::Vm1);
-    let b = vm_backend_with_selector(&nv, BankSet::Vm1, Some(addr), sel.clone())
+    let sel = selector_for(slots::VM1);
+    let b = vm_backend_with_selector(&nv, slots::VM1, Some(addr), sel.clone())
         .with_deactivator(Arc::new(MockDeactivator::ok()));
-    set_selector_disabled(&sel, BankSet::Vm1, true);
+    set_selector_disabled(&sel, slots::VM1, true);
 
     let status = b.read_entity_status().await.unwrap();
     let rt = status.extensions["x-runtime"].as_object().unwrap().clone();
@@ -405,7 +410,7 @@ async fn a_guest_that_was_asked_to_run_and_is_not_reads_diverged() {
             "expected":"running","expected_by":"autostart","expected_for_ms":30000}"#,
     )
     .await;
-    let b = vm_backend(&nv, BankSet::Vm1, Some(addr));
+    let b = vm_backend(&nv, slots::VM1, Some(addr));
 
     let status = b.read_entity_status().await.unwrap();
     let rt = &status.extensions["x-runtime"];
@@ -428,7 +433,7 @@ async fn probe_component_status_rides_the_uniform_node() {
     // x-runtime node as every other component's metadata — never a
     // bespoke per-component route.
     let nv = make_nv();
-    let b = vm_backend(&nv, BankSet::Rt, None)
+    let b = vm_backend(&nv, slots::RT, None)
         .with_deactivator(Arc::new(MockDeactivator::ok()))
         .with_health_probe(Arc::new(MockProbe { running: true }));
     let status = b.read_entity_status().await.unwrap();
@@ -440,8 +445,8 @@ async fn probe_component_status_rides_the_uniform_node() {
     assert_eq!(rt["hb_seq"], 7, "probe health feeds the uniform fields");
 
     // Probe not running ⇒ the standard status field is honest.
-    let sel = selector_for(BankSet::Rt);
-    let b = vm_backend_with_selector(&nv, BankSet::Rt, None, sel.clone())
+    let sel = selector_for(slots::RT);
+    let b = vm_backend_with_selector(&nv, slots::RT, None, sel.clone())
         .with_deactivator(Arc::new(MockDeactivator::ok()))
         .with_health_probe(Arc::new(MockProbe { running: false }));
     let status = b.read_entity_status().await.unwrap();
@@ -454,7 +459,7 @@ async fn probe_component_status_rides_the_uniform_node() {
     // Disabled ⇒ minimal read: notReady + admin_state, no probe extensions.
     // Probe not running ⇒ the deactivation is fully realized: no
     // reboot_pending flag.
-    set_selector_disabled(&sel, BankSet::Rt, true);
+    set_selector_disabled(&sel, slots::RT, true);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::NotReady);
     let rt = &status.extensions["x-runtime"];
@@ -472,11 +477,11 @@ async fn probe_component_status_rides_the_uniform_node() {
     // application executing from SRAM) ⇒ the armed reboot is observable on
     // the uniform node until the real reboot clears it.
     let nv2 = make_nv();
-    let sel2 = selector_for(BankSet::Rt);
-    let b = vm_backend_with_selector(&nv2, BankSet::Rt, None, sel2.clone())
+    let sel2 = selector_for(slots::RT);
+    let b = vm_backend_with_selector(&nv2, slots::RT, None, sel2.clone())
         .with_deactivator(Arc::new(MockDeactivator::ok()))
         .with_health_probe(Arc::new(MockProbe { running: true }));
-    set_selector_disabled(&sel2, BankSet::Rt, true);
+    set_selector_disabled(&sel2, slots::RT, true);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(
         status.status,
@@ -495,13 +500,13 @@ async fn probe_component_status_rides_the_uniform_node() {
 async fn ecu_reset_skips_vm_service_when_disabled() {
     let nv = make_nv();
     let (addr, hits) = counting_server().await;
-    let sel = selector_for(BankSet::Vm1);
-    let b = vm_backend_with_selector(&nv, BankSet::Vm1, Some(addr), sel.clone())
+    let sel = selector_for(slots::VM1);
+    let b = vm_backend_with_selector(&nv, slots::VM1, Some(addr), sel.clone())
         .with_deactivator(Arc::new(MockDeactivator::ok()));
 
     // Disabled: a reset must NOT resurrect the VM — zero vm-service traffic
     // (neither the was-running probe nor the start/restart notify).
-    set_selector_disabled(&sel, BankSet::Vm1, true);
+    set_selector_disabled(&sel, slots::VM1, true);
     b.ecu_reset(0x01).await.unwrap();
     assert_eq!(
         hits.load(Ordering::SeqCst),
@@ -510,7 +515,7 @@ async fn ecu_reset_skips_vm_service_when_disabled() {
     );
 
     // Enabled: the reset notifies vm-service again.
-    set_selector_disabled(&sel, BankSet::Vm1, false);
+    set_selector_disabled(&sel, slots::VM1, false);
     b.ecu_reset(0x01).await.unwrap();
     assert!(
         hits.load(Ordering::SeqCst) > 0,
@@ -530,9 +535,10 @@ async fn disable_manifest_upload_enacts_deactivator_and_handles_reboot() {
     let deact = Arc::new(MockDeactivator::rebooting());
     let b = backend_with_manifests(
         &nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         Arc::new(CannedManifest {
-            bank_set: BankSet::Vm1,
+            component_name: "vm1".into(),
             disable_target: Some(0),
         }),
     )
@@ -555,20 +561,21 @@ async fn suit_disable_manifest_writes_selector_and_start_flash_admits_without_cl
     // no longer clears the selector — that clear happens at `finalize_flash`,
     // before trial (see `campaign_normal_flash_reenables_at_finalize`).
     let nv = make_nv();
-    let sel = selector_for(BankSet::Vm1);
+    let sel = selector_for(slots::VM1);
     let deact = Arc::new(MockDeactivator::ok());
     let b = backend_with_manifests(
         &nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         Arc::new(CannedManifest {
-            bank_set: BankSet::Vm1,
+            component_name: "vm1".into(),
             disable_target: Some(0),
         }),
     )
     .with_deactivator(deact.clone())
     .with_bank_provider(Arc::new(IvdBankProvider::new(
         nv.clone(),
-        BankSet::Vm1,
+        slots::VM1,
         false,
         None,
         "vm1".into(),
@@ -578,7 +585,7 @@ async fn suit_disable_manifest_writes_selector_and_start_flash_admits_without_cl
     )));
 
     assert!(!b.admin_disabled(), "starts enabled");
-    assert!(!sel.read().unwrap().disabled(BankSet::Vm1));
+    assert!(!sel.read().unwrap().disabled(slots::VM1));
 
     // Disable via the SUIT manifest → deactivate + record_disabled(true).
     b.receive_package(b"disable-envelope")
@@ -586,7 +593,7 @@ async fn suit_disable_manifest_writes_selector_and_start_flash_admits_without_cl
         .expect("disable manifest enacted");
     assert_eq!(deact.calls(), 1, "deactivator enacted once");
     assert!(
-        sel.read().unwrap().disabled(BankSet::Vm1),
+        sel.read().unwrap().disabled(slots::VM1),
         "the disable is persisted in the signed selector"
     );
     assert!(b.admin_disabled(), "admin_disabled() reads the selector");
@@ -599,7 +606,7 @@ async fn suit_disable_manifest_writes_selector_and_start_flash_admits_without_cl
         .await
         .expect("start_flash admits a disabled component");
     assert!(
-        sel.read().unwrap().disabled(BankSet::Vm1),
+        sel.read().unwrap().disabled(slots::VM1),
         "start_flash no longer clears the disable bit — that moved to finalize"
     );
     assert!(
@@ -614,9 +621,10 @@ async fn non_disable_no_payload_manifest_is_a_noop() {
     let deact = Arc::new(MockDeactivator::ok());
     let b = backend_with_manifests(
         &nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         Arc::new(CannedManifest {
-            bank_set: BankSet::Vm1,
+            component_name: "vm1".into(),
             disable_target: None,
         }),
     )
@@ -642,9 +650,10 @@ async fn disable_manifest_without_deactivator_errors() {
     // No `.with_deactivator(...)` — this component is not disableable.
     let b = backend_with_manifests(
         &nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         Arc::new(CannedManifest {
-            bank_set: BankSet::Vm1,
+            component_name: "vm1".into(),
             disable_target: Some(0),
         }),
     );
@@ -664,9 +673,10 @@ async fn disable_manifest_enact_failure_is_reported() {
     let deact = Arc::new(MockDeactivator::failing());
     let b = backend_with_manifests(
         &nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         Arc::new(CannedManifest {
-            bank_set: BankSet::Vm1,
+            component_name: "vm1".into(),
             disable_target: Some(0),
         }),
     )
@@ -683,13 +693,15 @@ async fn disable_manifest_enact_failure_is_reported() {
 async fn disable_manifest_for_other_component_is_rejected_before_enact() {
     let nv = make_nv();
     let deact = Arc::new(MockDeactivator::ok());
-    // Manifest names Vm2 but is POSTed to the Vm1 backend — the existing
-    // bank_set guard rejects it before any enact (no cross-component dispatch).
+    // Manifest names "vm2" but is POSTed to the "vm1" backend — the name guard
+    // rejects it before any enact (no cross-component dispatch). The comparison
+    // is name-to-id, verbatim; no slot is consulted on either side.
     let b = backend_with_manifests(
         &nv,
-        BankSet::Vm1,
+        slots::VM1,
+        "vm1",
         Arc::new(CannedManifest {
-            bank_set: BankSet::Vm2,
+            component_name: "vm2".into(),
             disable_target: Some(0),
         }),
     )
@@ -698,14 +710,17 @@ async fn disable_manifest_for_other_component_is_rejected_before_enact() {
         .receive_package(b"disable-envelope")
         .await
         .expect_err("cross-component disable must be rejected");
-    assert!(
-        matches!(err, BackendError::InvalidRequest(_)),
-        "got {err:?}"
-    );
+    match err {
+        BackendError::InvalidRequest(ref msg) => assert_eq!(
+            msg, "manifest targets 'vm2', but this is 'vm1'",
+            "the rejection names both components"
+        ),
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
     assert_eq!(
         deact.calls(),
         0,
-        "deactivator must not run on a bank_set mismatch"
+        "deactivator must not run on a component-name mismatch"
     );
 }
 
@@ -746,10 +761,10 @@ fn campaign_backend(
     manifests: Arc<dyn ManifestProvider>,
     sel: &SharedSystemBankState,
 ) -> ComponentBackend<MemBlockDevice> {
-    backend_with_manifests(nv, BankSet::Vm1, manifests).with_bank_provider(Arc::new(
+    backend_with_manifests(nv, slots::VM1, "vm1", manifests).with_bank_provider(Arc::new(
         IvdBankProvider::new(
             nv.clone(),
-            BankSet::Vm1,
+            slots::VM1,
             false,
             None,
             "vm1".into(),
@@ -769,22 +784,19 @@ async fn campaign_disable_manifest_enacts_at_finalize() {
     // into reconcile (which would hard-error demanding an image_digest a disable
     // lacks). Reverting the finalize enact makes this fail (deactivate never runs).
     let nv = make_nv();
-    let sel = selector_for(BankSet::Vm1);
+    let sel = selector_for(slots::VM1);
     let deact = Arc::new(MockDeactivator::rebooting());
     let b = campaign_backend(
         &nv,
         Arc::new(CannedManifest {
-            bank_set: BankSet::Vm1,
+            component_name: "vm1".into(),
             disable_target: Some(0),
         }),
         &sel,
     )
     .with_deactivator(deact.clone());
 
-    assert!(
-        !sel.read().unwrap().disabled(BankSet::Vm1),
-        "starts enabled"
-    );
+    assert!(!sel.read().unwrap().disabled(slots::VM1), "starts enabled");
 
     // start_flash → manifest upload parks the disable manifest (no payload).
     b.start_flash().await.expect("flash session starts");
@@ -804,7 +816,7 @@ async fn campaign_disable_manifest_enacts_at_finalize() {
         "deactivate() ran exactly once at finalize"
     );
     assert!(
-        sel.read().unwrap().disabled(BankSet::Vm1),
+        sel.read().unwrap().disabled(slots::VM1),
         "record_disabled(true) persisted in the signed selector"
     );
     // (c) the owed node reboot is recorded durably (reboot_required deactivator).
@@ -815,7 +827,7 @@ async fn campaign_disable_manifest_enacts_at_finalize() {
         .map(|s| s.reboot_owed)
         .unwrap_or(0);
     assert_ne!(
-        owed & (1u32 << BankSet::Vm1.as_index()),
+        owed & (1u32 << slots::VM1.as_index()),
         0,
         "the disable's owed reboot is recorded in NV"
     );
@@ -828,12 +840,12 @@ async fn campaign_normal_flash_reenables_at_finalize() {
     // selector's disable bit before trial, the SUIT-native replacement for the
     // manual enable lever now that the mis-placed start_flash clear is gone.
     let nv = make_nv();
-    let sel = selector_for(BankSet::Vm1);
+    let sel = selector_for(slots::VM1);
     let deact = Arc::new(MockDeactivator::ok());
     let b = campaign_backend(
         &nv,
         Arc::new(CannedManifest {
-            bank_set: BankSet::Vm1,
+            component_name: "vm1".into(),
             disable_target: None,
         }),
         &sel,
@@ -841,11 +853,8 @@ async fn campaign_normal_flash_reenables_at_finalize() {
     .with_deactivator(deact.clone());
 
     // Pre-disable it (as a prior disable manifest would have).
-    set_selector_disabled(&sel, BankSet::Vm1, true);
-    assert!(
-        sel.read().unwrap().disabled(BankSet::Vm1),
-        "starts disabled"
-    );
+    set_selector_disabled(&sel, slots::VM1, true);
+    assert!(sel.read().unwrap().disabled(slots::VM1), "starts disabled");
 
     // A normal flash through the same lifecycle.
     b.start_flash().await.expect("flash session starts");
@@ -857,7 +866,7 @@ async fn campaign_normal_flash_reenables_at_finalize() {
         .expect("finalize re-enables + activates");
 
     assert!(
-        !sel.read().unwrap().disabled(BankSet::Vm1),
+        !sel.read().unwrap().disabled(slots::VM1),
         "finalize cleared the selector's disable bit (re-enabled)"
     );
     assert_eq!(deact.calls(), 0, "re-enable must not run the deactivator");

@@ -5,9 +5,8 @@ edition = "2021"
 description = "Host OS update manager — A/B boot partition, IFS activation, reboot coordination"
 
 [dependencies]
-nv-store = { path = "../nv-store" }
+# The activators ARE the crate: `machine_mgr::BankActivator` + a log line.
+# nv-store/sha2/async-trait/serde_json went out with `HostOsComponent` — the
+# dead `Component` impl no production wiring ever constructed.
 machine-mgr = { path = "../machine-mgr" }
-sha2 = "0.10"
-async-trait = "0.1"
 tracing = "0.1"
-serde_json = "1"

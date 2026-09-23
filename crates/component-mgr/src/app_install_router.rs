@@ -279,7 +279,6 @@ mod tests {
     use crate::ota::ImageMeta;
     use async_trait::async_trait;
     use machine_mgr::{FlashCaps, LifecycleCaps, ResetKind};
-    use nv_store::types::BankSet;
     use sumo_offboard::keygen::{self, ES256};
     use sumo_offboard::ImageManifestBuilder;
 
@@ -372,7 +371,7 @@ mod tests {
             _min_security_ver: u32,
         ) -> Result<ValidatedFirmware, ManifestError> {
             Ok(ValidatedFirmware {
-                bank_set: BankSet::Vm2,
+                component_name: "vm2".into(),
                 manifest_type: ManifestType::Firmware,
                 image_meta: ImageMeta::default(),
                 image_data: Vec::new(),

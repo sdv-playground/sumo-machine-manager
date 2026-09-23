@@ -18,8 +18,9 @@ nv-store = { path = "../nv-store" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
-# Our own unit tests use the in-memory selector seams; the re-declaration
-# enables them for test builds only (cargo unifies dev-features there).
+# Our own unit tests use the in-memory selector seams and the `slots` fixture
+# names; the re-declaration enables them for test builds only (cargo unifies
+# dev-features there).
 nv-store = { path = "../nv-store", features = ["test-seams"] }
 
 [features]

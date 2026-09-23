@@ -19,6 +19,7 @@ use machine_mgr::{
     MachineRegistry, SharedSystemBankState, SystemBankManager, TestSigner,
 };
 use nv_store::block::MemBlockDevice;
+use nv_store::slots;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
@@ -109,17 +110,17 @@ fn make_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys
     let components: Vec<(&str, BankSet, ComponentConfig)> = vec![
         (
             "host",
-            BankSet::Os,
+            slots::OS,
             ComponentConfig {
                 entity_type: "host_os".into(),
                 ..ComponentConfig::default()
             },
         ),
-        ("vm1", BankSet::Vm1, ComponentConfig::default()),
-        ("vm2", BankSet::Vm2, ComponentConfig::default()),
+        ("vm1", slots::VM1, ComponentConfig::default()),
+        ("vm2", slots::VM2, ComponentConfig::default()),
         (
             "hsm",
-            BankSet::Hsm,
+            slots::HSM,
             ComponentConfig {
                 supports_rollback: false,
                 single_bank: true,
@@ -603,15 +604,14 @@ async fn faults_and_clear() {
     {
         let mut nv = nv.lock().unwrap();
         let bs = nv.read_boot_state().unwrap();
-        let active = bs.banks[BankSet::Vm1.as_index()].active_bank;
-        let mut runtime = nv.read_runtime(BankSet::Vm1, active).unwrap_or_default();
+        let active = bs.banks[slots::VM1.as_index()].active_bank;
+        let mut runtime = nv.read_runtime(slots::VM1, active).unwrap_or_default();
         runtime.dtc_count = 1;
         runtime.dtcs[0] = DtcEntry {
             dtc_number: 0x00A301,
             status: 0x01,
         };
-        nv.write_runtime(BankSet::Vm1, active, &mut runtime)
-            .unwrap();
+        nv.write_runtime(slots::VM1, active, &mut runtime).unwrap();
     }
 
     let (status, json) = get(&router, "/vehicle/v1/components/vm1/faults").await;
@@ -740,7 +740,7 @@ fn suit_provider_validates_good_envelope() {
     let envelope = make_test_suit_envelope(&keys, "vm1", 5, &image);
 
     let result = provider.validate(&envelope, 0).unwrap();
-    assert_eq!(result.bank_set, BankSet::Vm1);
+    assert_eq!(result.component_name, "vm1");
     assert_eq!(result.image_meta.fw_seq, 5);
     assert_eq!(result.image_data, image);
 }
@@ -782,7 +782,7 @@ async fn update_shape_reports_banked_for_ab_components() {
     let nv = Arc::new(Mutex::new(NvStore::new(dev)));
 
     let banked = ComponentBackend::new(
-        BankSet::Vm1,
+        slots::VM1,
         nv.clone(),
         manifest_provider.clone(),
         ComponentConfig::default(),
@@ -794,7 +794,7 @@ async fn update_shape_reports_banked_for_ab_components() {
     );
 
     let singleshot = ComponentBackend::new(
-        BankSet::Hsm,
+        slots::HSM,
         nv,
         manifest_provider,
         ComponentConfig {
@@ -954,9 +954,9 @@ async fn disable_manifest_settles_prepare_and_enacts_at_execute() {
     // Transferring. Drives the real router end to end: upload → prepare (must
     // settle at once) → execute (must enact the disable).
     let (router, keys, selector, deact, backend) =
-        make_disable_router("vm1", BankSet::Vm1, ComponentConfig::default());
+        make_disable_router("vm1", slots::VM1, ComponentConfig::default());
     assert!(
-        !selector.read().unwrap().disabled(BankSet::Vm1),
+        !selector.read().unwrap().disabled(slots::VM1),
         "starts enabled"
     );
 
@@ -1000,14 +1000,14 @@ async fn disable_manifest_settles_prepare_and_enacts_at_execute() {
         "deactivate() ran exactly once, at execute"
     );
     assert!(
-        selector.read().unwrap().disabled(BankSet::Vm1),
+        selector.read().unwrap().disabled(slots::VM1),
         "record_disabled(true) persisted in the signed selector"
     );
     // A disable stages no bank content, so it must never open a trial: the bank
     // set stays committed and the component therefore enters NEITHER the
     // `x-ota-update-state` Trial set nor the node flash gate's live-trial set.
-    let bank = backend.nv_lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
-        .clone();
+    let bank =
+        backend.nv_lock().unwrap().read_boot_state().unwrap().banks[slots::VM1.as_index()].clone();
     assert!(
         bank.committed,
         "a disable owes no verdict — it must not put the bank set in trial: {bank:?}"
@@ -1027,7 +1027,7 @@ async fn firmware_manifest_still_awaits_its_payload() {
     // payload part keeps parking — the transfer stays Transferring until the
     // part arrives, so `await_flash_settled` still means "the payload landed".
     let (router, keys, _selector, _deact, backend) =
-        make_disable_router("vm1", BankSet::Vm1, ComponentConfig::default());
+        make_disable_router("vm1", slots::VM1, ComponentConfig::default());
 
     let _update_id = register_and_upload_manifest(
         &router,
@@ -1052,7 +1052,7 @@ async fn singleshot_disable_settles_prepare_and_enacts_at_execute() {
     // once, execute enacts and terminates clean.
     let (router, keys, selector, deact, backend) = make_disable_router(
         "rt",
-        BankSet::Rt,
+        slots::RT,
         ComponentConfig {
             supports_rollback: false,
             single_bank: true,
@@ -1100,7 +1100,7 @@ async fn singleshot_disable_settles_prepare_and_enacts_at_execute() {
         "deactivate() ran exactly once, at execute"
     );
     assert!(
-        selector.read().unwrap().disabled(BankSet::Rt),
+        selector.read().unwrap().disabled(slots::RT),
         "record_disabled(true) persisted in the signed selector"
     );
 }
@@ -1128,8 +1128,8 @@ fn make_node_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, Tes
     let nv = Arc::new(Mutex::new(nv));
 
     let coord = Arc::new(NodeCoordinator::new(vec![
-        (BankSet::Vm1.as_index(), "vm1".to_string()),
-        (BankSet::Vm2.as_index(), "vm2".to_string()),
+        (slots::VM1.as_index(), "vm1".to_string()),
+        (slots::VM2.as_index(), "vm2".to_string()),
     ]));
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
@@ -1141,7 +1141,7 @@ fn make_node_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, Tes
         href: "/vehicle/v1".into(),
         status: None,
     });
-    for (id, set) in [("vm1", BankSet::Vm1), ("vm2", BankSet::Vm2)] {
+    for (id, set) in [("vm1", slots::VM1), ("vm2", slots::VM2)] {
         let backend = Arc::new(
             ComponentBackend::new(
                 set,
@@ -1204,7 +1204,7 @@ async fn armed_pre_reboot_component_does_not_block_a_sibling_open() {
 
     // The armed-pre-reboot fact the gate must distinguish: trial content staged
     // (uncommitted) but never booted into (`boot_count == 0`).
-    let vm1_bank = bank_state(&nv, BankSet::Vm1);
+    let vm1_bank = bank_state(&nv, slots::VM1);
     assert!(!vm1_bank.committed, "vm1 is armed: {vm1_bank:?}");
     assert_eq!(
         vm1_bank.boot_count, 0,
@@ -1240,7 +1240,7 @@ async fn live_trial_still_refuses_a_new_flash() {
     .await;
     activation_reset(&router, "vm1").await;
 
-    let vm1_bank = bank_state(&nv, BankSet::Vm1);
+    let vm1_bank = bank_state(&nv, slots::VM1);
     assert!(
         !vm1_bank.committed,
         "vm1 still owes a verdict: {vm1_bank:?}"
@@ -1302,7 +1302,7 @@ async fn commit_trials_resolves_both_components_after_one_coalesced_reboot() {
         "one node verdict must resolve the whole step: {body}"
     );
 
-    for set in [BankSet::Vm1, BankSet::Vm2] {
+    for set in [slots::VM1, slots::VM2] {
         let bank = bank_state(&nv, set);
         assert!(bank.committed, "{set:?} committed in NV: {bank:?}");
     }

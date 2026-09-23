@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
-use nv_store::types::{Bank, BankSet, MAX_TRIAL_BOOTS};
+use nv_store::types::{Bank, MAX_TRIAL_BOOTS};
 
 use crate::state::{self, AppConfig};
 
@@ -21,7 +21,7 @@ pub fn process_app_boot<D: BlockDevice>(config: &AppConfig, nv: &Arc<Mutex<NvSto
         }
     };
 
-    let idx = BankSet::Os.as_index();
+    let idx = config.slot.as_index();
     let bs = &mut boot_state.banks[idx];
 
     if bs.committed {

@@ -3,7 +3,6 @@
 /// OTA manifests use SUIT envelopes via [`SuitProvider`](crate::suit_provider).
 /// These YAML types are only used for factory-init (offline provisioning).
 use crate::ota::ImageMeta;
-use nv_store::types::BankSet;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -13,6 +12,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirmwareManifest {
     pub component_id: Vec<String>,
+    /// The NV slot this component's FW meta is written to, stated by the
+    /// factory manifest itself — the platform profile's assignment. Nothing
+    /// derives a slot from the component name (slot names were retired in
+    /// v0.1.2); factory tooling refuses a manifest that leaves this out.
+    #[serde(default)]
+    pub slot: Option<u8>,
     #[serde(default)]
     pub vendor_id: Option<String>,
     #[serde(default)]
@@ -54,13 +59,6 @@ impl FirmwareManifest {
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         Self::from_yaml(&content)
-    }
-
-    /// Resolve the BankSet from component_id.
-    /// Accepts ["vm1"], ["hypervisor"], or ["vendor", "vm1"], etc.
-    pub fn resolve_bank_set(&self) -> Option<BankSet> {
-        let tag = self.component_id.last()?;
-        BankSet::from_str(tag)
     }
 
     /// Convert to the existing ImageMeta type used by ota::install().
@@ -185,7 +183,6 @@ system_name: "VM1-Linux"
         assert_eq!(m.component_id, vec!["vm1"]);
         assert_eq!(m.sequence_number, 3);
         assert_eq!(m.version, "1.2.0");
-        assert_eq!(m.resolve_bank_set(), Some(BankSet::Vm1));
     }
 
     #[test]
@@ -196,7 +193,7 @@ sequence_number: 1
 version: "1.0.0"
 "#;
         let m = FirmwareManifest::from_yaml(yaml).unwrap();
-        assert_eq!(m.resolve_bank_set(), Some(BankSet::Os));
+        assert_eq!(m.component_id, vec!["host-os"]);
         assert!(m.spare_part_number.is_none());
     }
 

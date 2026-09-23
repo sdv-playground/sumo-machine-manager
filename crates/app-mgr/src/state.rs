@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use machine_mgr::error::{MachineError, MachineResult};
-use nv_store::types::Bank;
+use nv_store::types::{Bank, BankSet};
 
 /// Configuration for an AppComponent.
 pub struct AppConfig {
@@ -10,6 +10,9 @@ pub struct AppConfig {
     pub id: String,
     /// Base path containing A/, B/, current symlink (e.g. /data/app/).
     pub base_path: PathBuf,
+    /// The NV slot this app's boot state and firmware meta live in — from the
+    /// platform profile.
+    pub slot: BankSet,
 }
 
 /// Which bank directory name to use.

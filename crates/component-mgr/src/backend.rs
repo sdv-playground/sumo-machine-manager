@@ -374,9 +374,9 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     capabilities: Capabilities,
     bank_set: BankSet,
     /// Per-slot behavioral data (on-disk dir, SUIT-URI → filename
-    /// layout). Constructed by `BankSetSpec::for_well_known(bank_set)`
-    /// in the existing constructors; Phase 3 lets component-factory
-    /// supply a deployment-specific spec via `with_spec`.
+    /// layout). The constructors default it to an index-derived
+    /// `slot<N>` dir; component-factory supplies the deployment's own
+    /// via `with_bank_spec`.
     bank_spec: crate::bank_spec::BankSetSpec,
     config: ComponentConfig,
     nv: Arc<Mutex<NvStore<D>>>,
@@ -433,6 +433,18 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// Threaded from `FactoryDeps::hsm_crypto` via
     /// [`with_hsm_crypto`](Self::with_hsm_crypto).
     hsm_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
+    /// Advertise the device-global `x-attest-time` operation on this
+    /// component. Device-global means exactly one component carries it —
+    /// the platform decides which and says so via
+    /// [`with_attest_time`](Self::with_attest_time). Needs an HSM (the
+    /// floor slot) too, so the op is only listed when both hold.
+    attest_time: bool,
+    /// This component is a vm principal: after `commit_flash` it arms
+    /// in-band enrolment so the guest can run HELLO → ENROLL_ASSISTED
+    /// against vhsm-ssd. Set via
+    /// [`with_vm_principal`](Self::with_vm_principal); off for
+    /// everything that has no guest identity to enrol.
+    vm_principal: bool,
     /// Sink that steps the host wall clock forward to the safe-time floor after
     /// an install ratchets it (see [`crate::sovd::time_floor`]). Defaults to the
     /// log-only [`NoopWallClockFloor`]; the real host injects a clock-setting
@@ -575,27 +587,16 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         images_dir: Option<PathBuf>,
         hsm_provider: Option<Arc<Mutex<dyn hsm::HsmProvider>>>,
     ) -> Self {
-        // `name`/`desc` are the display defaults per bank set. `id` is only the
-        // FALLBACK id, used when the caller doesn't thread the configured
-        // component id via `with_id` (direct-constructor uses in tests). The
-        // factory always supplies `spec.id`, which then wins — so the registry
-        // key and the verdict/entity id share one source of truth.
-        let (id, name, desc) = match bank_set {
-            BankSet::Hsm => ("hsm", "HSM Key Store", "Hardware Security Module"),
-            BankSet::Bootloader => ("bootloader", "Bootloader", "Reserved bootloader bank set"),
-            BankSet::Os => (
-                "host-os",
-                "Host OS",
-                "Host OS (IFS + rootfs) A/B bank set; carries the self-updating app slot",
-            ),
-            BankSet::Rt => ("rt", "Realtime", "Realtime / Cortex-M7 core bank set"),
-            BankSet::Vm1 => ("vm1", "VM1", "Virtual machine slot 1"),
-            BankSet::Vm2 => ("vm2", "VM2", "Virtual machine slot 2"),
-            // Phase 2 of the deep refactor will look these up from
-            // deployment config; for now any slot beyond the 6
-            // well-known ones gets a generic stub.
-            _ => ("custom", "Custom", "Deployment-specific bank slot"),
-        };
+        // Neutral fallbacks for the direct-constructor path (tests): a slot
+        // knows its index and nothing else, so the id is derived from it and
+        // the display name defaults to the id. There is no slot→name table —
+        // a component's id comes from the platform profile, never from the
+        // slot it happens to occupy. The factory always supplies `spec.id` via
+        // `with_id` (and a display name via `with_display_name`), which then
+        // wins — so the registry key and the verdict/entity id share one
+        // source of truth.
+        let id = format!("slot{}", bank_set.as_index());
+        let desc = format!("bank slot {}", bank_set.as_index());
 
         // Read the current active bank at startup — this is what we're running on.
         let running_bank = if config.single_bank {
@@ -612,7 +613,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // hsm it holds (activator still None here; `with_bank_activator` rebuilds
         // it, as does `with_bank_spec` for the dir name). Clones the Arcs — the
         // struct literal below moves the originals into the backend's fields.
-        let bank_spec = crate::bank_spec::BankSetSpec::for_well_known(bank_set);
+        // Neutral default dir: the factory always supplies the real one (the
+        // component's `storage_subdir` or its id) via `with_bank_spec`.
+        let bank_spec = crate::bank_spec::BankSetSpec {
+            dir_name: format!("slot{}", bank_set.as_index()),
+        };
         let bank_provider: Arc<dyn BankProvider> = Arc::new(IvdBankProvider::new(
             nv.clone(),
             bank_set,
@@ -629,10 +634,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
         let backend = Self {
             entity_info: EntityInfo {
-                id: id.to_string(),
-                name: name.to_string(),
+                id: id.clone(),
+                name: id.clone(),
                 entity_type: config.entity_type.clone(),
-                description: Some(desc.to_string()),
+                description: Some(desc),
                 href: format!("/vehicle/v1/components/{id}"),
                 status: None,
             },
@@ -698,6 +703,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             // Defaults to the `dyn HsmProvider` path; component-factory injects a
             // crypto-only handle via `with_hsm_crypto` when link-B is configured.
             hsm_crypto: None,
+            attest_time: false,
+            vm_principal: false,
             wall_clock_floor: Arc::new(crate::sovd::time_floor::NoopWallClockFloor),
             health_probe: None,
             node_boot_id: None,
@@ -725,6 +732,24 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Override the component display name (shown in SOVD component listing).
     pub fn with_display_name(mut self, name: String) -> Self {
         self.entity_info.name = name;
+        self
+    }
+
+    /// Carry the device-global `x-attest-time` operation on this component.
+    /// The op ratchets the shared safe-time floor, so it is advertised ONCE
+    /// per device — the platform says which component hosts it, instead of a
+    /// slot identity deciding. Needs an HSM as well (the floor lives there).
+    pub fn with_attest_time(mut self, on: bool) -> Self {
+        self.attest_time = on;
+        self
+    }
+
+    /// Mark this component a vm principal: `commit_flash` then arms in-band
+    /// enrolment so the freshly promoted guest can run HELLO →
+    /// ENROLL_ASSISTED against vhsm-ssd. Off for components with no guest
+    /// identity of their own.
+    pub fn with_vm_principal(mut self, on: bool) -> Self {
+        self.vm_principal = on;
         self
     }
 
@@ -913,9 +938,9 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     }
 
     /// Override the bank-set spec (on-disk dir + URI→filename layout).
-    /// Constructors default to `BankSetSpec::for_well_known(bank_set)`;
-    /// component-factory uses this to inject deployment-config-driven
-    /// values once Phase 3 wires the ComponentSpec → BankSetSpec path.
+    /// Constructors default to an index-derived `slot<N>` dir;
+    /// component-factory uses this to inject the deployment-config-driven
+    /// value (`storage_subdir`, else the component id).
     pub fn with_bank_spec(mut self, spec: crate::bank_spec::BankSetSpec) -> Self {
         self.bank_spec = spec;
         // The provider keys its on-disk layout off `bank_spec.dir_name`; rebuild
@@ -4020,9 +4045,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         let mut ops = Vec::new();
         let id = &self.entity_info.id;
         // attest-time is device-global (ratchets the shared safe-time floor); it
-        // needs an HSM (the floor slot) and is advertised ONCE, on the host/device
-        // component (BankSet::Os), so it doesn't appear per-firmware-component.
-        if self.hsm_provider.is_some() && self.bank_set == BankSet::Os {
+        // needs an HSM (the floor slot) and is advertised ONCE, on the component
+        // the platform nominates via `with_attest_time`, so it doesn't appear
+        // per-firmware-component.
+        if self.hsm_provider.is_some() && self.attest_time {
             let op = ATTEST_TIME_OP_ID;
             ops.push(OperationInfo {
                 id: op.to_string(),
@@ -4163,10 +4189,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             .inspect_err(|e| self.ratchet_time_floor_on_reject(e))
             .map_err(|e| BackendError::InvalidRequest(format!("manifest validation: {e}")))?;
 
-        if validated.bank_set != self.bank_set {
+        if validated.component_name != self.entity_info.id {
             return Err(BackendError::InvalidRequest(format!(
-                "manifest targets {:?}, but this is {:?}",
-                validated.bank_set, self.bank_set
+                "manifest targets '{}', but this is '{}'",
+                validated.component_name, self.entity_info.id
             )));
         }
 
@@ -4283,7 +4309,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             self.manifest_provider.as_ref(),
             min_security_ver,
             Some(self.bank_provider.as_ref()),
-            self.bank_set,
+            &self.entity_info.id,
             target_bank,
         )
         .await
@@ -5633,9 +5659,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // will boot the just-promoted bank, connect to vhsm-ssd,
         // and run HELLO → ENROLL_ASSISTED; the daemon resolves
         // identity by source IP and consumes this pending flag.
-        // Non-VM banks (e.g. host-os, hsm) skip — enrol is a
-        // vm-principal concept.
-        if matches!(self.bank_set, BankSet::Vm1 | BankSet::Vm2) {
+        // Components that are not vm principals (e.g. host-os, hsm)
+        // skip — enrol is a vm-principal concept.
+        if self.vm_principal {
             if let Some(ref hsm) = self.hsm_provider {
                 let mut guard = hsm
                     .lock()
@@ -8171,6 +8197,7 @@ mod identity_tests {
     use hsm::HsmProvider;
     use hsm_sim_backend::SimHsm;
     use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
     use std::path::Path;
 
@@ -8258,7 +8285,7 @@ mod identity_tests {
         let (hsm, crypto, keystore) = provisioned_hsm(tag);
 
         let backend = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             nv,
             Arc::new(NoopManifest),
             ComponentConfig::default(),
@@ -8266,6 +8293,9 @@ mod identity_tests {
             Some(images_dir.clone()),
             Some(hsm),
         )
+        .with_bank_spec(crate::bank_spec::BankSetSpec {
+            dir_name: "vm1".into(),
+        })
         .with_hsm_crypto(crypto);
 
         // Stage a payload file in the target (bank_b) so the bank isn't
@@ -8281,7 +8311,7 @@ mod identity_tests {
             StoredPackage {
                 id: pkg_id.clone(),
                 validated: ValidatedFirmware {
-                    bank_set: BankSet::Vm1,
+                    component_name: "vm1".into(),
                     manifest_type: ManifestType::Firmware,
                     image_meta: meta,
                     image_data: Vec::new(),
@@ -8737,7 +8767,7 @@ mod identity_tests {
         // committed=false (exactly what `install_precomputed` leaves behind).
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
-        let idx = BankSet::Vm1.as_index();
+        let idx = slots::VM1.as_index();
         boot.banks[idx].active_bank = Bank::B;
         boot.banks[idx].committed = false;
         nv.write_boot_state(&mut boot).unwrap();
@@ -8750,7 +8780,7 @@ mod identity_tests {
         std::fs::write(bank_b.join("rootfs.img"), b"new bank bytes").unwrap();
 
         let backend = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             nv.clone(),
             Arc::new(NoopManifest),
             ComponentConfig::default(),
@@ -8801,7 +8831,7 @@ mod identity_tests {
         // is A = active.other(), which the buggy legacy path would target+wipe.
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
-        let idx = BankSet::Vm1.as_index();
+        let idx = slots::VM1.as_index();
         boot.banks[idx].active_bank = Bank::B;
         boot.banks[idx].committed = false;
         nv.write_boot_state(&mut boot).unwrap();
@@ -8814,7 +8844,7 @@ mod identity_tests {
         std::fs::write(&sentinel, b"committed rollback bytes").unwrap();
 
         let backend = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             nv,
             Arc::new(NoopManifest),
             ComponentConfig::default(),
@@ -8859,6 +8889,7 @@ mod bank_provider_injection_tests {
     use machine_mgr::bank_provider::{BankError, BankProvider};
     use machine_mgr::ResetKind;
     use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -8951,7 +8982,7 @@ mod bank_provider_injection_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig::default(),
@@ -8959,6 +8990,9 @@ mod bank_provider_injection_tests {
             None,
             None,
         )
+        // The vm-service URLs this fixture's servers assert on are built from
+        // the component id, which the factory supplies in production.
+        .with_id("vm1".into())
     }
 
     fn backend_with_commit_provider(
@@ -9065,7 +9099,7 @@ mod bank_provider_injection_tests {
         set_transfer_state(b, FlashState::AwaitingReboot);
         let mut nv = b.nv.lock().unwrap();
         let mut boot = nv.read_boot_state().unwrap();
-        let bank = &mut boot.banks[BankSet::Vm1.as_index()];
+        let bank = &mut boot.banks[slots::VM1.as_index()];
         bank.active_bank = Bank::B;
         bank.committed = false;
         bank.boot_count = 0;
@@ -9100,7 +9134,7 @@ mod bank_provider_injection_tests {
         {
             let mut nv = b.nv.lock().unwrap();
             let mut boot = nv.read_boot_state().unwrap();
-            let bank = &mut boot.banks[BankSet::Vm1.as_index()];
+            let bank = &mut boot.banks[slots::VM1.as_index()];
             bank.active_bank = Bank::B;
             bank.committed = false;
             bank.boot_count = 0;
@@ -9108,7 +9142,7 @@ mod bank_provider_injection_tests {
         }
         b.set_reboot_owed(true).unwrap();
         let reconstructed = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             b.nv.clone(),
             Arc::new(NoopManifest),
             ComponentConfig::default(),
@@ -9141,11 +9175,98 @@ mod bank_provider_injection_tests {
         {
             let mut nv = b.nv.lock().unwrap();
             let mut boot = nv.read_boot_state().unwrap();
-            boot.banks[BankSet::Vm1.as_index()].boot_count = 1;
+            boot.banks[slots::VM1.as_index()].boot_count = 1;
             nv.write_boot_state(&mut boot).unwrap();
         }
         assert!(matches!(b.commit_flash().await, Err(BackendError::Busy(_))));
         assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    }
+
+    /// Records the `arm_enrollment` calls `commit_flash` makes; every other
+    /// method is an unused stub (the commit path touches none of them).
+    struct EnrollRecorder {
+        armed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl hsm::HsmProvider for EnrollRecorder {
+        fn is_provisioned(&self) -> Result<bool, hsm::HsmError> {
+            Ok(true)
+        }
+        fn provision(&mut self, _envelope: &[u8]) -> Result<(), hsm::HsmError> {
+            Ok(())
+        }
+        fn list_slots(&self) -> Result<Vec<hsm::SlotInfo>, hsm::HsmError> {
+            Ok(Vec::new())
+        }
+        fn get_public_key(&self, _role: hsm::KeyRole) -> Result<Vec<u8>, hsm::HsmError> {
+            Ok(Vec::new())
+        }
+        fn provisioning_state(&self) -> Result<hsm::ProvisioningState, hsm::HsmError> {
+            Ok(hsm::ProvisioningState::Provisioned)
+        }
+        fn arm_enrollment(&mut self, vm_id: &str, _ttl: Option<u64>) -> Result<(), hsm::HsmError> {
+            self.armed.lock().unwrap().push(vm_id.to_string());
+            Ok(())
+        }
+    }
+
+    /// A banked component with an HSM whose `arm_enrollment` calls are
+    /// recorded, nominated (or not) as a vm principal.
+    fn backend_with_enroll_recorder(
+        vm_principal: bool,
+    ) -> (
+        ComponentBackend<MemBlockDevice>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<SentinelProvider>,
+    ) {
+        let armed = Arc::new(Mutex::new(Vec::new()));
+        let hsm: Arc<Mutex<dyn hsm::HsmProvider>> = Arc::new(Mutex::new(EnrollRecorder {
+            armed: armed.clone(),
+        }));
+        let provider = Arc::new(SentinelProvider::new(Some(Bank::A)));
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        nv.write_boot_state(&mut NvBootState::default()).unwrap();
+        let b = ComponentBackend::with_options(
+            slots::VM1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig::default(),
+            None,
+            None,
+            Some(hsm),
+        )
+        .with_id("vm1".into())
+        .with_vm_principal(vm_principal)
+        .with_bank_provider(provider.clone());
+        (b, armed, provider)
+    }
+
+    /// Arming in-band enrolment at commit is a vm-principal property the
+    /// platform declares, not something the slot implies: same banked
+    /// component, same HSM, armed only when nominated. The negative is the
+    /// rt-core shape — a banked component with no guest identity to enrol.
+    #[tokio::test]
+    async fn enrollment_is_armed_at_commit_only_for_a_vm_principal() {
+        for (vm_principal, expected) in [(true, vec!["vm1".to_string()]), (false, Vec::new())] {
+            let (b, armed, provider) = backend_with_enroll_recorder(vm_principal);
+            {
+                let mut nv = b.nv.lock().unwrap();
+                let mut boot = nv.read_boot_state().unwrap();
+                let bank = &mut boot.banks[slots::VM1.as_index()];
+                bank.committed = false;
+                bank.boot_count = 1;
+                nv.write_boot_state(&mut boot).unwrap();
+            }
+
+            b.commit_flash().await.unwrap();
+
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *armed.lock().unwrap(),
+                expected,
+                "vm_principal={vm_principal}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9155,7 +9276,7 @@ mod bank_provider_injection_tests {
         {
             let mut nv = b.nv.lock().unwrap();
             let mut boot = nv.read_boot_state().unwrap();
-            let bank = &mut boot.banks[BankSet::Vm1.as_index()];
+            let bank = &mut boot.banks[slots::VM1.as_index()];
             bank.committed = false;
             bank.boot_count = 1;
             nv.write_boot_state(&mut boot).unwrap();
@@ -9177,7 +9298,7 @@ mod bank_provider_injection_tests {
         {
             let mut nv = b.nv.lock().unwrap();
             let mut boot = nv.read_boot_state().unwrap();
-            let bank = &mut boot.banks[BankSet::Vm1.as_index()];
+            let bank = &mut boot.banks[slots::VM1.as_index()];
             bank.active_bank = Bank::B;
             bank.committed = false;
             bank.boot_count = 0;
@@ -9189,7 +9310,7 @@ mod bank_provider_injection_tests {
         assert!(matches!(err, BackendError::Transport(_)));
         assert_eq!(b.running_bank().unwrap(), Bank::A);
         let boot = b.nv.lock().unwrap().read_boot_state().unwrap();
-        assert_eq!(boot.banks[BankSet::Vm1.as_index()].boot_count, 0);
+        assert_eq!(boot.banks[slots::VM1.as_index()].boot_count, 0);
         assert_eq!(
             b.flash_transfer.lock().unwrap().as_ref().unwrap().state,
             FlashState::AwaitingReboot
@@ -9227,8 +9348,7 @@ mod bank_provider_injection_tests {
         );
         assert_eq!(b.running_bank().unwrap(), Bank::A);
         assert_eq!(
-            b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
-                .boot_count,
+            b.nv.lock().unwrap().read_boot_state().unwrap().banks[slots::VM1.as_index()].boot_count,
             0
         );
         server.join().unwrap();
@@ -9264,8 +9384,7 @@ mod bank_provider_injection_tests {
             FlashState::Verifying
         );
         assert_eq!(
-            b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
-                .boot_count,
+            b.nv.lock().unwrap().read_boot_state().unwrap().banks[slots::VM1.as_index()].boot_count,
             0
         );
 
@@ -9274,8 +9393,7 @@ mod bank_provider_injection_tests {
         assert_eq!(activation.state, FlashState::Verifying);
         assert_eq!(b.running_bank().unwrap(), Bank::A);
         assert_eq!(
-            b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
-                .boot_count,
+            b.nv.lock().unwrap().read_boot_state().unwrap().banks[slots::VM1.as_index()].boot_count,
             0
         );
         assert!(matches!(b.commit_flash().await, Err(BackendError::Busy(_))));
@@ -9305,8 +9423,7 @@ mod bank_provider_injection_tests {
         assert_eq!(activation.state, FlashState::Activated);
         assert_eq!(b.running_bank().unwrap(), Bank::B);
         assert_eq!(
-            b.nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Vm1.as_index()]
-                .boot_count,
+            b.nv.lock().unwrap().read_boot_state().unwrap().banks[slots::VM1.as_index()].boot_count,
             0,
             "the promotion must not write a boot counter for a vm-service guest"
         );
@@ -9345,7 +9462,7 @@ mod bank_provider_injection_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         ComponentBackend::with_options(
-            BankSet::Hsm,
+            slots::HSM,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
@@ -9369,13 +9486,13 @@ mod bank_provider_injection_tests {
         // bit and read it back via the same NvUpdateSession record the gate
         // consults. (The refuse-on-RebootPending decision is covered by
         // machine-mgr's node_update tests; this proves the component-mgr NV plumbing.)
-        let b = backend(); // BankSet::Vm1
+        let b = backend(); // slots::VM1
         assert!(b.node_reboot_owed().unwrap().reboot_owed.is_empty());
 
         b.set_reboot_owed(true).unwrap();
         assert_eq!(
             b.node_reboot_owed().unwrap().reboot_owed,
-            vec![format!("bank-set {}", BankSet::Vm1.as_index())]
+            vec![format!("bank-set {}", slots::VM1.as_index())]
         );
 
         b.set_reboot_owed(false).unwrap();
@@ -9391,7 +9508,7 @@ mod bank_provider_injection_tests {
         // the hook clears the durable reboot-owed bit AND drops the component from
         // the coordinator's staging.
         let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new(vec![(
-            BankSet::Vm1.as_index(),
+            slots::VM1.as_index(),
             "vm1".to_string(),
         )]));
         let b = backend().with_node_coordinator(coord.clone());
@@ -9546,7 +9663,7 @@ mod bank_provider_injection_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         let b = ComponentBackend::with_options(
-            BankSet::Os,
+            slots::OS,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
@@ -9628,7 +9745,7 @@ mod bank_provider_injection_tests {
         nv.write_boot_state(&mut boot).unwrap();
         // The full Tier-2 host mix: ring + files + persisted segments.
         let b = ComponentBackend::with_options(
-            BankSet::Os,
+            slots::OS,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
@@ -9694,7 +9811,7 @@ mod bank_provider_injection_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         let b = ComponentBackend::with_options(
-            BankSet::Os,
+            slots::OS,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
@@ -9753,7 +9870,7 @@ mod bank_provider_injection_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         let b = ComponentBackend::with_options(
-            BankSet::Os,
+            slots::OS,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
@@ -9807,7 +9924,7 @@ mod bank_provider_injection_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
@@ -9830,7 +9947,7 @@ mod bank_provider_injection_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         let b = ComponentBackend::with_options(
-            BankSet::Os,
+            slots::OS,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
@@ -9922,7 +10039,7 @@ mod bank_provider_injection_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
@@ -10706,7 +10823,7 @@ mod bank_provider_injection_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         let b = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
@@ -10768,7 +10885,7 @@ mod bank_provider_injection_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         let b = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig {
@@ -11228,7 +11345,9 @@ mod bank_provider_injection_tests {
         // one is NOT clobbered.
         let b = backend()
             .with_bank_provider(Arc::new(SentinelProvider::new(None)))
-            .with_bank_spec(crate::bank_spec::BankSetSpec::for_well_known(BankSet::Vm1));
+            .with_bank_spec(crate::bank_spec::BankSetSpec {
+                dir_name: "vm1".into(),
+            });
         assert_eq!(
             b.reset_kind(),
             ResetKind::RequiresEcuReset,
@@ -11279,6 +11398,7 @@ mod abort_flash_tests {
     use super::*;
     use crate::manifest_provider::ManifestError;
     use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
 
     struct NoopManifest;
@@ -11293,7 +11413,7 @@ mod abort_flash_tests {
         let mut boot = NvBootState::default();
         nv.write_boot_state(&mut boot).unwrap();
         ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig::default(),
@@ -11375,17 +11495,20 @@ mod abort_flash_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
-        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
+        boot.banks[slots::VM1.as_index()].active_bank = Bank::A;
         nv.write_boot_state(&mut boot).unwrap();
         let b = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig::default(),
             None,
             Some(dir.path().to_path_buf()),
             None,
-        );
+        )
+        .with_bank_spec(crate::bank_spec::BankSetSpec {
+            dir_name: "vm1".into(),
+        });
         // Active = A ⇒ target = B. Stage a partial file in bank_b.
         let bank_b = dir.path().join("vm1").join("bank_b");
         std::fs::create_dir_all(&bank_b).unwrap();
@@ -11410,17 +11533,20 @@ mod abort_flash_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
-        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
+        boot.banks[slots::VM1.as_index()].active_bank = Bank::A;
         nv.write_boot_state(&mut boot).unwrap();
         let b = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig::default(),
             None,
             Some(dir.path().to_path_buf()),
             None,
-        );
+        )
+        .with_bank_spec(crate::bank_spec::BankSetSpec {
+            dir_name: "vm1".into(),
+        });
         let bank_b = dir.path().join("vm1").join("bank_b");
         std::fs::create_dir_all(&bank_b).unwrap();
         std::fs::write(bank_b.join("rootfs.img"), vec![0u8; 1024]).unwrap();
@@ -11442,6 +11568,7 @@ mod copy_forward_tests {
     use super::*;
     use crate::manifest_provider::ManifestError;
     use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
     use sha2::{Digest, Sha256};
     use sumo_offboard::{keygen, ImageManifestBuilder};
@@ -11474,10 +11601,10 @@ mod copy_forward_tests {
     fn vm1_backend(images_dir: PathBuf) -> ComponentBackend<MemBlockDevice> {
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
-        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
+        boot.banks[slots::VM1.as_index()].active_bank = Bank::A;
         nv.write_boot_state(&mut boot).unwrap();
         ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig::default(),
@@ -11485,6 +11612,9 @@ mod copy_forward_tests {
             Some(images_dir),
             None,
         )
+        .with_bank_spec(crate::bank_spec::BankSetSpec {
+            dir_name: "vm1".into(),
+        })
     }
 
     /// Digest-match: the active bank's content hashes to what the manifest
@@ -11920,15 +12050,15 @@ mod copy_forward_tests {
         let images_dir = tmp.path().to_path_buf();
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
-        for set in [BankSet::Vm1, BankSet::Vm2] {
+        for set in [slots::VM1, slots::VM2] {
             boot.banks[set.as_index()].active_bank = Bank::A;
             boot.banks[set.as_index()].committed = true;
         }
         nv.write_boot_state(&mut boot).unwrap();
         let nv = Arc::new(Mutex::new(nv));
         let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new(vec![
-            (BankSet::Vm1.as_index(), "vm1".into()),
-            (BankSet::Vm2.as_index(), "vm2".into()),
+            (slots::VM1.as_index(), "vm1".into()),
+            (slots::VM2.as_index(), "vm2".into()),
         ]));
         let mk = |set: BankSet| {
             ComponentBackend::with_options(
@@ -11942,8 +12072,8 @@ mod copy_forward_tests {
             )
             .with_node_coordinator(coord.clone())
         };
-        let vm1 = mk(BankSet::Vm1);
-        let vm2 = mk(BankSet::Vm2);
+        let vm1 = mk(slots::VM1);
+        let vm2 = mk(slots::VM2);
 
         let campaign = [7u8; 32];
         let source = |sid| machine_mgr::InstallSource {
@@ -12000,17 +12130,17 @@ mod copy_forward_tests {
         // reaches the node gate.
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
-        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::B;
-        boot.banks[BankSet::Vm1.as_index()].committed = false;
-        boot.banks[BankSet::Vm1.as_index()].boot_count = 1;
-        boot.banks[BankSet::Vm2.as_index()].active_bank = Bank::A;
-        boot.banks[BankSet::Vm2.as_index()].committed = true;
+        boot.banks[slots::VM1.as_index()].active_bank = Bank::B;
+        boot.banks[slots::VM1.as_index()].committed = false;
+        boot.banks[slots::VM1.as_index()].boot_count = 1;
+        boot.banks[slots::VM2.as_index()].active_bank = Bank::A;
+        boot.banks[slots::VM2.as_index()].committed = true;
         nv.write_boot_state(&mut boot).unwrap();
         let nv = Arc::new(Mutex::new(nv));
 
         let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new(vec![
-            (BankSet::Vm1.as_index(), "vm1".into()),
-            (BankSet::Vm2.as_index(), "vm2".into()),
+            (slots::VM1.as_index(), "vm1".into()),
+            (slots::VM2.as_index(), "vm2".into()),
         ]));
         let mk = |set: BankSet| {
             ComponentBackend::with_options(
@@ -12024,8 +12154,8 @@ mod copy_forward_tests {
             )
             .with_node_coordinator(coord.clone())
         };
-        let vm1 = mk(BankSet::Vm1);
-        let vm2 = mk(BankSet::Vm2);
+        let vm1 = mk(slots::VM1);
+        let vm2 = mk(slots::VM2);
 
         // A DIFFERENT component is refused by the node gate: the node owes a
         // verdict for the in-trial vm1 (the refusal names vm1, not "bank-set N").
@@ -12064,7 +12194,7 @@ mod copy_forward_tests {
         {
             let mut guard = nv.lock().unwrap();
             let mut boot = guard.read_boot_state().unwrap();
-            boot.banks[BankSet::Vm1.as_index()].committed = true;
+            boot.banks[slots::VM1.as_index()].committed = true;
             guard.write_boot_state(&mut boot).unwrap();
         }
         vm2.ensure_flash_can_start()
@@ -12127,14 +12257,14 @@ mod copy_forward_tests {
 
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
-        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
-        boot.banks[BankSet::Vm1.as_index()].committed = true;
+        boot.banks[slots::VM1.as_index()].active_bank = Bank::A;
+        boot.banks[slots::VM1.as_index()].committed = true;
         nv.write_boot_state(&mut boot).unwrap();
         let nv = Arc::new(Mutex::new(nv));
 
         let (hsm, crypto, keystore) = provisioned_hsm("finalize");
         let backend = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             nv.clone(),
             Arc::new(NoopManifest),
             ComponentConfig::default(),
@@ -12142,6 +12272,9 @@ mod copy_forward_tests {
             Some(images_dir.clone()),
             Some(hsm),
         )
+        .with_bank_spec(crate::bank_spec::BankSetSpec {
+            dir_name: "vm1".into(),
+        })
         .with_hsm_crypto(crypto);
 
         // Park a manifest-only session (0 of 1 components pushed) + the Firmware
@@ -12149,7 +12282,7 @@ mod copy_forward_tests {
         // the header-only shape the real manifest-only path produces).
         let manifest = detached_manifest("rootfs.img", &digest, content.len() as u64);
         let validated = ValidatedFirmware {
-            bank_set: BankSet::Vm1,
+            component_name: "vm1".into(),
             manifest_type: ManifestType::Firmware,
             image_meta: crate::ota::ImageMeta::default(),
             image_data: Vec::new(),
@@ -12207,7 +12340,7 @@ mod copy_forward_tests {
             *backend.flash_session.lock().unwrap(),
             Some(FlashSessionState::Complete)
         ));
-        let s = crate::ota::status(&nv.lock().unwrap(), BankSet::Vm1).unwrap();
+        let s = crate::ota::status(&nv.lock().unwrap(), slots::VM1).unwrap();
         assert_eq!(
             s.active_bank,
             Bank::B,
@@ -12250,14 +12383,14 @@ mod copy_forward_tests {
 
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
-        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
-        boot.banks[BankSet::Vm1.as_index()].committed = true;
+        boot.banks[slots::VM1.as_index()].active_bank = Bank::A;
+        boot.banks[slots::VM1.as_index()].committed = true;
         nv.write_boot_state(&mut boot).unwrap();
         let nv = Arc::new(Mutex::new(nv));
 
         let (hsm, crypto, keystore) = provisioned_hsm("banked-owed");
         let backend = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             nv.clone(),
             Arc::new(NoopManifest),
             ComponentConfig::default(), // banked: supports_rollback, dual-bank
@@ -12265,6 +12398,9 @@ mod copy_forward_tests {
             Some(images_dir.clone()),
             Some(hsm),
         )
+        .with_bank_spec(crate::bank_spec::BankSetSpec {
+            dir_name: "vm1".into(),
+        })
         .with_hsm_crypto(crypto)
         .with_bank_activator(Arc::new(EcuResetActivator));
 
@@ -12277,7 +12413,7 @@ mod copy_forward_tests {
 
         let manifest = detached_manifest("rootfs.img", &digest, content.len() as u64);
         let validated = ValidatedFirmware {
-            bank_set: BankSet::Vm1,
+            component_name: "vm1".into(),
             manifest_type: ManifestType::Firmware,
             image_meta: crate::ota::ImageMeta::default(),
             image_data: Vec::new(),
@@ -12319,7 +12455,7 @@ mod copy_forward_tests {
         // The fix: arming a banked RequiresEcuReset component now owes a node reboot.
         assert_eq!(
             backend.node_reboot_owed().unwrap().reboot_owed,
-            vec![format!("bank-set {}", BankSet::Vm1.as_index())]
+            vec![format!("bank-set {}", slots::VM1.as_index())]
         );
 
         let _ = std::fs::remove_dir_all(&keystore);
@@ -12348,14 +12484,14 @@ mod copy_forward_tests {
 
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
-        boot.banks[BankSet::Vm1.as_index()].active_bank = Bank::A;
-        boot.banks[BankSet::Vm1.as_index()].committed = true;
+        boot.banks[slots::VM1.as_index()].active_bank = Bank::A;
+        boot.banks[slots::VM1.as_index()].committed = true;
         nv.write_boot_state(&mut boot).unwrap();
         let nv = Arc::new(Mutex::new(nv));
 
         let (hsm, crypto, keystore) = provisioned_hsm("finalize-fetch");
         let backend = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             nv.clone(),
             Arc::new(NoopManifest),
             ComponentConfig::default(),
@@ -12363,6 +12499,9 @@ mod copy_forward_tests {
             Some(images_dir.clone()),
             Some(hsm),
         )
+        .with_bank_spec(crate::bank_spec::BankSetSpec {
+            dir_name: "vm1".into(),
+        })
         .with_hsm_crypto(crypto);
         backend.set_install_source(test_source(base));
 
@@ -12373,7 +12512,7 @@ mod copy_forward_tests {
             &format!("sha256:{outer_hex}"),
         );
         let validated = ValidatedFirmware {
-            bank_set: BankSet::Vm1,
+            component_name: "vm1".into(),
             manifest_type: ManifestType::Firmware,
             image_meta: crate::ota::ImageMeta::default(),
             image_data: Vec::new(),
@@ -12419,7 +12558,7 @@ mod copy_forward_tests {
         );
         assert!(images_dir.join("vm1/bank_b/ivd-manifest.cbor").exists());
         assert!(images_dir.join("vm1/bank_b/ivd-signature.bin").exists());
-        let s = crate::ota::status(&nv.lock().unwrap(), BankSet::Vm1).unwrap();
+        let s = crate::ota::status(&nv.lock().unwrap(), slots::VM1).unwrap();
         assert_eq!(s.active_bank, Bank::B);
         assert!(!s.committed, "banked install enters trial mode");
         assert!(
@@ -12441,6 +12580,7 @@ mod time_floor_ratchet_tests {
     use hsm::HsmProvider;
     use hsm_sim_backend::SimHsm;
     use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
 
     struct NoopManifest;
@@ -12466,7 +12606,7 @@ mod time_floor_ratchet_tests {
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         nv.write_boot_state(&mut NvBootState::default()).unwrap();
         let backend = ComponentBackend::with_options(
-            BankSet::Vm1,
+            slots::VM1,
             Arc::new(Mutex::new(nv)),
             Arc::new(NoopManifest),
             ComponentConfig::default(),
@@ -12549,8 +12689,9 @@ mod time_floor_ratchet_tests {
     use sumo_offboard::{keygen, ImageManifestBuilder};
 
     /// Build a SoftwareAuthority-signed SUIT manifest carrying `signing_time`, plus
-    /// a SuitProvider that trusts that key as sw-authority, plus a host (BankSet::Os)
-    /// backend with a SimHsm. This is the operator-pushed attest-time artifact.
+    /// a SuitProvider that trusts that key as sw-authority, plus the host/device
+    /// backend — the one the platform nominates to carry attest-time — with a
+    /// SimHsm. This is the operator-pushed attest-time artifact.
     fn host_backend_and_signed_manifest(
         tag: &str,
         signing_time: u64,
@@ -12582,24 +12723,64 @@ mod time_floor_ratchet_tests {
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         nv.write_boot_state(&mut NvBootState::default()).unwrap();
         let backend = ComponentBackend::with_options(
-            BankSet::Os, // host/device component — where attest-time is advertised
+            slots::OS,
             Arc::new(Mutex::new(nv)),
             Arc::new(provider),
             ComponentConfig::default(),
             None,
             None,
             Some(hsm.clone()),
-        );
+        )
+        .with_id("host-os".into())
+        // The platform nominates this component to carry attest-time.
+        .with_attest_time(true);
         (backend, hsm, envelope)
     }
 
+    /// Advertised iff the platform nominated the component AND an HSM is
+    /// present (the safe-time floor lives in the HSM). Which slot the
+    /// component sits on never enters the decision.
     #[tokio::test]
-    async fn attest_time_is_advertised_on_the_host_component_with_an_hsm() {
-        let (backend, _hsm, _) = host_backend_and_signed_manifest("advertise", 1_784_600_000);
-        let ops = backend.list_operations().await.unwrap();
+    async fn attest_time_is_advertised_only_when_nominated_and_hsm_backed() {
+        let (nominated, _hsm, _) = host_backend_and_signed_manifest("advertise", 1_784_600_000);
         assert!(
-            ops.iter().any(|o| o.id == ATTEST_TIME_OP_ID),
-            "host component with an HSM advertises x-attest-time"
+            nominated
+                .list_operations()
+                .await
+                .unwrap()
+                .iter()
+                .any(|o| o.id == ATTEST_TIME_OP_ID),
+            "nominated component with an HSM advertises x-attest-time"
+        );
+
+        // Same component, same HSM, not nominated → silent.
+        let not_nominated = nominated.with_attest_time(false);
+        assert!(
+            !not_nominated
+                .list_operations()
+                .await
+                .unwrap()
+                .iter()
+                .any(|o| o.id == ATTEST_TIME_OP_ID),
+            "un-nominated component must not advertise x-attest-time"
+        );
+
+        // Nominated but HSM-less → still silent; there is no floor to ratchet.
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        nv.write_boot_state(&mut NvBootState::default()).unwrap();
+        let hsmless = ComponentBackend::with_options(
+            slots::OS,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .with_attest_time(true);
+        assert!(
+            hsmless.list_operations().await.unwrap().is_empty(),
+            "nomination without an HSM must not advertise x-attest-time"
         );
     }
 

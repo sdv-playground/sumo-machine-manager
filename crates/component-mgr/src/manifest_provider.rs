@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use hsm::ivd::IvdFile;
-use nv_store::types::BankSet;
 use sumo_onboard::decryptor::KeyUnwrap;
 
 use crate::ota::ImageMeta;
@@ -22,7 +21,11 @@ pub enum ManifestType {
 /// Result of successful manifest validation — ready for OTA install.
 #[derive(Clone)]
 pub struct ValidatedFirmware {
-    pub bank_set: BankSet,
+    /// The component this manifest addresses — segment 0 of its SUIT
+    /// component id, verbatim (see [`crate::dispatcher::target_component`]).
+    /// The receiving component compares it against its own id; nothing
+    /// derives a bank slot from it.
+    pub component_name: String,
     /// Manifest sub-type (firmware image vs HSM key material).
     pub manifest_type: ManifestType,
     pub image_meta: ImageMeta,
@@ -211,7 +214,7 @@ mod tests {
     impl ManifestProvider for StubProvider {
         fn validate(&self, _data: &[u8], _min: u32) -> Result<ValidatedFirmware, ManifestError> {
             Ok(ValidatedFirmware {
-                bank_set: BankSet::Vm1,
+                component_name: "vm1".into(),
                 manifest_type: ManifestType::Firmware,
                 image_meta: ImageMeta::default(),
                 image_data: Vec::new(),
@@ -230,7 +233,7 @@ mod tests {
     fn validate_header_only_default_delegates_to_validate() {
         let p = StubProvider;
         let vf = p.validate_header_only(&[], 0).unwrap();
-        assert_eq!(vf.bank_set, BankSet::Vm1);
+        assert_eq!(vf.component_name, "vm1");
         assert_eq!(vf.version_display, "1.0.0");
     }
 

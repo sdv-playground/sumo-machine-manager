@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::StreamExt;
 use hsm::ivd::IvdFile;
-use nv_store::types::{Bank, BankSet};
+use nv_store::types::Bank;
 use sha2::{Digest, Sha256};
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::decryptor::StreamingDecryptor;
@@ -49,7 +49,7 @@ pub async fn process_envelope_stream(
     manifest_provider: &dyn ManifestProvider,
     min_security_ver: u32,
     bank_provider: Option<&dyn BankProvider>,
-    bank_set: BankSet,
+    expected_component: &str,
     target_bank: Bank,
 ) -> Result<ValidatedFirmware, BackendError> {
     // Convert PackageStream → AsyncRead
@@ -61,8 +61,12 @@ pub async fn process_envelope_stream(
         parse_envelope_header(&mut reader).await?;
 
     // Step 2: Validate using header-only envelope (no payload)
-    let mut validated =
-        validate_header(manifest_provider, &header_bytes, min_security_ver, bank_set)?;
+    let mut validated = validate_header(
+        manifest_provider,
+        &header_bytes,
+        min_security_ver,
+        expected_component,
+    )?;
 
     // HSM key manifests: small enough to buffer entirely, pass raw to HSM provider.
     if validated.manifest_type == ManifestType::HsmKeys {
@@ -265,7 +269,7 @@ pub async fn process_envelope_stream(
     );
 
     Ok(ValidatedFirmware {
-        bank_set: validated.bank_set,
+        component_name: validated.component_name,
         manifest_type: validated.manifest_type,
         image_meta: validated.image_meta,
         image_data: Vec::new(),
@@ -866,7 +870,7 @@ fn validate_header(
     manifest_provider: &dyn ManifestProvider,
     header_bytes: &[u8],
     min_security_ver: u32,
-    expected_bank_set: BankSet,
+    expected_component: &str,
 ) -> Result<ValidatedFirmware, BackendError> {
     // Validate using the header-only envelope (no #firmware payload).
     // The validator checks auth + manifest — doesn't need the payload.
@@ -874,10 +878,10 @@ fn validate_header(
         .validate_header_only(header_bytes, min_security_ver)
         .map_err(|e| BackendError::InvalidRequest(format!("manifest validation: {e}")))?;
 
-    if validated.bank_set != expected_bank_set {
+    if validated.component_name != expected_component {
         return Err(BackendError::InvalidRequest(format!(
-            "manifest targets {:?}, but this is {:?}",
-            validated.bank_set, expected_bank_set
+            "manifest targets '{}', but this is '{}'",
+            validated.component_name, expected_component
         )));
     }
 

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures::stream;
 use nv_store::block::MemBlockDevice;
+use nv_store::slots;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::{Bank, BankSet, NvBootState};
 use sumo_crypto::{CryptoBackend, RustCryptoBackend};
@@ -28,7 +29,6 @@ use sumo_offboard::keygen;
 use sumo_offboard::recipient::Recipient;
 
 use component_mgr::bank_provider::IvdBankProvider;
-use component_mgr::bank_spec::BankSetSpec;
 use component_mgr::streaming::process_envelope_stream;
 use component_mgr::suit_provider::SuitProvider;
 use puller::Puller;
@@ -38,21 +38,25 @@ type PackageStream = Pin<
 >;
 
 /// Build an `IvdBankProvider` rooted at `images_dir` for `set` so
-/// `process_envelope_stream` writes payloads to `images_dir/<set>/bank_x/`.
-/// NV is a throwaway MemBlockDevice — `open_payload_writer` only consults
-/// the images_dir + dir_name, not NV.
-fn provider_for(images_dir: &Path, set: BankSet) -> IvdBankProvider<MemBlockDevice> {
+/// `process_envelope_stream` writes payloads to `images_dir/<dir_name>/bank_x/`.
+/// `dir_name` is supplied by the platform in production; the fixture supplies
+/// it here. NV is a throwaway MemBlockDevice — `open_payload_writer` only
+/// consults the images_dir + dir_name, not NV.
+fn provider_for(
+    images_dir: &Path,
+    set: BankSet,
+    dir_name: &str,
+) -> IvdBankProvider<MemBlockDevice> {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
     let mut nv = NvStore::new(dev);
     let mut state = NvBootState::default();
     nv.write_boot_state(&mut state).unwrap();
-    let dir_name = BankSetSpec::for_well_known(set).dir_name;
     IvdBankProvider::new(
         Arc::new(Mutex::new(nv)),
         set,
         false,
         Some(images_dir.to_path_buf()),
-        dir_name,
+        dir_name.to_string(),
         None,
         None,
         None,
@@ -189,13 +193,13 @@ async fn single_component_unencrypted() {
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
-    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
+    let bank_provider = provider_for(tmp.path(), slots::VM1, "vm1");
     let result = process_envelope_stream(
         stream_from_bytes(envelope),
         &provider,
         0,
         Some(&bank_provider),
-        BankSet::Vm1,
+        "vm1",
         Bank::A,
     )
     .await;
@@ -233,13 +237,13 @@ async fn single_component_encrypted() {
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
-    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
+    let bank_provider = provider_for(tmp.path(), slots::VM1, "vm1");
     let result = process_envelope_stream(
         stream_from_bytes(envelope),
         &provider,
         0,
         Some(&bank_provider),
-        BankSet::Vm1,
+        "vm1",
         Bank::A,
     )
     .await;
@@ -296,7 +300,7 @@ fn multi_component_separate_uploads() {
 
     // Step 1: Validate manifest (tiny, ~1KB)
     let validated = validate_manifest(&manifest, &provider, 0).unwrap();
-    assert_eq!(validated.bank_set, BankSet::Vm1);
+    assert_eq!(validated.component_name, "vm1");
     // The signed manifest signing time (iat) flows offboard → validate →
     // ValidatedFirmware, so the install path can ratchet the safe-time floor
     // from it (docs/design/safe-time-floor.md). The builder set 1_700_000_000.
@@ -482,13 +486,13 @@ async fn chunked_delivery() {
 
     let tmp = tempfile::tempdir().unwrap();
     // Split into 512-byte chunks
-    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
+    let bank_provider = provider_for(tmp.path(), slots::VM1, "vm1");
     let result = process_envelope_stream(
         stream_chunked(envelope, 512),
         &provider,
         0,
         Some(&bank_provider),
-        BankSet::Vm1,
+        "vm1",
         Bank::A,
     )
     .await;
@@ -529,13 +533,13 @@ async fn corrupted_payload_digest_mismatch() {
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
-    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
+    let bank_provider = provider_for(tmp.path(), slots::VM1, "vm1");
     let result = process_envelope_stream(
         stream_from_bytes(envelope),
         &provider,
         0,
         Some(&bank_provider),
-        BankSet::Vm1,
+        "vm1",
         Bank::A,
     )
     .await;
@@ -572,13 +576,13 @@ async fn truncated_transfer() {
     let truncated = envelope[..envelope.len() * 80 / 100].to_vec();
 
     let tmp = tempfile::tempdir().unwrap();
-    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
+    let bank_provider = provider_for(tmp.path(), slots::VM1, "vm1");
     let result = process_envelope_stream(
         stream_from_bytes(truncated),
         &provider,
         0,
         Some(&bank_provider),
-        BankSet::Vm1,
+        "vm1",
         Bank::A,
     )
     .await;
@@ -612,13 +616,13 @@ async fn wrong_device_key() {
     let provider = test_provider(&signing_key, Some(&wrong_key));
 
     let tmp = tempfile::tempdir().unwrap();
-    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
+    let bank_provider = provider_for(tmp.path(), slots::VM1, "vm1");
     let result = process_envelope_stream(
         stream_from_bytes(envelope),
         &provider,
         0,
         Some(&bank_provider),
-        BankSet::Vm1,
+        "vm1",
         Bank::A,
     )
     .await;
@@ -652,13 +656,13 @@ async fn anti_rollback_rejects_old_security_version() {
         .unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
-    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
+    let bank_provider = provider_for(tmp.path(), slots::VM1, "vm1");
     let result = process_envelope_stream(
         stream_from_bytes(envelope),
         &provider,
         5, // min_security_ver = 5 — higher than manifest's 1
         Some(&bank_provider),
-        BankSet::Vm1,
+        "vm1",
         Bank::A,
     )
     .await;
@@ -703,16 +707,9 @@ async fn stream_error_mid_transfer() {
     let stream: PackageStream = Box::pin(stream::iter(chunks));
 
     let tmp = tempfile::tempdir().unwrap();
-    let bank_provider = provider_for(tmp.path(), BankSet::Vm1);
-    let result = process_envelope_stream(
-        stream,
-        &provider,
-        0,
-        Some(&bank_provider),
-        BankSet::Vm1,
-        Bank::A,
-    )
-    .await;
+    let bank_provider = provider_for(tmp.path(), slots::VM1, "vm1");
+    let result =
+        process_envelope_stream(stream, &provider, 0, Some(&bank_provider), "vm1", Bank::A).await;
 
     assert!(result.is_err());
 }
@@ -1523,8 +1520,12 @@ async fn pull_update_rejects_garbage_and_non_campaign() {
     assert_eq!(stub.uploads.load(Ordering::SeqCst), 0);
 }
 
+/// A campaign names a COMPONENT, and the slot that component's banked storage
+/// happens to occupy does not enter the dispatch: a component registered as
+/// "vm2" whose storage is the VM1 slot takes its own campaign. Before the
+/// dispatcher compared names this exact shape was refused with a 415.
 #[tokio::test]
-async fn pull_update_wrong_bank_set_target_is_415() {
+async fn pull_update_targets_the_named_component_not_its_slot() {
     let (signing, _) = test_keys();
     let l1 = campaign_integrated(&signing, &["vm2"]);
     let (enc, dec) = issuer_keys();
@@ -1533,18 +1534,25 @@ async fn pull_update_wrong_bank_set_target_is_415() {
         mint_token(&enc, "onboard", "rig-1", "component:vm2 update:execute")
     );
 
-    // A component registered as "vm2" whose banked storage is the Vm1 slot —
-    // the dispatcher's wrong-target check must refuse the envelope (415).
-    let stub = Arc::new(PullStub::new("vm2").with_bank_set(BankSet::Vm1));
+    let stub = Arc::new(PullStub::new("vm2").with_bank_set(slots::VM1));
     let router = pull_router(
         vec![stub.clone()],
         operational_authorizer(dec),
         signing.public_key_bytes(),
     );
 
-    let (status, _, _) = post_pull(&router, Some(&bearer), pull_body(None, &l1, DEAD_CAS)).await;
-    assert_eq!(status, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert_eq!(stub.uploads.load(Ordering::SeqCst), 0);
+    let (status, location, _) =
+        post_pull(&router, Some(&bearer), pull_body(None, &l1, DEAD_CAS)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let exec = poll_execution(&router, &location.unwrap()).await;
+    assert!(
+        matches!(exec.status, sovd_core::OperationStatus::Completed),
+        "status = {:?}, error = {:?}",
+        exec.status,
+        exec.error
+    );
+    assert_eq!(stub.uploads.load(Ordering::SeqCst), 1);
+    assert_eq!(stub.finalized.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
 component_id: ["vm2"]
+slot: 5   # NV slot — the platform profile's assignment; nothing derives it from the name
 vendor_id: "fa6b4a53-d5ad-5fdf-be9d-e4e97d85cd2b"
 class_id: "7a3e1b92-c8f4-5d1a-a629-3f8c42e1d7b0"
 

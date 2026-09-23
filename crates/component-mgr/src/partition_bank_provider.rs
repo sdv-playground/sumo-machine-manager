@@ -438,8 +438,9 @@ mod tests {
         InMemorySelectorStore, SharedSystemBankState, SystemBankManager, TestSigner,
     };
     use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
     use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
-    use nv_store::types::{BankBootState, BankSet, NvBootState};
+    use nv_store::types::{BankBootState, NvBootState};
     use std::io::Write;
     use std::sync::{Mutex, RwLock};
 
@@ -515,7 +516,7 @@ mod tests {
             Arc::new(hsm_sim_backend::SimHsm::new(ks.clone()));
         let inner = IvdBankProvider::new(
             nv,
-            BankSet::Os,
+            slots::OS,
             false,
             Some(images_dir),
             "os".into(),
@@ -779,7 +780,7 @@ mod tests {
 
         fn route(&self, bank: Bank) -> Result<(), BankError> {
             if let Some((sel, nv)) = &self.witness {
-                let selected = sel.read().unwrap().active_bank(BankSet::Os);
+                let selected = sel.read().unwrap().active_bank(slots::OS);
                 self.seen_at_route
                     .lock()
                     .unwrap()
@@ -809,7 +810,7 @@ mod tests {
     fn nv_armed(active: Bank) -> Arc<Mutex<NvStore<MemBlockDevice>>> {
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut state = NvBootState::default();
-        state.banks[BankSet::Os.as_index()] = BankBootState {
+        state.banks[slots::OS.as_index()] = BankBootState {
             active_bank: active,
             committed: false,
             boot_count: 0,
@@ -820,7 +821,7 @@ mod tests {
 
     /// The Os slot's boot state as NV has it right now.
     fn nv_os(nv: &Arc<Mutex<NvStore<MemBlockDevice>>>) -> BankBootState {
-        nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Os.as_index()].clone()
+        nv.lock().unwrap().read_boot_state().unwrap().banks[slots::OS.as_index()].clone()
     }
 
     /// A boot selector whose PRIMARY (booted selection) for Os is `bank`.
@@ -830,7 +831,7 @@ mod tests {
         let shared: SharedSystemBankState = Arc::new(RwLock::new(mgr));
         {
             let mut g = shared.write().unwrap();
-            g.stage(BankSet::Os, bank);
+            g.stage(slots::OS, bank);
             assert!(g.seal());
         }
         shared
@@ -842,7 +843,7 @@ mod tests {
         {
             let mut g = shared.write().unwrap();
             g.commit(); // floor := the booted selection
-            g.stage(BankSet::Os, armed);
+            g.stage(slots::OS, armed);
             assert!(g.seal()); // PRIMARY := the trial bank
         }
         shared
@@ -1104,7 +1105,7 @@ mod tests {
             // writes), while the cache still names the booted bank A.
             let mut g = nv.lock().unwrap();
             let mut state = g.read_boot_state().unwrap();
-            state.banks[BankSet::Os.as_index()] = BankBootState {
+            state.banks[slots::OS.as_index()] = BankBootState {
                 active_bank: Bank::B,
                 committed: false,
                 boot_count: 0,

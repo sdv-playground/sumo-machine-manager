@@ -28,6 +28,9 @@ pub use selector::{
 };
 #[cfg(feature = "test-seams")]
 pub use selector::{InMemorySelectorStore, TestSigner};
+/// The named reference slot layout — a test fixture, not a production API.
+#[cfg(any(test, feature = "test-seams"))]
+pub use types::slots;
 
 #[cfg(test)]
 mod tests;

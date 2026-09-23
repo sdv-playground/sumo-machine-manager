@@ -8,8 +8,9 @@ nv-store = { path = "../nv-store" }
 sha2 = "0.10"
 
 [dev-dependencies]
-# The selector tests use nv-store's in-memory seams; the re-declaration enables
-# them for test builds only (cargo unifies dev-features there).
+# The tests use nv-store's in-memory selector seams and its `slots` fixture
+# names; the re-declaration enables them for test builds only (cargo unifies
+# dev-features there).
 nv-store = { path = "../nv-store", features = ["test-seams"] }
 
 [[bin]]

@@ -6,6 +6,7 @@ use nv_store::block::MemBlockDevice;
 use nv_store::selector::{
     InMemorySelectorStore, SelectorBlob, SelectorStore, SlotSelect, TestSigner,
 };
+use nv_store::slots;
 use nv_store::store::{nv_device_size, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 use sha2::{Digest, Sha256};
@@ -299,10 +300,10 @@ fn verify_image_correct_hash() {
     let mut meta = NvFwMeta::default();
     meta.image_sha256 = expected_hash;
     mgr.nv_mut()
-        .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta)
+        .write_fw_meta(slots::VM1, Bank::A, &mut meta)
         .unwrap();
 
-    let result = mgr.verify_image(BankSet::Vm1, Bank::A, image_data);
+    let result = mgr.verify_image(slots::VM1, Bank::A, image_data);
     assert_eq!(result, HashCheck::Ok);
 }
 
@@ -317,10 +318,10 @@ fn verify_image_wrong_hash() {
     let mut meta = NvFwMeta::default();
     meta.image_sha256 = Sha256::digest(wrong_data).into();
     mgr.nv_mut()
-        .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta)
+        .write_fw_meta(slots::VM1, Bank::A, &mut meta)
         .unwrap();
 
-    let result = mgr.verify_image(BankSet::Vm1, Bank::A, image_data);
+    let result = mgr.verify_image(slots::VM1, Bank::A, image_data);
     match result {
         HashCheck::Mismatch { expected, actual } => {
             assert_eq!(expected, Sha256::digest(wrong_data).as_slice());
@@ -335,7 +336,7 @@ fn verify_image_no_meta() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    let result = mgr.verify_image(BankSet::Vm1, Bank::A, b"anything");
+    let result = mgr.verify_image(slots::VM1, Bank::A, b"anything");
     assert_eq!(result, HashCheck::NoMeta);
 }
 
@@ -346,10 +347,10 @@ fn verify_image_zero_hash_is_no_meta() {
 
     let mut meta = NvFwMeta::default(); // all zeros including hash
     mgr.nv_mut()
-        .write_fw_meta(BankSet::Vm1, Bank::A, &mut meta)
+        .write_fw_meta(slots::VM1, Bank::A, &mut meta)
         .unwrap();
 
-    let result = mgr.verify_image(BankSet::Vm1, Bank::A, b"anything");
+    let result = mgr.verify_image(slots::VM1, Bank::A, b"anything");
     assert_eq!(result, HashCheck::NoMeta);
 }
 
@@ -361,14 +362,14 @@ fn hash_failure_in_trial_triggers_rollback() {
     mgr.process_boot().unwrap();
 
     // Put VM1 in trial on Bank B
-    let vm1 = BankSet::Vm1.as_index();
+    let vm1 = slots::VM1.as_index();
     let mut state = mgr.nv().read_boot_state().unwrap();
     state.banks[vm1].active_bank = Bank::B;
     state.banks[vm1].committed = false;
     state.banks[vm1].boot_count = 3;
     mgr.nv_mut().write_boot_state(&mut state).unwrap();
 
-    let action = mgr.handle_hash_failure(BankSet::Vm1).unwrap();
+    let action = mgr.handle_hash_failure(slots::VM1).unwrap();
     assert_eq!(
         action,
         BootAction::HashRollback {
@@ -389,7 +390,7 @@ fn hash_failure_in_committed_is_fatal() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    let action = mgr.handle_hash_failure(BankSet::Vm1).unwrap();
+    let action = mgr.handle_hash_failure(slots::VM1).unwrap();
     assert_eq!(action, BootAction::HashFatal { bank: Bank::A });
 
     // NV state unchanged — committed image is corrupt, nothing to do
@@ -404,9 +405,9 @@ fn active_bank_query() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    assert_eq!(mgr.active_bank(BankSet::Os), Some(Bank::A));
-    assert_eq!(mgr.active_bank(BankSet::Vm1), Some(Bank::A));
-    assert_eq!(mgr.active_bank(BankSet::Vm2), Some(Bank::A));
+    assert_eq!(mgr.active_bank(slots::OS), Some(Bank::A));
+    assert_eq!(mgr.active_bank(slots::VM1), Some(Bank::A));
+    assert_eq!(mgr.active_bank(slots::VM2), Some(Bank::A));
 }
 
 #[test]
@@ -414,14 +415,14 @@ fn is_trial_query() {
     let mut mgr = make_bootmgr();
     mgr.process_boot().unwrap();
 
-    assert_eq!(mgr.is_trial(BankSet::Vm1), Some(false));
+    assert_eq!(mgr.is_trial(slots::VM1), Some(false));
 
     // Put into trial
     let mut state = mgr.nv().read_boot_state().unwrap();
-    state.banks[BankSet::Vm1.as_index()].committed = false;
+    state.banks[slots::VM1.as_index()].committed = false;
     mgr.nv_mut().write_boot_state(&mut state).unwrap();
 
-    assert_eq!(mgr.is_trial(BankSet::Vm1), Some(true));
+    assert_eq!(mgr.is_trial(slots::VM1), Some(true));
 }
 
 // --- Simulated OTA + boot cycle ---
@@ -442,7 +443,7 @@ fn ota_trial_commit_cycle() {
     meta.min_security_ver = 1;
     meta.image_sha256 = hash;
     mgr.nv_mut()
-        .write_fw_meta(BankSet::Vm1, Bank::B, &mut meta)
+        .write_fw_meta(slots::VM1, Bank::B, &mut meta)
         .unwrap();
 
     // Switch to trial
@@ -463,10 +464,7 @@ fn ota_trial_commit_cycle() {
     );
 
     // Verify image
-    assert_eq!(
-        mgr.verify_image(BankSet::Vm1, Bank::B, image),
-        HashCheck::Ok
-    );
+    assert_eq!(mgr.verify_image(slots::VM1, Bank::B, image), HashCheck::Ok);
 
     // Commit (simulating diagserver command)
     let mut state = mgr.nv().read_boot_state().unwrap();
@@ -475,12 +473,12 @@ fn ota_trial_commit_cycle() {
     mgr.nv_mut().write_boot_state(&mut state).unwrap();
 
     // Raise anti-rollback floor
-    let mut meta = mgr.nv().read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
+    let mut meta = mgr.nv().read_fw_meta(slots::VM1, Bank::B).unwrap();
     if meta.fw_secver > meta.min_security_ver {
         meta.min_security_ver = meta.fw_secver;
     }
     mgr.nv_mut()
-        .write_fw_meta(BankSet::Vm1, Bank::B, &mut meta)
+        .write_fw_meta(slots::VM1, Bank::B, &mut meta)
         .unwrap();
 
     // Next boot: committed on B
@@ -488,7 +486,7 @@ fn ota_trial_commit_cycle() {
     assert_eq!(actions[1], BootAction::Boot { bank: Bank::B });
 
     // Verify anti-rollback floor was raised
-    let meta = mgr.nv().read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
+    let meta = mgr.nv().read_fw_meta(slots::VM1, Bank::B).unwrap();
     assert_eq!(meta.min_security_ver, 2);
 }
 
@@ -570,31 +568,27 @@ fn seed_committed(store: &InMemorySelectorStore, gen: u64, entries: &[(BankSet, 
 fn selector_committed_boots() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // PRIMARY == SECONDARY: host-os=B, vm1=A — both committed.
-    seed_committed(
-        &store,
-        7,
-        &[(BankSet::Os, Bank::B), (BankSet::Vm1, Bank::A)],
-    );
+    seed_committed(&store, 7, &[(slots::OS, Bank::B), (slots::VM1, Bank::A)]);
 
     let actions = mgr.process_boot().unwrap();
     assert_eq!(
-        actions[BankSet::Os.as_index()],
+        actions[slots::OS.as_index()],
         BootAction::Boot { bank: Bank::B }
     );
     assert_eq!(
-        actions[BankSet::Vm1.as_index()],
+        actions[slots::VM1.as_index()],
         BootAction::Boot { bank: Bank::A }
     );
 
     // active_bank() is selector-resolved.
-    assert_eq!(mgr.active_bank(BankSet::Os), Some(Bank::B));
-    assert_eq!(mgr.active_bank(BankSet::Vm1), Some(Bank::A));
+    assert_eq!(mgr.active_bank(slots::OS), Some(Bank::B));
+    assert_eq!(mgr.active_bank(slots::VM1), Some(Bank::A));
 }
 
 #[test]
 fn selector_committed_does_not_touch_nv_count() {
     let (mut mgr, store) = make_bootmgr_with_selector();
-    seed_committed(&store, 1, &[(BankSet::Os, Bank::A)]);
+    seed_committed(&store, 1, &[(slots::OS, Bank::A)]);
 
     for _ in 0..5 {
         let actions = mgr.process_boot().unwrap();
@@ -609,10 +603,10 @@ fn selector_committed_does_not_touch_nv_count() {
 fn selector_trial_increments_boot_count() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // SECONDARY floor at host-os=A; PRIMARY booted at host-os=B → trial.
-    store.write_secondary(&signed_blob(1, &[(BankSet::Os, Bank::A)]));
-    store.write_primary(&signed_blob(2, &[(BankSet::Os, Bank::B)]));
+    store.write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]));
+    store.write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]));
 
-    let os = BankSet::Os.as_index();
+    let os = slots::OS.as_index();
     let actions = mgr.process_boot().unwrap();
     assert_eq!(
         actions[os],
@@ -634,7 +628,7 @@ fn selector_trial_increments_boot_count() {
     assert_eq!(mgr.nv().read_boot_state().unwrap().banks[os].boot_count, 2);
 
     // active_bank() still reports the booted (PRIMARY) trial bank.
-    assert_eq!(mgr.active_bank(BankSet::Os), Some(Bank::B));
+    assert_eq!(mgr.active_bank(slots::OS), Some(Bank::B));
 }
 
 #[test]
@@ -643,15 +637,15 @@ fn selector_trial_and_committed_sets_are_independent() {
     // host-os in trial (A floor, B booted); vm1 committed (A == A).
     store.write_secondary(&signed_blob(
         1,
-        &[(BankSet::Os, Bank::A), (BankSet::Vm1, Bank::A)],
+        &[(slots::OS, Bank::A), (slots::VM1, Bank::A)],
     ));
     store.write_primary(&signed_blob(
         2,
-        &[(BankSet::Os, Bank::B), (BankSet::Vm1, Bank::A)],
+        &[(slots::OS, Bank::B), (slots::VM1, Bank::A)],
     ));
 
-    let os = BankSet::Os.as_index();
-    let vm1 = BankSet::Vm1.as_index();
+    let os = slots::OS.as_index();
+    let vm1 = slots::VM1.as_index();
     let actions = mgr.process_boot().unwrap();
     assert_eq!(
         actions[os],
@@ -671,10 +665,10 @@ fn selector_trial_and_committed_sets_are_independent() {
 fn selector_global_rollback_after_max_trial_boots() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // SECONDARY floor host-os=A; PRIMARY booted host-os=B → trial.
-    store.write_secondary(&signed_blob(1, &[(BankSet::Os, Bank::A)]));
-    store.write_primary(&signed_blob(2, &[(BankSet::Os, Bank::B)]));
+    store.write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]));
+    store.write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]));
 
-    let os = BankSet::Os.as_index();
+    let os = slots::OS.as_index();
     // Boot MAX times — all trial.
     for i in 1..=MAX_TRIAL_BOOTS {
         let actions = mgr.process_boot().unwrap();
@@ -701,7 +695,7 @@ fn selector_global_rollback_after_max_trial_boots() {
     let primary = store.read_primary().unwrap();
     let secondary = store.read_secondary().unwrap();
     assert_eq!(primary.selectors, secondary.selectors);
-    assert_eq!(primary.selectors[&BankSet::Os].bank, Bank::A);
+    assert_eq!(primary.selectors[&slots::OS].bank, Bank::A);
     // The copied PRIMARY verifies (it is the already-signed SECONDARY blob).
     assert!(primary.is_valid(&TestSigner));
     // The trialed set's boot_count was reset.
@@ -710,7 +704,7 @@ fn selector_global_rollback_after_max_trial_boots() {
     // Subsequent boots are committed on A (PRIMARY == SECONDARY now).
     let actions = mgr.process_boot().unwrap();
     assert_eq!(actions[os], BootAction::Boot { bank: Bank::A });
-    assert_eq!(mgr.active_bank(BankSet::Os), Some(Bank::A));
+    assert_eq!(mgr.active_bank(slots::OS), Some(Bank::A));
 }
 
 #[test]
@@ -718,14 +712,14 @@ fn selector_global_rollback_reverts_every_trialed_set_at_once() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // Two sets in trial (host-os: A→B, vm2: A→B); vm1 committed (A==A).
     let floor = [
-        (BankSet::Os, Bank::A),
-        (BankSet::Vm1, Bank::A),
-        (BankSet::Vm2, Bank::A),
+        (slots::OS, Bank::A),
+        (slots::VM1, Bank::A),
+        (slots::VM2, Bank::A),
     ];
     let booted = [
-        (BankSet::Os, Bank::B),
-        (BankSet::Vm1, Bank::A),
-        (BankSet::Vm2, Bank::B),
+        (slots::OS, Bank::B),
+        (slots::VM1, Bank::A),
+        (slots::VM2, Bank::B),
     ];
     store.write_secondary(&signed_blob(1, &floor));
     store.write_primary(&signed_blob(2, &booted));
@@ -734,9 +728,9 @@ fn selector_global_rollback_reverts_every_trialed_set_at_once() {
     // NEXT boot trips host-os over the budget and the GLOBAL rollback reverts
     // vm2 too even though vm2 is well under its own budget. Seed the NV
     // boot_counts directly (the selector path reads NV for the per-set counter).
-    let os = BankSet::Os.as_index();
-    let vm1 = BankSet::Vm1.as_index();
-    let vm2 = BankSet::Vm2.as_index();
+    let os = slots::OS.as_index();
+    let vm1 = slots::VM1.as_index();
+    let vm2 = slots::VM2.as_index();
     let mut st = NvBootState::default();
     st.banks[os].boot_count = MAX_TRIAL_BOOTS; // host-os one boot from rollback
     st.banks[vm2].boot_count = 2; // vm2 nowhere near
@@ -793,7 +787,7 @@ fn selector_absent_primary_falls_back_to_nv() {
     assert!(store.read_primary().is_none());
 
     // active_bank() falls back to NV when PRIMARY is absent.
-    assert_eq!(mgr.active_bank(BankSet::Os), Some(Bank::A));
+    assert_eq!(mgr.active_bank(slots::OS), Some(Bank::A));
 }
 
 #[test]
@@ -802,11 +796,11 @@ fn selector_set_not_in_map_uses_nv_logic() {
     // its NV per-set state (here: NV trial on B), proving both authorities run
     // side by side during the flip.
     let (mut mgr, store) = make_bootmgr_with_selector();
-    seed_committed(&store, 3, &[(BankSet::Os, Bank::A)]);
+    seed_committed(&store, 3, &[(slots::OS, Bank::A)]);
 
     // Initialize NV, then put vm1 into NV trial on B.
-    let os = BankSet::Os.as_index();
-    let vm1 = BankSet::Vm1.as_index();
+    let os = slots::OS.as_index();
+    let vm1 = slots::VM1.as_index();
     mgr.process_boot().unwrap();
     let mut st = mgr.nv().read_boot_state().unwrap();
     st.banks[vm1].active_bank = Bank::B;
@@ -825,6 +819,6 @@ fn selector_set_not_in_map_uses_nv_logic() {
         }
     );
     // active_bank: host-os selector-resolved, vm1 NV-resolved.
-    assert_eq!(mgr.active_bank(BankSet::Os), Some(Bank::A));
-    assert_eq!(mgr.active_bank(BankSet::Vm1), Some(Bank::B));
+    assert_eq!(mgr.active_bank(slots::OS), Some(Bank::A));
+    assert_eq!(mgr.active_bank(slots::VM1), Some(Bank::B));
 }

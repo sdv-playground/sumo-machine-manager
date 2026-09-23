@@ -73,12 +73,8 @@ sovd-docs-hook = []
 container = ["app-mgr/container"]
 
 [dev-dependencies]
-# Used by tests/component_adapter_tests.rs ONLY — the library itself never
-# names host_os_mgr. It sat in [dependencies] until item 3d measured the
-# closure, so every consumer of component-mgr (supernova included) linked the
-# host OS manager for nothing. Same pass dropped sumo-processor and
-# tracing-subscriber, which no target referenced at all.
-host-os-mgr = { path = "../host-os-mgr" }
+# host-os-mgr left even the dev-dependencies in v0.1.2: its only user here was
+# the HostOsComponent adapter test, and HostOsComponent is gone.
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 hyper = "1"
@@ -91,6 +87,9 @@ rand = "0.8"
 # machine-mgr; the re-declaration enables them for test builds only (cargo
 # unifies dev-features there).
 machine-mgr = { path = "../machine-mgr", features = ["test-seams"] }
+# Tests name slots through the `nv_store::slots` fixtures (production code
+# never names a slot); same re-declaration trick, test builds only.
+nv-store = { path = "../nv-store", features = ["test-seams"] }
 
 [[example]]
 name = "build_hsm_keys"

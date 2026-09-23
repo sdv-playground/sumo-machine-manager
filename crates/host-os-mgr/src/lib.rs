@@ -1,10 +1,12 @@
-//! Host OS manager — manages the host operating system image lifecycle.
+//! Host OS manager — the [`BankActivator`] impls for the host operating
+//! system image: copy a staged IFS to the boot location ([`ifs::dev`],
+//! mount + atomic copy) or write it to a raw boot partition
+//! ([`ifs::partition`]).
 //!
-//! Responsibilities:
-//! - A/B boot partition writes (stage new IFS + root image)
-//! - Boot policy (trial boot → commit or auto-rollback)
-//! - IFS activation (copy staged image to boot location)
-//! - Reboot coordination (signal readiness, trigger reboot)
+//! The lifecycle around them — boot policy, trial counting, commit /
+//! rollback, reboot coordination — is driven by the generic component
+//! state machine (`component-mgr`) over these activators; this crate is
+//! only the host-specific write.
 //!
 //! This is NOT a VM. The host OS boots bare-metal (or as the hypervisor
 //! host) and cannot be hot-updated — it requires a full reboot cycle.
@@ -16,8 +18,6 @@
 //! 4. Trial: boot manager counts boots, auto-rolls back if unhealthy
 //! 5. Commit: mark new bank as committed (raises anti-rollback floor)
 
-pub mod component;
 pub mod ifs;
 
-pub use component::HostOsComponent;
 pub use ifs::{BankActivator, BankActivatorError};

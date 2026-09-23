@@ -811,6 +811,7 @@ mod tests {
         InMemorySelectorStore, SharedSystemBankState, SystemBankManager, TestSigner,
     };
     use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
     use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
     use nv_store::types::NvBootState;
     use std::sync::RwLock;
@@ -851,7 +852,7 @@ mod tests {
 
     #[test]
     fn selector_is_serving_authority_but_target_anchors_to_running_bank() {
-        let set = BankSet::Vm1;
+        let set = slots::VM1;
         // The desync a rollback-without-reboot leaves: NV/running says A (what
         // physically booted + is loopback-mounted), the selector says B (next-boot
         // intent). These MUST resolve differently for their two purposes.
@@ -883,7 +884,7 @@ mod tests {
 
     #[test]
     fn no_pending_reboot_when_selector_matches_running() {
-        let set = BankSet::Vm1;
+        let set = slots::VM1;
         // Consistent state: selector and NV/running both A → no reboot owed,
         // target is the clean sibling (B).
         let nv = nv_with_active(set, Bank::A);
@@ -898,7 +899,7 @@ mod tests {
 
     #[test]
     fn no_selector_falls_back_to_running_bank() {
-        let set = BankSet::Vm1;
+        let set = slots::VM1;
         // No selector injected → active_bank reads the NV-seeded running_bank.
         let nv = nv_with_active(set, Bank::B);
         let p = provider(nv, set, None);
@@ -915,9 +916,9 @@ mod tests {
     fn selector_without_entry_for_set_falls_back_to_nv() {
         // Selector populated for a DIFFERENT set leaves this set unselected →
         // active_bank falls through to the NV/running_bank fallback.
-        let set = BankSet::Vm1;
+        let set = slots::VM1;
         let nv = nv_with_active(set, Bank::B);
-        let selector = selector_with(BankSet::Vm2, Bank::A);
+        let selector = selector_with(slots::VM2, Bank::A);
         let p = provider(nv, set, Some(selector));
 
         assert_eq!(
@@ -932,7 +933,7 @@ mod tests {
         // The OTA write path: a provider holding the shared selector (VM shape
         // — no activator/images_dir, so `activate` only does the selector
         // dual-write) must move the selector's PRIMARY to the activated bank.
-        let set = BankSet::Vm1;
+        let set = slots::VM1;
         // Selector + NV both start at A; activate(B) must flip PRIMARY to B.
         let nv = nv_with_active(set, Bank::A);
         let selector = selector_with(set, Bank::A);
@@ -1004,10 +1005,10 @@ mod tests {
     /// An `images_dir`-backed provider with NO HSM wired — proves the
     /// report-only read needs none.
     fn disk_provider_no_hsm(images_dir: PathBuf) -> IvdBankProvider<MemBlockDevice> {
-        let nv = nv_with_active(BankSet::Vm1, Bank::A);
+        let nv = nv_with_active(slots::VM1, Bank::A);
         IvdBankProvider::new(
             nv,
-            BankSet::Vm1,
+            slots::VM1,
             false,
             Some(images_dir),
             "vm1".into(),

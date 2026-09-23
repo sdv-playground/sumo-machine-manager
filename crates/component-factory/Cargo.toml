@@ -17,6 +17,11 @@ sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 
+[dev-dependencies]
+# The spec's own wire format — the defaults tests parse the YAML a platform
+# profile actually ships, not a hand-built struct literal.
+serde_yaml = "0.9"
+
 [features]
 # Forward container/OCI support to the crates that own it, so a binary composed
 # through this factory can turn containers on with a single flag. Nothing in the

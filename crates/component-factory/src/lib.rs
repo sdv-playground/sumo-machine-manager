@@ -35,27 +35,23 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub base_path: Option<PathBuf>,
 
-    /// Override the bank-set name this component plugs into.
-    /// Resolved via `BankSet::from_str`; falls back to the id-based
-    /// mapping in [`bank_set_for_id`]. Use for deployment-specific
-    /// component ids that don't match a well-known id/name.
+    /// RETIRED slot-name key. Kept as a field so a stale config fails loudly
+    /// rather than being silently ignored: any value makes
+    /// [`resolve_bank_set`] refuse the component. Set `slot:` instead.
     #[serde(default)]
     pub bank_set: Option<String>,
 
-    /// Explicit NV slot index. Wins over both `bank_set` and id-based
-    /// resolution when present. Set this when a deployment uses more
-    /// than one custom slot — the slot number is the source of truth,
-    /// the dir name + layout below describe what to do with it. Must
-    /// be a slot the open NV store can address (its size decides how
-    /// many it has); [`build_component`] refuses the component
-    /// otherwise.
+    /// The NV slot index this component plugs into — the ONLY source of a
+    /// component's bank set, written by the platform profile. Optional in
+    /// serde so a config that omits it gets a spoken error instead of a parse
+    /// failure; [`resolve_bank_set`] refuses such a spec. Must be a slot the
+    /// open NV store can address (its size decides how many it has);
+    /// [`build_component`] refuses the component otherwise.
     #[serde(default)]
     pub slot: Option<u8>,
 
-    /// On-disk subdirectory under `images_dir`. Defaults to the
-    /// well-known dir for whichever BankSet `bank_set`/`slot`/`id`
-    /// resolves to (`vm1`, `host-os`, `custom`, ...). Override when
-    /// two custom slots need distinct dirs (`rt`, `co-processor`, ...).
+    /// On-disk subdirectory under `images_dir`. Defaults to the component id.
+    /// Override when a component's bank dirs don't live under its own id.
     #[serde(default)]
     pub storage_subdir: Option<String>,
 
@@ -66,7 +62,7 @@ pub struct ComponentSpec {
     pub activator: Option<String>,
 
     /// Human-readable display name for SOVD reads. Optional override; `None`
-    /// keeps the component's default name. The binary typically reads this from
+    /// defaults to the component id. The binary typically reads this from
     /// the active bank's `vm-config.yaml` and sets it here — keeping that file
     /// I/O in the caller rather than the factory.
     #[serde(default)]
@@ -145,6 +141,18 @@ pub struct ComponentSpec {
     /// (`/mnt/common-rw`, `/proc/meminfo`) are visible over SOVD. Default false.
     #[serde(default)]
     pub host_diagnostics: bool,
+
+    /// This component fronts the node-level time attestation operation
+    /// (`x-attest-time`); exactly one component per device should set it — the
+    /// platform profile decides which.
+    #[serde(default)]
+    pub attest_time: bool,
+
+    /// This component is a vHSM principal: after a bank commit the host arms
+    /// enrollment so the guest can enroll on its next boot. The platform fills
+    /// it — supernova derives it from its `hsm.allow` list.
+    #[serde(default)]
+    pub vm_principal: bool,
 }
 
 impl ComponentSpec {
@@ -267,51 +275,44 @@ pub struct FactoryDeps<D: BlockDevice> {
     pub wall_clock_floor: Option<Arc<dyn component_mgr::sovd::time_floor::WallClockFloor>>,
 }
 
-pub fn bank_set_for_id(id: &str) -> Option<BankSet> {
-    match id {
-        "hsm" => Some(BankSet::Hsm),
-        "bootloader" => Some(BankSet::Bootloader),
-        "os" | "host" | "host-os" | "supernova" | "app" => Some(BankSet::Os),
-        "rt" => Some(BankSet::Rt),
-        "vm1" => Some(BankSet::Vm1),
-        "vm2" => Some(BankSet::Vm2),
-        _ => None,
+/// Resolve the bank-set for a `ComponentSpec`: the explicit `slot:`, and
+/// nothing else. Slot NAMES were retired in v0.1.2 — the platform profile
+/// writes the number, so there is no id table and no name parser left to fall
+/// back to. A spec with no `slot:`, or one still carrying the retired
+/// `bank_set:` key, is an operator error and says so.
+pub fn resolve_bank_set(spec: &ComponentSpec) -> Result<BankSet, String> {
+    if let Some(ref name) = spec.bank_set {
+        return Err(format!(
+            "component '{}' sets bank_set '{name}' — slot names were retired in \
+             v0.1.2, set slot: N",
+            spec.id,
+        ));
     }
-}
-
-/// Resolve the bank-set for a `ComponentSpec`. Priority:
-/// 1. Explicit `slot:` (numeric, deployment-controlled).
-/// 2. Explicit `bank_set:` name (parsed via `BankSet::from_str`).
-/// 3. Id-based fallback via [`bank_set_for_id`].
-///
-/// Returns `None` if none resolve — caller decides whether that's
-/// fatal (most components require a bank-set; pure-runtime ones can
-/// be `None`).
-pub fn resolve_bank_set(spec: &ComponentSpec) -> Option<BankSet> {
-    if let Some(slot) = spec.slot {
-        return Some(BankSet(slot));
+    match spec.slot {
+        Some(slot) => Ok(BankSet(slot)),
+        None => Err(format!(
+            "component '{}' has no slot — set slot: N (slot names were retired \
+             in v0.1.2)",
+            spec.id,
+        )),
     }
-    if let Some(ref s) = spec.bank_set {
-        return BankSet::from_str(s);
-    }
-    bank_set_for_id(&spec.id)
 }
 
 /// Resolve both the bank-set slot AND its spec (on-disk dir name)
 /// from a `ComponentSpec`. The slot comes from [`resolve_bank_set`];
-/// the dir name is taken from the explicit `storage_subdir` when
-/// present, else defaulted via `BankSetSpec::for_well_known`.
-///
-/// Returns `None` if the slot can't be resolved.
+/// the dir name is the explicit `storage_subdir` when present, else
+/// the component id.
 pub fn resolve_bank_set_spec(
     spec: &ComponentSpec,
-) -> Option<(BankSet, component_mgr::bank_spec::BankSetSpec)> {
+) -> Result<(BankSet, component_mgr::bank_spec::BankSetSpec), String> {
     let bank_set = resolve_bank_set(spec)?;
-    let mut bspec = component_mgr::bank_spec::BankSetSpec::for_well_known(bank_set);
-    if let Some(ref subdir) = spec.storage_subdir {
-        bspec.dir_name = subdir.clone();
-    }
-    Some((bank_set, bspec))
+    let bspec = component_mgr::bank_spec::BankSetSpec {
+        dir_name: spec
+            .storage_subdir
+            .clone()
+            .unwrap_or_else(|| spec.id.clone()),
+    };
+    Ok((bank_set, bspec))
 }
 
 /// Build a selector-aware `IvdBankProvider` mirroring the args
@@ -410,13 +411,12 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
     spec: &ComponentSpec,
     deps: &FactoryDeps<D>,
 ) -> Option<BuiltComponent> {
-    let Some((bank_set, bank_spec)) = resolve_bank_set_spec(spec) else {
-        tracing::warn!(
-            "no bank-set for component id '{}' (no `slot:`/`bank_set:` \
-             override and id doesn't match a well-known set) — skipping",
-            spec.id,
-        );
-        return None;
+    let (bank_set, bank_spec) = match resolve_bank_set_spec(spec) {
+        Ok(resolved) => resolved,
+        Err(msg) => {
+            tracing::error!("{msg}");
+            return None;
+        }
     };
 
     if let Err(msg) = check_slot_in_range(&spec.id, bank_set, &deps.nv.lock().unwrap()) {
@@ -433,6 +433,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             let config = app_mgr::AppConfig {
                 id: spec.id.clone(),
                 base_path: base_path.clone(),
+                slot: bank_set,
             };
             let comp = app_mgr::AppComponent::new(config, deps.nv.clone());
             let bank = comp.boot_check();
@@ -458,7 +459,11 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 deps.hsm_provider.clone(),
             )
             .with_id(spec.id.clone())
-            .with_bank_spec(bank_spec.clone());
+            .with_bank_spec(bank_spec.clone())
+            // Node-level meanings that used to ride on slot numbers, now
+            // declared per component by the platform profile.
+            .with_attest_time(spec.attest_time)
+            .with_vm_principal(spec.vm_principal);
             // Inject a selector-aware provider LAST so the boot selector drives
             // active/target bank (NV/symlink fallback). App has no activator.
             if let Some(provider) = selector_aware_provider(
@@ -472,9 +477,8 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             ) {
                 backend = backend.with_bank_provider(provider);
             }
-            if let Some(name) = &spec.display_name {
-                backend = backend.with_display_name(name.clone());
-            }
+            backend = backend
+                .with_display_name(spec.display_name.clone().unwrap_or_else(|| spec.id.clone()));
             if let Some(coord) = &deps.node_coordinator {
                 backend = backend.with_node_coordinator(coord.clone());
             }
@@ -568,7 +572,11 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 deps.hsm_provider.clone(),
             )
             .with_id(spec.id.clone())
-            .with_bank_spec(bank_spec.clone());
+            .with_bank_spec(bank_spec.clone())
+            // Node-level meanings that used to ride on slot numbers, now
+            // declared per component by the platform profile.
+            .with_attest_time(spec.attest_time)
+            .with_vm_principal(spec.vm_principal);
 
             let activator = deps.bank_activators.get(&spec.id).cloned();
             if let Some(ref a) = activator {
@@ -622,9 +630,8 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 backend = backend.with_bank_provider(provider);
             }
 
-            if let Some(name) = &spec.display_name {
-                backend = backend.with_display_name(name.clone());
-            }
+            backend = backend
+                .with_display_name(spec.display_name.clone().unwrap_or_else(|| spec.id.clone()));
             if let Some(coord) = &deps.node_coordinator {
                 backend = backend.with_node_coordinator(coord.clone());
             }
@@ -643,7 +650,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             let backend_arc: Arc<ComponentBackend<_>> = Arc::new(backend);
             let mut component_inner = ComponentAdapter::new(backend_arc.clone());
 
-            if bank_set == BankSet::Hsm {
+            if spec.component_type == "hsm" {
                 if let Some(ref keystore) = deps.hsm_keystore {
                     component_inner = component_inner.with_csr_keystore(keystore.clone());
                 }
@@ -729,6 +736,8 @@ mod tests {
             test_agent_url: None,
             diag_agent_url: None,
             host_diagnostics: false,
+            attest_time: false,
+            vm_principal: false,
         }
     }
 
@@ -780,5 +789,97 @@ mod tests {
         assert!(build_component(&spec_on_slot("co-processor", 12), &deps).is_none());
         // Same spec on an addressable slot still builds.
         assert!(build_component(&spec_on_slot("co-processor", 9), &deps).is_some());
+    }
+
+    /// The slot comes from the platform profile and nowhere else: a spec that
+    /// omits it is refused by name, not quietly landed on whatever slot its id
+    /// used to imply.
+    #[test]
+    fn a_spec_without_a_slot_is_refused_by_name() {
+        let mut spec = spec_on_slot("vm1", 4);
+        spec.slot = None;
+
+        assert_eq!(
+            resolve_bank_set(&spec).unwrap_err(),
+            "component 'vm1' has no slot — set slot: N (slot names were retired in v0.1.2)"
+        );
+        assert!(build_component(&spec, &ten_slot_deps()).is_none());
+    }
+
+    /// A config still carrying the retired `bank_set:` name must fail loudly —
+    /// the factory no longer reads it, and silently ignoring it would put the
+    /// component on a slot the operator never asked for.
+    #[test]
+    fn a_spec_still_naming_a_bank_set_is_refused_by_name() {
+        let mut spec = spec_on_slot("host", 2);
+        spec.bank_set = Some("os".to_string());
+
+        assert_eq!(
+            resolve_bank_set(&spec).unwrap_err(),
+            "component 'host' sets bank_set 'os' — slot names were retired in v0.1.2, set slot: N"
+        );
+        assert!(build_component(&spec, &ten_slot_deps()).is_none());
+    }
+
+    #[test]
+    fn the_bank_dir_defaults_to_the_component_id() {
+        let mut spec = spec_on_slot("co-processor", 9);
+        assert_eq!(
+            resolve_bank_set_spec(&spec).unwrap().1.dir_name,
+            "co-processor"
+        );
+
+        spec.storage_subdir = Some("rt".to_string());
+        assert_eq!(resolve_bank_set_spec(&spec).unwrap().1.dir_name, "rt");
+    }
+
+    #[test]
+    fn the_display_name_defaults_to_the_component_id() {
+        let deps = ten_slot_deps();
+        let mut spec = spec_on_slot("vm1", 4);
+
+        let built = build_component(&spec, &deps).unwrap();
+        assert_eq!(built.diag_backend.unwrap().entity_info().name, "vm1");
+
+        spec.display_name = Some("Infotainment".to_string());
+        let built = build_component(&spec, &deps).unwrap();
+        assert_eq!(
+            built.diag_backend.unwrap().entity_info().name,
+            "Infotainment"
+        );
+    }
+
+    #[test]
+    fn attest_time_and_vm_principal_default_off_and_parse_on() {
+        let bare: ComponentSpec = serde_yaml::from_str("id: vm1\ntype: bank\nslot: 4\n").unwrap();
+        assert!(!bare.attest_time);
+        assert!(!bare.vm_principal);
+
+        let set: ComponentSpec = serde_yaml::from_str(
+            "id: vm1\ntype: bank\nslot: 4\nattest_time: true\nvm_principal: true\n",
+        )
+        .unwrap();
+        assert!(set.attest_time);
+        assert!(set.vm_principal);
+    }
+
+    /// The HSM CSR/keystore wiring follows the DECLARED component type, not the
+    /// slot number it happens to sit on — `with_csr_keystore` is what flips the
+    /// adapter's `hsm` capability, so the capability is the observable.
+    #[test]
+    fn the_hsm_csr_wiring_follows_the_component_type() {
+        let mut deps = ten_slot_deps();
+        deps.hsm_keystore = Some(PathBuf::from("/tmp/vhsm-keys"));
+
+        let mut spec = spec_on_slot("keystore", 0);
+        spec.component_type = "hsm".to_string();
+        spec.single_bank = true;
+        let built = build_component(&spec, &deps).unwrap();
+        assert!(built.component.capabilities().hsm.is_some());
+
+        // Same id, same slot, plain `bank` type: no CSR wiring.
+        spec.component_type = "bank".to_string();
+        let built = build_component(&spec, &deps).unwrap();
+        assert!(built.component.capabilities().hsm.is_none());
     }
 }

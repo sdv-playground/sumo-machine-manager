@@ -32,6 +32,7 @@ use machine_mgr::{
 use sovd_core::DiagnosticBackend;
 
 use nv_store::block::MemBlockDevice;
+use nv_store::slots;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
@@ -134,7 +135,7 @@ impl ManifestProvider for AcceptingManifestProvider {
         _min_security_ver: u32,
     ) -> Result<ValidatedFirmware, ManifestError> {
         Ok(ValidatedFirmware {
-            bank_set: BankSet::Vm2,
+            component_name: "vm2".into(),
             manifest_type: ManifestType::Firmware,
             image_meta: ImageMeta::default(),
             image_data: Vec::new(),
@@ -157,7 +158,7 @@ fn engine_backend() -> Arc<ComponentBackend<MemBlockDevice>> {
 
     let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(vec![0u8; 32]));
     Arc::new(ComponentBackend::new(
-        BankSet::Vm2,
+        slots::VM2,
         nv,
         mp,
         ComponentConfig::default(),
@@ -290,7 +291,7 @@ fn router_diag_with_factory(
     let nv = Arc::new(Mutex::new(nv));
     let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(vec![0u8; 32]));
     let backend: Arc<ComponentBackend<MemBlockDevice>> = Arc::new(ComponentBackend::new(
-        BankSet::Vm2,
+        slots::VM2,
         nv,
         mp,
         ComponentConfig::default(),

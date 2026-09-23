@@ -7,10 +7,11 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use machine_mgr::{
-    Component, DidKind, DtcFilter, EntityInfo, FlashId, FlashState, MachineError, MachineRegistry,
+    Component, DidKind, DtcFilter, EntityInfo, FlashId, MachineError, MachineRegistry,
 };
 
 use nv_store::block::MemBlockDevice;
+use nv_store::slots;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
@@ -19,14 +20,6 @@ use component_mgr::component_adapter::ComponentAdapter;
 use component_mgr::did::{DID_SERIAL_NUMBER, DID_VIN};
 use component_mgr::manifest_provider::ManifestProvider;
 use component_mgr::suit_provider::SuitProvider;
-
-struct NoopActivator;
-
-impl machine_mgr::BankActivator for NoopActivator {
-    fn activate(&self, _bank_dir: &std::path::Path) -> Result<(), machine_mgr::BankActivatorError> {
-        Ok(())
-    }
-}
 
 fn make_nv() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
     let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
@@ -44,6 +37,7 @@ fn str_arr<const N: usize>(s: &str) -> [u8; N] {
 }
 
 fn vm_backend(
+    id: &str,
     nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
     set: BankSet,
     config: ComponentConfig,
@@ -51,7 +45,7 @@ fn vm_backend(
     let trust_anchor = vec![0u8; 32];
     let suit_provider = SuitProvider::new(trust_anchor);
     let mp: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
-    Arc::new(ComponentBackend::new(set, nv, mp, config))
+    Arc::new(ComponentBackend::new(set, nv, mp, config).with_id(id.to_string()))
 }
 
 fn entity() -> EntityInfo {
@@ -68,7 +62,7 @@ fn entity() -> EntityInfo {
 #[tokio::test]
 async fn component_id_and_capabilities() {
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     assert_eq!(comp.id(), "vm1");
@@ -89,18 +83,19 @@ async fn component_id_and_capabilities() {
 }
 
 #[tokio::test]
-async fn app_and_host_preflights_require_durable_boot_evidence() {
+async fn app_preflight_requires_durable_boot_evidence() {
     let app_nv = make_nv();
     {
         let mut nv = app_nv.lock().unwrap();
         let mut boot = nv.read_boot_state().unwrap();
-        boot.banks[BankSet::Os.as_index()].committed = false;
+        boot.banks[slots::OS.as_index()].committed = false;
         nv.write_boot_state(&mut boot).unwrap();
     }
     let app = app_mgr::AppComponent::new(
         app_mgr::AppConfig {
             id: "app".into(),
             base_path: "/unused".into(),
+            slot: slots::OS,
         },
         app_nv.clone(),
     );
@@ -111,60 +106,10 @@ async fn app_and_host_preflights_require_durable_boot_evidence() {
     {
         let mut nv = app_nv.lock().unwrap();
         let mut boot = nv.read_boot_state().unwrap();
-        boot.banks[BankSet::Os.as_index()].boot_count = 1;
+        boot.banks[slots::OS.as_index()].boot_count = 1;
         nv.write_boot_state(&mut boot).unwrap();
     }
     app.preflight_commit().await.unwrap();
-
-    let host_nv = make_nv();
-    {
-        let mut nv = host_nv.lock().unwrap();
-        let mut boot = nv.read_boot_state().unwrap();
-        boot.banks[BankSet::Os.as_index()].committed = false;
-        boot.banks[BankSet::Os.as_index()].boot_count = 1;
-        nv.write_boot_state(&mut boot).unwrap();
-        let mut session = NvUpdateSession {
-            reboot_owed: 1 << BankSet::Os.as_index(),
-            ..Default::default()
-        };
-        nv.write_update_session(&mut session).unwrap();
-    }
-    let host = host_os_mgr::HostOsComponent::new(host_nv.clone(), Arc::new(NoopActivator));
-    assert!(matches!(
-        host.preflight_commit().await,
-        Err(MachineError::Busy(_))
-    ));
-    host_nv.lock().unwrap().clear_update_session().unwrap();
-    host.preflight_commit().await.unwrap();
-}
-
-#[tokio::test]
-async fn host_activation_state_uses_durable_reboot_and_boot_witness() {
-    let nv = make_nv();
-    {
-        let mut nv = nv.lock().unwrap();
-        let mut boot = nv.read_boot_state().unwrap();
-        boot.banks[BankSet::Os.as_index()].committed = false;
-        nv.write_boot_state(&mut boot).unwrap();
-    }
-    let host = host_os_mgr::HostOsComponent::new(nv.clone(), Arc::new(NoopActivator));
-
-    assert_eq!(
-        host.activation_state().await.unwrap().unwrap().state,
-        FlashState::AwaitingReboot
-    );
-
-    {
-        let mut nv = nv.lock().unwrap();
-        let mut boot = nv.read_boot_state().unwrap();
-        boot.banks[BankSet::Os.as_index()].boot_count = 1;
-        nv.write_boot_state(&mut boot).unwrap();
-    }
-
-    assert_eq!(
-        host.activation_state().await.unwrap().unwrap().state,
-        FlashState::Activated
-    );
 }
 
 #[tokio::test]
@@ -179,7 +124,7 @@ async fn hsm_component_capabilities_are_single_bank() {
         diag_agent_url: None,
         host_diagnostics: false,
     };
-    let hsm = vm_backend(nv, BankSet::Hsm, cfg);
+    let hsm = vm_backend("hsm", nv, slots::HSM, cfg);
     let comp = ComponentAdapter::new(hsm);
 
     assert_eq!(comp.id(), "hsm");
@@ -200,7 +145,7 @@ async fn read_factory_did_via_component() {
         g.write_factory(&mut f).unwrap();
     }
 
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     let serial = comp
@@ -216,7 +161,7 @@ async fn read_factory_did_via_component() {
 #[tokio::test]
 async fn read_did_not_found() {
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     let err = comp.read_did(0xABCD, DidKind::Runtime).await.unwrap_err();
@@ -226,7 +171,7 @@ async fn read_did_not_found() {
 #[tokio::test]
 async fn write_runtime_did_then_read_back() {
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     comp.write_did(0xFD10, DidKind::Runtime, b"hello")
@@ -239,7 +184,7 @@ async fn write_runtime_did_then_read_back() {
 #[tokio::test]
 async fn write_factory_did_rejected() {
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     let err = comp
@@ -255,7 +200,7 @@ async fn write_factory_did_rejected() {
 #[tokio::test]
 async fn activation_state_returns_some() {
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     let st = comp.activation_state().await.unwrap().expect("Some(state)");
@@ -265,7 +210,7 @@ async fn activation_state_returns_some() {
 #[tokio::test]
 async fn read_dtcs_empty() {
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     let dtcs = comp.read_dtcs(&DtcFilter::default()).await.unwrap();
@@ -284,7 +229,7 @@ async fn rollback_unsupported_for_hsm() {
         diag_agent_url: None,
         host_diagnostics: false,
     };
-    let hsm = vm_backend(nv, BankSet::Hsm, cfg);
+    let hsm = vm_backend("hsm", nv, slots::HSM, cfg);
     let comp = ComponentAdapter::new(hsm);
 
     let err = comp
@@ -300,7 +245,7 @@ async fn rollback_unsupported_for_hsm() {
 #[tokio::test]
 async fn defaults_return_not_supported() {
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     // Methods not yet wired must still return NotSupported.
@@ -315,7 +260,7 @@ async fn defaults_return_not_supported() {
 #[tokio::test]
 async fn get_csr_not_supported_without_keystore() {
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     // No with_csr_keystore call → NotSupported.
@@ -329,8 +274,9 @@ async fn get_csr_generates_csr_when_keystore_configured() {
     use std::path::PathBuf;
     let nv = make_nv();
     let vm = vm_backend(
+        "hsm",
         nv,
-        BankSet::Hsm,
+        slots::HSM,
         ComponentConfig {
             supports_rollback: false,
             single_bank: true,
@@ -370,8 +316,9 @@ async fn get_device_id_returns_a_stable_device_key_thumbprint() {
     use std::path::PathBuf;
     let nv = make_nv();
     let vm = vm_backend(
+        "hsm",
         nv,
-        BankSet::Hsm,
+        slots::HSM,
         ComponentConfig {
             supports_rollback: false,
             single_bank: true,
@@ -403,7 +350,7 @@ async fn abort_install_clears_session_pre_finalize() {
     use machine_mgr::FlashId;
 
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     // No session in flight — abort is a no-op success.
@@ -416,7 +363,7 @@ async fn defaults_return_not_supported_after_abort_wired() {
     // Sanity: abort_install is now wired; another defaulted method should
     // still surface NotSupported. install_keys is the remaining one.
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     let err = comp.install_keys(&[]).await.unwrap_err();
@@ -428,7 +375,7 @@ async fn list_dids_returns_registry_minus_health_when_no_vm_service() {
     use machine_mgr::DidFilter;
 
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     let dids = comp.list_dids(&DidFilter::default()).await.unwrap();
@@ -451,7 +398,7 @@ async fn list_dids_includes_runtime_dids_from_nv() {
     use machine_mgr::{DidFilter, DidKind};
 
     let nv = make_nv();
-    let vm1 = vm_backend(nv, BankSet::Vm1, ComponentConfig::default());
+    let vm1 = vm_backend("vm1", nv, slots::VM1, ComponentConfig::default());
     let comp = ComponentAdapter::new(vm1);
 
     // Write a custom runtime DID — should appear in list_dids.
@@ -472,18 +419,21 @@ async fn list_dids_includes_runtime_dids_from_nv() {
 async fn machine_registry_holds_multiple_components() {
     let nv = make_nv();
     let vm1 = ComponentAdapter::new(vm_backend(
+        "vm1",
         nv.clone(),
-        BankSet::Vm1,
+        slots::VM1,
         ComponentConfig::default(),
     ));
     let vm2 = ComponentAdapter::new(vm_backend(
+        "vm2",
         nv.clone(),
-        BankSet::Vm2,
+        slots::VM2,
         ComponentConfig::default(),
     ));
     let hsm = ComponentAdapter::new(vm_backend(
+        "hsm",
         nv,
-        BankSet::Hsm,
+        slots::HSM,
         ComponentConfig {
             supports_rollback: false,
             single_bank: true,

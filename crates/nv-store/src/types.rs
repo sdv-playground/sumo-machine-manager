@@ -1,14 +1,10 @@
 //! Core types for the NV store bank management system.
 //!
-//! Independent A/B bank sets on a fixed semantic slot layout
-//! (low slot → high in the boot order):
-//!
-//! - Hsm (Hardware Security Module — single-banked, non-rollbackable) — slot 0
-//! - Bootloader (reserved, unused) — slot 1
-//! - Os (host OS: IFS + rootfs, updated atomically; the host rides here) — slot 2
-//! - Rt (realtime / Cortex-M7 core) — slot 3
-//! - Vm1 (Linux or QNX VM) — slot 4
-//! - Vm2 (Linux or QNX VM) — slot 5
+//! Independent A/B bank sets addressed by a numeric slot index. What a slot
+//! HOLDS is declared by the platform profile (supernova's `id` + `slot` per
+//! component) and handed to every consumer at construction; this library
+//! names no slot. The `slots` module at the bottom carries a reference layout
+//! for tests only (`test-seams`).
 
 /// Identifies which bank is active within a bank set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -35,63 +31,43 @@ impl Bank {
     }
 }
 
-/// Identifies which bank set — a numeric slot index in the NV
-/// partition layout. The slot index is a fixed semantic layout
-/// (`Hsm=0`, `Bootloader=1`, `Os=2`, `Rt=3`, `Vm1=4`, `Vm2=5`)
-/// exposed as associated constants; the type itself is opaque, so
-/// any slot index in `0..MAX_SLOTS` is a valid `BankSet` — whether a
-/// given store can *address* it is a per-store question
+/// Identifies which bank set — a numeric slot index in the NV partition
+/// layout, and nothing more. The library attaches no meaning to a value:
+/// which component lives in slot 2 is the platform profile's business, and a
+/// component learns its slot when it is constructed. Any index in
+/// `0..MAX_SLOTS` is a valid `BankSet`; whether a given store can *address*
+/// it is a per-store question
 /// ([`NvStore::slot_in_range`](crate::store::NvStore::slot_in_range)).
 ///
-/// Phase 2 moves the per-slot behavior (dir name, file-naming
-/// layout) off the type and into a deployment-config-supplied
-/// `BankSetSpec`. Phase 3 makes the slot assignment itself
-/// config-driven so deployments add components without touching
-/// these constants.
+/// Until v0.1.2 this type carried six named constants and a string parser
+/// for one board's layout; both were retired with the slot vocabulary
+/// (tests use the `slots` fixtures instead).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct BankSet(pub u8);
 
-#[allow(non_upper_case_globals)]
 impl BankSet {
-    // Fixed semantic slot layout. The slot index encodes the
-    // component's role in the boot order, low to high:
-    //   Hsm (security root) → Bootloader → Os (host) → Rt
-    //   (realtime core) → the application VMs.
-    pub const Hsm: BankSet = BankSet(0);
-    pub const Bootloader: BankSet = BankSet(1);
-    pub const Os: BankSet = BankSet(2);
-    pub const Rt: BankSet = BankSet(3);
-    pub const Vm1: BankSet = BankSet(4);
-    pub const Vm2: BankSet = BankSet(5);
-
     /// Map this slot to its array index in NV records (`banks[i]`).
     /// Replaces `bank_set as usize`.
     pub fn as_index(self) -> usize {
         self.0 as usize
     }
+}
 
-    /// Parse a config-string name to a well-known slot. Phase 3 will
-    /// remove this entirely — slot assignment moves into the
-    /// component spec, no string-to-slot lookups left.
-    ///
-    /// Intentionally not the `std::str::FromStr` trait method — the
-    /// trait requires an `Err` type and an infallible parse semantics
-    /// we don't want here (unknown strings legitimately return None,
-    /// not a hard error).
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "hsm" => Some(BankSet::Hsm),
-            "bootloader" | "boot" => Some(BankSet::Bootloader),
-            "os" | "host" | "host-os" | "host_os" | "supernova" | "app" => Some(BankSet::Os),
-            "rt" | "custom" => Some(BankSet::Rt),
-            "os1" | "vm1" => Some(BankSet::Vm1),
-            "os2" | "vm2" => Some(BankSet::Vm2),
-            _ => None,
-        }
-    }
+/// Reference slot layout used by tests and examples ONLY. Production code
+/// receives a component's slot from the platform profile (supernova's
+/// `id` + `slot`) and never names one; this module exists so tests read
+/// as prose. Enabled by the `test-seams` feature (dev-dependency re-declaration).
+#[cfg(any(test, feature = "test-seams"))]
+pub mod slots {
+    use super::BankSet;
+    pub const HSM: BankSet = BankSet(0);
+    pub const BOOTLOADER: BankSet = BankSet(1);
+    pub const OS: BankSet = BankSet(2);
+    pub const RT: BankSet = BankSet(3);
+    pub const VM1: BankSet = BankSet(4);
+    pub const VM2: BankSet = BankSet(5);
 }
 
 /// Hard ceiling on bank slots: the width of the `NvUpdateSession`

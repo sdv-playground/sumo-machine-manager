@@ -421,6 +421,7 @@ pub fn status<D: BlockDevice>(nv: &NvStore<D>, set: BankSet) -> Option<BankStatu
 mod tests {
     use super::*;
     use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
     use nv_store::store::MIN_NV_DEVICE_SIZE;
 
     fn make_nv() -> NvStore<MemBlockDevice> {
@@ -476,10 +477,10 @@ mod tests {
         let mut nv = make_nv();
         init_boot(&mut nv);
 
-        let res = install(&mut nv, BankSet::Vm1, b"image-bytes", &meta_v(1, 0), false).unwrap();
+        let res = install(&mut nv, slots::VM1, b"image-bytes", &meta_v(1, 0), false).unwrap();
         assert_eq!(res.target_bank, Bank::B, "must land on the inactive bank");
 
-        let s = status(&nv, BankSet::Vm1).unwrap();
+        let s = status(&nv, slots::VM1).unwrap();
         assert_eq!(s.active_bank, Bank::B);
         assert!(!s.committed, "install must enter trial mode");
         assert_eq!(s.boot_count, 0);
@@ -490,12 +491,12 @@ mod tests {
         let mut nv = make_nv();
         init_boot(&mut nv);
 
-        install(&mut nv, BankSet::Vm1, b"img", &meta_v(7, 0), false).unwrap();
+        install(&mut nv, slots::VM1, b"img", &meta_v(7, 0), false).unwrap();
 
-        let b = nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
+        let b = nv.read_fw_meta(slots::VM1, Bank::B).unwrap();
         assert_eq!(b.fw_seq, 7);
         assert!(
-            nv.read_fw_meta(BankSet::Vm1, Bank::A).is_none(),
+            nv.read_fw_meta(slots::VM1, Bank::A).is_none(),
             "previous (A) bank must stay untouched"
         );
     }
@@ -504,7 +505,7 @@ mod tests {
     fn install_computes_sha256_in_result() {
         let mut nv = make_nv();
         init_boot(&mut nv);
-        let res = install(&mut nv, BankSet::Vm1, b"hello", &meta_v(1, 0), false).unwrap();
+        let res = install(&mut nv, slots::VM1, b"hello", &meta_v(1, 0), false).unwrap();
         let expected = <[u8; 32]>::from(Sha256::digest(b"hello"));
         assert_eq!(res.image_sha256, expected);
     }
@@ -519,13 +520,12 @@ mod tests {
         let mut initial = NvFwMeta::default();
         initial.fw_secver = 5;
         initial.min_security_ver = 5;
-        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut initial)
-            .unwrap();
+        nv.write_fw_meta(slots::VM1, Bank::A, &mut initial).unwrap();
 
-        install(&mut nv, BankSet::Vm1, b"img", &meta_v(1, 7), false).unwrap();
+        install(&mut nv, slots::VM1, b"img", &meta_v(1, 7), false).unwrap();
 
         // min_security_ver on target (B) must be carried over (=5), not raised to 7.
-        let b = nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
+        let b = nv.read_fw_meta(slots::VM1, Bank::B).unwrap();
         assert_eq!(b.min_security_ver, 5);
         assert_eq!(b.fw_secver, 7);
     }
@@ -536,10 +536,10 @@ mod tests {
     fn install_rejects_when_in_trial() {
         let mut nv = make_nv();
         init_boot(&mut nv);
-        install(&mut nv, BankSet::Vm1, b"img", &meta_v(1, 0), false).unwrap();
+        install(&mut nv, slots::VM1, b"img", &meta_v(1, 0), false).unwrap();
 
         // Second install without commit → InTrial
-        let err = install(&mut nv, BankSet::Vm1, b"img2", &meta_v(2, 0), false).unwrap_err();
+        let err = install(&mut nv, slots::VM1, b"img2", &meta_v(2, 0), false).unwrap_err();
         assert_eq!(err, OtaError::InTrial);
     }
 
@@ -550,9 +550,9 @@ mod tests {
 
         let mut cur = NvFwMeta::default();
         cur.min_security_ver = 10;
-        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut cur).unwrap();
+        nv.write_fw_meta(slots::VM1, Bank::A, &mut cur).unwrap();
 
-        let err = install(&mut nv, BankSet::Vm1, b"img", &meta_v(1, 3), false).unwrap_err();
+        let err = install(&mut nv, slots::VM1, b"img", &meta_v(1, 3), false).unwrap_err();
         assert_eq!(
             err,
             OtaError::SecurityVersionTooLow {
@@ -566,7 +566,7 @@ mod tests {
     fn install_without_boot_state_errors() {
         let mut nv = make_nv();
         // No init_boot() — boot state absent.
-        let err = install(&mut nv, BankSet::Vm1, b"img", &meta_v(1, 0), false).unwrap_err();
+        let err = install(&mut nv, slots::VM1, b"img", &meta_v(1, 0), false).unwrap_err();
         assert_eq!(err, OtaError::NoBootState);
     }
 
@@ -577,15 +577,15 @@ mod tests {
         let mut nv = make_nv();
         init_boot(&mut nv);
 
-        let res = install(&mut nv, BankSet::Hsm, b"key-material", &meta_v(1, 4), true).unwrap();
+        let res = install(&mut nv, slots::HSM, b"key-material", &meta_v(1, 4), true).unwrap();
         assert_eq!(res.target_bank, Bank::A);
 
-        let s = status(&nv, BankSet::Hsm).unwrap();
+        let s = status(&nv, slots::HSM).unwrap();
         assert_eq!(s.active_bank, Bank::A);
         assert!(s.committed, "single_bank install must not enter trial mode");
 
         // Single-bank raises floor immediately to the installed version.
-        let m = nv.read_fw_meta(BankSet::Hsm, Bank::A).unwrap();
+        let m = nv.read_fw_meta(slots::HSM, Bank::A).unwrap();
         assert_eq!(m.min_security_ver, 4);
         assert_eq!(m.fw_secver, 4);
     }
@@ -599,11 +599,11 @@ mod tests {
 
         let sha = [0xAA; 32];
         let res =
-            install_precomputed(&mut nv, BankSet::Vm1, sha, 1234, &meta_v(1, 0), false).unwrap();
+            install_precomputed(&mut nv, slots::VM1, sha, 1234, &meta_v(1, 0), false).unwrap();
         assert_eq!(res.target_bank, Bank::B);
         assert_eq!(res.image_sha256, sha);
         assert_eq!(
-            nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap().image_sha256,
+            nv.read_fw_meta(slots::VM1, Bank::B).unwrap().image_sha256,
             sha
         );
     }
@@ -614,9 +614,9 @@ mod tests {
         init_boot(&mut nv);
         let mut cur = NvFwMeta::default();
         cur.min_security_ver = 9;
-        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut cur).unwrap();
+        nv.write_fw_meta(slots::VM1, Bank::A, &mut cur).unwrap();
 
-        let err = install_precomputed(&mut nv, BankSet::Vm1, [0; 32], 10, &meta_v(1, 2), false)
+        let err = install_precomputed(&mut nv, slots::VM1, [0; 32], 10, &meta_v(1, 2), false)
             .unwrap_err();
         assert_eq!(err, OtaError::SecurityVersionTooLow { image: 2, floor: 9 });
     }
@@ -632,17 +632,17 @@ mod tests {
         let mut prior = NvFwMeta::default();
         prior.fw_secver = 2;
         prior.min_security_ver = 2;
-        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut prior).unwrap();
+        nv.write_fw_meta(slots::VM1, Bank::A, &mut prior).unwrap();
 
-        install(&mut nv, BankSet::Vm1, b"img", &meta_v(1, 7), false).unwrap();
-        commit(&mut nv, BankSet::Vm1).unwrap();
+        install(&mut nv, slots::VM1, b"img", &meta_v(1, 7), false).unwrap();
+        commit(&mut nv, slots::VM1).unwrap();
 
-        let s = status(&nv, BankSet::Vm1).unwrap();
+        let s = status(&nv, slots::VM1).unwrap();
         assert!(s.committed);
         assert_eq!(s.boot_count, 0);
 
         // Floor raised to new secver=7.
-        let m = nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
+        let m = nv.read_fw_meta(slots::VM1, Bank::B).unwrap();
         assert_eq!(m.min_security_ver, 7);
     }
 
@@ -654,13 +654,13 @@ mod tests {
         let mut prior = NvFwMeta::default();
         prior.fw_secver = 10;
         prior.min_security_ver = 10;
-        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut prior).unwrap();
+        nv.write_fw_meta(slots::VM1, Bank::A, &mut prior).unwrap();
 
         // Install an image with same secver=10 (equal-to-floor allowed).
-        install(&mut nv, BankSet::Vm1, b"img", &meta_v(1, 10), false).unwrap();
-        commit(&mut nv, BankSet::Vm1).unwrap();
+        install(&mut nv, slots::VM1, b"img", &meta_v(1, 10), false).unwrap();
+        commit(&mut nv, slots::VM1).unwrap();
 
-        let m = nv.read_fw_meta(BankSet::Vm1, Bank::B).unwrap();
+        let m = nv.read_fw_meta(slots::VM1, Bank::B).unwrap();
         assert_eq!(m.min_security_ver, 10, "floor should not drop");
     }
 
@@ -668,14 +668,14 @@ mod tests {
     fn commit_rejects_when_already_committed() {
         let mut nv = make_nv();
         init_boot(&mut nv);
-        let err = commit(&mut nv, BankSet::Vm1).unwrap_err();
+        let err = commit(&mut nv, slots::VM1).unwrap_err();
         assert_eq!(err, OtaError::AlreadyCommitted);
     }
 
     #[test]
     fn commit_without_boot_state_errors() {
         let mut nv = make_nv();
-        let err = commit(&mut nv, BankSet::Vm1).unwrap_err();
+        let err = commit(&mut nv, slots::VM1).unwrap_err();
         assert_eq!(err, OtaError::NoBootState);
     }
 
@@ -685,13 +685,13 @@ mod tests {
     fn rollback_swaps_back_and_recommits() {
         let mut nv = make_nv();
         init_boot(&mut nv);
-        install(&mut nv, BankSet::Vm1, b"img", &meta_v(1, 0), false).unwrap();
+        install(&mut nv, slots::VM1, b"img", &meta_v(1, 0), false).unwrap();
 
         // After install: active=B, committed=false.
-        let prev = rollback(&mut nv, BankSet::Vm1).unwrap();
+        let prev = rollback(&mut nv, slots::VM1).unwrap();
         assert_eq!(prev, Bank::A);
 
-        let s = status(&nv, BankSet::Vm1).unwrap();
+        let s = status(&nv, slots::VM1).unwrap();
         assert_eq!(
             s.active_bank,
             Bank::A,
@@ -705,14 +705,14 @@ mod tests {
     fn rollback_rejects_when_not_in_trial() {
         let mut nv = make_nv();
         init_boot(&mut nv);
-        let err = rollback(&mut nv, BankSet::Vm1).unwrap_err();
+        let err = rollback(&mut nv, slots::VM1).unwrap_err();
         assert_eq!(err, OtaError::NotInTrial);
     }
 
     #[test]
     fn rollback_without_boot_state_errors() {
         let mut nv = make_nv();
-        let err = rollback(&mut nv, BankSet::Vm1).unwrap_err();
+        let err = rollback(&mut nv, slots::VM1).unwrap_err();
         assert_eq!(err, OtaError::NoBootState);
     }
 
@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn status_returns_none_without_boot_state() {
         let nv = make_nv();
-        assert!(status(&nv, BankSet::Vm1).is_none());
+        assert!(status(&nv, slots::VM1).is_none());
     }
 
     #[test]
@@ -732,9 +732,9 @@ mod tests {
         let mut m = NvFwMeta::default();
         m.fw_secver = 42;
         m.min_security_ver = 10;
-        nv.write_fw_meta(BankSet::Vm1, Bank::A, &mut m).unwrap();
+        nv.write_fw_meta(slots::VM1, Bank::A, &mut m).unwrap();
 
-        let s = status(&nv, BankSet::Vm1).unwrap();
+        let s = status(&nv, slots::VM1).unwrap();
         assert_eq!(s.fw_secver, Some(42));
         assert_eq!(s.min_security_ver, Some(10));
     }
@@ -747,16 +747,16 @@ mod tests {
         init_boot(&mut nv);
 
         // Cycle 1: A → B, commit
-        install(&mut nv, BankSet::Vm1, b"v1", &meta_v(1, 1), false).unwrap();
-        commit(&mut nv, BankSet::Vm1).unwrap();
-        assert_eq!(status(&nv, BankSet::Vm1).unwrap().active_bank, Bank::B);
+        install(&mut nv, slots::VM1, b"v1", &meta_v(1, 1), false).unwrap();
+        commit(&mut nv, slots::VM1).unwrap();
+        assert_eq!(status(&nv, slots::VM1).unwrap().active_bank, Bank::B);
 
         // Cycle 2: B → A, commit
-        install(&mut nv, BankSet::Vm1, b"v2", &meta_v(2, 2), false).unwrap();
-        commit(&mut nv, BankSet::Vm1).unwrap();
-        assert_eq!(status(&nv, BankSet::Vm1).unwrap().active_bank, Bank::A);
+        install(&mut nv, slots::VM1, b"v2", &meta_v(2, 2), false).unwrap();
+        commit(&mut nv, slots::VM1).unwrap();
+        assert_eq!(status(&nv, slots::VM1).unwrap().active_bank, Bank::A);
         assert_eq!(
-            nv.read_fw_meta(BankSet::Vm1, Bank::A)
+            nv.read_fw_meta(slots::VM1, Bank::A)
                 .unwrap()
                 .min_security_ver,
             2,
@@ -768,11 +768,11 @@ mod tests {
     fn install_then_rollback_restores_bank_a_committed() {
         let mut nv = make_nv();
         init_boot(&mut nv);
-        install(&mut nv, BankSet::Vm1, b"bad-image", &meta_v(1, 0), false).unwrap();
-        assert_eq!(status(&nv, BankSet::Vm1).unwrap().active_bank, Bank::B);
+        install(&mut nv, slots::VM1, b"bad-image", &meta_v(1, 0), false).unwrap();
+        assert_eq!(status(&nv, slots::VM1).unwrap().active_bank, Bank::B);
 
-        rollback(&mut nv, BankSet::Vm1).unwrap();
-        let s = status(&nv, BankSet::Vm1).unwrap();
+        rollback(&mut nv, slots::VM1).unwrap();
+        let s = status(&nv, slots::VM1).unwrap();
         assert_eq!(s.active_bank, Bank::A);
         assert!(s.committed);
     }
@@ -783,8 +783,8 @@ mod tests {
         let mut nv = make_nv();
         init_boot(&mut nv);
 
-        install(&mut nv, BankSet::Vm1, b"img-vm1", &meta_v(1, 0), false).unwrap();
-        let vm2 = status(&nv, BankSet::Vm2).unwrap();
+        install(&mut nv, slots::VM1, b"img-vm1", &meta_v(1, 0), false).unwrap();
+        let vm2 = status(&nv, slots::VM2).unwrap();
         assert_eq!(vm2.active_bank, Bank::A);
         assert!(vm2.committed);
     }

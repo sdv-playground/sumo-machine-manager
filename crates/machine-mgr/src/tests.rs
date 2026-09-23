@@ -268,7 +268,8 @@ fn registry_with_arc_accepts_prebuilt_arcs() {
 #[test]
 fn seed_selector_writes_on_first_seed_and_is_idempotent() {
     use crate::system_bank_state::{InMemorySelectorStore, SelectorStore, TestSigner};
-    use nv_store::types::{Bank, BankSet};
+    use nv_store::slots;
+    use nv_store::types::Bank;
 
     // A real two-slot store we can inspect after seeding.
     let store = InMemorySelectorStore::new();
@@ -284,15 +285,15 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
 
     // First seed of an empty selector: both entries differ from the (absent)
     // PRIMARY view, so both are staged and a single seal promotes them.
-    let entries = vec![(BankSet::Vm1, Bank::B), (BankSet::Vm2, Bank::A)];
+    let entries = vec![(slots::VM1, Bank::B), (slots::VM2, Bank::A)];
     m.seed_selector(entries.clone());
 
     // The selector now mirrors the seed and the store's PRIMARY slot was
     // written with both entries at generation 1. Active-bank reads also go via
     // the read-only `boot_selector()` view to exercise that handle.
     let sel = m.boot_selector();
-    assert_eq!(sel.active_bank(BankSet::Vm1), Some(Bank::B));
-    assert_eq!(sel.active_bank(BankSet::Vm2), Some(Bank::A));
+    assert_eq!(sel.active_bank(slots::VM1), Some(Bank::B));
+    assert_eq!(sel.active_bank(slots::VM2), Some(Bank::A));
     assert_eq!(
         m.system_bank().read().unwrap().generation(),
         1,
@@ -300,8 +301,8 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
     );
     let primary = store.read_primary().expect("PRIMARY written by the seed");
     assert_eq!(primary.generation, 1);
-    assert_eq!(primary.selectors[&BankSet::Vm1].bank, Bank::B);
-    assert_eq!(primary.selectors[&BankSet::Vm2].bank, Bank::A);
+    assert_eq!(primary.selectors[&slots::VM1].bank, Bank::B);
+    assert_eq!(primary.selectors[&slots::VM2].bank, Bank::A);
 
     // The seed commits too, so SECONDARY is written equal to PRIMARY — the
     // not-in-trial baseline (PRIMARY == SECONDARY).
