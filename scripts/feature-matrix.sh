@@ -56,6 +56,15 @@ run "all features" \
 run "tests (default features)" \
     cargo test --workspace
 
+# Slot-vocabulary guard (v0.1.2). A bank slot is a number a component is
+# constructed with; which slot means what lives in the platform profile
+# (supernova), never here. The named constants, the name parser and the
+# id/name/dir tables were retired in v0.1.2 — this keeps them from creeping
+# back. The `nv_store::slots` test fixtures (HSM/OS/…, `test-seams` only) are
+# deliberately outside the pattern.
+run "no slot vocabulary in the library" \
+    bash -c '! git grep -n -E "BankSet::(Hsm|Bootloader|Os|Rt|Vm1|Vm2)\b|pub const (Hsm|Bootloader|Os|Rt|Vm1|Vm2): BankSet|BankSet::from_str|bank_set_for_id|for_well_known|component_aliases" -- crates services tools'
+
 # The opt-in container/OCI server build — the one deployments with a container
 # runtime ship. Proves the forwarding chain vm-sovd -> component-factory ->
 # component-mgr -> app-mgr actually resolves.
