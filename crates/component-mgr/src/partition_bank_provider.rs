@@ -41,7 +41,7 @@ use nv_store::block::BlockDevice;
 use nv_store::types::{Bank, BankSet};
 
 use machine_mgr::bank_provider::{BankError, BankProvider, FirmwareIdentity, InstalledFirmware};
-use machine_mgr::ResetKind;
+use machine_mgr::{ImageRecord, ResetKind};
 
 use crate::bank_provider::{firmware_to_ivd_identity, IvdBankProvider};
 
@@ -49,7 +49,7 @@ use crate::bank_provider::{firmware_to_ivd_identity, IvdBankProvider};
 /// component-id's last segment, e.g. `application.img`) and the A/B eMMC device
 /// paths it is written to. The map is deployment config, not code — the consumer
 /// (host/rt/bootloader) fills it at construction.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PartitionPart {
     /// Payload name as it arrives on the wire (`payload_target_name_for_id`).
     pub file: String,
@@ -57,9 +57,33 @@ pub struct PartitionPart {
     pub partition_a: String,
     /// Device path for bank B (e.g. `/dev/emmc0.lnxdata.bank1-application`).
     pub partition_b: String,
+    /// The platform's own record of this part's image (a hardware boot manager's
+    /// image table), when the deployment has one. `None` — the default — is
+    /// today's behaviour exactly: nothing recorded, nothing routed.
+    pub record: Option<Arc<dyn ImageRecord>>,
+}
+
+// Hand-written because `ImageRecord` is `Send + Sync` only (a record is a
+// platform handle, not a value); the part renders it as present/absent.
+impl std::fmt::Debug for PartitionPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartitionPart")
+            .field("file", &self.file)
+            .field("partition_a", &self.partition_a)
+            .field("partition_b", &self.partition_b)
+            .field("record", &self.record.is_some())
+            .finish()
+    }
 }
 
 impl PartitionPart {
+    /// Attach the platform's image record to this part — see [`ImageRecord`] for
+    /// the ordering the provider then guarantees.
+    pub fn with_record(mut self, r: Arc<dyn ImageRecord>) -> Self {
+        self.record = Some(r);
+        self
+    }
+
     /// The device path for `bank`.
     fn device(&self, bank: Bank) -> &str {
         match bank {
@@ -156,6 +180,18 @@ impl<D: BlockDevice + Send + 'static> PartitionBankProvider<D> {
             .ok_or_else(|| BankError::Failed("no images_dir configured".into()))
     }
 
+    /// Point every attached [`ImageRecord`] at `bank`. Called by `activate` and
+    /// `rollback` BEFORE the boot selector moves — never by `commit`. Parts with
+    /// no record (the default) make this a no-op.
+    fn route_records(&self, bank: Bank) -> Result<(), BankError> {
+        for part in &self.parts {
+            if let Some(r) = &part.record {
+                r.route(bank)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Hash a device path to EOF, streamed (never slurps the whole image). For a
     /// partition-exact image, hash-to-EOF == the image sha256.
     fn hash_device(path: &str) -> Result<(u64, [u8; 32]), BankError> {
@@ -191,15 +227,28 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         self.inner.read_installed(bank)
     }
     fn activate(&self, bank: Bank) -> Result<ResetKind, BankError> {
+        // Route FIRST: every attached record points at `bank` BEFORE the inner
+        // switches the boot selector to it, so the platform is never asked to
+        // boot a bank it has not been pointed at. A route error returns here,
+        // with the selector still on the old bank.
+        self.route_records(bank)?;
         // inner has NO activator → activate() is the boot-selector stage+seal
         // only (the bytes are already on the partition from the sink). No
         // byte-copy, no RAM read.
         self.inner.activate(bank)
     }
     fn commit(&self) -> Result<(), BankError> {
+        // No routing here, ever: commit confirms the bank that ALREADY booted —
+        // it moves nothing, so there is nothing to point a record at.
         self.inner.commit()
     }
     fn rollback(&self) -> Result<(), BankError> {
+        // Same ordering as `activate`, with the target read rather than handed
+        // in: `rollback_target` is the bank NV will land on (the sibling of NV
+        // `active_bank`, from the boot state `ota::rollback` itself swaps), so
+        // the records are pointed at it BEFORE the flip.
+        let target = self.inner.rollback_target()?;
+        self.route_records(target)?;
         self.inner.rollback()
     }
     fn record_disabled(&self, set: BankSet, disabled: bool) -> Result<(), BankError> {
@@ -295,6 +344,12 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
             }
             let (size, sha) = Self::hash_device(device)?;
             tracing::info!(part = %part.file, device = %device, size, "partition bank: hashed partition for IVD");
+            // The record learns the image from the medium BEFORE the bank is
+            // signed: a refusal aborts here, with no IvdFile pushed for the
+            // parts after this one and nothing signed below.
+            if let Some(r) = &part.record {
+                r.sealed(bank, size, &sha)?;
+            }
             files.push(hsm::ivd::IvdFile {
                 relative_path: part.file.clone(),
                 sha256: sha.to_vec(),
@@ -379,11 +434,14 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use machine_mgr::system_bank_state::{
+        InMemorySelectorStore, SharedSystemBankState, SystemBankManager, TestSigner,
+    };
     use nv_store::block::MemBlockDevice;
     use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
-    use nv_store::types::{BankSet, NvBootState};
+    use nv_store::types::{BankBootState, BankSet, NvBootState};
     use std::io::Write;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, RwLock};
 
     // A file stands in for the eMMC partition device: File::create + hash-back
     // behave identically to a block device for the provider's logic (the
@@ -435,6 +493,19 @@ mod tests {
         parts: Vec<PartitionPart>,
         tag: &str,
     ) -> PartitionBankProvider<MemBlockDevice> {
+        build_with(images_dir, parts, tag, nv(), None)
+    }
+
+    /// `build` with the boot authorities handed in: an NV store seeded by the
+    /// caller and (optionally) a shared boot selector, so the record tests can
+    /// watch the switch the records are ordered against.
+    fn build_with(
+        images_dir: PathBuf,
+        parts: Vec<PartitionPart>,
+        tag: &str,
+        nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
+        selector: Option<SharedSystemBankState>,
+    ) -> PartitionBankProvider<MemBlockDevice> {
         let ks = provisioned_keystore(tag);
         // Two independent SimHsm handles over the same keystore dir — one as the
         // provisioning-gate HsmProvider, one as the signing HsmCryptoProvider.
@@ -443,14 +514,14 @@ mod tests {
         let crypto: Arc<dyn hsm::HsmCryptoProvider> =
             Arc::new(hsm_sim_backend::SimHsm::new(ks.clone()));
         let inner = IvdBankProvider::new(
-            nv(),
+            nv,
             BankSet::Os,
             false,
             Some(images_dir),
             "os".into(),
             Some(hsm.clone()),
             None, // activator = None → activate() is selector-flip only
-            None,
+            selector,
         )
         .with_hsm_crypto(crypto.clone());
         PartitionBankProvider::new(inner, parts, Some(hsm), Some(crypto))
@@ -469,6 +540,7 @@ mod tests {
             file: "application.img".into(),
             partition_a: dev_a.to_string_lossy().into(),
             partition_b: dev_b.to_string_lossy().into(),
+            record: None,
         }];
         let p = build(base.join("images"), parts, "write");
 
@@ -492,6 +564,7 @@ mod tests {
             file: "application.img".into(),
             partition_a: dev_a.to_string_lossy().into(),
             partition_b: base.join("bankB.img").to_string_lossy().into(),
+            record: None,
         }];
         let p = build(base.join("images"), parts, "seal");
 
@@ -542,6 +615,7 @@ mod tests {
             file: "application.img".into(),
             partition_a: base.join("a.img").to_string_lossy().into(),
             partition_b: base.join("b.img").to_string_lossy().into(),
+            record: None,
         }];
         let p = build(base.join("images"), parts, "fallback");
         // "ifs" is not mapped → inner opens images/os/bank_a/ifs
@@ -628,6 +702,7 @@ mod tests {
             file: "application.img".into(),
             partition_a: dev_a.to_string_lossy().into(),
             partition_b: base.join("bankB.img").to_string_lossy().into(),
+            record: None,
         }];
         let p = build(base.join("images"), parts, "truncated");
 
@@ -640,5 +715,452 @@ mod tests {
             }
             other => panic!("truncated partition must fail verify, got {other:?}"),
         }
+    }
+
+    // --- ImageRecord: the ordering seam ---------------------------------------
+
+    /// One recorded call: the op, the bank it was given, and — for `sealed` —
+    /// the `(size, sha256)` that came with it.
+    type RecCall = (&'static str, Bank, Option<(u64, [u8; 32])>);
+
+    /// A recording [`ImageRecord`]. Beyond the call log it captures, INSIDE
+    /// `route`, what the boot authorities said at that moment — the ordering
+    /// guarantee ("routed before the switch") is only observable from in there.
+    #[derive(Default)]
+    struct Rec {
+        calls: Mutex<Vec<RecCall>>,
+        fail_sealed: bool,
+        fail_route: bool,
+        /// Authorities to read at `route` time; `None` in tests that only count.
+        witness: Option<(SharedSystemBankState, Arc<Mutex<NvStore<MemBlockDevice>>>)>,
+        /// `(selector PRIMARY, NV active_bank)` as of each `route` call.
+        seen_at_route: Mutex<Vec<(Option<Bank>, Bank)>>,
+    }
+
+    impl Rec {
+        fn watching(
+            selector: &SharedSystemBankState,
+            nv: &Arc<Mutex<NvStore<MemBlockDevice>>>,
+        ) -> Self {
+            Self {
+                witness: Some((selector.clone(), nv.clone())),
+                ..Self::default()
+            }
+        }
+
+        /// The ops recorded so far, in order.
+        fn ops(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().iter().map(|c| c.0).collect()
+        }
+
+        /// The banks `route` was called with, in order.
+        fn routes(&self) -> Vec<Bank> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.0 == "route")
+                .map(|c| c.1)
+                .collect()
+        }
+    }
+
+    impl ImageRecord for Rec {
+        fn sealed(&self, bank: Bank, size: u64, sha256: &[u8; 32]) -> Result<(), BankError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("sealed", bank, Some((size, *sha256))));
+            if self.fail_sealed {
+                return Err(BankError::Failed("record refuses this image".into()));
+            }
+            Ok(())
+        }
+
+        fn route(&self, bank: Bank) -> Result<(), BankError> {
+            if let Some((sel, nv)) = &self.witness {
+                let selected = sel.read().unwrap().active_bank(BankSet::Os);
+                self.seen_at_route
+                    .lock()
+                    .unwrap()
+                    .push((selected, nv_os(nv).active_bank));
+            }
+            self.calls.lock().unwrap().push(("route", bank, None));
+            if self.fail_route {
+                return Err(BankError::Failed("record refuses this route".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// A mapped part with no record attached; tests add one with `with_record`.
+    fn part(file: &str, a: &std::path::Path, b: &std::path::Path) -> PartitionPart {
+        PartitionPart {
+            file: file.into(),
+            partition_a: a.to_string_lossy().into(),
+            partition_b: b.to_string_lossy().into(),
+            record: None,
+        }
+    }
+
+    /// NV for the Os set in the state an install+activate leaves: `active` is
+    /// the next-boot bank, armed but not yet booted (`committed=false`,
+    /// `boot_count=0`) — the only state `ota::rollback` accepts.
+    fn nv_armed(active: Bank) -> Arc<Mutex<NvStore<MemBlockDevice>>> {
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut state = NvBootState::default();
+        state.banks[BankSet::Os.as_index()] = BankBootState {
+            active_bank: active,
+            committed: false,
+            boot_count: 0,
+        };
+        nv.write_boot_state(&mut state).unwrap();
+        Arc::new(Mutex::new(nv))
+    }
+
+    /// The Os slot's boot state as NV has it right now.
+    fn nv_os(nv: &Arc<Mutex<NvStore<MemBlockDevice>>>) -> BankBootState {
+        nv.lock().unwrap().read_boot_state().unwrap().banks[BankSet::Os.as_index()].clone()
+    }
+
+    /// A boot selector whose PRIMARY (booted selection) for Os is `bank`.
+    fn selector_on(bank: Bank) -> SharedSystemBankState {
+        let mgr =
+            SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner));
+        let shared: SharedSystemBankState = Arc::new(RwLock::new(mgr));
+        {
+            let mut g = shared.write().unwrap();
+            g.stage(BankSet::Os, bank);
+            assert!(g.seal());
+        }
+        shared
+    }
+
+    /// A boot selector mid-trial: PRIMARY = `armed`, rollback floor = `floor`.
+    fn selector_armed(floor: Bank, armed: Bank) -> SharedSystemBankState {
+        let shared = selector_on(floor);
+        {
+            let mut g = shared.write().unwrap();
+            g.commit(); // floor := the booted selection
+            g.stage(BankSet::Os, armed);
+            assert!(g.seal()); // PRIMARY := the trial bank
+        }
+        shared
+    }
+
+    fn sha_of(bytes: &[u8]) -> (u64, [u8; 32]) {
+        use sha2::{Digest, Sha256};
+        (bytes.len() as u64, Sha256::digest(bytes).into())
+    }
+
+    #[test]
+    fn sealed_called_once_per_part_with_hash_device_values() {
+        let base = tmp("rec-sealed");
+        let appl = base.join("bankA-appl.img");
+        let ifs = base.join("bankA-ifs.img");
+        std::fs::write(&appl, b"the real host application image bytes").unwrap();
+        std::fs::write(&ifs, vec![0x5Au8; 3000]).unwrap();
+        let rec = Arc::new(Rec::default());
+        let parts = vec![
+            part("application.img", &appl, &base.join("bankB-appl.img")).with_record(rec.clone()),
+            part("ifs", &ifs, &base.join("bankB-ifs.img")).with_record(rec.clone()),
+            // Absent device → skipped before hashing, so never recorded either.
+            part("rootfs", &base.join("absent-a"), &base.join("absent-b")).with_record(rec.clone()),
+        ];
+        let p = build(base.join("images"), parts, "rec-sealed");
+
+        p.seal(Bank::A, FirmwareIdentity::default(), 1, &[])
+            .unwrap();
+
+        let calls = rec.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one `sealed` per PRESENT mapped part (the absent device stays skipped): {calls:?}"
+        );
+        // The values are what an independent read+hash of the partition gives —
+        // i.e. what came BACK off the medium, not what the wire claimed.
+        assert_eq!(
+            calls[0],
+            (
+                "sealed",
+                Bank::A,
+                Some(sha_of(&std::fs::read(&appl).unwrap()))
+            )
+        );
+        assert_eq!(
+            calls[1],
+            (
+                "sealed",
+                Bank::A,
+                Some(sha_of(&std::fs::read(&ifs).unwrap()))
+            )
+        );
+    }
+
+    #[test]
+    fn sealed_error_aborts_seal_before_signing() {
+        let base = tmp("rec-sealed-err");
+        let appl = base.join("bankA-appl.img");
+        let ifs = base.join("bankA-ifs.img");
+        std::fs::write(&appl, b"application image bytes").unwrap();
+        std::fs::write(&ifs, b"ifs image bytes").unwrap();
+        let rec = Arc::new(Rec {
+            fail_sealed: true,
+            ..Rec::default()
+        });
+        let parts = vec![
+            part("application.img", &appl, &base.join("bankB-appl.img")).with_record(rec.clone()),
+            part("ifs", &ifs, &base.join("bankB-ifs.img")).with_record(rec.clone()),
+        ];
+        let p = build(base.join("images"), parts, "rec-sealed-err");
+
+        assert!(matches!(
+            p.seal(Bank::A, FirmwareIdentity::default(), 1, &[]),
+            Err(BankError::Failed(_))
+        ));
+
+        // Aborted AT the refusing part: the next part was never hashed…
+        assert_eq!(rec.ops(), ["sealed"], "seal stopped at the refusing part");
+        // …and nothing was signed — the success test's observables, inverted.
+        let md = p.metadata_dir(Bank::A).unwrap();
+        assert!(
+            !md.join(hsm::ivd::IVD_MANIFEST_FILE).exists(),
+            "no manifest written"
+        );
+        assert!(
+            !md.join(hsm::ivd::IVD_SIGNATURE_FILE).exists(),
+            "no signature written"
+        );
+        assert!(matches!(
+            p.read_installed(Bank::A),
+            Err(BankError::NotInstalled)
+        ));
+    }
+
+    #[test]
+    fn activate_routes_before_the_switch() {
+        let base = tmp("rec-activate");
+        let nv = nv();
+        let selector = selector_on(Bank::A);
+        let rec = Arc::new(Rec::watching(&selector, &nv));
+        let parts = vec![
+            part("application.img", &base.join("a.img"), &base.join("b.img"))
+                .with_record(rec.clone()),
+        ];
+        let p = build_with(
+            base.join("images"),
+            parts,
+            "rec-activate",
+            nv,
+            Some(selector),
+        );
+        assert_eq!(
+            p.selected_bank(),
+            Some(Bank::A),
+            "selector starts on the old bank"
+        );
+
+        p.activate(Bank::B).unwrap();
+
+        assert_eq!(rec.routes(), [Bank::B], "routed at the activated bank");
+        assert_eq!(
+            rec.seen_at_route.lock().unwrap().clone(),
+            vec![(Some(Bank::A), Bank::A)],
+            "the record was routed while the boot authority still said A"
+        );
+        assert_eq!(
+            p.selected_bank(),
+            Some(Bank::B),
+            "…and only then did the switch happen"
+        );
+    }
+
+    #[test]
+    fn route_error_leaves_selector_untouched() {
+        let base = tmp("rec-route-err");
+        let selector = selector_on(Bank::A);
+        let rec = Arc::new(Rec {
+            fail_route: true,
+            ..Rec::default()
+        });
+        let parts = vec![
+            part("application.img", &base.join("a.img"), &base.join("b.img"))
+                .with_record(rec.clone()),
+        ];
+        let p = build_with(
+            base.join("images"),
+            parts,
+            "rec-route-err",
+            nv(),
+            Some(selector),
+        );
+
+        assert!(matches!(p.activate(Bank::B), Err(BankError::Failed(_))));
+        assert_eq!(
+            p.selected_bank(),
+            Some(Bank::A),
+            "a refused route aborts with the selector still on the old bank"
+        );
+    }
+
+    #[test]
+    fn commit_never_routes() {
+        let base = tmp("rec-commit");
+        let dev_a = base.join("bankA.img");
+        std::fs::write(&dev_a, b"host application image").unwrap();
+        // Armed on A: the trial `commit` then has real work to do.
+        let nv = nv_armed(Bank::A);
+        let selector = selector_on(Bank::A);
+        let rec = Arc::new(Rec::default());
+        let parts =
+            vec![part("application.img", &dev_a, &base.join("bankB.img")).with_record(rec.clone())];
+        let p = build_with(
+            base.join("images"),
+            parts,
+            "rec-commit",
+            nv.clone(),
+            Some(selector),
+        );
+
+        p.seal(Bank::A, FirmwareIdentity::default(), 1, &[])
+            .unwrap();
+        p.activate(Bank::A).unwrap();
+        let routes_before = rec.routes().len();
+        p.commit().unwrap();
+
+        assert_eq!(routes_before, 1, "the one route came from activate");
+        assert_eq!(
+            rec.routes().len(),
+            routes_before,
+            "commit routed nothing — it confirms the booted bank, it moves nothing"
+        );
+        assert!(
+            nv_os(&nv).committed,
+            "…and it was a real commit, not a no-op"
+        );
+    }
+
+    #[test]
+    fn rollback_routes_the_bank_nv_lands_on() {
+        let base = tmp("rec-rollback");
+        // Armed-not-booted (boot_count 0): NV says the trial bank B is next, the
+        // selector's PRIMARY is B over an A floor. NOTE `active_bank()` is B
+        // here — routing that (instead of the rollback target) is the bug this
+        // test exists to catch.
+        let nv = nv_armed(Bank::B);
+        let selector = selector_armed(Bank::A, Bank::B);
+        let rec = Arc::new(Rec::watching(&selector, &nv));
+        let parts = vec![
+            part("application.img", &base.join("a.img"), &base.join("b.img"))
+                .with_record(rec.clone()),
+        ];
+        let p = build_with(
+            base.join("images"),
+            parts,
+            "rec-rollback",
+            nv.clone(),
+            Some(selector),
+        );
+        assert_eq!(p.active_bank(), Bank::B, "the trial bank is the active one");
+
+        p.rollback().unwrap();
+
+        // Routed at the bank NV actually landed on …
+        assert_eq!(nv_os(&nv).active_bank, Bank::A, "rollback landed NV on A");
+        assert_eq!(p.active_bank(), Bank::A, "…and the selector with it");
+        assert_eq!(rec.routes(), [p.active_bank()]);
+        // … and routed BEFORE either authority flipped (both still on B).
+        assert_eq!(
+            rec.seen_at_route.lock().unwrap().clone(),
+            vec![(Some(Bank::B), Bank::B)],
+            "the record was routed before ota/selector flipped to A"
+        );
+    }
+
+    #[test]
+    fn rollback_ignores_the_providers_cached_running_bank() {
+        let base = tmp("rec-rollback-stale");
+        // The provider is long-lived: it cached `running_bank` = A at boot, and
+        // the install that armed the trial on B ran later. Routing off that
+        // cache — or off its sibling — points at the wrong bank; only the NV
+        // boot state says where `ota::rollback` will actually land.
+        let nv = nv();
+        let rec = Arc::new(Rec::default());
+        let parts = vec![
+            part("application.img", &base.join("a.img"), &base.join("b.img"))
+                .with_record(rec.clone()),
+        ];
+        let p = build_with(
+            base.join("images"),
+            parts,
+            "rec-rollback-stale",
+            nv.clone(),
+            None, // no selector → active_bank() IS the cached running bank
+        );
+        assert_eq!(p.active_bank(), Bank::A, "cached at construction");
+        {
+            // The install lands: NV arms the trial on B (what `ota::install`
+            // writes), while the cache still names the booted bank A.
+            let mut g = nv.lock().unwrap();
+            let mut state = g.read_boot_state().unwrap();
+            state.banks[BankSet::Os.as_index()] = BankBootState {
+                active_bank: Bank::B,
+                committed: false,
+                boot_count: 0,
+            };
+            g.write_boot_state(&mut state).unwrap();
+        }
+
+        p.rollback().unwrap();
+
+        assert_eq!(nv_os(&nv).active_bank, Bank::A, "rollback landed NV on A");
+        assert_eq!(
+            rec.routes(),
+            [Bank::A],
+            "routed where NV landed — not the cached bank's sibling (B)"
+        );
+    }
+
+    #[test]
+    fn rollback_on_a_committed_set_routes_nothing() {
+        let base = tmp("rec-rollback-committed");
+        // Committed: there is no trial to discard, so `ota::rollback` refuses.
+        // The refusal must come BEFORE any record is touched — a rollback that
+        // does not happen must not leave a record pointed somewhere.
+        let nv = nv(); // NvBootState default = committed on A
+        let selector = selector_on(Bank::A);
+        let rec = Arc::new(Rec::default());
+        let parts = vec![
+            part("application.img", &base.join("a.img"), &base.join("b.img"))
+                .with_record(rec.clone()),
+        ];
+        let p = build_with(
+            base.join("images"),
+            parts,
+            "rec-rollback-committed",
+            nv.clone(),
+            Some(selector),
+        );
+        assert!(nv_os(&nv).committed, "the set starts committed");
+
+        // The error is the one `ota::rollback` would have raised — identical
+        // with or without a record attached.
+        match p.rollback() {
+            Err(BankError::Failed(msg)) => {
+                assert_eq!(msg, crate::ota::OtaError::NotInTrial.to_string())
+            }
+            other => panic!("a committed set must refuse rollback, got {other:?}"),
+        }
+        assert!(
+            rec.routes().is_empty(),
+            "a refused rollback routes nothing: {:?}",
+            rec.routes()
+        );
+        assert_eq!(
+            p.active_bank(),
+            Bank::A,
+            "…and leaves the boot authority alone"
+        );
     }
 }

@@ -176,6 +176,35 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
             .unwrap_or(Bank::A)
     }
 
+    /// The bank a [`rollback`](BankProvider::rollback) will land on: the sibling
+    /// of NV `active_bank`, read from the SAME boot state `ota::rollback` reads
+    /// and swaps — never `active_bank()` (the selector / the `running_bank` copy
+    /// cached at construction), which after an activate-without-reboot names a
+    /// different bank. Exposed so a wrapping provider can act on the rollback
+    /// target BEFORE the rollback flips it (see
+    /// `PartitionBankProvider::rollback`); it fails exactly as the `rollback` it
+    /// precedes would — same error for a missing boot state and for a committed
+    /// set with no trial to discard — so acting on the target first never
+    /// changes what the caller sees.
+    pub fn rollback_target(&self) -> Result<Bank, BankError> {
+        let nv = self
+            .nv
+            .lock()
+            .map_err(|_| BankError::Failed("nv lock poisoned".into()))?;
+        let state = nv
+            .read_boot_state()
+            .ok_or_else(|| BankError::Failed(ota::OtaError::NoBootState.to_string()))?;
+        let bank = &state.banks[self.bank_set.as_index()];
+        // Mirror `ota::rollback`'s precondition: a committed set has no trial to
+        // discard. Refusing HERE — before the caller acts on the target — means
+        // a refused rollback is refused with nothing done, and the error is the
+        // one `rollback` itself would have returned.
+        if bank.committed {
+            return Err(BankError::Failed(ota::OtaError::NotInTrial.to_string()));
+        }
+        Ok(bank.active_bank.other())
+    }
+
     /// Wipe the target bank dir (frees ~1 image worth of space) and remove any
     /// orphaned staged files left in `images_dir` root by previous flashes.
     /// `pub` so the engine's thin `prepare_target_bank_dir` delegator (which a

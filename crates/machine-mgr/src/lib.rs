@@ -69,6 +69,7 @@ pub mod bank_provider;
 pub mod component;
 pub mod deactivator;
 pub mod error;
+pub mod image_record;
 pub mod machine;
 pub mod node_update;
 pub mod system_bank_state;
@@ -84,6 +85,7 @@ pub use bank_provider::{
 pub use component::Component;
 pub use deactivator::{DeactivateError, DeactivateOutcome, Deactivator};
 pub use error::{MachineError, MachineResult};
+pub use image_record::ImageRecord;
 pub use machine::{Machine, MachineRegistry};
 pub use system_bank_state::{
     BootSelector, FileSelectorStore, SelectorBlob, SelectorStore, SharedSystemBankState, Signer,
