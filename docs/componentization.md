@@ -332,8 +332,9 @@ constructs an in-process `SimHsm` in non-test code —
 
 - `component_adapter.rs:377, 443, 473` — the `get_csr` / `list_keys` /
   `get_device_id` fallback when no `csr_crypto` provider is injected
-  (`csr_crypto` is only ever wired for `BankSet::Hsm`, and only when
-  `FactoryDeps.hsm_crypto` is `Some` — `component-factory/src/lib.rs:625-627`)
+  (`csr_crypto` is only ever wired for a component that declared
+  `type: hsm`, and only when `FactoryDeps.hsm_crypto` is `Some` —
+  `component-factory/src/lib.rs:625-627`)
 - `main.rs:276` — the `vm-diagctl` CLI's factory-init `--hsm-keystore`
   bring-up
 
@@ -540,8 +541,9 @@ belongs to the host MM — a guest gateway has no business owning it.
       from the shared `FactoryDeps`, not asked for — the split is what stops
       them being inherited.
 - [ ] Consequence to enforce, not just document: the gateway must be **unable**
-      to build a `BankSet::Hsm` component. Today it could, if a config declared
-      one, and it would reach the in-process `SimHsm` fallback while doing it.
+      to build a component that declared `type: hsm`. Today it could, if a
+      config declared one, and it would reach the in-process `SimHsm` fallback
+      while doing it.
 - [ ] Dependency fallout for the gateway half: `hsm-contract` (+ `vhsm-provider`
       / `vhsm-client`) instead of `hsm` with `crypto`+`suit`, and no edge to
       `component-mgr`'s HSM bank component. This is the first concrete

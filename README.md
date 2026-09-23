@@ -60,8 +60,8 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 │  machine-mgr     Platform-agnostic Machine/Component       │
 │  (lib)           trait — host-os / vm1 / vm2 / hsm         │
 │                                                            │
-│  host-os-mgr     Host OS update: IFS activation, A/B boot  │
-│  (lib)           partition, reboot coordination             │
+│  host-os-mgr     Host OS bank activators: IFS write, A/B   │
+│  (lib)           boot partition swap                       │
 │                                                            │
 │  app-mgr         App/container updates via Component        │
 │  (lib)           container image import for local runtimes  │
@@ -87,7 +87,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `vm-devices` | — | CAN / health / time simulators (host-side) |
 | `vm-mgr` | — (lib, was `vm-service`; `tools/crates/vm-service` builds the `vm-service` dev binary) | QEMU (+ QNX `qvm`) lifecycle, per-bank VM config, ivshmem |
 | `machine-mgr` | — | `Machine` + `Component` trait layer (platform-agnostic) |
-| `host-os-mgr` | — | Host OS Component: IFS activation, A/B partition, reboot |
+| `host-os-mgr` | — | Host OS bank activators: IFS write, A/B partition swap |
 | `app-mgr` | — | App/container Component: local container image import for Docker, Podman, or containerd |
 | `component-mgr` | — (lib; `tools/crates/vm-diagctl` builds the CLI) | SUIT + SOVD: validation, OTA engine, DID resolution, `/updates` wire; `vm-diagctl` is the NV/bank + factory CLI over it |
 | `services/vm-sovd` | `vm-sovd` | The SOVD/OTA server process — wires the machine registry, components, and the `/updates` wire |
@@ -111,7 +111,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 vm-boot        — WHEN to boot which bank (runs once at startup)
 vm-service     — HOW to start/stop VMs (QEMU QMP, qvm lifecycle)
 component-mgr         — WHAT to flash and verify (OTA engine, SUIT, SOVD wire)
-host-os-mgr    — Host-specific: IFS write, partition swap, reboot
+host-os-mgr    — Host-specific bank activators: IFS write, partition swap
 machine-mgr    — Abstract trait layer connecting them all
 ```
 
@@ -143,12 +143,16 @@ Uses [sovd-core](https://github.com/sdv-playground/SOVDd) `DiagnosticBackend` tr
 
 ### Components
 
-| Component | Bank Set | Description |
-|-----------|----------|-------------|
-| `host-os` | HostOs | Host OS (IFS + rootfs), updated atomically |
-| `vm1` | Vm1 | Primary OS VM (Linux) |
-| `vm2` | Vm2 | Secondary OS VM (QNX) |
-| `hsm` | Hsm | HSM firmware (single-bank, no rollback) |
+| Component | Description |
+|-----------|-------------|
+| `host-os` | Host OS (IFS + rootfs), updated atomically |
+| `vm1` | Primary OS VM (Linux) |
+| `vm2` | Secondary OS VM (QNX) |
+| `hsm` | HSM firmware (single-bank, no rollback) |
+
+The component id is the addressing unit — a SUIT envelope targets a component
+*name*, and each component's bank slot number comes from the platform profile,
+not from this library.
 
 ### Endpoints
 
@@ -175,7 +179,7 @@ the UDS-device handler (SOVDd) — never by the client.
 
 ## Key Concepts
 
-- **Bank sets**: a runtime slot count derived from the NV device size (`slot_count()`, default 16, max 32 — the width of the u32 reboot-owed mask), 6 named — Hsm (single-bank), Bootloader (reserved), Os/host-os (A/B, IFS+rootfs atomic), Rt (Cortex-M7), Vm1, Vm2 (A/B); the remaining slots are unnamed (`set<N>` dirs unless config sets `storage_subdir`)
+- **Bank sets**: a runtime slot count derived from the NV device size (`slot_count()`, default 16, max 32 — the width of the u32 reboot-owed mask); a slot is a *number*, nothing more — a component's slot comes from its spec (`slot: N`, written by the platform profile) and the library names no slot (the old names live on only as `test-seams` fixtures, `nv_store::slots::*`). Storage dir = `storage_subdir` if set, else the component id
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA via SOVD)
 - **Per-bank VM config**: vm-config.yaml in bank directories, delivered alongside firmware via OTA
 - **Multi-payload SUIT**: host-os carries IFS + rootfs; VMs carry kernel + rootfs + config

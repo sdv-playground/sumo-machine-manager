@@ -18,9 +18,9 @@ Offset      Size        Sectors   Content
 0x008000    8 KB        2         Update Session (node update transaction)
 0x00A000    24 KB       --        (reserved)
 
-0x010000    96 KB       24        Slot 0 (Hsm)
-0x028000    96 KB       24        Slot 1 (Bootloader)
-0x040000    96 KB       24        Slot 2 (Os)
+0x010000    96 KB       24        Slot 0
+0x028000    96 KB       24        Slot 1
+0x040000    96 KB       24        Slot 2
    ...
 0x010000 + i * 0x018000           Slot i, for i in 0..slot_count()
 
@@ -43,9 +43,10 @@ is therefore a 10-slot store. Growing a store means recreating the device — qn
 `ftruncate(grow)` is a silent no-op — and the "too small, recreate" guard lives in the
 supernova host binary, not in this library.
 
-Slots 0–5 are named (`Hsm`, `Bootloader`, `Os`, `Rt`, `Vm1`, `Vm2`); slots 6 and up are
-unnamed, their storage directory derived from the index (`set<N>`) unless config sets
-`storage_subdir`. HSM (slot 0) is single-bank: always bank A, always committed.
+Slots are numbers here and nothing else: what a slot holds is declared by the platform
+profile (supernova's `id` + `slot`); the library names no slot. A component's storage
+directory is its `storage_subdir` when the profile sets one, else its component id. A
+single-bank component (the HSM keystore) is always bank A, always committed.
 
 ## Sector Rotation
 

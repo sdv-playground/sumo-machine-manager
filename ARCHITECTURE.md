@@ -25,7 +25,7 @@ supplying concrete impls.
 
 **Two-process model on a node:** `vm-service` (QEMU/qvm process lifecycle) +
 `vm-sovd` (diagnostics + OTA engine). A platform integrator may also embed both in
-a single host-manager binary that itself rides the **Os** bank set (i.e. the host
+a single host-manager binary that itself rides a bank slot (i.e. the host
 manager is one of the components it updates).
 
 **Division of responsibility (important):** the **real bootloader is C, owned by
@@ -44,7 +44,7 @@ defaults). Two structural shapes, discriminated at runtime via `Capabilities`:
 
 | Shape | Lifecycle | Implementors |
 |---|---|---|
-| **Banked** — A/B + trial + commit/rollback | `start_install → upload_envelope → finalize_install (flip, reboot) → trial → commit_install OR auto-rollback` | `ComponentAdapter` (component-mgr, over `ComponentBackend`), `HostOsComponent` (host-os-mgr), `AppComponent` (app-mgr), an RT-core component |
+| **Banked** — A/B + trial + commit/rollback | `start_install → upload_envelope → finalize_install (flip, reboot) → trial → commit_install OR auto-rollback` | `ComponentAdapter` (component-mgr, over `ComponentBackend`), `AppComponent` (app-mgr), an RT-core component |
 | **Singleshot** — write-through, no rollback | `start_install → upload_envelope → finalize_install (write live) → commit_install (raise floor)` | the HSM keystore (a single-bank `ComponentBackend`), `ContainerImageComponent` (app-mgr) |
 
 ```mermaid
@@ -119,10 +119,8 @@ classDiagram
         <<trait, component-mgr>>
         +validate_envelope
         +extract_metadata
-        +component_aliases
     }
     Component <|.. ComponentAdapter : component-mgr
-    Component <|.. HostOsComponent : host-os-mgr
     Component <|.. AppComponent : app-mgr
     Component <|.. ContainerImageComponent : app-mgr
     ComponentAdapter --> ComponentBackend : wraps
@@ -178,12 +176,14 @@ The core update/diagnostics path:
   `ComponentAdapter` (exposes it as a `Component`); `install_router_diag`
   (`InstallRouterDiag` — routes a VM's install methods to its container-vs-VM router,
   delegates everything else to the engine); `bank_provider` (the `BankProvider` seam:
-  `IvdBankProvider`); `dispatcher` (SUIT-aware target `BankSet` resolver); `suit_provider`,
-  `manifest_provider`, `streaming`, `did`, `ota`. **`ComponentBackend` is wired directly
-  into SOVD** — the old `ComponentDiagBackend` round-trip adapter was deleted (converged
-  to one backend).
-- **host-os-mgr** (lib): `HostOsComponent` (Banked); `DevBankActivator` (mount+copy) and
-  `PartitionBankActivator` (raw partition write) impl `machine_mgr::BankActivator`.
+  `IvdBankProvider`); `dispatcher` (checks a SUIT envelope's target component NAME against
+  the route's component); `suit_provider`, `manifest_provider`, `streaming`, `did`, `ota`.
+  **`ComponentBackend` is wired directly into SOVD** — the old `ComponentDiagBackend`
+  round-trip adapter was deleted (converged to one backend).
+- **host-os-mgr** (lib): **activators only** — `DevBankActivator` (mount+copy) and
+  `PartitionBankActivator` (raw partition write) impl `machine_mgr::BankActivator`. It no
+  longer carries a `Component` impl of its own; the host OS is a `ComponentAdapter` like
+  every other banked component.
 - **app-mgr** (lib): `AppComponent` (Banked) + `ContainerImageComponent` (Singleshot —
   imports detached `#container-image` payloads into Docker/Podman/containerd).
   `ContainerImageComponent` and the container-image install route are behind the
@@ -276,10 +276,13 @@ per-component NV boot state as the authority for "which bank each set boots from
 - `vm-boot` reads PRIMARY and drives the bank decision; trial/rollback is **global**
   (whole-blob copy of SECONDARY over PRIMARY — vm-boot has no signer at boot so it can't
   re-sign a per-set change).
-- `BankSet` is a `pub struct BankSet(pub u8)` newtype: `Hsm=0, Bootloader=1, Os=2, Rt=3,
-  Vm1=4, Vm2=5`; the slot *count* is runtime — `slot_count()`, derived from the NV device
-  size (default 16, `MAX_SLOTS=32`) — with the first 6 named and the rest unnamed. The host
-  manager rides the **Os** slot; RT is before the VMs.
+- `BankSet` is a bare `pub struct BankSet(pub u8)` newtype — a slot *number*, nothing more.
+  The library names no slot: a component's slot comes from its spec (`slot: N`, written by
+  the platform profile), and what a slot holds is that profile's decision (a spec that still
+  carries a `bank_set:` name is refused at load — "slot names were retired in v0.1.2 — set
+  `slot: N`"). The slot *count* is runtime — `slot_count()`, derived from the NV device size
+  (default 16, `MAX_SLOTS=32`). The old reference layout survives only as test fixtures
+  (`nv_store::slots::{HSM, BOOTLOADER, OS, RT, VM1, VM2}`, behind `test-seams`).
 
 ```mermaid
 flowchart LR
@@ -435,8 +438,9 @@ cover sign/verify/encrypt/derive + handle/policy + SUIT key provisioning.
   ECDSA-P256).
 - **Converged to one diagnostics backend** — deleted `ComponentDiagBackend`; wired
   `ComponentBackend` directly; app-capable VMs use the narrow `InstallRouterDiag`.
-- **`BankSet` redo** — fixed semantic slots (`Hsm=0 … Vm2=5`); the slot *count* is runtime
-  since 2026-09-23 (device-derived, max 32).
+- **`BankSet` redo** — a bare slot number; the named slots were retired in v0.1.2 (a
+  component's slot comes from its spec, written by the platform profile). The slot *count*
+  is runtime since 2026-09-23 (device-derived, max 32).
 - **`current` symlink retired** (per-VM) — bank-relative `load kernel` + vm-service
   cwd=bank_dir. (`mmgr/current`, the host manager's own self-update bank pointer, stays.)
 - **qvm.conf moved to the deployment** as host-integration config (examples in the

@@ -19,11 +19,11 @@ discriminated at runtime via `Capabilities`):
 
 | Shape | Lifecycle | Implementations |
 |---|---|---|
-| **Banked** — A/B + trial + commit/rollback | `start_install` → `upload_envelope` → `finalize_install` (flip pointer, reboot needed) → trial boot → `commit_install` OR auto-rollback | `ComponentAdapter` (component-mgr), `HostOsComponent` (host-os-mgr), future RT-core component, A/B-style slave-ECU component |
+| **Banked** — A/B + trial + commit/rollback | `start_install` → `upload_envelope` → `finalize_install` (flip pointer, reboot needed) → trial boot → `commit_install` OR auto-rollback | `ComponentAdapter` (component-mgr), future RT-core component, A/B-style slave-ECU component |
 | **Singleshot** — write-through, no rollback | `start_install` → `upload_envelope` → `finalize_install` (write live) → `commit_install` (raise floor + audit) | HSM keystore (hsm crate), `ContainerImageComponent` (app-mgr) |
 
 `component-mgr` is **the VM impl of `Component`**, not the base. Same for
-`host-os-mgr`, `app-mgr`, and `hsm`. They're siblings under the same
+`app-mgr` and `hsm`. They're siblings under the same
 trait; `MachineRegistry` (`crates/machine-mgr/src/machine.rs`) holds
 them as `dyn Component` and routes by `component_id`.
 
@@ -71,9 +71,10 @@ The load-bearing ones, bottom-up:
 - **machine-mgr** (lib): platform-agnostic `Machine` / `Component` trait
   layer. Connects all updatable things under a single registry. Also owns
   the `BankActivator` trait + `BankActivatorError` enum.
-- **host-os-mgr** (lib): Host OS update management — IFS activation, A/B
-  boot partition switching, reboot coordination. `DevBankActivator` (mount+copy)
+- **host-os-mgr** (lib): bank activators only — `DevBankActivator` (mount+copy)
   and `PartitionBankActivator` (raw partition write) implement `machine_mgr::BankActivator`.
+  No `Component` impl of its own: the host OS is a `ComponentAdapter` like every
+  other banked component.
 - **app-mgr** (lib): Application/container update management through the
   `Component` lifecycle. `ContainerImageComponent` validates detached
   `#container-image` payloads and imports them into Docker, Podman, or
@@ -84,8 +85,9 @@ The load-bearing ones, bottom-up:
   and the SOVD wire adapter. `ComponentBackend` is the per-component state machine
   and *is* the `DiagnosticBackend` — wired straight into SOVD (the old
   `ComponentDiagBackend` indirection was deleted).
-  `dispatcher.rs` resolves a SUIT envelope's target `BankSet` (used by the
-  /updates wire to reject mismatches with HTTP 415 before opening a session).
+  `dispatcher.rs` checks a SUIT envelope's target component NAME against the
+  route's component (used by the /updates wire to reject mismatches with HTTP 415
+  before opening a session).
 
 Design docs: `docs/hsm-backend-architecture.md` (the HSM contract + the link-B C
 vendor handoff) and `docs/vhsm-integration-path.md`; the SOVD server entrypoints
@@ -99,7 +101,7 @@ inventoried in `docs/sovd-entrypoints.md`. HSM tooling under
 vm-boot        — WHEN to boot which bank (runs once at startup, all bank sets)
 vm-service     — HOW to start/stop VMs (QEMU QMP, qvm lifecycle)
 component-mgr         — WHAT to flash and verify (OTA engine, SUIT, SOVD wire)
-host-os-mgr    — Host-specific: IFS write, partition swap, reboot
+host-os-mgr    — Host-specific bank activators: IFS write, partition swap
 machine-mgr    — Abstract trait layer connecting them all
 ```
 
@@ -117,7 +119,7 @@ machine-mgr    — Abstract trait layer connecting them all
 
 ### Key Concepts
 
-- **Bank sets**: a runtime slot count derived from the NV device size (`slot_count()`, default 16, max 32 — the width of the u32 reboot-owed mask), 6 named — Hsm (single-bank), Bootloader (reserved), Os/host-os (A/B, IFS+rootfs atomic), Rt (Cortex-M7), Vm1, Vm2 (A/B); the remaining slots are unnamed (`set<N>` dirs unless config sets `storage_subdir`)
+- **Bank sets**: a runtime slot count derived from the NV device size (`slot_count()`, default 16, max 32 — the width of the u32 reboot-owed mask); a slot is a *number*, nothing more — a component's slot comes from its spec (`slot: N`, written by the platform profile) and the library names no slot (the old names live on only as `test-seams` fixtures, `nv_store::slots::*`). Storage dir = `storage_subdir` if set, else the component id
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA)
 - **Per-bank VM config**: `vm-config.yaml` in bank directories, delivered alongside firmware
 - **Multi-payload SUIT**: host-os carries `#ifs` + `#rootfs` in one envelope; VMs carry kernel + rootfs + config
@@ -136,7 +138,7 @@ machine-mgr    — Abstract trait layer connecting them all
 crates/component-mgr/src/
   backend.rs              — ComponentBackend: per-component state machine
   component_adapter.rs    — ComponentAdapter: exposes ComponentBackend via Component
-  dispatcher.rs           — F.D3 SUIT-aware target resolver (peek_target_bank_set / check_target)
+  dispatcher.rs           — F.D3 SUIT target component-name check (peek_target_component / check_target)
   suit_provider.rs        — SUIT envelope validation
   manifest_provider.rs    — ManifestProvider trait
   ota.rs                  — OTA engine: install, commit, rollback
@@ -147,7 +149,6 @@ tools/crates/vm-diagctl/src/
   main.rs                 — vm-diagctl CLI over the component-mgr lib (NV/bank + factory ops; NOT an HTTP server — the SOVD/OTA server is the vm-sovd crate in services/)
 
 crates/host-os-mgr/src/
-  component.rs            — HostOsComponent (implements machine_mgr::Component)
   ifs/mod.rs              — re-exports BankActivator + BankActivatorError from machine-mgr
   ifs/dev.rs              — DevBankActivator (mount + atomic copy)
   ifs/partition.rs        — PartitionBankActivator (raw block device write)
