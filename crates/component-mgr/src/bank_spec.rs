@@ -18,28 +18,35 @@ use nv_store::types::BankSet;
 /// Per-bank-set spec attached to each ComponentBackend at construction.
 #[derive(Debug, Clone)]
 pub struct BankSetSpec {
-    /// On-disk subdirectory under `images_dir`. E.g. "vm1", "host-os",
-    /// "custom", or a deployment-defined name for an extra slot.
+    /// On-disk subdirectory under `images_dir`. E.g. "vm1" or "os" for a
+    /// named slot, `set<N>` for an unnamed one, or whatever deployment
+    /// config sets via `storage_subdir`.
     pub dir_name: String,
 }
 
 impl BankSetSpec {
-    /// Build the default spec for one of the well-known BankSet slots —
-    /// the on-disk directory name that slot lives under. Every existing
-    /// ComponentBackend constructor goes through here; component-factory
-    /// overrides `dir_name` from deployment config (`storage_subdir`)
-    /// when a slot needs a distinct directory.
+    /// Build the default spec for a BankSet slot — the on-disk directory
+    /// name that slot lives under. Every existing ComponentBackend
+    /// constructor goes through here; component-factory overrides
+    /// `dir_name` from deployment config (`storage_subdir`) when a slot
+    /// needs a distinct directory.
     pub fn for_well_known(bs: BankSet) -> Self {
         let dir_name = match bs {
-            BankSet::Hsm => "hsm",
-            BankSet::Bootloader => "bootloader",
-            BankSet::Os => "os",
-            BankSet::Rt => "rt",
-            BankSet::Vm1 => "vm1",
-            BankSet::Vm2 => "vm2",
-            _ => "custom",
-        }
-        .to_string();
+            BankSet::Hsm => "hsm".to_string(),
+            BankSet::Bootloader => "bootloader".to_string(),
+            BankSet::Os => "os".to_string(),
+            BankSet::Rt => "rt".to_string(),
+            BankSet::Vm1 => "vm1".to_string(),
+            BankSet::Vm2 => "vm2".to_string(),
+            // Unnamed slots get an index-derived directory. Until 2026-09-23
+            // every slot past the named ones fell through to ONE constant
+            // ("custom") — and `images_dir/<dir_name>/<bank>` is where the
+            // banked payloads live, so two components on extra slots would
+            // have shared, and overwritten, a single directory. `set<N>` is
+            // unique for every slot a store can address and needs no slot
+            // vocabulary; deployment config still renames via `storage_subdir`.
+            _ => format!("set{}", bs.as_index()),
+        };
 
         Self { dir_name }
     }
@@ -84,10 +91,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_slot_falls_back_to_custom() {
-        // Slots beyond the well-known ones get the "custom" dir. Phase 3
-        // replaces this with a component-config lookup.
-        assert_eq!(BankSetSpec::for_well_known(BankSet(99)).dir_name, "custom");
+    fn unnamed_slots_get_unique_index_derived_dirs() {
+        // An unnamed slot's directory is derived from its index, so no two
+        // slots can ever share `images_dir/<dir>` — the previous constant
+        // fallback ("custom") was a live collision between any two extra
+        // slots. Checked over the whole addressable range (32 = the u32
+        // reboot-mask bound), named slots included.
+        assert_eq!(BankSetSpec::for_well_known(BankSet(6)).dir_name, "set6");
+        assert_eq!(BankSetSpec::for_well_known(BankSet(31)).dir_name, "set31");
+        let dirs: std::collections::BTreeSet<String> = (0..32u8)
+            .map(|i| BankSetSpec::for_well_known(BankSet(i)).dir_name)
+            .collect();
+        assert_eq!(dirs.len(), 32, "every slot must map to a distinct dir");
     }
 
     #[test]
