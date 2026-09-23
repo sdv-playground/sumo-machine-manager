@@ -1,7 +1,7 @@
-use nv_store::block::FileBlockDevice;
+use nv_store::block::{BlockDevice, FileBlockDevice};
 use nv_store::selector::FileSelectorStore;
-use nv_store::store::MIN_NV_DEVICE_SIZE;
-use nv_store::types::BankSet;
+use nv_store::store::nv_device_size;
+use nv_store::types::{BankSet, DEFAULT_SLOTS};
 use std::path::PathBuf;
 use vm_boot::{BootAction, BootManager, HashCheck};
 
@@ -59,7 +59,7 @@ fn main() {
 
     let dev = if init && !nv_path.exists() {
         eprintln!("[bootmgr] creating NV store: {}", nv_path.display());
-        FileBlockDevice::create(&nv_path, MIN_NV_DEVICE_SIZE)
+        FileBlockDevice::create(&nv_path, nv_device_size(DEFAULT_SLOTS))
     } else {
         FileBlockDevice::open(&nv_path)
     };
@@ -73,6 +73,14 @@ fn main() {
     };
 
     let mut mgr = BootManager::new(dev);
+    // The addressable slot count comes from the file's size, so print what this
+    // store actually is — an existing file may be smaller than a fresh one.
+    eprintln!(
+        "[bootmgr] NV store {}: {} bytes = {} slots",
+        nv_path.display(),
+        mgr.nv().device().size(),
+        mgr.nv().slot_count()
+    );
     if let Some(dir) = &selector_dir {
         eprintln!("[bootmgr] using boot selector: {}", dir.display());
         mgr = mgr.with_selector(Box::new(FileSelectorStore::new(dir.clone())));
@@ -98,7 +106,15 @@ fn main() {
     ];
 
     for &(name, idx, set) in output_sets {
-        let action = &actions[idx];
+        // `actions` is one entry per ADDRESSABLE slot, so an undersized store
+        // can simply not have this set. Say so rather than panicking.
+        let Some(action) = actions.get(idx) else {
+            eprintln!(
+                "[bootmgr] {name}: NV slot {idx} is beyond this store's {} slots",
+                actions.len()
+            );
+            continue;
+        };
         match action {
             BootAction::FirstBoot => {
                 println!("[bootmgr] {name}: first boot, initialized to bank A");

@@ -137,14 +137,15 @@ impl<D: BlockDevice> BootManager<D> {
     /// Process boot for all bank sets. Handles trial mode, auto-rollback,
     /// and writes updated boot state to NV.
     ///
-    /// Returns one BootAction per bank set. Does NOT verify image hashes —
-    /// call `verify_image` separately for that.
+    /// Returns one BootAction per bank set the store can address — the Vec's
+    /// length is `nv().slot_count()`, indexed by `BankSet::as_index()`. Does
+    /// NOT verify image hashes — call `verify_image` separately for that.
     ///
     /// Selector-driven when a [`SelectorStore`] is attached *and* its PRIMARY
     /// slot exists (see module docs); otherwise the NV path runs unchanged. An
     /// absent PRIMARY is first boot — the host seeds the selector only after
     /// `vm-boot` has run once — so it falls through to NV.
-    pub fn process_boot(&mut self) -> Result<[BootAction; NUM_BANK_SETS], BootError> {
+    pub fn process_boot(&mut self) -> Result<Vec<BootAction>, BootError> {
         if let Some(selector) = self.selector.as_ref() {
             if let Some(primary) = selector.read_primary() {
                 let secondary = selector.read_secondary();
@@ -159,22 +160,22 @@ impl<D: BlockDevice> BootManager<D> {
     /// The original NV-driven boot: per-set `active_bank` / `committed` /
     /// `boot_count` in `NvBootState`, each set committing/rolling back on its
     /// own. Used when no selector is attached, or before PRIMARY is seeded.
-    fn process_boot_nv(&mut self) -> Result<[BootAction; NUM_BANK_SETS], BootError> {
+    fn process_boot_nv(&mut self) -> Result<Vec<BootAction>, BootError> {
+        let slots = self.nv.slot_count();
         let mut state = match self.nv.read_boot_state() {
             Some(s) => s,
             None => {
                 // First boot — initialize default state (all committed to Bank A)
                 let mut default = NvBootState::default();
                 self.nv.write_boot_state(&mut default)?;
-                return Ok(std::array::from_fn(|_| BootAction::FirstBoot));
+                return Ok(vec![BootAction::FirstBoot; slots]);
             }
         };
 
-        let mut actions: [BootAction; NUM_BANK_SETS] =
-            std::array::from_fn(|_| BootAction::FirstBoot);
+        let mut actions = vec![BootAction::FirstBoot; slots];
         let mut state_changed = false;
 
-        for (i, bs) in state.banks.iter_mut().enumerate() {
+        for (i, bs) in state.banks.iter_mut().enumerate().take(slots) {
             if bs.committed {
                 actions[i] = BootAction::Boot {
                     bank: bs.active_bank,
@@ -236,7 +237,8 @@ impl<D: BlockDevice> BootManager<D> {
         &mut self,
         primary: &SelectorBlob,
         secondary: Option<&SelectorBlob>,
-    ) -> Result<[BootAction; NUM_BANK_SETS], BootError> {
+    ) -> Result<Vec<BootAction>, BootError> {
+        let slots = self.nv.slot_count();
         // NV state still backs the per-set trial-boot counter (and any
         // not-in-selector sets). Initialize it on first sight, exactly like the
         // NV path, so `boot_count` storage exists.
@@ -249,8 +251,7 @@ impl<D: BlockDevice> BootManager<D> {
             }
         };
 
-        let mut actions: [BootAction; NUM_BANK_SETS] =
-            std::array::from_fn(|_| BootAction::FirstBoot);
+        let mut actions = vec![BootAction::FirstBoot; slots];
         let mut state_changed = false;
 
         // First pass: classify each selector-known set and accumulate trial
@@ -260,12 +261,12 @@ impl<D: BlockDevice> BootManager<D> {
         // (index, primary_bank, secondary_bank) for each trialed set — used to
         // emit AutoRollback after a global revert.
         let mut trialed: Vec<(usize, Bank, Bank)> = Vec::new();
-        let mut handled = [false; NUM_BANK_SETS];
+        let mut handled = vec![false; slots];
 
         for (set, sel) in &primary.selectors {
             let bank = sel.bank;
             let idx = set.as_index();
-            if idx >= NUM_BANK_SETS {
+            if idx >= slots {
                 continue;
             }
             handled[idx] = true;
@@ -330,7 +331,7 @@ impl<D: BlockDevice> BootManager<D> {
         // Sets the selector doesn't carry fall back to their NV per-set logic
         // (committed → Boot; trial → count / NV-rollback). Keeps NV authority
         // intact for components not yet flipped onto the selector.
-        for i in 0..NUM_BANK_SETS {
+        for i in 0..slots {
             if handled[i] {
                 continue;
             }

@@ -39,7 +39,9 @@ impl Bank {
 /// partition layout. The slot index is a fixed semantic layout
 /// (`Hsm=0`, `Bootloader=1`, `Os=2`, `Rt=3`, `Vm1=4`, `Vm2=5`)
 /// exposed as associated constants; the type itself is opaque, so
-/// any slot index in `0..NUM_BANK_SETS` is a valid `BankSet`.
+/// any slot index in `0..MAX_SLOTS` is a valid `BankSet` — whether a
+/// given store can *address* it is a per-store question
+/// ([`NvStore::slot_in_range`](crate::store::NvStore::slot_in_range)).
 ///
 /// Phase 2 moves the per-slot behavior (dir name, file-naming
 /// layout) off the type and into a deployment-config-supplied
@@ -63,12 +65,6 @@ impl BankSet {
     pub const Rt: BankSet = BankSet(3);
     pub const Vm1: BankSet = BankSet(4);
     pub const Vm2: BankSet = BankSet(5);
-
-    /// Iterate every slot the NV-store can address. Replaces the
-    /// old `BankSet::all() -> [BankSet; NUM_BANK_SETS]` array.
-    pub fn all() -> impl Iterator<Item = BankSet> {
-        (0..NUM_BANK_SETS).map(|i| BankSet(i as u8))
-    }
 
     /// Map this slot to its array index in NV records (`banks[i]`).
     /// Replaces `bank_set as usize`.
@@ -98,17 +94,20 @@ impl BankSet {
     }
 }
 
-/// Capacity of the NV `banks` array — how many bank slots the
-/// store can address. Deployments use 0..N of these; slots beyond
-/// what a deployment registers are unused but still allocated.
-///
-/// Currently 6 are named (Hsm, Bootloader, Os, Rt, Vm1, Vm2) and in
-/// production use (Rt holds the RT/Cortex-M7 component; Bootloader is
-/// reserved headroom with no component mapped yet). Slots 6..9 are
-/// reserved headroom — adding a new component just picks an unused
-/// index without bumping this constant + the NV partition size + the
-/// on-device file.
-pub const NUM_BANK_SETS: usize = 10;
+/// Hard ceiling on bank slots: the width of the `NvUpdateSession`
+/// reboot-owed bitmask (u32) AND the capacity of the `NvBootState`
+/// `banks` array. How many slots a given store *addresses* is a
+/// runtime property derived from its device size
+/// ([`NvStore::slot_count`](crate::store::NvStore::slot_count)); this
+/// is only the bound neither can exceed.
+pub const MAX_SLOTS: usize = 32;
+
+/// Slot count a fresh store is created with when the platform doesn't
+/// say otherwise — the CVC contract's image count. An existing store
+/// keeps whatever its device size gives it; only the create path
+/// (`nv_device_size(DEFAULT_SLOTS)`) uses this.
+pub const DEFAULT_SLOTS: usize = 16;
+
 pub const MAX_TRIAL_BOOTS: u8 = 10;
 
 // NV partition magic numbers (sector validation)
@@ -215,35 +214,32 @@ impl Default for BankBootState {
     }
 }
 
-/// Complete boot state for all bank sets.
+/// Complete boot state for every slot the record can carry.
 ///
-/// Wire format (28 bytes). Each slot is 3 bytes (active_bank,
-/// committed, boot_count) in the fixed semantic order; only the
-/// first 6 of `NUM_BANK_SETS` are named today.
+/// Wire format (`8 + 3*MAX_SLOTS` = 104 bytes): a fixed header, then one
+/// 3-byte entry per slot at a fixed stride, in slot-index order.
 /// ```text
-/// [0..4]   magic (NVB1)
-/// [4..8]   write_seq
-/// [8]      hsm.active_bank        (slot 0)
-/// [9]      hsm.committed
-/// [10]     hsm.boot_count
-/// [11]     bootloader.active_bank (slot 1)
-/// [12]     bootloader.committed
-/// [13]     bootloader.boot_count
-/// [14]     os.active_bank         (slot 2)
-/// [15]     os.committed
-/// [16]     os.boot_count
-/// [17]     rt.active_bank         (slot 3)
-/// [18]     rt.committed
-/// [19]     rt.boot_count
-/// [20]     vm1.active_bank        (slot 4)
-/// [21]     vm1.committed
-/// [22]     vm1.boot_count
-/// [23..28] padding
+/// [0..4]       magic (NVB1)
+/// [4..8]       write_seq
+/// [8 + i*3]    banks[i].active_bank   for i in 0..MAX_SLOTS
+/// [9 + i*3]    banks[i].committed
+/// [10 + i*3]   banks[i].boot_count
 /// ```
+///
+/// The base and stride have never moved, so the record only ever grew in
+/// place and the magic was never bumped: 5 slots → 10 on 2026-05-29 (the
+/// RT component needed a slot the file had no room for), 10 →
+/// `MAX_SLOTS` on 2026-09-23 (the addressable count became a per-store
+/// runtime value derived from the device size). A record written by an
+/// older, fewer-slot writer leaves the trailing entries as the sector's
+/// zero padding, which decodes as `{Bank::A, committed: false,
+/// boot_count: 0}` — harmless, because
+/// [`read_boot_state`](crate::store::NvStore::read_boot_state) resets
+/// every entry past the store's own slot count to the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NvBootState {
     pub write_seq: u32,
-    pub banks: [BankBootState; NUM_BANK_SETS],
+    pub banks: [BankBootState; MAX_SLOTS],
 }
 
 impl Default for NvBootState {
@@ -259,7 +255,7 @@ impl NvRecord for NvBootState {
     const MAGIC: u32 = MAGIC_BOOT;
 
     fn size() -> usize {
-        28 // 4 magic + 4 seq + 6*3 banks + 2 padding
+        8 + 3 * MAX_SLOTS // 4 magic + 4 seq + 3 bytes per slot
     }
 
     fn write_seq(&self) -> u32 {
@@ -286,9 +282,9 @@ impl NvRecord for NvBootState {
             return None;
         }
         let write_seq = get_u32_le(buf, 4);
-        let mut banks: [BankBootState; NUM_BANK_SETS] = Default::default();
+        let mut banks: [BankBootState; MAX_SLOTS] = std::array::from_fn(|_| Default::default());
         #[allow(clippy::needless_range_loop)]
-        for i in 0..NUM_BANK_SETS {
+        for i in 0..MAX_SLOTS {
             let off = 8 + i * 3;
             banks[i] = BankBootState {
                 active_bank: Bank::from_u8(buf[off])?,
@@ -733,8 +729,14 @@ impl NvRecord for NvVehicle {
 /// [0..4]    magic (NVU1)
 /// [4..8]    write_seq
 /// [8..40]   session_id (32 bytes; the transaction's provenance — zero = none)
-/// [40..42]  reboot_owed (u16 bitmask over bank sets; bit i = BankSet(i))
+/// [40..44]  reboot_owed (u32 bitmask over bank sets; bit i = BankSet(i))
 /// ```
+///
+/// `reboot_owed` was a u16 at `[40..42]` until 2026-09-23, when the slot
+/// count became a per-store runtime value bounded by `MAX_SLOTS`. Being the
+/// LAST field, widening it is a pure extension — a u16-era record's two
+/// trailing bytes are the sector's zero padding, so it decodes with the
+/// upper half zero and the magic did not need a bump.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NvUpdateSession {
     pub write_seq: u32,
@@ -745,7 +747,7 @@ pub struct NvUpdateSession {
     pub session_id: [u8; 32],
     /// Bank sets that owe the coalesced node reboot (bit i ⇒ `BankSet(i)`).
     /// Nonzero ⇒ the node is `RebootPending`.
-    pub reboot_owed: u16,
+    pub reboot_owed: u32,
 }
 
 impl NvUpdateSession {
@@ -757,7 +759,7 @@ impl NvUpdateSession {
 
     /// True when bank set `set` owes the pending node reboot.
     pub fn owes(&self, set: BankSet) -> bool {
-        self.reboot_owed & (1u16 << set.as_index()) != 0
+        self.reboot_owed & (1u32 << set.as_index()) != 0
     }
 }
 
@@ -765,7 +767,7 @@ impl NvRecord for NvUpdateSession {
     const MAGIC: u32 = MAGIC_UPDATE_SESSION;
 
     fn size() -> usize {
-        42
+        44
     }
 
     fn write_seq(&self) -> u32 {
@@ -780,7 +782,7 @@ impl NvRecord for NvUpdateSession {
         put_u32_le(buf, 0, Self::MAGIC);
         put_u32_le(buf, 4, self.write_seq);
         put_bytes(buf, 8, &self.session_id);
-        put_u16_le(buf, 40, self.reboot_owed);
+        put_u32_le(buf, 40, self.reboot_owed);
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
@@ -790,7 +792,7 @@ impl NvRecord for NvUpdateSession {
         Some(Self {
             write_seq: get_u32_le(buf, 4),
             session_id: get_bytes::<32>(buf, 8),
-            reboot_owed: get_u16_le(buf, 40),
+            reboot_owed: get_u32_le(buf, 40),
         })
     }
 }

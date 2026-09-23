@@ -175,7 +175,7 @@ the UDS-device handler (SOVDd) — never by the client.
 
 ## Key Concepts
 
-- **Bank sets**: 10 slots (`NUM_BANK_SETS=10`), 6 named — Hsm (single-bank), Bootloader (reserved), Os/host-os (A/B, IFS+rootfs atomic), Rt (Cortex-M7), Vm1, Vm2 (A/B); slots 6–9 reserved headroom
+- **Bank sets**: a runtime slot count derived from the NV device size (`slot_count()`, default 16, max 32 — the width of the u32 reboot-owed mask), 6 named — Hsm (single-bank), Bootloader (reserved), Os/host-os (A/B, IFS+rootfs atomic), Rt (Cortex-M7), Vm1, Vm2 (A/B); the remaining slots are unnamed (`set<N>` dirs unless config sets `storage_subdir`)
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA via SOVD)
 - **Per-bank VM config**: vm-config.yaml in bank directories, delivered alongside firmware via OTA
 - **Multi-payload SUIT**: host-os carries IFS + rootfs; VMs carry kernel + rootfs + config
@@ -197,7 +197,7 @@ platform-independent — only the trait implementations change per target.
 
 ## NV Store Layout
 
-The NV store holds these record types (the per-bank-set `banks` array is sized `NUM_BANK_SETS=10`):
+The NV store holds these record types (the per-bank-set `banks` array holds `MAX_SLOTS = 32` entries; a store exposes the first `slot_count()` of them):
 
 ```
 Boot State     — active bank, committed flag, boot count (per bank set)

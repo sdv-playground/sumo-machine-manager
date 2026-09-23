@@ -172,6 +172,10 @@ pub fn write_record<T: NvRecord>(
 /// High-level NV store providing typed access to all NV regions.
 pub struct NvStore<D: BlockDevice> {
     dev: D,
+    /// How many bank slots this store can address — derived from the device
+    /// size once, at open (see [`NvStore::slot_count`]). Not a compile-time
+    /// constant: the same binary runs against NV files of different sizes.
+    slot_count: usize,
 }
 
 /// Outcome of [`NvStore::confirm_running_bank`] — whether the node is running
@@ -193,7 +197,11 @@ pub enum RunningBankVerdict {
 
 impl<D: BlockDevice> NvStore<D> {
     pub fn new(dev: D) -> Self {
-        Self { dev }
+        let slot_count = MAX_SLOTS.min(
+            (dev.size().saturating_sub(layout::BANKSET_BASE) / layout::BANKSET_STRIDE) as usize,
+        );
+        tracing::info!("nv store: {slot_count} slots ({} bytes)", dev.size());
+        Self { dev, slot_count }
     }
 
     pub fn into_inner(self) -> D {
@@ -204,10 +212,39 @@ impl<D: BlockDevice> NvStore<D> {
         &self.dev
     }
 
+    /// How many bank slots this device has room for, capped at [`MAX_SLOTS`]
+    /// (the width of the reboot-owed mask and of the boot-state record).
+    /// Computed once in [`NvStore::new`] — the device is fixed for the store's
+    /// life.
+    pub fn slot_count(&self) -> usize {
+        self.slot_count
+    }
+
+    /// Every slot this store can address, low to high. The runtime replacement
+    /// for iterating a compile-time slot constant.
+    pub fn slots(&self) -> impl Iterator<Item = BankSet> {
+        (0..self.slot_count).map(|i| BankSet(i as u8))
+    }
+
+    /// Whether `set` is a slot this store can address. False ⇒ its bank region
+    /// lies past the end of the device.
+    pub fn slot_in_range(&self, set: BankSet) -> bool {
+        set.as_index() < self.slot_count
+    }
+
     // --- Boot State ---
 
     pub fn read_boot_state(&self) -> Option<NvBootState> {
-        read_record(&self.dev, layout::BOOT_OFFSET, layout::BOOT_SECTORS)
+        let mut state: NvBootState =
+            read_record(&self.dev, layout::BOOT_OFFSET, layout::BOOT_SECTORS)?;
+        // The record always carries MAX_SLOTS entries, but a store only owns
+        // the ones its device has room for. Reset the rest: a slot whose banks
+        // cannot be read must never look armed or uncommitted to the boot /
+        // commit logic.
+        for bs in state.banks.iter_mut().skip(self.slot_count) {
+            *bs = BankBootState::default();
+        }
+        Some(state)
     }
 
     pub fn write_boot_state(&mut self, state: &mut NvBootState) -> Result<(), BlockError> {
@@ -346,7 +383,7 @@ impl<D: BlockDevice> NvStore<D> {
         }
 
         let mut s = self.read_update_session().unwrap_or_default();
-        let bit = 1u16 << bank_set.as_index();
+        let bit = 1u32 << bank_set.as_index();
         if s.reboot_owed & bit != 0 {
             s.reboot_owed &= !bit;
             self.write_update_session(&mut s)?;
@@ -354,9 +391,25 @@ impl<D: BlockDevice> NvStore<D> {
         Ok(RunningBankVerdict::Confirmed { bank: armed })
     }
 
+    /// The error a per-slot write gets for a slot this store cannot address.
+    /// Names the region the write WOULD have landed on, so the message reads
+    /// the same as the `OutOfBounds` the device itself would raise.
+    fn out_of_range(&self, set: BankSet) -> BlockError {
+        BlockError::OutOfBounds {
+            offset: layout::bankset_offset(set),
+            len: layout::BANKSET_STRIDE as usize,
+            size: self.dev.size(),
+        }
+    }
+
     // --- FW Meta (per bank set, per bank) ---
 
+    /// `None` for a slot past [`NvStore::slot_count`] — the same answer as a
+    /// never-written record, which is what an unaddressable slot is.
     pub fn read_fw_meta(&self, set: BankSet, bank: Bank) -> Option<NvFwMeta> {
+        if !self.slot_in_range(set) {
+            return None;
+        }
         let offset = layout::fw_meta_offset(set, bank);
         read_record(&self.dev, offset, layout::FW_META_SECTORS)
     }
@@ -367,13 +420,21 @@ impl<D: BlockDevice> NvStore<D> {
         bank: Bank,
         meta: &mut NvFwMeta,
     ) -> Result<(), BlockError> {
+        if !self.slot_in_range(set) {
+            return Err(self.out_of_range(set));
+        }
         let offset = layout::fw_meta_offset(set, bank);
         write_record(&mut self.dev, offset, layout::FW_META_SECTORS, meta)
     }
 
     // --- Runtime (per bank set, per bank) ---
 
+    /// `None` for a slot past [`NvStore::slot_count`] — see
+    /// [`read_fw_meta`](Self::read_fw_meta).
     pub fn read_runtime(&self, set: BankSet, bank: Bank) -> Option<NvRuntime> {
+        if !self.slot_in_range(set) {
+            return None;
+        }
         let offset = layout::runtime_offset(set, bank);
         read_record(&self.dev, offset, layout::RUNTIME_SECTORS)
     }
@@ -384,6 +445,9 @@ impl<D: BlockDevice> NvStore<D> {
         bank: Bank,
         runtime: &mut NvRuntime,
     ) -> Result<(), BlockError> {
+        if !self.slot_in_range(set) {
+            return Err(self.out_of_range(set));
+        }
         let offset = layout::runtime_offset(set, bank);
         write_record(&mut self.dev, offset, layout::RUNTIME_SECTORS, runtime)
     }
@@ -399,18 +463,30 @@ impl<D: BlockDevice> NvStore<D> {
     }
 }
 
-/// Minimum device size to hold the full NV layout for all `NUM_BANK_SETS`
-/// slots. Computed as `BANKSET_BASE + NUM_BANK_SETS * BANKSET_STRIDE`
-/// (with current values: `0x10000 + 10*0x18000 = 0x100000` = 1 MiB).
+/// Device size that holds the full NV layout for exactly `slots` bank slots:
+/// the fixed header region plus one `BANKSET_STRIDE` window per slot. The
+/// inverse of [`NvStore::slot_count`] — what a creator asks for, versus what
+/// an opener derives.
+pub const fn nv_device_size(slots: usize) -> u64 {
+    layout::BANKSET_BASE + slots as u64 * layout::BANKSET_STRIDE
+}
+
+/// The size a fresh store is created with: a [`DEFAULT_SLOTS`]-slot store
+/// (`0x190000` = 1.5625 MiB). NOT a floor a store must meet — a store's real
+/// slot count is derived from its device at open ([`NvStore::slot_count`]),
+/// so a smaller file is simply a smaller store, and a larger one addresses
+/// more slots (up to [`MAX_SLOTS`]).
 ///
-/// Bumped from 0x88000 (544 KiB, 5 slots) → 0x100000 (1 MiB, 10 slots)
-/// on 2026-05-29 when the RT/Cortex-M7 component landed using slot 5
-/// and we found the existing NV file was sized for only 5 slots. The
-/// bump gives 4 slots of headroom for future components without another
-/// migration.
+/// History: 0x88000 (5 slots) → 0x100000 (10 slots) on 2026-05-29, when the
+/// RT/Cortex-M7 component landed on a slot the file had no room for; →
+/// 0x190000 (16 slots) on 2026-09-23 with the runtime slot count. The name is
+/// kept because ~60 test fixtures and the supernova host address it.
 ///
-/// On-device NV files smaller than this are re-created (wiped) at next
-/// host start — the existing bootstrap path handles this via
-/// `tracing::warn!("NV store too small, recreating")`. Operators
-/// re-provision via the factory_reset / provisioning flow.
-pub const MIN_NV_DEVICE_SIZE: u64 = 0x100000; // 1 MiB (10 slots × 96 KiB + 64 KiB header)
+/// Growing an existing on-device file is the HOST's job, not this library's:
+/// `supernova-machine-manager/src/main.rs` compares the file against the size
+/// it wants and re-creates (wipes) it when it falls short — operators
+/// re-provision via the factory_reset / provisioning flow. This repo's `boot`
+/// and `vm-sovd` binaries only create the file when it is MISSING; they never
+/// resize one that exists (and could not: qnx6's `ftruncate(grow)` is a silent
+/// no-op — see `FileBlockDevice::create`).
+pub const MIN_NV_DEVICE_SIZE: u64 = nv_device_size(DEFAULT_SLOTS);

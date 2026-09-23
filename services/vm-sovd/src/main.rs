@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use nv_store::block::FileBlockDevice;
-use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
-use nv_store::types::{BankSet, NvBootState};
+use nv_store::store::{nv_device_size, NvStore};
+use nv_store::types::{BankSet, NvBootState, DEFAULT_SLOTS};
 
 use sovd_core::DiagnosticBackend;
 
@@ -157,7 +157,8 @@ async fn main() {
         FileBlockDevice::open(&nv_path).expect("failed to open NV store")
     } else {
         tracing::info!("creating NV store: {}", nv_path.display());
-        FileBlockDevice::create(&nv_path, MIN_NV_DEVICE_SIZE).expect("failed to create NV store")
+        FileBlockDevice::create(&nv_path, nv_device_size(DEFAULT_SLOTS))
+            .expect("failed to create NV store")
     };
 
     let mut nv = NvStore::new(dev);

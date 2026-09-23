@@ -42,11 +42,13 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub bank_set: Option<String>,
 
-    /// Explicit NV slot index (0..=NUM_BANK_SETS-1). Wins over both
-    /// `bank_set` and id-based resolution when present. Set this
-    /// when a deployment uses more than one custom slot — the slot
-    /// number is the source of truth, the dir name + layout below
-    /// describe what to do with it.
+    /// Explicit NV slot index. Wins over both `bank_set` and id-based
+    /// resolution when present. Set this when a deployment uses more
+    /// than one custom slot — the slot number is the source of truth,
+    /// the dir name + layout below describe what to do with it. Must
+    /// be a slot the open NV store can address (its size decides how
+    /// many it has); [`build_component`] refuses the component
+    /// otherwise.
     #[serde(default)]
     pub slot: Option<u8>,
 
@@ -382,6 +384,27 @@ fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
     Some(Arc::new(provider))
 }
 
+/// Refuse a component whose NV slot the open store cannot address. The store's
+/// slot count comes from its device size, so a config can legitimately name a
+/// slot a smaller NV file has no room for — catch it here, where the configured
+/// slot first meets the store, rather than at the first bank read further down.
+fn check_slot_in_range<D: BlockDevice>(
+    id: &str,
+    bank_set: BankSet,
+    nv: &NvStore<D>,
+) -> Result<(), String> {
+    if nv.slot_in_range(bank_set) {
+        return Ok(());
+    }
+    Err(format!(
+        "component '{id}' uses NV slot {} but this store has {} slots ({} bytes) \
+         — recreate the store larger or fix the slot",
+        bank_set.as_index(),
+        nv.slot_count(),
+        nv.device().size(),
+    ))
+}
+
 /// Build a single component from its spec and shared dependencies.
 pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
     spec: &ComponentSpec,
@@ -395,6 +418,11 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
         );
         return None;
     };
+
+    if let Err(msg) = check_slot_in_range(&spec.id, bank_set, &deps.nv.lock().unwrap()) {
+        tracing::error!("{msg}");
+        return None;
+    }
 
     match spec.component_type.as_str() {
         "app" => {
@@ -670,4 +698,87 @@ fn default_true() -> bool {
 /// colocated with the sealed segments.
 pub fn default_slog2_live_dir() -> String {
     "/dev/shmem".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nv_store::block::MemBlockDevice;
+    use nv_store::store::nv_device_size;
+
+    fn spec_on_slot(id: &str, slot: u8) -> ComponentSpec {
+        ComponentSpec {
+            id: id.to_string(),
+            component_type: "bank".to_string(),
+            rollback: true,
+            single_bank: false,
+            storage_path: None,
+            base_path: None,
+            bank_set: None,
+            slot: Some(slot),
+            storage_subdir: None,
+            activator: None,
+            display_name: None,
+            entity_type: None,
+            log_agent_url: None,
+            host_log_globs: None,
+            host_dump_dir: None,
+            host_slog2: false,
+            host_slog2_segments_dir: None,
+            host_slog2_live_dir: default_slog2_live_dir(),
+            test_agent_url: None,
+            diag_agent_url: None,
+            host_diagnostics: false,
+        }
+    }
+
+    fn ten_slot_deps() -> FactoryDeps<MemBlockDevice> {
+        FactoryDeps {
+            nv: Arc::new(Mutex::new(NvStore::new(MemBlockDevice::new(
+                nv_device_size(10) as usize,
+            )))),
+            manifest_provider: Arc::new(
+                component_mgr::suit_provider::SuitProvider::with_factory_authority(),
+            ),
+            vm_service_addr: None,
+            hsm_provider: None,
+            hsm_crypto: None,
+            hsm_keystore: None,
+            hsm_port: 5100,
+            bank_activators: HashMap::new(),
+            partition_parts: HashMap::new(),
+            health_probes: HashMap::new(),
+            node_boot_id: None,
+            deactivators: HashMap::new(),
+            boot_selector: None,
+            node_coordinator: None,
+            post_provision_reload: None,
+            wall_clock_floor: None,
+        }
+    }
+
+    /// A configured slot the store has no room for is an operator error, not a
+    /// runtime surprise: refuse the component at build time and say exactly what
+    /// to do about it.
+    #[test]
+    fn slot_beyond_the_store_is_refused_with_an_actionable_message() {
+        let deps = ten_slot_deps();
+        let nv = deps.nv.lock().unwrap();
+
+        assert_eq!(
+            check_slot_in_range("co-processor", BankSet(12), &nv).unwrap_err(),
+            "component 'co-processor' uses NV slot 12 but this store has 10 slots \
+             (1048576 bytes) — recreate the store larger or fix the slot"
+        );
+        // The last slot this store owns is fine; one past it is not.
+        assert!(check_slot_in_range("rt", BankSet(9), &nv).is_ok());
+    }
+
+    #[test]
+    fn build_component_skips_a_component_on_an_unaddressable_slot() {
+        let deps = ten_slot_deps();
+        assert!(build_component(&spec_on_slot("co-processor", 12), &deps).is_none());
+        // Same spec on an addressable slot still builds.
+        assert!(build_component(&spec_on_slot("co-processor", 9), &deps).is_some());
+    }
 }

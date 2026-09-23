@@ -815,7 +815,7 @@ async fn campaign_disable_manifest_enacts_at_finalize() {
         .map(|s| s.reboot_owed)
         .unwrap_or(0);
     assert_ne!(
-        owed & (1u16 << BankSet::Vm1.as_index()),
+        owed & (1u32 << BankSet::Vm1.as_index()),
         0,
         "the disable's owed reboot is recorded in NV"
     );

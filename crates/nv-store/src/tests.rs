@@ -3,7 +3,7 @@
 // at every call site for negligible benefit.  Allow at module scope.
 #![allow(clippy::field_reassign_with_default)]
 
-use crate::block::{BlockDevice, MemBlockDevice};
+use crate::block::{BlockDevice, BlockError, MemBlockDevice};
 use crate::store::*;
 use crate::types::*;
 
@@ -723,4 +723,183 @@ fn running_bank_mismatch_records_no_boot_witness() {
         }
     );
     assert_eq!(store.read_boot_state().unwrap().banks[index].boot_count, 0);
+}
+
+// --- Runtime slot count (derived from the device) ---
+
+#[test]
+fn nv_device_size_pins_the_layout() {
+    // The sizes that exist in the field — a store created at one of these
+    // must keep resolving to exactly that many slots.
+    assert_eq!(nv_device_size(10), 0x100000); // the 2026-05-29 store
+    assert_eq!(nv_device_size(16), 0x190000); // DEFAULT_SLOTS today
+    assert_eq!(nv_device_size(32), 0x310000); // MAX_SLOTS
+    assert_eq!(MIN_NV_DEVICE_SIZE, nv_device_size(DEFAULT_SLOTS));
+}
+
+#[test]
+fn slot_count_comes_from_the_device_size() {
+    let slots = |size: u64| NvStore::new(MemBlockDevice::new(size as usize)).slot_count();
+    assert_eq!(slots(nv_device_size(10)), 10);
+    assert_eq!(slots(nv_device_size(16)), 16);
+    assert_eq!(slots(nv_device_size(32)), 32);
+    // Space past MAX_SLOTS is simply not addressable — the mask and the
+    // boot-state record stop there.
+    assert_eq!(slots(0x400000), MAX_SLOTS);
+    // One byte short of the first slot's full stride ⇒ no slots at all.
+    assert_eq!(slots(layout::BANKSET_BASE + layout::BANKSET_STRIDE - 1), 0);
+}
+
+#[test]
+fn slot_in_range_stops_at_the_count() {
+    let store = NvStore::new(MemBlockDevice::new(nv_device_size(10) as usize));
+    assert_eq!(store.slots().count(), 10);
+    assert!(store.slot_in_range(BankSet(9)));
+    assert!(!store.slot_in_range(BankSet(10)));
+    // A slot the store can't address has no banks to read, and refuses writes.
+    assert!(store.read_fw_meta(BankSet(10), Bank::A).is_none());
+    assert!(store.read_runtime(BankSet(10), Bank::A).is_none());
+}
+
+#[test]
+fn writes_to_an_unaddressable_slot_are_refused() {
+    let mut store = NvStore::new(MemBlockDevice::new(nv_device_size(10) as usize));
+    let mut meta = NvFwMeta::default();
+    assert!(matches!(
+        store.write_fw_meta(BankSet(10), Bank::A, &mut meta),
+        Err(BlockError::OutOfBounds { .. })
+    ));
+    let mut runtime = NvRuntime::default();
+    assert!(matches!(
+        store.write_runtime(BankSet(10), Bank::A, &mut runtime),
+        Err(BlockError::OutOfBounds { .. })
+    ));
+}
+
+// --- Boot-state wire compatibility across the slot-count bumps ---
+
+/// A boot sector byte-for-byte as the 10-slot writer produced it (in the field
+/// 2026-05-29 … 2026-09-23): magic, seq, ten 3-byte entries, then the sector's
+/// zero padding, CRC over everything before the last four bytes.
+fn ten_slot_era_boot_sector(write_seq: u32) -> Vec<u8> {
+    let mut sector = vec![0u8; SECTOR_SIZE];
+    sector[0..4].copy_from_slice(&MAGIC_BOOT.to_le_bytes());
+    sector[4..8].copy_from_slice(&write_seq.to_le_bytes());
+    for i in 0..10 {
+        let off = 8 + i * 3;
+        sector[off] = (i % 2) as u8; // alternating Bank A / B
+        sector[off + 1] = 1; // committed
+        sector[off + 2] = i as u8; // boot_count
+    }
+    let crc = crc32fast::hash(&sector[..SECTOR_SIZE - 4]);
+    sector[SECTOR_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+    sector
+}
+
+#[test]
+fn ten_slot_era_boot_record_reads_through_a_bigger_store() {
+    let mut dev = MemBlockDevice::new(nv_device_size(16) as usize);
+    dev.write(layout::BOOT_OFFSET, &ten_slot_era_boot_sector(7))
+        .unwrap();
+    let store = NvStore::new(dev);
+
+    let state = store.read_boot_state().expect("old record still decodes");
+    assert_eq!(state.write_seq, 7);
+    for i in 0..10 {
+        let expect = if i % 2 == 0 { Bank::A } else { Bank::B };
+        assert_eq!(state.banks[i].active_bank, expect, "slot {i}");
+        assert!(state.banks[i].committed, "slot {i}");
+        assert_eq!(state.banks[i].boot_count, i as u8, "slot {i}");
+    }
+    // Slots the old writer never wrote are the sector's zero padding, which
+    // decodes as committed:FALSE (not the `default()` committed:true) — the
+    // known downgrade-era shape. Harmless: those banks hold nothing, and only
+    // an ARMED slot (active_bank flipped, boot_count > 0) is ever acted on.
+    for i in 10..16 {
+        assert_eq!(
+            state.banks[i],
+            BankBootState {
+                active_bank: Bank::A,
+                committed: false,
+                boot_count: 0,
+            },
+            "slot {i}"
+        );
+    }
+}
+
+#[test]
+fn slots_past_the_stores_count_read_back_as_default() {
+    // The same record on a 10-slot store: everything from 10 up is forced to
+    // the default, because this store cannot address those banks at all.
+    let mut dev = MemBlockDevice::new(nv_device_size(10) as usize);
+    dev.write(layout::BOOT_OFFSET, &ten_slot_era_boot_sector(7))
+        .unwrap();
+    let store = NvStore::new(dev);
+
+    let state = store.read_boot_state().unwrap();
+    assert_eq!(state.banks[9].boot_count, 9);
+    for i in 10..MAX_SLOTS {
+        assert_eq!(state.banks[i], BankBootState::default(), "slot {i}");
+    }
+}
+
+#[test]
+fn boot_state_round_trips_every_slot_on_a_full_store() {
+    let mut store = NvStore::new(MemBlockDevice::new(nv_device_size(MAX_SLOTS) as usize));
+    let mut state = NvBootState {
+        write_seq: 0,
+        banks: std::array::from_fn(|i| BankBootState {
+            active_bank: if i % 3 == 0 { Bank::B } else { Bank::A },
+            committed: i % 2 == 0,
+            boot_count: i as u8,
+        }),
+    };
+    store.write_boot_state(&mut state).unwrap();
+
+    let read = store.read_boot_state().unwrap();
+    for i in 0..MAX_SLOTS {
+        assert_eq!(read.banks[i], state.banks[i], "slot {i}");
+    }
+}
+
+// --- reboot_owed: u16 -> u32 (a pure extension, the field is last) ---
+
+#[test]
+fn u16_era_update_session_decodes_with_a_zero_upper_half() {
+    let mut sector = vec![0u8; SECTOR_SIZE];
+    sector[0..4].copy_from_slice(&MAGIC_UPDATE_SESSION.to_le_bytes());
+    sector[4..8].copy_from_slice(&3u32.to_le_bytes());
+    sector[8..40].copy_from_slice(&[0x5A; 32]);
+    // The mask as the u16-era writer left it; [42..44] is sector padding.
+    sector[40..42].copy_from_slice(&0b1_0000_0101u16.to_le_bytes());
+    let crc = crc32fast::hash(&sector[..SECTOR_SIZE - 4]);
+    sector[SECTOR_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+
+    let mut dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    dev.write(layout::UPDATE_SESSION_OFFSET, &sector).unwrap();
+    let store = NvStore::new(dev);
+
+    let s = store.read_update_session().expect("u16-era record decodes");
+    assert_eq!(s.write_seq, 3);
+    assert_eq!(s.session_id, [0x5A; 32]);
+    assert_eq!(s.reboot_owed, 0b1_0000_0101);
+    assert!(s.owes(BankSet(0)) && s.owes(BankSet(2)) && s.owes(BankSet(8)));
+    assert!(!s.owes(BankSet(1)));
+}
+
+#[test]
+fn reboot_owed_round_trips_the_top_slot() {
+    let mut store = NvStore::new(MemBlockDevice::new(nv_device_size(MAX_SLOTS) as usize));
+    let top = BankSet((MAX_SLOTS - 1) as u8);
+    let mut s = NvUpdateSession {
+        reboot_owed: 1u32 << top.as_index(),
+        ..Default::default()
+    };
+    store.write_update_session(&mut s).unwrap();
+
+    let read = store.read_update_session().unwrap();
+    assert!(read.owes(top), "bit 31 survives the widened wire");
+    assert!(!read.owes(BankSet(0)));
+    assert!(read.reboot_pending());
 }

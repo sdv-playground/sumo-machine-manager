@@ -277,7 +277,8 @@ per-component NV boot state as the authority for "which bank each set boots from
   (whole-blob copy of SECONDARY over PRIMARY — vm-boot has no signer at boot so it can't
   re-sign a per-set change).
 - `BankSet` is a `pub struct BankSet(pub u8)` newtype: `Hsm=0, Bootloader=1, Os=2, Rt=3,
-  Vm1=4, Vm2=5`, `NUM_BANK_SETS=10` (the first 6 are named; the rest reserved). The host
+  Vm1=4, Vm2=5`; the slot *count* is runtime — `slot_count()`, derived from the NV device
+  size (default 16, `MAX_SLOTS=32`) — with the first 6 named and the rest unnamed. The host
   manager rides the **Os** slot; RT is before the VMs.
 
 ```mermaid
@@ -372,7 +373,8 @@ the deployment, not the guest build (which ships only a reference example).
 ## State management
 
 Per-component NV (sector-rotated, CRC-protected, power-loss-safe): `NvBootState`
-(`[BankBootState; NUM_BANK_SETS]` — active_bank/committed/boot_count per set), `NvFactory`
+(`[BankBootState; MAX_SLOTS]` — active_bank/committed/boot_count per set, the first
+`slot_count()` addressable), `NvFactory`
 (serial/VIN/HW ids, write-once), `NvFwMeta` (per set+bank: fw identity, security version,
 image hash, `min_security_ver` floor), `NvRuntime` (writable per-bank DIDs/DTCs). Boot
 authority sits *above* this in the signed selector. Live SOVD/upload state is in-memory
@@ -433,7 +435,8 @@ cover sign/verify/encrypt/derive + handle/policy + SUIT key provisioning.
   ECDSA-P256).
 - **Converged to one diagnostics backend** — deleted `ComponentDiagBackend`; wired
   `ComponentBackend` directly; app-capable VMs use the narrow `InstallRouterDiag`.
-- **`BankSet` redo** — fixed semantic slots (`Hsm=0 … Vm2=5`, `NUM_BANK_SETS=10`).
+- **`BankSet` redo** — fixed semantic slots (`Hsm=0 … Vm2=5`); the slot *count* is runtime
+  since 2026-09-23 (device-derived, max 32).
 - **`current` symlink retired** (per-VM) — bank-relative `load kernel` + vm-service
   cwd=bank_dir. (`mmgr/current`, the host manager's own self-update bank pointer, stays.)
 - **qvm.conf moved to the deployment** as host-integration config (examples in the

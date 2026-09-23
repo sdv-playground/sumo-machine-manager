@@ -38,9 +38,9 @@ use machine_mgr::bank_provider::{BankProvider, FirmwareIdentity, InstalledFirmwa
 use crate::bank_provider::IvdBankProvider;
 use crate::did;
 use crate::lifecycle::GuestLifecycle;
-use machine_mgr::types::{RuntimeState, RuntimeStatus};
 use crate::manifest_provider::{ManifestProvider, ManifestType, ValidatedFirmware};
 use crate::ota;
+use machine_mgr::types::{RuntimeState, RuntimeStatus};
 
 /// Vendor SOVD data-parameter id for the committed bank's signed IVD
 /// manifest. `x-ota-` prefix per ISO 17978-3 Table 70 vendor-extension
@@ -1778,7 +1778,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // target_bank() may be the LIVE bank (single-bank components target
         // their only bank) and this is called as a stale-DELETE no-op.
         if had_session {
-            if let Err(e) = self.bank_provider.prepare_target(self.bank_provider.target_bank()) {
+            if let Err(e) = self
+                .bank_provider
+                .prepare_target(self.bank_provider.target_bank())
+            {
                 tracing::warn!(
                     error = %e,
                     "abort: staging bank dir not wiped — space reclaims at next flash"
@@ -1887,8 +1890,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .lock()
             .map_err(|_| BackendError::Internal("nv lock".into()))?;
         let session = nv.read_update_session().unwrap_or_default();
-        let reboot_owed = (0..nv_store::types::NUM_BANK_SETS)
-            .filter(|&i| session.reboot_owed & (1u16 << i) != 0)
+        let reboot_owed = (0..nv.slot_count())
+            .filter(|&i| session.reboot_owed & (1u32 << i) != 0)
             .map(|i| {
                 self.node_coordinator
                     .as_ref()
@@ -1912,7 +1915,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .lock()
             .map_err(|_| BackendError::Internal("nv lock".into()))?;
         let mut s = nv.read_update_session().unwrap_or_default();
-        let bit = 1u16 << self.bank_set.as_index();
+        let bit = 1u32 << self.bank_set.as_index();
         let before = s.reboot_owed;
         if owed {
             s.reboot_owed |= bit;
@@ -2801,7 +2804,7 @@ fn trial_labels<D: BlockDevice>(
 ) -> Vec<String> {
     nv.read_boot_state()
         .map(|s| {
-            (0..NUM_BANK_SETS)
+            (0..nv.slot_count())
                 .filter(|&i| is_member(&s.banks[i]))
                 .map(|i| coord.label(i))
                 .collect()

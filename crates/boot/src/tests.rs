@@ -6,7 +6,7 @@ use nv_store::block::MemBlockDevice;
 use nv_store::selector::{
     InMemorySelectorStore, SelectorBlob, SelectorStore, SlotSelect, TestSigner,
 };
-use nv_store::store::MIN_NV_DEVICE_SIZE;
+use nv_store::store::{nv_device_size, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -15,6 +15,20 @@ use crate::*;
 
 fn make_bootmgr() -> BootManager<MemBlockDevice> {
     BootManager::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize))
+}
+
+// --- Slot count ---
+
+#[test]
+fn process_boot_returns_one_action_per_addressable_slot() {
+    // The result is indexed by `BankSet::as_index()`, so its length has to
+    // track the store's own slot count — not a compile-time constant.
+    for slots in [10, 16] {
+        let mut mgr = BootManager::new(MemBlockDevice::new(nv_device_size(slots) as usize));
+        assert_eq!(mgr.nv().slot_count(), slots);
+        assert_eq!(mgr.process_boot().unwrap().len(), slots, "first boot");
+        assert_eq!(mgr.process_boot().unwrap().len(), slots, "steady state");
+    }
 }
 
 // --- First boot ---

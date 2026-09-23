@@ -11,37 +11,41 @@ CRC-32 integrity and monotonic write sequence numbers for wear leveling.
 ```
 Offset      Size        Sectors   Content
 ──────      ────        ───────   ───────
-0x000000    8 KB        2         Boot State (all bank sets)
+0x000000    8 KB        2         Boot State (all slots)
 0x002000    8 KB        2         Factory (write-once, shared)
 0x004000    8 KB        2         App (shared application data)
 0x006000    8 KB        2         Vehicle (freshness coordinator, §7.2)
-0x008000    32 KB       --        (reserved)
+0x008000    8 KB        2         Update Session (node update transaction)
+0x00A000    24 KB       --        (reserved)
 
-0x010000    16 KB       4         Hypervisor FW Meta A
-0x014000    16 KB       4         Hypervisor FW Meta B
-0x018000    32 KB       8         Hypervisor Runtime A
-0x020000    32 KB       8         Hypervisor Runtime B
+0x010000    96 KB       24        Slot 0 (Hsm)
+0x028000    96 KB       24        Slot 1 (Bootloader)
+0x040000    96 KB       24        Slot 2 (Os)
+   ...
+0x010000 + i * 0x018000           Slot i, for i in 0..slot_count()
 
-0x028000    16 KB       4         VM1 FW Meta A
-0x02C000    16 KB       4         VM1 FW Meta B
-0x030000    32 KB       8         VM1 Runtime A
-0x038000    32 KB       8         VM1 Runtime B
-
-0x040000    16 KB       4         VM2 FW Meta A
-0x044000    16 KB       4         VM2 FW Meta B
-0x048000    32 KB       8         VM2 Runtime A
-0x050000    32 KB       8         VM2 Runtime B
-
-0x058000    16 KB       4         HSM FW Meta (single bank)
-0x05C000    32 KB       8         HSM Runtime (single bank)
-
-0x064000    16 KB       4         Qtd FW Meta (reserved, wire compat)
-0x068000    32 KB       8         Qtd Runtime (reserved, wire compat)
-
-0x070000    remainder   --        (reserved for future use)
+Each 96 KB slot region, relative to its base:
++0x000000   16 KB       4         FW Meta A
++0x004000   16 KB       4         FW Meta B
++0x008000   32 KB       8         Runtime A
++0x010000   32 KB       8         Runtime B
 ```
 
 Sector size: 4 KB (matches typical eMMC erase block).
+
+The slot count is a runtime property of the store, not a constant: `NvStore::new`
+computes `min(MAX_SLOTS, (device_size - 0x010000) / 0x018000)` once at open and exposes
+it as `slot_count()` / `slots()` / `slot_in_range()`. `MAX_SLOTS = 32` is the hard cap
+(the width of the u32 reboot-owed mask and of the boot-state record); `DEFAULT_SLOTS = 16`
+is the size a fresh store is created with when the platform does not say otherwise, so
+`MIN_NV_DEVICE_SIZE = nv_device_size(DEFAULT_SLOTS) = 0x190000` (1600 KB). A 1 MB device
+is therefore a 10-slot store. Growing a store means recreating the device — qnx6
+`ftruncate(grow)` is a silent no-op — and the "too small, recreate" guard lives in the
+supernova host binary, not in this library.
+
+Slots 0–5 are named (`Hsm`, `Bootloader`, `Os`, `Rt`, `Vm1`, `Vm2`); slots 6 and up are
+unnamed, their storage directory derived from the index (`set<N>`) unless config sets
+`storage_subdir`. HSM (slot 0) is single-bank: always bank A, always committed.
 
 ## Sector Rotation
 
@@ -72,39 +76,34 @@ Magic numbers:
 - Runtime:    `0x4E565231` ("NVR1")
 - App:        `0x4E564131` ("NVA1")
 - Vehicle:    `0x4E565631` ("NVV1")
+- Update Session: `0x4E565531` ("NVU1")
 
 ## Boot State
 
-Tracks the active bank, committed status, and boot count for each bank set.
+Tracks the active bank, committed status, and boot count for every slot.
 
 ```
-Offset  Size  Field
-0x00    4     magic (NVB1)
-0x04    4     write_seq
-0x08    1     hypervisor.active_bank  (0=A, 1=B)
-0x09    1     hypervisor.committed    (0=trial, 1=committed)
-0x0A    1     hypervisor.boot_count   (incremented each boot in trial mode)
-0x0B    1     vm1.active_bank
-0x0C    1     vm1.committed
-0x0D    1     vm1.boot_count
-0x0E    1     vm2.active_bank
-0x0F    1     vm2.committed
-0x10    1     vm2.boot_count
-0x11    1     hsm.active_bank         (always 0, single-bank)
-0x12    1     hsm.committed           (always 1)
-0x13    1     hsm.boot_count          (always 0)
-0x14    1     qtd.active_bank         (reserved, wire compat)
-0x15    1     qtd.committed           (reserved)
-0x16    1     qtd.boot_count          (reserved)
-0x17    1     (padding)
-0x18    4     crc32
+Offset        Size  Field
+0x00          4     magic (NVB1)
+0x04          4     write_seq
+0x08 + 3*i    1     slot i: active_bank  (0=A, 1=B)
+0x09 + 3*i    1     slot i: committed    (0=trial, 1=committed)
+0x0A + 3*i    1     slot i: boot_count   (incremented each boot in trial mode)
+              ...   one triplet per slot, for i in 0..MAX_SLOTS (32)
+0x68..0xFFC   --    zero padding
+0xFFC         4     crc32
 ```
 
-Total: 28 bytes per sector (rest of 4 KB sector is unused/zero-padded).
+Total: `8 + 3*32` = 104 bytes of payload; the rest of the 4 KB sector is zero padding,
+and the CRC-32 over bytes [0..4092) sits at 0xFFC — as for every record in this format
+(see `read_record` / `write_record` in `crates/nv-store/src/store.rs`).
 
-Note: The wire format includes 5 bank sets (Hypervisor, VM1, VM2, HSM, Qtd)
-for compatibility. HSM is single-bank (always bank A, always committed).
-Qtd is reserved and unused.
+Note: the record always carries `MAX_SLOTS` entries, whatever the store's
+`slot_count()`. Older writers left the trailing entries as zero padding, which decodes as
+`{bank A, committed: false, boot_count: 0}` — the same default the store forces onto every
+entry at index >= `slot_count()`, so records from an earlier era read back correctly.
+History: 5 slots (2026-05) → 10 slots (2026-05-29) → a per-store runtime count capped at
+`MAX_SLOTS` = 32 (2026-09-23). The `NVB1` magic never changed.
 
 ## Factory Data
 

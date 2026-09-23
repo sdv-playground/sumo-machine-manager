@@ -117,7 +117,7 @@ machine-mgr    — Abstract trait layer connecting them all
 
 ### Key Concepts
 
-- **Bank sets**: 10 slots (`NUM_BANK_SETS=10`), 6 named — Hsm (single-bank), Bootloader (reserved), Os/host-os (A/B, IFS+rootfs atomic), Rt (Cortex-M7), Vm1, Vm2 (A/B); slots 6–9 reserved headroom
+- **Bank sets**: a runtime slot count derived from the NV device size (`slot_count()`, default 16, max 32 — the width of the u32 reboot-owed mask), 6 named — Hsm (single-bank), Bootloader (reserved), Os/host-os (A/B, IFS+rootfs atomic), Rt (Cortex-M7), Vm1, Vm2 (A/B); the remaining slots are unnamed (`set<N>` dirs unless config sets `storage_subdir`)
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA)
 - **Per-bank VM config**: `vm-config.yaml` in bank directories, delivered alongside firmware
 - **Multi-payload SUIT**: host-os carries `#ifs` + `#rootfs` in one envelope; VMs carry kernel + rootfs + config
