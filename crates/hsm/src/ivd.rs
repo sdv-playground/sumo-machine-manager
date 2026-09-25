@@ -64,19 +64,27 @@
 //! bytes of `ivd-manifest.cbor`. No COSE wrapping — the verifier
 //! handles raw DER directly via the same `sign`/`verify` ops.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{HsmError, KeyRole};
+use crate::HsmError;
 // The IVD entry points take a `HsmCryptoProvider`; the shared inner helpers name
-// `KeyHandle` in their `sign`/`verify` closure bounds. Both are referenced only
-// from the `#[cfg(feature = "crypto")]` functions, so the import is gated too.
+// `KeyHandle` in their `sign`/`verify` closure bounds, `KeyRole` to name the
+// signing slot, and `BTreeMap` to index the claimed file inventory. All four are
+// referenced only from the `#[cfg(feature = "crypto")]` functions, so the
+// imports are gated too.
+//
+// `suit` ON with `crypto` OFF had never been built until `hsm-supervisor`
+// (2026-09-25) took a default-features dep on this crate: the workspace-wide
+// runs unify `crypto` on via component-mgr, and `--no-default-features` turns
+// `suit` off as well, so this corner fell between the feature-matrix runs.
 #[cfg(feature = "crypto")]
-use crate::{HsmCryptoProvider, KeyHandle};
+use crate::{HsmCryptoProvider, KeyHandle, KeyRole};
+#[cfg(feature = "crypto")]
+use std::collections::BTreeMap;
 
 /// Slot key_id used by `hsm.sign(...)` / `hsm.verify(...)`. Mirrors
 /// `KeyRole::IvdSigning.key_id()`.

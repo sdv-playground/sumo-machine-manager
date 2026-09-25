@@ -1,0 +1,26 @@
+[package]
+name = "hsm-supervisor"
+version = "0.1.0"
+edition = "2021"
+description = """
+Spawn, supervise and reap a node's two HSM daemons — the link-B crypto backend \
+and the vhsm-ssd proxy guests reach over /dev/vhsm. Deliberately dep-light \
+(hsm + tracing + libc): every node family stands these up the same way, so this \
+must not be reachable only from a machine manager that also links SOVD."""
+
+[dependencies]
+# `HsmProvider` (what standup returns), `link_b::{spawn_and_connect, LinkBClient}`
+# (the backend handshake) and `LinkBProvider` (the wrapper that IS the node's
+# HsmProvider once the daemon lifecycle is owned locally).
+hsm = { path = "../hsm" }
+tracing = "0.1"
+# `libc::kill` for the SIGTERM-then-SIGKILL teardown. std has no portable
+# "terminate gracefully" — `Child::kill` is SIGKILL, which skips the vhsm-ssd
+# connect-only signal path's clean exit.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+# The crypto half of the link-B probe in tests/standup_link_b.rs: the moved test
+# signs with `KeyRole::IamSigning`, which is `HsmCryptoProvider` surface.
+hsm = { path = "../hsm", features = ["crypto"] }

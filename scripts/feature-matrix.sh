@@ -77,6 +77,24 @@ run "no slot vocabulary in the library" \
 run "machine-contract stays dep-light" \
     bash -c 'out=$(cargo tree -p machine-contract -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -v -E "^(machine-contract|nv-store|serde) "'
 
+# Same allowlist discipline for hsm-supervisor, for the same reason: a node that
+# only needs to PARENT the two HSM daemons must not have to link a SOVD server to
+# do it. Allowlist: the crate itself, hsm, libc, tracing. Anything else printed
+# fails the run — in particular sovd-core / tokio / axum creeping in would mean
+# the extraction from supernova's main.rs had quietly re-coupled.
+run "hsm-supervisor stays dep-light" \
+    bash -c 'out=$(cargo tree -p hsm-supervisor -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -v -E "^(hsm-supervisor|hsm|libc|tracing) "'
+
+# `hsm` with `suit` ON and `crypto` OFF — a corner NO run above can reach. The
+# three workspace-wide runs unify `crypto` on (component-mgr turns it on), and
+# `--no-default-features` turns `suit` off as well, so the combination had never
+# been compiled until hsm-supervisor took a default-features dep on hsm: two
+# `crypto`-only imports in `hsm/src/ivd.rs` had been sitting unused-in-this-corner
+# the whole time. `--lib` is load-bearing — hsm-supervisor's dev-dependencies ask
+# for `crypto`, so `--all-targets` would unify it back on and lose the corner.
+run "hsm with suit but no crypto" \
+    cargo clippy -p hsm-supervisor --lib -- -D warnings
+
 # The opt-in container/OCI server build — the one deployments with a container
 # runtime ship. Proves the forwarding chain vm-sovd -> component-factory ->
 # component-mgr -> app-mgr actually resolves.

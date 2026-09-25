@@ -12,6 +12,11 @@ members = [
     "crates/hsm",
     "crates/hsm-contract",
     "crates/hsm-link-b",
+    # Parenting the two HSM daemons (link-B backend + the vhsm-ssd proxy): spawn,
+    # stale-orphan reclaim, respawn-on-provision, reap. Extracted from
+    # supernova's main.rs — it is the same on every node family, and dep-light
+    # (hsm + tracing + libc) so a node need not link SOVD to parent a daemon.
+    "crates/hsm-supervisor",
     "crates/policy-eval",
     "crates/policy-partition",
     "crates/vm-wire",
