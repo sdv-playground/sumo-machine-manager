@@ -107,6 +107,17 @@ run "host-reboot stays dep-light" \
 run "host-clock stays dep-light" \
     bash -c 'out=$(cargo tree -p host-clock -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -v -E "^(host-clock|machine-contract|libc|tracing) "'
 
+# The other direction of the same seam, and the one a careless wiring change would
+# actually take: component-mgr must NOT depend on the platform impls. Its
+# `sovd::hsm_authorizer` needs a floor advance to reach the host's clock, and takes
+# it as an injected `dyn FloorSink` precisely so that need does not become an edge —
+# a `host-clock` dependency here would make every consumer of the OTA engine link
+# `clock_settime`, and `host-reboot` would do the same for `sysmgr_reboot`. This is a
+# DENYLIST, not an allowlist: component-mgr legitimately has ~30 direct deps, and
+# enumerating them would fail on every unrelated addition and get deleted.
+run "component-mgr does not depend on the platform impls" \
+    bash -c 'out=$(cargo tree -p component-mgr -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -E "^(host-clock|host-reboot) "'
+
 # `hsm` with `suit` ON and `crypto` OFF — a corner NO run above can reach. The
 # three workspace-wide runs unify `crypto` on (component-mgr turns it on), and
 # `--no-default-features` turns `suit` off as well, so the combination had never

@@ -71,6 +71,7 @@ pub mod sovd {
     pub mod delegated_rights;
     pub mod delegation;
     pub mod gateway;
+    pub mod hsm_authorizer;
     pub mod identity;
     pub mod issuer_keys;
     pub mod openapi;
