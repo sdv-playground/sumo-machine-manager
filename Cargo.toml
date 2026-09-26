@@ -5,6 +5,16 @@ members = [
     "crates/boot",
     "crates/component-mgr",
     "crates/host-os-mgr",
+    # Resetting the node this process runs on: QNX per-thread privity, the
+    # kernel-direct `sysmgr_reboot` that avoids `shutdown`'s deadlock on a dead
+    # loopback pager, and the once-guarded deadman that resets anyway when
+    # teardown wedges. Extracted from supernova's main.rs; QNX-specific but not
+    # board-specific, and dep-light (libc + tracing).
+    "crates/host-reboot",
+    # The platform side of machine-contract's two floor seams: step CLOCK_REALTIME
+    # forward to a proven safe-time floor, forward-only and best-effort. Also from
+    # supernova's main.rs; POSIX only, so Linux and QNX alike.
+    "crates/host-clock",
     "crates/app-mgr",
     "crates/machine-mgr",
     "crates/machine-contract", # the four synchronous bank traits + ResetKind (nv-store + serde only)

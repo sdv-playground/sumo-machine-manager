@@ -1,0 +1,13 @@
+[package]
+name = "host-clock"
+version = "0.1.0"
+edition = "2021"
+description = "Step the host's CLOCK_REALTIME forward to a proven safe-time floor — the platform side of machine-contract's WallClockFloor and FloorSink seams. Forward-only, best-effort, libc + tracing only."
+
+[dependencies]
+# The two seams this crate implements. Dep-light by construction (nv-store +
+# serde), which is the reason they live there and not in component-mgr.
+machine-contract = { path = "../machine-contract" }
+# clock_gettime / clock_settime over the same POSIX surface on Linux and QNX.
+libc = "0.2"
+tracing = "0.1"

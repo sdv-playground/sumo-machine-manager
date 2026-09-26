@@ -1,0 +1,12 @@
+[package]
+name = "host-reboot"
+version = "0.1.0"
+edition = "2021"
+description = "Kernel-direct host reset for a QNX Neutrino node, plus the once-guarded deadman that fires it even when teardown wedges. Depends on libc and tracing and nothing else, so a node that needs to reset itself does not link a SOVD server to do it."
+
+[dependencies]
+# The only two. `libc` for the QNX privity + sync + the two `extern "C"` system
+# calls; `tracing` because a reset that does not fire must leave a log line — the
+# whole design is "never take the process down, always leave evidence".
+libc = "0.2"
+tracing = "0.1"

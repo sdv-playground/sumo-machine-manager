@@ -85,6 +85,28 @@ run "machine-contract stays dep-light" \
 run "hsm-supervisor stays dep-light" \
     bash -c 'out=$(cargo tree -p hsm-supervisor -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -v -E "^(hsm-supervisor|hsm|libc|tracing) "'
 
+# Same for host-reboot: resetting the node this process runs on is libc + a log
+# line, and a node that needs it must not link an OTA engine to get it. Allowlist:
+# the crate itself, libc, tracing.
+#
+# NOTE what this does NOT cover: the substance of that crate is behind
+# `cfg(target_os = "nto")`, which no run in this file compiles. Holding that arm
+# needs the SDP plus nightly + `-Zbuild-std`; it is verified by
+# `cargo +nightly clippy -p host-reboot --target aarch64-unknown-nto-qnx710
+# -Zbuild-std --all-targets -- -D warnings` and is not wired into CI yet. It is
+# not theoretical: the QNX-only `catch_unwind` needed `AssertUnwindSafe` for a
+# non-`RefUnwindSafe` `Arc<dyn Fn()>`, and the host build could not see it.
+run "host-reboot stays dep-light" \
+    bash -c 'out=$(cargo tree -p host-reboot -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -v -E "^(host-reboot|libc|tracing) "'
+
+# host-clock implements two machine-contract seams over POSIX clock calls. The
+# allowlist adds machine-contract and nothing else — in particular NOT
+# component-mgr, which is where those two traits used to live and is exactly the
+# coupling the seam move was for. `--depth 1` again: machine-contract's own
+# closure (nv-store, serde) is legitimate and an implementer takes it anyway.
+run "host-clock stays dep-light" \
+    bash -c 'out=$(cargo tree -p host-clock -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -v -E "^(host-clock|machine-contract|libc|tracing) "'
+
 # `hsm` with `suit` ON and `crypto` OFF — a corner NO run above can reach. The
 # three workspace-wide runs unify `crypto` on (component-mgr turns it on), and
 # `--no-default-features` turns `suit` off as well, so the combination had never

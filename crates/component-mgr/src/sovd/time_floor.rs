@@ -59,6 +59,17 @@ impl TimeFloor {
         hsm.read_monotonic(Self::HANDLE)
     }
 
+    /// The floor as a plain number, treating an unreadable slot as "no floor".
+    ///
+    /// The `0 = no floor` convention belongs to the floor, not to any one
+    /// deployment: 0 is what a never-raised monotonic slot reads, and both
+    /// answers mean the same thing to a caller — fall back to the raw wall clock.
+    /// Every host wanting the floor for a clockless-device check wants exactly
+    /// this, and each was writing its own `…read(p).unwrap_or(0)` wrapper.
+    pub fn read_or_zero(hsm: &dyn HsmProvider) -> u64 {
+        Self::read(hsm).unwrap_or(0)
+    }
+
     /// Ratchet the floor up to `max(current, verified_secs)` and return the
     /// resulting value. `verified_secs` MUST come from a trustworthy source: the
     /// value can only move forward, never rewind (the safety core).
