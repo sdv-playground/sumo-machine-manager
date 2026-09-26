@@ -27,28 +27,12 @@ use sovd_api::{AccessRequest, Authorizer, Capability, ClientContext};
 // JWT verifying key from the verified leaf needs the x509/p256 SPKI surface.
 use crate::sovd::delegation::verify_delegate_chain;
 
-/// Durably persist a safe-time-floor advance discovered during authorization.
-///
-/// When the delegated path accepts a workshop delegate whose (trusted) `not_before`
-/// is ahead of the device's clock, the authorizer bumps its in-memory floor cell for
-/// the current run — but the *durable* effects (ratchet the HSM monotonic slot so it
-/// survives reboot, and step `CLOCK_REALTIME` forward so the JWT `exp`/`nbf` checks,
-/// which read the raw wall clock, also see the advanced time) require host resources
-/// the HSM-agnostic authorizer does not hold. The deployment injects a sink that does
-/// them (supernova wires it to `TimeFloor::advance` + `SystemWallClockFloor`); the
-/// default is a no-op. Best-effort and monotonic — `secs` at/below the current floor
-/// is a no-op. See `docs/safe-time-floor.md`.
-pub trait FloorSink: Send + Sync {
-    fn advance_floor(&self, secs: u64);
-}
-
-/// No-op sink: the in-memory bump still applies, but nothing is persisted or
-/// clock-disciplined. The default where the deployment wires nothing (tests, or a
-/// platform that owns its own clock).
-pub struct NoopFloorSink;
-impl FloorSink for NoopFloorSink {
-    fn advance_floor(&self, _secs: u64) {}
-}
+// `FloorSink` is implemented by the deployment (it needs the HSM monotonic slot
+// and the system clock, neither of which this HSM-agnostic authorizer holds), so
+// the trait lives in `machine-contract` alongside the other out-of-tree seams.
+// Re-exported here at its original path — `NoopFloorSink` is still this module's
+// default, and every `component_mgr::sovd::authz::FloorSink` import is unchanged.
+pub use machine_contract::floor_sink::{FloorSink, NoopFloorSink};
 
 /// Authority tier. A token may only exercise a capability whose tier is `<=` the
 /// ceiling of the issuer that signed it. Order matters: `Operational <

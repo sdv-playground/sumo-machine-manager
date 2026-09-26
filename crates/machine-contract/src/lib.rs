@@ -13,6 +13,17 @@
 //! git dependency and inherits only nv-store's own closure (it needs nv-store
 //! anyway — that is where `Bank` / `BankSet` come from).
 //!
+//! Two smaller seams ride along for the identical reason — both are implemented
+//! by the platform and called by the OTA engine, never the other way round:
+//! [`WallClockFloor`] (step the host clock forward to a proven time floor, over
+//! the platform's `libc`) and [`FloorSink`] (make a floor advance durable, over
+//! the platform's HSM slot plus that clock). They were defined inside
+//! `component-mgr`, which meant a ~15-line impl of either had to link SUIT,
+//! streaming, SOVD and tokio to name the trait it satisfied. `component-mgr`
+//! re-exports both at their previous paths (`sovd::time_floor`, `sovd::authz`),
+//! so no import changed. The floor's *authority* — the HSM monotonic slot
+//! plumbing — stayed in `component-mgr`: it is called, not implemented.
+//!
 //! [`ResetKind`] is defined here for the same reason: it is the return of
 //! `BankProvider::activate`, so naming a reset kind must not cost an implementer
 //! a dependency on SOVDd. `machine-mgr` is the SOVD edge and converts to and
@@ -39,13 +50,17 @@
 pub mod bank_activator;
 pub mod bank_provider;
 pub mod deactivator;
+pub mod floor_sink;
 pub mod image_record;
 pub mod reset_kind;
+pub mod wall_clock_floor;
 
 pub use bank_activator::{BankActivator, BankActivatorError};
 pub use bank_provider::{
     BankError, BankProvider, FirmwareIdentity, InstalledFile, InstalledFirmware,
 };
 pub use deactivator::{DeactivateError, DeactivateOutcome, Deactivator};
+pub use floor_sink::{FloorSink, NoopFloorSink};
 pub use image_record::ImageRecord;
 pub use reset_kind::ResetKind;
+pub use wall_clock_floor::{DisciplineOutcome, NoopWallClockFloor, WallClockFloor};

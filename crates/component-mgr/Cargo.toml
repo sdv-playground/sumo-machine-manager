@@ -6,6 +6,11 @@ edition = "2021"
 [dependencies]
 nv-store = { path = "../nv-store" }
 machine-mgr = { path = "../machine-mgr" }
+# Direct, not via machine-mgr's re-exports: the two seams this crate takes from
+# here (WallClockFloor, FloorSink) are not part of machine-mgr's trait layer, and
+# routing them through it would make machine-mgr re-export names it never uses.
+# No new graph edge — machine-mgr already depends on machine-contract.
+machine-contract = { path = "../machine-contract" }
 # Shared log readers (platform-integration). Provides read_slog2 for the host's
 # LogSource::Slog2 — the QNX slogger2 ring reader (supernova + driver telemetry).
 platform-log = { path = "../platform-integration/platform-log" }

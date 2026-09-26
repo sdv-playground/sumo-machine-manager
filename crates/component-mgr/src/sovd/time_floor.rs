@@ -16,47 +16,15 @@
 
 use hsm::{HsmError, HsmProvider, KeyHandle};
 
-/// What [`WallClockFloor::discipline_to`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DisciplineOutcome {
-    /// The wall clock was below the floor and was stepped forward to it.
-    Stepped { from_secs: u64, to_secs: u64 },
-    /// The wall clock was already at or ahead of the floor — left untouched.
-    AlreadyAhead,
-    /// A step was wanted but not performed (no privilege, or a log-only sink).
-    /// Best-effort: the caller logs and continues; the authoritative floor still
-    /// lives in the HSM.
-    NotStepped,
-}
-
-/// A sink that disciplines the host wall clock forward to a proven time floor.
-///
-/// After the safe-time floor is ratcheted (from a verified SUIT `iat`, an
-/// identity leaf's `not_before`, etc.), the device steps its own
-/// `CLOCK_REALTIME` up to the floor when the clock is behind it — so every
-/// reader of the system clock gets `max(now, floor)` for free, with no separate
-/// floor cache to keep in sync. Forward-only; a clock already ahead is left
-/// alone (so it never fights NTP/gPTP). Injected: the real host wires a
-/// clock-setting impl (`SystemWallClockFloor`, in supernova, over libc); tests
-/// and clock-owned-elsewhere deployments use [`NoopWallClockFloor`].
-///
-/// `discipline_to` never errors — a failed set reports
-/// [`DisciplineOutcome::NotStepped`], so a clock hiccup can never fail an
-/// otherwise-valid OTA install.
-pub trait WallClockFloor: Send + Sync {
-    fn discipline_to(&self, floor_secs: u64) -> DisciplineOutcome;
-}
-
-/// Log-only sink: never touches the OS clock. The default in `ComponentBackend`
-/// and the right choice where something else owns the clock or the platform
-/// cannot set time (dev/CI). Carries no clock dependency of its own.
-pub struct NoopWallClockFloor;
-
-impl WallClockFloor for NoopWallClockFloor {
-    fn discipline_to(&self, _floor_secs: u64) -> DisciplineOutcome {
-        DisciplineOutcome::NotStepped
-    }
-}
+// The clock-stepping seam itself lives in `machine-contract`: a platform's impl
+// is ~15 lines over `libc::clock_settime`, and it should not have to link this
+// crate's SUIT / streaming / SOVD / tokio closure just to name the trait. Only
+// the seam moved — `TimeFloor` below, the floor's HSM-backed *authority*, is
+// called rather than implemented and stays here. Re-exported at the original
+// path so every `component_mgr::sovd::time_floor::…` import is unchanged.
+pub use machine_contract::wall_clock_floor::{
+    DisciplineOutcome, NoopWallClockFloor, WallClockFloor,
+};
 
 /// Adopt an incoming monotonic value: take the max, never go backwards.
 ///
