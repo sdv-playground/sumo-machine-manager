@@ -124,11 +124,17 @@ entries to it is a wire change.
 
 ## Deferred work (recorded, not scheduled)
 
-- **RT out of Tier-1, as its own crate.** `mmgr-rt` depending on
-  `machine-contract`, behind `rt-runtime = ["dep:mmgr-rt"]`, not in `default`.
-  Tier-1 then builds as `--no-default-features --features hsm-sim,ifs-partition`,
-  and the acceptance check is that no `m7loader` symbol appears in the Tier-1
-  binary. This is also where the startup capability/feature check above lands.
+- **RT out of Tier-1, as its own crate.** Started 2026-09-25 in the vendor's
+  board repo: `mmgr-rt` depends on `machine-contract`, behind
+  `rt-runtime = ["dep:mmgr-rt"]`, not in `default`. Tier-1 builds as
+  `--no-default-features --features hsm-sim` (the `ifs-*` activator features
+  were deleted on 2026-09-23 — the host OS bank is the profile-declared
+  raw-partition provider), and the acceptance check is that no `m7loader`
+  symbol appears in the Tier-1 binary. This is also where the startup
+  capability/feature check above lands. Two gaps that split exposed, for the
+  next audit: `SharedSystemBankState` (the selector write handle) still lives in
+  `machine-mgr`, and `HealthProbe` is implemented out of tree but defined in
+  `component-mgr` with `serde_json` in its signature.
 - **The `Banked` / `Singleshot` compile-time trait split.** Not deferred —
   dropped (ARCHITECTURE.md: "it would type one outlier and not enforce the
   real invariant"; the real invariant is the never-mix-rollbackable-with-
@@ -144,6 +150,10 @@ entries to it is a wire change.
 
 ## Audit history
 
+- **2026-09-27 (v0.1.6)** — `HostReboot` added to machine-contract; `host-reboot`
+  implements it (QNX kernel-direct, exit-under-supervisor) — trigger: a second
+  node family and an emulated node reset differently, and the deadman must not
+  know how.
 - **2026-09-23 (v0.1.3)** — the four traits + `ResetKind` extracted into
   `crates/machine-contract`; `machine-mgr` re-exports them; the `cargo tree`
   guard added to `scripts/feature-matrix.sh`. Trigger: the per-board split of

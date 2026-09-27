@@ -87,7 +87,8 @@ run "hsm-supervisor stays dep-light" \
 
 # Same for host-reboot: resetting the node this process runs on is libc + a log
 # line, and a node that needs it must not link an OTA engine to get it. Allowlist:
-# the crate itself, libc, tracing.
+# the crate itself, machine-contract (the `HostReboot` seam it fires and a board
+# implements out of tree — dep-light by its own guard above), libc, tracing.
 #
 # NOTE what this does NOT cover: the substance of that crate is behind
 # `cfg(target_os = "nto")`, which no run in this file compiles. Holding that arm
@@ -97,7 +98,7 @@ run "hsm-supervisor stays dep-light" \
 # not theoretical: the QNX-only `catch_unwind` needed `AssertUnwindSafe` for a
 # non-`RefUnwindSafe` `Arc<dyn Fn()>`, and the host build could not see it.
 run "host-reboot stays dep-light" \
-    bash -c 'out=$(cargo tree -p host-reboot -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -v -E "^(host-reboot|libc|tracing) "'
+    bash -c 'out=$(cargo tree -p host-reboot -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -v -E "^(host-reboot|machine-contract|libc|tracing) "'
 
 # host-clock implements two machine-contract seams over POSIX clock calls. The
 # allowlist adds machine-contract and nothing else — in particular NOT

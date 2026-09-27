@@ -3,7 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::reset::{reboot_host, PreReboot};
+use machine_contract::HostReboot;
+
+use crate::reset::reboot_host;
 
 /// Hard deadline from "reboot requested" to the reset. A clean teardown of both
 /// guests measures ≤6s on the S32G3 (and ~0 with no guests running), so 15s is
@@ -88,13 +90,14 @@ pub fn spawn_reboot_deadman(reset: Arc<OnceReset>, deadline: Duration, phase: &'
 /// path must fire through. Call BEFORE any teardown work: from that point the
 /// node resets within [`REBOOT_DEADLINE`] no matter what wedges.
 ///
-/// `pre_reboot` is the deployment's bounded last-chance hook (see [`PreReboot`]);
-/// it runs on whichever path actually fires, deadman included, which is the point
-/// — the wedged path is exactly the one where losing the RAM log window hurts.
-pub fn arm_reboot_deadman(phase: &'static str, pre_reboot: PreReboot) -> Arc<OnceReset> {
+/// `reboot` is the node's reset mechanism (see [`HostReboot`]); the deadman never
+/// learns which one it is, and the hook it carries runs on whichever path
+/// actually fires, deadman included — which is the point: the wedged path is
+/// exactly the one where losing the RAM log window hurts.
+pub fn arm_reboot_deadman(phase: &'static str, reboot: Arc<dyn HostReboot>) -> Arc<OnceReset> {
     let reset = OnceReset::new(Arc::new(move || {
-        if let Err(e) = reboot_host(pre_reboot.clone()) {
-            tracing::error!(phase, "kernel-direct reboot failed: {e}");
+        if let Err(e) = reboot_host(reboot.clone()) {
+            tracing::error!(phase, "could not spawn the reset thread: {e}");
         }
     }));
     tracing::warn!(
@@ -108,26 +111,57 @@ pub fn arm_reboot_deadman(phase: &'static str, pre_reboot: PreReboot) -> Arc<Onc
 
 #[cfg(test)]
 mod tests {
-    use super::{spawn_reboot_deadman, OnceReset};
+    use super::{reboot_host, spawn_reboot_deadman, HostReboot, OnceReset};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// A reset that counts instead of resetting the board.
-    fn counting_reset() -> (Arc<OnceReset>, Arc<AtomicUsize>) {
+    /// A reset mechanism that counts instead of resetting the node. `ok` picks
+    /// whether the mechanism reports success; either way the node must be counted
+    /// as asked exactly once, and the test process must survive.
+    struct CountingReboot {
+        hits: Arc<AtomicUsize>,
+        ok: bool,
+    }
+
+    impl HostReboot for CountingReboot {
+        fn reboot(&self) -> std::io::Result<()> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            if self.ok {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("this node cannot be reset"))
+            }
+        }
+    }
+
+    /// [`arm_reboot_deadman`]'s own wiring — the once-guard over `reboot_host`
+    /// over an injected [`HostReboot`] — with the counting fake in the platform's
+    /// place, so the tests drive the production path and not a lookalike. The
+    /// deadline is the caller's, because 15s is not a unit test.
+    ///
+    /// [`arm_reboot_deadman`]: super::arm_reboot_deadman
+    fn counting_reset(ok: bool) -> (Arc<OnceReset>, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
-        let h = hits.clone();
+        let reboot: Arc<dyn HostReboot> = Arc::new(CountingReboot {
+            hits: hits.clone(),
+            ok,
+        });
         (
             OnceReset::new(Arc::new(move || {
-                h.fetch_add(1, Ordering::SeqCst);
+                reboot_host(reboot.clone()).expect("the reset thread spawned");
             })),
             hits,
         )
     }
 
+    /// `reboot_host` hands the mechanism to a thread it spawns, so the count lands
+    /// asynchronously. Generous for one atomic add.
+    const SETTLE: Duration = Duration::from_millis(200);
+
     #[test]
-    fn deadman_fires_when_teardown_blocks_past_the_deadline() {
-        let (reset, hits) = counting_reset();
+    fn deadman_fires_through_the_injected_implementation() {
+        let (reset, hits) = counting_reset(true);
         spawn_reboot_deadman(reset, Duration::from_millis(100), "test");
         // The "teardown" never fires — the wedge case.
         std::thread::sleep(Duration::from_millis(400));
@@ -136,18 +170,42 @@ mod tests {
 
     #[test]
     fn fast_teardown_resets_once_and_the_deadman_stays_quiet() {
-        let (reset, hits) = counting_reset();
+        let (reset, hits) = counting_reset(true);
         spawn_reboot_deadman(reset.clone(), Duration::from_millis(200), "test");
         assert!(reset.fire(), "the teardown path fired the reset");
+        std::thread::sleep(SETTLE);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         // Past the deadline: the deadman woke, found it already fired, did nothing.
         std::thread::sleep(Duration::from_millis(400));
         assert_eq!(hits.load(Ordering::SeqCst), 1, "no second reset");
     }
 
+    /// A mechanism that cannot even request the reset must be a log line, not a
+    /// dead process — the whole crate's premise is that the node stays alive to
+    /// be reset by something else (the deadman, a fallback, a human).
+    #[test]
+    fn a_failing_implementation_is_logged_not_fatal() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let reboot: Arc<dyn HostReboot> = Arc::new(CountingReboot {
+            hits: hits.clone(),
+            ok: false,
+        });
+        // `Ok` because the THREAD spawned; the mechanism's own failure happens on
+        // it, after this returns.
+        reboot_host(reboot).expect("the reset thread spawned");
+        std::thread::sleep(SETTLE);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the mechanism was asked once"
+        );
+        // Reaching this line is the other half of the assertion: the failing reset
+        // did not take the process down with it.
+    }
+
     #[test]
     fn racing_paths_reset_exactly_once() {
-        let (reset, hits) = counting_reset();
+        let (reset, hits) = counting_reset(true);
         // Deadman deadline ~now, plus a pack of "teardown finished" callers: all
         // of them race, exactly one wins.
         spawn_reboot_deadman(reset.clone(), Duration::from_millis(50), "test");

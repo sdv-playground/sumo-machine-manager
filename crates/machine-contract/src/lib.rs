@@ -24,6 +24,15 @@
 //! so no import changed. The floor's *authority* — the HSM monotonic slot
 //! plumbing — stayed in `component-mgr`: it is called, not implemented.
 //!
+//! [`HostReboot`] is a third, and the one with the same shape as
+//! [`BankActivator`]: *how* this kind of node is asked to reset — a QNX
+//! kernel-direct reset, a process exit under a respawn supervisor — is a
+//! platform fact, while *when* a reset is owed, what must happen first and how
+//! long teardown may take belongs to the deployment (`host-reboot` carries that
+//! half, its deadman included). Defined here so that half can fire any
+//! mechanism without knowing which, and so a board that resets differently
+//! brings its own impl instead of forking the watchdog.
+//!
 //! [`ResetKind`] is defined here for the same reason: it is the return of
 //! `BankProvider::activate`, so naming a reset kind must not cost an implementer
 //! a dependency on SOVDd. `machine-mgr` is the SOVD edge and converts to and
@@ -51,6 +60,7 @@ pub mod bank_activator;
 pub mod bank_provider;
 pub mod deactivator;
 pub mod floor_sink;
+pub mod host_reboot;
 pub mod image_record;
 pub mod reset_kind;
 pub mod wall_clock_floor;
@@ -61,6 +71,7 @@ pub use bank_provider::{
 };
 pub use deactivator::{DeactivateError, DeactivateOutcome, Deactivator};
 pub use floor_sink::{FloorSink, NoopFloorSink};
+pub use host_reboot::HostReboot;
 pub use image_record::ImageRecord;
 pub use reset_kind::ResetKind;
 pub use wall_clock_floor::{DisciplineOutcome, NoopWallClockFloor, WallClockFloor};

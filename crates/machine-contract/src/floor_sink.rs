@@ -18,7 +18,7 @@
 /// survives reboot, and step `CLOCK_REALTIME` forward so the JWT `exp`/`nbf` checks,
 /// which read the raw wall clock, also see the advanced time) require host resources
 /// the HSM-agnostic authorizer does not hold. The deployment injects a sink that does
-/// them (supernova wires it to `TimeFloor::advance` + `SystemWallClockFloor`); the
+/// them (a host manager wires it to `TimeFloor::advance` + `SystemWallClockFloor`); the
 /// default is a no-op. Best-effort and monotonic — `secs` at/below the current floor
 /// is a no-op. See `docs/safe-time-floor.md`.
 pub trait FloorSink: Send + Sync {
