@@ -26,7 +26,7 @@
 //!
 //! The floor is a *lower bound* on real time. Stepping the clock up to it can
 //! only move time toward truth; stepping it down could resurrect an expired
-//! grant or replay an old token into validity. So [`step_needed`] is the rule,
+//! grant or replay an old token into validity. So `step_needed` is the rule,
 //! it takes no syscall, and it is tested exhaustively — the dangerous direction
 //! is unrepresentable rather than merely unused.
 //!

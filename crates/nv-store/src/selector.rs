@@ -21,7 +21,7 @@
 //! signed record). `StubSelectorStore` / `StubSigner` are the loud no-op default
 //! for builds that wire no store; `InMemorySelectorStore` / `TestSigner` (gated
 //! behind `test-seams`) back the unit tests. The transition engine
-//! ([`machine_mgr::system_bank_state::SystemBankManager`]) is the load-bearing
+//! (`machine_mgr::system_bank_state::SystemBankManager`) is the load-bearing
 //! boot / VM-launch authority — see its module docs.
 
 use std::collections::BTreeMap;

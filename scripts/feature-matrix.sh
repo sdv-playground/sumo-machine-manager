@@ -145,6 +145,24 @@ run "vm-sovd with container, no docs hook" \
     cargo clippy --package vm-sovd --all-targets \
     --no-default-features --features container -- -D warnings
 
+# rustdoc as a lint: broken intra-doc links and doc-list lints are errors here.
+# Nothing else checks a doc comment — a link naming a renamed item rots in
+# silence, and for these crates the docs ARE the build instructions an
+# out-of-tree implementer works from. Scoped to exactly that surface and not the
+# workspace: 14 other targets carry 44 pre-existing doc warnings (mostly
+# unclosed HTML tags like `<vin>` and links to private items), so gating them
+# all today would land this as a red line instead of a green one. Widening it is
+# the follow-up.
+#
+# NOTE what this does NOT cover, for the same reason the host-reboot note above
+# does not: a `cfg(target_os = "nto")` item's docs. rustdoc only documents the
+# arms the target compiles, so a broken link inside the QNX arm passes here just
+# as it passes every clippy run above — verified by breaking one in
+# `QnxSysmgrReboot`'s docs. The board-target run named above still sees them
+# first.
+run "docs build clean (-D warnings)" \
+    bash -c 'RUSTDOCFLAGS="-D warnings" cargo doc -p machine-contract -p host-reboot -p host-clock -p hsm-supervisor -p nv-store --no-deps'
+
 # `cargo hack` (install with `cargo install cargo-hack`) walks EVERY feature
 # combination of the crates that own or forward `container`, which the three
 # workspace-wide runs above can't reach on their own — Cargo unifies features
