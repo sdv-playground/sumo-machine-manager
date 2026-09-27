@@ -96,7 +96,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 | `app-mgr` | — | App/container Component: local container image import for Docker, Podman, or containerd |
 | `component-mgr` | — (lib; `tools/crates/vm-diagctl` builds the CLI) | SUIT + SOVD: validation, OTA engine, DID resolution, `/updates` wire; `vm-diagctl` is the NV/bank + factory CLI over it |
 | `services/vm-sovd` | `vm-sovd` | The SOVD/OTA server process — wires the machine registry, components, and the `/updates` wire |
-| `component-factory` | — | `build_component(ComponentSpec, FactoryDeps)` — per-kind backend + adapter builder |
+| `component-factory` | — | `build_component(ComponentSpec, FactoryDeps) -> Result` — per-kind backend + adapter builder; `validate_specs(&[ComponentSpec], slots)` gives the same verdicts at config-load time, plus the cross-component slot/device rules |
 | `hsm-contract` | — | Shared handle-addressed HSM crypto contract (`HsmCryptoProvider`, `KeyHandle` / `SlotInfo` / `SlotKind` / `KeyType`) |
 | `hsm-link-b` | — | Frozen link-B wire + C header: the host↔backend service protocol a hardware-HSE vendor implements; C skeleton in `reference/` |
 | `tools/crates/hsm-sim-backend` | `hsm-sim-service` | `SimHsm` — the non-production reference HSM backend, served behind link-B |

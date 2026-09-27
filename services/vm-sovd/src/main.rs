@@ -491,11 +491,19 @@ async fn main() {
         wall_clock_floor: None,
     };
     for spec in &specs {
-        if let Some(built) = build_component(spec, &deps) {
-            machine_builder = machine_builder.with_arc(built.component);
-            if let Some(diag) = built.diag_backend {
-                backends.insert(spec.id.clone(), diag);
+        // Non-fatal per component, but never silent: a spec that cannot be built is
+        // absent from the registry, so it can be neither flashed nor diagnosed, and
+        // the reason is the only thing that distinguishes "not deployed here" from
+        // a profile typo. Refusing the whole gateway would be worse — one bad spec
+        // would take every other component's diagnostics down with it.
+        match build_component(spec, &deps) {
+            Ok(built) => {
+                machine_builder = machine_builder.with_arc(built.component);
+                if let Some(diag) = built.diag_backend {
+                    backends.insert(spec.id.clone(), diag);
+                }
             }
+            Err(e) => tracing::error!("component '{}' not registered: {e}", spec.id),
         }
     }
 

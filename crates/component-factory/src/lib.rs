@@ -379,6 +379,97 @@ pub fn validate_parts(spec: &ComponentSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Check a WHOLE component set: everything [`build_component`] can reject, checked
+/// at config-load time, plus the two cross-component rules `build_component`
+/// structurally cannot see.
+///
+/// A platform wants this verdict from its config parser, before anything is wired.
+/// [`build_component`] is per-component and runs at startup with the NV store
+/// already open: by the time it returns an `Err` the caller is mid-boot, and the
+/// only honest thing left to do is log and carry on without that component — which
+/// on a multi-bank host is a partition nothing writes and nothing mentions again.
+///
+/// `slots` is a PARAMETER, not read from an [`NvStore`], because this runs before
+/// any store is opened — which is the whole point. [`check_slot_in_range`] re-checks
+/// the same bound against the real device size once the store exists; a store
+/// smaller than the profile expects is a separate fault this cannot see.
+///
+/// The cross-component halves are why this takes a slice, and why no per-component
+/// check could ever have covered them: one slot is one A/B selection and one
+/// `BankBootState`, and one partition is one device. Sharing either makes two
+/// components flip, roll back or stream together, with nothing at runtime saying so.
+pub fn validate_specs(specs: &[ComponentSpec], slots: usize) -> Result<(), String> {
+    // (id, slot) and (id, device) in profile order — small n, so a scan beats a map
+    // and keeps the FIRST declarer as the one the message names.
+    let mut slot_owners: Vec<(&str, usize)> = Vec::with_capacity(specs.len());
+    let mut device_owners: Vec<(&str, &str)> = Vec::new();
+
+    for spec in specs {
+        // Per-component well-formedness: unique part names, distinct devices, no
+        // device claimed twice inside one component. One rule, one place.
+        validate_parts(spec)?;
+
+        // The four types the factory builds. `build_component` matches exactly
+        // these and rejects everything else, so this set is the library's own and
+        // the library is the only honest place to check it.
+        if !matches!(spec.component_type.as_str(), "app" | "bank" | "hpc" | "hsm") {
+            return Err(unknown_component_type(spec));
+        }
+
+        // The single source of the "no `slot:`" and "retired `bank_set:`"
+        // rejections — and it YIELDS the slot the two checks below need, so
+        // nothing here decides a spec's slot a second time.
+        let slot = resolve_bank_set(spec)?.as_index();
+
+        if slot >= slots {
+            return Err(format!(
+                "component '{}' declares slot {slot}, but only {slots} slots exist \
+                 (0..{slots}) — it would be DROPPED silently at startup; raise the \
+                 slot count or fix the slot",
+                spec.id,
+            ));
+        }
+
+        if let Some((prev, _)) = slot_owners.iter().find(|(_, s)| *s == slot) {
+            return Err(format!(
+                "components '{prev}' and '{}' both declare slot {slot} — one slot is \
+                 one A/B selection, so they would flip and roll back together",
+                spec.id,
+            ));
+        }
+        slot_owners.push((&spec.id, slot));
+
+        // `validate_parts` rejects a device listed twice WITHIN a component; two
+        // components naming one partition is the case it cannot see. It means two
+        // independent update transactions streaming to one device — and, where a
+        // platform derives its factory-reset device list from `parts:` too, a
+        // partition that is at once a wipe target and a protected bank.
+        for part in &spec.parts {
+            for device in [part.a.as_str(), part.b.as_str()] {
+                if let Some((owner, _)) = device_owners.iter().find(|(_, d)| *d == device) {
+                    return Err(format!(
+                        "components '{owner}' and '{}' both declare device {device} — \
+                         two banks cannot share a partition",
+                        spec.id,
+                    ));
+                }
+                device_owners.push((&spec.id, device));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The one message for a `type:` the factory does not build, so
+/// [`validate_specs`] (config load) and [`build_component`] (startup) cannot
+/// disagree about what they reject or what they call it.
+fn unknown_component_type(spec: &ComponentSpec) -> String {
+    format!(
+        "unknown component type '{}' for id '{}'",
+        spec.component_type, spec.id,
+    )
+}
+
 /// Resolve both the bank-set slot AND its spec (on-disk dir name)
 /// from a `ComponentSpec`. The slot comes from [`resolve_bank_set`];
 /// the dir name is the explicit `storage_subdir` when present, else
@@ -488,27 +579,23 @@ fn check_slot_in_range<D: BlockDevice>(
 }
 
 /// Build a single component from its spec and shared dependencies.
+///
+/// Every rejection is returned, never swallowed: a component that cannot be built
+/// does not appear in the registry, so it cannot be flashed, activated or
+/// diagnosed, and the caller is the only one that knows whether that is fatal for
+/// its deployment. Refusing in silence — which this did while it returned `Option`
+/// — turned a profile typo into a partition nothing writes. A platform that wants
+/// the same verdicts *before* startup calls [`validate_specs`] from its config
+/// parser; everything here except [`check_slot_in_range`] is also checked there.
 pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
     spec: &ComponentSpec,
     deps: &FactoryDeps<D>,
-) -> Option<BuiltComponent> {
-    if let Err(msg) = validate_parts(spec) {
-        tracing::error!("{msg}");
-        return None;
-    }
+) -> Result<BuiltComponent, String> {
+    validate_parts(spec)?;
 
-    let (bank_set, bank_spec) = match resolve_bank_set_spec(spec) {
-        Ok(resolved) => resolved,
-        Err(msg) => {
-            tracing::error!("{msg}");
-            return None;
-        }
-    };
+    let (bank_set, bank_spec) = resolve_bank_set_spec(spec)?;
 
-    if let Err(msg) = check_slot_in_range(&spec.id, bank_set, &deps.nv.lock().unwrap()) {
-        tracing::error!("{msg}");
-        return None;
-    }
+    check_slot_in_range(&spec.id, bank_set, &deps.nv.lock().unwrap())?;
 
     match spec.component_type.as_str() {
         "app" => {
@@ -609,7 +696,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 engine,
             );
 
-            Some(BuiltComponent {
+            Ok(BuiltComponent {
                 component,
                 diag_backend: Some(Arc::new(diag)),
                 flash_probe: Some(flash_probe),
@@ -780,17 +867,14 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             // `Component` view (orthogonal to SOVD).
             let diag_backend: Arc<dyn sovd_core::DiagnosticBackend> = backend_arc;
 
-            Some(BuiltComponent {
+            Ok(BuiltComponent {
                 component,
                 diag_backend: Some(diag_backend),
                 flash_probe: Some(flash_probe),
                 flash_clear: Some(flash_clear),
             })
         }
-        other => {
-            tracing::warn!("unknown component type '{other}' for id '{}'", spec.id);
-            None
-        }
+        _ => Err(unknown_component_type(spec)),
     }
 }
 
@@ -883,11 +967,11 @@ mod tests {
     }
 
     #[test]
-    fn build_component_skips_a_component_on_an_unaddressable_slot() {
+    fn build_component_refuses_a_component_on_an_unaddressable_slot() {
         let deps = ten_slot_deps();
-        assert!(build_component(&spec_on_slot("co-processor", 12), &deps).is_none());
+        assert!(build_component(&spec_on_slot("co-processor", 12), &deps).is_err());
         // Same spec on an addressable slot still builds.
-        assert!(build_component(&spec_on_slot("co-processor", 9), &deps).is_some());
+        assert!(build_component(&spec_on_slot("co-processor", 9), &deps).is_ok());
     }
 
     /// The slot comes from the platform profile and nowhere else: a spec that
@@ -902,7 +986,7 @@ mod tests {
             resolve_bank_set(&spec).unwrap_err(),
             "component 'vm1' has no slot — set slot: N (slot names were retired in v0.1.2)"
         );
-        assert!(build_component(&spec, &ten_slot_deps()).is_none());
+        assert!(build_component(&spec, &ten_slot_deps()).is_err());
     }
 
     /// A config still carrying the retired `bank_set:` name must fail loudly —
@@ -917,7 +1001,7 @@ mod tests {
             resolve_bank_set(&spec).unwrap_err(),
             "component 'host' sets bank_set 'os' — slot names were retired in v0.1.2, set slot: N"
         );
-        assert!(build_component(&spec, &ten_slot_deps()).is_none());
+        assert!(build_component(&spec, &ten_slot_deps()).is_err());
     }
 
     #[test]
@@ -1120,11 +1204,11 @@ mod tests {
                 b: "/dev/blk0p6".into(),
             },
         ];
-        assert!(build_component(&spec, &ten_slot_deps()).is_none());
+        assert!(build_component(&spec, &ten_slot_deps()).is_err());
 
         // The same spec with the duplicate renamed builds.
         spec.parts[1].name = "boot.ifs".into();
-        assert!(build_component(&spec, &ten_slot_deps()).is_some());
+        assert!(build_component(&spec, &ten_slot_deps()).is_ok());
     }
 
     /// The HSM CSR/keystore wiring follows the DECLARED component type, not the
@@ -1145,5 +1229,144 @@ mod tests {
         spec.component_type = "bank".to_string();
         let built = build_component(&spec, &deps).unwrap();
         assert!(built.component.capabilities().hsm.is_none());
+    }
+
+    /// A four-bank host in miniature: one component per host image, each on its own
+    /// slot with its own raw A/B pair — the shape [`validate_specs`] exists for. Four
+    /// banks on four slots is the *legal* case; every guard below falsifies it by
+    /// breaking exactly one thing, which is what stops a guard from passing because
+    /// the fixture was invalid for some unrelated reason.
+    fn four_host_banks() -> Vec<ComponentSpec> {
+        [
+            ("host-appl", 2u8, "platform.img", "appl"),
+            ("host-ifs", 6, "ifs.img", "ifs"),
+            ("host-core", 7, "qnx-os.img", "core"),
+            ("host-etc", 8, "etc.img", "etc"),
+        ]
+        .into_iter()
+        .map(|(id, slot, file, dev)| {
+            let mut spec = spec_on_slot(id, slot);
+            spec.component_type = "hpc".into();
+            spec.activator = Some("host-bank".into());
+            spec.parts = vec![PartSpec {
+                name: file.into(),
+                a: format!("/dev/hostA-{dev}"),
+                b: format!("/dev/hostB-{dev}"),
+            }];
+            spec
+        })
+        .collect()
+    }
+
+    #[test]
+    fn the_four_bank_host_shape_is_legal() {
+        validate_specs(&four_host_banks(), 10).expect("four banks on four slots is the point");
+        // And the empty set is legal — a profile that declares nothing is a
+        // deployment decision, not a config error.
+        assert!(validate_specs(&[], 10).is_ok());
+    }
+
+    /// The per-component half is not re-implemented here: `validate_specs` calls
+    /// [`validate_parts`], so there is one message for a malformed part list
+    /// wherever it is caught.
+    #[test]
+    fn validate_specs_delegates_the_per_component_part_checks() {
+        let mut specs = four_host_banks();
+        specs[1].parts.push(PartSpec {
+            name: "ifs.img".into(),
+            a: "/dev/hostA-spare".into(),
+            b: "/dev/hostB-spare".into(),
+        });
+        assert_eq!(
+            validate_specs(&specs, 10).unwrap_err(),
+            "component 'host-ifs' declares part 'ifs.img' twice"
+        );
+    }
+
+    /// `build_component` warned about an unbuildable `type:` and dropped the
+    /// component; the config parser now refuses it, with the SAME text, before
+    /// anything is wired.
+    #[test]
+    fn validate_specs_refuses_a_type_the_factory_cannot_build() {
+        let mut specs = four_host_banks();
+        specs[3].component_type = "boot_image".into();
+        assert_eq!(
+            validate_specs(&specs, 10).unwrap_err(),
+            "unknown component type 'boot_image' for id 'host-etc'"
+        );
+        // The two must agree word for word — they are the same rule at two times.
+        // (`err()`, not `unwrap_err()`: `BuiltComponent` holds trait objects and so
+        // is not `Debug`.)
+        assert_eq!(
+            build_component(&specs[3], &ten_slot_deps()).err(),
+            Some("unknown component type 'boot_image' for id 'host-etc'".to_string())
+        );
+    }
+
+    /// Both `resolve_bank_set` refusals reach the config parser unchanged — a spec
+    /// with no `slot:` and one still carrying the retired `bank_set:` name. This is
+    /// why `validate_specs` resolves through it rather than reading `spec.slot`: one
+    /// place decides a spec's slot.
+    #[test]
+    fn validate_specs_refuses_a_spec_whose_slot_cannot_be_resolved() {
+        let mut specs = four_host_banks();
+        specs[2].slot = None;
+        assert_eq!(
+            validate_specs(&specs, 10).unwrap_err(),
+            "component 'host-core' has no slot — set slot: N (slot names were retired in v0.1.2)"
+        );
+
+        let mut specs = four_host_banks();
+        specs[2].bank_set = Some("os".into());
+        assert_eq!(
+            validate_specs(&specs, 10).unwrap_err(),
+            "component 'host-core' sets bank_set 'os' — slot names were retired in v0.1.2, \
+             set slot: N"
+        );
+    }
+
+    /// The bound that used to be checked only once the NV store was open, where
+    /// [`check_slot_in_range`] made `build_component` drop the component: the
+    /// registry came up without it and a declared bank simply was not there.
+    #[test]
+    fn validate_specs_refuses_a_slot_the_profile_cannot_address() {
+        let specs = four_host_banks();
+        assert_eq!(
+            validate_specs(&specs, 8).unwrap_err(),
+            "component 'host-etc' declares slot 8, but only 8 slots exist (0..8) — it \
+             would be DROPPED silently at startup; raise the slot count or fix the slot"
+        );
+        // The last slot the profile owns is fine; one past it is not.
+        assert!(validate_specs(&specs, 9).is_ok());
+    }
+
+    /// One slot is one A/B selection and one `BankBootState`. Two components on it
+    /// flip together and roll back together, with nothing at runtime to say so —
+    /// unaddressable while every component had its own slot by construction, and the
+    /// obvious copy-paste once a profile hand-assigns four host slots in a row.
+    #[test]
+    fn two_components_may_not_share_a_slot() {
+        let mut specs = four_host_banks();
+        specs[2].slot = Some(6);
+        assert_eq!(
+            validate_specs(&specs, 10).unwrap_err(),
+            "components 'host-ifs' and 'host-core' both declare slot 6 — one slot is \
+             one A/B selection, so they would flip and roll back together"
+        );
+    }
+
+    /// The cross-component half of the device check `validate_parts` cannot see:
+    /// two independent update transactions streaming to one partition — and, where a
+    /// platform derives its factory-reset device list from `parts:`, a partition that
+    /// is at once a wipe target and a protected bank.
+    #[test]
+    fn two_components_may_not_share_a_partition_device() {
+        let mut specs = four_host_banks();
+        specs[3].parts[0].a = "/dev/hostB-core".into();
+        assert_eq!(
+            validate_specs(&specs, 10).unwrap_err(),
+            "components 'host-core' and 'host-etc' both declare device /dev/hostB-core \
+             — two banks cannot share a partition"
+        );
     }
 }

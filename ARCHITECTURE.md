@@ -210,6 +210,12 @@ The core update/diagnostics path:
   opt-in `container` feature (default OFF) — see `docs/features.md`.
 - **component-factory** (lib): `build_component(ComponentSpec, FactoryDeps)` — builds the
   right backend + adapter per component kind (incl. the install router for app-capable VMs).
+  It returns `Result<BuiltComponent, String>`: a component that cannot be built is absent
+  from the registry, so it can be neither flashed nor diagnosed, and only the caller knows
+  whether that is fatal for its deployment. `validate_specs(&[ComponentSpec], slots)` is the
+  same verdicts a profile can get from its config parser *before* startup — plus the two
+  cross-component rules no per-component check can see (one slot is one A/B selection; one
+  partition is one device).
 - **vm-mgr** (lib, was `vm-service`; the `vm-service` PROCESS that drives it is
   `tools/crates/vm-service`):
   QEMU/`qvm` lifecycle, per-bank VM config, the pre-launch
