@@ -894,3 +894,22 @@ fn reboot_owed_round_trips_the_top_slot() {
     assert!(!read.owes(BankSet(0)));
     assert!(read.reboot_pending());
 }
+
+// --- Selector canonical encoding ---
+
+#[test]
+fn canonical_bytes_are_two_per_slot() {
+    use crate::selector::{SelectorBlob, SlotSelect};
+    use std::collections::BTreeMap;
+
+    // The signed bytes are the u64 LE generation, then `[set, bank]` per slot
+    // in ascending set order — inserted out of order to prove the ordering.
+    let mut selectors = BTreeMap::new();
+    selectors.insert(slots::VM1, SlotSelect::new(Bank::B));
+    selectors.insert(slots::OS, SlotSelect::new(Bank::A));
+
+    assert_eq!(
+        SelectorBlob::canonical_bytes(0x0102, &selectors),
+        [0x02, 0x01, 0, 0, 0, 0, 0, 0, 2, 0, 4, 1],
+    );
+}

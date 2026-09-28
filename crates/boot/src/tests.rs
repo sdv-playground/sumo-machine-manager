@@ -548,7 +548,7 @@ fn make_bootmgr_with_selector() -> (BootManager<MemBlockDevice>, InMemorySelecto
 fn sel_map(entries: &[(BankSet, Bank)]) -> BTreeMap<BankSet, SlotSelect> {
     entries
         .iter()
-        .map(|&(set, bank)| (set, SlotSelect::enabled(bank)))
+        .map(|&(set, bank)| (set, SlotSelect::new(bank)))
         .collect()
 }
 

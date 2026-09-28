@@ -270,9 +270,7 @@ impl<D: BlockDevice> BootManager<D> {
                 continue;
             }
             handled[idx] = true;
-            // Trial is a BANK-selection difference; the per-slot enable bit is
-            // orthogonal (an idle disable must not look like a trial), so compare
-            // the floor's bank only.
+            // Trial is a BANK-selection difference: compare the floor's bank.
             let floor = secondary.and_then(|s| s.selectors.get(set).map(|s| s.bank));
 
             if floor == Some(bank) {

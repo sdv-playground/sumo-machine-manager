@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use nv_store::types::{Bank, BankSet};
+use nv_store::types::{BankBootState, BankSet};
 
 use crate::component::Component;
 use crate::system_bank_state::{
@@ -100,11 +100,17 @@ impl MachineRegistry {
     }
 
     /// Seed the boot selector from the node's per-bank-set boot state so the
-    /// selector's PRIMARY slot mirrors reality on startup.
+    /// selector mirrors reality on startup: PRIMARY boots each set's NV
+    /// `active_bank`, and SECONDARY (the rollback floor) holds each set's
+    /// COMMITTED bank — `active_bank` itself for a committed set,
+    /// `active_bank.other()` for a set NV holds in trial (`committed ==
+    /// false`), so a trial survives the reseed as a trial over its floor.
     ///
-    /// For each `(set, bank)` entry, this stages the selection **only when it
-    /// differs** from the selector's current PRIMARY view; after the loop, it
-    /// seals **once** iff anything was staged.
+    /// The seed runs **only when some entry's `active_bank` differs** from the
+    /// selector's current PRIMARY view. It then stages every set's floor, seals
+    /// and commits (PRIMARY == SECONDARY == floor), and — iff any set is in
+    /// trial — stages those sets' active banks and seals again, which arms the
+    /// trial exactly as an OTA does: PRIMARY ahead of the committed floor.
     ///
     /// **Idempotent on purpose**: when the selector already matches the
     /// supplied entries (the steady-state case on every boot), nothing is
@@ -116,25 +122,32 @@ impl MachineRegistry {
     /// Additive: this is a read-only mirror of `NvBootState` into the selector
     /// — it does not make the selector the boot authority. Nothing consults the
     /// selector for a boot/bank decision.
-    pub fn seed_selector(&mut self, entries: impl IntoIterator<Item = (BankSet, Bank)>) {
-        // One write lock for the whole seed: the read-compare-stage loop and
-        // the seal/commit must see a consistent view of the selector.
+    pub fn seed_selector(&mut self, entries: impl IntoIterator<Item = (BankSet, BankBootState)>) {
+        // One write lock for the whole seed: the compare and the stage/seal/
+        // commit sequence must see a consistent view of the selector.
         let mut sb = self.system_bank.write().expect("selector poisoned");
-        let mut staged_any = false;
-        for (set, bank) in entries {
-            if sb.active_bank(set) != Some(bank) {
-                sb.stage(set, bank);
-                staged_any = true;
-            }
+        let entries: Vec<(BankSet, BankBootState)> = entries.into_iter().collect();
+        if entries
+            .iter()
+            .all(|(set, nv)| sb.active_bank(*set) == Some(nv.active_bank))
+        {
+            return;
         }
-        if staged_any {
-            // seal writes PRIMARY; commit copies it to SECONDARY so both slots
-            // exist and are equal — the not-in-trial baseline (PRIMARY ==
-            // SECONDARY). A real trial (the two diverging) only arises later
-            // from an OTA stage/seal, not from this mirror seed.
-            sb.seal();
-            sb.commit();
+        for (set, nv) in &entries {
+            let floor = if nv.committed {
+                nv.active_bank
+            } else {
+                nv.active_bank.other()
+            };
+            sb.stage(*set, floor);
         }
+        sb.seal();
+        sb.commit();
+        for (set, nv) in entries.iter().filter(|(_, nv)| !nv.committed) {
+            sb.stage(*set, nv.active_bank);
+        }
+        // A no-op when nothing is in trial: `seal` needs something staged.
+        sb.seal();
     }
 }
 

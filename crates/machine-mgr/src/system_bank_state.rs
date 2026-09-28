@@ -34,11 +34,11 @@
 //!
 //! # Status: the boot / VM-launch authority
 //!
-//! This IS the authority for "which bank does each set boot from" + its
-//! enable/disable state on the supernova host: the OTA path
+//! This IS the authority for "which bank does each set boot from" on the
+//! supernova host: the OTA path
 //! stages/seals/commits/rolls it back on every bank move, and boot + VM-launch
 //! read it (`vm-boot::process_boot` prefers the selector; supernova's auto-start
-//! loop launches from `selector.active_bank`/`disabled`). `NvBootState` is NOT a
+//! loop launches from `selector.active_bank`). `NvBootState` is NOT a
 //! second boot authority — it holds the RUNNING-bank / OTA-target anchor and the
 //! trial statistics (`boot_count` / `committed`), which the selector deliberately
 //! does not duplicate (it derives trial structurally from PRIMARY ≠ SECONDARY).
@@ -67,7 +67,7 @@ pub use nv_store::selector::{
 pub use nv_store::selector::{InMemorySelectorStore, TestSigner};
 
 /// Compact one-line render of a selector map for logs, e.g.
-/// `{0:A+ 2:B+ 4:B-}` where `+`/`-` is enabled/disabled. Slot order is
+/// `{0:A 2:B 4:B}`. Slot order is
 /// ascending `BankSet`. Keeps the mutation logs greppable + diffable across
 /// boots so a lost/reverted slot is obvious at a glance.
 fn render_slots(m: &BTreeMap<BankSet, SlotSelect>) -> String {
@@ -76,12 +76,7 @@ fn render_slots(m: &BTreeMap<BankSet, SlotSelect>) -> String {
         if i > 0 {
             s.push(' ');
         }
-        s.push_str(&format!(
-            "{}:{:?}{}",
-            set.as_index(),
-            sel.bank,
-            if sel.enabled { '+' } else { '-' }
-        ));
+        s.push_str(&format!("{}:{:?}", set.as_index(), sel.bank));
     }
     s.push('}');
     s
@@ -107,8 +102,7 @@ fn render_slots(m: &BTreeMap<BankSet, SlotSelect>) -> String {
 pub struct SystemBankManager {
     store: Box<dyn SelectorStore>,
     signer: Box<dyn Signer>,
-    /// PRIMARY / booted selection. Each slot carries its bank **and** its
-    /// enable bit (`SlotSelect`) — disable is per slot, not a separate set.
+    /// PRIMARY / booted selection.
     current: BTreeMap<BankSet, SlotSelect>,
     /// Generation of `current`.
     generation: u64,
@@ -134,13 +128,30 @@ impl SystemBankManager {
     /// drive boot. An absent PRIMARY (the stub case) yields empty maps at
     /// generation 0.
     pub fn load(store: Box<dyn SelectorStore>, signer: Box<dyn Signer>) -> Self {
-        let primary = store.read_primary().filter(|b| b.is_valid(&*signer));
+        // A PRESENT blob that fails verification warns rather than vanishing
+        // silently: the slot reads as absent (an absent PRIMARY is the host's
+        // reseed-from-NV trigger), and this line is the only record of why.
+        let verified = |slot: &str, blob: Option<SelectorBlob>| {
+            blob.filter(|b| {
+                let valid = b.is_valid(&*signer);
+                if !valid {
+                    tracing::warn!(
+                        generation = b.generation,
+                        slots = %render_slots(&b.selectors),
+                        "boot selector {slot} failed verification — treated as absent (will be reseeded)"
+                    );
+                }
+                valid
+            })
+        };
+
+        let primary = verified("PRIMARY", store.read_primary());
         let (current, generation) = match primary {
             Some(b) => (b.selectors, b.generation),
             None => (BTreeMap::new(), 0),
         };
 
-        let secondary = store.read_secondary().filter(|b| b.is_valid(&*signer));
+        let secondary = verified("SECONDARY", store.read_secondary());
         let (committed, committed_generation) = match secondary {
             Some(b) => (b.selectors, b.generation),
             None => (BTreeMap::new(), 0),
@@ -165,11 +176,7 @@ impl SystemBankManager {
     /// exactly why a reboot here boots the old selection.
     pub fn stage(&mut self, set: BankSet, bank: Bank) {
         let mut pending = self.pending.take().unwrap_or_else(|| self.current.clone());
-        // Preserve the slot's existing enable bit across a bank change (staging a
-        // new bank must not silently re-enable a disabled slot); a brand-new slot
-        // defaults to enabled.
-        let enabled = pending.get(&set).is_none_or(|s| s.enabled);
-        pending.insert(set, SlotSelect { bank, enabled });
+        pending.insert(set, SlotSelect::new(bank));
         self.pending = Some(pending);
     }
 
@@ -198,46 +205,6 @@ impl SystemBankManager {
             "boot-selector SEAL → PRIMARY (new booted selection)"
         );
         true
-    }
-
-    /// Flip a bank set's booted (PRIMARY) enable bit and re-sign PRIMARY in place.
-    ///
-    /// Unlike [`stage`](Self::stage) + [`seal`](Self::seal), this writes
-    /// immediately: disabling a component is an idle-time admin action, not a
-    /// staged boot trial. The whole blob is re-signed at the **current**
-    /// generation — no anti-rollback bump, because the booted *selection* is
-    /// unchanged (only the enable bit moves) and a single component disables at
-    /// idle (enforced elsewhere), so there is no in-flight selector trial to
-    /// disturb. SECONDARY (the rollback floor) is left untouched.
-    ///
-    /// Disabling a slot that has **no** selection yet records a default-bank,
-    /// disabled entry so the disable survives a reload (the "empty slot" case);
-    /// enabling an absent slot is a no-op.
-    pub fn stage_disabled(&mut self, set: BankSet, disabled: bool) {
-        let enabled = !disabled;
-        match self.current.get_mut(&set) {
-            Some(sel) => sel.enabled = enabled,
-            None if disabled => {
-                self.current.insert(
-                    set,
-                    SlotSelect {
-                        bank: Bank::A,
-                        enabled,
-                    },
-                );
-            }
-            None => return, // enabling an absent slot: nothing to do
-        }
-        let blob = SelectorBlob::signed(self.generation, self.current.clone(), &*self.signer);
-        self.store.write_primary(&blob);
-        tracing::info!(
-            op = "stage_disabled",
-            set = set.as_index(),
-            disabled,
-            generation = self.generation,
-            slots = %render_slots(&self.current),
-            "boot-selector STAGE_DISABLED → PRIMARY re-signed (enable bit flip)"
-        );
     }
 
     /// Promote the booted (PRIMARY) selection to the rollback floor (SECONDARY)
@@ -292,24 +259,11 @@ impl SystemBankManager {
         self.current.get(&set).map(|s| s.bank)
     }
 
-    /// Whether `set` is disabled in the booted (PRIMARY) selection — i.e. the
-    /// node must not boot it. A slot with no selection is **not** disabled (it
-    /// simply has no selection). See [`BootSelector::disabled`].
-    pub fn disabled(&self, set: BankSet) -> bool {
-        self.current.get(&set).is_some_and(|s| !s.enabled)
-    }
-
     /// Whether the node is in a trial: the booted BANK selection (PRIMARY)
-    /// differs from the committed floor (SECONDARY). The per-slot enable bit is
-    /// orthogonal — an idle [`stage_disabled`](Self::stage_disabled) mutates
-    /// PRIMARY but must NOT read as a trial — so the comparison is bank-only.
+    /// differs from the committed floor (SECONDARY).
     pub fn is_trial(&self) -> bool {
-        let banks = |m: &BTreeMap<BankSet, SlotSelect>| {
-            m.iter()
-                .map(|(k, v)| (*k, v.bank))
-                .collect::<BTreeMap<_, _>>()
-        };
-        banks(&self.current) != banks(&self.committed)
+        // Bank-only by construction: a `SlotSelect` carries nothing but the bank.
+        self.current != self.committed
     }
 
     /// The generation of the currently-booted (PRIMARY) selection.
@@ -366,12 +320,6 @@ impl BootSelector {
     /// selection for that set. See [`SystemBankManager::active_bank`].
     pub fn active_bank(&self, set: BankSet) -> Option<Bank> {
         self.0.read().expect("selector poisoned").active_bank(set)
-    }
-
-    /// Whether `set` is disabled in the booted selector (PRIMARY) — the node
-    /// must not boot it. See [`SystemBankManager::disabled`].
-    pub fn disabled(&self, set: BankSet) -> bool {
-        self.0.read().expect("selector poisoned").disabled(set)
     }
 
     /// Whether the node is in a trial (PRIMARY differs from SECONDARY). See
@@ -516,7 +464,7 @@ mod tests {
         // Plant a PRIMARY blob whose signature doesn't verify under TestSigner
         // (empty sig — StubSigner would have produced this).
         let mut selectors = BTreeMap::new();
-        selectors.insert(slots::VM1, SlotSelect::enabled(Bank::B));
+        selectors.insert(slots::VM1, SlotSelect::new(Bank::B));
         let generation = 9;
         let bad = SelectorBlob {
             generation,
@@ -562,7 +510,7 @@ mod tests {
     /// signature) for the file round-trip.
     fn blob(generation: u64, set: BankSet, bank: Bank) -> SelectorBlob {
         let mut selectors = BTreeMap::new();
-        selectors.insert(set, SlotSelect::enabled(bank));
+        selectors.insert(set, SlotSelect::new(bank));
         SelectorBlob::signed(generation, selectors, &TestSigner)
     }
 
@@ -614,96 +562,50 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 
-    // --- per-slot `enabled` (folded-in disable) ---
+    // --- blobs signed over the retired three-byte slot encoding ---
 
     #[test]
-    fn enable_bit_is_covered_by_the_signature() {
-        // Flipping a slot's `enabled` bit must change the digest — and therefore
-        // the signature — exactly as a bank change does. This is the whole point
-        // of folding disable INTO the signed selector.
-        let generation: u64 = 7;
-        let mut enabled = BTreeMap::new();
-        enabled.insert(slots::VM1, SlotSelect::enabled(Bank::A));
-        let mut disabled = BTreeMap::new();
-        disabled.insert(
-            slots::VM1,
-            SlotSelect {
-                bank: Bank::A,
-                enabled: false,
-            },
+    fn legacy_three_byte_blob_is_rejected_on_load() {
+        // A blob correctly signed over the OLD encoding — `[set, bank,
+        // enabled]` per slot — no longer verifies: its digest covers a byte the
+        // canonical encoding dropped. Both slots read as absent, so the node
+        // looks unseeded and the host reseeds it from NV.
+        use sha2::{Digest, Sha256};
+
+        let generation: u64 = 5;
+        let mut legacy = generation.to_le_bytes().to_vec();
+        legacy.extend_from_slice(&[slots::VM1.0, Bank::A as u8, 1]);
+        let sha256: [u8; 32] = Sha256::digest(&legacy).into();
+        let mut selectors = BTreeMap::new();
+        selectors.insert(slots::VM1, SlotSelect::new(Bank::A));
+        let blob = SelectorBlob {
+            generation,
+            selectors,
+            sha256,
+            signature: TestSigner.sign(&sha256),
+        };
+        assert!(
+            TestSigner.verify(&blob.sha256, &blob.signature),
+            "the signature itself is good — only the digest is stale"
         );
-
-        let a = SelectorBlob::signed(generation, enabled, &TestSigner);
-        let b = SelectorBlob::signed(generation, disabled, &TestSigner);
-
-        assert_ne!(a.sha256, b.sha256, "the enable bit must change the digest");
-        assert_ne!(
-            a.signature, b.signature,
-            "a changed digest must change the signature",
-        );
-    }
-
-    #[test]
-    fn stage_disabled_round_trips_and_persists() {
-        // `stage_disabled` + `disabled(set)` round-trip: set, clear, re-set; the
-        // disable persists into PRIMARY (survives a reload), leaves the bank
-        // selection intact, and is visible through the read-only `BootSelector`.
-        use std::sync::{Arc, RwLock};
 
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-        m.stage(slots::VM1, Bank::A);
-        m.seal();
-        m.commit(); // establish the committed floor so PRIMARY == SECONDARY
+        store.write_primary(&blob);
+        store.write_secondary(&blob);
 
-        m.stage_disabled(slots::VM1, true);
-        assert!(m.disabled(slots::VM1));
-        assert!(!m.disabled(slots::VM2));
-        assert!(!m.is_trial(), "an idle disable is not a trial");
-        m.stage_disabled(slots::VM1, false);
-        assert!(!m.disabled(slots::VM1), "clearing re-enables the slot");
-        m.stage_disabled(slots::VM1, true);
-
-        // Re-sealed into PRIMARY, so a fresh load sees the disable and the
-        // selection is intact.
-        let m2 = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-        assert!(m2.disabled(slots::VM1), "disable survives reload");
-        assert_eq!(
-            m2.active_bank(slots::VM1),
-            Some(Bank::A),
-            "selection intact"
-        );
-
-        // Visible through the read-only BootSelector view.
-        let selector = BootSelector::new(Arc::new(RwLock::new(m)));
-        assert!(selector.disabled(slots::VM1));
-        assert!(!selector.disabled(slots::VM2));
+        let m = SystemBankManager::load(Box::new(store), Box::new(TestSigner));
+        assert!(m.is_empty(), "PRIMARY rejected");
+        assert_eq!(m.generation(), 0);
+        // current is empty, so a trial would mean SECONDARY survived.
+        assert!(!m.is_trial(), "SECONDARY rejected");
     }
 
     #[test]
-    fn is_valid_holds_for_a_disabled_carrying_blob() {
-        // A blob whose signed digest covers a disabled slot still verifies.
-        let generation: u64 = 3;
-        let mut selectors = BTreeMap::new();
-        selectors.insert(
-            slots::VM1,
-            SlotSelect {
-                bank: Bank::B,
-                enabled: false,
-            },
-        );
-        let blob = SelectorBlob::signed(generation, selectors, &TestSigner);
-        assert!(blob.is_valid(&TestSigner));
-    }
-
-    #[test]
-    fn slot_without_enabled_key_defaults_to_enabled() {
-        // A slot serialized without an explicit `enabled` key (e.g. a pre-fold
-        // on-disk blob, which only had a bare bank) deserializes as enabled — a
-        // slot with a selection is bootable unless explicitly disabled.
-        let json = serde_json::json!({ "bank": "A" });
+    fn slot_json_with_legacy_enabled_key_still_parses() {
+        // A slot written with the retired `enabled` key still parses (unknown
+        // keys are ignored); its blob then fails `is_valid`, not the parse.
+        let json = serde_json::json!({ "bank": "A", "enabled": false });
         let sel: SlotSelect = serde_json::from_value(json).expect("slot parses");
-        assert_eq!(sel.bank, Bank::A);
-        assert!(sel.enabled, "missing enabled key defaults to true");
+        assert_eq!(sel, SlotSelect { bank: Bank::A });
     }
 }

@@ -31,35 +31,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{Bank, BankSet};
 
-/// One slot's boot selection: which bank, and whether the node may boot/launch
-/// it. `enabled == false` is the disable state — it **replaces** the old
-/// separate top-level `disabled` set, so enable/disable now lives per slot,
-/// alongside the bank, and is covered by the same signature (see
-/// [`SelectorBlob::canonical_bytes`]).
+/// One slot's boot selection: which bank the node boots for that set, covered
+/// by the signature (see [`SelectorBlob::canonical_bytes`]).
+///
+/// A struct rather than a bare [`Bank`] so the on-disk JSON slot stays the
+/// object `{"bank":"A"}` — host-boot.sh reads the `"bank"` key inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotSelect {
     /// The booted bank for this slot.
     pub bank: Bank,
-    /// Whether the node may boot/launch this slot. `#[serde(default)]` to `true`
-    /// so a selection with no explicit `enabled` key (or a pre-fold on-disk blob)
-    /// reads as enabled — a slot with a selection is bootable unless disabled.
-    #[serde(default = "enabled_default")]
-    pub enabled: bool,
-}
-
-/// `serde` default for [`SlotSelect::enabled`] — a slot is enabled unless told
-/// otherwise.
-fn enabled_default() -> bool {
-    true
 }
 
 impl SlotSelect {
-    /// A newly-selected, enabled slot.
-    pub fn enabled(bank: Bank) -> Self {
-        Self {
-            bank,
-            enabled: true,
-        }
+    /// The selection of `bank`.
+    pub fn new(bank: Bank) -> Self {
+        Self { bank }
     }
 }
 
@@ -74,11 +60,8 @@ impl SlotSelect {
 pub struct SelectorBlob {
     /// Global anti-rollback generation. Monotonic on `seal`.
     pub generation: u64,
-    /// `BankSet -> {bank, enabled}` boot selection, canonically ordered. The
-    /// per-slot `enabled` flag folds in what used to be a separate top-level
-    /// `disabled` set: a slot present with `enabled == false` is the disable
-    /// state. Both the bank and the enable bit are covered by the signature
-    /// (see [`Self::canonical_bytes`]).
+    /// `BankSet -> {bank}` boot selection, canonically ordered. The bank is
+    /// covered by the signature (see [`Self::canonical_bytes`]).
     pub selectors: BTreeMap<BankSet, SlotSelect>,
     /// SHA-256 over the canonical `(generation, selectors)` bytes — the digest
     /// the signature covers. Serialized as a lowercase hex string.
@@ -96,20 +79,15 @@ impl SelectorBlob {
     ///
     /// Layout (little-endian, fixed-width — no length-prefixed text, so it is
     /// reproducible byte-for-byte): the u64 generation, then each
-    /// `(BankSet.0: u8, Bank: u8, enabled: u8)` selector triple in `BTreeMap`
-    /// (ascending `BankSet`) order. `BankSet` is a `u8` newtype and `Bank` is
-    /// `repr(u8)`, so three bytes per slot suffice.
-    ///
-    /// The `enabled` byte is part of the signed encoding, so disabling a slot
-    /// (flipping its bit) changes the digest and therefore the signature — the
-    /// enable/disable state is attested exactly like the bank selection.
+    /// `(BankSet.0: u8, Bank: u8)` selector pair in `BTreeMap` (ascending
+    /// `BankSet`) order. `BankSet` is a `u8` newtype and `Bank` is `repr(u8)`,
+    /// so two bytes per slot suffice.
     pub fn canonical_bytes(generation: u64, selectors: &BTreeMap<BankSet, SlotSelect>) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + selectors.len() * 3);
+        let mut buf = Vec::with_capacity(8 + selectors.len() * 2);
         buf.extend_from_slice(&generation.to_le_bytes());
         for (set, sel) in selectors {
             buf.push(set.0);
             buf.push(sel.bank as u8);
-            buf.push(u8::from(sel.enabled));
         }
         buf
     }
