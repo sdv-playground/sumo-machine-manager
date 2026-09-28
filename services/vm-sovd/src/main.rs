@@ -461,9 +461,12 @@ async fn main() {
         manifest_provider: manifest_provider.clone(),
         vm_service_addr: vm_service_addr.clone(),
         hsm_provider: hsm_provider.clone(),
-        // No crypto-only handle in the dev vm-sovd binary — keeps the
-        // `dyn HsmProvider` path for seal / unwrap / CSR.
-        hsm_crypto: None,
+        // The link-B client as the crypto handle too — the SAME connection
+        // `hsm_provider` wraps, as on the host. It signs the IVD seal and the
+        // disable sentinel (without a signer a disable is refused with a 409),
+        // and serves the keys-provision CEK unwrap and the HSM component's CSR.
+        // `None` without `--backend-socket`, like `hsm_provider`.
+        hsm_crypto: client.clone().map(|c| c as Arc<dyn hsm::HsmCryptoProvider>),
         hsm_keystore: Some(hsm_keystore_path.clone()),
         hsm_port,
         bank_activators,
