@@ -219,6 +219,13 @@ pub struct BuiltComponent {
     pub diag_backend: Option<Arc<dyn sovd_core::DiagnosticBackend>>,
     pub flash_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub flash_clear: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// `Some` only for administratively disableable components (a `Deactivator` is
+    /// equipped): answers "is this component administratively disabled right now",
+    /// derived from the serving bank's signed IVD sentinel record, cached in the backend.
+    /// The node binary late-binds vm-mgr's admin gate, the autostart skip and the
+    /// witness/M7 skips to it, because those are wired before `build_component` runs.
+    /// Never call it with the NV mutex held: a cache miss takes it.
+    pub admin_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// Shared dependencies passed to the factory for all components.
@@ -684,6 +691,15 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 let b = backend_arc.clone();
                 Arc::new(move || b.clear_flash_session())
             };
+            // Structural, as in the `bank` arm: `None` today, because this arm
+            // never equips a Deactivator.
+            let admin_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>> =
+                if backend_arc.is_disableable() {
+                    let b = backend_arc.clone();
+                    Some(Arc::new(move || b.admin_disabled()))
+                } else {
+                    None
+                };
 
             // The `app` component has its OWN install/flash lifecycle
             // (`AppComponent`: app-mgr A/B symlink flip) that is NOT the VM
@@ -701,6 +717,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 diag_backend: Some(Arc::new(diag)),
                 flash_probe: Some(flash_probe),
                 flash_clear: Some(flash_clear),
+                admin_probe,
             })
         }
         // `bank` is the canonical name for "bank-managed Component, launch
@@ -858,6 +875,15 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 let b = backend_arc.clone();
                 Arc::new(move || b.clear_flash_session())
             };
+            // Only a component the Deactivator above made disableable has an
+            // admin state to probe.
+            let admin_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>> =
+                if backend_arc.is_disableable() {
+                    let b = backend_arc.clone();
+                    Some(Arc::new(move || b.admin_disabled()))
+                } else {
+                    None
+                };
 
             // `bank`/`hpc`/`hsm` install/flash lives natively on
             // `ComponentBackend` (the `ComponentAdapter` above delegates its
@@ -872,6 +898,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 diag_backend: Some(diag_backend),
                 flash_probe: Some(flash_probe),
                 flash_clear: Some(flash_clear),
+                admin_probe,
             })
         }
         _ => Err(unknown_component_type(spec)),
@@ -1229,6 +1256,51 @@ mod tests {
         spec.component_type = "bank".to_string();
         let built = build_component(&spec, &deps).unwrap();
         assert!(built.component.capabilities().hsm.is_none());
+    }
+
+    /// The node binary late-binds its admin gates (vm-mgr's start gate, the
+    /// autostart skip, the witness and M7 sync skips) to this probe, so it exists
+    /// exactly where a Deactivator does: on a `bank` given one, not on a plain
+    /// `bank`, and never on `hsm` or `app` — not even under an id the deployment
+    /// injected a deactivator for.
+    #[test]
+    fn admin_probe_present_only_for_disableable_components() {
+        struct OkDeactivator;
+        impl machine_mgr::Deactivator for OkDeactivator {
+            fn deactivate(
+                &self,
+            ) -> Result<machine_mgr::DeactivateOutcome, machine_mgr::DeactivateError> {
+                Ok(machine_mgr::DeactivateOutcome {
+                    reboot_required: false,
+                })
+            }
+        }
+        let mut deps = ten_slot_deps();
+        deps.deactivators
+            .insert("rt".to_string(), Arc::new(OkDeactivator));
+
+        let probe = build_component(&spec_on_slot("rt", 9), &deps)
+            .unwrap()
+            .admin_probe
+            .expect("a bank with a deactivator is disableable");
+        // A fresh backend has no sentinel record: enabled.
+        assert!(!probe());
+
+        // No deactivator for this id, and no vm-service to build one from.
+        assert!(build_component(&spec_on_slot("vm1", 4), &deps)
+            .unwrap()
+            .admin_probe
+            .is_none());
+
+        // Same id, same injected deactivator: the type decides.
+        for component_type in ["hsm", "app"] {
+            let mut spec = spec_on_slot("rt", 9);
+            spec.component_type = component_type.to_string();
+            assert!(
+                build_component(&spec, &deps).unwrap().admin_probe.is_none(),
+                "{component_type} is never disableable"
+            );
+        }
     }
 
     /// A four-bank host in miniature: one component per host image, each on its own
