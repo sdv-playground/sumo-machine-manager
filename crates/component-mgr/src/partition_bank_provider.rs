@@ -264,6 +264,13 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
     fn disabled(&self, set: BankSet) -> bool {
         self.inner.disabled(set)
     }
+    fn write_disabled_record(&self, bank: Bank, gen: u64) -> Result<(), BankError> {
+        // The IVD pair lives in the metadata dir exactly as for a file bank.
+        self.inner.write_disabled_record(bank, gen)
+    }
+    fn disabled_record(&self, bank: Bank) -> Result<Option<u64>, BankError> {
+        self.inner.disabled_record(bank)
+    }
     fn reset_kind(&self) -> ResetKind {
         // A raw partition takes effect only after the node reboots + the
         // bootloader re-selects — always a full ECU reset.

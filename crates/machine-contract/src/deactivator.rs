@@ -12,9 +12,9 @@
 //!
 //! - **Enact only.** Stop/erase the component's runtime. Implementations
 //!   never touch NV — the caller (`component-mgr`'s admin-state op) owns the
-//!   persisted admin flag, and persists it BEFORE enacting so a crash between
-//!   the two converges at the next boot (the start gate skips a disabled
-//!   component).
+//!   persisted admin flag, and persists it only AFTER a successful enact
+//!   (enact-first): a failed enact persists nothing, so the recorded state
+//!   never claims a disable the runtime did not take.
 //! - **Never reboot the node.** When completing the deactivation needs a node
 //!   reset (RT erase: the M7 keeps running from SRAM until the next boot),
 //!   return [`DeactivateOutcome::reboot_required`] `= true` — the op arms it

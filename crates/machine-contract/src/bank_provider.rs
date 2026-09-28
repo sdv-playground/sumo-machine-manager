@@ -62,6 +62,24 @@ pub struct InstalledFirmware {
     pub raw: Option<Vec<u8>>,
 }
 
+/// Mirror of `hsm::ivd::IVD_DISABLED_RECORD_PATH`: the name of the
+/// administrative-disable sentinel's one inventory entry. This crate may not
+/// depend on `hsm` (its dep-light allowlist), so the value is repeated here;
+/// component-mgr pins the two equal with a test.
+pub const DISABLED_RECORD_PATH: &str = ".admin-disabled";
+
+impl InstalledFirmware {
+    /// Display/test convenience: a single entry at [`DISABLED_RECORD_PATH`]
+    /// with an all-zero digest. NOT authoritative — the IVD provider's
+    /// `read_installed` zero-pads a short digest to 32 bytes, so never gate on
+    /// this; the gate is [`BankProvider::disabled_record`].
+    pub fn is_disabled_record(&self) -> bool {
+        self.files.len() == 1
+            && self.files[0].name == DISABLED_RECORD_PATH
+            && self.files[0].sha256 == [0u8; 32]
+    }
+}
+
 /// Errors from [`BankProvider`] operations.
 #[derive(Debug)]
 pub enum BankError {
@@ -220,4 +238,18 @@ pub trait BankProvider: Send + Sync {
     fn disabled(&self, _set: BankSet) -> bool {
         false
     }
+
+    /// Persist "administratively disabled" for `bank` by rewriting its signed
+    /// installed-firmware record as the sentinel (one entry:
+    /// [`DISABLED_RECORD_PATH`], zero digest, size 0) at `gen`, identity carried
+    /// over from the record being replaced. Must persist or return `Err` —
+    /// never a silent no-op: an unsigned or unsignable record leaves nothing for
+    /// the start gate to read.
+    fn write_disabled_record(&self, bank: Bank, gen: u64) -> Result<(), BankError>;
+
+    /// The gen of a SIGNATURE-VERIFIED sentinel record on `bank`, else
+    /// `Ok(None)`: a real inventory, a missing record and a record whose
+    /// signature does not verify all read `None` (the last with a warn). `Err`
+    /// only when a record exists but cannot be read/decoded.
+    fn disabled_record(&self, bank: Bank) -> Result<Option<u64>, BankError>;
 }

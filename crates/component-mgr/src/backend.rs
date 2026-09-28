@@ -9026,6 +9026,12 @@ mod bank_provider_injection_tests {
         fn reset_kind(&self) -> ResetKind {
             ResetKind::RequiresEcuReset
         }
+        fn write_disabled_record(&self, _bank: Bank, _gen: u64) -> Result<(), BankError> {
+            Err(BankError::Failed("test provider".into()))
+        }
+        fn disabled_record(&self, _bank: Bank) -> Result<Option<u64>, BankError> {
+            Ok(None)
+        }
     }
 
     fn backend() -> ComponentBackend<MemBlockDevice> {
@@ -12957,6 +12963,12 @@ mod declared_parts_tests {
         }
         fn rollback(&self) -> Result<(), BankError> {
             Ok(())
+        }
+        fn write_disabled_record(&self, _bank: Bank, _gen: u64) -> Result<(), BankError> {
+            Err(BankError::Failed("test provider".into()))
+        }
+        fn disabled_record(&self, _bank: Bank) -> Result<Option<u64>, BankError> {
+            Ok(None)
         }
     }
 

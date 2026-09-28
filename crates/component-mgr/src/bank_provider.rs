@@ -206,7 +206,8 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     }
 
     /// Wipe the target bank dir (frees ~1 image worth of space) and remove any
-    /// orphaned staged files left in `images_dir` root by previous flashes.
+    /// orphaned staged files left in `images_dir` root by previous flashes. A
+    /// single-bank provider keeps the bank's IVD pair (see the loop).
     /// `pub` so the engine's thin `prepare_target_bank_dir` delegator (which a
     /// couple of call sites use directly, separately from the bundled
     /// `prepare_target`) can reach it.
@@ -224,6 +225,17 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
+                    // Single bank: the target IS the live bank, wiped here at
+                    // flash START. Keep its IVD pair — it may be the disable
+                    // sentinel, which must survive a flash that aborts before
+                    // `seal` (a seal that signs rewrites both files anyway).
+                    if self.single_bank
+                        && path.file_name().is_some_and(|n| {
+                            n == hsm::ivd::IVD_MANIFEST_FILE || n == hsm::ivd::IVD_SIGNATURE_FILE
+                        })
+                    {
+                        continue;
+                    }
                     if let Err(e) = std::fs::remove_file(&path) {
                         tracing::warn!("failed to clear {}: {e}", path.display());
                     } else {
@@ -762,6 +774,87 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         self.selector
             .as_ref()
             .is_some_and(|s| s.read().expect("selector poisoned").disabled(set))
+    }
+
+    fn write_disabled_record(&self, bank: Bank, gen: u64) -> Result<(), BankError> {
+        let bank_id = format!("{}/{}", &self.dir_name, bank_dir_name(bank));
+
+        // Unlike `seal`, nothing here is skippable: no in-memory skip, no
+        // payload-empty skip, no pre-provisioning skip. A disable that is not
+        // signed onto disk is one the start gate never sees.
+        let bank_dir = self.target_bank_dir(bank).ok_or_else(|| {
+            BankError::Failed(format!(
+                "ivd disable {bank_id}: no images_dir — cannot persist disable"
+            ))
+        })?;
+        let hsm_arc = self.hsm.as_ref().ok_or_else(|| {
+            BankError::Failed(format!(
+                "ivd disable {bank_id}: no HSM provider attached — disable record cannot be signed"
+            ))
+        })?;
+        let provisioned = hsm_arc
+            .lock()
+            .map_err(|_| BankError::Failed("ivd disable: hsm mutex poisoned".into()))?
+            .is_provisioned()
+            .map_err(|e| {
+                BankError::Failed(format!(
+                    "ivd disable {bank_id}: hsm provisioning probe failed: {e}"
+                ))
+            })?;
+        if !provisioned {
+            return Err(BankError::Failed(format!(
+                "ivd disable {bank_id}: HSM not provisioned — disable record cannot be signed"
+            )));
+        }
+        let crypto = self.hsm_crypto.as_ref().ok_or_else(|| {
+            BankError::Failed(format!(
+                "ivd disable {bank_id}: no HSM crypto handle attached — disable record cannot be signed"
+            ))
+        })?;
+
+        // Carry the replaced record's identity over, so the identification
+        // DIDs still name the firmware on a disabled bank.
+        let identity = hsm::ivd::read_manifest_unverified(&bank_dir)
+            .map(|vm| vm.manifest.identity)
+            .unwrap_or_default();
+        hsm::ivd::sign_disabled_record_crypto(crypto.as_ref(), &bank_dir, gen, identity)
+            .map_err(|e| BankError::Failed(format!("ivd disable {bank_id}: {e}")))?;
+        tracing::info!(bank_id = %bank_id, gen, "ivd disable record written");
+        Ok(())
+    }
+
+    fn disabled_record(&self, bank: Bank) -> Result<Option<u64>, BankError> {
+        let Some(bank_dir) = self.target_bank_dir(bank) else {
+            return Ok(None);
+        };
+        // Only a signature-verified sentinel counts as disabled. A record that
+        // does not verify reads as "not disabled" here and is left to the
+        // launch gate, which refuses it.
+        let Some(crypto) = self.hsm_crypto.as_ref() else {
+            tracing::debug!(
+                bank_dir = %bank_dir.display(),
+                "ivd disable record: no HSM crypto handle to verify with; reading as not disabled",
+            );
+            return Ok(None);
+        };
+        match hsm::ivd::read_manifest_verified(crypto.as_ref(), &bank_dir) {
+            Ok(m) => Ok(hsm::ivd::is_disabled_manifest(&m).then_some(m.gen)),
+            // Never sealed (or never flashed): no record, nothing disabled.
+            Err(hsm::ivd::IvdError::Io(e, _)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(hsm::ivd::IvdError::SignatureInvalid) => {
+                tracing::warn!(
+                    bank_dir = %bank_dir.display(),
+                    "ivd disable record: signature does not verify; reading as not disabled",
+                );
+                Ok(None)
+            }
+            Err(e) => Err(BankError::Failed(format!(
+                "disabled_record {}: {e}",
+                bank_dir.display()
+            ))),
+        }
     }
 
     fn reset_kind(&self) -> ResetKind {
