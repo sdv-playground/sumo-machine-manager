@@ -638,8 +638,8 @@ async fn run_campaign(
 }
 
 /// The full `Authorization` header value (`"Bearer <token>"`), if present —
-/// the authorizer strips the `Bearer ` prefix itself. `pub(crate)`: the
-/// admin-state router (same inline-auth pattern) shares it.
+/// the authorizer strips the `Bearer ` prefix itself. `pub(crate)` so any other
+/// inline-auth route can share it (the retired admin-state router once did).
 pub(crate) fn bearer_of(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)

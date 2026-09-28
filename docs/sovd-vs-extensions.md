@@ -23,7 +23,7 @@ to provide a compatible log endpoint).
 ```
 
 SOVDd stays spec-pure; every sumo-specific route lives in
-`component_mgr::sovd::{routes, admin_state, pull_update}` and is merged onto the
+`component_mgr::sovd::{routes, pull_update}` and is merged onto the
 router at bind time (`vm-sovd/src/main.rs`, `gateway.rs`). The update-verdict
 VERBS on the standard `/updates` resource are baked into the SOVDd router itself
 (OTA orchestration was co-designed); C-026 closed that seam by renaming them
