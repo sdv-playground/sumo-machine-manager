@@ -323,9 +323,10 @@ fn error_response(e: ManagerError) -> (StatusCode, Json<serde_json::Value>) {
         // hard, non-retryable refusal — the bank must be re-flashed with content
         // that verifies.
         ManagerError::VerifyRefused(_) => (StatusCode::FORBIDDEN, e.to_string()),
-        // Administratively disabled: persisted operator intent, not a content
-        // problem — 409 (transient by design: re-enable via the SOVD
-        // admin-state op and retry), beside the VerifyRefused 403 above.
+        // Administratively disabled: operator intent derived from the serving
+        // bank's signed IVD sentinel record, not a content problem — 409
+        // (transient by design: re-enable by flashing the component and
+        // retry), beside the VerifyRefused 403 above.
         ManagerError::AdminDisabled(_) => (StatusCode::CONFLICT, e.to_string()),
     };
     (code, Json(serde_json::json!({"error": msg})))
@@ -335,7 +336,7 @@ fn error_response(e: ManagerError) -> (StatusCode, Json<serde_json::Value>) {
 mod tests {
     use super::*;
     use crate::config::VmServiceConfig;
-    use crate::manager::VmManager;
+    use crate::manager::{PreLaunchRefusal, VmManager};
     use std::sync::Mutex as StdMutex;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -476,6 +477,41 @@ vms:
             status.contains("409"),
             "expected 409 Conflict, got: {status}"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_queues_then_background_verify_records_admin_disabled() {
+        // No gate refuses, so the request is queued (200) and the sentinel is
+        // found by the background launch's verify, where a refusal is only a log
+        // line. The health view is where a caller reads that the VM is down on
+        // purpose: intent `stopped` by `admin_disable`, not a failed launch.
+        let fired = Arc::new(StdMutex::new(false));
+        let fired_for_hook = fired.clone();
+        let mgr = VmManager::with_device_transport(dummy_config(), None).with_pre_launch_verify(
+            Arc::new(move |_name, _bank_dir| {
+                *fired_for_hook.lock().unwrap() = true;
+                Err(PreLaunchRefusal::AdminDisabled(
+                    "bank is the disable sentinel".to_string(),
+                ))
+            }),
+        );
+        let mgr: SharedManager = Arc::new(Mutex::new(mgr));
+        mgr.lock().await.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        let addr = serve(mgr.clone()).await;
+
+        let status = post(addr, "/vms/vm1/restart").await;
+        assert!(status.contains("200"), "queued 200, got: {status}");
+        assert!(
+            wait_until(|| *fired.lock().unwrap()).await,
+            "background launch should have run the verify"
+        );
+
+        // The hook runs under the manager lock and the intent is recorded before
+        // that lock is released, so this read (which takes it) sees the outcome.
+        let body = get_json(addr, "/vms/vm1/health").await;
+        assert_eq!(body["status"], "stopped", "{body}");
+        assert_eq!(body["expected"], "stopped", "{body}");
+        assert_eq!(body["expected_by"], "admin_disable", "{body}");
     }
 
     #[tokio::test]

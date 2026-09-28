@@ -138,7 +138,8 @@ pub struct VmManager {
     /// [`ManagerError::AdminDisabled`]. THE start choke point for
     /// per-component administrative disable: autostart, `ensure_vm_running`,
     /// and post-reset relaunch all converge here. Owned by the host because
-    /// the persisted admin flag lives in its NV, which vm-service doesn't
+    /// the admin state is derived from the serving bank's signed IVD sentinel
+    /// record, and checking that signature needs the HSM vm-service doesn't
     /// depend on. Default `None` (no gate).
     admin_gate: Option<AdminGate>,
     /// Optional notification emitted after a process has started successfully.
@@ -146,21 +147,36 @@ pub struct VmManager {
     next_launch_generation: u64,
 }
 
+/// Why the pre-launch verify refused. The two arms are different HTTP answers and
+/// different intents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreLaunchRefusal {
+    /// The bank's signed record is the administrative-disable sentinel: operator
+    /// intent, 409, `expect(Stopped, AdminDisable)` — recorded exactly as the
+    /// admin gate records it ([`ManagerError::AdminDisabled`]).
+    AdminDisabled(String),
+    /// Integrity failure (signature, pins, re-hash): 403,
+    /// [`ManagerError::VerifyRefused`].
+    Verify(String),
+}
+
 /// Closure type for [`VmManager::with_pre_launch_verify`].
 ///
 /// Args: `(vm_name, bank_dir)`. Returns `Ok(())` to allow the launch,
-/// `Err(message)` to refuse it. The closure is expected to log its own
-/// outcome (timing, sig status, gen) — `start_vm` only adds a thin
-/// failure breadcrumb on its end.
-pub type PreLaunchVerify = Arc<dyn Fn(&str, &std::path::Path) -> Result<(), String> + Send + Sync>;
+/// `Err(refusal)` to refuse it — [`PreLaunchRefusal`] says which refusal. The
+/// closure is expected to log its own outcome (timing, sig status, gen) —
+/// `start_vm` only adds a thin failure breadcrumb on its end.
+pub type PreLaunchVerify =
+    Arc<dyn Fn(&str, &std::path::Path) -> Result<(), PreLaunchRefusal> + Send + Sync>;
 
 /// Closure type for [`VmManager::with_admin_gate`].
 ///
 /// Arg: the VM name. Returns `Ok(())` to allow the start, `Err(reason)` to
 /// refuse it as administratively disabled (mapped to
 /// [`ManagerError::AdminDisabled`] → HTTP 409). Consulted synchronously and
-/// often (every start attempt) — implementations should be cheap (an NV
-/// bitmask read).
+/// often (every start attempt) — implementations should be cheap: the state is
+/// derived from the serving bank's signed IVD sentinel record, one signature
+/// check and no re-hash of the bank.
 pub type AdminGate = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// Identity of one successfully launched VM process lifetime.
@@ -207,10 +223,11 @@ pub enum ManagerError {
     /// signature, install-gen, committed floor, or a file re-hash didn't
     /// match the signed manifest. Carries the verify hook's message.
     VerifyRefused(String),
-    /// The admin gate refused the start: the VM is administratively disabled
-    /// (persisted operator intent, not a content problem). Carries the gate's
-    /// reason. Mapped to HTTP 409 — transient by design: re-enable via the
-    /// SOVD admin-state op and retry.
+    /// The admin gate or the pre-launch verify refused the start: the VM is
+    /// administratively disabled (operator intent derived from the serving
+    /// bank's signed IVD sentinel record, not a content problem). Carries the
+    /// refusing hook's reason. Mapped to HTTP 409 — transient by design:
+    /// re-enable by flashing the component and retry.
     AdminDisabled(String),
 }
 
@@ -343,9 +360,9 @@ impl VmManager {
 
     /// Install the administrative-state gate, consulted at the very top of
     /// `start_vm` (before any side effect, and before the pre-launch verify).
-    /// Lets the host plug in its persisted NV admin state without vm-service
-    /// taking an NV dependency — the same injection shape as
-    /// [`Self::with_pre_launch_verify`].
+    /// Lets the host plug in the admin state — derived from the serving bank's
+    /// signed IVD sentinel record — without vm-service taking an HSM
+    /// dependency; the same injection shape as [`Self::with_pre_launch_verify`].
     pub fn with_admin_gate(mut self, hook: AdminGate) -> Self {
         self.admin_gate = Some(hook);
         self
@@ -575,7 +592,22 @@ impl VmManager {
                         "pre-launch verify OK",
                     );
                 }
-                Err(e) => {
+                Err(PreLaunchRefusal::AdminDisabled(reason)) => {
+                    tracing::info!(
+                        vm = name,
+                        bank_dir = %effective_def.image_dir.display(),
+                        verify_ms = started.elapsed().as_millis() as u64,
+                        %reason,
+                        "pre-launch verify refused start — VM is administratively disabled",
+                    );
+                    // Operator intent, not an integrity failure: recorded exactly
+                    // as the admin gate records it, overriding the `Running`
+                    // expectation stamped above.
+                    vm.lifecycle
+                        .expect(ExpectedState::Stopped, ExpectedBy::AdminDisable);
+                    return Err(ManagerError::AdminDisabled(reason));
+                }
+                Err(PreLaunchRefusal::Verify(e)) => {
                     tracing::error!(
                         vm = name,
                         bank_dir = %effective_def.image_dir.display(),
@@ -1154,7 +1186,7 @@ vms:
         let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
 
         mgr = mgr.with_pre_launch_verify(Arc::new(|_name, _bank_dir| {
-            Err("bad signature".to_string())
+            Err(PreLaunchRefusal::Verify("bad signature".to_string()))
         }));
 
         mgr.set_vm_bank("vm1", Some(Bank::B)).unwrap();
@@ -1235,7 +1267,9 @@ vms:
         // side is `failed`, which already said something was wrong — the intent
         // axis adds *what was wanted instead*.)
         let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None)
-            .with_pre_launch_verify(Arc::new(|_n, _d| Err("bad signature".to_string())));
+            .with_pre_launch_verify(Arc::new(|_n, _d| {
+                Err(PreLaunchRefusal::Verify("bad signature".to_string()))
+            }));
         mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
         let _ = mgr.start_vm("vm1");
 
@@ -1395,7 +1429,9 @@ vms:
         // is exactly what an operator needs after the reboot — the sweep must
         // not overwrite it with "stop requested".
         let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None);
-        mgr = mgr.with_pre_launch_verify(Arc::new(|_n, _d| Err("bad signature".to_string())));
+        mgr = mgr.with_pre_launch_verify(Arc::new(|_n, _d| {
+            Err(PreLaunchRefusal::Verify("bad signature".to_string()))
+        }));
         mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
         let _ = mgr.start_vm("vm1");
 
@@ -1495,6 +1531,64 @@ vms:
         mgr.start_vm("vm1")
             .expect("an allowing admin gate must not block the start");
         assert!(mgr.check_admin_gate("vm1").is_ok());
+    }
+
+    #[test]
+    fn verify_admin_disabled_records_stopped_intent() {
+        // A bank whose signed record is the disable sentinel is refused by the
+        // verify, not the gate. It is still operator intent, so it is recorded
+        // exactly as a gate refusal is: AdminDisabled (409), intent `stopped` by
+        // `admin_disable`, overriding the `running` the request stamped — and
+        // down on purpose reads `stopped`, not `failed`.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None)
+            .with_pre_launch_verify(Arc::new(|_n, _d| {
+                Err(PreLaunchRefusal::AdminDisabled(
+                    "bank is the disable sentinel".to_string(),
+                ))
+            }));
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        let err = mgr
+            .start_vm_with_source("vm1", ExpectedBy::Autostart)
+            .expect_err("a disabled bank must refuse the launch");
+        assert!(
+            matches!(err, ManagerError::AdminDisabled(ref m)
+                if m == "bank is the disable sentinel"),
+            "expected AdminDisabled, got {err:?}",
+        );
+        assert_eq!(mgr.runtime_identity("vm1"), None, "nothing launched");
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.status, HealthStatus::Stopped);
+        assert_eq!(detail.expected, ExpectedState::Stopped);
+        assert_eq!(detail.expected_by, ExpectedBy::AdminDisable);
+    }
+
+    #[test]
+    fn verify_integrity_failure_still_maps_to_verify_refused() {
+        // The other arm keeps its contract: an integrity failure is a fault
+        // (VerifyRefused, 403, `failed`), and the request's `running` intent
+        // stands — the gap between it and reality is what needs reporting.
+        let mut mgr = VmManager::with_device_transport(dummy_config("/var/lib/vms/vm1"), None)
+            .with_pre_launch_verify(Arc::new(|_n, _d| {
+                Err(PreLaunchRefusal::Verify("bad signature".to_string()))
+            }));
+        mgr.set_vm_bank("vm1", Some(Bank::A)).unwrap();
+        let err = mgr
+            .start_vm_with_source("vm1", ExpectedBy::Autostart)
+            .expect_err("an integrity failure must refuse the launch");
+        assert!(
+            matches!(err, ManagerError::VerifyRefused(ref m) if m == "bad signature"),
+            "expected VerifyRefused(\"bad signature\"), got {err:?}",
+        );
+
+        let detail = mgr.health_detail("vm1").unwrap();
+        assert_eq!(detail.status, HealthStatus::Failed);
+        assert_eq!(
+            detail.reason.as_deref(),
+            Some("pre-launch verify failed: bad signature")
+        );
+        assert_eq!(detail.expected, ExpectedState::Running);
+        assert_eq!(detail.expected_by, ExpectedBy::Autostart);
     }
 
     #[test]
