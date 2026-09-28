@@ -205,6 +205,43 @@ fn rejects_install_gen_mismatch() {
     );
 }
 
+/// A bank disabled in place: the sentinel record over a sealed bank whose
+/// images stay on disk. With the pins satisfied that is a state, not a verify
+/// failure — its own exit code and one stdout line — and still not a launch.
+#[test]
+fn disabled_bank_exits_3_and_prints_disabled() {
+    let s = Scratch::new("disabled");
+    let keystore = provisioned_keystore(&s);
+
+    let bank = s.path("vm2/bank_a");
+    std::fs::create_dir_all(&bank).unwrap();
+    std::fs::write(bank.join("kernel"), b"kernel bytes").unwrap();
+
+    let hsm = SimHsm::new(keystore.clone());
+    ivd::sign_bank_crypto(&hsm, &bank, 6, ivd::IvdIdentity::default()).unwrap();
+    ivd::sign_disabled_record_crypto(&hsm, &bank, 7, ivd::IvdIdentity::default()).unwrap();
+
+    let out = Command::new(binary())
+        .arg("--bank")
+        .arg(&bank)
+        .arg("--keystore")
+        .arg(&keystore)
+        .arg("--expect-install-gen")
+        .arg("7")
+        .arg("--min-committed-gen")
+        .arg("6")
+        .output()
+        .expect("run sumo-verify");
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "expected exit 3 (disabled) — stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "disabled gen=7\n");
+}
+
 #[test]
 fn rejects_missing_bank_dir() {
     let s = Scratch::new("missing-bank");

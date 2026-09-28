@@ -25,6 +25,10 @@
 //!         unexpected file, gen mismatch, ...). DO NOT launch.
 //!   2  — usage / setup error (missing args, missing keystore, ...).
 //!         The verifier couldn't run; treat as launch-blocking.
+//!   3  — the bank is administratively disabled: its signed record is the
+//!         disable sentinel, and it passed the signature and the pins.
+//!         Prints `disabled gen=<N>` on stdout. A state the device was
+//!         told to be in, not a fault — but still DO NOT launch.
 //!
 //! On managed-cvc (no real secure boot), `start-managed.sh` runs this
 //! after the host comes up, once per VM bank; only the banks that
@@ -40,6 +44,7 @@ use hsm_sim_backend::SimHsm;
 const EXIT_OK: u8 = 0;
 const EXIT_VERIFY_FAIL: u8 = 1;
 const EXIT_USAGE: u8 = 2;
+const EXIT_DISABLED: u8 = 3;
 
 fn usage() {
     eprintln!(
@@ -73,7 +78,9 @@ Arguments:
 Exit codes:
   0  verification passed (safe to launch)
   1  verification failed (DO NOT launch)
-  2  usage / setup error",
+  2  usage / setup error
+  3  bank administratively disabled; prints `disabled gen=<N>`
+     (DO NOT launch)",
     );
 }
 
@@ -228,6 +235,12 @@ fn run() -> ExitCode {
                 );
             }
             ExitCode::from(EXIT_OK)
+        }
+        // An authenticated disable sentinel is a state, not a fault: reported
+        // on stdout under its own code, and still not a launch.
+        Err(ivd::IvdError::AdminDisabled { gen }) => {
+            println!("disabled gen={gen}");
+            ExitCode::from(EXIT_DISABLED)
         }
         Err(e) => {
             // Stderr mention what went wrong; stdout stays empty so
