@@ -790,27 +790,6 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         Ok(())
     }
 
-    fn record_disabled(&self, set: BankSet, disabled: bool) -> Result<(), BankError> {
-        // Persist the disable straight into the signed selector: `stage_disabled`
-        // sets/clears `set` in PRIMARY's disable set and re-signs PRIMARY in place
-        // (current generation, no anti-rollback bump). No-op when no selector is
-        // wired (tests / the no-selector inline provider in `backend.rs`).
-        if let Some(sel) = &self.selector {
-            sel.write()
-                .expect("selector poisoned")
-                .stage_disabled(set, disabled);
-        }
-        Ok(())
-    }
-
-    fn disabled(&self, set: BankSet) -> bool {
-        // The signed selector's booted (PRIMARY) disable set — the boot
-        // authority. `false` when no selector is wired.
-        self.selector
-            .as_ref()
-            .is_some_and(|s| s.read().expect("selector poisoned").disabled(set))
-    }
-
     fn can_persist_disabled_record(&self) -> Result<(), BankError> {
         // `write_disabled_record`'s refusals, minus the write: an images_dir,
         // then the shared HSM gate.

@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nv_store::block::BlockDevice;
-use nv_store::types::{Bank, BankSet};
+use nv_store::types::Bank;
 
 use machine_mgr::bank_provider::{BankError, BankProvider, FirmwareIdentity, InstalledFirmware};
 use machine_mgr::{ImageRecord, ResetKind};
@@ -257,12 +257,6 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         let target = self.inner.rollback_target()?;
         self.route_records(target)?;
         self.inner.rollback()
-    }
-    fn record_disabled(&self, set: BankSet, disabled: bool) -> Result<(), BankError> {
-        self.inner.record_disabled(set, disabled)
-    }
-    fn disabled(&self, set: BankSet) -> bool {
-        self.inner.disabled(set)
     }
     fn can_persist_disabled_record(&self) -> Result<(), BankError> {
         self.inner.can_persist_disabled_record()
