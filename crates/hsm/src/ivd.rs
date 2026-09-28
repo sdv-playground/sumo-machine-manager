@@ -105,6 +105,10 @@ pub const IVD_MANIFEST_VERSION: u64 = 3;
 /// Filenames the IVD machinery owns inside a bank dir.
 pub const IVD_MANIFEST_FILE: &str = "ivd-manifest.cbor";
 pub const IVD_SIGNATURE_FILE: &str = "ivd-signature.bin";
+/// The temp file each of the pair is written through, then renamed over it
+/// (`write_file_durably`). The bank-dir walk skips them like the pair itself.
+const IVD_MANIFEST_TMP: &str = "ivd-manifest.cbor.tmp";
+const IVD_SIGNATURE_TMP: &str = "ivd-signature.bin.tmp";
 
 /// IVD manifest — what the HSM signs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,8 +397,16 @@ fn collect_files(
         let file_name = file_name.to_string_lossy();
 
         // Skip the IVD-owned files when scanning the bank — the
-        // manifest must not enumerate itself or the signature.
-        if dir == root && (file_name == IVD_MANIFEST_FILE || file_name == IVD_SIGNATURE_FILE) {
+        // manifest must not enumerate itself or the signature. Nor their
+        // temp files: a power cut between creating one and renaming it leaves
+        // it behind, and a leftover must neither fail a healthy bank as
+        // `UnexpectedFile` nor be signed into the next manifest.
+        if dir == root
+            && matches!(
+                &*file_name,
+                IVD_MANIFEST_FILE | IVD_SIGNATURE_FILE | IVD_MANIFEST_TMP | IVD_SIGNATURE_TMP
+            )
+        {
             continue;
         }
 
@@ -545,7 +557,8 @@ pub fn sign_bank_with_files_crypto(
 /// Shared body behind [`sign_bank_crypto`] / [`sign_bank_with_files_crypto`]:
 /// build + encode the manifest, `sign` its bytes (the lone HSM op, supplied as a
 /// closure over [`HsmCryptoProvider::sign`]), and write the two artefacts into
-/// `bank_dir`, each through `write_file_durably`, manifest first.
+/// `bank_dir`, each through `write_file_durably`, manifest first. A temp file an
+/// interrupted earlier write left behind is removed before anything else.
 #[cfg(feature = "crypto")]
 fn sign_bank_with_files_inner(
     sign: impl FnOnce(KeyHandle, &[u8]) -> Result<Vec<u8>, HsmError>,
@@ -556,6 +569,17 @@ fn sign_bank_with_files_inner(
     walk_hash_ms: Option<u64>,
 ) -> Result<IvdManifest, IvdError> {
     let started = std::time::Instant::now();
+
+    // Best-effort: the walks already skip a leftover temp, so this only keeps
+    // the dir to what the manifest describes, even when this sign then fails.
+    for tmp in [IVD_MANIFEST_TMP, IVD_SIGNATURE_TMP] {
+        let path = bank_dir.join(tmp);
+        if let Err(e) = fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), error = %e, "stale ivd temp file not removed");
+            }
+        }
+    }
 
     let manifest = build_manifest_from_files(files, gen, identity);
     let manifest_bytes = encode_manifest(&manifest)?;
@@ -569,9 +593,14 @@ fn sign_bank_with_files_inner(
     // a torn file must never replace a whole one. The pair is two renames, not
     // one: a crash between them leaves the new manifest under the old
     // signature, which fails the signature check (fail-closed).
-    write_file_durably(&bank_dir.join(IVD_MANIFEST_FILE), &manifest_bytes)
-        .map_err(|e| IvdError::Io(e, bank_dir.join(IVD_MANIFEST_FILE)))?;
-    write_file_durably(&bank_dir.join(IVD_SIGNATURE_FILE), &sig)
+    write_file_durably(
+        bank_dir,
+        IVD_MANIFEST_FILE,
+        IVD_MANIFEST_TMP,
+        &manifest_bytes,
+    )
+    .map_err(|e| IvdError::Io(e, bank_dir.join(IVD_MANIFEST_FILE)))?;
+    write_file_durably(bank_dir, IVD_SIGNATURE_FILE, IVD_SIGNATURE_TMP, &sig)
         .map_err(|e| IvdError::Io(e, bank_dir.join(IVD_SIGNATURE_FILE)))?;
 
     let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
@@ -589,19 +618,17 @@ fn sign_bank_with_files_inner(
     Ok(manifest)
 }
 
-/// Replace `path` with `bytes` durably: write `<name>.tmp` beside it, fsync it,
-/// rename it over `path`, then fsync the parent dir so the rename survives a
-/// power cut too. A crash leaves `path` whole, the old bytes or the new, never a
-/// truncated file. The dir fsync is best-effort: some platforms and filesystems
-/// refuse fsync on a directory.
+/// Replace `dir/name` with `bytes` durably: write `dir/tmp_name`, fsync it,
+/// rename it over `dir/name`, then fsync `dir` so the rename survives a power
+/// cut too. A crash leaves `name` whole, the old bytes or the new, never a
+/// truncated file; it can leave `tmp_name` behind. The dir fsync is
+/// best-effort: some platforms and filesystems refuse fsync on a directory.
 #[cfg(feature = "crypto")]
-fn write_file_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_file_durably(dir: &Path, name: &str, tmp_name: &str, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-
+    let path = dir.join(name);
+    let tmp = dir.join(tmp_name);
     let replaced = fs::File::create(&tmp)
         .and_then(|mut file| {
             file.write_all(bytes)?;
@@ -609,18 +636,15 @@ fn write_file_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             // replacement, it does not make the new bytes durable.
             file.sync_all()
         })
-        .and_then(|()| fs::rename(&tmp, path));
+        .and_then(|()| fs::rename(&tmp, &path));
     if let Err(e) = replaced {
-        // `path` still holds the old bytes, and a leftover tmp would be an
-        // unexpected file to the verify's scan, refusing the bank anyway.
+        // `path` still holds the old bytes; leave nothing beside it.
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
 
-    if let Some(dir) = path.parent() {
-        if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
-            tracing::debug!(dir = %dir.display(), error = %e, "ivd dir fsync skipped");
-        }
+    if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::debug!(dir = %dir.display(), error = %e, "ivd dir fsync skipped");
     }
     Ok(())
 }
@@ -1755,6 +1779,53 @@ mod tests {
         let back = read_manifest_unverified(&bank).unwrap();
         assert_eq!(back.manifest_bytes, encode_manifest(&disabled).unwrap());
         assert_eq!(read_manifest_verified(&hsm, &bank).unwrap().gen, 6);
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// A power cut between creating an IVD temp file and its rename leaves the
+    /// temp behind. It is skipped like the pair: a healthy bank still verifies,
+    /// and the next walk-based sign does not attest it. Every sign clears a
+    /// leftover first, even one whose HSM op then fails.
+    #[test]
+    fn a_leftover_ivd_temp_file_is_neither_unexpected_nor_signed() {
+        let bank = temp_bank("leftover-temp");
+        write(&bank.join("kernel"), b"kernel bytes");
+        write(&bank.join("rootfs.img"), &[0xAB; 4096]);
+        let (hsm, keystore) = provisioned_sim("leftover-temp");
+        sign_bank_crypto(&hsm, &bank, 3, sample_identity()).unwrap();
+
+        write(&bank.join(IVD_MANIFEST_TMP), b"half-written manifest");
+        write(&bank.join(IVD_SIGNATURE_TMP), b"half-written signature");
+        let pins = VerifyPins {
+            expected_install_gen: Some(3),
+            min_committed_gen: Some(3),
+        };
+        assert_eq!(verify_bank_crypto(&hsm, &bank, pins).unwrap().gen, 3);
+
+        let resigned = sign_bank_crypto(&hsm, &bank, 4, sample_identity()).unwrap();
+        let paths: Vec<&str> = resigned
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, ["kernel", "rootfs.img"]);
+        assert!(!bank.join(IVD_MANIFEST_TMP).exists());
+        assert!(!bank.join(IVD_SIGNATURE_TMP).exists());
+
+        // The clearing runs before the HSM op, so a sign that fails still did it.
+        write(&bank.join(IVD_MANIFEST_TMP), b"half-written manifest");
+        let failed = sign_bank_with_files_inner(
+            |_, _| Err(HsmError::NotSupported("sign".into())),
+            &bank,
+            5,
+            sample_identity(),
+            Vec::new(),
+            None,
+        );
+        assert!(failed.is_err());
+        assert!(!bank.join(IVD_MANIFEST_TMP).exists());
 
         let _ = std::fs::remove_dir_all(&bank);
         let _ = std::fs::remove_dir_all(&keystore);
