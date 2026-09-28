@@ -15,14 +15,14 @@ use nv_store::slots;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
-use machine_mgr::bank_provider::BankProvider;
+use machine_mgr::bank_provider::{BankProvider, FirmwareIdentity};
 use machine_mgr::{
     DeactivateError, DeactivateOutcome, Deactivator, InMemorySelectorStore, SharedSystemBankState,
     SystemBankManager, TestSigner,
 };
 use sovd_core::{BackendError, DiagnosticBackend, EntityStatus, PackageStream};
 
-use component_mgr::backend::{ComponentBackend, ComponentConfig};
+use component_mgr::backend::{ComponentBackend, ComponentConfig, INSTALLED_MANIFEST_PARAM_ID};
 use component_mgr::bank_provider::IvdBankProvider;
 use component_mgr::manifest_provider::{
     ManifestError, ManifestProvider, ManifestType, ValidatedFirmware,
@@ -260,6 +260,67 @@ fn signing_provider(
     )
 }
 
+/// As [`signing_provider`], but for a single-bank (rt-shaped) component: the
+/// provider's `single_bank` flag is set and `dir_name` is `id` — the shape
+/// `sovd_tests.rs`'s `make_disable_router("rt", …)` wires, where the live
+/// bank IS the only bank and a flash targets it in place.
+fn single_bank_signing_provider(
+    nv: &SharedNv,
+    set: BankSet,
+    id: &str,
+    selector: Option<SharedSystemBankState>,
+    tmp: &Path,
+) -> Arc<IvdBankProvider<MemBlockDevice>> {
+    let ks = provisioned_keystore(tmp);
+    let hsm: Arc<Mutex<dyn hsm::HsmProvider>> =
+        Arc::new(Mutex::new(hsm_sim_backend::SimHsm::new(ks.clone())));
+    Arc::new(
+        IvdBankProvider::new(
+            nv.clone(),
+            set,
+            true,
+            Some(tmp.join("images")),
+            id.into(),
+            Some(hsm),
+            None,
+            selector,
+        )
+        .with_hsm_crypto(Arc::new(hsm_sim_backend::SimHsm::new(ks))),
+    )
+}
+
+/// `ComponentConfig` for the rt-shaped single-bank tests — the same shape
+/// `sovd_tests.rs`'s `make_disable_router("rt", …)` wires.
+fn rt_config() -> ComponentConfig {
+    ComponentConfig {
+        supports_rollback: false,
+        single_bank: true,
+        entity_type: "rt".into(),
+        ..ComponentConfig::default()
+    }
+}
+
+/// A single-bank (rt-shaped) backend over a caller-supplied `provider` and
+/// manifest provider — the direct-construction analogue of
+/// [`backend_with_manifests`] for the [`single_bank_signing_provider`] shape.
+fn rt_backend_with_manifests(
+    nv: &SharedNv,
+    manifests: Arc<dyn ManifestProvider>,
+    provider: Arc<IvdBankProvider<MemBlockDevice>>,
+) -> ComponentBackend<MemBlockDevice> {
+    ComponentBackend::with_options(
+        slots::RT,
+        nv.clone(),
+        manifests,
+        rt_config(),
+        None,
+        None,
+        None,
+    )
+    .with_id("rt".to_string())
+    .with_bank_provider(provider)
+}
+
 /// `bank`'s installed-firmware gen (NvFwMeta) — the gen a disable ratchets
 /// from — writing gen 1 first when the fixture has none.
 fn installed_gen(nv: &SharedNv, set: BankSet, bank: Bank) -> u64 {
@@ -341,6 +402,46 @@ async fn counting_server_with_health(health: &'static str) -> (String, Arc<Atomi
                 let body = if request.starts_with("GET ") {
                     health
                 } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (addr, count)
+}
+
+/// As [`counting_server`], but the counter records only POST requests — the
+/// vm-service (re)start/restart notify `ecu_reset` issues — so the GET health
+/// probe `ecu_reset` also makes on the same address does not inflate the
+/// count. GET still gets [`HEALTH_WITHOUT_INTENT`]: the health baseline
+/// `ecu_reset` must establish before it will notify at all.
+async fn counting_post_server() -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let c = c.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let size = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..size]);
+                let body = if request.starts_with("GET ") {
+                    HEALTH_WITHOUT_INTENT
+                } else {
+                    if request.starts_with("POST ") {
+                        c.fetch_add(1, Ordering::SeqCst);
+                    }
                     ""
                 };
                 let response = format!(
@@ -782,7 +883,7 @@ async fn disable_manifest_without_deactivator_errors() {
 async fn disable_manifest_enact_failure_is_reported() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
-    installed_gen(&nv, slots::VM1, Bank::A);
+    let gen_before = installed_gen(&nv, slots::VM1, Bank::A);
     let provider = signing_provider(&nv, slots::VM1, None, tmp.path());
     let deact = Arc::new(MockDeactivator::failing());
     let b = backend_with_manifests(
@@ -808,6 +909,21 @@ async fn disable_manifest_enact_failure_is_reported() {
     assert!(
         !serving_dir.join(hsm::ivd::IVD_MANIFEST_FILE).exists(),
         "a failed enact writes no IVD manifest"
+    );
+    assert_eq!(
+        provider.disabled_record(Bank::A).unwrap(),
+        None,
+        "no sentinel record after a failed enact"
+    );
+    let gen_after = nv
+        .lock()
+        .unwrap()
+        .read_fw_meta(slots::VM1, Bank::A)
+        .unwrap()
+        .gen;
+    assert_eq!(
+        gen_after, gen_before,
+        "NvFwMeta gen must be unchanged after a failed enact"
     );
 }
 
@@ -1036,6 +1152,31 @@ fn campaign_backend(
     (backend, provider)
 }
 
+/// As [`campaign_backend`], but wired to a vm-service address and reusing an
+/// EXISTING signing provider instead of building a fresh one: the reset test
+/// needs one provider shared across two backend instances (the manifest shape
+/// is fixed per backend, so re-enabling needs a second one — same reason as
+/// `rollback_of_reenable_lands_disabled_and_stops_the_guest`) AND vm-service
+/// traffic to count.
+fn campaign_backend_with_vm_service(
+    nv: &SharedNv,
+    manifests: Arc<dyn ManifestProvider>,
+    provider: Arc<IvdBankProvider<MemBlockDevice>>,
+    vm_service_addr: Option<String>,
+) -> ComponentBackend<MemBlockDevice> {
+    ComponentBackend::with_options(
+        slots::VM1,
+        nv.clone(),
+        manifests,
+        ComponentConfig::default(),
+        vm_service_addr,
+        None,
+        None,
+    )
+    .with_id("vm1".to_string())
+    .with_bank_provider(provider)
+}
+
 /// Flash `image` into vm1's target bank through the campaign lifecycle: start,
 /// the manifest, the payload (which seals the target), finalize (which
 /// activates it).
@@ -1212,5 +1353,482 @@ async fn rollback_of_reenable_lands_disabled_and_stops_the_guest() {
         deact.calls(),
         2,
         "the trial's guest is stopped: the deactivator ran again"
+    );
+    let committed =
+        nv.lock().unwrap().read_boot_state().unwrap().banks[slots::VM1.as_index()].committed;
+    assert!(committed, "rollback must leave the bank set committed");
+}
+
+// --- Additional sentinel-record behaviour (F9) ------------------------------
+// `non_disableable_component_ignores_sentinel` (no deactivator; a written
+// sentinel; admin_disabled() false; /status carries no admin_state) is
+// already covered verbatim by `non_disableable_component_omits_admin_state`
+// above — skipped here rather than duplicated.
+
+#[tokio::test]
+async fn disable_persists_in_bank_ivd_without_selector() {
+    // Pre-selector shape: no boot selector wired to the provider at all —
+    // `serving_bank()` falls back to `running_bank`. The disable must still
+    // persist to the bank's signed IVD and be readable back with no selector
+    // in the picture at all.
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    installed_gen(&nv, slots::VM1, Bank::A);
+    let provider = signing_provider(&nv, slots::VM1, None, tmp.path());
+    let b = backend_with_manifests(
+        &nv,
+        slots::VM1,
+        "vm1",
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: Some(0),
+        }),
+    )
+    .with_bank_provider(provider.clone())
+    .with_deactivator(Arc::new(MockDeactivator::ok()));
+
+    b.receive_package(b"disable-envelope")
+        .await
+        .expect("disable manifest enacted");
+    assert!(b.admin_disabled(), "disabled with no selector wired");
+
+    // A second backend over the same images_dir/NV, without ever calling
+    // enact itself: the sentinel must be durable on disk, not carried in this
+    // process's memory.
+    let b2 = backend_with_manifests(
+        &nv,
+        slots::VM1,
+        "vm1",
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: None,
+        }),
+    )
+    .with_bank_provider(provider.clone())
+    .with_deactivator(Arc::new(MockDeactivator::ok()));
+    assert!(
+        b2.admin_disabled(),
+        "a fresh backend over the same bank reads the persisted sentinel"
+    );
+}
+
+/// `can_persist_disabled_record()`'s HSM gate must refuse — and the
+/// deactivator must never run — for an HSM that exists but was never
+/// provisioned, before a single byte of the record is written.
+#[tokio::test]
+async fn enact_refuses_when_hsm_unprovisioned_before_deactivating() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    installed_gen(&nv, slots::VM1, Bank::A);
+
+    let ks = tmp.path().join("unprovisioned-keystore");
+    std::fs::create_dir_all(&ks).unwrap();
+    let hsm: Arc<Mutex<dyn hsm::HsmProvider>> =
+        Arc::new(Mutex::new(hsm_sim_backend::SimHsm::new(ks.clone())));
+    let provider = Arc::new(
+        IvdBankProvider::new(
+            nv.clone(),
+            slots::VM1,
+            false,
+            Some(tmp.path().join("images")),
+            "vm1".into(),
+            Some(hsm),
+            None,
+            None,
+        )
+        .with_hsm_crypto(Arc::new(hsm_sim_backend::SimHsm::new(ks))),
+    );
+    let deact = Arc::new(MockDeactivator::ok());
+    let b = backend_with_manifests(
+        &nv,
+        slots::VM1,
+        "vm1",
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: Some(0),
+        }),
+    )
+    .with_bank_provider(provider.clone())
+    .with_deactivator(deact.clone());
+
+    let err = b
+        .receive_package(b"disable-envelope")
+        .await
+        .expect_err("an unprovisioned HSM must refuse the disable");
+    assert!(
+        matches!(err, BackendError::PreconditionFailed(_)),
+        "got {err:?}"
+    );
+    assert_eq!(
+        deact.calls(),
+        0,
+        "the deactivator must not run before the HSM gate"
+    );
+    let bank_dir = provider.target_bank_dir(Bank::A).unwrap();
+    assert!(
+        !bank_dir.join(hsm::ivd::IVD_MANIFEST_FILE).exists(),
+        "a refused disable writes no IVD manifest"
+    );
+}
+
+/// A "keyless replay": copy the pre-disable signed IVD pair aside, disable
+/// (which ratchets NvFwMeta), then restore the OLD pair over the sentinel.
+/// The restored pair is a real, validly-signed inventory — but at the
+/// pre-disable gen, one behind the ratcheted NvFwMeta. It must not read as
+/// disabled (it is a real inventory, not a sentinel) and it must not pass the
+/// launch gate either: replaying old signed bytes cannot forge a bank at the
+/// new gen without the signing key.
+#[tokio::test]
+async fn enact_ratchets_gen_so_the_old_ivd_pair_fails_gen_mismatch() {
+    // NOTE: this needs a REAL enact (`receive_package`), not the
+    // `write_sentinel` fixture — `write_sentinel` writes the sentinel at
+    // whatever gen NvFwMeta ALREADY holds (it doesn't ratchet), so it cannot
+    // exercise "the old pair now fails at the ratcheted gen".
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    let old_gen = installed_gen(&nv, slots::VM1, Bank::A);
+    let provider = signing_provider(&nv, slots::VM1, None, tmp.path());
+
+    // Seal a real inventory at the pre-disable gen — what the bank held
+    // before the disable.
+    let bank_dir = provider.target_bank_dir(Bank::A).unwrap();
+    std::fs::create_dir_all(&bank_dir).unwrap();
+    std::fs::write(bank_dir.join("kernel"), b"kernel bytes").unwrap();
+    provider
+        .seal(
+            Bank::A,
+            FirmwareIdentity::default(),
+            old_gen,
+            &["kernel".to_string()],
+        )
+        .unwrap();
+    let old_manifest = std::fs::read(bank_dir.join(hsm::ivd::IVD_MANIFEST_FILE)).unwrap();
+    let old_signature = std::fs::read(bank_dir.join(hsm::ivd::IVD_SIGNATURE_FILE)).unwrap();
+
+    // A real enact: ratchets NvFwMeta from old_gen to old_gen + 1 and signs
+    // the sentinel there. Checked via the PROVIDER, not `b.admin_disabled()`:
+    // the backend caches its answer per serving bank until an NV write
+    // clears it, and the replay below is a raw file swap with no NV write —
+    // calling `b.admin_disabled()` here would poison that cache with
+    // "disabled" and the assertion below would pass for the wrong reason.
+    let b = backend_with_manifests(
+        &nv,
+        slots::VM1,
+        "vm1",
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: Some(0),
+        }),
+    )
+    .with_bank_provider(provider.clone())
+    .with_deactivator(Arc::new(MockDeactivator::ok()));
+    b.receive_package(b"disable-envelope")
+        .await
+        .expect("disable manifest enacted");
+    assert_eq!(
+        provider.disabled_record(Bank::A).unwrap(),
+        Some(old_gen + 1),
+        "precondition: the sentinel verifies at the ratcheted gen"
+    );
+
+    // The replay: restore the old (pre-disable) pair over the sentinel.
+    std::fs::write(bank_dir.join(hsm::ivd::IVD_MANIFEST_FILE), &old_manifest).unwrap();
+    std::fs::write(bank_dir.join(hsm::ivd::IVD_SIGNATURE_FILE), &old_signature).unwrap();
+
+    assert!(
+        !b.admin_disabled(),
+        "the restored pair is a real inventory, not a sentinel — a replay does not re-enable"
+    );
+
+    let new_gen = nv
+        .lock()
+        .unwrap()
+        .read_fw_meta(slots::VM1, Bank::A)
+        .unwrap()
+        .gen;
+    assert_eq!(new_gen, old_gen + 1, "precondition: gen was ratcheted");
+    let crypto = hsm_sim_backend::SimHsm::new(tmp.path().join("keystore"));
+    let pins = hsm::ivd::VerifyPins {
+        expected_install_gen: Some(new_gen),
+        min_committed_gen: None,
+    };
+    match hsm::ivd::verify_bank_crypto(&crypto, &bank_dir, pins) {
+        Err(hsm::ivd::IvdError::GenMismatch { expected, claimed }) => {
+            assert_eq!(expected, new_gen);
+            assert_eq!(claimed, old_gen);
+        }
+        other => panic!("expected GenMismatch, got {other:?}"),
+    }
+}
+
+/// A sentinel manifest with a bad signature (structurally well-formed — a
+/// real signature with one flipped byte, `disable_record_tests.rs`'s "bad
+/// signature" shape — not arbitrary garbage bytes, which the crypto backend
+/// refuses to even parse and which would test the wrong failure mode) must
+/// not read as disabled, and the launch-time verify must refuse it as a bad
+/// signature — never confuse it with a real `AdminDisabled` sentinel, which
+/// requires a signature that actually verifies.
+#[tokio::test]
+async fn unsigned_sentinel_reads_enabled_and_verify_refuses() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    let (b, provider) =
+        vm_backend_with_selector(&nv, slots::VM1, None, selector_for(slots::VM1), tmp.path());
+    let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
+    let gen = installed_gen(&nv, slots::VM1, Bank::A);
+    // A real, validly-signed sentinel first — `b.admin_disabled()` is not
+    // called yet, so its per-bank cache stays cold; the first call below
+    // derives fresh from the (about to be corrupted) on-disk state.
+    write_sentinel(&provider, &nv, slots::VM1, Bank::A);
+
+    let bank_dir = provider.target_bank_dir(Bank::A).unwrap();
+    let sig_path = bank_dir.join(hsm::ivd::IVD_SIGNATURE_FILE);
+    let mut sig = std::fs::read(&sig_path).unwrap();
+    let last = sig.len() - 1;
+    sig[last] ^= 0x01;
+    std::fs::write(&sig_path, &sig).unwrap();
+
+    assert!(
+        !b.admin_disabled(),
+        "a bad-signature sentinel must not read as disabled"
+    );
+
+    let crypto = hsm_sim_backend::SimHsm::new(tmp.path().join("keystore"));
+    let pins = hsm::ivd::VerifyPins {
+        expected_install_gen: Some(gen),
+        min_committed_gen: None,
+    };
+    match hsm::ivd::verify_bank_crypto(&crypto, &bank_dir, pins) {
+        Err(hsm::ivd::IvdError::SignatureInvalid) => {}
+        other => panic!("expected SignatureInvalid, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn reenable_flash_reads_enabled_before_ecu_reset_and_relaunches_once() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    installed_gen(&nv, slots::VM1, Bank::A);
+    let sel = selector_for(slots::VM1);
+    let (addr, hits) = counting_post_server().await;
+    let deact = Arc::new(MockDeactivator::ok());
+
+    // Disabled via the real SUIT disable-manifest path.
+    let (disabler, provider) = campaign_backend(
+        &nv,
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: Some(0),
+        }),
+        &sel,
+        tmp.path(),
+    );
+    let disabler = disabler.with_deactivator(deact.clone());
+    disabler
+        .receive_package(b"disable-envelope")
+        .await
+        .expect("disable manifest enacted");
+
+    // A second backend (the manifest shape is fixed per backend), wired to
+    // vm-service, drives the re-enabling flash and the reset.
+    let b = campaign_backend_with_vm_service(
+        &nv,
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: None,
+        }),
+        provider.clone(),
+        Some(addr),
+    )
+    .with_deactivator(deact.clone());
+    assert!(b.admin_disabled(), "starts disabled");
+
+    flash_firmware(&b, b"vm1 firmware image").await;
+    assert!(
+        !b.admin_disabled(),
+        "the flash must re-enable before any reset is issued"
+    );
+
+    b.ecu_reset(0x01).await.unwrap();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "exactly one vm-service relaunch after the re-enabling flash"
+    );
+}
+
+/// Mirrors production construction order (`component_factory::build_component`
+/// wires a fresh `ComponentBackend` + selector-aware `IvdBankProvider` over
+/// the same on-disk dirs at every process start) without taking a dependency
+/// on the component-factory crate itself. The property under test:
+/// `read_entity_status()`'s FIRST call on a brand-new backend — no NV write
+/// has happened in this process to warm any cache — reads the persisted
+/// sentinel straight off disk.
+#[tokio::test]
+async fn startup_with_existing_sentinel_reports_disabled_before_any_nv_write() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    let sel = selector_for(slots::VM1);
+    installed_gen(&nv, slots::VM1, Bank::A);
+    let provider = signing_provider(&nv, slots::VM1, Some(sel), tmp.path());
+    let b = backend_with_manifests(
+        &nv,
+        slots::VM1,
+        "vm1",
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: Some(0),
+        }),
+    )
+    .with_bank_provider(provider.clone())
+    .with_deactivator(Arc::new(MockDeactivator::ok()));
+    b.receive_package(b"disable-envelope")
+        .await
+        .expect("disable manifest enacted");
+    drop(b);
+
+    // A brand-new backend instance over the same nv/provider — no shared
+    // in-memory cache with the one that enacted the disable.
+    let fresh = vm_backend(&nv, slots::VM1, None)
+        .with_bank_provider(provider.clone())
+        .with_deactivator(Arc::new(MockDeactivator::ok()));
+
+    let status = fresh.read_entity_status().await.unwrap();
+    assert_eq!(
+        status.extensions["x-runtime"]["admin_state"], "disabled",
+        "the first read on a fresh backend must see the persisted sentinel"
+    );
+}
+
+/// After enact, `x-ota-installed-manifest` reports the sentinel: exactly one
+/// file (the reserved `.admin-disabled` path, all-zero digest) and the
+/// identity strings carried over from the pre-disable manifest.
+#[tokio::test]
+async fn installed_manifest_shows_sentinel_when_disabled() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    let (b, provider) =
+        vm_backend_with_selector(&nv, slots::VM1, None, selector_for(slots::VM1), tmp.path());
+    let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
+    let gen = installed_gen(&nv, slots::VM1, Bank::A);
+
+    // Seal a real, identified inventory first — the disable must carry this
+    // identity forward into the sentinel.
+    let bank_dir = provider.target_bank_dir(Bank::A).unwrap();
+    std::fs::create_dir_all(&bank_dir).unwrap();
+    std::fs::write(bank_dir.join("kernel"), b"kernel bytes").unwrap();
+    provider
+        .seal(
+            Bank::A,
+            FirmwareIdentity {
+                version: Some("1.2.0".into()),
+                ecu_sw_number: Some("VM1-SW-001".into()),
+                ..Default::default()
+            },
+            gen,
+            &["kernel".to_string()],
+        )
+        .unwrap();
+
+    write_sentinel(&provider, &nv, slots::VM1, Bank::A);
+    assert!(b.admin_disabled(), "precondition: disabled");
+
+    let vals = b
+        .read_data(&[INSTALLED_MANIFEST_PARAM_ID.to_string()])
+        .await
+        .expect("x-ota-installed-manifest reads even when disabled");
+    let v = &vals[0].value;
+    let files = v["files"].as_array().expect("files array");
+    assert_eq!(
+        files.len(),
+        1,
+        "the sentinel inventory is exactly one file: {files:?}"
+    );
+    assert_eq!(files[0]["path"], hsm::ivd::IVD_DISABLED_RECORD_PATH);
+    let zero_sha = "0".repeat(64);
+    assert_eq!(
+        files[0]["sha256"].as_str().unwrap(),
+        zero_sha,
+        "the sentinel digest is 32 zero bytes: {files:?}"
+    );
+    assert_eq!(v["identity"]["version"], "1.2.0");
+    assert_eq!(v["identity"]["ecu_sw_number"], "VM1-SW-001");
+}
+
+// --- Single-bank (rt-shaped) sentinel behaviour -----------------------------
+
+#[tokio::test]
+async fn single_bank_rt_abort_keeps_the_sentinel() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    let sel = selector_for(slots::RT);
+    let provider = single_bank_signing_provider(&nv, slots::RT, "rt", Some(sel), tmp.path());
+    let b = rt_backend_with_manifests(&nv, Arc::new(StubManifests), provider.clone())
+        .with_deactivator(Arc::new(MockDeactivator::ok()));
+
+    write_sentinel(&provider, &nv, slots::RT, Bank::A);
+    assert!(b.admin_disabled(), "precondition: disabled");
+
+    b.start_flash().await.expect("flash session starts");
+    b.abort_flash("t1").await.expect("abort clears the session");
+
+    assert!(b.admin_disabled(), "abort must not clear the sentinel");
+    let bank_a = provider.target_bank_dir(Bank::A).unwrap();
+    assert!(
+        bank_a.join(hsm::ivd::IVD_MANIFEST_FILE).exists(),
+        "the sentinel manifest must survive an abort"
+    );
+    assert!(
+        bank_a.join(hsm::ivd::IVD_SIGNATURE_FILE).exists(),
+        "the sentinel signature must survive an abort"
+    );
+}
+
+/// Companion to the abort test: a normal single-shot flash of a real payload
+/// (not an abort) DOES replace the sentinel — re-enabling structurally, same
+/// as the banked `campaign_normal_flash_reenables_by_activating_a_real_ivd`.
+#[tokio::test]
+async fn single_bank_rt_disable_then_reenable() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    installed_gen(&nv, slots::RT, Bank::A);
+    let sel = selector_for(slots::RT);
+    let provider = single_bank_signing_provider(&nv, slots::RT, "rt", Some(sel), tmp.path());
+    let deact = Arc::new(MockDeactivator::ok());
+
+    let disabler = rt_backend_with_manifests(
+        &nv,
+        Arc::new(CannedManifest {
+            component_name: "rt".into(),
+            disable_target: Some(0),
+        }),
+        provider.clone(),
+    )
+    .with_deactivator(deact.clone());
+    disabler
+        .receive_package(b"disable-envelope")
+        .await
+        .expect("disable manifest enacted");
+    assert!(disabler.admin_disabled(), "starts disabled");
+
+    let reenabler = rt_backend_with_manifests(
+        &nv,
+        Arc::new(CannedManifest {
+            component_name: "rt".into(),
+            disable_target: None,
+        }),
+        provider.clone(),
+    )
+    .with_deactivator(deact.clone());
+    flash_firmware(&reenabler, b"rt firmware image").await;
+
+    assert!(
+        !reenabler.admin_disabled(),
+        "a normal single-shot flash re-enables the single-bank component"
+    );
+    assert_eq!(
+        deact.calls(),
+        1,
+        "re-enable must not run the deactivator again"
     );
 }
