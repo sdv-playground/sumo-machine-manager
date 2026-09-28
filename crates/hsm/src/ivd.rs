@@ -545,7 +545,7 @@ pub fn sign_bank_with_files_crypto(
 /// Shared body behind [`sign_bank_crypto`] / [`sign_bank_with_files_crypto`]:
 /// build + encode the manifest, `sign` its bytes (the lone HSM op, supplied as a
 /// closure over [`HsmCryptoProvider::sign`]), and write the two artefacts into
-/// `bank_dir`.
+/// `bank_dir`, each through `write_file_durably`, manifest first.
 #[cfg(feature = "crypto")]
 fn sign_bank_with_files_inner(
     sign: impl FnOnce(KeyHandle, &[u8]) -> Result<Vec<u8>, HsmError>,
@@ -565,9 +565,13 @@ fn sign_bank_with_files_inner(
     let sig = sign(KeyRole::IvdSigning.handle(), &manifest_bytes)?;
     let sig_ms = sig_start.elapsed().as_millis() as u64;
 
-    fs::write(bank_dir.join(IVD_MANIFEST_FILE), &manifest_bytes)
+    // A disable sentinel written here must survive a power cut after `Ok`, and
+    // a torn file must never replace a whole one. The pair is two renames, not
+    // one: a crash between them leaves the new manifest under the old
+    // signature, which fails the signature check (fail-closed).
+    write_file_durably(&bank_dir.join(IVD_MANIFEST_FILE), &manifest_bytes)
         .map_err(|e| IvdError::Io(e, bank_dir.join(IVD_MANIFEST_FILE)))?;
-    fs::write(bank_dir.join(IVD_SIGNATURE_FILE), &sig)
+    write_file_durably(&bank_dir.join(IVD_SIGNATURE_FILE), &sig)
         .map_err(|e| IvdError::Io(e, bank_dir.join(IVD_SIGNATURE_FILE)))?;
 
     let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
@@ -583,6 +587,42 @@ fn sign_bank_with_files_inner(
     );
 
     Ok(manifest)
+}
+
+/// Replace `path` with `bytes` durably: write `<name>.tmp` beside it, fsync it,
+/// rename it over `path`, then fsync the parent dir so the rename survives a
+/// power cut too. A crash leaves `path` whole, the old bytes or the new, never a
+/// truncated file. The dir fsync is best-effort: some platforms and filesystems
+/// refuse fsync on a directory.
+#[cfg(feature = "crypto")]
+fn write_file_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    let replaced = fs::File::create(&tmp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            // Flush the bytes BEFORE the rename: the rename orders the
+            // replacement, it does not make the new bytes durable.
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&tmp, path));
+    if let Err(e) = replaced {
+        // `path` still holds the old bytes, and a leftover tmp would be an
+        // unexpected file to the verify's scan, refusing the bank anyway.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Some(dir) = path.parent() {
+        if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+            tracing::debug!(dir = %dir.display(), error = %e, "ivd dir fsync skipped");
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite `bank_dir`'s IVD as the disable sentinel — the one
@@ -1671,6 +1711,50 @@ mod tests {
             other => panic!("expected SignatureInvalid, got {other:?}"),
         }
         assert!(read_manifest_unverified(&bank).is_ok());
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// Both IVD files are replaced through a temp file + rename: afterwards the
+    /// dir holds the pair and no `*.tmp` beside it, and the pair reads back as
+    /// exactly what was signed. The pre-existing pair is longer than what
+    /// replaces it, so a write that appended, or overwrote in place without
+    /// truncating, would leave its tail behind and fail the read-back.
+    #[test]
+    fn ivd_pair_write_leaves_no_temp_files_and_reads_back() {
+        let bank = temp_bank("pair-durable");
+        write(&bank.join("kernel"), b"kernel bytes");
+        write(&bank.join(IVD_MANIFEST_FILE), &[0xAA; 4096]);
+        write(&bank.join(IVD_SIGNATURE_FILE), &[0xBB; 4096]);
+        let (hsm, keystore) = provisioned_sim("pair-durable");
+        let entries = || {
+            let mut names: Vec<String> = std::fs::read_dir(&bank)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let signed = sign_bank_crypto(&hsm, &bank, 5, sample_identity()).unwrap();
+        assert_eq!(entries(), [IVD_MANIFEST_FILE, IVD_SIGNATURE_FILE, "kernel"]);
+        let back = read_manifest_unverified(&bank).unwrap();
+        assert_eq!(back.manifest_bytes, encode_manifest(&signed).unwrap());
+        assert_eq!(back.manifest.gen, 5);
+        assert_eq!(back.manifest.identity, sample_identity());
+        let pins = VerifyPins {
+            expected_install_gen: Some(5),
+            min_committed_gen: Some(5),
+        };
+        assert_eq!(verify_bank_crypto(&hsm, &bank, pins).unwrap().gen, 5);
+
+        // A signed pair replaced by another: the in-place disable.
+        let disabled = sign_disabled_record_crypto(&hsm, &bank, 6, sample_identity()).unwrap();
+        assert_eq!(entries(), [IVD_MANIFEST_FILE, IVD_SIGNATURE_FILE, "kernel"]);
+        let back = read_manifest_unverified(&bank).unwrap();
+        assert_eq!(back.manifest_bytes, encode_manifest(&disabled).unwrap());
+        assert_eq!(read_manifest_verified(&hsm, &bank).unwrap().gen, 6);
 
         let _ = std::fs::remove_dir_all(&bank);
         let _ = std::fs::remove_dir_all(&keystore);
