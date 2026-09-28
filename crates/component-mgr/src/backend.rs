@@ -511,6 +511,13 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// `NvWriteGuard::drop` (same trigger as `did_cache`); the next reader
     /// re-populates lazily.
     verified_manifest_cache: Mutex<Option<(Bank, Arc<InstalledFirmware>)>>,
+    /// The administrative-disable state [`admin_disabled`](Self::admin_disabled)
+    /// derived, as `(serving bank, disabled)`, so a status poll costs a lock
+    /// instead of a record read + HSM verify. LAZY: `None` at construction, the
+    /// first reader derives it. BANK-KEYED: a serving-bank flip (activate,
+    /// rollback, ecu_reset) misses and re-derives. Cleared to `None` on every
+    /// NV write, at the same point as `verified_manifest_cache`.
+    admin_disabled_cache: Mutex<Option<(Bank, bool)>>,
     /// The per-kind A/B storage + lifecycle seam — the engine's ONLY bank
     /// handle. Owns every bank touch: target selection, prepare/seed, payload
     /// sinks, IVD seal, installed-firmware read-back, activator-then-flip
@@ -559,8 +566,8 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// component-factory via [`with_deactivator`](Self::with_deactivator): VMs
     /// get the generic vm-service-stop deactivator, RT gets the
     /// deployment-injected erase, hsm/app/host-os never get one. The persisted
-    /// disable itself lives in the boot authority (the signed selector), read
-    /// through the bank provider.
+    /// disable itself is the serving bank's signed sentinel record, written and
+    /// read through the bank provider.
     deactivator: Option<Arc<dyn machine_mgr::Deactivator>>,
     /// SOVD §7.15 script (test) executions, keyed by exec_id. A guest test-agent
     /// run is SYNCHRONOUS — `start_script` proxies `POST /tests/{id}/run`, which
@@ -737,6 +744,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             manifest_describe: Mutex::new(HashMap::new()),
             verified_manifest_cache: Mutex::new(None),
+            admin_disabled_cache: Mutex::new(None),
             bank_provider,
             bank_provider_override: false,
             declared_parts: None,
@@ -1061,8 +1069,9 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Equip this component with its administrative-disable enactment
     /// (`Deactivator`) — which is what MAKES it disableable (see the field
     /// docs). Disable is now driven by a signed SUIT *disable* manifest (the
-    /// selector's `disabled` set is the authority — see `enact_disable_manifest`
-    /// / `admin_disabled`), NOT the retired `x-sumo-admin-state` operation.
+    /// serving bank's signed sentinel record is the authority — see
+    /// `enact_disable_manifest` / `admin_disabled`), NOT the retired
+    /// `x-sumo-admin-state` operation.
     /// Threaded from `FactoryDeps::deactivators` / built by component-factory.
     pub fn with_deactivator(mut self, deactivator: Arc<dyn machine_mgr::Deactivator>) -> Self {
         self.deactivator = Some(deactivator);
@@ -1122,6 +1131,12 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .verified_manifest_cache
             .lock()
             .expect("verified_manifest_cache poisoned") = None;
+        // Same funnel for the derived admin-disable state — cleared only, never
+        // re-derived here: deriving it takes the NV mutex this caller holds.
+        *self
+            .admin_disabled_cache
+            .lock()
+            .expect("admin_disabled_cache poisoned") = None;
 
         // Build the new map outside any cache lock — readers proceed
         // against the old map throughout this loop.
@@ -1541,7 +1556,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     ))
                 })?;
             // Name from the component-id part, not the (content-address) uri.
-            let name = crate::bank_spec::payload_target_name_for_id(manifest.component_id(i));
+            let name = crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))?;
 
             match crate::bank_seed::copy_forward_file(&active_dir, &target_dir, &name, &expected) {
                 Ok((sha256, size)) => {
@@ -1693,7 +1708,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 .expect("verified_manifest_cache poisoned");
             if let Some((cached_bank, fw)) = cache.as_ref() {
                 if *cached_bank == bank {
-                    tracing::info!(component = %self.entity_info.id, bank = ?bank, "ivd-route: cache hit -> serving");
+                    tracing::debug!(component = %self.entity_info.id, bank = ?bank, "ivd-route: cache hit -> serving");
                     return Some(Arc::clone(fw));
                 }
             }
@@ -1873,11 +1888,12 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     }
 
     pub fn ensure_flash_can_start(&self) -> BackendResult<()> {
-        // A disabled component is admitted here — the real-flash paths clear the
-        // selector's disable bit at admission (before any trial mutation), so a
-        // campaign that flashes it as a normal member re-enables it first. The
-        // "disabled ⇒ never uncommitted" invariant now holds by clearing before
-        // trial, not by refusing the flash.
+        // A disabled component is admitted here, and nothing is cleared: a flash
+        // re-enables structurally. It seals a real IVD into the target bank and
+        // `activate` moves the selector there, so the serving bank reads a real
+        // inventory; a rollback returns to the sentinel bank, disabled again.
+        // "Disabled ⇒ never uncommitted" holds because the disable enact refuses
+        // a component mid-trial, not by refusing the flash.
 
         if !self.config.single_bank {
             let nv = self
@@ -2098,13 +2114,78 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     }
 
     /// The component's *effective* administrative state: `true` only for a
-    /// disableable component that the boot authority (the signed selector, read
-    /// through the bank provider) marks disabled. A disable bit on a component
-    /// with no deactivator (the deployment shape changed) reads as enabled — the
-    /// equipped deactivator is the authority on disableability. A userspace/
-    /// post-boot gate: read to gate start / flash, never consulted at vm-boot.
+    /// disableable component whose SERVING bank (`serving_bank()`: the boot
+    /// selector's selection, else `running_bank`) holds a signature-verified
+    /// disable sentinel at that bank's NvFwMeta gen — the record
+    /// `enact_disable_manifest` writes and the launch gate refuses to start.
+    /// Everything else reads as enabled:
+    ///
+    /// - a sentinel at any other gen: stale (a moved or pre-ratchet record);
+    ///   warned, and the launch gate's gen pin refuses it anyway;
+    /// - a real inventory, no record, or one whose signature does not verify;
+    /// - a record that cannot be read (`Err`): warned and NOT cached, so the
+    ///   next read retries;
+    /// - any record on a component with no deactivator (the deployment shape
+    ///   changed) — the equipped deactivator is the authority on
+    ///   disableability.
+    ///
+    /// Derived lazily and cached per serving bank (`admin_disabled_cache`,
+    /// cleared on every NV write). A userspace/post-boot gate: read to gate
+    /// start / flash, never consulted at vm-boot.
+    ///
+    /// PRECONDITION: never call with the NV mutex held — a cache miss takes it,
+    /// briefly, for the expected gen.
     pub fn admin_disabled(&self) -> bool {
-        self.is_disableable() && self.bank_provider.disabled(self.bank_set)
+        if !self.is_disableable() {
+            return false;
+        }
+        let bank = self.serving_bank();
+        let cached = *self
+            .admin_disabled_cache
+            .lock()
+            .expect("admin_disabled_cache poisoned");
+        if let Some((cached_bank, disabled)) = cached {
+            if cached_bank == bank {
+                return disabled;
+            }
+        }
+
+        // Miss. NV only for the expected gen; the record read + HSM verify run
+        // with NV released.
+        let expected_gen = self
+            .nv
+            .lock()
+            .unwrap()
+            .read_fw_meta(self.bank_set, bank)
+            .map(|m| m.gen);
+        let disabled = match self.bank_provider.disabled_record(bank) {
+            Ok(Some(gen)) if Some(gen) == expected_gen => true,
+            Ok(Some(gen)) => {
+                tracing::warn!(
+                    component = %self.entity_info.id,
+                    bank = ?bank,
+                    gen,
+                    expected_gen = ?expected_gen,
+                    "stale sentinel gen on the serving bank — reading as enabled",
+                );
+                false
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    component = %self.entity_info.id,
+                    bank = ?bank,
+                    error = %e,
+                    "disable record unreadable — reading as enabled (not cached)",
+                );
+                return false;
+            }
+        };
+        *self
+            .admin_disabled_cache
+            .lock()
+            .expect("admin_disabled_cache poisoned") = Some((bank, disabled));
+        disabled
     }
 
     /// Enact a SUIT administrative-*disable* manifest — the no-payload
@@ -2114,17 +2195,67 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// component). The sync deactivator runs off the async worker and
     /// `reboot_required` is surfaced.
     ///
-    /// Enact-first: only once the deactivator succeeds is the disable persisted
-    /// in the boot authority (the signed selector, via the bank provider), so
-    /// an enact failure has nothing to fall back on and is reported as an error
-    /// rather than a persisted-but-failed state. `NotSupported` when the
-    /// component is not disableable (no `Deactivator`).
+    /// The disable is persisted as the SERVING bank's signed sentinel record at
+    /// a ratcheted gen (`NvFwMeta.gen + 1`, NV following the record), which is
+    /// what `admin_disabled()` and the launch gate read. Nothing is persisted
+    /// before the deactivator succeeds, and the deactivator runs only once the
+    /// cheap checks pass: the component is idle (committed, no reboot pending
+    /// or owed — `Busy` otherwise, as `ensure_flash_can_start` answers), the
+    /// serving bank has an installed-firmware gen to ratchet, and the provider
+    /// can persist the record (`PreconditionFailed` otherwise). `NotSupported`
+    /// when the component is not disableable (no `Deactivator`).
     async fn enact_disable_manifest(&self) -> BackendResult<()> {
         let Some(deactivator) = self.deactivator.clone() else {
             return Err(BackendError::NotSupported(
                 "component does not support administrative disable".into(),
             ));
         };
+
+        // Admission: idle only. A sentinel sealed mid-trial, or with a reboot
+        // pending or owed, lands on a bank the verdict or the reboot may still
+        // move away from. `pending_reboot` reads NV itself — ask it first.
+        let busy = || {
+            BackendError::Busy(
+                "disable refused: component is mid-trial or owes a reboot — retry when idle".into(),
+            )
+        };
+        if self.bank_provider.pending_reboot() {
+            return Err(busy());
+        }
+        let serving = self.serving_bank();
+        let gen = {
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("nv lock".into()))?;
+            let idx = self.bank_set.as_index();
+            let committed = self.config.single_bank
+                || nv
+                    .read_boot_state()
+                    .ok_or_else(|| BackendError::Internal("no boot state".into()))?
+                    .banks[idx]
+                    .committed;
+            let owed = nv.read_update_session().unwrap_or_default().reboot_owed & (1u32 << idx);
+            if !committed || owed != 0 {
+                return Err(busy());
+            }
+            nv.read_fw_meta(self.bank_set, serving).map(|m| m.gen)
+        };
+        // Pre-flight, before anything is enacted. Never invent gen 0: the
+        // launch gate pins the sentinel's gen to NvFwMeta, so a bank with no
+        // installed generation has nothing to disable.
+        let Some(gen) = gen else {
+            return Err(BackendError::PreconditionFailed(
+                "no installed-firmware generation for the serving bank — nothing to disable".into(),
+            ));
+        };
+        self.bank_provider
+            .can_persist_disabled_record()
+            .map_err(|e| {
+                BackendError::PreconditionFailed(format!(
+                    "disable refused: the disable record cannot be persisted: {e}"
+                ))
+            })?;
 
         let enact = tokio::task::spawn_blocking(move || deactivator.deactivate()).await;
         let reboot_required = match enact {
@@ -2137,12 +2268,29 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             }
         };
 
-        // Deactivation succeeded — persist the disable in the boot authority
-        // (the signed selector, via the provider) so `admin_disabled()` reads it
-        // and the start gate keeps the component down across reboots.
+        // Deactivation succeeded — persist the disable: the serving bank's signed
+        // record becomes the sentinel at gen + 1, its images left in place. An
+        // error returns before NV moves; a crash between the two IVD files
+        // leaves a pair that does not verify, which the launch gate refuses.
+        let gen = gen + 1;
         self.bank_provider
-            .record_disabled(self.bank_set, true)
-            .map_err(|e| BackendError::Internal(format!("record disable in selector: {e}")))?;
+            .write_disabled_record(serving, gen)
+            .map_err(|e| BackendError::Internal(format!("write disable record: {e}")))?;
+        // Ratchet NvFwMeta to the sentinel's gen so the launch gate's gen pin
+        // matches it. Through `nv_write`: its drop clears the derived caches.
+        {
+            let mut nv = self.nv_write()?;
+            let mut meta = nv.read_fw_meta(self.bank_set, serving).ok_or_else(|| {
+                BackendError::Internal("nv fw meta vanished during disable".into())
+            })?;
+            meta.gen = gen;
+            nv.write_fw_meta(self.bank_set, serving, &mut meta)
+                .map_err(|e| BackendError::Internal(format!("nv write fw meta: {e:?}")))?;
+        }
+        *self
+            .admin_disabled_cache
+            .lock()
+            .expect("admin_disabled_cache poisoned") = None;
 
         // A deactivation that owes an ECU reset records the node reboot in the
         // same durable NV marker `finalize_flash` uses for firmware singleshots,
@@ -2155,6 +2303,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         tracing::info!(
             component = %self.entity_info.id,
             bank_set = ?self.bank_set,
+            bank = ?serving,
+            gen,
             reboot_required,
             "component disabled via SUIT disable manifest"
         );
@@ -2275,7 +2425,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             // Name from the component-id part, not the (possibly content-address)
             // uri — see `payload_target_name_for_id`.
             let target_name =
-                crate::bank_spec::payload_target_name_for_id(suit_manifest.component_id(comp_idx));
+                crate::bank_spec::payload_target_name_for_id(suit_manifest.component_id(comp_idx))?;
 
             // Open the payload sink through the bank provider — it owns where
             // the bytes land and creates the bank dir as needed.
@@ -2404,7 +2554,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 if manifest.image_digest(i).is_none() {
                     continue; // no payload owed (disable / policy component)
                 }
-                let name = crate::bank_spec::payload_target_name_for_id(manifest.component_id(i));
+                let name = crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))?;
                 if !declared.contains(&name) {
                     return Err(BackendError::UnsupportedMediaType(format!(
                         "manifest part '{name}' is not a part of bank '{}' (declared: {})",
@@ -2602,7 +2752,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // uri is the content-address fetch reference (sha256:<outer>) and would
         // otherwise land the file as `sha256:…` (un-bootable).
         let target_name =
-            crate::bank_spec::payload_target_name_for_id(manifest.component_id(comp_idx));
+            crate::bank_spec::payload_target_name_for_id(manifest.component_id(comp_idx))?;
 
         // Open the payload sink through the bank provider — it owns where the
         // bytes land and creates the bank dir as needed.
@@ -4392,26 +4542,6 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             return Ok(self.next_id());
         }
 
-        // Non-disable legacy flash of a currently-disabled component = re-enable.
-        // This one-shot path enacts inline (no separate finalize_flash), so the
-        // re-enable clear lives HERE — after the disable check (so it never fires
-        // for a disable member) and before the bank state advances below, so the
-        // component is enabled before trial. Mirrors finalize_flash's re-enable
-        // branch. Guarded so a normal flash of a never-disabled component doesn't
-        // re-sign the selector.
-        if self.bank_provider.disabled(self.bank_set) {
-            self.bank_provider
-                .record_disabled(self.bank_set, false)
-                .map_err(|e| {
-                    BackendError::Internal(format!("clear disable on re-enable install: {e}"))
-                })?;
-            tracing::info!(
-                component = %self.entity_info.id,
-                bank_set = ?self.bank_set,
-                "component re-enabled on campaign install"
-            );
-        }
-
         {
             let mut ft = self.flash_transfer.lock().unwrap();
             if let Some(ref mut t) = *ft {
@@ -4903,8 +5033,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     }
 
     async fn finalize_flash(&self) -> BackendResult<()> {
-        // Campaign/session disable enact + re-enable clear — decided HERE, on the
-        // validated manifest, POST-validation and PRE-trial, before any of the
+        // Campaign/session disable enact — decided HERE, on the validated
+        // manifest, POST-validation and PRE-trial, before any of the
         // reconcile/install/activate work below. A no-payload disable manifest is
         // parked in `AwaitingPayload` by the manifest upload (no payload follows),
         // so its `validated.disable_target` is the campaign path's disable signal.
@@ -4917,11 +5047,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             )
         };
         if is_disable {
-            // Enact against this component's Deactivator (deactivate +
-            // record_disabled(true) + reboot-owed), then finish like an activated
-            // singleshot: a disable stages no payload and touches no bank, so the
-            // reconcile/install/activate path below does not apply and would
-            // otherwise hard-error demanding an image_digest the disable lacks.
+            // Enact against this component's Deactivator (deactivate, then the
+            // sentinel record + gen ratchet, then reboot-owed), then finish like
+            // an activated singleshot: a disable stages no payload and installs
+            // nothing, so the reconcile/install/activate path below does not
+            // apply and would otherwise hard-error demanding an image_digest the
+            // disable lacks.
             self.enact_disable_manifest().await?;
             *self.flash_session.lock().unwrap() = Some(FlashSessionState::Complete);
             {
@@ -4932,23 +5063,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             }
             *self.install_source.lock().unwrap() = None;
             return Ok(());
-        } else if self.bank_provider.disabled(self.bank_set) {
-            // Normal flash of a currently-disabled component = re-enable. Clear the
-            // selector's disable bit HERE — before the activate below — so the
-            // component is enabled before it enters trial ("a disabled component is
-            // never in trial/uncommitted"). Guarded so a normal flash of a
-            // never-disabled component doesn't re-sign the selector.
-            self.bank_provider
-                .record_disabled(self.bank_set, false)
-                .map_err(|e| {
-                    BackendError::Internal(format!("clear disable on re-enable install: {e}"))
-                })?;
-            tracing::info!(
-                component = %self.entity_info.id,
-                bank_set = ?self.bank_set,
-                "component re-enabled on campaign install"
-            );
         }
+        // No re-enable step for a normal flash of a disabled component: it
+        // re-enables structurally. The flash seals a real IVD into the target and
+        // `activate` below moves the selector there, so `serving_bank()` reads a
+        // real inventory; a rollback returns the selector to the sentinel bank,
+        // i.e. disabled again.
 
         // Manifest-only / partial push reconciliation. The orchestrator pushed
         // the L2 manifest but no payload for some components — "the vehicle
@@ -5780,6 +5900,31 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 .lock()
                 .map_err(|_| BackendError::Internal("nv lock poisoned".into()))?;
             self.refresh_did_cache_locked(&nv);
+        }
+        // Rolling back a re-enable lands on the sentinel bank again: disabled,
+        // yet the guest launched for the trial may still be up — stop it.
+        // Best-effort: a failed stop warns and never fails the rollback (a VM
+        // deactivator reads an already-stopped guest as converged).
+        if self.admin_disabled() {
+            if let Some(deactivator) = self.deactivator.clone() {
+                match tokio::task::spawn_blocking(move || deactivator.deactivate()).await {
+                    Ok(Ok(outcome)) => tracing::info!(
+                        component = %self.entity_info.id,
+                        reboot_required = outcome.reboot_required,
+                        "rollback landed on a disabled bank — component deactivated"
+                    ),
+                    Ok(Err(e)) => tracing::warn!(
+                        component = %self.entity_info.id,
+                        error = %e,
+                        "rollback landed on a disabled bank — deactivation failed"
+                    ),
+                    Err(e) => tracing::warn!(
+                        component = %self.entity_info.id,
+                        error = %e,
+                        "rollback landed on a disabled bank — deactivator task join error"
+                    ),
+                }
+            }
         }
         // Clear flash transfer state after rollback
         *self.flash_transfer.lock().unwrap() = None;
@@ -9025,6 +9170,9 @@ mod bank_provider_injection_tests {
         }
         fn reset_kind(&self) -> ResetKind {
             ResetKind::RequiresEcuReset
+        }
+        fn can_persist_disabled_record(&self) -> Result<(), BankError> {
+            Err(BankError::Failed("test provider".into()))
         }
         fn write_disabled_record(&self, _bank: Bank, _gen: u64) -> Result<(), BankError> {
             Err(BankError::Failed("test provider".into()))
@@ -12963,6 +13111,9 @@ mod declared_parts_tests {
         }
         fn rollback(&self) -> Result<(), BankError> {
             Ok(())
+        }
+        fn can_persist_disabled_record(&self) -> Result<(), BankError> {
+            Err(BankError::Failed("test provider".into()))
         }
         fn write_disabled_record(&self, _bank: Bank, _gen: u64) -> Result<(), BankError> {
             Err(BankError::Failed("test provider".into()))

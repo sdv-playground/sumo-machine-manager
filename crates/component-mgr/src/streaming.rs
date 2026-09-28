@@ -148,7 +148,7 @@ pub async fn process_envelope_stream(
 
         // Name from the component-id part, not the (possibly content-address)
         // payload key — see `payload_target_name_for_id`.
-        let target_name = payload_target_name_for_id(manifest.component_id(comp_idx));
+        let target_name = payload_target_name_for_id(manifest.component_id(comp_idx))?;
 
         // Open the payload sink through the bank provider — it owns where the
         // bytes land (a file in the target bank dir for IVD, a raw-partition

@@ -264,6 +264,9 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
     fn disabled(&self, set: BankSet) -> bool {
         self.inner.disabled(set)
     }
+    fn can_persist_disabled_record(&self) -> Result<(), BankError> {
+        self.inner.can_persist_disabled_record()
+    }
     fn write_disabled_record(&self, bank: Bank, gen: u64) -> Result<(), BankError> {
         // The IVD pair lives in the metadata dir exactly as for a file bank.
         self.inner.write_disabled_record(bank, gen)

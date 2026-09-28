@@ -1,17 +1,21 @@
 //! Integration tests for the per-component administrative state slice: the
-//! SUIT disable-manifest enact path (`enact_disable_manifest`), the signed
-//! selector as the disable authority (`admin_disabled`), and the flash-gate +
-//! status + reset enforcement points — mirroring the `sovd_tests.rs` harness
-//! style.
+//! SUIT disable-manifest enact path (`enact_disable_manifest`), the serving
+//! bank's signed sentinel record as the disable authority (`admin_disabled`),
+//! and the flash-gate + status + reset enforcement points — mirroring the
+//! `sovd_tests.rs` harness style.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+use sha2::{Digest, Sha256};
 
 use nv_store::block::MemBlockDevice;
 use nv_store::slots;
 use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
 
+use machine_mgr::bank_provider::BankProvider;
 use machine_mgr::{
     DeactivateError, DeactivateOutcome, Deactivator, InMemorySelectorStore, SharedSystemBankState,
     SystemBankManager, TestSigner,
@@ -179,9 +183,8 @@ fn backend_with_manifests(
     .with_id(id.to_string())
 }
 
-/// A shared boot selector with a booted selection for `set` (so the provider
-/// resolves a bank); the disable set starts empty. The signed selector is the
-/// read/write authority for a component's administrative disable state.
+/// A shared boot selector with a booted selection for `set` (bank A) — the
+/// serving bank a component's disable record is read from.
 fn selector_for(set: BankSet) -> SharedSystemBankState {
     let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner));
     let shared: SharedSystemBankState = Arc::new(std::sync::RwLock::new(mgr));
@@ -193,32 +196,116 @@ fn selector_for(set: BankSet) -> SharedSystemBankState {
     shared
 }
 
-/// Set/clear `set`'s disable bit in the selector directly — the state a SUIT
-/// disable manifest (`record_disabled`) persists and `admin_disabled()` reads.
-fn set_selector_disabled(sel: &SharedSystemBankState, set: BankSet, disabled: bool) {
-    sel.write().unwrap().stage_disabled(set, disabled);
+/// Point the selector's booted selection for `set` at `bank` — what a flash's
+/// `activate` does. Re-enable is structural: once the serving bank holds no
+/// sentinel, `admin_disabled()` reads enabled.
+fn serve_bank(sel: &SharedSystemBankState, set: BankSet, bank: Bank) {
+    let mut g = sel.write().unwrap();
+    g.stage(set, bank);
+    g.seal();
 }
 
-/// A vm-style backend whose bank provider is wired to `selector`, so the
-/// disable read/write paths route through it (the production shape once the
-/// signed selector is the disable authority).
+/// Provision the IVD-signing slot in a fresh keystore dir. Reproduces
+/// `partition_bank.rs`'s `provisioned_keystore` (an integration test can't
+/// reach another test crate's helpers).
+fn provisioned_keystore(tmp: &Path) -> PathBuf {
+    use hsm::payload::*;
+    let ks_dir = tmp.join("keystore");
+    std::fs::create_dir_all(&ks_dir).unwrap();
+    let hsm = hsm_sim_backend::SimHsm::new(ks_dir.clone());
+    hsm.write_keystore(&HsmKeystore {
+        schema_version: SCHEMA_VERSION,
+        security_version: 1,
+        identities: vec![],
+        slots: vec![KeySlot {
+            key_id: hsm::ivd::IVD_KEY_ID.to_string(),
+            key_kind: KEY_TYPE_EC_P256,
+            anchor_public_key: None,
+            allowed_guests: None,
+            allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
+        }],
+        certificates: Vec::new(),
+        trust_anchors: Vec::new(),
+    })
+    .unwrap();
+    std::fs::write(ks_dir.join("provision_state"), b"1\n").unwrap();
+    ks_dir
+}
+
+/// A `vm1`-dir `IvdBankProvider` that can SIGN: an on-disk `images_dir` under
+/// `tmp` and a provisioned SimHsm as both its provisioning authority and its
+/// crypto handle — so the disable record is written and read for real, the
+/// production shape. `selector`, when given, is the boot authority it follows.
+fn signing_provider(
+    nv: &SharedNv,
+    set: BankSet,
+    selector: Option<SharedSystemBankState>,
+    tmp: &Path,
+) -> Arc<IvdBankProvider<MemBlockDevice>> {
+    let ks = provisioned_keystore(tmp);
+    let hsm: Arc<Mutex<dyn hsm::HsmProvider>> =
+        Arc::new(Mutex::new(hsm_sim_backend::SimHsm::new(ks.clone())));
+    Arc::new(
+        IvdBankProvider::new(
+            nv.clone(),
+            set,
+            false,
+            Some(tmp.join("images")),
+            "vm1".into(),
+            Some(hsm),
+            None,
+            selector,
+        )
+        .with_hsm_crypto(Arc::new(hsm_sim_backend::SimHsm::new(ks))),
+    )
+}
+
+/// `bank`'s installed-firmware gen (NvFwMeta) — the gen a disable ratchets
+/// from — writing gen 1 first when the fixture has none.
+fn installed_gen(nv: &SharedNv, set: BankSet, bank: Bank) -> u64 {
+    let mut nv = nv.lock().unwrap();
+    if let Some(meta) = nv.read_fw_meta(set, bank) {
+        return meta.gen;
+    }
+    let mut meta = NvFwMeta {
+        gen: 1,
+        ..Default::default()
+    };
+    nv.write_fw_meta(set, bank, &mut meta).unwrap();
+    1
+}
+
+/// Persist a disable the way the enact does, minus the enact itself: `bank`'s
+/// signed sentinel record at its NvFwMeta gen — what `admin_disabled()` reads.
+/// Written behind the backend's back, so it must land before that backend
+/// first derives its admin state (the derived state is cached until NV or the
+/// serving bank changes).
+fn write_sentinel(
+    provider: &IvdBankProvider<MemBlockDevice>,
+    nv: &SharedNv,
+    set: BankSet,
+    bank: Bank,
+) {
+    let gen = installed_gen(nv, set, bank);
+    provider.write_disabled_record(bank, gen).unwrap();
+}
+
+/// A vm-style backend whose bank provider is wired to `selector` and can sign
+/// ([`signing_provider`] under `tmp`), so the disable read/write paths run for
+/// real. Hands the provider back for `write_sentinel` and on-disk assertions.
 fn vm_backend_with_selector(
     nv: &SharedNv,
     set: BankSet,
     vm_service_addr: Option<String>,
     selector: SharedSystemBankState,
-) -> ComponentBackend<MemBlockDevice> {
-    let provider = IvdBankProvider::new(
-        nv.clone(),
-        set,
-        false,
-        None,
-        "disable".into(),
-        None,
-        None,
-        Some(selector),
-    );
-    vm_backend(nv, set, vm_service_addr).with_bank_provider(Arc::new(provider))
+    tmp: &Path,
+) -> (
+    ComponentBackend<MemBlockDevice>,
+    Arc<IvdBankProvider<MemBlockDevice>>,
+) {
+    let provider = signing_provider(nv, set, Some(selector), tmp);
+    let backend = vm_backend(nv, set, vm_service_addr).with_bank_provider(provider.clone());
+    (backend, provider)
 }
 
 /// The pre-step-2 health body: an older vm-service that reports no intent at
@@ -272,17 +359,18 @@ async fn counting_server_with_health(health: &'static str) -> (String, Arc<Atomi
 #[tokio::test]
 async fn non_disableable_component_omits_admin_state() {
     // No deactivator ⇒ not disableable. `admin_disabled()` short-circuits on
-    // `is_disableable()`, so even a disable bit set in the signed selector reads
-    // as enabled — the equipped deactivator is the authority.
+    // `is_disableable()`, so even a sentinel on the serving bank reads as
+    // enabled — the equipped deactivator is the authority.
     let nv = make_nv();
-    let sel = selector_for(slots::VM1);
-    let b = vm_backend_with_selector(&nv, slots::VM1, None, sel.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    let (b, provider) =
+        vm_backend_with_selector(&nv, slots::VM1, None, selector_for(slots::VM1), tmp.path());
     assert!(!b.is_disableable());
 
-    set_selector_disabled(&sel, slots::VM1, true);
+    write_sentinel(&provider, &nv, slots::VM1, Bank::A);
     assert!(
         !b.admin_disabled(),
-        "a disable bit on a non-disableable component reads as enabled"
+        "a sentinel on a non-disableable component reads as enabled"
     );
 
     // No admin_state field in /status (tri-state read-back), no advertised op.
@@ -297,34 +385,42 @@ async fn non_disableable_component_omits_admin_state() {
 
 #[tokio::test]
 async fn ensure_flash_can_start_admits_disabled() {
-    // E4a relaxed the gate: a disabled component is NO LONGER refused here — the
-    // real-flash paths clear its disable bit at admission (re-enable on flash),
-    // so the gate must admit it. The "disabled ⇒ never uncommitted" invariant is
-    // preserved by clearing before trial, not by refusing at this gate.
+    // A disabled component is NOT refused here: a flash re-enables it
+    // structurally (a real IVD sealed into the target, the selector moved
+    // there), so the gate must admit it. The "disabled ⇒ never uncommitted"
+    // invariant holds because the disable enact refuses a component mid-trial,
+    // not by refusing at this gate.
     let nv = make_nv();
-    let sel = selector_for(slots::VM1);
-    let b = vm_backend_with_selector(&nv, slots::VM1, None, sel.clone())
-        .with_deactivator(Arc::new(MockDeactivator::ok()));
+    let tmp = tempfile::tempdir().unwrap();
+    let (b, provider) =
+        vm_backend_with_selector(&nv, slots::VM1, None, selector_for(slots::VM1), tmp.path());
+    let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
     b.ensure_flash_can_start()
         .expect("enabled component is flashable");
 
-    set_selector_disabled(&sel, slots::VM1, true);
+    write_sentinel(&provider, &nv, slots::VM1, Bank::A);
+    assert!(
+        b.admin_disabled(),
+        "precondition: the component is disabled"
+    );
     b.ensure_flash_can_start()
-        .expect("a disabled component is now admitted (re-enabled at flash admission)");
+        .expect("a disabled component is admitted (a flash re-enables it)");
 }
 
 #[tokio::test]
 async fn read_entity_status_tri_state_and_probe_skip() {
     let nv = make_nv();
     let (addr, probes) = counting_server().await;
+    let tmp = tempfile::tempdir().unwrap();
     let sel = selector_for(slots::VM1);
-    let b = vm_backend_with_selector(&nv, slots::VM1, Some(addr), sel.clone())
-        .with_deactivator(Arc::new(MockDeactivator::ok()));
+    let (b, provider) =
+        vm_backend_with_selector(&nv, slots::VM1, Some(addr), sel.clone(), tmp.path());
+    let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
 
     // Disabled: NotReady, admin_state "disabled", and the vm-service probe
     // is SKIPPED (zero connections — no phantom health traffic to a VM that
     // is down by design).
-    set_selector_disabled(&sel, slots::VM1, true);
+    write_sentinel(&provider, &nv, slots::VM1, Bank::A);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::NotReady);
     let rt = &status.extensions["x-runtime"];
@@ -341,9 +437,11 @@ async fn read_entity_status_tri_state_and_probe_skip() {
         "nothing was polled, so no verdict may be claimed: {rt}"
     );
 
-    // Enabled again: the probe runs (our canned server is not a healthy
-    // guest, so spec status stays notReady — honesty), admin_state "enabled".
-    set_selector_disabled(&sel, slots::VM1, false);
+    // Enabled again — structurally, the selector now serving a bank with no
+    // sentinel (what a flash's activate does): the probe runs (our canned
+    // server is not a healthy guest, so spec status stays notReady — honesty),
+    // admin_state "enabled".
+    serve_bank(&sel, slots::VM1, Bank::B);
     let status = b.read_entity_status().await.unwrap();
     let rt = &status.extensions["x-runtime"];
     assert_eq!(rt["admin_state"], "enabled", "enabled read-back");
@@ -370,10 +468,16 @@ async fn disabled_status_and_runtime_state_agree() {
     // again.
     let nv = make_nv();
     let (addr, _probes) = counting_server().await;
-    let sel = selector_for(slots::VM1);
-    let b = vm_backend_with_selector(&nv, slots::VM1, Some(addr), sel.clone())
-        .with_deactivator(Arc::new(MockDeactivator::ok()));
-    set_selector_disabled(&sel, slots::VM1, true);
+    let tmp = tempfile::tempdir().unwrap();
+    let (b, provider) = vm_backend_with_selector(
+        &nv,
+        slots::VM1,
+        Some(addr),
+        selector_for(slots::VM1),
+        tmp.path(),
+    );
+    let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
+    write_sentinel(&provider, &nv, slots::VM1, Bank::A);
 
     let status = b.read_entity_status().await.unwrap();
     let rt = status.extensions["x-runtime"].as_object().unwrap().clone();
@@ -445,8 +549,10 @@ async fn probe_component_status_rides_the_uniform_node() {
     assert_eq!(rt["hb_seq"], 7, "probe health feeds the uniform fields");
 
     // Probe not running ⇒ the standard status field is honest.
-    let sel = selector_for(slots::RT);
-    let b = vm_backend_with_selector(&nv, slots::RT, None, sel.clone())
+    let tmp = tempfile::tempdir().unwrap();
+    let (b, provider) =
+        vm_backend_with_selector(&nv, slots::RT, None, selector_for(slots::RT), tmp.path());
+    let b = b
         .with_deactivator(Arc::new(MockDeactivator::ok()))
         .with_health_probe(Arc::new(MockProbe { running: false }));
     let status = b.read_entity_status().await.unwrap();
@@ -458,8 +564,13 @@ async fn probe_component_status_rides_the_uniform_node() {
 
     // Disabled ⇒ minimal read: notReady + admin_state, no probe extensions.
     // Probe not running ⇒ the deactivation is fully realized: no
-    // reboot_pending flag.
-    set_selector_disabled(&sel, slots::RT, true);
+    // reboot_pending flag. A fresh backend over the same bank reads it: the
+    // record lands behind `b`'s back, and `b` keeps the state it derived above.
+    write_sentinel(&provider, &nv, slots::RT, Bank::A);
+    let b = vm_backend(&nv, slots::RT, None)
+        .with_bank_provider(provider.clone())
+        .with_deactivator(Arc::new(MockDeactivator::ok()))
+        .with_health_probe(Arc::new(MockProbe { running: false }));
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(status.status, EntityStatus::NotReady);
     let rt = &status.extensions["x-runtime"];
@@ -477,11 +588,13 @@ async fn probe_component_status_rides_the_uniform_node() {
     // application executing from SRAM) ⇒ the armed reboot is observable on
     // the uniform node until the real reboot clears it.
     let nv2 = make_nv();
-    let sel2 = selector_for(slots::RT);
-    let b = vm_backend_with_selector(&nv2, slots::RT, None, sel2.clone())
+    let tmp2 = tempfile::tempdir().unwrap();
+    let (b, provider2) =
+        vm_backend_with_selector(&nv2, slots::RT, None, selector_for(slots::RT), tmp2.path());
+    let b = b
         .with_deactivator(Arc::new(MockDeactivator::ok()))
         .with_health_probe(Arc::new(MockProbe { running: true }));
-    set_selector_disabled(&sel2, slots::RT, true);
+    write_sentinel(&provider2, &nv2, slots::RT, Bank::A);
     let status = b.read_entity_status().await.unwrap();
     assert_eq!(
         status.status,
@@ -500,13 +613,15 @@ async fn probe_component_status_rides_the_uniform_node() {
 async fn ecu_reset_skips_vm_service_when_disabled() {
     let nv = make_nv();
     let (addr, hits) = counting_server().await;
+    let tmp = tempfile::tempdir().unwrap();
     let sel = selector_for(slots::VM1);
-    let b = vm_backend_with_selector(&nv, slots::VM1, Some(addr), sel.clone())
-        .with_deactivator(Arc::new(MockDeactivator::ok()));
+    let (b, provider) =
+        vm_backend_with_selector(&nv, slots::VM1, Some(addr), sel.clone(), tmp.path());
+    let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
 
     // Disabled: a reset must NOT resurrect the VM — zero vm-service traffic
     // (neither the was-running probe nor the start/restart notify).
-    set_selector_disabled(&sel, slots::VM1, true);
+    write_sentinel(&provider, &nv, slots::VM1, Bank::A);
     b.ecu_reset(0x01).await.unwrap();
     assert_eq!(
         hits.load(Ordering::SeqCst),
@@ -514,8 +629,9 @@ async fn ecu_reset_skips_vm_service_when_disabled() {
         "reset of a disabled component must not touch vm-service"
     );
 
-    // Enabled: the reset notifies vm-service again.
-    set_selector_disabled(&sel, slots::VM1, false);
+    // Enabled (the selector now serves a bank with no sentinel): the reset
+    // notifies vm-service again.
+    serve_bank(&sel, slots::VM1, Bank::B);
     b.ecu_reset(0x01).await.unwrap();
     assert!(
         hits.load(Ordering::SeqCst) > 0,
@@ -532,6 +648,8 @@ async fn ecu_reset_skips_vm_service_when_disabled() {
 #[tokio::test]
 async fn disable_manifest_upload_enacts_deactivator_and_handles_reboot() {
     let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    installed_gen(&nv, slots::VM1, Bank::A);
     let deact = Arc::new(MockDeactivator::rebooting());
     let b = backend_with_manifests(
         &nv,
@@ -542,6 +660,7 @@ async fn disable_manifest_upload_enacts_deactivator_and_handles_reboot() {
             disable_target: Some(0),
         }),
     )
+    .with_bank_provider(signing_provider(&nv, slots::VM1, None, tmp.path()))
     .with_deactivator(deact.clone());
 
     // Routes to the deactivator (not stored as a package); reboot_required=true
@@ -553,15 +672,17 @@ async fn disable_manifest_upload_enacts_deactivator_and_handles_reboot() {
 }
 
 #[tokio::test]
-async fn suit_disable_manifest_writes_selector_and_start_flash_admits_without_clearing() {
+async fn suit_disable_manifest_writes_sentinel_and_start_flash_admits() {
     // A SUIT disable manifest on the single-shot `receive_package` path routes to
-    // `enact_disable_manifest`, which persists the disable in the signed selector
-    // (`record_disabled(true)`); `admin_disabled()` reads it back. Re-enable has
-    // MOVED off flash admission: `start_flash` now admits a disabled component but
-    // no longer clears the selector — that clear happens at `finalize_flash`,
-    // before trial (see `campaign_normal_flash_reenables_at_finalize`).
+    // `enact_disable_manifest`, which persists the disable as the serving bank's
+    // signed sentinel record at its (ratcheted) NvFwMeta gen; `admin_disabled()`
+    // reads it back. `start_flash` admits a disabled component and clears
+    // nothing: a flash re-enables structurally, by activating a real IVD (see
+    // `campaign_normal_flash_reenables_by_activating_a_real_ivd`).
     let nv = make_nv();
-    let sel = selector_for(slots::VM1);
+    let tmp = tempfile::tempdir().unwrap();
+    installed_gen(&nv, slots::VM1, Bank::A);
+    let provider = signing_provider(&nv, slots::VM1, Some(selector_for(slots::VM1)), tmp.path());
     let deact = Arc::new(MockDeactivator::ok());
     let b = backend_with_manifests(
         &nv,
@@ -573,45 +694,35 @@ async fn suit_disable_manifest_writes_selector_and_start_flash_admits_without_cl
         }),
     )
     .with_deactivator(deact.clone())
-    .with_bank_provider(Arc::new(IvdBankProvider::new(
-        nv.clone(),
-        slots::VM1,
-        false,
-        None,
-        "vm1".into(),
-        None,
-        None,
-        Some(sel.clone()),
-    )));
+    .with_bank_provider(provider.clone());
 
     assert!(!b.admin_disabled(), "starts enabled");
-    assert!(!sel.read().unwrap().disabled(slots::VM1));
 
-    // Disable via the SUIT manifest → deactivate + record_disabled(true).
+    // Disable via the SUIT manifest → deactivate + the sentinel record.
     b.receive_package(b"disable-envelope")
         .await
         .expect("disable manifest enacted");
     assert_eq!(deact.calls(), 1, "deactivator enacted once");
-    assert!(
-        sel.read().unwrap().disabled(slots::VM1),
-        "the disable is persisted in the signed selector"
+    let gen = nv
+        .lock()
+        .unwrap()
+        .read_fw_meta(slots::VM1, Bank::A)
+        .unwrap()
+        .gen;
+    assert_eq!(
+        provider.disabled_record(Bank::A).unwrap(),
+        Some(gen),
+        "the serving bank holds the sentinel at its NvFwMeta gen"
     );
-    assert!(b.admin_disabled(), "admin_disabled() reads the selector");
+    assert!(b.admin_disabled(), "admin_disabled() reads the sentinel");
 
-    // Re-enable moved OUT of flash admission: `start_flash` now ADMITS a disabled
-    // component (the gate is relaxed) but no longer clears the selector — the
-    // re-enable clear happens at `finalize_flash`, before trial. So the disable
-    // bit is still set right after admission.
+    // `start_flash` ADMITS a disabled component and clears nothing.
     b.start_flash()
         .await
         .expect("start_flash admits a disabled component");
     assert!(
-        sel.read().unwrap().disabled(slots::VM1),
-        "start_flash no longer clears the disable bit — that moved to finalize"
-    );
-    assert!(
         b.admin_disabled(),
-        "still disabled until finalize re-enables"
+        "still disabled until a flash activates a real bank"
     );
 }
 
@@ -670,6 +781,9 @@ async fn disable_manifest_without_deactivator_errors() {
 #[tokio::test]
 async fn disable_manifest_enact_failure_is_reported() {
     let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    installed_gen(&nv, slots::VM1, Bank::A);
+    let provider = signing_provider(&nv, slots::VM1, None, tmp.path());
     let deact = Arc::new(MockDeactivator::failing());
     let b = backend_with_manifests(
         &nv,
@@ -680,6 +794,7 @@ async fn disable_manifest_enact_failure_is_reported() {
             disable_target: Some(0),
         }),
     )
+    .with_bank_provider(provider.clone())
     .with_deactivator(deact.clone());
     let err = b
         .receive_package(b"disable-envelope")
@@ -687,6 +802,140 @@ async fn disable_manifest_enact_failure_is_reported() {
         .expect_err("a failing deactivator must surface an error");
     assert_eq!(deact.calls(), 1);
     assert!(matches!(err, BackendError::Internal(_)), "got {err:?}");
+    // Enact-first: a failed enact persists nothing — no record in the serving
+    // bank.
+    let serving_dir = provider.target_bank_dir(Bank::A).unwrap();
+    assert!(
+        !serving_dir.join(hsm::ivd::IVD_MANIFEST_FILE).exists(),
+        "a failed enact writes no IVD manifest"
+    );
+}
+
+/// A disable is refused while the component is mid-trial: the sentinel would
+/// land on a bank the pending verdict may still roll away from. `Busy` — the
+/// flash gate's answer to the same state — and nothing is enacted.
+#[tokio::test]
+async fn enact_refuses_when_not_idle() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    installed_gen(&nv, slots::VM1, Bank::A);
+    {
+        let mut nv = nv.lock().unwrap();
+        let mut boot = nv.read_boot_state().unwrap();
+        boot.banks[slots::VM1.as_index()].committed = false;
+        nv.write_boot_state(&mut boot).unwrap();
+    }
+    let deact = Arc::new(MockDeactivator::ok());
+    let b = backend_with_manifests(
+        &nv,
+        slots::VM1,
+        "vm1",
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: Some(0),
+        }),
+    )
+    .with_bank_provider(signing_provider(&nv, slots::VM1, None, tmp.path()))
+    .with_deactivator(deact.clone());
+
+    let err = b
+        .receive_package(b"disable-envelope")
+        .await
+        .expect_err("a mid-trial component must refuse a disable");
+    assert!(matches!(err, BackendError::Busy(_)), "got {err:?}");
+    assert_eq!(deact.calls(), 0, "nothing is enacted");
+}
+
+/// With no installed-firmware gen on the serving bank there is nothing to
+/// ratchet and nothing to disable: refused before the deactivator runs, and no
+/// sentinel is invented at gen 0.
+#[tokio::test]
+async fn enact_refuses_without_gen_source() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = signing_provider(&nv, slots::VM1, None, tmp.path());
+    let deact = Arc::new(MockDeactivator::ok());
+    let b = backend_with_manifests(
+        &nv,
+        slots::VM1,
+        "vm1",
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: Some(0),
+        }),
+    )
+    .with_bank_provider(provider.clone())
+    .with_deactivator(deact.clone());
+
+    let err = b
+        .receive_package(b"disable-envelope")
+        .await
+        .expect_err("no gen source must refuse the disable");
+    assert!(
+        matches!(err, BackendError::PreconditionFailed(_)),
+        "got {err:?}"
+    );
+    assert_eq!(deact.calls(), 0, "refused before the deactivator runs");
+    assert_eq!(provider.disabled_record(Bank::A).unwrap(), None);
+}
+
+/// The enact ratchets the serving bank's NvFwMeta gen by one and signs the
+/// sentinel at exactly that gen — the pair the launch gate's gen pin checks.
+#[tokio::test]
+async fn enact_ratchets_gen() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    let old = installed_gen(&nv, slots::VM1, Bank::A);
+    let provider = signing_provider(&nv, slots::VM1, None, tmp.path());
+    let b = backend_with_manifests(
+        &nv,
+        slots::VM1,
+        "vm1",
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: Some(0),
+        }),
+    )
+    .with_bank_provider(provider.clone())
+    .with_deactivator(Arc::new(MockDeactivator::ok()));
+
+    b.receive_package(b"disable-envelope")
+        .await
+        .expect("disable manifest enacted");
+    let gen = nv
+        .lock()
+        .unwrap()
+        .read_fw_meta(slots::VM1, Bank::A)
+        .unwrap()
+        .gen;
+    assert_eq!(gen, old + 1, "NvFwMeta ratcheted by one");
+    assert_eq!(
+        provider.disabled_record(Bank::A).unwrap(),
+        Some(old + 1),
+        "the sentinel is signed at the ratcheted gen"
+    );
+}
+
+/// Only a sentinel at the serving bank's NvFwMeta gen disables: one at any
+/// other gen (a moved or pre-ratchet record) is stale and reads as enabled.
+#[tokio::test]
+async fn admin_disabled_is_false_for_a_stale_sentinel_gen() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    let (b, provider) =
+        vm_backend_with_selector(&nv, slots::VM1, None, selector_for(slots::VM1), tmp.path());
+    let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
+    let gen = installed_gen(&nv, slots::VM1, Bank::A);
+    provider.write_disabled_record(Bank::A, gen + 1).unwrap();
+    assert_eq!(
+        provider.disabled_record(Bank::A).unwrap(),
+        Some(gen + 1),
+        "precondition: the sentinel itself verifies"
+    );
+    assert!(
+        !b.admin_disabled(),
+        "a sentinel off the NvFwMeta gen is stale: enabled"
+    );
 }
 
 #[tokio::test]
@@ -745,6 +994,21 @@ fn detached_envelope() -> Vec<u8> {
         .unwrap()
 }
 
+/// A detached single-component envelope for vm1's `firmware` part declaring
+/// `image`'s real digest, so the payload upload that follows passes the
+/// pipeline's digest check and the target bank is sealed for real.
+fn firmware_envelope(image: &[u8]) -> Vec<u8> {
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    ImageManifestBuilder::new()
+        .signing_time(1_700_000_000)
+        .component_id(vec!["vm1".into(), "firmware".into()])
+        .sequence_number(2)
+        .payload_digest(&Sha256::digest(image), image.len() as u64)
+        .payload_uri("#firmware".into())
+        .build(&key)
+        .unwrap()
+}
+
 /// Wrap envelope bytes as the single-chunk `PackageStream` the upload path reads.
 fn envelope_stream(data: Vec<u8>) -> PackageStream {
     Box::pin(futures::stream::iter(vec![Ok::<
@@ -755,48 +1019,64 @@ fn envelope_stream(data: Vec<u8>) -> PackageStream {
 
 /// A vm1 backend wired with `CannedManifest` (so the campaign manifest upload
 /// validates to the desired disable/normal shape) AND a selector-backed provider
-/// (so `record_disabled` writes/reads the shared selector `sel`).
+/// that can sign ([`signing_provider`] under `tmp`), so the disable record is
+/// written and read for real. Hands the provider back.
 fn campaign_backend(
     nv: &SharedNv,
     manifests: Arc<dyn ManifestProvider>,
     sel: &SharedSystemBankState,
-) -> ComponentBackend<MemBlockDevice> {
-    backend_with_manifests(nv, slots::VM1, "vm1", manifests).with_bank_provider(Arc::new(
-        IvdBankProvider::new(
-            nv.clone(),
-            slots::VM1,
-            false,
-            None,
-            "vm1".into(),
-            None,
-            None,
-            Some(sel.clone()),
-        ),
-    ))
+    tmp: &Path,
+) -> (
+    ComponentBackend<MemBlockDevice>,
+    Arc<IvdBankProvider<MemBlockDevice>>,
+) {
+    let provider = signing_provider(nv, slots::VM1, Some(sel.clone()), tmp);
+    let backend = backend_with_manifests(nv, slots::VM1, "vm1", manifests)
+        .with_bank_provider(provider.clone());
+    (backend, provider)
+}
+
+/// Flash `image` into vm1's target bank through the campaign lifecycle: start,
+/// the manifest, the payload (which seals the target), finalize (which
+/// activates it).
+async fn flash_firmware(b: &ComponentBackend<MemBlockDevice>, image: &[u8]) {
+    b.start_flash().await.expect("flash session starts");
+    b.receive_package_stream(envelope_stream(firmware_envelope(image)), None)
+        .await
+        .expect("normal manifest parked");
+    b.receive_package_stream(envelope_stream(image.to_vec()), None)
+        .await
+        .expect("payload staged and the target sealed");
+    b.finalize_flash()
+        .await
+        .expect("finalize activates the flashed bank");
 }
 
 #[tokio::test]
 async fn campaign_disable_manifest_enacts_at_finalize() {
     // The REAL campaign path: a no-payload disable manifest is parked in
     // AwaitingPayload by the manifest upload (no payload follows), then
-    // finalize_flash must ENACT it — deactivate + record_disabled(true) + record
+    // finalize_flash must ENACT it — deactivate + the sentinel record + record
     // the owed reboot — and return Ok, instead of driving the parked manifest
     // into reconcile (which would hard-error demanding an image_digest a disable
     // lacks). Reverting the finalize enact makes this fail (deactivate never runs).
     let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    installed_gen(&nv, slots::VM1, Bank::A);
     let sel = selector_for(slots::VM1);
     let deact = Arc::new(MockDeactivator::rebooting());
-    let b = campaign_backend(
+    let (b, provider) = campaign_backend(
         &nv,
         Arc::new(CannedManifest {
             component_name: "vm1".into(),
             disable_target: Some(0),
         }),
         &sel,
-    )
-    .with_deactivator(deact.clone());
+        tmp.path(),
+    );
+    let b = b.with_deactivator(deact.clone());
 
-    assert!(!sel.read().unwrap().disabled(slots::VM1), "starts enabled");
+    assert!(!b.admin_disabled(), "starts enabled");
 
     // start_flash → manifest upload parks the disable manifest (no payload).
     b.start_flash().await.expect("flash session starts");
@@ -809,15 +1089,16 @@ async fn campaign_disable_manifest_enacts_at_finalize() {
         .await
         .expect("finalize enacts the disable; no reconcile error");
 
-    // (a) the Deactivator ran; (b) the selector records the disable.
+    // (a) the Deactivator ran; (b) the serving bank holds the sentinel.
     assert_eq!(
         deact.calls(),
         1,
         "deactivate() ran exactly once at finalize"
     );
+    assert!(b.admin_disabled(), "admin_disabled() reads the sentinel");
     assert!(
-        sel.read().unwrap().disabled(slots::VM1),
-        "record_disabled(true) persisted in the signed selector"
+        provider.disabled_record(Bank::A).unwrap().is_some(),
+        "the sentinel record is on disk in the serving bank"
     );
     // (c) the owed node reboot is recorded durably (reboot_required deactivator).
     let owed = nv
@@ -834,40 +1115,102 @@ async fn campaign_disable_manifest_enacts_at_finalize() {
 }
 
 #[tokio::test]
-async fn campaign_normal_flash_reenables_at_finalize() {
+async fn campaign_normal_flash_reenables_by_activating_a_real_ivd() {
     // Companion to the disable test: a NORMAL (non-disable) campaign flash of a
-    // currently-disabled component RE-ENABLES it — finalize_flash clears the
-    // selector's disable bit before trial, the SUIT-native replacement for the
-    // manual enable lever now that the mis-placed start_flash clear is gone.
+    // currently-disabled component RE-ENABLES it, structurally — the flash seals
+    // a real IVD into the target bank and `activate` moves the selector there,
+    // so the serving bank reads a real inventory. Nothing clears the sentinel:
+    // it stays in the old bank, which is where a rollback would land.
     let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
     let sel = selector_for(slots::VM1);
     let deact = Arc::new(MockDeactivator::ok());
-    let b = campaign_backend(
+    let (b, provider) = campaign_backend(
         &nv,
         Arc::new(CannedManifest {
             component_name: "vm1".into(),
             disable_target: None,
         }),
         &sel,
-    )
-    .with_deactivator(deact.clone());
+        tmp.path(),
+    );
+    let b = b.with_deactivator(deact.clone());
 
     // Pre-disable it (as a prior disable manifest would have).
-    set_selector_disabled(&sel, slots::VM1, true);
-    assert!(sel.read().unwrap().disabled(slots::VM1), "starts disabled");
+    write_sentinel(&provider, &nv, slots::VM1, Bank::A);
+    assert!(b.admin_disabled(), "starts disabled");
 
-    // A normal flash through the same lifecycle.
-    b.start_flash().await.expect("flash session starts");
-    b.receive_package_stream(envelope_stream(detached_envelope()), None)
-        .await
-        .expect("normal manifest parked");
-    b.finalize_flash()
-        .await
-        .expect("finalize re-enables + activates");
+    // A normal flash through the same lifecycle, its payload streamed in.
+    flash_firmware(&b, b"vm1 firmware image").await;
 
     assert!(
-        !sel.read().unwrap().disabled(slots::VM1),
-        "finalize cleared the selector's disable bit (re-enabled)"
+        !b.admin_disabled(),
+        "the serving bank now holds a real inventory (re-enabled)"
     );
     assert_eq!(deact.calls(), 0, "re-enable must not run the deactivator");
+    let installed = provider
+        .read_installed(Bank::B)
+        .expect("the target bank is sealed");
+    let names: Vec<&str> = installed.files.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["firmware"], "the target holds a real IVD");
+    assert_eq!(provider.disabled_record(Bank::B).unwrap(), None);
+    assert!(
+        provider.disabled_record(Bank::A).unwrap().is_some(),
+        "the old bank still holds the sentinel"
+    );
+}
+
+/// Rolling back a re-enable returns the selector to the sentinel bank: the
+/// component reads disabled again, and the guest launched for the trial is
+/// stopped — the deactivator runs a second time.
+#[tokio::test]
+async fn rollback_of_reenable_lands_disabled_and_stops_the_guest() {
+    let nv = make_nv();
+    let tmp = tempfile::tempdir().unwrap();
+    installed_gen(&nv, slots::VM1, Bank::A);
+    let sel = selector_for(slots::VM1);
+    let deact = Arc::new(MockDeactivator::ok());
+
+    // Disabled by a real enact: the sentinel lands in A (deactivator run 1).
+    let (disabler, provider) = campaign_backend(
+        &nv,
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: Some(0),
+        }),
+        &sel,
+        tmp.path(),
+    );
+    let disabler = disabler.with_deactivator(deact.clone());
+    disabler
+        .receive_package(b"disable-envelope")
+        .await
+        .expect("disable manifest enacted");
+
+    // Re-enabled by a normal flash into B. A second backend over the same bank:
+    // the manifest shape is fixed per backend.
+    let b = backend_with_manifests(
+        &nv,
+        slots::VM1,
+        "vm1",
+        Arc::new(CannedManifest {
+            component_name: "vm1".into(),
+            disable_target: None,
+        }),
+    )
+    .with_bank_provider(provider.clone())
+    .with_deactivator(deact.clone());
+    flash_firmware(&b, b"vm1 firmware image").await;
+    assert!(!b.admin_disabled(), "the trial bank is a real inventory");
+
+    b.rollback_flash().await.expect("rollback");
+    assert!(
+        b.admin_disabled(),
+        "the rollback lands on the sentinel bank: disabled again"
+    );
+    assert_eq!(
+        deact.calls(),
+        2,
+        "the trial's guest is stopped: the deactivator ran again"
+    );
 }

@@ -357,6 +357,41 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
             }
         }
     }
+
+    /// The HSM half of the disable-record gate, shared by
+    /// `write_disabled_record` and `can_persist_disabled_record` so the probe
+    /// refuses exactly where the writer would: an attached, provisioned HSM and
+    /// a crypto handle to sign with. `what` names the bank (or set) in the
+    /// error.
+    fn disabled_record_crypto(
+        &self,
+        what: &str,
+    ) -> Result<&Arc<dyn hsm::HsmCryptoProvider>, BankError> {
+        let hsm_arc = self.hsm.as_ref().ok_or_else(|| {
+            BankError::Failed(format!(
+                "ivd disable {what}: no HSM provider attached — disable record cannot be signed"
+            ))
+        })?;
+        let provisioned = hsm_arc
+            .lock()
+            .map_err(|_| BankError::Failed("ivd disable: hsm mutex poisoned".into()))?
+            .is_provisioned()
+            .map_err(|e| {
+                BankError::Failed(format!(
+                    "ivd disable {what}: hsm provisioning probe failed: {e}"
+                ))
+            })?;
+        if !provisioned {
+            return Err(BankError::Failed(format!(
+                "ivd disable {what}: HSM not provisioned — disable record cannot be signed"
+            )));
+        }
+        self.hsm_crypto.as_ref().ok_or_else(|| {
+            BankError::Failed(format!(
+                "ivd disable {what}: no HSM crypto handle attached — disable record cannot be signed"
+            ))
+        })
+    }
 }
 
 /// Map the manifest's [`hsm::ivd::IvdIdentity`] onto the trait's
@@ -776,6 +811,18 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             .is_some_and(|s| s.read().expect("selector poisoned").disabled(set))
     }
 
+    fn can_persist_disabled_record(&self) -> Result<(), BankError> {
+        // `write_disabled_record`'s refusals, minus the write: an images_dir,
+        // then the shared HSM gate.
+        if self.images_dir.is_none() {
+            return Err(BankError::Failed(format!(
+                "ivd disable {}: no images_dir — cannot persist disable",
+                self.dir_name
+            )));
+        }
+        self.disabled_record_crypto(&self.dir_name).map(|_| ())
+    }
+
     fn write_disabled_record(&self, bank: Bank, gen: u64) -> Result<(), BankError> {
         let bank_id = format!("{}/{}", &self.dir_name, bank_dir_name(bank));
 
@@ -787,35 +834,14 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
                 "ivd disable {bank_id}: no images_dir — cannot persist disable"
             ))
         })?;
-        let hsm_arc = self.hsm.as_ref().ok_or_else(|| {
-            BankError::Failed(format!(
-                "ivd disable {bank_id}: no HSM provider attached — disable record cannot be signed"
-            ))
-        })?;
-        let provisioned = hsm_arc
-            .lock()
-            .map_err(|_| BankError::Failed("ivd disable: hsm mutex poisoned".into()))?
-            .is_provisioned()
-            .map_err(|e| {
-                BankError::Failed(format!(
-                    "ivd disable {bank_id}: hsm provisioning probe failed: {e}"
-                ))
-            })?;
-        if !provisioned {
-            return Err(BankError::Failed(format!(
-                "ivd disable {bank_id}: HSM not provisioned — disable record cannot be signed"
-            )));
-        }
-        let crypto = self.hsm_crypto.as_ref().ok_or_else(|| {
-            BankError::Failed(format!(
-                "ivd disable {bank_id}: no HSM crypto handle attached — disable record cannot be signed"
-            ))
-        })?;
+        let crypto = self.disabled_record_crypto(&bank_id)?;
 
         // Carry the replaced record's identity over, so the identification
-        // DIDs still name the firmware on a disabled bank.
-        let identity = hsm::ivd::read_manifest_unverified(&bank_dir)
-            .map(|vm| vm.manifest.identity)
+        // DIDs still name the firmware on a disabled bank — only from a record
+        // whose signature verifies: a string read from an unverified file is
+        // never signed into the sentinel.
+        let identity = hsm::ivd::read_manifest_verified(crypto.as_ref(), &bank_dir)
+            .map(|m| m.identity)
             .unwrap_or_default();
         hsm::ivd::sign_disabled_record_crypto(crypto.as_ref(), &bank_dir, gen, identity)
             .map_err(|e| BankError::Failed(format!("ivd disable {bank_id}: {e}")))?;

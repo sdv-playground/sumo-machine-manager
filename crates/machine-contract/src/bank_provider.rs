@@ -239,6 +239,13 @@ pub trait BankProvider: Send + Sync {
         false
     }
 
+    /// Whether [`Self::write_disabled_record`] could persist a disable right
+    /// now: its refusals, checked without writing anything. The engine asks
+    /// BEFORE it stops the component, so a disable that cannot be recorded is
+    /// refused while the component still runs, not enacted and then lost.
+    /// `Err` names what is missing.
+    fn can_persist_disabled_record(&self) -> Result<(), BankError>;
+
     /// Persist "administratively disabled" for `bank` by rewriting its signed
     /// installed-firmware record as the sentinel (one entry:
     /// [`DISABLED_RECORD_PATH`], zero digest, size 0) at `gen`, identity carried

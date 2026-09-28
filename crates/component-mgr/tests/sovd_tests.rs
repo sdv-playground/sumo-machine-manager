@@ -5,6 +5,7 @@
 //! standard SOVD REST API.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +14,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+use machine_mgr::bank_provider::BankProvider;
 use machine_mgr::node_update::NodeCoordinator;
 use machine_mgr::{
     DeactivateError, DeactivateOutcome, Deactivator, EntityInfo, InMemorySelectorStore,
@@ -831,12 +833,46 @@ impl Deactivator for CountingDeactivator {
     }
 }
 
+/// Provision the IVD-signing slot in a fresh keystore dir. Reproduces
+/// `partition_bank.rs`'s `provisioned_keystore` (an integration test can't
+/// reach another test crate's helpers).
+fn provisioned_keystore(tmp: &Path) -> PathBuf {
+    use hsm::payload::*;
+    let ks_dir = tmp.join("keystore");
+    std::fs::create_dir_all(&ks_dir).unwrap();
+    let hsm = hsm_sim_backend::SimHsm::new(ks_dir.clone());
+    hsm.write_keystore(&HsmKeystore {
+        schema_version: SCHEMA_VERSION,
+        security_version: 1,
+        identities: vec![],
+        slots: vec![KeySlot {
+            key_id: hsm::ivd::IVD_KEY_ID.to_string(),
+            key_kind: KEY_TYPE_EC_P256,
+            anchor_public_key: None,
+            allowed_guests: None,
+            allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
+        }],
+        certificates: Vec::new(),
+        trust_anchors: Vec::new(),
+    })
+    .unwrap();
+    std::fs::write(ks_dir.join("provision_state"), b"1\n").unwrap();
+    ks_dir
+}
+
+/// Where a disable lands: the provider (to read the record back) and the
+/// tempdir holding its `images_dir` + keystore, kept alive for the test.
+type SigningBank = (Arc<IvdBankProvider<MemBlockDevice>>, tempfile::TempDir);
+
 /// A single-component router wired for administrative disable: a `Deactivator`
-/// (so the component is disableable) plus a selector-backed bank provider (so
-/// `record_disabled` lands in the shared signed selector the test reads back).
-/// `config.single_bank` picks the update shape — banked (vm1) vs singleshot
-/// (rt, the field shape). Also hands back the backend, so a test can read the
-/// flash transfer state the /updates wire polls.
+/// (so the component is disableable) plus a selector-backed bank provider that
+/// can sign — an on-disk `images_dir` and a provisioned SimHsm — so the
+/// disable lands as the serving bank's sentinel record, read back through the
+/// returned [`SigningBank`]. The serving bank (A) carries an installed-firmware
+/// gen (1) for the disable to ratchet. `config.single_bank` picks the update
+/// shape — banked (vm1) vs singleshot (rt, the field shape). Also hands back
+/// the backend, so a test can read the flash transfer state the /updates wire
+/// polls.
 fn make_disable_router(
     id: &str,
     set: BankSet,
@@ -844,7 +880,7 @@ fn make_disable_router(
 ) -> (
     axum::Router,
     TestKeys,
-    SharedSystemBankState,
+    SigningBank,
     Arc<CountingDeactivator>,
     Arc<ComponentBackend<MemBlockDevice>>,
 ) {
@@ -857,9 +893,14 @@ fn make_disable_router(
     let mut nv = NvStore::new(dev);
     let mut boot_state = NvBootState::default();
     nv.write_boot_state(&mut boot_state).unwrap();
+    let mut meta = NvFwMeta {
+        gen: 1,
+        ..Default::default()
+    };
+    nv.write_fw_meta(set, Bank::A, &mut meta).unwrap();
     let nv = Arc::new(Mutex::new(nv));
 
-    // Sealed booted selection for the component; the disable set starts empty.
+    // Sealed booted selection for the component: bank A serves.
     let selector: SharedSystemBankState = Arc::new(std::sync::RwLock::new(
         SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner)),
     ));
@@ -869,28 +910,35 @@ fn make_disable_router(
         g.seal();
     }
 
-    let single_bank = config.single_bank;
+    let tmp = tempfile::tempdir().unwrap();
+    let ks = provisioned_keystore(tmp.path());
+    let hsm: Arc<Mutex<dyn hsm::HsmProvider>> =
+        Arc::new(Mutex::new(hsm_sim_backend::SimHsm::new(ks.clone())));
+    let provider = Arc::new(
+        IvdBankProvider::new(
+            nv.clone(),
+            set,
+            config.single_bank,
+            Some(tmp.path().join("images")),
+            id.into(),
+            Some(hsm),
+            None,
+            Some(selector),
+        )
+        .with_hsm_crypto(Arc::new(hsm_sim_backend::SimHsm::new(ks))),
+    );
     let deactivator = Arc::new(CountingDeactivator(AtomicUsize::new(0)));
     let backend = Arc::new(
-        ComponentBackend::new(set, nv.clone(), manifest_provider, config)
+        ComponentBackend::new(set, nv, manifest_provider, config)
             .with_id(id.to_string())
-            .with_bank_provider(Arc::new(IvdBankProvider::new(
-                nv,
-                set,
-                single_bank,
-                None,
-                id.into(),
-                None,
-                None,
-                Some(selector.clone()),
-            )))
+            .with_bank_provider(provider.clone())
             .with_deactivator(deactivator.clone()),
     );
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert(id.to_string(), backend.clone());
     let router = sovd_api::create_router(sovd_api::AppState::new(backends));
-    (router, keys, selector, deactivator, backend)
+    (router, keys, (provider, tmp), deactivator, backend)
 }
 
 /// A REAL signed administrative-disable manifest: one component, no payload
@@ -953,12 +1001,9 @@ async fn disable_manifest_settles_prepare_and_enacts_at_execute() {
     // so nothing would ever arrive to move `flash_transfer.state` off
     // Transferring. Drives the real router end to end: upload → prepare (must
     // settle at once) → execute (must enact the disable).
-    let (router, keys, selector, deact, backend) =
+    let (router, keys, (provider, _tmp), deact, backend) =
         make_disable_router("vm1", slots::VM1, ComponentConfig::default());
-    assert!(
-        !selector.read().unwrap().disabled(slots::VM1),
-        "starts enabled"
-    );
+    assert!(!backend.admin_disabled(), "starts enabled");
 
     let update_id =
         register_and_upload_manifest(&router, "vm1", make_disable_envelope(&keys, "vm1", 5)).await;
@@ -981,8 +1026,8 @@ async fn disable_manifest_settles_prepare_and_enacts_at_execute() {
         started.elapsed(),
     );
 
-    // Execute enacts: deactivate + record_disabled(true) in the signed selector.
-    // The banked follow-on validate/activate are no-ops on the already-Activated
+    // Execute enacts: deactivate + the serving bank's sentinel record. The
+    // banked follow-on validate/activate are no-ops on the already-Activated
     // transfer a disable parks, so the wire reports a clean execute/completed.
     let (status, _) = put_empty(
         &router,
@@ -1000,8 +1045,13 @@ async fn disable_manifest_settles_prepare_and_enacts_at_execute() {
         "deactivate() ran exactly once, at execute"
     );
     assert!(
-        selector.read().unwrap().disabled(slots::VM1),
-        "record_disabled(true) persisted in the signed selector"
+        backend.admin_disabled(),
+        "admin_disabled() reads the sentinel"
+    );
+    assert_eq!(
+        provider.disabled_record(Bank::A).unwrap(),
+        Some(2),
+        "the sentinel is on disk in the serving bank, at the ratcheted gen"
     );
     // A disable stages no bank content, so it must never open a trial: the bank
     // set stays committed and the component therefore enters NEITHER the
@@ -1026,7 +1076,7 @@ async fn firmware_manifest_still_awaits_its_payload() {
     // Counter-assertion to the settle above: a manifest that DOES declare a
     // payload part keeps parking — the transfer stays Transferring until the
     // part arrives, so `await_flash_settled` still means "the payload landed".
-    let (router, keys, _selector, _deact, backend) =
+    let (router, keys, _bank, _deact, backend) =
         make_disable_router("vm1", slots::VM1, ComponentConfig::default());
 
     let _update_id = register_and_upload_manifest(
@@ -1050,7 +1100,7 @@ async fn singleshot_disable_settles_prepare_and_enacts_at_execute() {
     // and the execute wire drives finalize → commit_flash, never
     // validate/activate. Same contract as the banked case — prepare settles at
     // once, execute enacts and terminates clean.
-    let (router, keys, selector, deact, backend) = make_disable_router(
+    let (router, keys, (provider, _tmp), deact, backend) = make_disable_router(
         "rt",
         slots::RT,
         ComponentConfig {
@@ -1100,8 +1150,14 @@ async fn singleshot_disable_settles_prepare_and_enacts_at_execute() {
         "deactivate() ran exactly once, at execute"
     );
     assert!(
-        selector.read().unwrap().disabled(slots::RT),
-        "record_disabled(true) persisted in the signed selector"
+        backend.admin_disabled(),
+        "admin_disabled() reads the sentinel"
+    );
+    // Single bank: the sentinel lands in the one bank there is, bank_a.
+    assert_eq!(
+        provider.disabled_record(Bank::A).unwrap(),
+        Some(2),
+        "the sentinel is on disk in bank_a, at the ratcheted gen"
     );
 }
 
