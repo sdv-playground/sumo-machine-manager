@@ -101,7 +101,8 @@ pub enum ExpectedState {
     /// selected, verify refused, spawn failed) — the request happened, so the
     /// gap between it and reality is exactly what needs reporting.
     Running,
-    /// A stop was requested, or the admin gate refused the start.
+    /// A stop was requested, or the start was refused as administratively
+    /// disabled (by the admin gate or the pre-launch verify).
     Stopped,
 }
 
@@ -137,8 +138,9 @@ pub enum ExpectedBy {
     /// `stop_all_for_reboot` — every guest signalled at once for a node reboot,
     /// which is a very different thing from an operator stopping one VM.
     RebootSweep,
-    /// The admin gate refused the start: persisted operator intent, read from
-    /// the signed boot selector.
+    /// The start was refused as administratively disabled: persisted operator
+    /// intent, derived from the serving bank's signed IVD sentinel record, by
+    /// the admin gate or the pre-launch verify.
     AdminDisable,
 }
 
