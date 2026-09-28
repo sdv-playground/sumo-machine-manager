@@ -2005,7 +2005,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .map_err(|_| BackendError::Internal("nv lock".into()))?;
         let session = nv.read_update_session().unwrap_or_default();
         let reboot_owed = (0..nv.slot_count())
-            .filter(|&i| session.reboot_owed & (1u32 << i) != 0)
+            .filter(|&i| session.owes(BankSet(i as u8)))
             .map(|i| {
                 self.node_coordinator
                     .as_ref()
@@ -2029,14 +2029,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .lock()
             .map_err(|_| BackendError::Internal("nv lock".into()))?;
         let mut s = nv.read_update_session().unwrap_or_default();
-        let bit = 1u32 << self.bank_set.as_index();
-        let before = s.reboot_owed;
-        if owed {
-            s.reboot_owed |= bit;
-        } else {
-            s.reboot_owed &= !bit;
-        }
-        if s.reboot_owed != before {
+        if s.set_owed(self.bank_set, owed) {
             nv.write_update_session(&mut s)
                 .map_err(|e| BackendError::Internal(format!("nv write update-session: {e:?}")))?;
         }
@@ -2279,8 +2272,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     .ok_or_else(|| BackendError::Internal("no boot state".into()))?
                     .banks[idx]
                     .committed;
-            let owed = nv.read_update_session().unwrap_or_default().reboot_owed & (1u32 << idx);
-            if !committed || owed != 0 {
+            let owed = nv
+                .read_update_session()
+                .unwrap_or_default()
+                .owes(self.bank_set);
+            if !committed || owed {
                 return Err(busy());
             }
             nv.read_fw_meta(self.bank_set, serving).map(|m| m.gen)

@@ -35,8 +35,8 @@ Sector size: 4 KB (matches typical eMMC erase block).
 
 The slot count is a runtime property of the store, not a constant: `NvStore::new`
 computes `min(MAX_SLOTS, (device_size - 0x010000) / 0x018000)` once at open and exposes
-it as `slot_count()` / `slots()` / `slot_in_range()`. `MAX_SLOTS = 32` is the hard cap
-(the width of the u32 reboot-owed mask and of the boot-state record); `DEFAULT_SLOTS = 16`
+it as `slot_count()` / `slots()` / `slot_in_range()`. `MAX_SLOTS = 64` is the hard cap
+(the width of the u64 reboot-owed mask and of the boot-state record); `DEFAULT_SLOTS = 16`
 is the size a fresh store is created with when the platform does not say otherwise, so
 `MIN_NV_DEVICE_SIZE = nv_device_size(DEFAULT_SLOTS) = 0x190000` (1600 KB). A 1 MB device
 is therefore a 10-slot store. Growing a store means recreating the device — qnx6
@@ -90,12 +90,12 @@ Offset        Size  Field
 0x08 + 3*i    1     slot i: active_bank  (0=A, 1=B)
 0x09 + 3*i    1     slot i: committed    (0=trial, 1=committed)
 0x0A + 3*i    1     slot i: boot_count   (incremented each boot in trial mode)
-              ...   one triplet per slot, for i in 0..MAX_SLOTS (32)
-0x68..0xFFC   --    zero padding
+              ...   one triplet per slot, for i in 0..MAX_SLOTS (64)
+0xC8..0xFFC   --    zero padding
 0xFFC         4     crc32
 ```
 
-Total: `8 + 3*32` = 104 bytes of payload; the rest of the 4 KB sector is zero padding,
+Total: `8 + 3*64` = 200 bytes of payload; the rest of the 4 KB sector is zero padding,
 and the CRC-32 over bytes [0..4092) sits at 0xFFC — as for every record in this format
 (see `read_record` / `write_record` in `crates/nv-store/src/store.rs`).
 
@@ -104,7 +104,8 @@ Note: the record always carries `MAX_SLOTS` entries, whatever the store's
 `{bank A, committed: false, boot_count: 0}` — the same default the store forces onto every
 entry at index >= `slot_count()`, so records from an earlier era read back correctly.
 History: 5 slots (2026-05) → 10 slots (2026-05-29) → a per-store runtime count capped at
-`MAX_SLOTS` = 32 (2026-09-23). The `NVB1` magic never changed.
+32 (2026-09-23) → the cap raised to `MAX_SLOTS` = 64 (2026-09-28; no layout change beyond
+the array). The `NVB1` magic never changed.
 
 ## Factory Data
 
@@ -199,6 +200,26 @@ Total: 24-byte record (rest of 4 KB sector is unused/zero-padded). The
 `vehicle_epoch` only ever moves forward; peer ECUs adopt `max(local,
 master)` and never rewind, so a bad master can stall freshness but never
 replay an old epoch into validity.
+
+## Update Session
+
+Node update-transaction state — the durable "a node reboot is owed" marker the flash gate
+checks. `reboot_owed == 0` means no open session.
+
+```
+Offset        Size  Field
+0x00          4     magic (NVU1)
+0x04          4     write_seq
+0x08          32    session_id   (the transaction's provenance; all-zero = none)
+0x28          8     reboot_owed  (u64 bitmask; bit i = slot i owes the node reboot)
+0x30..0xFFC   --    zero padding
+0xFFC         4     crc32
+```
+
+Total: 48 bytes of payload. History: `reboot_owed` was a u16 until 2026-09-23 and a u32
+until 2026-09-28 — the slot cap is the mask's width. Being the last field, each widening
+was a pure extension: an older record's missing upper bytes are the sector's zero padding
+and decode as zero, so the `NVU1` magic never changed.
 
 ## Integrity
 

@@ -383,9 +383,7 @@ impl<D: BlockDevice> NvStore<D> {
         }
 
         let mut s = self.read_update_session().unwrap_or_default();
-        let bit = 1u32 << bank_set.as_index();
-        if s.reboot_owed & bit != 0 {
-            s.reboot_owed &= !bit;
+        if s.set_owed(bank_set, false) {
             self.write_update_session(&mut s)?;
         }
         Ok(RunningBankVerdict::Confirmed { bank: armed })

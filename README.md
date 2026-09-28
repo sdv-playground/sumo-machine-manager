@@ -184,7 +184,7 @@ the UDS-device handler (SOVDd) — never by the client.
 
 ## Key Concepts
 
-- **Bank sets**: a runtime slot count derived from the NV device size (`slot_count()`, default 16, max 32 — the width of the u32 reboot-owed mask); a slot is a *number*, nothing more — a component's slot comes from its spec (`slot: N`, written by the platform profile) and the library names no slot (the old names live on only as `test-seams` fixtures, `nv_store::slots::*`). Storage dir = `storage_subdir` if set, else the component id
+- **Bank sets**: a runtime slot count derived from the NV device size (`slot_count()`, default 16, max 64 — the width of the u64 reboot-owed mask); a slot is a *number*, nothing more — a component's slot comes from its spec (`slot: N`, written by the platform profile) and the library names no slot (the old names live on only as `test-seams` fixtures, `nv_store::slots::*`). Storage dir = `storage_subdir` if set, else the component id
 - **Two-process architecture**: `vm-service` (QEMU/qvm lifecycle) + `vm-sovd` (diagnostics/OTA via SOVD)
 - **Per-bank VM config**: vm-config.yaml in bank directories, delivered alongside firmware via OTA
 - **Multi-payload SUIT**: one payload per declared part — VMs carry kernel + rootfs + config; a raw-partition bank carries one payload per `parts:` entry, each streamed straight to that part's A/B device
@@ -206,7 +206,7 @@ platform-independent — only the trait implementations change per target.
 
 ## NV Store Layout
 
-The NV store holds these record types (the per-bank-set `banks` array holds `MAX_SLOTS = 32` entries; a store exposes the first `slot_count()` of them):
+The NV store holds these record types (the per-bank-set `banks` array holds `MAX_SLOTS = 64` entries; a store exposes the first `slot_count()` of them):
 
 ```
 Boot State     — active bank, committed flag, boot count (per bank set)

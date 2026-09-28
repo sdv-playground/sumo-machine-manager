@@ -1246,13 +1246,8 @@ async fn campaign_disable_manifest_enacts_at_finalize() {
         .lock()
         .unwrap()
         .read_update_session()
-        .map(|s| s.reboot_owed)
-        .unwrap_or(0);
-    assert_ne!(
-        owed & (1u32 << slots::VM1.as_index()),
-        0,
-        "the disable's owed reboot is recorded in NV"
-    );
+        .is_some_and(|s| s.owes(slots::VM1));
+    assert!(owed, "the disable's owed reboot is recorded in NV");
 }
 
 #[tokio::test]

@@ -690,10 +690,7 @@ fn confirmed_running_trial_persists_boot_witness_before_clearing_reboot_owed() {
         RunningBankVerdict::Confirmed { bank: Bank::B }
     );
     assert_eq!(store.read_boot_state().unwrap().banks[index].boot_count, 1);
-    assert_eq!(
-        store.read_update_session().unwrap().reboot_owed & (1 << index),
-        0
-    );
+    assert!(!store.read_update_session().unwrap().owes(slots::OS));
 }
 
 #[test]
@@ -724,7 +721,8 @@ fn nv_device_size_pins_the_layout() {
     // must keep resolving to exactly that many slots.
     assert_eq!(nv_device_size(10), 0x100000); // the 2026-05-29 store
     assert_eq!(nv_device_size(16), 0x190000); // DEFAULT_SLOTS today
-    assert_eq!(nv_device_size(32), 0x310000); // MAX_SLOTS
+    assert_eq!(nv_device_size(32), 0x310000); // the 2026-09-23 cap
+    assert_eq!(nv_device_size(64), 0x610000); // MAX_SLOTS
     assert_eq!(MIN_NV_DEVICE_SIZE, nv_device_size(DEFAULT_SLOTS));
 }
 
@@ -734,9 +732,12 @@ fn slot_count_comes_from_the_device_size() {
     assert_eq!(slots(nv_device_size(10)), 10);
     assert_eq!(slots(nv_device_size(16)), 16);
     assert_eq!(slots(nv_device_size(32)), 32);
+    assert_eq!(slots(nv_device_size(64)), 64);
     // Space past MAX_SLOTS is simply not addressable — the mask and the
     // boot-state record stop there.
-    assert_eq!(slots(0x400000), MAX_SLOTS);
+    assert_eq!(slots(nv_device_size(MAX_SLOTS + 1)), MAX_SLOTS);
+    // The old 32-slot cap no longer bites.
+    assert_eq!(slots(0x400000), 42);
     // One byte short of the first slot's full stride ⇒ no slots at all.
     assert_eq!(slots(layout::BANKSET_BASE + layout::BANKSET_STRIDE - 1), 0);
 }
@@ -854,7 +855,7 @@ fn boot_state_round_trips_every_slot_on_a_full_store() {
     }
 }
 
-// --- reboot_owed: u16 -> u32 (a pure extension, the field is last) ---
+// --- reboot_owed: u16 -> u32 -> u64 (pure extensions, the field is last) ---
 
 #[test]
 fn u16_era_update_session_decodes_with_a_zero_upper_half() {
@@ -880,19 +881,95 @@ fn u16_era_update_session_decodes_with_a_zero_upper_half() {
 }
 
 #[test]
+fn u32_era_update_session_decodes_with_a_zero_upper_half() {
+    let mut sector = vec![0u8; SECTOR_SIZE];
+    sector[0..4].copy_from_slice(&MAGIC_UPDATE_SESSION.to_le_bytes());
+    sector[4..8].copy_from_slice(&4u32.to_le_bytes());
+    sector[8..40].copy_from_slice(&[0xA5; 32]);
+    // The mask as the u32-era writer left it; [44..48] is sector padding.
+    sector[40..44].copy_from_slice(&0x8000_0005u32.to_le_bytes());
+    let crc = crc32fast::hash(&sector[..SECTOR_SIZE - 4]);
+    sector[SECTOR_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+
+    let mut dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    dev.write(layout::UPDATE_SESSION_OFFSET, &sector).unwrap();
+    let store = NvStore::new(dev);
+
+    let s = store.read_update_session().expect("u32-era record decodes");
+    assert_eq!(s.write_seq, 4);
+    assert_eq!(s.session_id, [0xA5; 32]);
+    assert_eq!(s.reboot_owed, 0x8000_0005);
+    assert!(s.owes(BankSet(0)) && s.owes(BankSet(2)) && s.owes(BankSet(31)));
+    assert!(!s.owes(BankSet(32)) && !s.owes(BankSet(63)));
+}
+
+#[test]
+fn update_session_wire_layout_is_48_bytes() {
+    // `size()` is the one layout number the compiler cannot check.
+    assert_eq!(NvUpdateSession::size(), 48);
+    assert_eq!(NvBootState::size(), 200);
+
+    let s = NvUpdateSession {
+        write_seq: 9,
+        session_id: [0x3C; 32],
+        reboot_owed: 0x8000_0001_0000_0004,
+    };
+    let mut sector = vec![0u8; SECTOR_SIZE];
+    s.serialize(&mut sector);
+    assert_eq!(sector[40..48], s.reboot_owed.to_le_bytes());
+    assert!(
+        sector[48..].iter().all(|&b| b == 0),
+        "nothing past [40..48]"
+    );
+}
+
+#[test]
 fn reboot_owed_round_trips_the_top_slot() {
     let mut store = NvStore::new(MemBlockDevice::new(nv_device_size(MAX_SLOTS) as usize));
     let top = BankSet((MAX_SLOTS - 1) as u8);
     let mut s = NvUpdateSession {
-        reboot_owed: 1u32 << top.as_index(),
+        reboot_owed: (1 << 32) | (1 << top.as_index()),
         ..Default::default()
     };
     store.write_update_session(&mut s).unwrap();
 
     let read = store.read_update_session().unwrap();
-    assert!(read.owes(top), "bit 31 survives the widened wire");
-    assert!(!read.owes(BankSet(0)));
+    assert_eq!(
+        read.reboot_owed,
+        (1 << 32) | (1 << 63),
+        "the low word stays zero — nothing aliases below bit 32"
+    );
+    assert!(read.owes(BankSet(32)), "bit 32 lands past the u32-era wire");
+    assert!(read.owes(top), "bit 63 survives the widened wire");
+    assert!(!read.owes(BankSet(0)) && !read.owes(BankSet(31)));
     assert!(read.reboot_pending());
+}
+
+#[test]
+fn owes_is_false_past_the_mask_width() {
+    // `BankSet` is a bare u8, so 64..=255 are representable but past the mask.
+    let mut s = NvUpdateSession {
+        reboot_owed: u64::MAX,
+        ..Default::default()
+    };
+    assert!(!s.owes(BankSet(64)));
+    assert!(!s.owes(BankSet(255)));
+    // Setting or clearing a bit past the cap reports "unchanged" in every
+    // build and never touches the mask (a shift there would alias slot 64
+    // onto slot 0 in release).
+    assert!(
+        !s.set_owed(BankSet(64), true),
+        "set past the cap is a no-op"
+    );
+    assert!(
+        !s.set_owed(BankSet(64), false),
+        "clear past the cap is a no-op"
+    );
+    assert_eq!(
+        s.reboot_owed,
+        u64::MAX,
+        "the mask is untouched past the cap"
+    );
 }
 
 // --- Selector canonical encoding ---

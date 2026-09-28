@@ -309,7 +309,7 @@ per-component NV boot state as the authority for "which bank each set boots from
   the platform profile), and what a slot holds is that profile's decision (a spec that still
   carries a `bank_set:` name is refused at load — "slot names were retired in v0.1.2 — set
   `slot: N`"). The slot *count* is runtime — `slot_count()`, derived from the NV device size
-  (default 16, `MAX_SLOTS=32`). The old reference layout survives only as test fixtures
+  (default 16, `MAX_SLOTS=64`). The old reference layout survives only as test fixtures
   (`nv_store::slots::{HSM, BOOTLOADER, OS, RT, VM1, VM2}`, behind `test-seams`).
 
 ```mermaid
@@ -472,7 +472,7 @@ cover sign/verify/encrypt/derive + handle/policy + SUIT key provisioning.
   `ComponentBackend` directly; app-capable VMs use the narrow `InstallRouterDiag`.
 - **`BankSet` redo** — a bare slot number; the named slots were retired in v0.1.2 (a
   component's slot comes from its spec, written by the platform profile). The slot *count*
-  is runtime since 2026-09-23 (device-derived, max 32).
+  is runtime since 2026-09-23 (device-derived, max 32; 64 since 2026-09-28).
 - **`current` symlink retired** (per-VM) — bank-relative `load kernel` + vm-service
   cwd=bank_dir. (`mmgr/current`, the host manager's own self-update bank pointer, stays.)
 - **qvm.conf moved to the deployment** as host-integration config (examples in the

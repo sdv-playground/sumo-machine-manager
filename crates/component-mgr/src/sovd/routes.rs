@@ -18,6 +18,7 @@ use machine_mgr::node_update::{Durable, NodeCoordinator, NodePhase, NodeUpdateSt
 use machine_mgr::{Component, FlashId, FlashState, Machine, MachineError};
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
+use nv_store::types::BankSet;
 use sovd_core::{OperationExecution, OperationStatus};
 
 /// `GET /vehicle/v1/data/x-ota-update-state` — the node's update-transaction
@@ -82,7 +83,7 @@ fn derive_node_update_state<D: BlockDevice>(
         let nv = nv.lock().expect("nv lock poisoned");
         let session = nv.read_update_session().unwrap_or_default();
         let reboot_owed: Vec<String> = (0..nv.slot_count())
-            .filter(|&i| session.reboot_owed & (1u32 << i) != 0)
+            .filter(|&i| session.owes(BankSet(i as u8)))
             .map(|i| coord.label(i))
             .collect();
         // The in-trial set is derived by the shared `node_in_trial_labels` so this

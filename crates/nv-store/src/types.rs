@@ -71,12 +71,13 @@ pub mod slots {
 }
 
 /// Hard ceiling on bank slots: the width of the `NvUpdateSession`
-/// reboot-owed bitmask (u32) AND the capacity of the `NvBootState`
+/// reboot-owed bitmask (u64) AND the capacity of the `NvBootState`
 /// `banks` array. How many slots a given store *addresses* is a
 /// runtime property derived from its device size
 /// ([`NvStore::slot_count`](crate::store::NvStore::slot_count)); this
 /// is only the bound neither can exceed.
-pub const MAX_SLOTS: usize = 32;
+pub const MAX_SLOTS: usize = 64;
+const _: () = assert!(MAX_SLOTS <= u64::BITS as usize); // the mask is the cap
 
 /// Slot count a fresh store is created with when the platform doesn't
 /// say otherwise — the CVC contract's image count. An existing store
@@ -192,7 +193,7 @@ impl Default for BankBootState {
 
 /// Complete boot state for every slot the record can carry.
 ///
-/// Wire format (`8 + 3*MAX_SLOTS` = 104 bytes): a fixed header, then one
+/// Wire format (`8 + 3*MAX_SLOTS` = 200 bytes): a fixed header, then one
 /// 3-byte entry per slot at a fixed stride, in slot-index order.
 /// ```text
 /// [0..4]       magic (NVB1)
@@ -204,9 +205,10 @@ impl Default for BankBootState {
 ///
 /// The base and stride have never moved, so the record only ever grew in
 /// place and the magic was never bumped: 5 slots → 10 on 2026-05-29 (the
-/// RT component needed a slot the file had no room for), 10 →
-/// `MAX_SLOTS` on 2026-09-23 (the addressable count became a per-store
-/// runtime value derived from the device size). A record written by an
+/// RT component needed a slot the file had no room for), 10 → 32 on
+/// 2026-09-23 (the addressable count became a per-store runtime value
+/// derived from the device size), 32 → 64 on 2026-09-28 (no layout
+/// change beyond the array). A record written by an
 /// older, fewer-slot writer leaves the trailing entries as the sector's
 /// zero padding, which decodes as `{Bank::A, committed: false,
 /// boot_count: 0}` — harmless, because
@@ -705,14 +707,16 @@ impl NvRecord for NvVehicle {
 /// [0..4]    magic (NVU1)
 /// [4..8]    write_seq
 /// [8..40]   session_id (32 bytes; the transaction's provenance — zero = none)
-/// [40..44]  reboot_owed (u32 bitmask over bank sets; bit i = BankSet(i))
+/// [40..48]  reboot_owed (u64 bitmask over bank sets; bit i = BankSet(i))
 /// ```
 ///
 /// `reboot_owed` was a u16 at `[40..42]` until 2026-09-23, when the slot
-/// count became a per-store runtime value bounded by `MAX_SLOTS`. Being the
-/// LAST field, widening it is a pure extension — a u16-era record's two
-/// trailing bytes are the sector's zero padding, so it decodes with the
-/// upper half zero and the magic did not need a bump.
+/// count became a per-store runtime value bounded by `MAX_SLOTS`, and a u32
+/// at `[40..44]` until 2026-09-28, when `MAX_SLOTS` went 32 → 64. Being the
+/// LAST field, each widening is a pure extension — an older record's
+/// trailing bytes (`[42..44]`, then `[44..48]`) are the sector's zero
+/// padding, so it decodes with the upper half zero and the magic did not
+/// need a bump.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NvUpdateSession {
     pub write_seq: u32,
@@ -722,8 +726,9 @@ pub struct NvUpdateSession {
     /// (both reduced to 32 bytes). All-zero ⇒ no open session.
     pub session_id: [u8; 32],
     /// Bank sets that owe the coalesced node reboot (bit i ⇒ `BankSet(i)`).
-    /// Nonzero ⇒ the node is `RebootPending`.
-    pub reboot_owed: u32,
+    /// Nonzero ⇒ the node is `RebootPending`. One set's bit is read and
+    /// written through `owes` / `set_owed`, never a hand-rolled shift.
+    pub reboot_owed: u64,
 }
 
 impl NvUpdateSession {
@@ -733,9 +738,34 @@ impl NvUpdateSession {
         self.reboot_owed != 0
     }
 
-    /// True when bank set `set` owes the pending node reboot.
+    /// The mask bit for `set`, or `None` past the cap (`BankSet` is a bare u8;
+    /// shifting by >= 64 would panic in debug and silently alias slot n onto
+    /// n-64 in release).
+    fn bit(set: BankSet) -> Option<u64> {
+        (set.as_index() < MAX_SLOTS).then(|| 1 << set.as_index())
+    }
+
+    /// True when bank set `set` owes the pending node reboot; `false` past
+    /// the cap.
     pub fn owes(&self, set: BankSet) -> bool {
-        self.reboot_owed & (1u32 << set.as_index()) != 0
+        Self::bit(set).is_some_and(|bit| self.reboot_owed & bit != 0)
+    }
+
+    /// Set or clear `set`'s bit; returns whether the mask changed, so a
+    /// caller writes the record only on a change. Past the cap it is a no-op
+    /// that reports "unchanged" — nothing constructs such a set, and a shift
+    /// there would alias slots, so the guard is the whole protection.
+    pub fn set_owed(&mut self, set: BankSet, owed: bool) -> bool {
+        let Some(bit) = Self::bit(set) else {
+            return false;
+        };
+        let before = self.reboot_owed;
+        if owed {
+            self.reboot_owed |= bit;
+        } else {
+            self.reboot_owed &= !bit;
+        }
+        self.reboot_owed != before
     }
 }
 
@@ -743,7 +773,7 @@ impl NvRecord for NvUpdateSession {
     const MAGIC: u32 = MAGIC_UPDATE_SESSION;
 
     fn size() -> usize {
-        44
+        48
     }
 
     fn write_seq(&self) -> u32 {
@@ -758,7 +788,7 @@ impl NvRecord for NvUpdateSession {
         put_u32_le(buf, 0, Self::MAGIC);
         put_u32_le(buf, 4, self.write_seq);
         put_bytes(buf, 8, &self.session_id);
-        put_u32_le(buf, 40, self.reboot_owed);
+        put_u64_le(buf, 40, self.reboot_owed);
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
@@ -768,7 +798,7 @@ impl NvRecord for NvUpdateSession {
         Some(Self {
             write_seq: get_u32_le(buf, 4),
             session_id: get_bytes::<32>(buf, 8),
-            reboot_owed: get_u32_le(buf, 40),
+            reboot_owed: get_u64_le(buf, 40),
         })
     }
 }
