@@ -226,8 +226,10 @@ impl<D: BlockDevice> BootManager<D> {
     /// whole node rolls back: the already-signed SECONDARY blob is copied
     /// verbatim over PRIMARY ([`SelectorStore::write_primary`]) — a GLOBAL
     /// revert (committed sets have `PRIMARY == SECONDARY`, so they no-op). Each
-    /// reverted set gets its `boot_count` reset to 0 and an
-    /// [`BootAction::AutoRollback`].
+    /// reverted set gets an [`BootAction::AutoRollback`], and its NV record
+    /// follows the floor it now boots (`active_bank` = the floor, `committed`,
+    /// `boot_count` 0), as the NV path's auto-rollback leaves it: component-mgr
+    /// reads NV `active_bank` as the running bank.
     ///
     /// Sets **absent** from the selector map fall back to their NV
     /// per-set logic — the selector is authoritative only for the sets it
@@ -313,6 +315,8 @@ impl<D: BlockDevice> BootManager<D> {
                 .expect("selector present in this path")
                 .write_primary(secondary);
             for &(idx, from, to) in &trialed {
+                state.banks[idx].active_bank = to;
+                state.banks[idx].committed = true;
                 state.banks[idx].boot_count = 0;
                 actions[idx] = BootAction::AutoRollback { from, to };
             }

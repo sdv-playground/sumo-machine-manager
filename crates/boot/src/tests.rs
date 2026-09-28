@@ -763,6 +763,36 @@ fn selector_global_rollback_reverts_every_trialed_set_at_once() {
 }
 
 #[test]
+fn selector_auto_rollback_marks_committed() {
+    // NV as the OTA activation leaves it: the trial bank (B), uncommitted, one
+    // boot from the budget. The rollback must bring NV to the floor the node
+    // now boots, or component-mgr keeps reading B as the running bank.
+    let (mut mgr, store) = make_bootmgr_with_selector();
+    store.write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]));
+    store.write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]));
+    let os = slots::OS.as_index();
+    let mut st = NvBootState::default();
+    st.banks[os].active_bank = Bank::B;
+    st.banks[os].committed = false;
+    st.banks[os].boot_count = MAX_TRIAL_BOOTS;
+    mgr.nv_mut().write_boot_state(&mut st).unwrap();
+
+    let actions = mgr.process_boot().unwrap();
+    assert_eq!(
+        actions[os],
+        BootAction::AutoRollback {
+            from: Bank::B,
+            to: Bank::A
+        }
+    );
+
+    let st = mgr.nv().read_boot_state().unwrap();
+    assert_eq!(st.banks[os].active_bank, Bank::A, "NV follows the floor");
+    assert!(st.banks[os].committed, "the reverted set is out of trial");
+    assert_eq!(st.banks[os].boot_count, 0);
+}
+
+#[test]
 fn selector_absent_primary_falls_back_to_nv() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // Selector attached but NOT seeded — PRIMARY absent (first boot before
