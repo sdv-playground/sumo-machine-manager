@@ -119,9 +119,10 @@ impl MachineRegistry {
     /// changed (e.g. after an OTA bank flip) and the selector needs to catch
     /// up.
     ///
-    /// Additive: this is a read-only mirror of `NvBootState` into the selector
-    /// — it does not make the selector the boot authority. Nothing consults the
-    /// selector for a boot/bank decision.
+    /// The selector, not `NvBootState`, is the boot / VM-launch authority; this
+    /// only gives it a starting selection. The host machine managers call it at
+    /// startup when the selector is empty: a fresh node, a factory reset, or a
+    /// blob that failed verification on [`SystemBankManager::load`].
     pub fn seed_selector(&mut self, entries: impl IntoIterator<Item = (BankSet, BankBootState)>) {
         // One write lock for the whole seed: the compare and the stage/seal/
         // commit sequence must see a consistent view of the selector.
