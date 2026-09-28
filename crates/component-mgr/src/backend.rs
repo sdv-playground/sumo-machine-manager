@@ -275,6 +275,43 @@ struct FlashTransferState {
 }
 
 // ---------------------------------------------------------------------------
+// Derived administrative-disable state
+// ---------------------------------------------------------------------------
+
+/// The cached answer of `ComponentBackend::admin_disabled`, guarded by an
+/// epoch. A miss reads `epoch` together with `value`, derives outside the lock
+/// and stores through [`store_if_epoch`](Self::store_if_epoch); a
+/// [`clear`](Self::clear) in between bumps the epoch and the store is dropped.
+/// Without the epoch, a status poll that read the record just before a disable
+/// could cache "enabled" after the enact's clear, and keep answering it until
+/// the next NV write.
+#[derive(Default)]
+struct AdminStateCache {
+    /// Bumped by every clear.
+    epoch: u64,
+    /// `(serving bank, disabled)` as last derived; `None` = derive on the next
+    /// read.
+    value: Option<(Bank, bool)>,
+}
+
+impl AdminStateCache {
+    /// Invalidate: the next read re-derives, and a derivation already in flight
+    /// is not stored.
+    fn clear(&mut self) {
+        self.epoch += 1;
+        self.value = None;
+    }
+
+    /// Store a derivation that began at epoch `observed` — only if nothing has
+    /// cleared the cache since.
+    fn store_if_epoch(&mut self, observed: u64, bank: Bank, disabled: bool) {
+        if self.epoch == observed {
+            self.value = Some((bank, disabled));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Component configuration
 // ---------------------------------------------------------------------------
 
@@ -513,11 +550,12 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     verified_manifest_cache: Mutex<Option<(Bank, Arc<InstalledFirmware>)>>,
     /// The administrative-disable state [`admin_disabled`](Self::admin_disabled)
     /// derived, as `(serving bank, disabled)`, so a status poll costs a lock
-    /// instead of a record read + HSM verify. LAZY: `None` at construction, the
+    /// instead of a record read + HSM verify. LAZY: empty at construction, the
     /// first reader derives it. BANK-KEYED: a serving-bank flip (activate,
-    /// rollback, ecu_reset) misses and re-derives. Cleared to `None` on every
-    /// NV write, at the same point as `verified_manifest_cache`.
-    admin_disabled_cache: Mutex<Option<(Bank, bool)>>,
+    /// rollback, ecu_reset) misses and re-derives. Cleared on every NV write, at
+    /// the same point as `verified_manifest_cache`; the clear bumps an epoch so
+    /// a derivation in flight across it is not stored (see [`AdminStateCache`]).
+    admin_disabled_cache: Mutex<AdminStateCache>,
     /// The per-kind A/B storage + lifecycle seam — the engine's ONLY bank
     /// handle. Owns every bank touch: target selection, prepare/seed, payload
     /// sinks, IVD seal, installed-firmware read-back, activator-then-flip
@@ -744,7 +782,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             did_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             manifest_describe: Mutex::new(HashMap::new()),
             verified_manifest_cache: Mutex::new(None),
-            admin_disabled_cache: Mutex::new(None),
+            admin_disabled_cache: Mutex::new(AdminStateCache::default()),
             bank_provider,
             bank_provider_override: false,
             declared_parts: None,
@@ -1133,10 +1171,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .expect("verified_manifest_cache poisoned") = None;
         // Same funnel for the derived admin-disable state — cleared only, never
         // re-derived here: deriving it takes the NV mutex this caller holds.
-        *self
-            .admin_disabled_cache
+        self.admin_disabled_cache
             .lock()
-            .expect("admin_disabled_cache poisoned") = None;
+            .expect("admin_disabled_cache poisoned")
+            .clear();
 
         // Build the new map outside any cache lock — readers proceed
         // against the old map throughout this loop.
@@ -2130,8 +2168,9 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     ///   disableability.
     ///
     /// Derived lazily and cached per serving bank (`admin_disabled_cache`,
-    /// cleared on every NV write). A userspace/post-boot gate: read to gate
-    /// start / flash, never consulted at vm-boot.
+    /// cleared on every NV write; a derivation that raced a clear is returned
+    /// but not cached). A userspace/post-boot gate: read to gate start / flash,
+    /// never consulted at vm-boot.
     ///
     /// PRECONDITION: never call with the NV mutex held — a cache miss takes it,
     /// briefly, for the expected gen.
@@ -2140,18 +2179,23 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             return false;
         }
         let bank = self.serving_bank();
-        let cached = *self
-            .admin_disabled_cache
-            .lock()
-            .expect("admin_disabled_cache poisoned");
-        if let Some((cached_bank, disabled)) = cached {
-            if cached_bank == bank {
-                return disabled;
+        let observed = {
+            let cache = self
+                .admin_disabled_cache
+                .lock()
+                .expect("admin_disabled_cache poisoned");
+            if let Some((cached_bank, disabled)) = cache.value {
+                if cached_bank == bank {
+                    return disabled;
+                }
             }
-        }
+            cache.epoch
+        };
 
         // Miss. NV only for the expected gen; the record read + HSM verify run
-        // with NV released.
+        // with NV and the cache released. The answer is stored only if nothing
+        // cleared the cache meanwhile: a clear means state moved under this
+        // derivation (e.g. a disable landed), so it is returned, not cached.
         let expected_gen = self
             .nv
             .lock()
@@ -2181,10 +2225,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 return false;
             }
         };
-        *self
-            .admin_disabled_cache
+        self.admin_disabled_cache
             .lock()
-            .expect("admin_disabled_cache poisoned") = Some((bank, disabled));
+            .expect("admin_disabled_cache poisoned")
+            .store_if_epoch(observed, bank, disabled);
         disabled
     }
 
@@ -2287,10 +2331,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             nv.write_fw_meta(self.bank_set, serving, &mut meta)
                 .map_err(|e| BackendError::Internal(format!("nv write fw meta: {e:?}")))?;
         }
-        *self
-            .admin_disabled_cache
+        self.admin_disabled_cache
             .lock()
-            .expect("admin_disabled_cache poisoned") = None;
+            .expect("admin_disabled_cache poisoned")
+            .clear();
 
         // A deactivation that owes an ECU reset records the node reboot in the
         // same durable NV marker `finalize_flash` uses for firmware singleshots,
@@ -5908,9 +5952,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         if self.admin_disabled() {
             if let Some(deactivator) = self.deactivator.clone() {
                 match tokio::task::spawn_blocking(move || deactivator.deactivate()).await {
-                    Ok(Ok(outcome)) => tracing::info!(
+                    // Surfaced, not armed: the rollback does not record the
+                    // reset as owed.
+                    Ok(Ok(outcome)) if outcome.reboot_required => tracing::warn!(
                         component = %self.entity_info.id,
-                        reboot_required = outcome.reboot_required,
+                        reboot_required = true,
+                        "rollback landed on a disabled bank — component deactivated, but the \
+                         deactivation needs an ECU reset that is not recorded as owed"
+                    ),
+                    Ok(Ok(_)) => tracing::info!(
+                        component = %self.entity_info.id,
                         "rollback landed on a disabled bank — component deactivated"
                     ),
                     Ok(Err(e)) => tracing::warn!(
@@ -13228,6 +13279,128 @@ mod declared_parts_tests {
                 Some(FlashSessionState::AwaitingPayload { .. })
             ),
             "…and the session advanced to awaiting its payload"
+        );
+    }
+}
+
+// ===========================================================================
+// The derived admin-disable state: a derivation that raced a clear is dropped
+// ===========================================================================
+#[cfg(test)]
+mod admin_state_cache_tests {
+    use super::*;
+    use crate::manifest_provider::ManifestError;
+    use hsm_sim_backend::SimHsm;
+    use nv_store::block::MemBlockDevice;
+    use nv_store::slots;
+    use nv_store::store::MIN_NV_DEVICE_SIZE;
+
+    /// The enact never validates a SUIT envelope here — it is called directly.
+    struct NoopManifest;
+    impl ManifestProvider for NoopManifest {
+        fn validate(&self, _d: &[u8], _m: u32) -> Result<ValidatedFirmware, ManifestError> {
+            Err(ManifestError::ParseError(
+                "unused in admin-state cache tests".into(),
+            ))
+        }
+    }
+
+    struct OkDeactivator;
+    impl machine_mgr::Deactivator for OkDeactivator {
+        fn deactivate(
+            &self,
+        ) -> Result<machine_mgr::DeactivateOutcome, machine_mgr::DeactivateError> {
+            Ok(machine_mgr::DeactivateOutcome {
+                reboot_required: false,
+            })
+        }
+    }
+
+    /// A vm1 backend that can enact a disable for real: an on-disk `images_dir`
+    /// under `tmp`, a provisioned SimHsm (provisioning authority + crypto
+    /// handle), a deactivator, and an installed-firmware gen (1) on the serving
+    /// bank, A.
+    fn disableable_backend(tmp: &Path) -> ComponentBackend<MemBlockDevice> {
+        use hsm::payload::*;
+        let ks = tmp.join("keystore");
+        std::fs::create_dir_all(&ks).unwrap();
+        SimHsm::new(ks.clone())
+            .write_keystore(&HsmKeystore {
+                schema_version: SCHEMA_VERSION,
+                security_version: 1,
+                identities: vec![],
+                slots: vec![KeySlot {
+                    key_id: hsm::ivd::IVD_KEY_ID.to_string(),
+                    key_kind: KEY_TYPE_EC_P256,
+                    anchor_public_key: None,
+                    allowed_guests: None,
+                    allowed_ops: Some(vec![OP_SIGN, OP_VERIFY, OP_GET_PUBKEY]),
+                }],
+                certificates: Vec::new(),
+                trust_anchors: Vec::new(),
+            })
+            .unwrap();
+        std::fs::write(ks.join("provision_state"), b"1\n").unwrap();
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        nv.write_boot_state(&mut NvBootState::default()).unwrap();
+        let mut meta = NvFwMeta {
+            gen: 1,
+            ..Default::default()
+        };
+        nv.write_fw_meta(slots::VM1, Bank::A, &mut meta).unwrap();
+        let hsm: Arc<Mutex<dyn hsm::HsmProvider>> = Arc::new(Mutex::new(SimHsm::new(ks.clone())));
+        ComponentBackend::with_options(
+            slots::VM1,
+            Arc::new(Mutex::new(nv)),
+            Arc::new(NoopManifest),
+            ComponentConfig::default(),
+            None,
+            Some(tmp.join("images")),
+            Some(hsm),
+        )
+        .with_hsm_crypto(Arc::new(SimHsm::new(ks)))
+        .with_deactivator(Arc::new(OkDeactivator))
+    }
+
+    /// Observe the epoch, clear, store: the store is dropped. Observe and store
+    /// with no clear between: it lands.
+    #[test]
+    fn a_store_from_a_stale_epoch_is_dropped() {
+        let mut cache = AdminStateCache::default();
+
+        let observed = cache.epoch;
+        cache.clear();
+        cache.store_if_epoch(observed, Bank::A, false);
+        assert_eq!(cache.value, None, "a derivation older than the clear");
+
+        let observed = cache.epoch;
+        cache.store_if_epoch(observed, Bank::A, true);
+        assert_eq!(cache.value, Some((Bank::A, true)), "no clear since: stored");
+    }
+
+    /// The race the epoch closes, driven through the backend: a reader misses
+    /// and derives "enabled" just before a disable lands, and stores only after
+    /// the enact's clear. The store is dropped, so the next read sees the
+    /// sentinel instead of the stale answer.
+    #[tokio::test]
+    async fn enact_invalidates_a_miss_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = disableable_backend(tmp.path());
+
+        // A reader misses: it observes the epoch and derives "enabled"…
+        let observed = b.admin_disabled_cache.lock().unwrap().epoch;
+        // …the disable lands meanwhile…
+        b.enact_disable_manifest().await.expect("disable enacted");
+        // …and only then does the reader store what it derived.
+        b.admin_disabled_cache
+            .lock()
+            .unwrap()
+            .store_if_epoch(observed, Bank::A, false);
+
+        assert!(
+            b.admin_disabled(),
+            "the stale store was dropped; the sentinel reads through"
         );
     }
 }
