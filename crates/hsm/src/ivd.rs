@@ -202,6 +202,38 @@ pub struct IvdFile {
     pub size: u64,
 }
 
+/// Relative path of the administrative-disable sentinel record — a name in the
+/// signed inventory, never a file the record vouches for. The leading dot keeps
+/// it clear of the usual part names, but a part name is taken verbatim from the
+/// SUIT component-id, so the name is not the guard: the all-zero digest of
+/// [`disabled_record`] is, since no real file hashes to it.
+pub const IVD_DISABLED_RECORD_PATH: &str = ".admin-disabled";
+
+/// The sentinel inventory entry: zero digest, size 0. SHA-256("") is e3b0c4…,
+/// never all-zero, so this cannot collide with an empty real file.
+pub fn disabled_record() -> IvdFile {
+    IvdFile {
+        relative_path: IVD_DISABLED_RECORD_PATH.into(),
+        sha256: vec![0u8; 32],
+        size: 0,
+    }
+}
+
+/// Whether `f` is exactly [`disabled_record`]: the sentinel path, size 0 and a
+/// full-length all-zero digest. A short or empty digest is not a sentinel.
+pub fn is_disabled_record(f: &IvdFile) -> bool {
+    f.relative_path == IVD_DISABLED_RECORD_PATH
+        && f.size == 0
+        && f.sha256.len() == 32
+        && f.sha256.iter().all(|&b| b == 0)
+}
+
+/// Whether `m` is the disable sentinel: its whole inventory is the one
+/// [`disabled_record`] entry.
+pub fn is_disabled_manifest(m: &IvdManifest) -> bool {
+    m.files.len() == 1 && is_disabled_record(&m.files[0])
+}
+
 /// Anything that can go wrong specifically inside the IVD machinery.
 /// Mostly wraps `HsmError` and IO; verification failures get their
 /// own variants for orchestrator-visible reasons.
@@ -236,6 +268,12 @@ pub enum IvdError {
     GenBelowFloor {
         manifest: u64,
         floor: u64,
+    },
+    /// The signed record is the disable sentinel ([`is_disabled_manifest`]) and
+    /// it passed the signature and the pins: the bank is administratively
+    /// disabled, not broken. Still an error — nothing launches the bank.
+    AdminDisabled {
+        gen: u64,
     },
     /// HSM rejected the verify or signature is bad.
     SignatureInvalid,
@@ -272,6 +310,12 @@ impl std::fmt::Display for IvdError {
                 write!(
                     f,
                     "ivd gen below floor: manifest {manifest} < committed_gen {floor}"
+                )
+            }
+            IvdError::AdminDisabled { gen } => {
+                write!(
+                    f,
+                    "ivd: bank is administratively disabled (sentinel record at gen {gen})"
                 )
             }
             IvdError::SignatureInvalid => write!(f, "ivd signature invalid"),
@@ -541,6 +585,21 @@ fn sign_bank_with_files_inner(
     Ok(manifest)
 }
 
+/// Rewrite `bank_dir`'s IVD as the disable sentinel — the one
+/// [`disabled_record`] entry as its whole inventory — at `gen`, signed with
+/// `ivd-signing`. Creates `bank_dir` if absent; overwrites a previous manifest +
+/// signature; touches nothing else in the dir.
+#[cfg(feature = "crypto")]
+pub fn sign_disabled_record_crypto(
+    hsm: &dyn HsmCryptoProvider,
+    bank_dir: &Path,
+    gen: u64,
+    identity: IvdIdentity,
+) -> Result<IvdManifest, IvdError> {
+    fs::create_dir_all(bank_dir).map_err(|e| IvdError::Io(e, bank_dir.to_path_buf()))?;
+    sign_bank_with_files_crypto(hsm, bank_dir, gen, identity, vec![disabled_record()], None)
+}
+
 /// Verification pins. Both checks are optional but should both be
 /// passed by the launch-time gate; only the developer
 /// "did my sig round-trip" use case omits them.
@@ -570,6 +629,17 @@ pub fn verify_bank_crypto(
     verify_bank_with(|h, d, s| hsm.verify(h, d, s), bank_dir, pins)
 }
 
+/// Phase 1 of [`verify_bank_crypto`] only: read both files, check the
+/// signature, decode. No pins, no file scan. NotFound surfaces as
+/// [`IvdError::Io`] exactly like [`read_manifest_unverified`].
+#[cfg(feature = "crypto")]
+pub fn read_manifest_verified(
+    hsm: &dyn HsmCryptoProvider,
+    bank_dir: &Path,
+) -> Result<IvdManifest, IvdError> {
+    read_signed_manifest(|h, d, s| hsm.verify(h, d, s), bank_dir).map(|(manifest, _)| manifest)
+}
+
 /// Shared body behind [`verify_bank_crypto`]: run the inner verify (signature
 /// check + pins + re-hash) under the supplied `verify` closure, logging a single
 /// operator-visible failure line on the error paths (the inner records its own
@@ -582,29 +652,42 @@ fn verify_bank_with(
 ) -> Result<IvdManifest, IvdError> {
     let started = std::time::Instant::now();
     let result = verify_bank_inner(verify, bank_dir, pins, started);
-    if let Err(ref e) = result {
-        // Inner records its own per-phase timings on success; on the
-        // pre-signature error paths (file IO etc.) we still want a
-        // single failure line for the operator log.
-        tracing::error!(
-            bank_dir = %bank_dir.display(),
-            expected_install_gen = ?pins.expected_install_gen,
-            min_committed_gen = ?pins.min_committed_gen,
-            total_ms = started.elapsed().as_millis() as u64,
-            error = %e,
-            "ivd verify FAIL",
-        );
+    match &result {
+        // An authenticated disable sentinel is a state, not a fault: still an
+        // `Err` (nothing launches the bank), but no FAIL line for it.
+        Err(IvdError::AdminDisabled { gen }) => {
+            tracing::info!(
+                bank_dir = %bank_dir.display(),
+                gen,
+                "ivd verify: bank administratively disabled",
+            );
+        }
+        Err(e) => {
+            // Inner records its own per-phase timings on success; on the
+            // pre-signature error paths (file IO etc.) we still want a
+            // single failure line for the operator log.
+            tracing::error!(
+                bank_dir = %bank_dir.display(),
+                expected_install_gen = ?pins.expected_install_gen,
+                min_committed_gen = ?pins.min_committed_gen,
+                total_ms = started.elapsed().as_millis() as u64,
+                error = %e,
+                "ivd verify FAIL",
+            );
+        }
+        Ok(_) => {}
     }
     result
 }
 
+/// Phase 1, shared by [`verify_bank_inner`] and [`read_manifest_verified`]:
+/// read manifest + signature, check the signature over the manifest bytes,
+/// decode. Also returns the signature-check time in ms for the verify's log.
 #[cfg(feature = "crypto")]
-fn verify_bank_inner(
+fn read_signed_manifest(
     verify: impl FnOnce(KeyHandle, &[u8], &[u8]) -> Result<bool, HsmError>,
     bank_dir: &Path,
-    pins: VerifyPins,
-    started: std::time::Instant,
-) -> Result<IvdManifest, IvdError> {
+) -> Result<(IvdManifest, u64), IvdError> {
     let manifest_path = bank_dir.join(IVD_MANIFEST_FILE);
     let signature_path = bank_dir.join(IVD_SIGNATURE_FILE);
 
@@ -620,7 +703,17 @@ fn verify_bank_inner(
         return Err(IvdError::SignatureInvalid);
     }
 
-    let manifest = decode_manifest(&manifest_bytes)?;
+    Ok((decode_manifest(&manifest_bytes)?, sig_verify_ms))
+}
+
+#[cfg(feature = "crypto")]
+fn verify_bank_inner(
+    verify: impl FnOnce(KeyHandle, &[u8], &[u8]) -> Result<bool, HsmError>,
+    bank_dir: &Path,
+    pins: VerifyPins,
+    started: std::time::Instant,
+) -> Result<IvdManifest, IvdError> {
+    let (manifest, sig_verify_ms) = read_signed_manifest(verify, bank_dir)?;
 
     // Per-slot install-gen cross-check. The NV record was written
     // at install time; the manifest carries the same value baked
@@ -647,6 +740,15 @@ fn verify_bank_inner(
                 floor,
             });
         }
+    }
+
+    // A signed disable sentinel attests no payload, so the file scan below has
+    // nothing to check: whatever the dir still holds (the bank's previous
+    // images) must read as "disabled", never as an unexpected file. After the
+    // pins, so a sentinel moved from another slot or below the floor still
+    // fails as the rollback it is.
+    if is_disabled_manifest(&manifest) {
+        return Err(IvdError::AdminDisabled { gen: manifest.gen });
     }
 
     // ---- Phase 2: re-hash every file the manifest claims ----
@@ -1371,5 +1473,206 @@ mod tests {
             other => panic!("expected Io(NotFound), got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&bank);
+    }
+
+    /// The sentinel written into a bank dir that does not exist yet: the writer
+    /// creates it holding the IVD pair and nothing else, the record reads back
+    /// verified as the sentinel, and the full verify — pins satisfied —
+    /// short-circuits to `AdminDisabled`.
+    #[test]
+    fn disabled_record_signs_and_verify_short_circuits_as_admin_disabled() {
+        let root = temp_bank("disabled-sentinel");
+        let bank = root.join("bank_a");
+        let (hsm, keystore) = provisioned_sim("disabled-sentinel");
+
+        let m = sign_disabled_record_crypto(&hsm, &bank, 4, sample_identity()).unwrap();
+        assert!(is_disabled_manifest(&m));
+        assert_eq!(m.identity, sample_identity());
+        let mut entries: Vec<String> = std::fs::read_dir(&bank)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![IVD_MANIFEST_FILE, IVD_SIGNATURE_FILE]);
+
+        let back = read_manifest_verified(&hsm, &bank).unwrap();
+        assert!(is_disabled_manifest(&back));
+        assert_eq!(back.gen, 4);
+
+        let pins = VerifyPins {
+            expected_install_gen: Some(4),
+            min_committed_gen: Some(4),
+        };
+        match verify_bank_crypto(&hsm, &bank, pins) {
+            Err(IvdError::AdminDisabled { gen }) => assert_eq!(gen, 4),
+            other => panic!("expected AdminDisabled, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// The real flow: a sealed bank is disabled in place. Its images stay on
+    /// disk beside the sentinel, and verify reports the disable — the file scan
+    /// that would flag them as unexpected never runs.
+    #[test]
+    fn sentinel_on_populated_bank_is_admin_disabled_not_unexpected_file() {
+        let bank = temp_bank("disabled-populated");
+        write(&bank.join("kernel"), b"kernel bytes");
+        write(&bank.join("rootfs.img"), &[0xAB; 4096]);
+        let (hsm, keystore) = provisioned_sim("disabled-populated");
+        sign_bank_crypto(&hsm, &bank, 6, sample_identity()).unwrap();
+
+        sign_disabled_record_crypto(&hsm, &bank, 7, sample_identity()).unwrap();
+        // The writer replaced the IVD pair and touched nothing else.
+        assert_eq!(std::fs::read(bank.join("kernel")).unwrap(), b"kernel bytes");
+        assert!(bank.join("rootfs.img").exists());
+
+        let pins = VerifyPins {
+            expected_install_gen: Some(7),
+            min_committed_gen: Some(6),
+        };
+        match verify_bank_crypto(&hsm, &bank, pins) {
+            Err(IvdError::AdminDisabled { gen }) => assert_eq!(gen, 7),
+            other => panic!("expected AdminDisabled, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// The pins run BEFORE the sentinel check: a sentinel in a slot whose NV
+    /// install-gen differs, or below the committed floor, still fails as the
+    /// swap / rollback it is.
+    #[test]
+    fn sentinel_with_wrong_gen_is_gen_mismatch() {
+        let bank = temp_bank("disabled-wrong-gen");
+        let (hsm, keystore) = provisioned_sim("disabled-wrong-gen");
+        sign_disabled_record_crypto(&hsm, &bank, 5, sample_identity()).unwrap();
+
+        let pins = VerifyPins {
+            expected_install_gen: Some(6),
+            ..Default::default()
+        };
+        match verify_bank_crypto(&hsm, &bank, pins) {
+            Err(IvdError::GenMismatch { expected, claimed }) => {
+                assert_eq!(expected, 6);
+                assert_eq!(claimed, 5);
+            }
+            other => panic!("expected GenMismatch, got {other:?}"),
+        }
+
+        let pins = VerifyPins {
+            min_committed_gen: Some(6),
+            ..Default::default()
+        };
+        match verify_bank_crypto(&hsm, &bank, pins) {
+            Err(IvdError::GenBelowFloor { manifest, floor }) => {
+                assert_eq!(manifest, 5);
+                assert_eq!(floor, 6);
+            }
+            other => panic!("expected GenBelowFloor, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// A REAL empty file at the sentinel path hashes to SHA-256(""), never the
+    /// all-zero digest: it is an ordinary inventory entry, and a bank holding
+    /// one verifies as an ordinary bank.
+    #[test]
+    fn empty_real_file_is_not_a_sentinel() {
+        let entry = IvdFile {
+            relative_path: IVD_DISABLED_RECORD_PATH.into(),
+            sha256: sha256(&[]),
+            size: 0,
+        };
+        assert!(!is_disabled_record(&entry));
+        let m = build_manifest_from_files(vec![entry], 1, IvdIdentity::default());
+        assert!(!is_disabled_manifest(&m));
+
+        let bank = temp_bank("disabled-empty-real-file");
+        write(&bank.join(IVD_DISABLED_RECORD_PATH), &[]);
+        let (hsm, keystore) = provisioned_sim("disabled-empty-real-file");
+        let m = sign_bank_crypto(&hsm, &bank, 2, sample_identity()).unwrap();
+        assert!(!is_disabled_manifest(&m));
+        let pins = VerifyPins {
+            expected_install_gen: Some(2),
+            min_committed_gen: Some(2),
+        };
+        assert_eq!(verify_bank_crypto(&hsm, &bank, pins).unwrap().gen, 2);
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// Only a full-length all-zero digest is the sentinel: an entry at the
+    /// sentinel path with an empty or short digest is not. (component-mgr's
+    /// `read_installed` zero-pads short digests to 32 bytes — why nothing may
+    /// gate on its copy.)
+    #[test]
+    fn short_digest_is_not_a_sentinel() {
+        let empty = IvdFile {
+            relative_path: IVD_DISABLED_RECORD_PATH.into(),
+            sha256: vec![],
+            size: 0,
+        };
+        assert!(!is_disabled_record(&empty));
+        let short = IvdFile {
+            sha256: vec![0u8; 31],
+            ..empty
+        };
+        assert!(!is_disabled_record(&short));
+        assert!(is_disabled_record(&disabled_record()), "control");
+    }
+
+    /// The sentinel is a whole inventory, not an entry among others.
+    #[test]
+    fn sentinel_must_be_the_whole_inventory() {
+        let alone = build_manifest_from_files(vec![disabled_record()], 1, IvdIdentity::default());
+        assert!(is_disabled_manifest(&alone), "control");
+        let files = vec![
+            disabled_record(),
+            IvdFile {
+                relative_path: "kernel".into(),
+                sha256: sha256(b"k"),
+                size: 1,
+            },
+        ];
+        let mixed = build_manifest_from_files(files, 1, IvdIdentity::default());
+        assert!(!is_disabled_manifest(&mixed));
+    }
+
+    /// `read_manifest_verified` is phase 1 alone: absent → `Io(NotFound)` like
+    /// the unverified reader; intact → the decoded manifest; a tampered
+    /// signature → `SignatureInvalid`, where the report-only reader still
+    /// reports.
+    #[test]
+    fn read_manifest_verified_rejects_a_tampered_signature() {
+        let bank = temp_bank("read-manifest-verified");
+        let (hsm, keystore) = provisioned_sim("read-manifest-verified");
+        match read_manifest_verified(&hsm, &bank) {
+            Err(IvdError::Io(e, _)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            other => panic!("expected Io(NotFound), got {other:?}"),
+        }
+
+        sign_disabled_record_crypto(&hsm, &bank, 3, sample_identity()).unwrap();
+        assert_eq!(read_manifest_verified(&hsm, &bank).unwrap().gen, 3);
+
+        // Flip the last byte: still well-formed DER, no longer a valid signature.
+        let spath = bank.join(IVD_SIGNATURE_FILE);
+        let mut sig = std::fs::read(&spath).unwrap();
+        let last = sig.len() - 1;
+        sig[last] ^= 0x01;
+        std::fs::write(&spath, &sig).unwrap();
+        match read_manifest_verified(&hsm, &bank) {
+            Err(IvdError::SignatureInvalid) => {}
+            other => panic!("expected SignatureInvalid, got {other:?}"),
+        }
+        assert!(read_manifest_unverified(&bank).is_ok());
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
     }
 }
