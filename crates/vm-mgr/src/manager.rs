@@ -301,6 +301,8 @@ impl VmManager {
                     Box::new(DummyRunner::new())
                 }
                 BackendType::Qnx => Box::new(QnxRunner::new()),
+                #[cfg(feature = "process")]
+                BackendType::Process => Box::new(crate::runner::process::ProcessRunner::new()),
                 BackendType::Dummy => Box::new(DummyRunner::new()),
             };
 

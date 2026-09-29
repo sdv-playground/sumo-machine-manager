@@ -108,6 +108,7 @@ members = [
     # sim half of the `hsm` crate; S7b relocated it here). Not merely test
     # tooling: sim/dev deployments run it as their HSM — see its crate docs.
     "tools/crates/hsm-sim-backend",
+    "tools/crates/vm-shim",
     # Build read-only policy images (squashfs / qnx6) for the policy partition.
     "tools/crates/policy-build",
     # Dev factory-reset capability-token minter (well-known dev key).

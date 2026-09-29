@@ -208,6 +208,13 @@ pub struct VmDefinition {
     /// Directory for host simulator binaries.
     #[serde(default)]
     pub sim_dir: Option<PathBuf>,
+    /// Executable used by the portable process backend. The child receives
+    /// `SUMO_VM_NAME` and `SUMO_VM_BANK_DIR` environment variables.
+    #[serde(default)]
+    pub process_command: Option<PathBuf>,
+    /// Arguments passed to `process_command`.
+    #[serde(default)]
+    pub process_args: Vec<String>,
     /// Path to qvm config file (QNX backend only).
     #[serde(default)]
     pub qvm_config: Option<PathBuf>,
@@ -241,6 +248,8 @@ pub enum OsType {
 pub enum BackendType {
     Qemu,
     Qnx,
+    #[cfg(feature = "process")]
+    Process,
     Dummy,
 }
 
@@ -677,6 +686,8 @@ mod tests {
             shutdown: None,
             extra_cmdline: Some("console=ttyS0".into()),
             sim_dir: None,
+            process_command: None,
+            process_args: Vec::new(),
             qvm_config: None,
             auto_start: false,
         }
@@ -1030,6 +1041,8 @@ arch: amd64
         for (s, want) in [
             ("qemu", BackendType::Qemu),
             ("qnx", BackendType::Qnx),
+            #[cfg(feature = "process")]
+            ("process", BackendType::Process),
             ("dummy", BackendType::Dummy),
         ] {
             let yaml = format!("backend: {s}\nimage_dir: /x\n");

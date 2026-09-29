@@ -1,0 +1,12 @@
+[package]
+name = "vm-shim"
+version = "0.1.0"
+edition = "2021"
+description = "Portable guest process used by native and Docker machine-manager integration tests"
+
+[dependencies]
+vm-wire = { path = "../../../crates/vm-wire" }
+
+[[bin]]
+name = "vm-shim"
+path = "src/main.rs"

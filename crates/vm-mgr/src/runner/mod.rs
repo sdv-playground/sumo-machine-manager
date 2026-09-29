@@ -3,10 +3,13 @@
 //! Implementations:
 //!
 //! - `QemuRunner`: builds QEMU command line, manages ivshmem-server + simulators
+//! - `ProcessRunner`: portable child processes for native integration tests
 //! - `DummyRunner`: instant no-ops for components without a real VM
 //! - `QnxRunner`: stub for QNX qvm integration (future)
 
 pub mod dummy;
+#[cfg(feature = "process")]
+pub mod process;
 #[cfg(target_os = "linux")]
 pub mod qemu;
 pub mod qnx;
