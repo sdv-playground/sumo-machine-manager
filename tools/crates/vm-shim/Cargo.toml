@@ -10,3 +10,11 @@ vm-wire = { path = "../../../crates/vm-wire" }
 [[bin]]
 name = "vm-shim"
 path = "src/main.rs"
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+vm-devices = { path = "../../../crates/vm-devices", features = ["http-transport"] }
+vm-mgr = { path = "../../../crates/vm-mgr", features = ["process"] }
+serde_yaml = "0.9"

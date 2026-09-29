@@ -28,8 +28,10 @@ stale-heartbeat
 exit-immediately
 ```
 
-The Supernova process-level test can consume this backend after the host
-composition bumps its pinned `vm-mgr` dependency to a revision containing
-the `process` feature. Until then, do not add a local Cargo path override to a
-committed lockfile; the native test should consume the same published revision
-used by the Docker image.
+`cargo test -p vm-shim` starts the real child with `VmManager` and an HTTP
+device transport, and checks all four health modes. The host composition's
+opt-in test runs from `supernova-machine-manager` with:
+
+```bash
+cargo test --features native-process-tests --test native_process
+```

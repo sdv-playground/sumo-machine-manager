@@ -6,6 +6,7 @@
 
 #[cfg(all(unix, feature = "process"))]
 mod unix {
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
     use vm_mgr::config::{BackendType, VmServiceConfig};
     use vm_mgr::manager::VmManager;
@@ -24,7 +25,7 @@ vms:
     backend: process
     image_dir: {}
     process_command: /bin/sh
-    process_args: ["-c", "sleep 30"]
+    process_args: ["-c", "exec sleep 30"]
 "#,
             root.path().display()
         ))
@@ -39,6 +40,12 @@ vms:
         assert!(manager.runtime_identity("vm1").is_some());
 
         manager.stop_vm("vm1").unwrap();
+        assert!(manager.runtime_identity("vm1").is_none());
+
+        manager.start_vm("vm1").unwrap();
+        let started = Instant::now();
+        manager.stop_all_for_reboot(5);
+        assert!(started.elapsed() < Duration::from_secs(3));
         assert!(manager.runtime_identity("vm1").is_none());
     }
 }

@@ -15,6 +15,7 @@ pub mod qemu;
 pub mod qnx;
 
 use crate::config::VmDefinition;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -69,6 +70,12 @@ pub trait VmRunner: Send {
 
     /// Check if a VM is still running.
     fn is_running(&self, handle: &VmHandle) -> bool;
+
+    /// Probe for an owned child that can be polled while the manager lock is released.
+    /// Other runners use the PID-based wait in `VmManager`.
+    fn exit_probe(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        None
+    }
 
     /// Block until the VM exits. Returns the exit code, or None if unknown.
     #[allow(dead_code)]

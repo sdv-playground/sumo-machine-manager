@@ -6,11 +6,12 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 
 use super::*;
 
 pub struct ProcessRunner {
-    child: Option<Child>,
+    child: Option<Arc<Mutex<Child>>>,
 }
 
 impl Default for ProcessRunner {
@@ -49,7 +50,7 @@ impl VmRunner for ProcessRunner {
             .spawn()
             .map_err(|e| RunnerError::ProcessFailed(format!("{}: {e}", command.display())))?;
         let pid = child.id();
-        self.child = Some(child);
+        self.child = Some(Arc::new(Mutex::new(child)));
         Ok(VmHandle {
             name: name.to_string(),
             pid: Some(pid),
@@ -57,34 +58,60 @@ impl VmRunner for ProcessRunner {
     }
 
     fn stop(&mut self, _handle: &VmHandle) -> Result<(), RunnerError> {
-        if let Some(child) = self.child.as_mut() {
-            child.kill()?;
-            let _ = child.wait();
+        if let Some(child) = self.child.as_ref() {
+            let mut child = child.lock().unwrap();
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+                child.wait()?;
+            }
         }
         self.child = None;
         Ok(())
     }
 
-    fn is_running(&self, handle: &VmHandle) -> bool {
-        handle
-            .pid
-            .map(|pid| unsafe { libc::kill(pid as libc::pid_t, 0) == 0 })
-            .unwrap_or(false)
+    fn is_running(&self, _handle: &VmHandle) -> bool {
+        self.child.as_ref().is_some_and(|child| {
+            child
+                .lock()
+                .unwrap()
+                .try_wait()
+                .is_ok_and(|exit| exit.is_none())
+        })
+    }
+
+    fn exit_probe(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        let child = self.child.as_ref()?.clone();
+        Some(Arc::new(move || {
+            child
+                .lock()
+                .unwrap()
+                .try_wait()
+                .is_ok_and(|exit| exit.is_some())
+        }))
     }
 
     fn wait(&mut self, _handle: &VmHandle) -> Result<Option<i32>, RunnerError> {
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.take() else {
             return Err(RunnerError::ProcessFailed("process child not found".into()));
         };
+        let mut child = child.lock().unwrap();
         Ok(child.wait()?.code())
     }
 
     fn cleanup(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(child) = self.child.take() {
+            let mut child = child.lock().unwrap();
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
-        self.child = None;
+    }
+}
+
+impl Drop for ProcessRunner {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }
 
@@ -119,7 +146,7 @@ mod tests {
     fn starts_and_stops_a_process() {
         let mut runner = ProcessRunner::new();
         let mut def = definition(Some("/bin/sh".into()));
-        def.process_args = vec!["-c".into(), "sleep 30".into()];
+        def.process_args = vec!["-c".into(), "exec sleep 30".into()];
         let handle = runner.start("vm1", &def).unwrap();
         assert!(runner.is_running(&handle));
         runner.stop(&handle).unwrap();
@@ -127,6 +154,40 @@ mod tests {
         runner
             .graceful_shutdown(&handle, Duration::from_millis(1))
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reaps_exited_child_and_allows_relaunch() {
+        let mut runner = ProcessRunner::new();
+        let mut def = definition(Some("/bin/sh".into()));
+        def.process_args = vec!["-c".into(), "exit 0".into()];
+        let handle = runner.start("vm1", &def).unwrap();
+        for _ in 0..100 {
+            if !runner.is_running(&handle) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!runner.is_running(&handle));
+        runner.cleanup();
+        let next = runner.start("vm1", &def).unwrap();
+        runner.wait(&next).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_runner_kills_and_reaps_its_child() {
+        let mut runner = ProcessRunner::new();
+        let mut def = definition(Some("/bin/sh".into()));
+        def.process_args = vec!["-c".into(), "exec sleep 30".into()];
+        let handle = runner.start("vm1", &def).unwrap();
+        assert!(runner.is_running(&handle));
+        let pid = handle.pid.unwrap();
+
+        drop(runner);
+
+        assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
     }
 
     #[cfg(unix)]

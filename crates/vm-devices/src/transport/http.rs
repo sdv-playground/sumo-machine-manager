@@ -163,6 +163,14 @@ impl DeviceTransport for HttpTransport {
         });
         Ok(http_channel as Arc<dyn DeviceChannel>)
     }
+
+    fn release_vm(&self, vm: &str) {
+        self.state
+            .channels
+            .lock()
+            .expect("HttpTransport channels mutex poisoned")
+            .retain(|key, _| key.0 != vm);
+    }
 }
 
 /// In-process `DeviceChannel` handle. Goes directly to `ChannelState`,
@@ -337,6 +345,27 @@ mod tests {
         let t = make_transport();
         let ch = t.open_channel("vm2", "hb", "data", 32).unwrap();
         assert!(ch.read().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_vm_discards_prior_lifetime_without_affecting_other_vms() {
+        let t = make_transport();
+        let old = t
+            .open_channel("vm1", "power", "cmd", POWER_WIRE_SIZE)
+            .unwrap();
+        let other = t
+            .open_channel("vm2", "power", "cmd", POWER_WIRE_SIZE)
+            .unwrap();
+        old.write(&[1]).unwrap();
+        other.write(&[2]).unwrap();
+
+        t.release_vm("vm1");
+
+        let fresh = t
+            .open_channel("vm1", "power", "cmd", POWER_WIRE_SIZE)
+            .unwrap();
+        assert!(fresh.read().unwrap().is_empty());
+        assert_eq!(other.read().unwrap(), vec![2]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

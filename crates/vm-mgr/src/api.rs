@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Bank;
 use crate::health_status::{ExpectedBy, ExpectedState, HealthStatus};
-use crate::manager::{self, ManagerError, VmManager};
+use crate::manager::{ManagerError, VmManager};
 
 type SharedManager = Arc<Mutex<VmManager>>;
 
@@ -100,13 +100,12 @@ async fn stop_vm(State(mgr): State<SharedManager>, Path(name): Path<String>) -> 
     // Lock is released here — health/list remain responsive
 
     // Phase 2: wait for process to exit (blocking, NO lock held)
-    if let Some(pid) = stop_handle.pid {
-        let timeout = stop_handle.timeout_secs;
+    if stop_handle.pid.is_some() {
         let _ = tokio::task::spawn_blocking(move || {
             // bool return is "exited cleanly?"; finalize_stop force-kills
             // on false, so the result is informational here. Caller logs
             // its own elapsed metric.
-            manager::wait_for_exit(pid, timeout)
+            stop_handle.wait_for_exit()
         })
         .await;
     }
@@ -199,13 +198,12 @@ async fn ensure_vm_running(
         let total_started = std::time::Instant::now();
 
         if let Some(sh) = stop_handle {
-            if let Some(pid) = sh.pid {
+            if sh.pid.is_some() {
                 let timeout = sh.timeout_secs;
                 let phase_started = std::time::Instant::now();
-                let exited =
-                    tokio::task::spawn_blocking(move || manager::wait_for_exit(pid, timeout))
-                        .await
-                        .unwrap_or(false);
+                let exited = tokio::task::spawn_blocking(move || sh.wait_for_exit())
+                    .await
+                    .unwrap_or(false);
                 let elapsed_secs = phase_started.elapsed().as_secs();
                 if exited {
                     tracing::info!(

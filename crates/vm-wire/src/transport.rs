@@ -159,8 +159,9 @@ pub trait DeviceTransport: Send + Sync {
     /// must drop its handle before the next qvm spawn or it ends up
     /// reading stale memory from the dead process.
     ///
-    /// Default is a no-op for transports whose state is independent of
-    /// VM lifecycle (HTTP, in-memory, ivshmem files).
+    /// HTTP also clears its snapshots between VM lifetimes so a fresh guest
+    /// cannot observe a stale heartbeat or shutdown command. The default is
+    /// a no-op for transports without per-VM state to release.
     fn release_vm(&self, _vm: &str) {}
 }
 

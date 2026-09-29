@@ -73,8 +73,11 @@ fn main() {
                 },
                 boot_id,
             };
-            let _ = put_channel(&host, &vm, "heartbeat", "data", &heartbeat.to_bytes());
-            sent_stale = true;
+            let delivered =
+                put_channel(&host, &vm, "heartbeat", "data", &heartbeat.to_bytes()).is_some();
+            if mode == Mode::StaleHeartbeat {
+                sent_stale = delivered;
+            }
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -115,7 +118,7 @@ fn request(method: &str, path: &str, body: &[u8]) -> Option<Vec<u8>> {
         .ok()?
         .parse::<u16>()
         .ok()?;
-    if !(200..300).contains(&status) && status != 404 {
+    if !(200..300).contains(&status) {
         return None;
     }
     Some(response[separator + 4..].to_vec())

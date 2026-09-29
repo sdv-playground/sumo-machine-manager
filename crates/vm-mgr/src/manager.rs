@@ -196,21 +196,51 @@ pub struct StopHandle {
     pub name: String,
     pub pid: Option<u32>,
     pub timeout_secs: u64,
+    exit_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl StopHandle {
+    /// Wait for this VM to exit without holding the manager lock.
+    pub fn wait_for_exit(&self) -> bool {
+        self.pid.is_none_or(|pid| {
+            wait_for_exit_with_probe(pid, self.timeout_secs, self.exit_probe.as_ref())
+        })
+    }
+
+    fn has_exited(&self) -> bool {
+        self.pid
+            .is_none_or(|pid| has_exited(pid, self.exit_probe.as_ref()))
+    }
 }
 
 /// Wait for a process to exit, polling with a timeout. No locks held.
 /// Returns `true` if the process exited within the timeout, `false`
 /// on timeout (caller is expected to force-kill in that case).
 pub fn wait_for_exit(pid: u32, timeout_secs: u64) -> bool {
+    wait_for_exit_with_probe(pid, timeout_secs, None)
+}
+
+fn wait_for_exit_with_probe(
+    pid: u32,
+    timeout_secs: u64,
+    probe: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> bool {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
-        if unsafe { libc::kill(pid as i32, 0) != 0 } {
+        if has_exited(pid, probe) {
             return true; // process gone
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     tracing::warn!("pid {pid} did not exit within {timeout_secs}s — will force-kill");
     false
+}
+
+fn has_exited(pid: u32, probe: Option<&Arc<dyn Fn() -> bool + Send + Sync>>) -> bool {
+    probe.map_or_else(
+        || unsafe { libc::kill(pid as i32, 0) != 0 },
+        |probe| probe(),
+    )
 }
 
 #[derive(Debug)]
@@ -772,6 +802,7 @@ impl VmManager {
                 name: name.to_string(),
                 pid: None,
                 timeout_secs: 0,
+                exit_probe: None,
             });
         }
 
@@ -808,12 +839,14 @@ impl VmManager {
         };
 
         let pid = handle.pid;
+        let exit_probe = vm.runner.exit_probe();
         tracing::info!("signalled shutdown for VM {name} (pid: {pid:?}, timeout: {timeout_secs}s)");
 
         Ok(StopHandle {
             name: name.to_string(),
             pid,
             timeout_secs,
+            exit_probe,
         })
     }
 
@@ -850,10 +883,10 @@ impl VmManager {
     /// for the full duration — only use when lock contention doesn't matter.
     pub fn stop_vm(&mut self, name: &str) -> Result<(), ManagerError> {
         let sh = self.initiate_stop(name)?;
-        if let Some(pid) = sh.pid {
+        if sh.pid.is_some() {
             // finalize_stop force-kills on a timeout; the bool result is
             // informational (logged inside wait_for_exit on timeout).
-            let _ = wait_for_exit(pid, sh.timeout_secs);
+            let _ = sh.wait_for_exit();
         }
         self.finalize_stop(name);
         Ok(())
@@ -926,35 +959,46 @@ impl VmManager {
     pub fn stop_all_for_reboot(&mut self, grace_secs: u64) {
         let names: Vec<String> = self.vms.keys().cloned().collect();
         // 1. Signal graceful shutdown to ALL at once (parallel, not sequential).
-        let mut pids: Vec<(String, u32)> = Vec::new();
+        let mut stopping: Vec<StopHandle> = Vec::new();
+        let mut force_now: Vec<String> = Vec::new();
         for name in &names {
             match self.initiate_stop_with_source(name, ExpectedBy::RebootSweep) {
                 Ok(sh) => {
-                    if let Some(pid) = sh.pid {
-                        pids.push((name.clone(), pid));
+                    if sh.pid.is_some() {
+                        if sh.timeout_secs == 0 {
+                            force_now.push(name.clone());
+                        } else {
+                            stopping.push(sh);
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("VM {name}: initiate_stop for reboot failed: {e}"),
             }
         }
+        // No shutdown command was sent for these VMs; waiting cannot help.
+        for name in &force_now {
+            self.finalize_stop(name);
+        }
         // 2. One short overall deadline for ALL guests to exit gracefully.
         let deadline = Instant::now() + Duration::from_secs(grace_secs);
         while Instant::now() < deadline {
-            pids.retain(|(_, pid)| unsafe { libc::kill(*pid as i32, 0) == 0 });
-            if pids.is_empty() {
+            stopping.retain(|sh| !sh.has_exited());
+            if stopping.is_empty() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        if !pids.is_empty() {
-            let left: Vec<&str> = pids.iter().map(|(n, _)| n.as_str()).collect();
+        if !stopping.is_empty() {
+            let left: Vec<&str> = stopping.iter().map(|sh| sh.name.as_str()).collect();
             tracing::warn!(
                 "reboot: VMs {left:?} didn't exit within {grace_secs}s — force-killing + reboot proceeds"
             );
         }
         // 3. Force-kill any survivors + clean up (unmounts bank loopbacks).
         for name in &names {
-            self.finalize_stop(name);
+            if !force_now.contains(name) {
+                self.finalize_stop(name);
+            }
         }
     }
 }
