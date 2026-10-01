@@ -268,7 +268,10 @@ pub const PERM_KEY_GENERATE: u32 = 1 << 10;
 //
 // Layout:
 //   0x0000              HANDLE_INVALID
-//   0x0001 .. 0x007F    sumo core well-known (this file owns numbering)
+//   0x0001 .. 0x007F    sumo core well-known (this file owns numbering) —
+//                       includes a few HOST-ONLY platform-served handles
+//                       (0x0010/0x0011/0x0013, see below) reserved here so the
+//                       core range stays collision-free across both daemons.
 //   0x0080 .. 0x00FF    project extensions (downstream owns numbering; see
 //                       guest-vm-spec/crates/vhsm-handles-ext and the C
 //                       mirror at guest-vm-spec/shared/include/vhsm_proto.h)
@@ -302,6 +305,22 @@ pub const HANDLE_TLS_IDENTITY: u32 = 0x000C;
 /// handle-addressed slot access (like the host-in-process key slots above) and
 /// is never registered on the guest wire.
 pub const HANDLE_TIME_FLOOR: u32 = 0x000D;
+
+// ---- Platform (supernova-platform) host-only well-known handles ----------
+//
+// These are served by the platform C `vhsmd` daemon (HSE-backed), NOT by sumo's
+// SimHsm / Link-B backend. They are HOST-ONLY (vhsmd rejects any guest vm_id with
+// POLICY_REJECT), so — exactly like HANDLE_IVD_SIGNING / TLS_IDENTITY / TIME_FLOOR
+// above — they are reserved here to freeze the numbering but are NOT guest-wire
+// handles and are deliberately absent from the c_header_freeze snapshot (the guest
+// C header must not define them).  Numbering is co-owned: the authoritative C
+// definitions live in supernova-platform's cvc-hpi subtree
+// (include/cvc/hpi/vhsm/vhsmd_proto.h, VHSM_HANDLE_*); mirrored here so sumo's
+// 0x0001..0x007F core range does not re-allocate them.  See platform ADR 0005
+// (wire conformance), ADR 0006 (device UUID).
+pub const HANDLE_SIL_AUTH_VER: u32 = 0x0010; // AES-128 CMAC, image SIL auth (platform)
+pub const HANDLE_RPMB_HMAC: u32 = 0x0011; // HMAC-SHA256, eMMC RPMB frame auth (platform)
+pub const HANDLE_DEVICE_UUID: u32 = 0x0013; // synthesized 128-bit device ID (platform, ADR 0006)
 
 /// Lower boundary of the project-extension well-known range. Sumo owns
 /// the slots strictly below this; downstream projects own
@@ -715,6 +734,9 @@ mod tests {
             HANDLE_IVD_SIGNING,
             HANDLE_TLS_IDENTITY,
             HANDLE_TIME_FLOOR,
+            HANDLE_SIL_AUTH_VER,
+            HANDLE_RPMB_HMAC,
+            HANDLE_DEVICE_UUID,
         ];
         for (i, a) in hs.iter().enumerate() {
             for b in &hs[i + 1..] {
@@ -741,6 +763,13 @@ mod tests {
                 s.handle
             );
             assert!(ids.insert(s.key_id), "duplicate key_id {}", s.key_id);
+            // The platform vhsmd serves these; a sumo slot must never take one.
+            assert!(
+                ![HANDLE_SIL_AUTH_VER, HANDLE_RPMB_HMAC, HANDLE_DEVICE_UUID].contains(&s.handle),
+                "slot {} takes the platform-served handle 0x{:04x}",
+                s.key_id,
+                s.handle
+            );
             // Guest-exposed slots carry permissions; host-only slots carry none.
             if s.guest_exposed {
                 assert_ne!(
