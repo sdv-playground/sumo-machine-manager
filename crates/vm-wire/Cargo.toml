@@ -2,7 +2,7 @@
 name = "vm-wire"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0 OR MIT"
+license.workspace = true
 description = "Cross-VM transport contract — DeviceChannel/StreamChannel traits, SharedMemory + Doorbell primitives, TransportError, and canonical wire formats (Heartbeat, PowerCommand). Consumed by both host and guest implementations."
 repository = "https://github.com/sdv-playground/sumo-machine-manager"
 

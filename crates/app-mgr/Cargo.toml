@@ -2,6 +2,7 @@
 name = "app-mgr"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Self-updating application component — filesystem A/B banks with NV-backed state"
 
 [dependencies]

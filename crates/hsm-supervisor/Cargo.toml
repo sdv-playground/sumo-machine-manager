@@ -2,6 +2,7 @@
 name = "hsm-supervisor"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = """
 Spawn, supervise and reap a node's two HSM daemons — the link-B crypto backend \
 and the vhsm-ssd proxy guests reach over /dev/vhsm. Deliberately dep-light \

@@ -2,6 +2,7 @@
 name = "vm-devices"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Host-side device simulators for virtual CAN, health, and time"
 
 [dependencies]

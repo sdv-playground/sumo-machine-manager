@@ -2,6 +2,7 @@
 name = "vhsm-crossnode-client"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Cross-node vHSM client connector — HSM-backed mTLS dial to a peer node's listener, returning a VhsmClient"
 
 [dependencies]

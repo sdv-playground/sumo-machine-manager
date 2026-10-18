@@ -2,6 +2,7 @@
 name = "component-factory"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Config-driven component construction for sumo machine manager"
 
 [dependencies]

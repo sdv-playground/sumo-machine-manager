@@ -2,6 +2,7 @@
 name = "vm-shim"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Portable guest process used by native and Docker machine-manager integration tests"
 
 [dependencies]

@@ -3,7 +3,7 @@ name = "vhsm-ssd"
 version = "0.1.0"
 edition = "2021"
 description = "vHSM Secure Storage Daemon — the host-side crypto service guest VMs reach over /dev/vhsm. Terminates the v3 handle-based wire protocol on the private vbr-vhsm bridge, establishes guest identity by CWT/IAM handshake, and delegates crypto to an HsmCryptoProvider (a link-B vendor service, or the software HSM). The reusable server half is the vhsm-server library; this package is the process that wires it to a backend, a secstore, TLS and the signal reaper."
-license = "MIT"
+license.workspace = true
 
 # PACKAGE NAME IS LOAD-BEARING: supernova-machine-manager installs this by name
 # (`cargo install --git … vhsm-ssd`, .gitlab-ci.yml) and builds it by name

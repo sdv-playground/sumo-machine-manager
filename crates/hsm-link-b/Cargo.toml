@@ -2,6 +2,7 @@
 name = "hsm-link-b"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Link-B: the host <-> physical-HSE service protocol (the vendor-facing HSM op contract)"
 
 # Pure protocol crate — no dependencies. Keys/algs/handles are caller-supplied

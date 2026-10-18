@@ -2,6 +2,7 @@
 name = "machine-contract"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Shared machine contract — the synchronous BankProvider / BankActivator / Deactivator / ImageRecord traits plus ResetKind and the bank record types. Implemented in-tree by component-mgr and host-os-mgr and out-of-tree by every platform machine manager, so a platform impl needs neither SOVDd nor an async runtime to satisfy the seam."
 
 [dependencies]

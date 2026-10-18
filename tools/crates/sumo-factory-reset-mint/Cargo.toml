@@ -2,6 +2,7 @@
 name = "sumo-factory-reset-mint"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Dev factory-reset SOVD capability-token minter — signs with the well-known dev key (P-256 scalar=1) so dev rigs are always resettable. NOT for production; NOT the onboard minter."
 
 [[bin]]

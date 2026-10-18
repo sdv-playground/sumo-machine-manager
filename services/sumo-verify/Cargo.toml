@@ -2,6 +2,7 @@
 name = "sumo-verify"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "CLI that validates a staged bank's IVD signature against the HSM's ivd-signing key. External secure boot invokes this before launching each component; on managed-cvc (no real secure boot) the start script uses it as the launch gate."
 
 [[bin]]

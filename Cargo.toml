@@ -115,6 +115,9 @@ members = [
     "tools/crates/sumo-factory-reset-mint",
 ]
 
+[workspace.package]
+license = "Apache-2.0"
+
 [profile.release]
 # Strip the symbol table from release binaries — keeps the deployed binaries
 # (vm-sovd, vhsm-ssd, the t2-seed-cicd layer binaries) slim, which matters for

@@ -2,6 +2,7 @@
 name = "puller"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 # HTTP client.  Default features are fine — TLS via rustls (sumo-mm

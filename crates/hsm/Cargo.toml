@@ -2,6 +2,7 @@
 name = "hsm"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "HSM provider/crypto contract: traits, types, KeyRole, keystore schema, IVD signing, and the link-B bridge"
 
 [dependencies]

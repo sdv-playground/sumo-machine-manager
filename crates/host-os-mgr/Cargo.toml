@@ -2,6 +2,7 @@
 name = "host-os-mgr"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Host OS update manager — A/B boot partition, IFS activation, reboot coordination"
 
 [dependencies]

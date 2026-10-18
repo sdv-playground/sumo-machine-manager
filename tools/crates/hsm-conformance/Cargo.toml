@@ -2,6 +2,7 @@
 name = "hsm-conformance"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Link-B HSM backend conformance battery — verify a vendor backend honours the host<->backend op contract"
 
 [dependencies]

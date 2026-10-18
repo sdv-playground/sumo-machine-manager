@@ -2,6 +2,7 @@
 name = "vhsm-server"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 # Renamed from `vhsm-ssd` by docs/componentization.md item 3d. The DAEMON keeps
 # that name — it is what consumers address (`cargo install … vhsm-ssd`, the
 # process on the device, the `aud` claim "vhsm-ssd" in vhsm-proto) and it now

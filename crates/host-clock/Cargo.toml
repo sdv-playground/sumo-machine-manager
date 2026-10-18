@@ -2,6 +2,7 @@
 name = "host-clock"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Step the host's CLOCK_REALTIME forward to a proven safe-time floor — the platform side of machine-contract's WallClockFloor and FloorSink seams. Forward-only, best-effort, libc + tracing only."
 
 [dependencies]

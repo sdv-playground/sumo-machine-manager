@@ -3,7 +3,7 @@ name = "sumo-log"
 version = "0.1.0"
 edition = "2021"
 description = "Fleet-wide logging init for sumo services. `sumo_log::init_tracing(context)` (for `tracing`-emitting code — the standard) or `init(context)` (for direct score_log callers) installs an Eclipse S-CORE score_log recorder chosen by env (SUMO_LOG_SINK: auto|stdout|slog2, SUMO_LOG_LEVEL) and, for the tracing variant, the tracing→score_log bridge. Apps pass only their context tag; level/format/destination policy + the capture wiring live HERE, not in each app."
-license = "MIT"
+license.workspace = true
 
 [lib]
 path = "src/lib.rs"

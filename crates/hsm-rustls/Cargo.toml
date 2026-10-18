@@ -2,6 +2,7 @@
 name = "hsm-rustls"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "HSM-backed rustls client identity — mTLS where the private key never leaves the HSM"
 
 [dependencies]

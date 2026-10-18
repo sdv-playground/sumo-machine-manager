@@ -2,6 +2,7 @@
 name = "machine-mgr"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Machine + Component traits — semantic API behind diagserver, swappable real/sim impls"
 
 [dependencies]

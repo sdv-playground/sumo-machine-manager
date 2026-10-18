@@ -2,6 +2,7 @@
 name = "policy-build"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Build read-only policy images (squashfs for Linux, qnx6 for QNX guests). AUTH-ARCH-001 §4."
 
 [dependencies]

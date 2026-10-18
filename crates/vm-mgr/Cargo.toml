@@ -9,7 +9,7 @@ edition = "2021"
 # in the family it belongs to: component-mgr, host-os-mgr, app-mgr, machine-mgr.
 # Its central type is `VmManager`.
 description = "VM lifecycle management — QEMU/qvm runners, per-bank VM config, ivshmem-server management, QMP integration and the VM control API. Embedded in-process by the host machine manager; the standalone process that drives it is tools/crates/vm-service."
-license = "MIT"
+license.workspace = true
 
 [dependencies]
 axum = "0.8"

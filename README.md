@@ -235,3 +235,7 @@ For CRL manifests: Upload → Apply floor → Done (no flash/reset/commit).
 | [sumo-sovd](https://github.com/sdv-playground/sumo-sovd) | Campaign orchestrator over SOVD |
 | [SOVDd](https://github.com/sdv-playground/SOVDd) | SOVD diagnostic server |
 | [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) | Diagnostic GUI |
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

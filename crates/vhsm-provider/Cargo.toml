@@ -2,6 +2,7 @@
 name = "vhsm-provider"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "vHSM-backed HsmCryptoProvider for the guest — implements the handle-addressed contract by forwarding each op over the vhsm-client wire to the host vhsm-ssd"
 
 [dependencies]

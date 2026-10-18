@@ -2,6 +2,7 @@
 name = "vhsm-client"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "The one v3 vHSM wire client — pluggable transport (caller stream / TCP / AF_UNIX / QNX devctl) + optional guest CWT handshake"
 
 [dependencies]

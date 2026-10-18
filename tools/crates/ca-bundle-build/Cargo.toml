@@ -2,6 +2,7 @@
 name = "ca-bundle-build"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Build read-only CA-bundle images (squashfs for Linux, qnx6 for QNX guests). Shipped as a per-VM SUIT component alongside kernel/rootfs."
 
 [dependencies]
