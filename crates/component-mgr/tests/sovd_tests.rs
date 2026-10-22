@@ -1213,11 +1213,7 @@ fn make_node_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, Tes
     }
 
     let router = sovd_api::create_router(sovd_api::AppState::new(backends)).merge(
-        component_mgr::sovd::routes::node_verdict_router(
-            Arc::new(machine.build()),
-            nv.clone(),
-            coord,
-        ),
+        component_mgr::sovd::routes::node_verdict_router(Arc::new(machine.build())),
     );
     (router, nv, keys)
 }

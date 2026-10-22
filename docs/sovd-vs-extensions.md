@@ -71,7 +71,7 @@ spec; all are `x-`-namespaced.
 
 | Route | Method | Purpose |
 |---|---|---|
-| `/data/x-ota-update-state` | GET | node update-transaction state (phase + per-component), polled between campaign steps |
+| `/data/x-ota-update-state` | GET | node update-transaction state: `phase` ∈ Idle/Staging/RebootPending/Trial, `components`, `reboot_owed`, `rebooted_since_arming` — polled between campaign steps |
 | `/components/hsm/data/keys` | GET | HSM key-slot inventory (public metadata only) |
 | `/components/hsm/operations/x-csr/executions` | POST | generate a PKCS#10 CSR for a key slot |
 | `/components/hsm/x-ecu-id` | GET | ECU id = HSM device-key thumbprint (the token `aud`); `text/plain` |
@@ -84,6 +84,29 @@ against each other inside sumo-mm, but SOVDd's component-level verdict routes do
 not share that mutex. Closing that cross-route TOCTOU window requires a shared
 guard in the upstream SOVDd API and is intentionally outside this repository's
 patch.
+
+**Commit is not gated on-device (since 2026-10-22).** Neither the node verdict routes
+nor a component's `preflight_commit` refuse a commit because a node reboot is owed or
+because a bank has no boot witness (`boot_count`). The device reports facts and the
+orchestrator decides:
+
+- `x-ota-update-state.reboot_owed` lists the components whose arming requires the
+  coalesced node reboot and whose trial is unresolved; the bit is set at finalize and
+  cleared only by commit / rollback / abort, so it persists across the reboot.
+- `x-ota-update-state.rebooted_since_arming` says whether `x-runtime.node_boot_id` has
+  changed since that arming (`null` when unknown). `phase` is `RebootPending` while it is
+  `false` and `Trial` once it is `true` (or unknown).
+- Orchestrator rule: `RebootPending` → reset the node first. `Trial` with a non-empty
+  `reboot_owed` → the node rebooted; check health, the reported running bank and
+  `x-ota-installed-manifest`, then commit or roll back. `Trial` with an empty
+  `reboot_owed` → a Local-reset (VM) trial; a verdict is owed.
+- Residual risk, by design: a bootloader fall-back after the reboot is invisible to this
+  process (`running_bank` is seeded from NV `active_bank`). The orchestrator must compare
+  the installed manifest / running release; on hardware the bootloader's boot-status
+  record is the durable answer.
+
+A new flash is still refused while any `reboot_owed` bit is set or a component is in
+trial (one update transaction per ECU) — that is transaction integrity, not a verdict.
 
 Vendor DATA params (served through the standard `/data/{param_id}` route, not
 new routes):

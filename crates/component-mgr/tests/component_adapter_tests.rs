@@ -83,12 +83,13 @@ async fn component_id_and_capabilities() {
 }
 
 #[tokio::test]
-async fn app_preflight_requires_durable_boot_evidence() {
+async fn app_preflight_needs_no_boot_witness_but_refuses_a_bank_mismatch() {
     let app_nv = make_nv();
     {
         let mut nv = app_nv.lock().unwrap();
         let mut boot = nv.read_boot_state().unwrap();
         boot.banks[slots::OS.as_index()].committed = false;
+        boot.banks[slots::OS.as_index()].boot_count = 0;
         nv.write_boot_state(&mut boot).unwrap();
     }
     let app = app_mgr::AppComponent::new(
@@ -99,17 +100,18 @@ async fn app_preflight_requires_durable_boot_evidence() {
         },
         app_nv.clone(),
     );
+    app.preflight_commit().await.unwrap();
+    {
+        let mut nv = app_nv.lock().unwrap();
+        let mut boot = nv.read_boot_state().unwrap();
+        let bank = &mut boot.banks[slots::OS.as_index()];
+        bank.active_bank = bank.active_bank.other();
+        nv.write_boot_state(&mut boot).unwrap();
+    }
     assert!(matches!(
         app.preflight_commit().await,
         Err(MachineError::Busy(_))
     ));
-    {
-        let mut nv = app_nv.lock().unwrap();
-        let mut boot = nv.read_boot_state().unwrap();
-        boot.banks[slots::OS.as_index()].boot_count = 1;
-        nv.write_boot_state(&mut boot).unwrap();
-    }
-    app.preflight_commit().await.unwrap();
 }
 
 #[tokio::test]

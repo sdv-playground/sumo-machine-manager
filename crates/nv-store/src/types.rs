@@ -699,8 +699,8 @@ impl NvRecord for NvVehicle {
 /// session. Written once a node activation reboot is *owed*: that's the one bit
 /// that can't be reconstructed from the per-bank `committed` flags after a power
 /// cycle (a singleshot write-through commits immediately, so "a reboot is still
-/// owed to run the new code" lives nowhere else). The gate reads it to refuse a
-/// new flash while a reboot is pending; the orchestrator reads it (over SOVD) to
+/// owed to run the new code" lives nowhere else). The flash gate refuses a new
+/// flash on an open transaction; the orchestrator reads it (over SOVD) to
 /// reconstruct where a campaign was. `reboot_owed == 0` ⇒ no open session.
 ///
 /// ```text
@@ -708,6 +708,8 @@ impl NvRecord for NvVehicle {
 /// [4..8]    write_seq
 /// [8..40]   session_id (32 bytes; the transaction's provenance — zero = none)
 /// [40..48]  reboot_owed (u64 bitmask over bank sets; bit i = BankSet(i))
+/// [48..64]  armed_boot_id (first 16 bytes of SHA-256 of the node boot id at
+///           arming; zero = unknown)
 /// ```
 ///
 /// `reboot_owed` was a u16 at `[40..42]` until 2026-09-23, when the slot
@@ -716,7 +718,9 @@ impl NvRecord for NvVehicle {
 /// LAST field, each widening is a pure extension — an older record's
 /// trailing bytes (`[42..44]`, then `[44..48]`) are the sector's zero
 /// padding, so it decodes with the upper half zero and the magic did not
-/// need a bump.
+/// need a bump. `armed_boot_id` was appended the same way (48 → 64 on
+/// 2026-10-22, trailing extension): an older record's `[48..64]` is sector
+/// padding, so it decodes with a zero (unknown) id.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NvUpdateSession {
     pub write_seq: u32,
@@ -726,9 +730,18 @@ pub struct NvUpdateSession {
     /// (both reduced to 32 bytes). All-zero ⇒ no open session.
     pub session_id: [u8; 32],
     /// Bank sets that owe the coalesced node reboot (bit i ⇒ `BankSet(i)`).
-    /// Nonzero ⇒ the node is `RebootPending`. One set's bit is read and
-    /// written through `owes` / `set_owed`, never a hand-rolled shift.
+    /// Nonzero ⇒ an unresolved node transaction (set at finalize for a
+    /// component whose activation needs the node reboot; cleared only by
+    /// commit/rollback/abort — it persists across the reboot). The flash gate
+    /// refuses a new flash on it and `x-ota-update-state.reboot_owed` reports
+    /// it. Whether the reboot has happened is `rebooted_since_arming`,
+    /// compared against `armed_boot_id`. One set's bit is read and written
+    /// through `owes` / `set_owed`, never a hand-rolled shift.
     pub reboot_owed: u64,
+    /// The node boot id at arming, reduced by [`Self::boot_id_digest`]. A plain
+    /// observation, never a gate. All-zero ⇒ unknown (never recorded, or a
+    /// pre-2026-10-22 record).
+    pub armed_boot_id: [u8; 16],
 }
 
 impl NvUpdateSession {
@@ -767,13 +780,45 @@ impl NvUpdateSession {
         }
         self.reboot_owed != before
     }
+
+    /// The stored form of a node boot id: the first 16 bytes of SHA-256 over
+    /// its UTF-8 bytes. A stored all-zero digest means "unknown", not a real
+    /// boot id.
+    pub fn boot_id_digest(node_boot_id: &str) -> [u8; 16] {
+        use sha2::{Digest, Sha256};
+        let full: [u8; 32] = Sha256::digest(node_boot_id.as_bytes()).into();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&full[..16]);
+        out
+    }
+
+    /// Record the node boot id at arming (`None` ⇒ unknown, stored as zero);
+    /// returns whether the stored id changed, so a caller writes the record
+    /// only on a change.
+    pub fn record_armed_boot_id(&mut self, node_boot_id: Option<&str>) -> bool {
+        let id = node_boot_id.map_or([0; 16], Self::boot_id_digest);
+        let changed = self.armed_boot_id != id;
+        self.armed_boot_id = id;
+        changed
+    }
+
+    /// Whether the node has rebooted since arming: `None` when either side is
+    /// unknown (no recorded id, or no current boot id), else whether the
+    /// current boot id differs from the armed one.
+    pub fn rebooted_since_arming(&self, current_node_boot_id: Option<&str>) -> Option<bool> {
+        if self.armed_boot_id == [0; 16] {
+            return None;
+        }
+        let current = current_node_boot_id?;
+        Some(self.armed_boot_id != Self::boot_id_digest(current))
+    }
 }
 
 impl NvRecord for NvUpdateSession {
     const MAGIC: u32 = MAGIC_UPDATE_SESSION;
 
     fn size() -> usize {
-        48
+        64
     }
 
     fn write_seq(&self) -> u32 {
@@ -789,6 +834,7 @@ impl NvRecord for NvUpdateSession {
         put_u32_le(buf, 4, self.write_seq);
         put_bytes(buf, 8, &self.session_id);
         put_u64_le(buf, 40, self.reboot_owed);
+        put_bytes(buf, 48, &self.armed_boot_id);
     }
 
     fn deserialize(buf: &[u8]) -> Option<Self> {
@@ -799,6 +845,7 @@ impl NvRecord for NvUpdateSession {
             write_seq: get_u32_le(buf, 4),
             session_id: get_bytes::<32>(buf, 8),
             reboot_owed: get_u64_le(buf, 40),
+            armed_boot_id: get_bytes::<16>(buf, 48),
         })
     }
 }

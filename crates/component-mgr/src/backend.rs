@@ -2016,29 +2016,57 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         Ok(machine_mgr::node_update::Durable {
             session_id: session.session_id,
             reboot_owed,
+            rebooted_since_arming: session
+                .rebooted_since_arming(self.current_node_boot_id().as_deref()),
         })
+    }
+
+    /// The node boot id this process sees now: the coordinator's when it carries
+    /// one, else the one injected via [`with_node_boot_id`](Self::with_node_boot_id).
+    fn current_node_boot_id(&self) -> Option<String> {
+        self.node_coordinator
+            .as_ref()
+            .and_then(|c| c.node_boot_id())
+            .map(str::to_owned)
+            .or_else(|| self.node_boot_id.clone())
     }
 
     /// Set or clear this component's bit in the node-level reboot-owed record
     /// (`NvUpdateSession`) — the durable "a node reboot is owed" marker the gate
-    /// checks. Read-modify-write of the shared node NV; idempotent (writes only on
-    /// a change). The mirror of [`node_reboot_owed`](Self::node_reboot_owed).
+    /// checks. Arming (`owed == true`) also records the current node boot id
+    /// (`armed_boot_id`) so [`node_reboot_owed`](Self::node_reboot_owed) can report
+    /// `rebooted_since_arming`; clearing leaves the armed id alone (it is
+    /// irrelevant once the mask is empty). Read-modify-write of the shared node NV;
+    /// idempotent (writes only on a change). The mirror of
+    /// [`node_reboot_owed`](Self::node_reboot_owed).
     fn set_reboot_owed(&self, owed: bool) -> BackendResult<()> {
+        let boot_id = self.current_node_boot_id();
         let mut nv = self
             .nv
             .lock()
             .map_err(|_| BackendError::Internal("nv lock".into()))?;
         let mut s = nv.read_update_session().unwrap_or_default();
-        if s.set_owed(self.bank_set, owed) {
+        let mut changed = s.set_owed(self.bank_set, owed);
+        if owed {
+            changed |= s.record_armed_boot_id(boot_id.as_deref());
+        }
+        if changed {
             nv.write_update_session(&mut s)
                 .map_err(|e| BackendError::Internal(format!("nv write update-session: {e:?}")))?;
         }
         Ok(())
     }
 
-    /// Refuse a banked commit until the activated bank is proven to be running.
-    /// This is deliberately read-only so a node verdict can preflight every
-    /// candidate before allowing any candidate to mutate durable state.
+    /// Refuse a banked commit only on facts this process can see: an in-memory
+    /// AwaitingReboot transfer, a selector that disagrees with the durable active
+    /// bank or with the bank this process booted from, or a provider that reports
+    /// a pending reboot. The ECU does NOT veto on an owed node reboot or on a boot
+    /// witness (`boot_count`): the orchestrator proves the reboot from
+    /// `x-ota-update-state` (`rebooted_since_arming`), `x-runtime.node_boot_id`
+    /// and the heartbeat `boot_id`, and decides commit/rollback. A bootloader
+    /// fall-back is invisible to this process (`running_bank` is seeded from NV
+    /// `active_bank`), so that too is the orchestrator's call. Read-only so a node
+    /// verdict can preflight every candidate before any mutates durable state.
     pub fn preflight_commit(&self) -> BackendResult<()> {
         if self.config.single_bank {
             return Ok(());
@@ -2053,12 +2081,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         {
             return Err(BackendError::Busy(
                 "commit refused: component is awaiting reboot".into(),
-            ));
-        }
-
-        if !self.node_reboot_owed()?.reboot_owed.is_empty() {
-            return Err(BackendError::Busy(
-                "commit refused: durable node reboot is still owed".into(),
             ));
         }
 
@@ -2079,29 +2101,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 bank.active_bank
             )));
         }
-        // No boot-counter gate for a vm-service-backed guest. Who writes that
-        // counter decides whether it can gate: the boot manager
-        // (`vm-boot::process_boot`) for a bank set the host itself boots, or
-        // `ecu_reset`'s simulation witness for a component with no vm-service. A
-        // guest reboots INSIDE the hypervisor, so the only writer is supernova's
-        // `confirm_started_vm_trial`, and it only writes after the GUEST produces
-        // two progressing healthy heartbeats within 120 s. Gate the commit on that
-        // and a guest whose heartbeat chain is not up (vm2 on the rig) is
-        // permanently uncommittable — "no durable boot witness" on
-        // `x-ota-commit-trials` even though the node came up by itself. The
-        // heartbeat is a health signal; making it a commit precondition is the ECU
-        // contesting a commit on evidence it cannot reliably obtain.
-        //
-        // The reboot check belongs to the ORCHESTRATOR, which holds the boot id it
-        // saw before the reset and compares it with the one this component now
-        // reports (`x-runtime.node_boot_id` / the heartbeat `boot_id`). The ECU
-        // reports facts and runs the health check (`VmHeartbeatProgress`, which
-        // drives the Verifying→Activated promotion); it does not veto.
-        if self.vm_service_addr.is_none() && !bank.committed && bank.boot_count == 0 {
-            return Err(BackendError::Busy(format!(
-                "commit refused: selected bank {selected:?} has no durable boot witness"
-            )));
-        }
+        // The owed-bit and boot-witness (`boot_count == 0`) gates were removed on
+        // 2026-10-22: proving the reboot is the orchestrator's call, not an ECU veto.
 
         let running = *self.running_bank.lock().unwrap();
         if selected != running {
@@ -3059,6 +3060,10 @@ pub(crate) fn node_in_trial_labels<D: BlockDevice>(
 /// flash's way — by its durable reboot-owed bit, which `admit` refuses on with
 /// precedence; a Local-reset VM never sets that bit, which is why the
 /// armed-pre-reboot window was only ever visible through this set.
+///
+/// Only Local-reset components (VM guests) enter this set via `boot_count`; a
+/// `RequiresEcuReset` component is covered by its owed bit, which now persists
+/// until the verdict.
 pub(crate) fn node_live_trial_labels<D: BlockDevice>(
     nv: &NvStore<D>,
     coord: &machine_mgr::node_update::NodeCoordinator,
@@ -5343,19 +5348,21 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // state marks the durable reboot-owed bit — the only record of "a node
         // reboot is owed" that survives a power cycle (or a failed/refused
         // reset), which the in-memory flash state does not. It stays set until
-        // the node is CONFIRMED running the armed bank (supernova's
-        // `NvStore::confirm_running_bank` at boot) or the trial is resolved
-        // (commit/rollback → `resolve_node_transaction`).
+        // the trial is resolved (commit/rollback/abort →
+        // `resolve_node_transaction`); nothing clears it at boot. It is the
+        // durable "this node transaction is unresolved and needed a node reboot"
+        // marker the flash gate refuses on, reported on
+        // `x-ota-update-state.reboot_owed`, with `rebooted_since_arming` (from the
+        // node boot id recorded here) saying whether the reboot has happened.
         //
         // This now covers BANKED `RequiresEcuReset` components (host-os), not
         // just write-through singleshots (rt). Why banked needs it: after arm,
         // `committed == false` alone reads as phase `Trial` (commit-allowed),
         // but the node hasn't rebooted into the armed bank yet — and a trial
-        // that falls back to the recovery bank never will. The owed bit makes
-        // the phase `RebootPending` from arm until confirmation; a fall-back
-        // leaves it set → commit refused → the campaign fails honestly and
-        // rolls back. `Local`-reset components (VMs: qvm/process cycle) never
-        // owe a node reboot and are excluded. Sibling-safe: the orchestrator
+        // that falls back to the recovery bank never will. The owed bit keeps
+        // the transaction unresolved from arm until the verdict. `Local`-reset
+        // components (VMs: qvm/process cycle) never owe a node reboot and are
+        // excluded. Sibling-safe: the orchestrator
         // stages every component before any finalize (the ordering rt's
         // existing mark already relies on), so marking here never refuses a
         // not-yet-started sibling. See docs/design/node-update-state.md.
@@ -5792,6 +5799,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             let ft = self.flash_transfer.lock().unwrap();
             ft.as_ref().map(|t| t.state)
         };
+        let node_boot_id = self.current_node_boot_id();
 
         let nv = self
             .nv
@@ -5815,6 +5823,19 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             None => match flash_state {
                 Some(s) => s,
                 None if active_meta.is_none() && previous_meta.is_none() => FlashState::Initial,
+                // A reconstructed owed trial whose node has not rebooted since
+                // arming is still awaiting that reboot: SOVDd's x-update maps
+                // AwaitingReboot → ACTIVATING and Activated →
+                // ACTIVATED_UNCOMMITTED. An observation, not a veto — the commit
+                // preflight only reads the in-memory transfer.
+                None if !status.committed && {
+                    let session = nv.read_update_session().unwrap_or_default();
+                    session.owes(self.bank_set)
+                        && session.rebooted_since_arming(node_boot_id.as_deref()) == Some(false)
+                } =>
+                {
+                    FlashState::AwaitingReboot
+                }
                 None if !status.committed => FlashState::Activated, // trial without transfer (e.g. after restart)
                 None => FlashState::Complete,                       // idle — no active update
             },
@@ -9379,10 +9400,9 @@ mod bank_provider_injection_tests {
         assert_eq!(b.nv.lock().unwrap().read_update_session(), before_session);
     }
 
-    #[tokio::test]
-    async fn banked_commit_preflight_rejects_durable_reboot_and_bank_mismatch() {
-        let provider = Arc::new(SentinelProvider::new(Some(Bank::A)));
-        let b = backend_with_commit_provider(provider.clone(), false);
+    /// Arm VM1 into a bank-B trial on `b`'s NV with no boot witness and the
+    /// durable reboot-owed bit set — the shape the removed gates used to veto.
+    fn arm_owed_bank_b_without_witness(b: &ComponentBackend<MemBlockDevice>) {
         {
             let mut nv = b.nv.lock().unwrap();
             let mut boot = nv.read_boot_state().unwrap();
@@ -9393,7 +9413,15 @@ mod bank_provider_injection_tests {
             nv.write_boot_state(&mut boot).unwrap();
         }
         b.set_reboot_owed(true).unwrap();
-        let reconstructed = ComponentBackend::with_options(
+    }
+
+    /// A clone of `b` rebuilt on the same NV, as after a process restart:
+    /// `running_bank` seeds from the NV active bank.
+    fn reconstruct(
+        b: &ComponentBackend<MemBlockDevice>,
+        provider: Arc<SentinelProvider>,
+    ) -> ComponentBackend<MemBlockDevice> {
+        ComponentBackend::with_options(
             slots::VM1,
             b.nv.clone(),
             Arc::new(NoopManifest),
@@ -9402,36 +9430,91 @@ mod bank_provider_injection_tests {
             None,
             None,
         )
-        .with_bank_provider(provider.clone());
-        let err = reconstructed.commit_flash().await.unwrap_err();
+        .with_bank_provider(provider)
+    }
+
+    #[tokio::test]
+    async fn banked_commit_preflight_rejects_bank_mismatch_only() {
+        let provider = Arc::new(SentinelProvider::new(Some(Bank::A)));
+        let b = backend_with_commit_provider(provider.clone(), false);
+        arm_owed_bank_b_without_witness(&b);
+
+        // The owed bit and the missing boot witness are not vetoes; the
+        // selector disagreeing with the durable active bank is.
+        let err = b.commit_flash().await.unwrap_err();
         assert!(matches!(err, BackendError::Busy(_)));
-        assert!(err.to_string().contains("durable node reboot"));
+        assert!(err.to_string().contains("durable active bank"), "{err}");
         assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
 
-        // Clearing reboot_owed after reconstruction is not sufficient when
-        // the provider and durable selector disagree.
-        reconstructed.set_reboot_owed(false).unwrap();
-        let err = reconstructed.commit_flash().await.unwrap_err();
-        assert!(matches!(err, BackendError::Busy(_)));
-        assert!(err.to_string().contains("durable active bank"));
-        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
-
-        // Once the provider agrees, the armed bank still needs durable proof
-        // that it actually booted.
+        // The selector now agrees with NV, but this (pre-arm) process still
+        // runs bank A.
         *provider.selected.lock().unwrap() = Some(Bank::B);
-        let err = reconstructed.commit_flash().await.unwrap_err();
+        let err = b.commit_flash().await.unwrap_err();
         assert!(matches!(err, BackendError::Busy(_)));
-        assert!(err.to_string().contains("no durable boot witness"));
+        assert!(err.to_string().contains("running bank"), "{err}");
         assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    }
 
+    #[tokio::test]
+    async fn banked_commit_succeeds_without_boot_witness_and_clears_owed_bit() {
+        let provider = Arc::new(SentinelProvider::new(Some(Bank::B)));
+        let b = backend_with_commit_provider(provider.clone(), false);
+        arm_owed_bank_b_without_witness(&b);
+        let reconstructed = reconstruct(&b, provider.clone());
+        assert!(reconstructed.vm_service_addr.is_none());
+
+        reconstructed.commit_flash().await.unwrap();
+
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+        let session =
+            b.nv.lock()
+                .unwrap()
+                .read_update_session()
+                .unwrap_or_default();
+        assert!(!session.owes(slots::VM1));
+    }
+
+    #[tokio::test]
+    async fn reconstructed_trial_reports_awaiting_reboot_until_the_node_boot_id_changes() {
+        let provider = Arc::new(SentinelProvider::new(Some(Bank::B)));
+        let b = backend_with_commit_provider(provider.clone(), false)
+            .with_node_boot_id("boot-x".into());
         {
             let mut nv = b.nv.lock().unwrap();
-            let mut boot = nv.read_boot_state().unwrap();
-            boot.banks[slots::VM1.as_index()].boot_count = 1;
-            nv.write_boot_state(&mut boot).unwrap();
+            let mut meta = NvFwMeta {
+                gen: 1,
+                ..Default::default()
+            };
+            nv.write_fw_meta(slots::VM1, Bank::B, &mut meta).unwrap();
         }
-        assert!(matches!(b.commit_flash().await, Err(BackendError::Busy(_))));
-        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+        arm_owed_bank_b_without_witness(&b);
+        assert_eq!(
+            b.nv.lock()
+                .unwrap()
+                .read_update_session()
+                .unwrap()
+                .armed_boot_id,
+            NvUpdateSession::boot_id_digest("boot-x")
+        );
+
+        let same_boot = reconstruct(&b, provider.clone()).with_node_boot_id("boot-x".into());
+        assert_eq!(
+            same_boot.get_activation_state().await.unwrap().state,
+            FlashState::AwaitingReboot
+        );
+        let rebooted = reconstruct(&b, provider.clone()).with_node_boot_id("boot-y".into());
+        assert_eq!(
+            rebooted.get_activation_state().await.unwrap().state,
+            FlashState::Activated
+        );
+        let unknown = reconstruct(&b, provider.clone());
+        assert_eq!(
+            unknown.get_activation_state().await.unwrap().state,
+            FlashState::Activated
+        );
+
+        rebooted.commit_flash().await.unwrap();
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
     }
 
     /// Records the `arm_enrollment` calls `commit_flash` makes; every other
@@ -9522,7 +9605,7 @@ mod bank_provider_injection_tests {
     }
 
     #[tokio::test]
-    async fn banked_commit_succeeds_with_matching_boot_witness() {
+    async fn banked_commit_succeeds_in_trial() {
         let provider = Arc::new(SentinelProvider::new(Some(Bank::A)));
         let b = backend_with_commit_provider(provider.clone(), false);
         {
@@ -9530,7 +9613,6 @@ mod bank_provider_injection_tests {
             let mut boot = nv.read_boot_state().unwrap();
             let bank = &mut boot.banks[slots::VM1.as_index()];
             bank.committed = false;
-            bank.boot_count = 1;
             nv.write_boot_state(&mut boot).unwrap();
         }
 
@@ -9758,11 +9840,16 @@ mod bank_provider_injection_tests {
         // stayed wedged in Staging/RebootPending and the node never returned to
         // Idle. Both paths now route through `resolve_node_transaction`; this proves
         // the hook clears the durable reboot-owed bit AND drops the component from
-        // the coordinator's staging.
-        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new(vec![(
-            slots::VM1.as_index(),
-            "vm1".to_string(),
-        )]));
+        // the coordinator's staging. The coordinator carries a node boot id so the
+        // armed-and-not-yet-rebooted state reads as RebootPending (without one,
+        // `rebooted_since_arming` is unknown and the phase is Trial).
+        let coord = Arc::new(
+            machine_mgr::node_update::NodeCoordinator::new(vec![(
+                slots::VM1.as_index(),
+                "vm1".to_string(),
+            )])
+            .with_node_boot_id("boot-x"),
+        );
         let b = backend().with_node_coordinator(coord.clone());
         let id = b.entity_info().id.clone();
 
@@ -12624,6 +12711,74 @@ mod copy_forward_tests {
     /// manifest-only finalize harness with a `RequiresEcuReset` activator.
     #[tokio::test]
     async fn banked_requires_ecu_reset_finalize_marks_reboot_owed() {
+        let (backend, _nv, keystore, _tmp) = finalize_banked_requires_ecu_reset(None).await;
+
+        // The fix: arming a banked RequiresEcuReset component now owes a node reboot.
+        assert_eq!(
+            backend.node_reboot_owed().unwrap().reboot_owed,
+            vec![format!("bank-set {}", slots::VM1.as_index())]
+        );
+
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// Arming records the node boot id it armed under, so a later process can
+    /// tell whether the node has rebooted since.
+    #[tokio::test]
+    async fn finalize_records_armed_boot_id() {
+        let (backend, nv, keystore, _tmp) =
+            finalize_banked_requires_ecu_reset(Some("boot-x")).await;
+
+        assert_eq!(
+            nv.lock()
+                .unwrap()
+                .read_update_session()
+                .unwrap()
+                .armed_boot_id,
+            NvUpdateSession::boot_id_digest("boot-x")
+        );
+        assert_eq!(
+            backend.node_reboot_owed().unwrap().rebooted_since_arming,
+            Some(false)
+        );
+        let on_nv = || {
+            ComponentBackend::with_options(
+                slots::VM1,
+                nv.clone(),
+                Arc::new(NoopManifest),
+                ComponentConfig::default(),
+                None,
+                None,
+                None,
+            )
+        };
+        assert_eq!(
+            on_nv()
+                .with_node_boot_id("boot-y".into())
+                .node_reboot_owed()
+                .unwrap()
+                .rebooted_since_arming,
+            Some(true)
+        );
+        assert_eq!(
+            on_nv().node_reboot_owed().unwrap().rebooted_since_arming,
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// Finalize a manifest-only push for a banked `RequiresEcuReset` VM1
+    /// (optionally under a node boot id). Returns the backend, its NV, the HSM
+    /// keystore to clean up and the images tempdir guard.
+    async fn finalize_banked_requires_ecu_reset(
+        node_boot_id: Option<&str>,
+    ) -> (
+        ComponentBackend<MemBlockDevice>,
+        Arc<Mutex<NvStore<MemBlockDevice>>>,
+        std::path::PathBuf,
+        tempfile::TempDir,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let images_dir = tmp.path().to_path_buf();
 
@@ -12655,6 +12810,10 @@ mod copy_forward_tests {
         })
         .with_hsm_crypto(crypto)
         .with_bank_activator(Arc::new(EcuResetActivator));
+        let backend = match node_boot_id {
+            Some(id) => backend.with_node_boot_id(id.into()),
+            None => backend,
+        };
 
         // Precondition: banked + RequiresEcuReset, and nothing owed yet.
         assert_eq!(
@@ -12703,14 +12862,7 @@ mod copy_forward_tests {
         DiagnosticBackend::finalize_flash(&backend)
             .await
             .expect("banked RequiresEcuReset finalize");
-
-        // The fix: arming a banked RequiresEcuReset component now owes a node reboot.
-        assert_eq!(
-            backend.node_reboot_owed().unwrap().reboot_owed,
-            vec![format!("bank-set {}", slots::VM1.as_index())]
-        );
-
-        let _ = std::fs::remove_dir_all(&keystore);
+        (backend, nv, keystore, tmp)
     }
 
     /// Pull-path finalize end-to-end: the un-pushed component is FETCHED by

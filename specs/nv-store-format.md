@@ -203,8 +203,13 @@ replay an old epoch into validity.
 
 ## Update Session
 
-Node update-transaction state — the durable "a node reboot is owed" marker the flash gate
-checks. `reboot_owed == 0` means no open session.
+Node update-transaction state — the durable "this node transaction is unresolved and
+needed a node reboot" marker. Set at finalize for a component whose activation needs the
+node reboot and cleared only by commit / rollback / abort, so it persists across the reboot.
+The flash gate refuses a new flash on it and `x-ota-update-state.reboot_owed` reports it;
+nothing on the device vetoes a commit on it. `armed_boot_id` records the node boot id at
+arming so the node can report `rebooted_since_arming` as an observation. `reboot_owed == 0`
+means no open session.
 
 ```
 Offset        Size  Field
@@ -212,14 +217,16 @@ Offset        Size  Field
 0x04          4     write_seq
 0x08          32    session_id   (the transaction's provenance; all-zero = none)
 0x28          8     reboot_owed  (u64 bitmask; bit i = slot i owes the node reboot)
-0x30..0xFFC   --    zero padding
+0x30          16    armed_boot_id (first 16 bytes of SHA-256 of the node boot id at arming; all-zero = unknown)
+0x40..0xFFC   --    zero padding
 0xFFC         4     crc32
 ```
 
-Total: 48 bytes of payload. History: `reboot_owed` was a u16 until 2026-09-23 and a u32
-until 2026-09-28 — the slot cap is the mask's width. Being the last field, each widening
-was a pure extension: an older record's missing upper bytes are the sector's zero padding
-and decode as zero, so the `NVU1` magic never changed.
+Total: 64 bytes of payload. History: `reboot_owed` was a u16 until 2026-09-23 and a u32
+until 2026-09-28 — the slot cap is the mask's width; `armed_boot_id` was added on
+2026-10-22 (48 → 64 bytes). Each change was a trailing, pure extension: an older record's
+missing bytes are the sector's zero padding and decode as zero (an unknown boot id), so
+the `NVU1` magic never changed.
 
 ## Integrity
 

@@ -14,7 +14,7 @@ use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use machine_mgr::node_update::{Durable, NodeCoordinator, NodePhase, NodeUpdateState};
+use machine_mgr::node_update::{Durable, NodeCoordinator, NodeUpdateState};
 use machine_mgr::{Component, FlashId, FlashState, Machine, MachineError};
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
@@ -42,11 +42,16 @@ pub fn update_state_router<D: BlockDevice + Send + 'static>(
 }
 
 /// The `x-ota-update-state` resource body — the node's update-transaction
-/// phase plus the component ids the transaction covers.
+/// phase plus the component ids the transaction covers. `reboot_owed`:
+/// components whose arming requires the node reboot and whose trial is
+/// unresolved; `rebooted_since_arming`: whether the node boot id has changed
+/// since that arming (null = unknown).
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct UpdateStateResponse {
     pub phase: String,
     pub components: Vec<String>,
+    pub reboot_owed: Vec<String>,
+    pub rebooted_since_arming: Option<bool>,
 }
 
 /// `GET /vehicle/v1/data/x-ota-update-state` — the handler behind
@@ -56,7 +61,7 @@ pub(crate) struct UpdateStateResponse {
     path = "/vehicle/v1/data/x-ota-update-state",
     tag = "x-extensions",
     responses(
-        (status = 200, description = "The node's update-transaction phase and the components it covers.", body = UpdateStateResponse),
+        (status = 200, description = "The node's update-transaction phase, the components it covers, the components owing the node reboot (`reboot_owed`), and whether the node has rebooted since arming (`rebooted_since_arming`, null = unknown).", body = UpdateStateResponse),
     ),
 )]
 pub(crate) async fn update_state<D: BlockDevice>(
@@ -67,12 +72,14 @@ pub(crate) async fn update_state<D: BlockDevice>(
     Json(UpdateStateResponse {
         phase: st.phase.as_str().to_string(),
         components: st.components,
+        reboot_owed: st.reboot_owed,
+        rebooted_since_arming: st.rebooted_since_arming,
     })
 }
 
 /// Derive the node's update-transaction state from NV + the coordinator's
-/// in-memory staging — the shared derivation behind both the
-/// `x-ota-update-state` resource and the commit gate ([`handle_verdict`]).
+/// in-memory staging — the derivation behind the `x-ota-update-state` resource
+/// (there is no commit gate on it).
 /// Translates the durable reboot-owed bitmask and per-bank `committed` flags
 /// into component labels, then folds in the coordinator's staging.
 fn derive_node_update_state<D: BlockDevice>(
@@ -94,6 +101,7 @@ fn derive_node_update_state<D: BlockDevice>(
             Durable {
                 session_id: session.session_id,
                 reboot_owed,
+                rebooted_since_arming: session.rebooted_since_arming(coord.node_boot_id()),
             },
             in_trial,
         )
@@ -550,37 +558,8 @@ fn verdict_response(
     (code, Json(VerdictExecution { execution, nonce })).into_response()
 }
 
-/// The commit gate's refusal (HTTP 409): a commit was issued while the node
-/// still owes its activation reboot — the armed bank is not the running bank
-/// yet, and a trial that fell back to the recovery bank must not be committed
-/// (field-proven). Rendered as a failed execution so clients read the reason
-/// from the same shape as a normal verdict, with the `nonce` echoed.
-fn commit_reboot_pending(execution_id: String, nonce: Option<String>) -> axum::response::Response {
-    let now = chrono::Utc::now();
-    let execution = OperationExecution {
-        execution_id,
-        operation_id: Verdict::Commit.op_id().to_string(),
-        status: OperationStatus::Failed,
-        result: None,
-        error: Some(
-            "commit refused: a reboot is pending (armed bank not booted) — reset the ECU and let \
-             the trial run"
-                .to_string(),
-        ),
-        started_at: now,
-        completed_at: Some(now),
-    };
-    (
-        StatusCode::CONFLICT,
-        Json(VerdictExecution { execution, nonce }),
-    )
-        .into_response()
-}
-
-async fn handle_verdict<D: BlockDevice>(
+async fn handle_verdict(
     machine: Arc<dyn Machine>,
-    nv: Arc<Mutex<NvStore<D>>>,
-    coord: Arc<NodeCoordinator>,
     verdict: Verdict,
     req: Option<VerdictRequest>,
     verdict_lock: Arc<tokio::sync::Mutex<()>>,
@@ -592,18 +571,8 @@ async fn handle_verdict<D: BlockDevice>(
     let nonce = req.and_then(|r| r.nonce);
     let execution_id = uuid::Uuid::new_v4().to_string();
 
-    // Commit gate: refuse while the node still owes its activation reboot. In
-    // that phase the armed bank has not been booted (a trial boot can fall back
-    // to the recovery bank — selector/armed state ≠ running), so committing
-    // would lock in a bank the node never ran. `RebootPending` is derived from
-    // NV exactly like the `x-ota-update-state` wire, and is always reachable.
-    // Rollback is the recovery path and is never gated here.
-    if let Verdict::Commit = verdict {
-        if derive_node_update_state(&nv, &coord).phase == NodePhase::RebootPending {
-            return commit_reboot_pending(execution_id, nonce);
-        }
-    }
-
+    // No node-level gate: each component's own `preflight_commit` (process-local
+    // facts) still runs for every candidate before any mutates (`run_verdict`).
     let out = run_verdict(machine.components(), verdict).await;
     let acted = out.acted.len();
     let skipped = out.skipped.len();
@@ -642,18 +611,16 @@ async fn handle_verdict<D: BlockDevice>(
     request_body(content = VerdictRequest, description = "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape)."),
     responses(
         (status = 200, description = "Verdict applied across the node's in-trial components (`result.committed` / `skipped`).", body = VerdictExecution),
-        (status = 409, description = "Refused: a node activation reboot is still owed (armed bank not booted).", body = VerdictExecution),
+        (status = 409, description = "Refused: a component's commit preflight reported Busy (awaiting reboot, selector/bank mismatch, provider pending reboot).", body = VerdictExecution),
         (status = 500, description = "One or more components failed to commit (failed execution).", body = VerdictExecution),
     ),
 )]
-pub(crate) async fn commit_trials<D: BlockDevice>(
+pub(crate) async fn commit_trials(
     machine: Arc<dyn Machine>,
-    nv: Arc<Mutex<NvStore<D>>>,
-    coord: Arc<NodeCoordinator>,
     req: Option<VerdictRequest>,
     verdict_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> axum::response::Response {
-    handle_verdict(machine, nv, coord, Verdict::Commit, req, verdict_lock).await
+    handle_verdict(machine, Verdict::Commit, req, verdict_lock).await
 }
 
 /// `POST /vehicle/v1/operations/x-ota-rollback-trials/executions` — the node
@@ -669,49 +636,33 @@ pub(crate) async fn commit_trials<D: BlockDevice>(
         (status = 500, description = "One or more components failed to roll back (failed execution).", body = VerdictExecution),
     ),
 )]
-pub(crate) async fn rollback_trials<D: BlockDevice>(
+pub(crate) async fn rollback_trials(
     machine: Arc<dyn Machine>,
-    nv: Arc<Mutex<NvStore<D>>>,
-    coord: Arc<NodeCoordinator>,
     req: Option<VerdictRequest>,
     verdict_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> axum::response::Response {
-    handle_verdict(machine, nv, coord, Verdict::Rollback, req, verdict_lock).await
+    handle_verdict(machine, Verdict::Rollback, req, verdict_lock).await
 }
 
-pub fn node_verdict_router<D: BlockDevice + Send + 'static>(
-    machine: Arc<dyn Machine>,
-    nv: Arc<Mutex<NvStore<D>>>,
-    coord: Arc<NodeCoordinator>,
-) -> Router {
+pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
     let verdict_lock = Arc::new(tokio::sync::Mutex::new(()));
     let commit_machine = machine.clone();
-    let commit_nv = nv.clone();
-    let commit_coord = coord.clone();
     let commit_lock = verdict_lock.clone();
     Router::new()
         .route(
             "/vehicle/v1/operations/x-ota-commit-trials/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = commit_machine.clone();
-                let nv = commit_nv.clone();
-                let coord = commit_coord.clone();
                 let verdict_lock = commit_lock.clone();
-                async move {
-                    commit_trials(machine, nv, coord, req.map(|Json(r)| r), verdict_lock).await
-                }
+                async move { commit_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
         )
         .route(
             "/vehicle/v1/operations/x-ota-rollback-trials/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = machine.clone();
-                let nv = nv.clone();
-                let coord = coord.clone();
                 let verdict_lock = verdict_lock.clone();
-                async move {
-                    rollback_trials(machine, nv, coord, req.map(|Json(r)| r), verdict_lock).await
-                }
+                async move { rollback_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
         )
 }
@@ -919,7 +870,8 @@ mod tests {
         nv_with(NvBootState::default(), None)
     }
 
-    /// RebootPending: a node reboot is owed (bit 4, vm1) — armed, not yet booted.
+    /// The owed bit for slot 4 (vm1) is set — an unresolved transaction, before
+    /// or after its reboot.
     fn nv_reboot_pending() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
         nv_with(
             NvBootState::default(),
@@ -934,12 +886,7 @@ mod tests {
     fn nv_trial() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
         let mut boot = NvBootState::default();
         boot.banks[4].committed = false;
-        boot.banks[4].boot_count = 1;
         nv_with(boot, None)
-    }
-
-    fn coord() -> Arc<NodeCoordinator> {
-        Arc::new(NodeCoordinator::new(Vec::new()))
     }
 
     /// A `POST` to `uri`, with a JSON `{"nonce": …}` body when `nonce` is set
@@ -965,7 +912,7 @@ mod tests {
     /// The `execution_id` from one commit POST against an idle node.
     async fn commit_execution_id() -> String {
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
-        let router = node_verdict_router(machine_with(&[stub]), nv_idle(), coord());
+        let router = node_verdict_router(machine_with(&[stub]));
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
         body_json(resp).await["execution_id"]
             .as_str()
@@ -1037,38 +984,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_refused_while_reboot_pending() {
-        // The node owes an activation reboot: the armed bank hasn't been booted,
-        // so a commit must be refused (409) with the phase named — never acting
-        // on the component.
-        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-        let router = node_verdict_router(
-            machine_with(std::slice::from_ref(&stub)),
-            nv_reboot_pending(),
-            coord(),
-        );
-
-        let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
-
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        assert_eq!(stub.commits.load(Ordering::SeqCst), 0);
-        let body = body_json(resp).await;
-        assert_eq!(
-            body["error"],
-            "commit refused: a reboot is pending (armed bank not booted) — reset the ECU and let the trial run"
-        );
-    }
-
-    #[tokio::test]
     async fn commit_proceeds_in_valid_trial() {
-        // Rebooted into the trial bank (no reboot owed): the gate lets the commit
-        // through and it acts on the in-trial component (existing behavior).
+        // An in-trial component is committed (there is no node-level gate;
+        // components preflight themselves).
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-        let router = node_verdict_router(
-            machine_with(std::slice::from_ref(&stub)),
-            nv_trial(),
-            coord(),
-        );
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
 
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
 
@@ -1081,11 +1001,7 @@ mod tests {
     async fn commit_preflights_all_candidates_before_mutating_any() {
         let first = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
         let refusing = Arc::new(VerdictStub::refusing_commit("vm2"));
-        let router = node_verdict_router(
-            machine_with(&[first.clone(), refusing.clone()]),
-            nv_trial(),
-            coord(),
-        );
+        let router = node_verdict_router(machine_with(&[first.clone(), refusing.clone()]));
 
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
 
@@ -1104,11 +1020,7 @@ mod tests {
     async fn mixed_preflight_failures_return_500_not_409() {
         let busy = Arc::new(VerdictStub::refusing_commit("vm1"));
         let internal = Arc::new(VerdictStub::failing_commit_preflight("vm2"));
-        let router = node_verdict_router(
-            machine_with(&[busy.clone(), internal.clone()]),
-            nv_trial(),
-            coord(),
-        );
+        let router = node_verdict_router(machine_with(&[busy.clone(), internal.clone()]));
 
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
 
@@ -1120,11 +1032,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_busy_failure_returns_documented_409() {
         let refusing = Arc::new(VerdictStub::refusing_rollback("vm1"));
-        let router = node_verdict_router(
-            machine_with(std::slice::from_ref(&refusing)),
-            nv_trial(),
-            coord(),
-        );
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&refusing)));
 
         let resp = router.oneshot(post(ROLLBACK_URI, None)).await.unwrap();
 
@@ -1139,11 +1047,7 @@ mod tests {
     #[tokio::test]
     async fn node_verdict_router_serializes_commit_and_rollback() {
         let component = Arc::new(VerdictStub::slow("vm1"));
-        let router = node_verdict_router(
-            machine_with(std::slice::from_ref(&component)),
-            nv_trial(),
-            coord(),
-        );
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&component)));
 
         let (commit, rollback) = tokio::join!(
             router.clone().oneshot(post(COMMIT_URI, None)),
@@ -1157,10 +1061,10 @@ mod tests {
 
     #[tokio::test]
     async fn commit_proceeds_when_idle() {
-        // An idle node (nothing in trial) commits as a no-op success — the gate
-        // only refuses RebootPending.
+        // An idle node (nothing in trial) commits as a no-op success — there is
+        // no node-level gate; components preflight themselves.
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
-        let router = node_verdict_router(machine_with(&[stub]), nv_idle(), coord());
+        let router = node_verdict_router(machine_with(&[stub]));
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -1170,11 +1074,7 @@ mod tests {
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
 
         // A supplied nonce is echoed verbatim in the execution record.
-        let router = node_verdict_router(
-            machine_with(std::slice::from_ref(&stub)),
-            nv_idle(),
-            coord(),
-        );
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
         let resp = router
             .oneshot(post(COMMIT_URI, Some("abc-123")))
             .await
@@ -1183,7 +1083,7 @@ mod tests {
         assert_eq!(body_json(resp).await["nonce"], "abc-123");
 
         // No body ⇒ old-client shape: no `nonce` field.
-        let router = node_verdict_router(machine_with(&[stub]), nv_idle(), coord());
+        let router = node_verdict_router(machine_with(&[stub]));
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
         assert!(body_json(resp).await.get("nonce").is_none());
     }
@@ -1200,17 +1100,78 @@ mod tests {
     // Shape-identity guards: the named response structs must serialize to the
     // exact JSON the handlers emitted as ad-hoc `serde_json::json!` before the
     // utoipa refactor (the regen test only covers the doc, not the wire).
-    #[test]
-    fn update_state_response_shape_is_stable() {
-        let resp = UpdateStateResponse {
-            phase: "RebootPending".to_string(),
-            components: vec!["vm1".to_string(), "hsm".to_string()],
-        };
+    /// The `x-ota-update-state` body for `nv`, with vm1 on slot 4 and the node
+    /// currently booted as `boot_id`.
+    async fn update_state_json(
+        nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
+        boot_id: &str,
+    ) -> serde_json::Value {
+        let coord = NodeCoordinator::new(vec![(4, "vm1".to_string())]).with_node_boot_id(boot_id);
+        serde_json::to_value(update_state(nv, Arc::new(coord)).await.0).unwrap()
+    }
+
+    /// vm1 (slot 4) owed, armed while the node was booted as `boot_id`.
+    fn nv_armed_at(boot_id: &str) -> Arc<Mutex<NvStore<MemBlockDevice>>> {
+        nv_with(
+            NvBootState::default(),
+            Some(NvUpdateSession {
+                reboot_owed: 1 << 4,
+                armed_boot_id: NvUpdateSession::boot_id_digest(boot_id),
+                ..Default::default()
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn update_state_response_shape_is_stable() {
+        // Idle: empty lists, unknown reboot.
         assert_eq!(
-            serde_json::to_value(&resp).unwrap(),
+            update_state_json(nv_idle(), "boot-a").await,
+            serde_json::json!({
+                "phase": "Idle",
+                "components": [],
+                "reboot_owed": [],
+                "rebooted_since_arming": null,
+            })
+        );
+        // In trial with nothing owed -> Trial, `reboot_owed` empty.
+        assert_eq!(
+            update_state_json(nv_trial(), "boot-a").await,
+            serde_json::json!({
+                "phase": "Trial",
+                "components": ["vm1"],
+                "reboot_owed": [],
+                "rebooted_since_arming": null,
+            })
+        );
+        // Owed, arming boot id unknown (zero): not provably pre-reboot -> Trial.
+        assert_eq!(
+            update_state_json(nv_reboot_pending(), "boot-a").await,
+            serde_json::json!({
+                "phase": "Trial",
+                "components": ["vm1"],
+                "reboot_owed": ["vm1"],
+                "rebooted_since_arming": null,
+            })
+        );
+        // Owed, still on the arming boot -> RebootPending.
+        assert_eq!(
+            update_state_json(nv_armed_at("boot-a"), "boot-a").await,
             serde_json::json!({
                 "phase": "RebootPending",
-                "components": ["vm1", "hsm"],
+                "components": ["vm1"],
+                "reboot_owed": ["vm1"],
+                "rebooted_since_arming": false,
+            })
+        );
+        // Owed, booted since arming -> Trial.
+        assert_eq!(
+            update_state_json(nv_armed_at("boot-a"), "boot-b").await,
+            serde_json::json!({
+                "phase": "Trial",
+                "components": ["vm1"],
+                "reboot_owed": ["vm1"],
+                "rebooted_since_arming": true,
             })
         );
     }
