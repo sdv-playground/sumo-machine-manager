@@ -1363,3 +1363,59 @@ async fn commit_trials_resolves_both_components_after_one_coalesced_reboot() {
         assert!(bank.committed, "{set:?} committed in NV: {bank:?}");
     }
 }
+
+/// The x-update extension pack beside x-ota: a two-phase registration pauses
+/// the banked execute, ACTIVATING until the orchestrator's reset and
+/// ACTIVATED_UNCOMMITTED once it runs the new bank, and an x-update verb settles it.
+async fn x_update_cycle(router: &axum::Router, envelope: Vec<u8>, verb: &str) -> serde_json::Value {
+    let (status, body) = post_json(
+        router,
+        "/vehicle/v1/components/vm1/updates",
+        serde_json::json!({ "x-update": { "two_phase": true } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
+    let update_id = body["update_id"].as_str().unwrap().to_string();
+    let base = format!("/vehicle/v1/components/vm1/updates/{update_id}");
+    let (status, _) = put_bytes(router, &format!("{base}/bulk-data/manifest"), envelope).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = put_empty(router, &format!("{base}/prepare")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let prepared = poll_status_until_terminal(router, "vm1", &update_id).await;
+    assert_eq!(prepared["x-update"]["state"], "VALIDATED", "{prepared}");
+    let (status, _) = put_empty(router, &format!("{base}/execute")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    // Armed but not yet running the new bank: ACTIVATING until the
+    // orchestrator's reset, ACTIVATED_UNCOMMITTED once it runs it.
+    let paused = poll_status_until_awaiting_verdict(router, "vm1", &update_id).await;
+    assert_eq!(paused["x-update"]["state"], "ACTIVATING", "{paused}");
+    if verb == "x-update-commit" {
+        activation_reset(router, "vm1").await;
+        let (_, trial) = get(router, &format!("{base}/status")).await;
+        assert_eq!(
+            trial["x-update"]["state"], "ACTIVATED_UNCOMMITTED",
+            "{trial}"
+        );
+    }
+    let (status, _) = put_empty(router, &format!("{base}/{verb}")).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    poll_status_until_terminal(router, "vm1", &update_id).await
+}
+
+#[tokio::test]
+async fn x_update_commit_via_sovd() {
+    let (router, _, keys) = make_router();
+    let envelope = make_test_suit_envelope(&keys, "vm1", 3, &vec![0xCC; 1024]);
+    let final_body = x_update_cycle(&router, envelope, "x-update-commit").await;
+    assert_eq!(final_body["status"], "completed");
+    assert_eq!(final_body["x-update"]["state"], "COMMITTED");
+}
+
+#[tokio::test]
+async fn x_update_rollback_via_sovd() {
+    let (router, _, keys) = make_router();
+    let envelope = make_test_suit_envelope(&keys, "vm1", 4, &vec![0xDD; 1024]);
+    let final_body = x_update_cycle(&router, envelope, "x-update-rollback").await;
+    assert_eq!(final_body["status"], "failed");
+    assert_eq!(final_body["x-update"]["state"], "ROLLED_BACK");
+}

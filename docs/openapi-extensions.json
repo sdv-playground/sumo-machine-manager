@@ -495,6 +495,134 @@
           }
         }
       }
+    },
+    "/vehicle/v1/updates/{update_id}/x-update-commit": {
+      "put": {
+        "tags": [
+          "x-extensions"
+        ],
+        "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); the\nx-update extension pack, beside x-ota.",
+        "operationId": "x_update_commit",
+        "parameters": [
+          {
+            "name": "update_id",
+            "in": "path",
+            "description": "The update; resolved to its component.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Commit posted; poll .../status.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "URL of the update status resource."
+              }
+            }
+          },
+          "409": {
+            "description": "The update is not ACTIVATED_UNCOMMITTED."
+          }
+        }
+      }
+    },
+    "/vehicle/v1/updates/{update_id}/x-update-finish": {
+      "put": {
+        "tags": [
+          "x-extensions"
+        ],
+        "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); the\nx-update extension pack, beside x-ota.",
+        "operationId": "x_update_finish",
+        "parameters": [
+          {
+            "name": "update_id",
+            "in": "path",
+            "description": "The update; resolved to its component.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The terminal update is cleaned up and awaits its DELETE."
+          },
+          "409": {
+            "description": "The update is not committed, rolled back or failed."
+          }
+        }
+      }
+    },
+    "/vehicle/v1/updates/{update_id}/x-update-invalidate": {
+      "put": {
+        "tags": [
+          "x-extensions"
+        ],
+        "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); the\nx-update extension pack, beside x-ota.",
+        "operationId": "x_update_invalidate",
+        "parameters": [
+          {
+            "name": "update_id",
+            "in": "path",
+            "description": "The update; resolved to its component.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The preparation is discarded; the update is READY again."
+          },
+          "409": {
+            "description": "The update is not VALIDATED."
+          }
+        }
+      }
+    },
+    "/vehicle/v1/updates/{update_id}/x-update-rollback": {
+      "put": {
+        "tags": [
+          "x-extensions"
+        ],
+        "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); the\nx-update extension pack, beside x-ota.",
+        "operationId": "x_update_rollback",
+        "parameters": [
+          {
+            "name": "update_id",
+            "in": "path",
+            "description": "The update; resolved to its component.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Rollback posted; poll .../status.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "URL of the update status resource."
+              }
+            }
+          },
+          "409": {
+            "description": "The update is not ACTIVATED_UNCOMMITTED."
+          }
+        }
+      }
     }
   },
   "components": {

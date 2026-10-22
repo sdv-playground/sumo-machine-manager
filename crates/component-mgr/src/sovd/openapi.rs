@@ -64,6 +64,10 @@ there."
         doc::x_ota_commit,
         doc::x_ota_rollback,
         doc::x_ota_force_rollback,
+        doc::x_update_commit,
+        doc::x_update_rollback,
+        doc::x_update_finish,
+        doc::x_update_invalidate,
     ),
     components(schemas(
         super::routes::UpdateStateResponse,
@@ -168,4 +172,68 @@ pub(crate) mod doc {
         ),
     )]
     pub(crate) fn x_ota_force_rollback() {}
+
+    /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); the
+    /// x-update extension pack, beside x-ota.
+    #[utoipa::path(
+        put,
+        path = "/vehicle/v1/updates/{update_id}/x-update-commit",
+        tag = "x-extensions",
+        params(
+            ("update_id" = String, Path, description = "The update; resolved to its component."),
+        ),
+        responses(
+            (status = 202, description = "Commit posted; poll .../status.", headers(("Location" = String, description = "URL of the update status resource."))),
+            (status = 409, description = "The update is not ACTIVATED_UNCOMMITTED."),
+        ),
+    )]
+    pub(crate) fn x_update_commit() {}
+
+    /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); the
+    /// x-update extension pack, beside x-ota.
+    #[utoipa::path(
+        put,
+        path = "/vehicle/v1/updates/{update_id}/x-update-rollback",
+        tag = "x-extensions",
+        params(
+            ("update_id" = String, Path, description = "The update; resolved to its component."),
+        ),
+        responses(
+            (status = 202, description = "Rollback posted; poll .../status.", headers(("Location" = String, description = "URL of the update status resource."))),
+            (status = 409, description = "The update is not ACTIVATED_UNCOMMITTED."),
+        ),
+    )]
+    pub(crate) fn x_update_rollback() {}
+
+    /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); the
+    /// x-update extension pack, beside x-ota.
+    #[utoipa::path(
+        put,
+        path = "/vehicle/v1/updates/{update_id}/x-update-finish",
+        tag = "x-extensions",
+        params(
+            ("update_id" = String, Path, description = "The update; resolved to its component."),
+        ),
+        responses(
+            (status = 204, description = "The terminal update is cleaned up and awaits its DELETE."),
+            (status = 409, description = "The update is not committed, rolled back or failed."),
+        ),
+    )]
+    pub(crate) fn x_update_finish() {}
+
+    /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); the
+    /// x-update extension pack, beside x-ota.
+    #[utoipa::path(
+        put,
+        path = "/vehicle/v1/updates/{update_id}/x-update-invalidate",
+        tag = "x-extensions",
+        params(
+            ("update_id" = String, Path, description = "The update; resolved to its component."),
+        ),
+        responses(
+            (status = 204, description = "The preparation is discarded; the update is READY again."),
+            (status = 409, description = "The update is not VALIDATED."),
+        ),
+    )]
+    pub(crate) fn x_update_invalidate() {}
 }
