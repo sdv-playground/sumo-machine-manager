@@ -180,16 +180,18 @@ pub struct NvStore<D: BlockDevice> {
 
 /// Outcome of [`NvStore::confirm_running_bank`] — whether the node is running
 /// the bank it armed for a bank set, and thus whether that set's node-level
-/// reboot-owed marker was cleared. The caller logs the distinction
-/// (trial-live vs still-owed).
+/// reboot-owed marker was cleared.
+///
+/// Legacy boot-time witness with no in-repo caller: nothing in sumo-mm gates a
+/// commit on this verdict (or on `boot_count`) any more. Slated for removal
+/// once the host repos stop calling it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunningBankVerdict {
     /// The running bank matches the armed bank: the reboot-owed bit was cleared
-    /// (or was already clear) — the banked trial is live and may be committed.
+    /// (or was already clear).
     Confirmed { bank: Bank },
     /// The running bank differs from the armed bank — a trial boot that fell
-    /// back to the recovery bank. The reboot-owed bit is LEFT set, so the node
-    /// stays `RebootPending` and a commit is refused (the safety property).
+    /// back to the recovery bank. The reboot-owed bit is LEFT set.
     Mismatch { running: Bank, armed: Bank },
     /// No boot state recorded yet (a fresh device): nothing to confirm.
     NoBootState,
@@ -340,8 +342,13 @@ impl<D: BlockDevice> NvStore<D> {
     }
 
     /// Confirm the node is running the bank it armed for `bank_set` and, on a
-    /// match, clear that set's node-level reboot-owed bit — the banked-trial
-    /// confirmation the `RebootPending` commit gate relies on.
+    /// match, clear that set's node-level reboot-owed bit.
+    ///
+    /// Legacy boot-time witness with no in-repo caller: nothing in sumo-mm
+    /// gates a commit on its result or on `boot_count` any more (whether the
+    /// node rebooted since arming is `NvUpdateSession::rebooted_since_arming`,
+    /// a plain observation). Kept code-identical only because host repos still
+    /// call it; slated for removal once they stop.
     ///
     /// Contract: `running_bank` is a TRUSTED boot-time signal — the bank the
     /// bootloader actually launched (e.g. the `SELECTED_OS_BANK` env the
@@ -349,12 +356,13 @@ impl<D: BlockDevice> NvStore<D> {
     /// have mis-flipped. The ARMED bank is read from NV (`active_bank` for the
     /// set — the pointer `finalize_flash` flipped). The reboot-owed bit is
     /// cleared ONLY when `running_bank == armed`; a mismatch (a trial that fell
-    /// back to the recovery bank) LEAVES it set, so the node stays
-    /// `RebootPending` and a commit is refused. Idempotent: a match with the bit
-    /// already clear is a no-op `Confirmed`.
+    /// back to the recovery bank) LEAVES it set. Idempotent: a match with the
+    /// bit already clear is a no-op `Confirmed`.
     ///
-    /// The counterpart to component-mgr's `set_reboot_owed(true)` mark at
-    /// finalize/arm: mark on arm, clear on confirmed `running == armed`.
+    /// Historically the counterpart to component-mgr's `set_reboot_owed(true)`
+    /// mark at finalize/arm (mark on arm, clear on confirmed
+    /// `running == armed`); in-repo, `reboot_owed` is now cleared only by
+    /// commit/rollback/abort.
     pub fn confirm_running_bank(
         &mut self,
         bank_set: BankSet,
@@ -372,11 +380,10 @@ impl<D: BlockDevice> NvStore<D> {
             });
         }
 
-        // Persist the positive boot witness before clearing reboot_owed. The
-        // component commit gate requires this counter after process restart;
-        // clearing the reboot marker first could otherwise make a witnessed
-        // hardware trial permanently uncommittable if the boot-state write
-        // failed.
+        // Legacy: persist the positive boot witness before clearing
+        // reboot_owed. Nothing in sumo-mm reads `boot_count` as a commit gate
+        // any more; the ordering is kept only so the host repos still calling
+        // this see unchanged behaviour until it is removed.
         if !state.banks[bank_index].committed && state.banks[bank_index].boot_count == 0 {
             state.banks[bank_index].boot_count = 1;
             self.write_boot_state(&mut state)?;

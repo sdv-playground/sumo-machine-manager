@@ -1,9 +1,16 @@
 //! Node-level update-transaction state — the coordinator logic the
 //! [`MachineRegistry`](crate::machine::MachineRegistry) owns. **One update
-//! transaction at a time per ECU:** while a node reboot is owed or a trial is
-//! unresolved, a new flash session is refused; a sibling component joins the
+//! transaction at a time per ECU:** while a node reboot is owed (armed, whether or
+//! not it has happened yet) or a trial is unresolved, a new flash session is
+//! refused; a sibling component joins the
 //! *same* `Staging` transaction only if its session id matches — so two updates
 //! never get coalesced into one reboot.
+//!
+//! Phases: `Idle` → `Staging` (in-memory) → `RebootPending` (armed, no reboot
+//! observed since arming) → `Trial` (rebooted into the staged banks, or a
+//! Local-reset component in trial) → verdict → `Idle`. `RebootPending` vs `Trial`
+//! is derived from an observed fact — has the node rebooted since arming
+//! ([`Durable::rebooted_since_arming`]) — not assumed from the owed record alone.
 //!
 //! The phase/gate logic here is pure. [`NodeCoordinator`] holds the in-memory
 //! [`Staging`]; the caller (component-mgr, which holds NV + the components) feeds it the
@@ -25,9 +32,12 @@ pub enum NodePhase {
     Idle,
     /// A component has an open flash session (a transaction is being assembled).
     Staging,
-    /// A node activation reboot is owed (issued-but-unconfirmed) — the durable phase.
+    /// Armed for a node reboot and no reboot observed since arming (the node boot
+    /// id recorded at arming still matches). A plain observation: nothing on the
+    /// device vetoes a verdict on it; the orchestrator decides to reset.
     RebootPending,
-    /// Rebooted into the staged banks; components in-trial awaiting a verdict.
+    /// Rebooted into the staged banks (or a Local-reset component in trial);
+    /// components await a verdict.
     Trial,
 }
 
@@ -49,6 +59,11 @@ pub struct NodeUpdateState {
     pub phase: NodePhase,
     pub session_id: Option<SessionId>,
     pub components: Vec<String>,
+    /// Components whose arming requires the coalesced node reboot (the durable
+    /// owed set), whether or not that reboot has happened.
+    pub reboot_owed: Vec<String>,
+    /// Whether the node has rebooted since arming (`None` = unknown).
+    pub rebooted_since_arming: Option<bool>,
 }
 
 impl NodeUpdateState {
@@ -57,6 +72,8 @@ impl NodeUpdateState {
             phase: NodePhase::Idle,
             session_id: None,
             components: Vec::new(),
+            reboot_owed: Vec::new(),
+            rebooted_since_arming: None,
         }
     }
 }
@@ -76,10 +93,13 @@ pub struct Staging {
 pub struct Durable {
     /// The open transaction's session id (`NO_SESSION` ⇒ none).
     pub session_id: SessionId,
-    /// Components that still owe the coalesced node reboot (RebootPending). Empty
-    /// once the reboot is confirmed — the transaction is then `Trial`, which is
-    /// derived from per-component `committed`, the session id retained.
+    /// Components whose arming requires the coalesced node reboot. Set at
+    /// finalize, cleared only by commit/rollback/abort — persists across the
+    /// reboot. Whether that reboot has happened is `rebooted_since_arming`.
     pub reboot_owed: Vec<String>,
+    /// Whether the node has rebooted since arming (the boot id recorded at arming
+    /// differs from the current one). `None` = unknown.
+    pub rebooted_since_arming: Option<bool>,
 }
 
 impl Durable {
@@ -113,7 +133,7 @@ impl std::fmt::Display for Refused {
         match self {
             Refused::RebootPending(c) => write!(
                 f,
-                "node owes an activation reboot for {c:?} — reboot or roll back before starting a new flash"
+                "an unresolved update owes a node reboot for {c:?} — reboot the node if not yet done, then commit or roll back before starting a new flash"
             ),
             Refused::Trial(c) => write!(
                 f,
@@ -129,25 +149,37 @@ impl std::fmt::Display for Refused {
 }
 
 /// Derive the node phase + snapshot from the durable facts and the in-memory
-/// `staging`. Precedence: RebootPending > Trial > Staging > Idle — a transaction
-/// advances through those, and the most-advanced one wins.
+/// `staging`. Precedence: RebootPending (owed and observed not rebooted) > Trial
+/// (owed with a reboot observed or unknown, or any in-trial component) > Staging >
+/// Idle — a transaction advances through those, and the most-advanced one wins.
 pub fn derive(
     durable: &Durable,
     in_trial: &[String],
     staging: Option<&Staging>,
 ) -> NodeUpdateState {
-    if !durable.reboot_owed.is_empty() {
+    if !durable.reboot_owed.is_empty() && durable.rebooted_since_arming == Some(false) {
         return NodeUpdateState {
             phase: NodePhase::RebootPending,
             session_id: Some(durable.session_id),
             components: durable.reboot_owed.clone(),
+            reboot_owed: durable.reboot_owed.clone(),
+            rebooted_since_arming: Some(false),
         };
     }
-    if !in_trial.is_empty() {
+    if !durable.reboot_owed.is_empty() || !in_trial.is_empty() {
+        // Owed first, then in-trial components not already named.
+        let mut components = durable.reboot_owed.clone();
+        for c in in_trial {
+            if !components.contains(c) {
+                components.push(c.clone());
+            }
+        }
         return NodeUpdateState {
             phase: NodePhase::Trial,
             session_id: durable.has_session().then_some(durable.session_id),
-            components: in_trial.to_vec(),
+            components,
+            reboot_owed: durable.reboot_owed.clone(),
+            rebooted_since_arming: durable.rebooted_since_arming,
         };
     }
     if let Some(s) = staging {
@@ -155,6 +187,8 @@ pub fn derive(
             phase: NodePhase::Staging,
             session_id: Some(s.session_id),
             components: s.components.clone(),
+            reboot_owed: vec![],
+            rebooted_since_arming: None,
         };
     }
     NodeUpdateState::idle()
@@ -211,6 +245,9 @@ pub struct NodeCoordinator {
     /// refusal name the components instead of "bank-set N". Built from the
     /// machine's components at construction.
     id_map: Vec<(usize, String)>,
+    /// The node's current boot id (compared against the one recorded at arming to
+    /// observe whether the node has rebooted since). `None` = unknown.
+    node_boot_id: Option<String>,
 }
 
 impl NodeCoordinator {
@@ -220,7 +257,19 @@ impl NodeCoordinator {
         Self {
             staging: RwLock::new(None),
             id_map,
+            node_boot_id: None,
         }
+    }
+
+    /// Set the node's current boot id.
+    pub fn with_node_boot_id(mut self, id: impl Into<String>) -> Self {
+        self.node_boot_id = Some(id.into());
+        self
+    }
+
+    /// The node's current boot id, if known.
+    pub fn node_boot_id(&self) -> Option<&str> {
+        self.node_boot_id.as_deref()
     }
 
     /// Name a bank set by its index, via the id map; falls back to "bank-set N".
@@ -268,8 +317,8 @@ impl NodeCoordinator {
 
     /// Take and clear the in-memory staging — called when staging is promoted to
     /// the durable NV reboot-owed record (the node reboot is issued), so the
-    /// transaction moves `Staging` -> `RebootPending` with the NV record now the
-    /// authority. Returns what was staged (the components owing the reboot).
+    /// transaction moves `Staging` -> `RebootPending` (until a reboot is observed)
+    /// with the NV record now the authority. Returns what was staged (the components owing the reboot).
     pub fn take_staging(&self) -> Option<Staging> {
         self.staging.write().expect("staging lock poisoned").take()
     }
@@ -331,8 +380,18 @@ mod tests {
         let durable = Durable {
             session_id: A,
             reboot_owed: ids(&["rt"]),
+            ..Default::default()
         };
         let mut staging = None;
+        let r = admit(B, "vm1", &durable, &[], &mut staging);
+        assert_eq!(r.unwrap_err(), Refused::RebootPending(ids(&["rt"])));
+        assert!(staging.is_none());
+        // Still refused once the reboot has been observed — the owed set is cleared
+        // only by commit/rollback/abort.
+        let durable = Durable {
+            rebooted_since_arming: Some(true),
+            ..durable
+        };
         let r = admit(B, "vm1", &durable, &[], &mut staging);
         assert_eq!(r.unwrap_err(), Refused::RebootPending(ids(&["rt"])));
         assert!(staging.is_none());
@@ -360,22 +419,67 @@ mod tests {
         let s = derive(&Durable::default(), &[], Some(&st));
         assert_eq!(s.phase, NodePhase::Staging);
         assert_eq!(s.session_id, Some(A));
-        // Trial (session id retained from the durable record, reboot_owed cleared)
+        assert_eq!(s.reboot_owed, Vec::<String>::new());
+        assert_eq!(s.rebooted_since_arming, None);
+        // Trial from in-trial only (session id retained, nothing owed)
         let durable = Durable {
             session_id: A,
-            reboot_owed: vec![],
+            ..Default::default()
         };
         let s = derive(&durable, &ids(&["vm1"]), Some(&st));
         assert_eq!(s.phase, NodePhase::Trial);
         assert_eq!(s.session_id, Some(A));
         assert_eq!(s.components, ids(&["vm1"]));
-        // RebootPending dominates everything below it
+        assert_eq!(s.reboot_owed, Vec::<String>::new());
+        // Owed, no reboot observed since arming -> RebootPending dominates
         let durable = Durable {
             session_id: A,
             reboot_owed: ids(&["rt"]),
+            rebooted_since_arming: Some(false),
         };
         let s = derive(&durable, &ids(&["vm1"]), Some(&st));
         assert_eq!(s.phase, NodePhase::RebootPending);
         assert_eq!(s.components, ids(&["rt"]));
+        assert_eq!(s.reboot_owed, ids(&["rt"]));
+        assert_eq!(s.rebooted_since_arming, Some(false));
+        // Owed, rebooted since arming -> Trial, owed first then in-trial
+        let durable = Durable {
+            rebooted_since_arming: Some(true),
+            ..durable
+        };
+        let s = derive(&durable, &ids(&["vm1"]), Some(&st));
+        assert_eq!(s.phase, NodePhase::Trial);
+        assert_eq!(s.session_id, Some(A));
+        assert_eq!(s.components, ids(&["rt", "vm1"]));
+        assert_eq!(s.reboot_owed, ids(&["rt"]));
+        assert_eq!(s.rebooted_since_arming, Some(true));
+        // Owed, reboot unknown -> Trial
+        let durable = Durable {
+            rebooted_since_arming: None,
+            ..durable
+        };
+        let s = derive(&durable, &[], None);
+        assert_eq!(s.phase, NodePhase::Trial);
+        assert_eq!(s.components, ids(&["rt"]));
+        assert_eq!(s.rebooted_since_arming, None);
+        // A component both owed and in trial is named once
+        let durable = Durable {
+            session_id: A,
+            reboot_owed: ids(&["vm1"]),
+            rebooted_since_arming: Some(true),
+        };
+        let s = derive(&durable, &ids(&["vm1"]), None);
+        assert_eq!(s.components, ids(&["vm1"]));
+    }
+
+    #[test]
+    fn node_boot_id_defaults_to_none_and_is_settable() {
+        assert_eq!(NodeCoordinator::new(vec![]).node_boot_id(), None);
+        assert_eq!(
+            NodeCoordinator::new(vec![])
+                .with_node_boot_id("abc")
+                .node_boot_id(),
+            Some("abc")
+        );
     }
 }

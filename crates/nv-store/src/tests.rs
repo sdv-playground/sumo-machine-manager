@@ -904,23 +904,98 @@ fn u32_era_update_session_decodes_with_a_zero_upper_half() {
 }
 
 #[test]
-fn update_session_wire_layout_is_48_bytes() {
+fn update_session_wire_layout_is_64_bytes() {
     // `size()` is the one layout number the compiler cannot check.
-    assert_eq!(NvUpdateSession::size(), 48);
+    assert_eq!(NvUpdateSession::size(), 64);
     assert_eq!(NvBootState::size(), 200);
 
     let s = NvUpdateSession {
         write_seq: 9,
         session_id: [0x3C; 32],
         reboot_owed: 0x8000_0001_0000_0004,
+        armed_boot_id: [0xC3; 16],
     };
     let mut sector = vec![0u8; SECTOR_SIZE];
     s.serialize(&mut sector);
     assert_eq!(sector[40..48], s.reboot_owed.to_le_bytes());
+    assert_eq!(sector[48..64], s.armed_boot_id);
     assert!(
-        sector[48..].iter().all(|&b| b == 0),
-        "nothing past [40..48]"
+        sector[64..].iter().all(|&b| b == 0),
+        "nothing past [48..64]"
     );
+}
+
+// --- armed_boot_id: 48 -> 64 (pure trailing extension) ---
+
+#[test]
+fn update_session_round_trips_the_armed_boot_id() {
+    let mut store = make_store();
+    let mut s = NvUpdateSession {
+        reboot_owed: 0b10,
+        ..Default::default()
+    };
+    assert!(s.record_armed_boot_id(Some("boot-a")));
+    assert_ne!(s.armed_boot_id, [0; 16]);
+    store.write_update_session(&mut s).unwrap();
+
+    let read = store.read_update_session().unwrap();
+    assert_eq!(read.armed_boot_id, s.armed_boot_id);
+    assert_eq!(read.reboot_owed, 0b10);
+    assert_eq!(read.rebooted_since_arming(Some("boot-a")), Some(false));
+}
+
+#[test]
+fn pre_boot_id_update_session_decodes_with_an_unknown_boot_id() {
+    // A 48-byte-era record: [48..64] is sector padding.
+    let mut sector = vec![0u8; SECTOR_SIZE];
+    sector[0..4].copy_from_slice(&MAGIC_UPDATE_SESSION.to_le_bytes());
+    sector[4..8].copy_from_slice(&5u32.to_le_bytes());
+    sector[8..40].copy_from_slice(&[0x77; 32]);
+    sector[40..48].copy_from_slice(&0x10u64.to_le_bytes());
+    let crc = crc32fast::hash(&sector[..SECTOR_SIZE - 4]);
+    sector[SECTOR_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+
+    let mut dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    dev.write(layout::UPDATE_SESSION_OFFSET, &sector).unwrap();
+    let store = NvStore::new(dev);
+
+    let s = store
+        .read_update_session()
+        .expect("48-byte-era record decodes");
+    assert_eq!(s.write_seq, 5);
+    assert_eq!(s.session_id, [0x77; 32]);
+    assert_eq!(s.reboot_owed, 0x10);
+    assert_eq!(s.armed_boot_id, [0; 16]);
+    assert_eq!(s.rebooted_since_arming(Some("x")), None);
+}
+
+#[test]
+fn boot_id_digest_and_rebooted_since_arming() {
+    assert_eq!(
+        NvUpdateSession::boot_id_digest("x"),
+        NvUpdateSession::boot_id_digest("x")
+    );
+    assert_ne!(
+        NvUpdateSession::boot_id_digest("x"),
+        NvUpdateSession::boot_id_digest("y")
+    );
+
+    let mut s = NvUpdateSession::default();
+    assert_eq!(s.rebooted_since_arming(Some("x")), None, "nothing recorded");
+    assert!(s.record_armed_boot_id(Some("x")));
+    assert!(!s.record_armed_boot_id(Some("x")), "same id: unchanged");
+    assert_eq!(s.armed_boot_id, NvUpdateSession::boot_id_digest("x"));
+    assert_eq!(s.rebooted_since_arming(Some("x")), Some(false));
+    assert_eq!(s.rebooted_since_arming(Some("y")), Some(true));
+    assert_eq!(s.rebooted_since_arming(None), None, "current unknown");
+
+    assert!(
+        s.record_armed_boot_id(None),
+        "clearing to unknown is a change"
+    );
+    assert_eq!(s.armed_boot_id, [0; 16]);
+    assert!(!s.record_armed_boot_id(None));
+    assert_eq!(s.rebooted_since_arming(Some("x")), None);
 }
 
 #[test]

@@ -253,7 +253,7 @@
         "operationId": "update_state",
         "responses": {
           "200": {
-            "description": "The node's update-transaction phase and the components it covers.",
+            "description": "The node's update-transaction phase, the components it covers, the components owing the node reboot (`reboot_owed`), and whether the node has rebooted since arming (`rebooted_since_arming`, null = unknown).",
             "content": {
               "application/json": {
                 "schema": {
@@ -296,7 +296,7 @@
             }
           },
           "409": {
-            "description": "Refused: a node activation reboot is still owed (armed bank not booted).",
+            "description": "Refused: a component's commit preflight reported Busy (awaiting reboot, selector/bank mismatch, provider pending reboot).",
             "content": {
               "application/json": {
                 "schema": {
@@ -666,10 +666,11 @@
       },
       "UpdateStateResponse": {
         "type": "object",
-        "description": "The `x-ota-update-state` resource body — the node's update-transaction\nphase plus the component ids the transaction covers.",
+        "description": "The `x-ota-update-state` resource body — the node's update-transaction\nphase plus the component ids the transaction covers. `reboot_owed`:\ncomponents whose arming requires the node reboot and whose trial is\nunresolved; `rebooted_since_arming`: whether the node boot id has changed\nsince that arming (null = unknown).",
         "required": [
           "phase",
-          "components"
+          "components",
+          "reboot_owed"
         ],
         "properties": {
           "components": {
@@ -680,6 +681,18 @@
           },
           "phase": {
             "type": "string"
+          },
+          "reboot_owed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rebooted_since_arming": {
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         }
       },

@@ -222,17 +222,15 @@ impl<D: BlockDevice + Send + 'static> Component for AppComponent<D> {
         Ok(())
     }
 
+    /// Refuse an app commit only on a bank mismatch between durable NV and the
+    /// bank this process runs. No boot-witness gate: the orchestrator proves the
+    /// restart from observables and decides.
     async fn preflight_commit(&self) -> MachineResult<()> {
         let nv = self.nv.lock().unwrap();
         let state = nv
             .read_boot_state()
             .ok_or_else(|| MachineError::Internal("no boot state".into()))?;
         let bank = &state.banks[self.config.slot.as_index()];
-        if !bank.committed && bank.boot_count == 0 {
-            return Err(MachineError::Busy(
-                "commit refused: app trial has no durable boot witness".into(),
-            ));
-        }
         if !bank.committed && bank.active_bank != self.active_bank() {
             return Err(MachineError::Busy(format!(
                 "commit refused: selected bank {:?} does not match running bank {:?}",
