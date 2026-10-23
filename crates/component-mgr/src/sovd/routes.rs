@@ -27,31 +27,47 @@ use sovd_core::{OperationExecution, OperationStatus};
 /// unresolved. Derived from the shared NV reboot-owed record (`NvUpdateSession`)
 /// and per-bank `committed`, plus the coordinator's in-memory staging. An `x-ota`
 /// vendor route (sumo-mm, not SOVDd); see `docs/design/node-update-state.md`.
+///
+/// Also serves `GET /vehicle/v1/data/x-update-state`, an alias with the same
+/// body (both carry `node_boot_id`).
 pub fn update_state_router<D: BlockDevice + Send + 'static>(
     nv: Arc<Mutex<NvStore<D>>>,
     coord: Arc<NodeCoordinator>,
 ) -> Router {
-    Router::new().route(
-        "/vehicle/v1/data/x-ota-update-state",
-        get(move || {
-            let nv = nv.clone();
-            let coord = coord.clone();
-            async move { update_state(nv, coord).await }
-        }),
-    )
+    let alias_nv = nv.clone();
+    let alias_coord = coord.clone();
+    Router::new()
+        .route(
+            "/vehicle/v1/data/x-ota-update-state",
+            get(move || {
+                let nv = nv.clone();
+                let coord = coord.clone();
+                async move { update_state(nv, coord).await }
+            }),
+        )
+        .route(
+            "/vehicle/v1/data/x-update-state",
+            get(move || {
+                let nv = alias_nv.clone();
+                let coord = alias_coord.clone();
+                async move { x_update_state(nv, coord).await }
+            }),
+        )
 }
 
 /// The `x-ota-update-state` resource body — the node's update-transaction
 /// phase plus the component ids the transaction covers. `reboot_owed`:
 /// components whose arming requires the node reboot and whose trial is
 /// unresolved; `rebooted_since_arming`: whether the node boot id has changed
-/// since that arming (null = unknown).
+/// since that arming (null = unknown); `node_boot_id`: the node's current boot
+/// id (null = unknown).
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct UpdateStateResponse {
     pub phase: String,
     pub components: Vec<String>,
     pub reboot_owed: Vec<String>,
     pub rebooted_since_arming: Option<bool>,
+    pub(crate) node_boot_id: Option<String>,
 }
 
 /// `GET /vehicle/v1/data/x-ota-update-state` — the handler behind
@@ -68,12 +84,38 @@ pub(crate) async fn update_state<D: BlockDevice>(
     nv: Arc<Mutex<NvStore<D>>>,
     coord: Arc<NodeCoordinator>,
 ) -> Json<UpdateStateResponse> {
-    let st = derive_node_update_state(&nv, &coord);
+    update_state_body(&nv, &coord)
+}
+
+/// `GET /vehicle/v1/data/x-update-state` — alias of
+/// [`update_state`] with the identical body.
+#[utoipa::path(
+    get,
+    path = "/vehicle/v1/data/x-update-state",
+    tag = "x-extensions",
+    responses(
+        (status = 200, description = "Alias of `x-ota-update-state`: the node's update-transaction phase, the components it covers, `reboot_owed`, `rebooted_since_arming` (null = unknown) and the node's current `node_boot_id` (null = unknown).", body = UpdateStateResponse),
+    ),
+)]
+pub(crate) async fn x_update_state<D: BlockDevice>(
+    nv: Arc<Mutex<NvStore<D>>>,
+    coord: Arc<NodeCoordinator>,
+) -> Json<UpdateStateResponse> {
+    update_state_body(&nv, &coord)
+}
+
+/// The shared body of [`update_state`] and [`x_update_state`].
+fn update_state_body<D: BlockDevice>(
+    nv: &Mutex<NvStore<D>>,
+    coord: &NodeCoordinator,
+) -> Json<UpdateStateResponse> {
+    let st = derive_node_update_state(nv, coord);
     Json(UpdateStateResponse {
         phase: st.phase.as_str().to_string(),
         components: st.components,
         reboot_owed: st.reboot_owed,
         rebooted_since_arming: st.rebooted_since_arming,
+        node_boot_id: coord.node_boot_id().map(str::to_string),
     })
 }
 
@@ -417,6 +459,23 @@ pub(crate) struct VerdictRequest {
     nonce: Option<String>,
 }
 
+/// The verdict word of the `x-update-verdict` body.
+#[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum VerdictWord {
+    Commit,
+    Rollback,
+}
+
+/// Required POST body of the node `x-update-verdict` operation: the verdict,
+/// plus the optional replay `nonce` echoed as in [`VerdictRequest`].
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub(crate) struct NodeVerdictRequest {
+    verdict: VerdictWord,
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
 /// A verdict operation execution with the optional client `nonce` echoed back.
 /// `#[serde(flatten)]` keeps the bare [`OperationExecution`] shape for old
 /// clients (no nonce ⇒ the field is skipped); a supplied nonce is appended
@@ -520,9 +579,11 @@ async fn run_verdict(components: &[Arc<dyn Component>], verdict: Verdict) -> Ver
 
 /// Render a [`VerdictOutcome`] as an ISO 17978-3 §7.14 operation execution.
 /// `execution_id` is freshly minted per POST (never the op id) and `nonce` is
-/// the client's echoed replay token.
+/// the client's echoed replay token. `operation_id` names the route the verdict
+/// came in on; the result key always follows `verdict`.
 fn verdict_response(
     verdict: Verdict,
+    operation_id: &'static str,
     execution_id: String,
     nonce: Option<String>,
     out: VerdictOutcome,
@@ -537,7 +598,7 @@ fn verdict_response(
     let now = chrono::Utc::now();
     let execution = OperationExecution {
         execution_id,
-        operation_id: verdict.op_id().to_string(),
+        operation_id: operation_id.to_string(),
         status: if failed {
             OperationStatus::Failed
         } else {
@@ -563,6 +624,7 @@ async fn handle_verdict(
     verdict: Verdict,
     req: Option<VerdictRequest>,
     verdict_lock: Arc<tokio::sync::Mutex<()>>,
+    operation_id: &'static str,
 ) -> axum::response::Response {
     // Serializes this router's node commit/rollback preflight+mutation window.
     // Component-level SOVDd verdict routes do not share this lock, so they can
@@ -578,13 +640,13 @@ async fn handle_verdict(
     let skipped = out.skipped.len();
     let errors = out.errors.len();
     tracing::info!(
-        op = verdict.op_id(),
+        op = operation_id,
         acted,
         skipped,
         errors,
         "node-level verdict fanned out across the registry"
     );
-    verdict_response(verdict, execution_id, nonce, out)
+    verdict_response(verdict, operation_id, execution_id, nonce, out)
 }
 
 /// Build the node-level commit/rollback verdict routes.
@@ -593,6 +655,9 @@ async fn handle_verdict(
 ///
 ///   `POST /vehicle/v1/operations/x-ota-commit-trials/executions`
 ///   `POST /vehicle/v1/operations/x-ota-rollback-trials/executions`
+///   `POST /vehicle/v1/operations/x-update-verdict/executions` — the same two
+///        verdicts with `{"verdict": "commit"|"rollback"}` in a required body,
+///        on the same lock
 ///
 /// The orchestrator issues ONE verdict per node per campaign step — the update
 /// *session* is the commit unit, never a single component. Entity-root
@@ -620,7 +685,14 @@ pub(crate) async fn commit_trials(
     req: Option<VerdictRequest>,
     verdict_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> axum::response::Response {
-    handle_verdict(machine, Verdict::Commit, req, verdict_lock).await
+    handle_verdict(
+        machine,
+        Verdict::Commit,
+        req,
+        verdict_lock,
+        Verdict::Commit.op_id(),
+    )
+    .await
 }
 
 /// `POST /vehicle/v1/operations/x-ota-rollback-trials/executions` — the node
@@ -641,13 +713,55 @@ pub(crate) async fn rollback_trials(
     req: Option<VerdictRequest>,
     verdict_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> axum::response::Response {
-    handle_verdict(machine, Verdict::Rollback, req, verdict_lock).await
+    handle_verdict(
+        machine,
+        Verdict::Rollback,
+        req,
+        verdict_lock,
+        Verdict::Rollback.op_id(),
+    )
+    .await
+}
+
+/// `POST /vehicle/v1/operations/x-update-verdict/executions` — the node verdict
+/// with the verdict in the body; exactly `x-ota-commit-trials` /
+/// `x-ota-rollback-trials` under one operation id. See [`node_verdict_router`].
+#[utoipa::path(
+    post,
+    path = "/vehicle/v1/operations/x-update-verdict/executions",
+    tag = "x-extensions",
+    request_body(content = NodeVerdictRequest, description = "Required JSON body: `verdict` (`commit` | `rollback`) plus an optional replay `nonce`. A missing or unknown `verdict` word is rejected with 422 (400 for malformed JSON, 415 without `Content-Type: application/json`)."),
+    responses(
+        (status = 200, description = "Verdict applied across the node's in-trial components (`result.committed` or `result.rolled_back`, following the verdict, plus `skipped`).", body = VerdictExecution),
+        (status = 409, description = "Refused: every failure was a transient Busy refusal (e.g. a component's commit preflight).", body = VerdictExecution),
+        (status = 500, description = "One or more components failed to commit / roll back (failed execution).", body = VerdictExecution),
+    ),
+)]
+pub(crate) async fn x_update_verdict(
+    machine: Arc<dyn Machine>,
+    req: NodeVerdictRequest,
+    verdict_lock: Arc<tokio::sync::Mutex<()>>,
+) -> axum::response::Response {
+    let verdict = match req.verdict {
+        VerdictWord::Commit => Verdict::Commit,
+        VerdictWord::Rollback => Verdict::Rollback,
+    };
+    handle_verdict(
+        machine,
+        verdict,
+        Some(VerdictRequest { nonce: req.nonce }),
+        verdict_lock,
+        "x-update-verdict",
+    )
+    .await
 }
 
 pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
     let verdict_lock = Arc::new(tokio::sync::Mutex::new(()));
     let commit_machine = machine.clone();
     let commit_lock = verdict_lock.clone();
+    let alias_machine = machine.clone();
+    let alias_lock = verdict_lock.clone();
     Router::new()
         .route(
             "/vehicle/v1/operations/x-ota-commit-trials/executions",
@@ -663,6 +777,14 @@ pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
                 let machine = machine.clone();
                 let verdict_lock = verdict_lock.clone();
                 async move { rollback_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
+            }),
+        )
+        .route(
+            "/vehicle/v1/operations/x-update-verdict/executions",
+            post(move |Json(req): Json<NodeVerdictRequest>| {
+                let machine = alias_machine.clone();
+                let verdict_lock = alias_lock.clone();
+                async move { x_update_verdict(machine, req, verdict_lock).await }
             }),
         )
 }
@@ -1097,6 +1219,185 @@ mod tests {
         assert_ne!(id1, Verdict::Commit.op_id());
     }
 
+    const VERDICT_URI: &str = "/vehicle/v1/operations/x-update-verdict/executions";
+
+    /// A JSON `POST` to `uri` with an arbitrary body.
+    fn post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn x_update_verdict_commit_matches_commit_trials() {
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
+
+        let resp = router
+            .oneshot(post_json(
+                VERDICT_URI,
+                serde_json::json!({"verdict": "commit"}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(stub.commits.load(Ordering::SeqCst), 1);
+        let body = body_json(resp).await;
+        assert_eq!(body["operation_id"], "x-update-verdict");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["result"]["committed"], serde_json::json!(["vm1"]));
+        assert_eq!(body["result"]["skipped"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn x_update_verdict_rollback_reports_rolled_back_key() {
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
+
+        let resp = router
+            .oneshot(post_json(
+                VERDICT_URI,
+                serde_json::json!({"verdict": "rollback"}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(stub.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.commits.load(Ordering::SeqCst), 0);
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["rolled_back"], serde_json::json!(["vm1"]));
+        assert!(body["result"].get("committed").is_none());
+    }
+
+    #[tokio::test]
+    async fn x_update_verdict_rejects_missing_or_unknown_word() {
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
+
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"verdict": "maybe"}),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(post_json(VERDICT_URI, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        }
+        assert_eq!(stub.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(stub.rollbacks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn x_update_verdict_busy_failure_returns_409() {
+        let refusing = Arc::new(VerdictStub::refusing_rollback("vm1"));
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&refusing)));
+
+        let resp = router
+            .oneshot(post_json(
+                VERDICT_URI,
+                serde_json::json!({"verdict": "rollback"}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(refusing.rollbacks.load(Ordering::SeqCst), 0);
+        assert!(body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("rollback temporarily blocked"));
+    }
+
+    #[tokio::test]
+    async fn x_update_verdict_echoes_nonce_and_mints_unique_execution_ids() {
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
+        let router = node_verdict_router(machine_with(&[stub]));
+
+        let with_nonce = body_json(
+            router
+                .clone()
+                .oneshot(post_json(
+                    VERDICT_URI,
+                    serde_json::json!({"verdict": "commit", "nonce": "n-1"}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(with_nonce["nonce"], "n-1");
+
+        let without = body_json(
+            router
+                .oneshot(post_json(
+                    VERDICT_URI,
+                    serde_json::json!({"verdict": "commit"}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(without.get("nonce").is_none());
+        assert_ne!(with_nonce["execution_id"], without["execution_id"]);
+        assert_ne!(without["execution_id"], "x-update-verdict");
+    }
+
+    #[tokio::test]
+    async fn x_update_verdict_shares_the_lock_with_x_ota_trials() {
+        let component = Arc::new(VerdictStub::slow("vm1"));
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&component)));
+
+        let (alias, ota) = tokio::join!(
+            router.clone().oneshot(post_json(
+                VERDICT_URI,
+                serde_json::json!({"verdict": "commit"})
+            )),
+            router.oneshot(post(ROLLBACK_URI, None))
+        );
+
+        assert!(alias.unwrap().status().is_success());
+        assert!(ota.unwrap().status().is_success());
+        assert_eq!(component.max_verdicts_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    async fn get_json(router: &Router, uri: &str) -> serde_json::Value {
+        let resp = router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    }
+
+    #[tokio::test]
+    async fn x_update_state_alias_matches_x_ota_update_state() {
+        let coord = NodeCoordinator::new(vec![(4, "vm1".to_string())]).with_node_boot_id("boot-b");
+        let router = update_state_router(nv_armed_at("boot-a"), Arc::new(coord));
+
+        let ota = get_json(&router, "/vehicle/v1/data/x-ota-update-state").await;
+        let alias = get_json(&router, "/vehicle/v1/data/x-update-state").await;
+        assert_eq!(ota, alias);
+        assert_eq!(alias["node_boot_id"], "boot-b");
+        assert_eq!(alias["rebooted_since_arming"], true);
+
+        // No boot id configured: `node_boot_id` is an explicit null.
+        let coord = NodeCoordinator::new(vec![(4, "vm1".to_string())]);
+        let router = update_state_router(nv_idle(), Arc::new(coord));
+        let alias = get_json(&router, "/vehicle/v1/data/x-update-state").await;
+        assert_eq!(alias["node_boot_id"], serde_json::Value::Null);
+        assert_eq!(
+            alias,
+            get_json(&router, "/vehicle/v1/data/x-ota-update-state").await
+        );
+    }
+
     // Shape-identity guards: the named response structs must serialize to the
     // exact JSON the handlers emitted as ad-hoc `serde_json::json!` before the
     // utoipa refactor (the regen test only covers the doc, not the wire).
@@ -1132,6 +1433,7 @@ mod tests {
                 "components": [],
                 "reboot_owed": [],
                 "rebooted_since_arming": null,
+                "node_boot_id": "boot-a",
             })
         );
         // In trial with nothing owed -> Trial, `reboot_owed` empty.
@@ -1142,6 +1444,7 @@ mod tests {
                 "components": ["vm1"],
                 "reboot_owed": [],
                 "rebooted_since_arming": null,
+                "node_boot_id": "boot-a",
             })
         );
         // Owed, arming boot id unknown (zero): not provably pre-reboot -> Trial.
@@ -1152,6 +1455,7 @@ mod tests {
                 "components": ["vm1"],
                 "reboot_owed": ["vm1"],
                 "rebooted_since_arming": null,
+                "node_boot_id": "boot-a",
             })
         );
         // Owed, still on the arming boot -> RebootPending.
@@ -1162,6 +1466,7 @@ mod tests {
                 "components": ["vm1"],
                 "reboot_owed": ["vm1"],
                 "rebooted_since_arming": false,
+                "node_boot_id": "boot-a",
             })
         );
         // Owed, booted since arming -> Trial.
@@ -1172,6 +1477,7 @@ mod tests {
                 "components": ["vm1"],
                 "reboot_owed": ["vm1"],
                 "rebooted_since_arming": true,
+                "node_boot_id": "boot-b",
             })
         );
     }

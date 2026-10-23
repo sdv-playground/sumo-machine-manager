@@ -54,16 +54,19 @@ there."
     ),
     paths(
         super::routes::update_state,
+        super::routes::x_update_state,
         super::routes::hsm_keys_list,
         super::routes::hsm_csr_execute,
         super::routes::device_id,
         super::routes::commit_trials,
         super::routes::rollback_trials,
+        super::routes::x_update_verdict,
         super::pull_update::handle_post,
         super::pull_update::get_pull_update_status,
         doc::x_ota_commit,
         doc::x_ota_rollback,
         doc::x_ota_force_rollback,
+        doc::x_update_verdict,
     ),
     components(schemas(
         super::routes::UpdateStateResponse,
@@ -72,6 +75,8 @@ there."
         super::routes::CsrRequest,
         super::routes::CsrResult,
         super::routes::VerdictRequest,
+        super::routes::VerdictWord,
+        super::routes::NodeVerdictRequest,
         super::pull_update::PullUpdateRequest,
         sovd_core::OperationStatus,
         sovd_core::OperationExecution,
@@ -168,4 +173,24 @@ pub(crate) mod doc {
         ),
     )]
     pub(crate) fn x_ota_force_rollback() {}
+
+    /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); see
+    /// SOVDd `docs/x-update.md`.
+    #[utoipa::path(
+        put,
+        path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-update-verdict",
+        tag = "x-extensions",
+        params(
+            ("component_id" = String, Path, description = "Target component."),
+            ("update_id" = String, Path, description = "The /updates entry; must be paused at execute/awaiting-verdict."),
+        ),
+        request_body(content = serde_json::Value, description = "`{\"verdict\": \"commit\" | \"rollback\"}`.", content_type = "application/json", example = json!({"verdict": "commit"})),
+        responses(
+            (status = 202, description = "Verdict posted; poll .../status.", headers(("Location" = String, description = "URL of the update status resource."))),
+            (status = 404, description = "Unknown update."),
+            (status = 409, description = "The update is not awaiting a verdict; `commit` additionally requires the new software running (state TRIAL)."),
+            (status = 422, description = "`verdict` missing or not one of `commit`, `rollback`."),
+        ),
+    )]
+    pub(crate) fn x_update_verdict() {}
 }
