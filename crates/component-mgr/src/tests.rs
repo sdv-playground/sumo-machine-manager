@@ -161,21 +161,6 @@ fn did_dynamic_active_bank() {
 }
 
 #[test]
-fn did_dynamic_committed() {
-    let mut nv = make_nv();
-
-    let val = read_did(&nv, slots::VM1, DID_COMMITTED, None);
-    assert_eq!(val, DidValue::Bytes(vec![1])); // true
-
-    let mut state = nv.read_boot_state().unwrap();
-    state.banks[slots::VM1.as_index()].committed = false;
-    nv.write_boot_state(&mut state).unwrap();
-
-    let val = read_did(&nv, slots::VM1, DID_COMMITTED, None);
-    assert_eq!(val, DidValue::Bytes(vec![0])); // false
-}
-
-#[test]
 fn did_dynamic_security_versions() {
     let mut nv = make_nv();
 

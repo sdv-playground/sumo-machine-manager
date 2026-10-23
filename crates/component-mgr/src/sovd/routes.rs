@@ -9,68 +9,62 @@
 //! to expose the same wire.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use machine_mgr::node_update::{Durable, NodeCoordinator, NodeUpdateState};
+use machine_mgr::node_update::NodeCoordinator;
 use machine_mgr::system_bank_state::{Outcome, Reason, Resolution};
 use machine_mgr::{BankContents, Component, FlashId, FlashState, Machine, MachineError};
-use nv_store::block::BlockDevice;
-use nv_store::store::NvStore;
-use nv_store::types::{Bank, BankSet};
+use nv_store::types::Bank;
 use sovd_core::{OperationExecution, OperationStatus};
 
 /// `GET /vehicle/v1/data/x-ota-update-state` — the node's update-transaction
 /// state (phase + the components involved), for the orchestrator to poll before
 /// each campaign step and refuse to proceed while a prior transaction is
-/// unresolved. Derived from the shared NV reboot-owed record (`NvUpdateSession`)
-/// and per-bank `committed`, plus the coordinator's in-memory staging. An `x-ota`
-/// vendor route (sumo-mm, not SOVDd); see `docs/design/node-update-state.md`.
+/// unresolved. Derived from the components' bank reports (`in_trial`,
+/// `pending_reset`) and the node's reboot observation, which the coordinator
+/// reads, plus its in-memory staging. An
+/// `x-ota` vendor route (sumo-mm, not SOVDd); see `docs/design/node-update-state.md`.
 ///
 /// Also serves `GET /vehicle/v1/data/x-update-state`, an alias with the same
 /// body (both carry `node_boot_id`).
 ///
 /// `machine` supplies the per-component `banks` member (what each bank holds,
-/// from the installed manifests). It is a deliberate signature change: hosts
-/// that merge this router pass the same `Arc<dyn Machine>` they hand
-/// [`node_verdict_router`] when they bump the pin.
-pub fn update_state_router<D: BlockDevice + Send + 'static>(
-    nv: Arc<Mutex<NvStore<D>>>,
-    coord: Arc<NodeCoordinator>,
-    machine: Arc<dyn Machine>,
-) -> Router {
-    let alias_nv = nv.clone();
+/// from the installed manifests) and the boot vector's header. The router
+/// takes no NV store: nothing it reports is read from NV. A deliberate
+/// signature change; hosts that merge this router drop the argument when they
+/// bump the pin.
+pub fn update_state_router(coord: Arc<NodeCoordinator>, machine: Arc<dyn Machine>) -> Router {
     let alias_coord = coord.clone();
     let alias_machine = machine.clone();
     Router::new()
         .route(
             "/vehicle/v1/data/x-ota-update-state",
             get(move || {
-                let nv = nv.clone();
                 let coord = coord.clone();
                 let machine = machine.clone();
-                async move { update_state(nv, coord, machine).await }
+                async move { update_state(coord, machine).await }
             }),
         )
         .route(
             "/vehicle/v1/data/x-update-state",
             get(move || {
-                let nv = alias_nv.clone();
                 let coord = alias_coord.clone();
                 let machine = alias_machine.clone();
-                async move { x_update_state(nv, coord, machine).await }
+                async move { x_update_state(coord, machine).await }
             }),
         )
 }
 
 /// The `x-ota-update-state` resource body — the node's update-transaction
 /// phase plus the component ids the transaction covers. `reboot_owed`:
-/// components whose arming requires the node reboot and whose trial is
-/// unresolved; `rebooted_since_arming`: whether the node boot id has changed
-/// since that arming (null = unknown); `node_boot_id`: the node's current boot
+/// components pending a node reset (their install needs a node reset that has
+/// not happened yet); `rebooted_since_arming`: whether the node has rebooted
+/// since the open trial was armed, from the boot vector's transaction header
+/// (null = unknown); `node_boot_id`: the node's current boot
 /// id (null = unknown); `banks`: what each component's banks hold, per the
 /// installed manifests (not a verification); `trial_boots`: node boots counted
 /// while armed without a verdict (null = no boot-vector trial open or
@@ -183,12 +177,11 @@ impl From<BankContents> for BankContentsResponse {
         (status = 200, description = "The node's update-transaction phase, the components it covers, the components owing the node reboot (`reboot_owed`), and whether the node has rebooted since arming (`rebooted_since_arming`, null = unknown).", body = UpdateStateResponse),
     ),
 )]
-pub(crate) async fn update_state<D: BlockDevice>(
-    nv: Arc<Mutex<NvStore<D>>>,
+pub(crate) async fn update_state(
     coord: Arc<NodeCoordinator>,
     machine: Arc<dyn Machine>,
 ) -> Json<UpdateStateResponse> {
-    update_state_body(&nv, &coord, machine.as_ref())
+    update_state_body(&coord, machine.as_ref())
 }
 
 /// `GET /vehicle/v1/data/x-update-state` — alias of
@@ -201,21 +194,16 @@ pub(crate) async fn update_state<D: BlockDevice>(
         (status = 200, description = "Alias of `x-ota-update-state`: the node's update-transaction phase, the components it covers, `reboot_owed`, `rebooted_since_arming` (null = unknown) and the node's current `node_boot_id` (null = unknown).", body = UpdateStateResponse),
     ),
 )]
-pub(crate) async fn x_update_state<D: BlockDevice>(
-    nv: Arc<Mutex<NvStore<D>>>,
+pub(crate) async fn x_update_state(
     coord: Arc<NodeCoordinator>,
     machine: Arc<dyn Machine>,
 ) -> Json<UpdateStateResponse> {
-    update_state_body(&nv, &coord, machine.as_ref())
+    update_state_body(&coord, machine.as_ref())
 }
 
 /// The shared body of [`update_state`] and [`x_update_state`].
-fn update_state_body<D: BlockDevice>(
-    nv: &Mutex<NvStore<D>>,
-    coord: &NodeCoordinator,
-    machine: &dyn Machine,
-) -> Json<UpdateStateResponse> {
-    let st = derive_node_update_state(nv, coord);
+fn update_state_body(coord: &NodeCoordinator, machine: &dyn Machine) -> Json<UpdateStateResponse> {
+    let st = coord.node_update_state();
     // The boot vector's header is meaningful only while in trial or when it
     // records a resolution; a committed node's leftover header reports nothing.
     let (trial_boots, resolution) = machine.system_bank().map_or((None, None), |sb| {
@@ -258,38 +246,6 @@ fn component_banks(machine: &dyn Machine) -> Vec<ComponentBanksResponse> {
             })
         })
         .collect()
-}
-
-/// Derive the node's update-transaction state from NV + the coordinator's
-/// in-memory staging — the derivation behind the `x-ota-update-state` resource
-/// (there is no commit gate on it).
-/// Translates the durable reboot-owed bitmask and per-bank `committed` flags
-/// into component labels, then folds in the coordinator's staging.
-fn derive_node_update_state<D: BlockDevice>(
-    nv: &Mutex<NvStore<D>>,
-    coord: &NodeCoordinator,
-) -> NodeUpdateState {
-    let (durable, in_trial) = {
-        let nv = nv.lock().expect("nv lock poisoned");
-        let session = nv.read_update_session().unwrap_or_default();
-        let reboot_owed: Vec<String> = (0..nv.slot_count())
-            .filter(|&i| session.owes(BankSet(i as u8)))
-            .map(|i| coord.label(i))
-            .collect();
-        // The in-trial set is derived by the shared `node_in_trial_labels` so this
-        // wire and the node flash gate (`ComponentBackend::ensure_flash_can_start`)
-        // name identical components.
-        let in_trial = crate::backend::node_in_trial_labels(&nv, coord);
-        (
-            Durable {
-                session_id: session.session_id,
-                reboot_owed,
-                rebooted_since_arming: session.rebooted_since_arming(coord.node_boot_id()),
-            },
-            in_trial,
-        )
-    };
-    coord.node_update_state(&durable, &in_trial)
 }
 
 /// Build the HSM component's SOVD vendor surface — the key-slot data resource
@@ -951,9 +907,6 @@ mod tests {
         ActivationState, Capabilities, EntityInfo, FlashCaps, LifecycleCaps, MachineRegistry,
         MachineResult, ResetKind,
     };
-    use nv_store::block::MemBlockDevice;
-    use nv_store::store::MIN_NV_DEVICE_SIZE;
-    use nv_store::types::{NvBootState, NvUpdateSession};
     use tower::ServiceExt;
 
     const COMMIT_URI: &str = "/vehicle/v1/operations/x-ota-commit-trials/executions";
@@ -1119,41 +1072,40 @@ mod tests {
         Arc::new(builder.build())
     }
 
-    /// An NV store seeded with `boot` + an optional update session.
-    fn nv_with(
-        mut boot: NvBootState,
-        session: Option<NvUpdateSession>,
-    ) -> Arc<Mutex<NvStore<MemBlockDevice>>> {
-        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
-        nv.write_boot_state(&mut boot).unwrap();
-        if let Some(mut s) = session {
-            nv.write_update_session(&mut s).unwrap();
+    /// A coordinator booted as `boot_id` with vm1's bank report fixed at
+    /// `(in_trial, pending_reset)` (`None` registers no bank probe) and the
+    /// node's "rebooted since arming" fixed at `rebooted` (`None` installs no
+    /// source).
+    fn coord_with(
+        vm1: Option<(bool, bool)>,
+        rebooted: Option<bool>,
+        boot_id: Option<&str>,
+    ) -> Arc<NodeCoordinator> {
+        let mut coord = NodeCoordinator::new();
+        if let Some(id) = boot_id {
+            coord = coord.with_node_boot_id(id);
         }
-        Arc::new(Mutex::new(nv))
-    }
-
-    /// Idle: everything committed, no session (`x-ota-update-state` = Idle).
-    fn nv_idle() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
-        nv_with(NvBootState::default(), None)
-    }
-
-    /// The owed bit for slot 4 (vm1) is set — an unresolved transaction, before
-    /// or after its reboot.
-    fn nv_reboot_pending() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
-        nv_with(
-            NvBootState::default(),
-            Some(NvUpdateSession {
-                reboot_owed: 1 << 4,
-                ..Default::default()
-            }),
-        )
-    }
-
-    /// Trial: rebooted (no reboot owed) but vm1 (slot 4) is still uncommitted.
-    fn nv_trial() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
-        let mut boot = NvBootState::default();
-        boot.banks[4].committed = false;
-        nv_with(boot, None)
+        if let Some(answer) = rebooted {
+            coord = coord.with_rebooted_probe(Arc::new(move |_| Some(answer)));
+        }
+        if let Some((in_trial, pending_reset)) = vm1 {
+            coord.register_banks_probe(
+                "vm1",
+                Arc::new(move || {
+                    Some(machine_mgr::ComponentBanks {
+                        active: BankContents {
+                            bank: Bank::B,
+                            images: BTreeMap::new(),
+                            install_boot_id: None,
+                        },
+                        inactive: None,
+                        in_trial,
+                        pending_reset,
+                    })
+                }),
+            );
+        }
+        Arc::new(coord)
     }
 
     /// A `POST` to `uri`, with a JSON `{"nonce": …}` body when `nonce` is set
@@ -1523,8 +1475,11 @@ mod tests {
 
     #[tokio::test]
     async fn x_update_state_alias_matches_x_ota_update_state() {
-        let coord = NodeCoordinator::new(vec![(4, "vm1".to_string())]).with_node_boot_id("boot-b");
-        let router = update_state_router(nv_armed_at("boot-a"), Arc::new(coord), machine_with(&[]));
+        // vm1 booted into its trial: rebooted since arming.
+        let router = update_state_router(
+            coord_with(Some((true, false)), Some(true), Some("boot-b")),
+            machine_with(&[]),
+        );
 
         let ota = get_json(&router, "/vehicle/v1/data/x-ota-update-state").await;
         let alias = get_json(&router, "/vehicle/v1/data/x-update-state").await;
@@ -1533,8 +1488,7 @@ mod tests {
         assert_eq!(alias["rebooted_since_arming"], true);
 
         // No boot id configured: `node_boot_id` is an explicit null.
-        let coord = NodeCoordinator::new(vec![(4, "vm1".to_string())]);
-        let router = update_state_router(nv_idle(), Arc::new(coord), machine_with(&[]));
+        let router = update_state_router(coord_with(None, None, None), machine_with(&[]));
         let alias = get_json(&router, "/vehicle/v1/data/x-update-state").await;
         assert_eq!(alias["node_boot_id"], serde_json::Value::Null);
         assert_eq!(
@@ -1546,33 +1500,27 @@ mod tests {
     // Shape-identity guards: the named response structs must serialize to the
     // exact JSON the handlers emitted as ad-hoc `serde_json::json!` before the
     // utoipa refactor (the regen test only covers the doc, not the wire).
-    /// The `x-ota-update-state` body for `nv`, with vm1 on slot 4 and the node
-    /// currently booted as `boot_id`.
+    /// The `x-ota-update-state` body with vm1 reporting `vm1`, the node
+    /// reporting `rebooted` (see [`coord_with`]) and currently booted as
+    /// `boot_id`.
     async fn update_state_json(
-        nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
+        vm1: Option<(bool, bool)>,
+        rebooted: Option<bool>,
         boot_id: &str,
     ) -> serde_json::Value {
-        let coord = NodeCoordinator::new(vec![(4, "vm1".to_string())]).with_node_boot_id(boot_id);
-        serde_json::to_value(update_state(nv, Arc::new(coord), machine_with(&[])).await.0).unwrap()
-    }
-
-    /// vm1 (slot 4) owed, armed while the node was booted as `boot_id`.
-    fn nv_armed_at(boot_id: &str) -> Arc<Mutex<NvStore<MemBlockDevice>>> {
-        nv_with(
-            NvBootState::default(),
-            Some(NvUpdateSession {
-                reboot_owed: 1 << 4,
-                armed_boot_id: NvUpdateSession::boot_id_digest(boot_id),
-                ..Default::default()
-            }),
+        serde_json::to_value(
+            update_state(coord_with(vm1, rebooted, Some(boot_id)), machine_with(&[]))
+                .await
+                .0,
         )
+        .unwrap()
     }
 
     #[tokio::test]
     async fn update_state_response_shape_is_stable() {
-        // Idle: empty lists, unknown reboot.
+        // Idle: empty lists; no reboot source, so unknown.
         assert_eq!(
-            update_state_json(nv_idle(), "boot-a").await,
+            update_state_json(None, None, "boot-a").await,
             serde_json::json!({
                 "phase": "Idle",
                 "components": [],
@@ -1585,39 +1533,10 @@ mod tests {
                 "resolution": null,
             })
         );
-        // In trial with nothing owed -> Trial, `reboot_owed` empty.
+        // Armed, its node reset not yet taken; the node reports no reboot since
+        // arming -> RebootPending.
         assert_eq!(
-            update_state_json(nv_trial(), "boot-a").await,
-            serde_json::json!({
-                "phase": "Trial",
-                "components": ["vm1"],
-                "reboot_owed": [],
-                "rebooted_since_arming": null,
-                "node_boot_id": "boot-a",
-                "banks": [],
-                "trial_boots": null,
-                "trial_boot_limit": null,
-                "resolution": null,
-            })
-        );
-        // Owed, arming boot id unknown (zero): not provably pre-reboot -> Trial.
-        assert_eq!(
-            update_state_json(nv_reboot_pending(), "boot-a").await,
-            serde_json::json!({
-                "phase": "Trial",
-                "components": ["vm1"],
-                "reboot_owed": ["vm1"],
-                "rebooted_since_arming": null,
-                "node_boot_id": "boot-a",
-                "banks": [],
-                "trial_boots": null,
-                "trial_boot_limit": null,
-                "resolution": null,
-            })
-        );
-        // Owed, still on the arming boot -> RebootPending.
-        assert_eq!(
-            update_state_json(nv_armed_at("boot-a"), "boot-a").await,
+            update_state_json(Some((true, true)), Some(false), "boot-a").await,
             serde_json::json!({
                 "phase": "RebootPending",
                 "components": ["vm1"],
@@ -1630,15 +1549,48 @@ mod tests {
                 "resolution": null,
             })
         );
-        // Owed, booted since arming -> Trial.
+        // In trial, nothing pending, armed and not yet rebooted (a Local-reset
+        // component) -> Trial; `rebooted_since_arming` is the node's `false`.
         assert_eq!(
-            update_state_json(nv_armed_at("boot-a"), "boot-b").await,
+            update_state_json(Some((true, false)), Some(false), "boot-a").await,
             serde_json::json!({
                 "phase": "Trial",
                 "components": ["vm1"],
-                "reboot_owed": ["vm1"],
+                "reboot_owed": [],
+                "rebooted_since_arming": false,
+                "node_boot_id": "boot-a",
+                "banks": [],
+                "trial_boots": null,
+                "trial_boot_limit": null,
+                "resolution": null,
+            })
+        );
+        // Booted into the trial: the node reports a reboot since arming ->
+        // Trial, nothing owed, `rebooted_since_arming` true.
+        assert_eq!(
+            update_state_json(Some((true, false)), Some(true), "boot-b").await,
+            serde_json::json!({
+                "phase": "Trial",
+                "components": ["vm1"],
+                "reboot_owed": [],
                 "rebooted_since_arming": true,
                 "node_boot_id": "boot-b",
+                "banks": [],
+                "trial_boots": null,
+                "trial_boot_limit": null,
+                "resolution": null,
+            })
+        );
+        // Pending a reset, the node's answer unknown -> RebootPending with a
+        // null `rebooted_since_arming`.
+        assert_eq!(
+            update_state_json(Some((false, true)), None, "boot-a").await,
+            serde_json::json!({
+                "phase": "RebootPending",
+                "components": ["vm1"],
+                "reboot_owed": ["vm1"],
+                "rebooted_since_arming": null,
+                "node_boot_id": "boot-a",
                 "banks": [],
                 "trial_boots": null,
                 "trial_boot_limit": null,

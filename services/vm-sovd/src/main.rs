@@ -440,21 +440,10 @@ async fn main() {
         status: None,
     });
     // One node update-transaction coordinator, shared into every component's
-    // start_flash gate (the "one transaction at a time" / no-mixing gate). The
-    // SOVD reset/verdict handlers will share this same Arc in the next steps.
-    // Bank-set-index -> component-id map, so the node update-state report and the
-    // gate's refusal name the components (not "bank-set N").
-    let id_map: Vec<(usize, String)> = specs
-        .iter()
-        .filter_map(|s| match component_factory::resolve_bank_set(s) {
-            Ok(bs) => Some((bs.as_index(), s.id.clone())),
-            Err(msg) => {
-                tracing::error!("{msg}");
-                None
-            }
-        })
-        .collect();
-    let node_coordinator = Arc::new(machine_mgr::node_update::NodeCoordinator::new(id_map));
+    // start_flash gate (the "one transaction at a time" gate). The SOVD
+    // reset/verdict handlers share this same Arc. Each component registers its
+    // bank report with it as its adapter is built.
+    let node_coordinator = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
 
     let deps = FactoryDeps {
         nv: nv.clone(),
@@ -541,7 +530,6 @@ async fn main() {
             device_id,
             host_sovd_url,
             &proxy_components,
-            nv.clone(),
             node_coordinator.clone(),
         )
         .await
@@ -555,7 +543,6 @@ async fn main() {
         sovd_api::create_router(state)
             .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
             .merge(component_mgr::sovd::routes::update_state_router(
-                nv.clone(),
                 node_coordinator.clone(),
                 machine.clone(),
             ))
@@ -729,20 +716,15 @@ fn connect_backend(socket: &std::path::Path) -> std::io::Result<LinkBClient> {
 /// `HsmCryptoProvider`, so this code is
 /// backend-agnostic — the issuer pubkeys and the sw-authority trust anchor are
 /// read via `get_public_key_der`, needing no lifecycle (`HsmProvider`) trait.
-#[allow(clippy::too_many_arguments)]
-async fn build_gateway_router<D>(
+async fn build_gateway_router(
     machine: Arc<dyn Machine>,
     mut backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
     crypto: Arc<dyn hsm::HsmCryptoProvider>,
     device_id: Option<String>,
     host_sovd_url: Option<String>,
     proxy_components: &[String],
-    nv: Arc<Mutex<NvStore<D>>>,
     node_coordinator: Arc<machine_mgr::node_update::NodeCoordinator>,
-) -> axum::Router
-where
-    D: nv_store::block::BlockDevice + Send + 'static,
-{
+) -> axum::Router {
     fn fail(msg: &str) -> ! {
         eprintln!("vm-sovd --gateway: {msg}");
         std::process::exit(1);
@@ -800,7 +782,6 @@ where
         trust_anchor,
     )
     .merge(component_mgr::sovd::routes::update_state_router(
-        nv,
         node_coordinator,
         machine,
     ))

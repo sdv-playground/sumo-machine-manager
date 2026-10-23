@@ -131,7 +131,7 @@ impl component_mgr::backend::HealthProbe for MockProbe {
         let mut m = serde_json::Map::new();
         m.insert("m7_total_startup".into(), serde_json::json!(86));
         // Collision: standard fields must win over probe contributions.
-        m.insert("boot_count".into(), serde_json::json!(999));
+        m.insert("hb_seq".into(), serde_json::json!(999));
         m
     }
 }
@@ -183,8 +183,9 @@ fn backend_with_manifests(
     .with_id(id.to_string())
 }
 
-/// A shared boot selector with a booted selection for component `id` (bank
-/// A) — the serving bank a component's disable record is read from.
+/// A shared boot selector with a committed, booted selection for component
+/// `id` (bank A) — the serving bank a component's disable record is read
+/// from. Committed, so the component is not in trial.
 fn selector_for(id: &str) -> SharedSystemBankState {
     let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner));
     let shared: SharedSystemBankState = Arc::new(std::sync::RwLock::new(mgr));
@@ -192,6 +193,7 @@ fn selector_for(id: &str) -> SharedSystemBankState {
         let mut g = shared.write().unwrap();
         g.stage(id, Bank::A, Default::default());
         g.seal(None).unwrap();
+        g.commit().unwrap();
     }
     shared
 }
@@ -641,8 +643,10 @@ async fn probe_component_status_rides_the_uniform_node() {
     let rt = &status.extensions["x-runtime"];
     assert_eq!(rt["admin_state"], "enabled");
     assert_eq!(rt["m7_total_startup"], 86, "probe extension merged");
-    assert_eq!(rt["boot_count"], 0, "standard field wins the collision");
-    assert_eq!(rt["hb_seq"], 7, "probe health feeds the uniform fields");
+    assert_eq!(
+        rt["hb_seq"], 7,
+        "probe health feeds the uniform fields; the standard field wins the collision"
+    );
 
     // Probe not running ⇒ the standard status field is honest.
     let tmp = tempfile::tempdir().unwrap();

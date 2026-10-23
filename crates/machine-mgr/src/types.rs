@@ -146,8 +146,7 @@ pub struct FlashSession {
 }
 
 /// Session-scoped pull source for an install whose manifest references
-/// payloads by content-addressed URI, plus the campaign identity for the
-/// node update-transaction gate. Set via `Component::set_install_source`
+/// payloads by content-addressed URI. Set via `Component::set_install_source`
 /// BEFORE `start_install`; cleared when the session ends.
 #[derive(Clone)]
 pub struct InstallSource {
@@ -158,11 +157,6 @@ pub struct InstallSource {
     /// CBOR COSE_Key trust anchor (sw-authority) for validating any manifest
     /// fetched through this source.
     pub trust_anchor: Vec<u8>,
-    /// Campaign identity (sha256 of the signed L1 envelope bytes) used as the
-    /// node update-transaction session id, so sibling components of one
-    /// campaign JOIN a single node transaction. `None` keeps the interim
-    /// zero id.
-    pub session_id: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for InstallSource {
@@ -170,7 +164,6 @@ impl std::fmt::Debug for InstallSource {
         f.debug_struct("InstallSource")
             .field("cas_base_url", &self.cas_base_url)
             .field("trust_anchor_bytes", &self.trust_anchor.len())
-            .field("session_id", &self.session_id.map(hex::encode))
             .finish()
     }
 }

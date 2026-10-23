@@ -488,6 +488,31 @@ unknown. `banks` reports it per bank and derives `pending_reset` from it: a comp
 needs a node reset, whose active bank was sealed in the boot still running, still waits for
 that reset.
 
+### Node update transaction
+
+One update transaction at a time per ECU, coordinated by `NodeCoordinator`
+(`machine-mgr::node_update`). Its readers derive from facts, not stored intent: each
+component's adapter registers its bank report (`in_trial`, `pending_reset`) with the
+coordinator, and the node answers `rebooted_since_arming` — a node fact, whatever the
+reset kind — from the boot vector's transaction header (`with_system_bank`: the boot id
+recorded at seal against the current one). Without a boot vector the coordinator falls
+back to the armed boot id in the NV update session, which the adapters register; with
+neither it is unknown. Two gates refuse a new flash (409):
+
+- **Pending reset**: any component is `pending_reset` (its install needs a node reset that
+  has not happened yet). That list is `reboot_owed` on the wire, and the phase is
+  `RebootPending`.
+- **Trial after the reboot**: any component is `in_trial` and the node has rebooted since
+  arming (`rebooted_since_arming == true`): the trial awaits its verdict. Before that
+  reboot (`false` or unknown) an in-trial component is an armed sibling of the same step,
+  so a new flash joins — one step, one reboot, one verdict, for Local-reset components too.
+
+Otherwise a new flash opens the in-memory `Staging` set or joins it. There is no session
+id. The phase is `Trial` while a component is in trial and none is pending. The NV
+reboot-owed record (`NvUpdateSession`) is still written at arming and cleared at the
+verdict; only its armed boot id is read, by the fallback above. It goes away in a later
+change.
+
 ## VM launch (vm-service)
 
 `vm-service` resolves the bank from the selector-set `bank` enum (never a `current`
