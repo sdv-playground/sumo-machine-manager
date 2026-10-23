@@ -1044,7 +1044,7 @@ mod tests {
         {
             let mut g = shared.write().unwrap();
             g.stage(slots::OS, bank);
-            assert!(g.seal());
+            assert!(g.seal().unwrap());
         }
         shared
     }
@@ -1054,9 +1054,9 @@ mod tests {
         let shared = selector_on(floor);
         {
             let mut g = shared.write().unwrap();
-            g.commit(); // floor := the booted selection
+            g.commit().unwrap(); // floor := the booted selection
             g.stage(slots::OS, armed);
-            assert!(g.seal()); // PRIMARY := the trial bank
+            assert!(g.seal().unwrap()); // PRIMARY := the trial bank
         }
         shared
     }

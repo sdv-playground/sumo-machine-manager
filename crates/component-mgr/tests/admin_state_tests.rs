@@ -191,7 +191,7 @@ fn selector_for(set: BankSet) -> SharedSystemBankState {
     {
         let mut g = shared.write().unwrap();
         g.stage(set, Bank::A);
-        g.seal();
+        g.seal().unwrap();
     }
     shared
 }
@@ -202,7 +202,7 @@ fn selector_for(set: BankSet) -> SharedSystemBankState {
 fn serve_bank(sel: &SharedSystemBankState, set: BankSet, bank: Bank) {
     let mut g = sel.write().unwrap();
     g.stage(set, bank);
-    g.seal();
+    g.seal().unwrap();
 }
 
 /// Provision the IVD-signing slot in a fresh keystore dir. Reproduces

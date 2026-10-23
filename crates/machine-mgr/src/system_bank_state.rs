@@ -16,7 +16,8 @@
 //!     node falls back to if a trial fails.
 //!
 //! It is written atomically at exactly **one** point — [`SystemBankManager::seal`]
-//! — and is intentionally **separate** from each component's per-bank IVD
+//! — and a failed write leaves the in-memory selector where it was and is
+//! reported to the caller. It is intentionally **separate** from each component's per-bank IVD
 //! manifest. `BankProvider::read_installed` (the signed CBOR manifest in a bank
 //! dir) stays untouched: that answers "what firmware *is* installed in bank X",
 //! this answers "which bank does the node *boot*".
@@ -58,8 +59,8 @@ use nv_store::types::{Bank, BankSet};
 // can read the selector without depending up on `machine-mgr`. Re-exported here
 // so existing `machine_mgr::system_bank_state::*` paths still resolve.
 pub use nv_store::selector::{
-    FileSelectorStore, SelectorBlob, SelectorStore, Signer, SlotSelect, StubSelectorStore,
-    StubSigner,
+    FileSelectorStore, SelectorBlob, SelectorError, SelectorStore, Signer, SlotSelect,
+    StubSelectorStore, StubSigner,
 };
 // In-memory test seams: only for test builds (this crate's own unit tests, or
 // downstream cfg(test) users via the forwarding `test-seams` feature).
@@ -188,14 +189,18 @@ impl SystemBankManager {
     /// writes **PRIMARY only**, then makes `pending` the new `current`.
     /// SECONDARY (the rollback floor) is deliberately untouched.
     ///
-    /// Returns `false` (no-op) when there is nothing staged.
-    pub fn seal(&mut self) -> bool {
-        let Some(pending) = self.pending.take() else {
-            return false;
+    /// Returns `Ok(false)` (no-op, nothing written) when there is nothing
+    /// staged. A failed PRIMARY write returns `Err` with `pending`, `current`
+    /// and `generation` untouched, so a retry seals the same selection at the
+    /// same generation.
+    pub fn seal(&mut self) -> Result<bool, SelectorError> {
+        let Some(pending) = self.pending.clone() else {
+            return Ok(false);
         };
         let gen = self.generation.max(self.committed_generation) + 1;
         let blob = SelectorBlob::signed(gen, pending.clone(), &*self.signer);
-        self.store.write_primary(&blob);
+        self.store.write_primary(&blob)?;
+        self.pending = None;
         self.current = pending;
         self.generation = gen;
         tracing::info!(
@@ -204,15 +209,16 @@ impl SystemBankManager {
             slots = %render_slots(&self.current),
             "boot-selector SEAL → PRIMARY (new booted selection)"
         );
-        true
+        Ok(true)
     }
 
     /// Promote the booted (PRIMARY) selection to the rollback floor (SECONDARY)
     /// — "the trial is over, this is now the floor". Builds + signs a blob from
-    /// `current` at the *current* generation and writes it to SECONDARY.
-    pub fn commit(&mut self) {
+    /// `current` at the *current* generation and writes it to SECONDARY. A
+    /// failed write returns `Err` with the floor untouched. Idempotent.
+    pub fn commit(&mut self) -> Result<(), SelectorError> {
         let blob = SelectorBlob::signed(self.generation, self.current.clone(), &*self.signer);
-        self.store.write_secondary(&blob);
+        self.store.write_secondary(&blob)?;
         self.committed = self.current.clone();
         self.committed_generation = self.generation;
         tracing::info!(
@@ -221,13 +227,15 @@ impl SystemBankManager {
             slots = %render_slots(&self.committed),
             "boot-selector COMMIT → SECONDARY (PRIMARY copied to rollback floor)"
         );
+        Ok(())
     }
 
     /// Roll the booted (PRIMARY) selection back to the committed floor
     /// (SECONDARY). Builds a blob from `committed` at the committed generation,
     /// writes it to PRIMARY, makes `committed` the new `current`, and clears any
-    /// pending staging.
-    pub fn rollback(&mut self) {
+    /// pending staging. A failed write returns `Err` with `current`,
+    /// `generation` and `pending` untouched.
+    pub fn rollback(&mut self) -> Result<(), SelectorError> {
         // TODO(bootloader): anti-rollback floor is SECONDARY.generation, not
         // last-seen-PRIMARY — a legitimate rollback writes an equal/lower
         // generation to PRIMARY, so the bootloader must gate on >=
@@ -237,7 +245,7 @@ impl SystemBankManager {
             self.committed.clone(),
             &*self.signer,
         );
-        self.store.write_primary(&blob);
+        self.store.write_primary(&blob)?;
         // WARN, not info: a rollback DISCARDS the trial (overwrites PRIMARY with
         // the SECONDARY floor). If a freshly-sealed VM slot vanishes across a
         // reboot, THIS line firing is the smoking gun (active revert); its
@@ -251,6 +259,7 @@ impl SystemBankManager {
         self.current = self.committed.clone();
         self.generation = self.committed_generation;
         self.pending = None;
+        Ok(())
     }
 
     /// The booted bank for `set` (from PRIMARY / `current`), or `None` if the
@@ -345,13 +354,13 @@ mod tests {
 
         // Establish a committed floor at A so the staged change is observable.
         m.stage(slots::VM1, Bank::A);
-        assert!(m.seal());
-        m.commit();
+        assert!(m.seal().unwrap());
+        m.commit().unwrap();
         assert!(!m.is_trial());
 
         // Stage B, seal.
         m.stage(slots::VM1, Bank::B);
-        assert!(m.seal());
+        assert!(m.seal().unwrap());
 
         assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
         assert!(m.is_trial(), "current(B) != committed(A) => trial");
@@ -369,12 +378,12 @@ mod tests {
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
         m.stage(slots::VM1, Bank::A);
-        m.seal();
-        m.commit();
+        m.seal().unwrap();
+        m.commit().unwrap();
 
         m.stage(slots::VM1, Bank::B);
-        m.seal();
-        m.commit();
+        m.seal().unwrap();
+        m.commit().unwrap();
 
         assert!(!m.is_trial());
         let primary = store.read_primary().unwrap();
@@ -389,14 +398,14 @@ mod tests {
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
         m.stage(slots::VM1, Bank::A);
-        m.seal();
-        m.commit(); // floor = A
+        m.seal().unwrap();
+        m.commit().unwrap(); // floor = A
 
         m.stage(slots::VM1, Bank::B);
-        m.seal(); // trial = B
+        m.seal().unwrap(); // trial = B
         assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
 
-        m.rollback();
+        m.rollback().unwrap();
         assert_eq!(m.active_bank(slots::VM1), Some(Bank::A));
         assert!(!m.is_trial());
         let primary = store.read_primary().unwrap();
@@ -416,8 +425,8 @@ mod tests {
         {
             let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
             m.stage(slots::VM1, Bank::A);
-            m.seal();
-            m.commit(); // committed floor = A, PRIMARY = A
+            m.seal().unwrap();
+            m.commit().unwrap(); // committed floor = A, PRIMARY = A
 
             // Stage B but DO NOT seal, then drop the manager (== reboot).
             m.stage(slots::VM1, Bank::B);
@@ -445,15 +454,15 @@ mod tests {
         assert_eq!(m.generation(), 0);
 
         m.stage(slots::VM1, Bank::A);
-        m.seal();
+        m.seal().unwrap();
         assert_eq!(m.generation(), 1);
 
         m.stage(slots::VM2, Bank::B);
-        m.seal();
+        m.seal().unwrap();
         assert_eq!(m.generation(), 2);
 
         // commit doesn't bump the PRIMARY generation.
-        m.commit();
+        m.commit().unwrap();
         assert_eq!(m.generation(), 2);
     }
 
@@ -472,7 +481,7 @@ mod tests {
             sha256: SelectorBlob::compute_sha256(generation, &selectors),
             signature: Vec::new(), // invalid under TestSigner
         };
-        store.write_primary(&bad);
+        store.write_primary(&bad).unwrap();
 
         let m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
         // Rejected => treated as absent => empty maps, generation 0.
@@ -486,7 +495,7 @@ mod tests {
             sha256: [0u8; 32], // doesn't match contents
             signature: TestSigner.sign(&[0u8; 32]),
         };
-        store.write_primary(&tampered);
+        store.write_primary(&tampered).unwrap();
         let m2 = SystemBankManager::load(Box::new(store), Box::new(TestSigner));
         assert_eq!(m2.active_bank(slots::VM1), None);
     }
@@ -498,12 +507,108 @@ mod tests {
         let mut m = SystemBankManager::load(Box::new(StubSelectorStore), Box::new(StubSigner));
         assert_eq!(m.generation(), 0);
         assert_eq!(m.active_bank(slots::VM1), None);
-        assert!(!m.seal(), "nothing staged => seal is a no-op");
+        assert!(!m.seal().unwrap(), "nothing staged => seal is a no-op");
 
         m.stage(slots::VM1, Bank::B);
-        assert!(m.seal()); // writes are dropped by the stub, but in-mem state advances
+        assert!(m.seal().unwrap()); // writes are dropped by the stub, but in-mem state advances
         assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
         assert_eq!(m.generation(), 1);
+    }
+
+    // --- a failed store write leaves the in-memory selector where it was ---
+
+    #[test]
+    fn failed_seal_leaves_state_untouched_and_retry_uses_same_generation() {
+        let store = InMemorySelectorStore::new();
+        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        m.stage(slots::VM1, Bank::A);
+        m.seal().unwrap();
+        m.commit().unwrap(); // floor = A at gen 1
+
+        m.stage(slots::VM1, Bank::B);
+        store.set_fail_writes(true);
+        assert!(m.seal().is_err());
+        assert_eq!(
+            m.active_bank(slots::VM1),
+            Some(Bank::A),
+            "current untouched"
+        );
+        assert_eq!(m.generation(), 1, "generation untouched");
+        assert!(m.pending.is_some(), "pending kept for the retry");
+        assert_eq!(store.read_primary().unwrap().generation, 1);
+
+        store.set_fail_writes(false);
+        assert!(m.seal().unwrap());
+        assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
+        assert_eq!(
+            m.generation(),
+            2,
+            "same gen the first attempt would have had"
+        );
+        assert!(m.pending.is_none());
+        assert_eq!(store.read_primary().unwrap().generation, 2);
+    }
+
+    #[test]
+    fn failed_commit_leaves_floor_untouched() {
+        let store = InMemorySelectorStore::new();
+        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        m.stage(slots::VM1, Bank::A);
+        m.seal().unwrap();
+        m.commit().unwrap();
+        m.stage(slots::VM1, Bank::B);
+        m.seal().unwrap(); // trial B over floor A
+
+        store.set_fail_writes(true);
+        assert!(m.commit().is_err());
+        assert_eq!(m.committed[&slots::VM1].bank, Bank::A);
+        assert_eq!(m.committed_generation, 1);
+        assert!(m.is_trial(), "still in trial");
+        assert_eq!(store.read_secondary().unwrap().generation, 1);
+    }
+
+    #[test]
+    fn failed_rollback_leaves_state_untouched() {
+        let store = InMemorySelectorStore::new();
+        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        m.stage(slots::VM1, Bank::A);
+        m.seal().unwrap();
+        m.commit().unwrap();
+        m.stage(slots::VM1, Bank::B);
+        m.seal().unwrap(); // trial B at gen 2
+        m.stage(slots::VM2, Bank::B); // something pending
+
+        store.set_fail_writes(true);
+        assert!(m.rollback().is_err());
+        assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
+        assert_eq!(m.generation(), 2);
+        assert!(m.pending.is_some(), "pending untouched");
+        assert_eq!(store.read_primary().unwrap().generation, 2);
+    }
+
+    #[test]
+    fn seal_with_nothing_staged_writes_nothing() {
+        let store = InMemorySelectorStore::new();
+        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        assert!(!m.seal().unwrap());
+        assert_eq!(store.write_count(), 0);
+        assert!(store.read_primary().is_none());
+    }
+
+    #[test]
+    fn commit_twice_is_ok_with_one_write_each() {
+        let store = InMemorySelectorStore::new();
+        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        m.stage(slots::VM1, Bank::A);
+        m.seal().unwrap();
+        let before = store.write_count();
+
+        m.commit().unwrap();
+        assert_eq!(store.write_count(), before + 1);
+        m.commit().unwrap();
+        assert_eq!(store.write_count(), before + 2);
+        assert!(!m.is_trial());
+        assert_eq!(store.read_secondary().unwrap().generation, 1);
     }
 
     /// Build a self-consistent signed blob (matching digest + TestSigner
@@ -532,8 +637,8 @@ mod tests {
 
         // Write through one store...
         let writer = FileSelectorStore::new(&dir);
-        writer.write_primary(&primary);
-        writer.write_secondary(&secondary);
+        writer.write_primary(&primary).unwrap();
+        writer.write_secondary(&secondary).unwrap();
 
         // ...read back through a fresh one (no shared in-process state).
         let reader = FileSelectorStore::new(&dir);
@@ -590,8 +695,8 @@ mod tests {
         );
 
         let store = InMemorySelectorStore::new();
-        store.write_primary(&blob);
-        store.write_secondary(&blob);
+        store.write_primary(&blob).unwrap();
+        store.write_secondary(&blob).unwrap();
 
         let m = SystemBankManager::load(Box::new(store), Box::new(TestSigner));
         assert!(m.is_empty(), "PRIMARY rejected");

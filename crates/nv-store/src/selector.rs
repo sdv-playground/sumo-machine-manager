@@ -157,6 +157,31 @@ mod hex_bytes {
 // Seams: storage + signing
 // ---------------------------------------------------------------------------
 
+/// A [`SelectorStore`] write that did not land. The slot must not be treated
+/// as written.
+#[derive(Debug)]
+pub enum SelectorError {
+    Io(std::io::Error),
+    Serialize(String),
+}
+
+impl From<std::io::Error> for SelectorError {
+    fn from(e: std::io::Error) -> Self {
+        SelectorError::Io(e)
+    }
+}
+
+impl std::fmt::Display for SelectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SelectorError::Io(e) => write!(f, "boot vector store I/O error: {e}"),
+            SelectorError::Serialize(e) => write!(f, "boot vector serialize error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SelectorError {}
+
 /// The two-slot persistence seam for the selector partition: a PRIMARY (booted)
 /// slot and a SECONDARY (rollback floor) slot.
 ///
@@ -164,11 +189,14 @@ mod hex_bytes {
 /// in-memory cells. Keeping this a trait makes the manager's cache + transition
 /// logic testable now and leaves the hardware edge swappable when the bootloader
 /// sector contract lands.
+///
+/// Writes are fallible: an `Err` means the slot was not written, and the caller
+/// must not move its in-memory view ahead of storage.
 pub trait SelectorStore: Send + Sync {
     fn read_primary(&self) -> Option<SelectorBlob>;
-    fn write_primary(&self, blob: &SelectorBlob);
+    fn write_primary(&self, blob: &SelectorBlob) -> Result<(), SelectorError>;
     fn read_secondary(&self) -> Option<SelectorBlob>;
-    fn write_secondary(&self, blob: &SelectorBlob);
+    fn write_secondary(&self, blob: &SelectorBlob) -> Result<(), SelectorError>;
 }
 
 /// The attestation seam: sign / verify the selector digest. The production impl
@@ -184,7 +212,8 @@ pub trait Signer: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Production [`SelectorStore`] placeholder. Every method warns loudly and does
-/// nothing: reads return `None`, writes are dropped. **Non-fatal on purpose** —
+/// nothing: reads return `None`, writes are dropped but report `Ok(())` — a
+/// loud no-op for builds that wire no store. **Non-fatal on purpose** —
 /// this is an additive shadow of the existing per-component boot state, not yet
 /// the boot authority, so a node with only the stub wired keeps booting via
 /// `NvBootState`. Replaced by real sector I/O when the bootloader publishes the
@@ -199,10 +228,11 @@ impl SelectorStore for StubSelectorStore {
         );
         None
     }
-    fn write_primary(&self, _blob: &SelectorBlob) {
+    fn write_primary(&self, _blob: &SelectorBlob) -> Result<(), SelectorError> {
         tracing::warn!(
             "TODO(bootloader): SystemBankState sector I/O unimplemented — selector partition layout pending bootloader support"
         );
+        Ok(())
     }
     fn read_secondary(&self) -> Option<SelectorBlob> {
         tracing::warn!(
@@ -210,10 +240,11 @@ impl SelectorStore for StubSelectorStore {
         );
         None
     }
-    fn write_secondary(&self, _blob: &SelectorBlob) {
+    fn write_secondary(&self, _blob: &SelectorBlob) -> Result<(), SelectorError> {
         tracing::warn!(
             "TODO(bootloader): SystemBankState sector I/O unimplemented — selector partition layout pending bootloader support"
         );
+        Ok(())
     }
 }
 
@@ -247,18 +278,49 @@ impl Signer for StubSigner {
 /// In-memory [`SelectorStore`]: two real cells behind a mutex. Lets the
 /// `SystemBankManager` be exercised end-to-end (including the
 /// reboot-mid-stage case: drop the manager, `load` a fresh one from the *same*
-/// store) without any hardware.
+/// store) without any hardware. [`Self::set_fail_writes`] makes every write
+/// fail (shared across clones) so callers' failure paths can be exercised.
 #[cfg(feature = "test-seams")]
 #[derive(Debug, Default, Clone)]
 pub struct InMemorySelectorStore {
     primary: std::sync::Arc<std::sync::Mutex<Option<SelectorBlob>>>,
     secondary: std::sync::Arc<std::sync::Mutex<Option<SelectorBlob>>>,
+    fail_writes: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(feature = "test-seams")]
 impl InMemorySelectorStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// While `fail` is set, every write returns `Err` and leaves both slots
+    /// untouched.
+    pub fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Number of writes that landed (failed writes are not counted).
+    pub fn write_count(&self) -> usize {
+        self.writes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn write_slot(
+        &self,
+        slot: &std::sync::Mutex<Option<SelectorBlob>>,
+        blob: &SelectorBlob,
+    ) -> Result<(), SelectorError> {
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SelectorError::Io(std::io::Error::other(
+                "injected boot vector store write failure",
+            )));
+        }
+        *slot.lock().expect("slot poisoned") = Some(blob.clone());
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -267,14 +329,14 @@ impl SelectorStore for InMemorySelectorStore {
     fn read_primary(&self) -> Option<SelectorBlob> {
         self.primary.lock().expect("primary poisoned").clone()
     }
-    fn write_primary(&self, blob: &SelectorBlob) {
-        *self.primary.lock().expect("primary poisoned") = Some(blob.clone());
+    fn write_primary(&self, blob: &SelectorBlob) -> Result<(), SelectorError> {
+        self.write_slot(&self.primary, blob)
     }
     fn read_secondary(&self) -> Option<SelectorBlob> {
         self.secondary.lock().expect("secondary poisoned").clone()
     }
-    fn write_secondary(&self, blob: &SelectorBlob) {
-        *self.secondary.lock().expect("secondary poisoned") = Some(blob.clone());
+    fn write_secondary(&self, blob: &SelectorBlob) -> Result<(), SelectorError> {
+        self.write_slot(&self.secondary, blob)
     }
 }
 
@@ -345,56 +407,31 @@ impl FileSelectorStore {
     }
 
     /// Atomically + durably write a slot: serialize into `<name>.tmp`, **fsync
-    /// it**, rename over `<name>`, then fsync the renamed file. Errors warn and
-    /// are swallowed (the in-memory state in `SystemBankManager` is the live
-    /// view; the file is the shadow).
+    /// it**, rename over `<name>`, then fsync the renamed file. The first
+    /// failing step is returned as `Err`; the caller must not treat the slot as
+    /// written (a failure before the rename leaves the prior slot intact).
     ///
-    /// The fsyncs matter because a CVC hardware reboot can follow a bank
-    /// activation IMMEDIATELY, and `sysmgr_reboot` is kernel-direct — without
-    /// the flush a just-sealed selection could sit only in the block cache and
-    /// be lost across the reset, so the next boot reads the STALE (pre-seal)
-    /// slot. (`reboot_now` also `sync()`s globally, but flushing here makes each
+    /// The fsyncs matter because a hardware reboot can follow a bank activation
+    /// IMMEDIATELY, and the reboot path is kernel-direct — without the flush a
+    /// just-sealed selection could sit only in the block cache and be lost
+    /// across the reset, so the next boot reads the STALE (pre-seal) slot.
+    /// (`reboot_now` also `sync()`s globally, but flushing here makes each
     /// write durable on its own, independent of that path.)
-    fn write_slot(&self, name: &str, blob: &SelectorBlob) {
-        if let Err(e) = std::fs::create_dir_all(&self.dir) {
-            tracing::warn!(dir = ?self.dir, error = %e, "selector dir create failed");
-            return;
-        }
+    fn write_slot(&self, name: &str, blob: &SelectorBlob) -> Result<(), SelectorError> {
+        std::fs::create_dir_all(&self.dir)?;
         let final_path = self.dir.join(name);
         let tmp_path = self.dir.join(format!("{name}.tmp"));
-        let file = match std::fs::File::create(&tmp_path) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(path = ?tmp_path, error = %e, "selector tmp create failed");
-                return;
-            }
-        };
-        if let Err(e) = serde_json::to_writer_pretty(&file, blob) {
-            tracing::warn!(path = ?tmp_path, error = %e, "selector serialize failed");
-            return;
-        }
+        let file = std::fs::File::create(&tmp_path)?;
+        serde_json::to_writer_pretty(&file, blob)
+            .map_err(|e| SelectorError::Serialize(e.to_string()))?;
         // Flush the payload to disk BEFORE the rename — the rename is only
         // atomic for ordering, not durability.
-        if let Err(e) = file.sync_all() {
-            tracing::warn!(path = ?tmp_path, error = %e, "selector tmp fsync failed");
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
-            tracing::warn!(from = ?tmp_path, to = ?final_path, error = %e, "selector rename failed");
-            return;
-        }
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, &final_path)?;
         // Re-open + fsync the renamed file so the directory entry the next boot
         // reads is itself durable, not just the tmp payload.
-        match std::fs::File::open(&final_path) {
-            Ok(f) => {
-                if let Err(e) = f.sync_all() {
-                    tracing::warn!(path = ?final_path, error = %e, "selector final fsync failed");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(path = ?final_path, error = %e, "selector reopen-for-fsync failed");
-            }
-        }
+        std::fs::File::open(&final_path)?.sync_all()?;
+        Ok(())
     }
 }
 
@@ -402,13 +439,65 @@ impl SelectorStore for FileSelectorStore {
     fn read_primary(&self) -> Option<SelectorBlob> {
         self.read_slot("primary")
     }
-    fn write_primary(&self, blob: &SelectorBlob) {
-        self.write_slot("primary", blob);
+    fn write_primary(&self, blob: &SelectorBlob) -> Result<(), SelectorError> {
+        self.write_slot("primary", blob)
     }
     fn read_secondary(&self) -> Option<SelectorBlob> {
         self.read_slot("secondary")
     }
-    fn write_secondary(&self, blob: &SelectorBlob) {
-        self.write_slot("secondary", blob);
+    fn write_secondary(&self, blob: &SelectorBlob) -> Result<(), SelectorError> {
+        self.write_slot("secondary", blob)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unique per-run path under the system temp dir so concurrent test
+    /// binaries don't collide.
+    fn temp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sumo-selector-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn blob(generation: u64) -> SelectorBlob {
+        let mut selectors = BTreeMap::new();
+        selectors.insert(BankSet(0), SlotSelect::new(Bank::B));
+        SelectorBlob::signed(generation, selectors, &StubSigner)
+    }
+
+    #[test]
+    fn file_store_write_into_uncreatable_dir_is_err() {
+        // A regular file sits where the store directory should be, so
+        // `create_dir_all` (and every later step) cannot succeed.
+        let file = temp_path("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let store = FileSelectorStore::new(file.join("store"));
+
+        assert!(store.write_primary(&blob(1)).is_err());
+        assert!(store.write_secondary(&blob(1)).is_err());
+        assert_eq!(store.read_primary(), None, "failed write left no slot");
+
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn file_store_successful_write_round_trips() {
+        let dir = temp_path("ok");
+        let store = FileSelectorStore::new(&dir);
+
+        store.write_primary(&blob(4)).expect("primary write");
+        store.write_secondary(&blob(2)).expect("secondary write");
+        assert_eq!(store.read_primary(), Some(blob(4)));
+        assert_eq!(store.read_secondary(), Some(blob(2)));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

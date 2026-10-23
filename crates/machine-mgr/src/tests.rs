@@ -299,7 +299,7 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
         (slots::VM1, nv_boot(Bank::B, true)),
         (slots::VM2, nv_boot(Bank::A, true)),
     ];
-    m.seed_selector(entries.clone());
+    m.seed_selector(entries.clone()).unwrap();
 
     // The selector now mirrors the seed and the store's PRIMARY slot was
     // written with both entries at generation 1. Active-bank reads also go via
@@ -329,7 +329,7 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
 
     // Second identical seed: every entry already matches PRIMARY, so nothing
     // is staged and seal is NOT called — the generation must not inflate.
-    m.seed_selector(entries);
+    m.seed_selector(entries).unwrap();
     assert_eq!(
         m.system_bank().read().unwrap().generation(),
         1,
@@ -367,8 +367,8 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
         signature: TestSigner.sign(&sha256),
     };
     let store = InMemorySelectorStore::new();
-    store.write_primary(&blob);
-    store.write_secondary(&blob);
+    store.write_primary(&blob).unwrap();
+    store.write_secondary(&blob).unwrap();
 
     // The load rejects it, so the registry's selector reads as unseeded — the
     // host's reseed trigger.
@@ -380,7 +380,8 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
     m.seed_selector(vec![
         (slots::VM1, nv_boot(Bank::B, true)),
         (slots::VM2, nv_boot(Bank::A, true)),
-    ]);
+    ])
+    .unwrap();
 
     assert_eq!(m.system_bank().read().unwrap().generation(), 1);
     let primary = store.read_primary().expect("PRIMARY reseeded");
@@ -414,7 +415,7 @@ fn seed_uses_the_committed_bank_for_secondary() {
         (slots::VM1, nv_boot(Bank::B, false)),
         (slots::VM2, nv_boot(Bank::A, true)),
     ];
-    m.seed_selector(entries.clone());
+    m.seed_selector(entries.clone()).unwrap();
 
     // PRIMARY boots NV's active bank for both sets...
     let primary = store.read_primary().expect("PRIMARY written by the seed");
@@ -437,7 +438,7 @@ fn seed_uses_the_committed_bank_for_secondary() {
     );
 
     // PRIMARY already mirrors NV, so a re-seed writes nothing.
-    m.seed_selector(entries);
+    m.seed_selector(entries).unwrap();
     assert_eq!(
         store.read_primary().map(|b| b.generation),
         Some(primary.generation),
