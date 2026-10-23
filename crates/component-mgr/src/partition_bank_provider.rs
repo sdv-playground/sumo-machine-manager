@@ -1050,7 +1050,7 @@ mod tests {
         {
             let mut g = shared.write().unwrap();
             g.stage("os", bank, Default::default());
-            assert!(g.seal().unwrap());
+            assert!(g.seal(None).unwrap());
         }
         shared
     }
@@ -1062,7 +1062,7 @@ mod tests {
             let mut g = shared.write().unwrap();
             g.commit().unwrap(); // floor := the booted selection
             g.stage("os", armed, Default::default());
-            assert!(g.seal().unwrap()); // PRIMARY := the trial bank
+            assert!(g.seal(None).unwrap()); // PRIMARY := the trial bank
         }
         shared
     }

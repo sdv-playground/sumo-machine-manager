@@ -364,6 +364,7 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
     let blob = SelectorBlob {
         generation,
         entries: BTreeMap::new(),
+        transaction: None,
         sha256,
         signature: TestSigner.sign(&sha256),
         selectors: Some(selectors),

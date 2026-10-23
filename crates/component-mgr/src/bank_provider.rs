@@ -90,6 +90,9 @@ pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     /// yields the same bank the fallback would. A later piece removes the
     /// symlink fallback once the selector is the sole authority.
     selector: Option<machine_mgr::SharedSystemBankState>,
+    /// The node's current boot id, recorded in the boot vector's transaction
+    /// header when `activate` arms a trial. `None` = unknown (stored as zero).
+    node_boot_id: Option<String>,
 }
 
 impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
@@ -135,6 +138,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
             bank_activator,
             running_bank: Mutex::new(running_bank),
             selector,
+            node_boot_id: None,
         }
     }
 
@@ -146,6 +150,13 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     /// `FactoryDeps::hsm_crypto` by the component factory.
     pub fn with_hsm_crypto(mut self, crypto: Arc<dyn hsm::HsmCryptoProvider>) -> Self {
         self.hsm_crypto = Some(crypto);
+        self
+    }
+
+    /// The node's current boot id, armed into the boot vector's transaction
+    /// header by `activate`. Threaded from `FactoryDeps::node_boot_id`.
+    pub fn with_node_boot_id(mut self, id: Option<String>) -> Self {
+        self.node_boot_id = id;
         self
     }
 
@@ -787,7 +798,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             // so a missing boot-vector write is diagnosable. A failed write fails the
             // activation, so the caller never arms NV for a bank the boot vector
             // does not name.
-            match g.seal() {
+            match g.seal(self.node_boot_id.as_deref()) {
                 Ok(true) => tracing::info!(
                     slot = self.bank_set.as_index(),
                     label = %self.dir_name,
@@ -865,7 +876,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         if let Some(sel) = &self.selector {
             sel.write()
                 .expect("selector poisoned")
-                .rollback()
+                .rollback(machine_mgr::system_bank_state::Reason::Verdict)
                 .map_err(|e| BankError::Failed(format!("boot-vector rollback failed: {e}")))?;
         }
         Ok(())
@@ -1054,7 +1065,7 @@ mod tests {
         {
             let mut g = shared.write().unwrap();
             g.stage(id, bank, BTreeMap::new());
-            assert!(g.seal().unwrap());
+            assert!(g.seal(None).unwrap());
             assert_eq!(g.active_bank(id), Some(bank));
         }
         shared
@@ -1180,7 +1191,7 @@ mod tests {
         let store = InMemorySelectorStore::new();
         let mut mgr = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
         mgr.stage(id, bank, BTreeMap::new());
-        assert!(mgr.seal().unwrap());
+        assert!(mgr.seal(None).unwrap());
         mgr.commit().unwrap();
         (Arc::new(RwLock::new(mgr)), store)
     }
@@ -1219,7 +1230,7 @@ mod tests {
         {
             let mut g = selector.write().unwrap();
             g.stage("vm1", Bank::B, BTreeMap::new());
-            assert!(g.seal().unwrap());
+            assert!(g.seal(None).unwrap());
         }
         let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
 

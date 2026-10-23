@@ -93,6 +93,13 @@ manifests as recorded at install time, read without signature check or payload h
 is a report, not a verification. Intended use: after any reboot the orchestrator compares
 `inactive` with its intended release and downloads only the images that differ.
 
+They also carry the boot vector's transaction state. `trial_boots`: distinct node boots
+counted while armed without a verdict (`null` when the boot vector has no header, or the
+node is not in trial and has no recorded resolution). `trial_boot_limit`: the count
+at which the node rolls itself back (`null` = disabled; set by the host). `resolution`: how
+the last node transaction ended, `{"outcome": "committed"|"rolled_back", "reason":
+"verdict"|"trial_boot_limit"}`, `null` while a trial is open or when none is recorded.
+
 Residual concurrency limitation: the node commit/rollback routes serialize
 against each other inside sumo-mm, but SOVDd's component-level verdict routes do
 not share that mutex. Closing that cross-route TOCTOU window requires a shared
