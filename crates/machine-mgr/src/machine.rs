@@ -4,11 +4,12 @@ use std::sync::{Arc, RwLock};
 use nv_store::types::BankBootState;
 
 use crate::component::Component;
+use crate::node_update::NodeCoordinator;
 use crate::system_bank_state::{
-    BootSelector, SelectorError, SelectorStore, SharedSystemBankState, Signer, StubSelectorStore,
-    StubSigner, SystemBankManager,
+    BootObservation, BootSelector, Reason, SelectorError, SelectorStore, SharedSystemBankState,
+    Signer, StubSelectorStore, StubSigner, SystemBankManager,
 };
-use crate::EntityInfo;
+use crate::{EntityInfo, FlashId};
 
 /// The top-level machine: an `EntityInfo` (vehicle-level identity) plus a
 /// registry of `Component` objects.
@@ -24,6 +25,26 @@ pub trait Machine: Send + Sync {
 
     /// Look up a component by id.
     fn component(&self, id: &str) -> Option<&Arc<dyn Component>>;
+
+    /// The node's boot vector, if this machine holds one.
+    fn system_bank(&self) -> Option<&SharedSystemBankState> {
+        None
+    }
+}
+
+/// What [`MachineRegistry::observe_node_boot`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeBootOutcome {
+    /// The trial boot count after this boot; `None` when no trial is armed
+    /// (or the count could not be read or written).
+    pub trial_boots: Option<u8>,
+    /// The coordinator's trial boot limit (`None` = disabled).
+    pub limit: Option<u8>,
+    /// Whether the node rolled itself back through the boot vector.
+    pub bailed_out: bool,
+    /// Per-component rollback failures after the bail-out: (component id,
+    /// error).
+    pub errors: Vec<(String, String)>,
 }
 
 /// Default `Machine` implementation backed by an in-memory registry.
@@ -153,14 +174,98 @@ impl MachineRegistry {
             };
             sb.stage(id, floor, BTreeMap::new());
         }
-        sb.seal()?;
+        sb.seal(None)?;
         sb.commit()?;
         for (id, nv) in entries.iter().filter(|(_, nv)| !nv.committed) {
             sb.stage(id, nv.active_bank, BTreeMap::new());
         }
         // A no-op when nothing is in trial: `seal` needs something staged.
-        sb.seal()?;
+        sb.seal(None)?;
         Ok(())
+    }
+
+    /// Count this node boot against the armed trial and, once the count
+    /// reaches `coord`'s trial boot limit, roll the whole node back.
+    ///
+    /// This is the node's **one bounded autonomous act**: after the
+    /// host-configured number of distinct node boots while armed without a
+    /// verdict, the node takes the same rollback path a rollback verdict takes
+    /// — the boot vector first (the authority, its header recording
+    /// `trial_boot_limit` as the reason), then each component that was in trial
+    /// rolls back its own NV. The node never commits by itself. Counting is
+    /// per distinct boot id, so a process restart within one boot counts
+    /// nothing; a failed count or a failed boot-vector rollback logs and is
+    /// retried on the next boot.
+    ///
+    /// The host calls this once after the store is loaded and before serving,
+    /// and sets the limit below its boot stage's own bound so the node, not
+    /// the boot stage, settles the trial. No boot id or no limit: counts (or
+    /// not) and never rolls back.
+    pub async fn observe_node_boot(&self, coord: &NodeCoordinator) -> NodeBootOutcome {
+        let limit = coord.trial_boot_limit();
+        let mut out = NodeBootOutcome {
+            trial_boots: None,
+            limit,
+            bailed_out: false,
+            errors: Vec::new(),
+        };
+        let Some(boot_id) = coord.node_boot_id() else {
+            return out;
+        };
+        let observed = self
+            .system_bank
+            .write()
+            .expect("selector poisoned")
+            .observe_node_boot(boot_id);
+        let trial_boots = match observed {
+            Ok(BootObservation::NotArmed) => return out,
+            Ok(
+                BootObservation::AlreadyCounted { trial_boots }
+                | BootObservation::Counted { trial_boots },
+            ) => trial_boots,
+            Err(e) => {
+                tracing::warn!(error = %e, "trial boot not counted — retried next boot");
+                return out;
+            }
+        };
+        out.trial_boots = Some(trial_boots);
+        if limit.is_none_or(|l| trial_boots < l) {
+            return out;
+        }
+
+        // The in-trial set is taken BEFORE the boot-vector rollback: afterwards
+        // the vector no longer names anyone in trial.
+        let in_trial: Vec<Arc<dyn Component>> = self
+            .components
+            .iter()
+            .filter(|c| c.banks().is_some_and(|b| b.in_trial))
+            .cloned()
+            .collect();
+        {
+            let mut sb = self.system_bank.write().expect("selector poisoned");
+            if !sb.is_trial() {
+                return out;
+            }
+            if let Err(e) = sb.rollback(Reason::TrialBootLimit) {
+                tracing::warn!(error = %e, "trial boot limit reached but boot-vector rollback failed — retried next boot");
+                return out;
+            }
+        }
+        out.bailed_out = true;
+        tracing::warn!(
+            trial_boots,
+            limit = ?limit,
+            components = ?in_trial.iter().map(|c| c.id()).collect::<Vec<_>>(),
+            "trial boot limit reached without a verdict — node rolled back"
+        );
+        // The advisory FlashId, as the node rollback verdict passes it.
+        let id = FlashId::new("");
+        for comp in in_trial {
+            if let Err(e) = comp.rollback_install(&id).await {
+                out.errors.push((comp.id().to_string(), e.to_string()));
+            }
+        }
+        out
     }
 }
 
@@ -176,6 +281,10 @@ impl Machine for MachineRegistry {
     fn component(&self, id: &str) -> Option<&Arc<dyn Component>> {
         let idx = *self.by_id.get(id)?;
         self.components.get(idx)
+    }
+
+    fn system_bank(&self) -> Option<&SharedSystemBankState> {
+        Some(&self.system_bank)
     }
 }
 

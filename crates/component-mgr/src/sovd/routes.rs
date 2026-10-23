@@ -16,6 +16,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use machine_mgr::node_update::{Durable, NodeCoordinator, NodeUpdateState};
+use machine_mgr::system_bank_state::{Outcome, Reason, Resolution};
 use machine_mgr::{BankContents, Component, FlashId, FlashState, Machine, MachineError};
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
@@ -71,7 +72,11 @@ pub fn update_state_router<D: BlockDevice + Send + 'static>(
 /// unresolved; `rebooted_since_arming`: whether the node boot id has changed
 /// since that arming (null = unknown); `node_boot_id`: the node's current boot
 /// id (null = unknown); `banks`: what each component's banks hold, per the
-/// installed manifests (not a verification).
+/// installed manifests (not a verification); `trial_boots`: node boots counted
+/// while armed without a verdict (null = no boot-vector trial open or
+/// resolved); `trial_boot_limit`: the count at which the node rolls itself
+/// back (null = disabled); `resolution`: how the last node transaction ended,
+/// per the boot vector (null = none recorded, or a trial is open).
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct UpdateStateResponse {
     pub phase: String,
@@ -80,6 +85,34 @@ pub(crate) struct UpdateStateResponse {
     pub rebooted_since_arming: Option<bool>,
     pub(crate) node_boot_id: Option<String>,
     pub banks: Vec<ComponentBanksResponse>,
+    pub trial_boots: Option<u8>,
+    pub trial_boot_limit: Option<u8>,
+    pub resolution: Option<ResolutionResponse>,
+}
+
+/// How a node transaction ended: `outcome` is `committed` or `rolled_back`,
+/// `reason` is `verdict` or `trial_boot_limit`.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct ResolutionResponse {
+    pub outcome: String,
+    pub reason: String,
+}
+
+impl From<Resolution> for ResolutionResponse {
+    fn from(r: Resolution) -> Self {
+        Self {
+            outcome: match r.outcome {
+                Outcome::Committed => "committed",
+                Outcome::RolledBack => "rolled_back",
+            }
+            .to_string(),
+            reason: match r.reason {
+                Reason::Verdict => "verdict",
+                Reason::TrialBootLimit => "trial_boot_limit",
+            }
+            .to_string(),
+        }
+    }
 }
 
 /// One component's entry in the `banks` member: the active bank
@@ -175,6 +208,18 @@ fn update_state_body<D: BlockDevice>(
     machine: &dyn Machine,
 ) -> Json<UpdateStateResponse> {
     let st = derive_node_update_state(nv, coord);
+    // The boot vector's header is meaningful only while in trial or when it
+    // records a resolution; a committed node's leftover header reports nothing.
+    let (trial_boots, resolution) = machine.system_bank().map_or((None, None), |sb| {
+        let sb = sb.read().expect("selector poisoned");
+        match sb
+            .transaction()
+            .filter(|t| sb.is_trial() || t.resolution.is_some())
+        {
+            Some(t) => (Some(t.trial_boots), t.resolution.map(Into::into)),
+            None => (None, None),
+        }
+    });
     Json(UpdateStateResponse {
         phase: st.phase.as_str().to_string(),
         components: st.components,
@@ -182,6 +227,9 @@ fn update_state_body<D: BlockDevice>(
         rebooted_since_arming: st.rebooted_since_arming,
         node_boot_id: coord.node_boot_id().map(str::to_string),
         banks: component_banks(machine),
+        trial_boots,
+        trial_boot_limit: coord.trial_boot_limit(),
+        resolution,
     })
 }
 
@@ -620,9 +668,13 @@ async fn run_verdict(components: &[Arc<dyn Component>], verdict: Verdict) -> Ver
             continue;
         };
         let banked_trial = flash.dual_bank || flash.supports_trial_boot;
+        // A component whose banks report it out of trial is not a member: the
+        // structural trial set when a boot vector is attached, NV-derived
+        // otherwise (both through `in_trial`).
         if !banked_trial
             || st.state != FlashState::Activated
             || (matches!(verdict, Verdict::Rollback) && !flash.supports_rollback)
+            || comp.banks().is_some_and(|b| !b.in_trial)
         {
             out.skipped.push(comp.id().to_string());
             continue;
@@ -1519,6 +1571,9 @@ mod tests {
                 "rebooted_since_arming": null,
                 "node_boot_id": "boot-a",
                 "banks": [],
+                "trial_boots": null,
+                "trial_boot_limit": null,
+                "resolution": null,
             })
         );
         // In trial with nothing owed -> Trial, `reboot_owed` empty.
@@ -1531,6 +1586,9 @@ mod tests {
                 "rebooted_since_arming": null,
                 "node_boot_id": "boot-a",
                 "banks": [],
+                "trial_boots": null,
+                "trial_boot_limit": null,
+                "resolution": null,
             })
         );
         // Owed, arming boot id unknown (zero): not provably pre-reboot -> Trial.
@@ -1543,6 +1601,9 @@ mod tests {
                 "rebooted_since_arming": null,
                 "node_boot_id": "boot-a",
                 "banks": [],
+                "trial_boots": null,
+                "trial_boot_limit": null,
+                "resolution": null,
             })
         );
         // Owed, still on the arming boot -> RebootPending.
@@ -1555,6 +1616,9 @@ mod tests {
                 "rebooted_since_arming": false,
                 "node_boot_id": "boot-a",
                 "banks": [],
+                "trial_boots": null,
+                "trial_boot_limit": null,
+                "resolution": null,
             })
         );
         // Owed, booted since arming -> Trial.
@@ -1567,6 +1631,9 @@ mod tests {
                 "rebooted_since_arming": true,
                 "node_boot_id": "boot-b",
                 "banks": [],
+                "trial_boots": null,
+                "trial_boot_limit": null,
+                "resolution": null,
             })
         );
     }

@@ -550,7 +550,7 @@ fn signed_blob(gen: u64, entries: &[(&str, Bank)]) -> SelectorBlob {
         .iter()
         .map(|&(id, bank)| (id.to_string(), ComponentEntry::new(bank, BTreeMap::new())))
         .collect();
-    SelectorBlob::signed(gen, entries, &TestSigner)
+    SelectorBlob::signed(gen, entries, None, &TestSigner)
 }
 
 /// Seed PRIMARY == SECONDARY at the given selection — the committed baseline

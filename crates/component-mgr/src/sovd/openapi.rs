@@ -73,6 +73,7 @@ there."
         super::routes::ComponentBanksResponse,
         super::routes::BankContentsResponse,
         super::routes::BankImageResponse,
+        super::routes::ResolutionResponse,
         super::routes::HsmKeyEntry,
         super::routes::HsmKeysResponse,
         super::routes::CsrRequest,

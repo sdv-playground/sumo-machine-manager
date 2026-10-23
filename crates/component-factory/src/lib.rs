@@ -531,7 +531,8 @@ fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
             None, // partition provider owns the write; no byte-copy activator
             Some(selector),
         )
-        .with_component_id(component_id);
+        .with_component_id(component_id)
+        .with_node_boot_id(deps.node_boot_id.clone());
         let inner = match deps.hsm_crypto.clone() {
             Some(crypto) => inner.with_hsm_crypto(crypto),
             None => inner,
@@ -555,7 +556,8 @@ fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
         activator,
         Some(selector),
     )
-    .with_component_id(component_id);
+    .with_component_id(component_id)
+    .with_node_boot_id(deps.node_boot_id.clone());
     // When a crypto-only HSM handle is configured (the host's link-B client),
     // the IVD `seal` runs its lone `sign` over `HsmCryptoProvider` instead of the
     // lifecycle-bearing `dyn HsmProvider`. `None` keeps the `hsm_provider` path.

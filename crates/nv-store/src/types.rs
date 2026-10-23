@@ -785,11 +785,7 @@ impl NvUpdateSession {
     /// its UTF-8 bytes. A stored all-zero digest means "unknown", not a real
     /// boot id.
     pub fn boot_id_digest(node_boot_id: &str) -> [u8; 16] {
-        use sha2::{Digest, Sha256};
-        let full: [u8; 32] = Sha256::digest(node_boot_id.as_bytes()).into();
-        let mut out = [0u8; 16];
-        out.copy_from_slice(&full[..16]);
-        out
+        crate::selector::boot_id_digest(node_boot_id)
     }
 
     /// Record the node boot id at arming (`None` ⇒ unknown, stored as zero);
