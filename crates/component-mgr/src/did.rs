@@ -53,7 +53,6 @@ pub const DID_ACTIVE_BANK: u16 = 0xFD00;
 pub const DID_COMMITTED: u16 = 0xFD01;
 pub const DID_MIN_SECURITY_VER: u16 = 0xFD02;
 pub const DID_CURRENT_SECURITY_VER: u16 = 0xFD03;
-pub const DID_BOOT_COUNT: u16 = 0xFD04;
 pub const DID_GUEST_STATE: u16 = 0xFD05;
 pub const DID_HEARTBEAT_SEQ: u16 = 0xFD06;
 
@@ -132,15 +131,14 @@ pub fn read_did<D: BlockDevice>(
         }
     }
 
-    // 4. Dynamic DIDs (computed)
-    let bs = &state.banks[set.as_index()];
+    // 4. Dynamic DIDs (computed). `DID_COMMITTED` is not served here: it
+    //    follows the component's bank report (`in_trial`), which the
+    //    ComponentBackend layer reads (`committed_did_bytes`).
     match did {
         DID_ACTIVE_BANK => {
             // Report the bank we're actually running on, not the staged next-boot bank
             DidValue::Bytes(vec![if active == Bank::A { b'A' } else { b'B' }])
         }
-        DID_COMMITTED => DidValue::Bytes(vec![bs.committed as u8]),
-        DID_BOOT_COUNT => DidValue::Bytes(vec![bs.boot_count]),
         DID_MIN_SECURITY_VER | DID_CURRENT_SECURITY_VER => {
             if let Some(meta) = nv.read_fw_meta(set, active) {
                 let val = if did == DID_MIN_SECURITY_VER {
@@ -318,20 +316,16 @@ mod tests {
     }
 
     #[test]
-    fn read_did_dynamic_committed_reflects_flag() {
+    fn read_did_does_not_serve_committed_from_nv() {
         let mut nv = make_nv();
         let mut state = NvBootState::default();
-        let idx = slots::VM1.as_index();
-        state.banks[idx].active_bank = Bank::A;
-        state.banks[idx].committed = false;
-        state.banks[idx].boot_count = 3;
+        state.banks[slots::VM1.as_index()].committed = false;
         nv.write_boot_state(&mut state).unwrap();
 
-        let committed = read_did(&nv, slots::VM1, DID_COMMITTED, None);
-        assert_eq!(committed, DidValue::Bytes(vec![0]));
-
-        let boot_count = read_did(&nv, slots::VM1, DID_BOOT_COUNT, None);
-        assert_eq!(boot_count, DidValue::Bytes(vec![3]));
+        assert_eq!(
+            read_did(&nv, slots::VM1, DID_COMMITTED, None),
+            DidValue::NotFound
+        );
     }
 
     #[test]

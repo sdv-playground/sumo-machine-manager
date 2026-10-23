@@ -117,21 +117,23 @@ not share that mutex. Closing that cross-route TOCTOU window requires a shared
 guard in the upstream SOVDd API and is intentionally outside this repository's
 patch.
 
-**Commit is not gated on-device (since 2026-10-22).** Neither the node verdict routes
-nor a component's `preflight_commit` refuse a commit because a node reboot is owed or
-because a bank has no boot witness (`boot_count`). The device reports facts and the
-orchestrator decides:
+**Commit is not gated on-device (since 2026-10-22).** The node verdict routes and a
+component's `preflight_commit` do not refuse a commit because a component is pending a
+node reset. The device reports facts and the orchestrator decides:
 
-- `x-ota-update-state.reboot_owed` lists the components whose arming requires the
-  coalesced node reboot and whose trial is unresolved; the bit is set at finalize and
-  cleared only by commit / rollback / abort, so it persists across the reboot.
-- `x-ota-update-state.rebooted_since_arming` says whether `x-runtime.node_boot_id` has
-  changed since that arming (`null` when unknown). `phase` is `RebootPending` while it is
-  `false` and `Trial` once it is `true` (or unknown).
-- Orchestrator rule: `RebootPending` → reset the node first. `Trial` with a non-empty
-  `reboot_owed` → the node rebooted; check health, the reported running bank and
-  `x-ota-installed-manifest`, then commit or roll back. `Trial` with an empty
-  `reboot_owed` → a Local-reset (VM) trial; a verdict is owed.
+- `x-ota-update-state.reboot_owed` lists the components pending a node reset: derived
+  from each component's `pending_reset` (its install needs a node reset that has not
+  happened yet), not stored. It empties once the node has rebooted.
+- `x-ota-update-state.rebooted_since_arming` says whether the node has rebooted since the
+  open trial was armed: the boot vector's transaction header compares the boot id recorded
+  at seal with the current one, whatever the components' reset kind (`null` when
+  unknown). `phase` is `RebootPending` while `reboot_owed` is non-empty and `Trial` while
+  a component is in trial and none is pending.
+- Orchestrator rule: `RebootPending` → reset the node first. `Trial` with
+  `rebooted_since_arming` true → the components booted into their new content; check
+  health, the reported running bank and `x-ota-installed-manifest`, then commit or roll
+  back. `Trial` before the reboot → the step is armed; stage the remaining components,
+  then reset.
 - Residual risk, by design: a bootloader fall-back after the reboot is invisible to this
   process (`running_bank` is seeded from NV `active_bank`). The orchestrator must compare
   the installed manifest / running release; on hardware the bootloader's boot-status
@@ -144,8 +146,10 @@ The per-update `x-update.state` / `reset_kind` on the update status and
 `capabilities.x-update.verdict` are served by SOVDd (see `SOVDd/docs/x-update.md`), derived
 from this backend's activation state and `update_shape()`.
 
-A new flash is still refused while any `reboot_owed` bit is set or a component is in
-trial (one update transaction per ECU) — that is transaction integrity, not a verdict.
+A new flash is still refused while any component is pending a node reset
+(`reboot_owed` non-empty), or while a component is in trial and the node has rebooted
+since arming (one update transaction per ECU) — that is transaction integrity, not a
+verdict. Before that reboot a new flash joins the armed step.
 
 Vendor DATA params (served through the standard `/data/{param_id}` route, not
 new routes):
@@ -244,7 +248,6 @@ verdict" from "checked, and it disagrees". Readers therefore key off the map
 
 | Key | Present when | Value |
 |---|---|---|
-| `boot_count` | always | Trial/boot counter for this component's bank set, from NV. |
 | `node_boot_id` | node knows it | Node-wide per-boot nonce — stamped on EVERY component, since host-os has no heartbeat of its own. The offboard reboot witness compares it. |
 | `admin_state` | component is disableable | `enabled`\|`disabled`. Tri-state by omission: a non-disableable component omits it, so a UI can tell "cannot be disabled" from "enabled". The **persisted operator decision**. |
 | `reboot_pending` | `true` only | An admin change needs a reboot to take effect. |

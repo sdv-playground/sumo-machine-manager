@@ -181,7 +181,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         };
         // With a boot vector attached, trial is structural: this component's
         // booted entry differs from its committed floor. Without one, the NV
-        // committed flag for the set (the source `node_in_trial_labels` reads).
+        // committed flag for the set.
         let in_trial = match &self.selector {
             Some(sel) => sel
                 .read()

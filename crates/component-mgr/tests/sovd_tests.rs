@@ -901,7 +901,8 @@ fn make_disable_router(
     nv.write_fw_meta(set, Bank::A, &mut meta).unwrap();
     let nv = Arc::new(Mutex::new(nv));
 
-    // Sealed booted selection for the component: bank A serves.
+    // Sealed, committed booted selection for the component: bank A serves,
+    // not in trial.
     let selector: SharedSystemBankState = Arc::new(std::sync::RwLock::new(
         SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner)),
     ));
@@ -909,6 +910,7 @@ fn make_disable_router(
         let mut g = selector.write().unwrap();
         g.stage(id, Bank::A, Default::default());
         g.seal(None).unwrap();
+        g.commit().unwrap();
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1174,6 +1176,13 @@ async fn singleshot_disable_settles_prepare_and_enacts_at_execute() {
 /// the NV store so a test can read the armed / live-trial facts the gate
 /// decides on.
 fn make_node_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys) {
+    make_node_router_with(Arc::new(NodeCoordinator::new()))
+}
+
+/// [`make_node_router`] over `coord`.
+fn make_node_router_with(
+    coord: Arc<NodeCoordinator>,
+) -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, TestKeys) {
     let keys = generate_test_keys();
     let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
     suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
@@ -1183,11 +1192,6 @@ fn make_node_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, Tes
     let mut boot_state = NvBootState::default();
     nv.write_boot_state(&mut boot_state).unwrap();
     let nv = Arc::new(Mutex::new(nv));
-
-    let coord = Arc::new(NodeCoordinator::new(vec![
-        (slots::VM1.as_index(), "vm1".to_string()),
-        (slots::VM2.as_index(), "vm2".to_string()),
-    ]));
 
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     let mut machine = MachineRegistry::builder(EntityInfo {
@@ -1219,15 +1223,14 @@ fn make_node_router() -> (axum::Router, Arc<Mutex<NvStore<MemBlockDevice>>>, Tes
     (router, nv, keys)
 }
 
-/// The bank-set boot state the node gate reads (active bank, committed,
-/// boot_count).
+/// The bank-set boot state in NV (active bank, committed, boot_count).
 fn bank_state(nv: &Arc<Mutex<NvStore<MemBlockDevice>>>, set: BankSet) -> BankBootState {
     nv.lock().unwrap().read_boot_state().unwrap().banks[set.as_index()].clone()
 }
 
 /// The coalesced activation reboot for one component, over the real §7.19
 /// restart route — the orchestrator's reset step. Switches the running bank to
-/// the armed bank and raises the trial `boot_count`.
+/// the armed bank.
 async fn activation_reset(router: &axum::Router, component: &str) {
     let (status, body) = put_json(
         router,
@@ -1282,8 +1285,15 @@ async fn live_trial_still_refuses_a_new_flash() {
     // The gate's genuine case, unchanged: once the activation reboot HAS happened
     // (running == armed, still uncommitted) the node owes a verdict, and a new
     // flash is refused 409 with the owes-a-verdict message — the engine's
-    // state-gated recovery keys off exactly this refusal.
-    let (router, nv, keys) = make_node_router();
+    // state-gated recovery keys off exactly this refusal. "Has happened" is the
+    // node's observation (the boot vector's header on a host); here a probe
+    // the test flips when it takes the reset.
+    let rebooted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let coord = Arc::new(NodeCoordinator::new().with_rebooted_probe({
+        let rebooted = rebooted.clone();
+        Arc::new(move |_| Some(rebooted.load(std::sync::atomic::Ordering::SeqCst)))
+    }));
+    let (router, nv, keys) = make_node_router_with(coord);
 
     flash_to_awaiting_verdict(
         &router,
@@ -1292,15 +1302,12 @@ async fn live_trial_still_refuses_a_new_flash() {
     )
     .await;
     activation_reset(&router, "vm1").await;
+    rebooted.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let vm1_bank = bank_state(&nv, slots::VM1);
     assert!(
         !vm1_bank.committed,
         "vm1 still owes a verdict: {vm1_bank:?}"
-    );
-    assert!(
-        vm1_bank.boot_count > 0,
-        "…and its trial is now LIVE — it booted the armed bank: {vm1_bank:?}"
     );
 
     let (status, body) = post_json(
@@ -1491,10 +1498,7 @@ fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, 
         None,
     );
 
-    let coord = Arc::new(NodeCoordinator::new(vec![
-        (slots::VM1.as_index(), "vm1".to_string()),
-        (slots::VM2.as_index(), "vm2".to_string()),
-    ]));
+    let coord = Arc::new(NodeCoordinator::new());
     let mut machine = MachineRegistry::builder(EntityInfo {
         id: "vehicle".into(),
         name: "vehicle".into(),
@@ -1532,8 +1536,7 @@ fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, 
         machine = machine.with(ComponentAdapter::new(backend));
     }
 
-    let router =
-        component_mgr::sovd::routes::update_state_router(nv, coord, Arc::new(machine.build()));
+    let router = component_mgr::sovd::routes::update_state_router(coord, Arc::new(machine.build()));
     (router, tmp)
 }
 
@@ -1746,14 +1749,9 @@ impl TrialNode {
     /// The update-state and node verdict routes over this node, reporting
     /// through `coord`.
     fn router(&self, coord: Arc<NodeCoordinator>) -> axum::Router {
-        component_mgr::sovd::routes::update_state_router(
-            self.nv.clone(),
-            coord,
-            self.machine.clone(),
+        component_mgr::sovd::routes::update_state_router(coord, self.machine.clone()).merge(
+            component_mgr::sovd::routes::node_verdict_router(self.machine.clone()),
         )
-        .merge(component_mgr::sovd::routes::node_verdict_router(
-            self.machine.clone(),
-        ))
     }
 
     fn store(&self) -> FileSelectorStore {
@@ -1763,12 +1761,9 @@ impl TrialNode {
 
 fn coord_at(boot_id: &str, limit: Option<u8>) -> Arc<NodeCoordinator> {
     Arc::new(
-        NodeCoordinator::new(vec![
-            (slots::VM1.as_index(), "vm1".to_string()),
-            (slots::VM2.as_index(), "vm2".to_string()),
-        ])
-        .with_node_boot_id(boot_id)
-        .with_trial_boot_limit(limit),
+        NodeCoordinator::new()
+            .with_node_boot_id(boot_id)
+            .with_trial_boot_limit(limit),
     )
 }
 

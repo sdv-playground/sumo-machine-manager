@@ -40,8 +40,17 @@ pub struct ComponentAdapter<D: BlockDevice + Send + 'static> {
 }
 
 impl<D: BlockDevice + Send + Sync + 'static> ComponentAdapter<D> {
+    /// Wrap `inner`. When it carries a node coordinator, registers its bank
+    /// report there, so the node-level readers derive from this component's
+    /// facts, plus the NV update session as the node's "rebooted since arming"
+    /// fallback (a no-op when the host wired the boot vector).
     pub fn new(inner: Arc<ComponentBackend<D>>) -> Self {
         let capabilities = derive_capabilities(&inner);
+        if let Some(coord) = inner.node_coordinator() {
+            let provider = inner.bank_provider().clone();
+            coord.register_banks_probe(&inner.entity_info().id, Arc::new(move || provider.banks()));
+            coord.register_rebooted_fallback(inner.nv_rebooted_probe());
+        }
         Self {
             inner,
             capabilities,
@@ -203,6 +212,10 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
     }
 
     async fn read_did(&self, key: u16, _kind: DidKind) -> MachineResult<Bytes> {
+        // Before the NV lock: the bank report takes it.
+        if key == did::DID_COMMITTED {
+            return Ok(Bytes::from(self.inner.committed_did_bytes()));
+        }
         let nv = self
             .inner
             .nv_lock()

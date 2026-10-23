@@ -95,7 +95,7 @@ safe-time floor, then reset on the next boot). Therefore:
 `GET .../status` returns §7.19.2 status with a flattened `x-runtime` object:
 ```jsonc
 { "...standard status...": "…",
-  "x-runtime": { "boot_count": 12, "uptime_s": 3400, "node_boot_id": "<uuid>", "admin_state": "enabled" } }
+  "x-runtime": { "uptime_s": 3400, "node_boot_id": "<uuid>", "admin_state": "enabled" } }
 ```
 `node_boot_id` (the current boot nonce) is required — it's what freshness-bound
 tokens (A.5) and cross-boot cursor logic key on.

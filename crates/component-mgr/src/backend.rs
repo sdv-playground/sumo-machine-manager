@@ -452,8 +452,8 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     uploaded_parts: Mutex<HashMap<String, UploadedPartLocation>>,
     flash_session: Mutex<Option<FlashSessionState>>,
     flash_transfer: Mutex<Option<FlashTransferState>>,
-    /// Session-scoped pull source (untrusted CAS base URL + trust anchor +
-    /// campaign session id) for installs whose manifest references payloads by
+    /// Session-scoped pull source (untrusted CAS base URL + trust anchor) for
+    /// installs whose manifest references payloads by
     /// content-addressed URI. Set by the pull route BEFORE `start_flash` via
     /// [`set_install_source`](Self::set_install_source); cleared when the
     /// session ends (`clear_flash_session` / successful `finalize_flash`).
@@ -1282,6 +1282,35 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         self.bank_set
     }
 
+    /// The `committed` DID (`0xFD01`) from the bank report: `1` unless the
+    /// component is in trial. PRECONDITION: never call with the NV mutex held —
+    /// the report may take it.
+    pub fn committed_did_bytes(&self) -> Vec<u8> {
+        vec![u8::from(
+            !self.bank_provider.banks().is_some_and(|b| b.in_trial),
+        )]
+    }
+
+    /// "Rebooted since arming" from the NV update session (the armed boot id
+    /// recorded by [`Self::set_reboot_owed`]) — the node's fallback when no
+    /// boot vector is wired. Holds the NV store, not the backend.
+    pub fn nv_rebooted_probe(&self) -> machine_mgr::node_update::RebootedProbe {
+        let nv = self.nv.clone();
+        Arc::new(move |boot_id| {
+            nv.lock()
+                .ok()?
+                .read_update_session()
+                .unwrap_or_default()
+                .rebooted_since_arming(boot_id)
+        })
+    }
+
+    /// The shared node update-transaction coordinator, when injected via
+    /// [`Self::with_node_coordinator`].
+    pub fn node_coordinator(&self) -> Option<&Arc<machine_mgr::node_update::NodeCoordinator>> {
+        self.node_coordinator.as_ref()
+    }
+
     pub fn has_vm_service(&self) -> bool {
         self.vm_service_addr.is_some()
     }
@@ -1876,8 +1905,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Provide the session-scoped pull source for the NEXT install session —
     /// see [`machine_mgr::InstallSource`]. Called by the pull route before
     /// `start_flash`; overwrites any previous value. Enables the fetch
-    /// fallback in `finalize_flash`'s reconciliation and stamps the campaign
-    /// session id on the node update-transaction gate.
+    /// fallback in `finalize_flash`'s reconciliation.
     pub fn set_install_source(&self, source: machine_mgr::InstallSource) {
         *self.install_source.lock().unwrap() = Some(source);
     }
@@ -1939,92 +1967,29 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // "Disabled ⇒ never uncommitted" holds because the disable enact refuses
         // a component mid-trial, not by refusing the flash.
 
-        if !self.config.single_bank {
-            let nv = self
-                .nv
-                .lock()
-                .map_err(|_| BackendError::Internal("nv lock".into()))?;
-            let state = nv
-                .read_boot_state()
-                .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-            let idx = self.bank_set.as_index();
-            if !state.banks[idx].committed {
-                return Err(BackendError::Busy(format!(
-                    "bank set {:?} is in trial mode (active={:?}, uncommitted) — \
-                     commit or rollback the pending upgrade before starting a new one",
-                    self.bank_set, state.banks[idx].active_bank
-                )));
-            }
+        if !self.config.single_bank && self.bank_provider.banks().is_some_and(|b| b.in_trial) {
+            return Err(BackendError::Busy(format!(
+                "bank set {:?} is in trial mode (active={:?}, uncommitted) — \
+                 commit or rollback the pending upgrade before starting a new one",
+                self.bank_set,
+                self.bank_provider.active_bank()
+            )));
         }
 
-        // Node-level update-transaction gate: refuse a new flash while a prior
-        // transaction is still unresolved on this node — either it owes an
-        // activation reboot (the durable half — survives a power cycle, unlike the
-        // in-memory flash state, which is how a singleshot rt slipped through) OR
-        // it owes a commit/rollback verdict for a component whose trial is LIVE.
-        // Both sets come from NV (`node_reboot_owed` + `node_live_trial_labels`).
-        // Live-trial, not the wider `x-ota-update-state` Trial set: a component
-        // that is armed but has not yet taken the coalesced activation reboot owes
-        // nothing yet, and refusing for it would break the engine's one-reboot
-        // coalescing of a banked campaign step (it 409'd the second component of a
-        // ["vm1","vm2"] step). A sibling joining the SAME transaction (matching
-        // session id) is admitted, so the banked group can stage together; the
-        // orchestrator stages every component before any finalize, so no
-        // owed/live-trial bit is set while a sibling is still being admitted.
-        // On admit, this component joins the staging set. No-op until `vm-sovd`
-        // injects the coordinator. The session id is zero for the push path; the
-        // pull route stamps the L1 campaign id via `install_source`, so one
-        // campaign's components Join a single node transaction and anything
-        // unrelated gets Mixing-refused.
+        // Node-level update-transaction gate (see `machine_mgr::node_update`):
+        // refuse a new flash while any component is pending a node reset, or
+        // while a component is in trial and the node has rebooted since arming
+        // (the trial awaits its verdict). Before that reboot an in-trial
+        // component is an armed sibling of the same campaign step, so this one
+        // joins: one step, one reboot, one verdict. On admit, this component
+        // joins the staging set. No-op until `vm-sovd` injects the coordinator.
         if let Some(coord) = &self.node_coordinator {
-            let durable = self.node_reboot_owed()?;
-            let in_trial = {
-                let nv = self
-                    .nv
-                    .lock()
-                    .map_err(|_| BackendError::Internal("nv lock".into()))?;
-                node_live_trial_labels(&nv, coord)
-            };
-            let session_id = self
-                .install_source
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|s| s.session_id)
-                .unwrap_or([0u8; 32]);
             coord
-                .gate_new_session(session_id, &self.entity_info.id, &durable, &in_trial)
+                .gate_new_session(&self.entity_info.id)
                 .map_err(|r| BackendError::Busy(r.to_string()))?;
         }
 
         Ok(())
-    }
-
-    /// Read the node-level reboot-owed set from this node's shared NV
-    /// (`NvUpdateSession`) as a [`machine_mgr::node_update::Durable`] — the durable
-    /// half of the update-transaction state the gate checks. Labelled by bank set;
-    /// the per-component names arrive once the coordinator holds the bank-set->id map.
-    fn node_reboot_owed(&self) -> BackendResult<machine_mgr::node_update::Durable> {
-        let nv = self
-            .nv
-            .lock()
-            .map_err(|_| BackendError::Internal("nv lock".into()))?;
-        let session = nv.read_update_session().unwrap_or_default();
-        let reboot_owed = (0..nv.slot_count())
-            .filter(|&i| session.owes(BankSet(i as u8)))
-            .map(|i| {
-                self.node_coordinator
-                    .as_ref()
-                    .map(|c| c.label(i))
-                    .unwrap_or_else(|| format!("bank-set {i}"))
-            })
-            .collect();
-        Ok(machine_mgr::node_update::Durable {
-            session_id: session.session_id,
-            reboot_owed,
-            rebooted_since_arming: session
-                .rebooted_since_arming(self.current_node_boot_id().as_deref()),
-        })
     }
 
     /// The node boot id this process sees now: the coordinator's when it carries
@@ -2038,13 +2003,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     }
 
     /// Set or clear this component's bit in the node-level reboot-owed record
-    /// (`NvUpdateSession`) — the durable "a node reboot is owed" marker the gate
-    /// checks. Arming (`owed == true`) also records the current node boot id
-    /// (`armed_boot_id`) so [`node_reboot_owed`](Self::node_reboot_owed) can report
-    /// `rebooted_since_arming`; clearing leaves the armed id alone (it is
-    /// irrelevant once the mask is empty). Read-modify-write of the shared node NV;
-    /// idempotent (writes only on a change). The mirror of
-    /// [`node_reboot_owed`](Self::node_reboot_owed).
+    /// (`NvUpdateSession`). Arming (`owed == true`) also records the current
+    /// node boot id (`armed_boot_id`); clearing leaves the armed id alone (it is
+    /// irrelevant once the mask is empty). Read-modify-write of the shared node
+    /// NV; idempotent (writes only on a change). Only the armed boot id is read
+    /// back, by [`Self::nv_rebooted_probe`] when no boot vector is wired.
     fn set_reboot_owed(&self, owed: bool) -> BackendResult<()> {
         let boot_id = self.current_node_boot_id();
         let mut nv = self
@@ -2064,10 +2027,9 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     }
 
     /// Refuse a banked commit only on facts this process can see: an in-memory
-    /// AwaitingReboot transfer, a selector that disagrees with the durable active
-    /// bank or with the bank this process booted from, or a provider that reports
-    /// a pending reboot. The ECU does NOT veto on an owed node reboot or on a boot
-    /// witness (`boot_count`): the orchestrator proves the reboot from
+    /// AwaitingReboot transfer, a selected bank that disagrees with the bank this
+    /// process booted from, or a provider that reports a pending reboot. The ECU
+    /// does NOT veto on a pending node reset: the orchestrator proves the reboot from
     /// `x-ota-update-state` (`rebooted_since_arming`), `x-runtime.node_boot_id`
     /// and the heartbeat `boot_id`, and decides commit/rollback. A bootloader
     /// fall-back is invisible to this process (`running_bank` is seeded from NV
@@ -2090,25 +2052,18 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             ));
         }
 
-        let boot = self
-            .nv
-            .lock()
-            .map_err(|_| BackendError::Internal("nv lock".into()))?
-            .read_boot_state()
-            .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-        let bank = &boot.banks[self.bank_set.as_index()];
-        let selected = self
-            .bank_provider
-            .selected_bank()
-            .unwrap_or(bank.active_bank);
-        if !bank.committed && selected != bank.active_bank {
-            return Err(BackendError::Busy(format!(
-                "commit refused: selected bank {selected:?} does not match durable active bank {:?}",
-                bank.active_bank
-            )));
-        }
-        // The owed-bit and boot-witness (`boot_count == 0`) gates were removed on
-        // 2026-10-22: proving the reboot is the orchestrator's call, not an ECU veto.
+        let selected = match self.bank_provider.selected_bank() {
+            Some(bank) => bank,
+            None => {
+                self.nv
+                    .lock()
+                    .map_err(|_| BackendError::Internal("nv lock".into()))?
+                    .read_boot_state()
+                    .ok_or_else(|| BackendError::Internal("no boot state".into()))?
+                    .banks[self.bank_set.as_index()]
+                .active_bank
+            }
+        };
 
         let running = *self.running_bank.lock().unwrap();
         if selected != running {
@@ -3018,80 +2973,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             Err(format!("vm-service returned: {status_line}"))
         }
     }
-}
-
-/// The node's in-trial component set — every bank set whose active bank is not
-/// yet committed (`committed == false`), labelled via the coordinator. This is
-/// the `x-ota-update-state` wire's Trial set — `sovd::routes::derive_node_update_state`,
-/// which the commit gate also reads for its `RebootPending` check. A component
-/// belongs from the moment its bank is armed, which is the phase the engine and
-/// the UIs report on.
-///
-/// The node flash gate uses the narrower [`node_live_trial_labels`] instead —
-/// see there for why the two must differ.
-pub(crate) fn node_in_trial_labels<D: BlockDevice>(
-    nv: &NvStore<D>,
-    coord: &machine_mgr::node_update::NodeCoordinator,
-) -> Vec<String> {
-    trial_labels(nv, coord, |b| !b.committed)
-}
-
-/// The node's LIVE-trial set — the components the open-a-new-flash gate
-/// (`ComponentBackend::ensure_flash_can_start`) refuses for. Narrower than
-/// [`node_in_trial_labels`]: a bank set counts only once the activation reboot
-/// has actually happened — the armed bank IS the running bank and a verdict is
-/// genuinely owed. `boot_count` is that event's durable witness: `ota::install`
-/// zeroes it when it arms the bank, and only a boot into the armed bank while
-/// uncommitted raises it — the boot manager's `process_boot`, or `ecu_reset`'s
-/// simulation witness for a component with no vm-service behind it. Commit /
-/// rollback / auto-rollback all re-commit the set, so a trial that fell back
-/// never lingers here.
-///
-/// For a vm-service-backed guest the only writer is supernova's
-/// `confirm_started_vm_trial` (heartbeat-confirmed, durable). `get_activation_state`
-/// used to bump the counter too, from its in-memory Verifying→Activated promotion —
-/// removed, because that made a process-lifetime fact look durable and it is not
-/// what this set is for (see `preflight_commit`). Consequence: a guest whose
-/// heartbeat chain is not up never joins this set, so an UNRELATED component's
-/// flash is not node-gated on its live trial. A re-flash of that guest itself is
-/// still refused one layer up, by `ensure_flash_can_start`'s per-bank-set
-/// committed check.
-///
-/// Why the gate must NOT use the wider wire set: the engine coalesces one
-/// campaign step into flash-all-banked → ONE reboot → trial-all → ONE
-/// commit-trials, so between two banked flashes the first component is
-/// armed-but-not-yet-rebooted. Counting it as in-trial refused its own sibling's
-/// `open_update` with `Refused::Trial` (409) and broke the coalescing. An
-/// armed-pre-reboot `RequiresEcuReset` component is still kept out of a new
-/// flash's way — by its durable reboot-owed bit, which `admit` refuses on with
-/// precedence; a Local-reset VM never sets that bit, which is why the
-/// armed-pre-reboot window was only ever visible through this set.
-///
-/// Only Local-reset components (VM guests) enter this set via `boot_count`; a
-/// `RequiresEcuReset` component is covered by its owed bit, which now persists
-/// until the verdict.
-pub(crate) fn node_live_trial_labels<D: BlockDevice>(
-    nv: &NvStore<D>,
-    coord: &machine_mgr::node_update::NodeCoordinator,
-) -> Vec<String> {
-    trial_labels(nv, coord, |b| !b.committed && b.boot_count > 0)
-}
-
-/// Label every bank set matching `is_member` via the coordinator's id map — the
-/// shared body of the two trial-set derivations above.
-fn trial_labels<D: BlockDevice>(
-    nv: &NvStore<D>,
-    coord: &machine_mgr::node_update::NodeCoordinator,
-    is_member: impl Fn(&BankBootState) -> bool,
-) -> Vec<String> {
-    nv.read_boot_state()
-        .map(|s| {
-            (0..nv.slot_count())
-                .filter(|&i| is_member(&s.banks[i]))
-                .map(|i| coord.label(i))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -4178,12 +4059,16 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 continue;
             }
 
-            let cached = self
-                .did_cache
-                .read()
-                .expect("did_cache poisoned")
-                .get(&did_num)
-                .cloned();
+            // `committed` follows the bank report, not NV, so it is read live.
+            let cached = if did_num == did::DID_COMMITTED {
+                Some(self.committed_did_bytes())
+            } else {
+                self.did_cache
+                    .read()
+                    .expect("did_cache poisoned")
+                    .get(&did_num)
+                    .cloned()
+            };
             match cached {
                 Some(bytes) => {
                     let value = did_value_to_json(did_num, &bytes, reg);
@@ -5475,12 +5360,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// definition → `ready`. The vendor `x-runtime` block (§5.4.5) carries
     /// the heartbeat `boot_id` (a per-lifetime nonce — the orchestrator's reboot
     /// witness: a *changed* boot_id proves a fresh guest lifetime, including a
-    /// node reboot, which `boot_count` cannot witness), the heartbeat `hb_seq`
-    /// (liveness), and `boot_count` (the NV trial counter — a metric only, written
-    /// by whatever observes the boot: the boot manager, `ecu_reset` for a component
-    /// with no vm-service, or supernova's heartbeat-confirmed VM witness. It stays
-    /// 0 for a guest whose heartbeat never progressed, so read `boot_id` for the
-    /// reboot question, not this).
+    /// node reboot), and the heartbeat `hb_seq` (liveness).
     async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {
         // Administratively disabled ⇒ skip the vm-service probe entirely (the
         // VM is down BY DESIGN — probing would only burn the health timeout)
@@ -5504,16 +5384,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             EntityStatus::NotReady
         };
 
-        let boot_count: u64 = self
-            .nv
-            .lock()
-            .unwrap()
-            .read_boot_state()
-            .map(|s| s.banks[self.bank_set.as_index()].boot_count as u64)
-            .unwrap_or(0);
-
         let mut runtime = serde_json::Map::new();
-        runtime.insert("boot_count".into(), serde_json::json!(boot_count));
         // Node reboot witness for the offboard flash gate — present on EVERY
         // component (it's a node-wide fact). The per-component heartbeat `boot_id`
         // below only exists for VM/RT; host-os has none, so the gate would fall
@@ -5533,9 +5404,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // `boot_id` is a per-lifetime nonce — it changes on every guest (re)boot
         // (node reboot OR per-VM relaunch). The orchestrator's reboot witness: a
         // changed boot_id proves a fresh guest lifetime and can't be faked by a
-        // stale heartbeat (which carries the OLD boot_id). Unlike boot_count
-        // (bumped only by a per-component ecu_reset), this also witnesses a node
-        // reboot.
+        // stale heartbeat (which carries the OLD boot_id). It also witnesses a
+        // node reboot.
         //
         // `lifecycle_for_ms` is the field an offboard waiter needs and never
         // had: "starting" alone can't distinguish a guest 2s into boot from one
@@ -5601,8 +5471,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
 
     async fn ecu_reset(&self, _reset_type: u8) -> BackendResult<Option<u8>> {
         // A VM reset queues the relaunch and enters Verifying; health polling
-        // records the bank switch and boot witness only after a fresh ready boot.
-        // Components without vm-service keep the explicit simulation path.
+        // records the bank switch only after a fresh ready boot. Components
+        // without vm-service switch the running bank directly.
 
         // A reset must never resurrect an administratively disabled component
         // — skip the pre-reset health probe AND the vm-service (re)start
@@ -5636,8 +5506,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         let was_running = matches!(pre_reset_health, Some(PreResetHealth::Running(_)));
 
         // Bank activation happens at install-finalize (finalize_flash),
-        // not here. ecu_reset requests the runtime launch, then records its
-        // durable simulated boot witness and transitions the flash state.
+        // not here. ecu_reset requests the runtime launch, then transitions
+        // the flash state.
 
         // Pick "restart" vs "start" based on whether the guest was actually
         // running pre-reset (the `was_running` probe above). For an offline
@@ -5695,24 +5565,20 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             return Ok(None);
         }
 
-        // Components without vm-service use an explicit simulation witness.
+        // Components without vm-service switch to the activated bank here; the
+        // served DIDs follow the running bank.
         if !self.config.single_bank {
-            let idx = self.bank_set.as_index();
-            let mut nv = self.nv_write()?;
-            let mut state = nv
-                .read_boot_state()
-                .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
-            if !state.banks[idx].committed {
-                state.banks[idx].boot_count += 1;
-                nv.write_boot_state(&mut state)
-                    .map_err(|e| BackendError::Internal(format!("nv write boot state: {e}")))?;
-            }
             *self.running_bank.lock().unwrap() = target_bank;
+            let nv = self
+                .nv
+                .lock()
+                .map_err(|_| BackendError::Internal("nv lock".into()))?;
+            self.refresh_did_cache_locked(&nv);
         }
 
-        // Single-bank components have no bank switch or durable boot witness.
+        // Single-bank components have no bank switch.
 
-        // Advance only after the runtime request and durable witness succeeded.
+        // Advance only after the runtime request succeeded.
         {
             let mut ft = self.flash_transfer.lock().unwrap();
             if let Some(ref mut t) = *ft {
@@ -5805,23 +5671,24 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             let ft = self.flash_transfer.lock().unwrap();
             ft.as_ref().map(|t| t.state)
         };
-        let node_boot_id = self.current_node_boot_id();
+        // Before the NV lock: the provider's report takes it.
+        let banks = self.bank_provider.banks();
+        let in_trial = banks.as_ref().is_some_and(|b| b.in_trial);
+        let pending_reset = banks.as_ref().is_some_and(|b| b.pending_reset);
 
         let nv = self
             .nv
             .lock()
             .map_err(|_| BackendError::Internal("lock".into()))?;
-        let status = ota::status(&*nv, self.bank_set)
-            .ok_or_else(|| BackendError::Internal("no boot state".into()))?;
 
         // Use running_bank for versions (not NV active_bank which may be staged)
         let rb = *self.running_bank.lock().unwrap();
         let active_meta = nv.read_fw_meta(self.bank_set, rb);
         let previous_meta = nv.read_fw_meta(self.bank_set, rb.other());
 
-        // Priority: upload phase > flash transfer > NV state.
+        // Priority: upload phase > flash transfer > the bank report.
         // A component with no fw_meta on either bank has never been
-        // OTA-written — report Initial regardless of the committed flag
+        // OTA-written — report Initial regardless of the trial flag
         // (defends against stale NV layouts that may show !committed for
         // never-touched slots).
         let state = match upload_state {
@@ -5829,21 +5696,13 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             None => match flash_state {
                 Some(s) => s,
                 None if active_meta.is_none() && previous_meta.is_none() => FlashState::Initial,
-                // A reconstructed owed trial whose node has not rebooted since
-                // arming is still awaiting that reboot: SOVDd's x-update maps
-                // AwaitingReboot → ACTIVATING and Activated →
-                // ACTIVATED_UNCOMMITTED. An observation, not a veto — the commit
-                // preflight only reads the in-memory transfer.
-                None if !status.committed && {
-                    let session = nv.read_update_session().unwrap_or_default();
-                    session.owes(self.bank_set)
-                        && session.rebooted_since_arming(node_boot_id.as_deref()) == Some(false)
-                } =>
-                {
-                    FlashState::AwaitingReboot
-                }
-                None if !status.committed => FlashState::Activated, // trial without transfer (e.g. after restart)
-                None => FlashState::Complete,                       // idle — no active update
+                // A reconstructed trial still pending its node reset is awaiting
+                // that reboot: SOVDd's x-update maps AwaitingReboot → ACTIVATING
+                // and Activated → ACTIVATED_UNCOMMITTED. An observation, not a
+                // veto — the commit preflight only reads the in-memory transfer.
+                None if in_trial && pending_reset => FlashState::AwaitingReboot,
+                None if in_trial => FlashState::Activated, // trial without transfer (e.g. after restart)
+                None => FlashState::Complete,              // idle — no active update
             },
         };
 
@@ -6187,13 +6046,6 @@ pub(crate) static DID_REGISTRY: &[DidEntry] = &[
         did: did::DID_CURRENT_SECURITY_VER,
         name: "Current Security Version",
         data_type: "uint32",
-        writable: false,
-    },
-    DidEntry {
-        id: "boot_count",
-        did: did::DID_BOOT_COUNT,
-        name: "Boot Count",
-        data_type: "uint8",
         writable: false,
     },
     DidEntry {
@@ -9180,6 +9032,8 @@ mod bank_provider_injection_tests {
         pending_reboot: AtomicBool,
         commits: AtomicUsize,
         rollbacks: AtomicUsize,
+        /// The bank report [`BankProvider::banks`] returns (`None` = none).
+        banks: Mutex<Option<machine_mgr::ComponentBanks>>,
     }
 
     impl SentinelProvider {
@@ -9189,7 +9043,22 @@ mod bank_provider_injection_tests {
                 pending_reboot: AtomicBool::new(false),
                 commits: AtomicUsize::new(0),
                 rollbacks: AtomicUsize::new(0),
+                banks: Mutex::new(None),
             }
+        }
+
+        /// Report bank B active with these trial facts from now on.
+        fn set_banks(&self, in_trial: bool, pending_reset: bool) {
+            *self.banks.lock().unwrap() = Some(machine_mgr::ComponentBanks {
+                active: machine_mgr::BankContents {
+                    bank: Bank::B,
+                    images: Default::default(),
+                    install_boot_id: None,
+                },
+                inactive: None,
+                in_trial,
+                pending_reset,
+            });
         }
     }
 
@@ -9253,6 +9122,9 @@ mod bank_provider_injection_tests {
         }
         fn disabled_record(&self, _bank: Bank) -> Result<Option<u64>, BankError> {
             Ok(None)
+        }
+        fn banks(&self) -> Option<machine_mgr::ComponentBanks> {
+            self.banks.lock().unwrap().clone()
         }
     }
 
@@ -9440,21 +9312,15 @@ mod bank_provider_injection_tests {
     }
 
     #[tokio::test]
-    async fn banked_commit_preflight_rejects_bank_mismatch_only() {
-        let provider = Arc::new(SentinelProvider::new(Some(Bank::A)));
+    async fn banked_commit_preflight_rejects_running_bank_mismatch_only() {
+        let provider = Arc::new(SentinelProvider::new(Some(Bank::B)));
         let b = backend_with_commit_provider(provider.clone(), false);
         arm_owed_bank_b_without_witness(&b);
+        provider.set_banks(true, true);
 
-        // The owed bit and the missing boot witness are not vetoes; the
-        // selector disagreeing with the durable active bank is.
-        let err = b.commit_flash().await.unwrap_err();
-        assert!(matches!(err, BackendError::Busy(_)));
-        assert!(err.to_string().contains("durable active bank"), "{err}");
-        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
-
-        // The selector now agrees with NV, but this (pre-arm) process still
-        // runs bank A.
-        *provider.selected.lock().unwrap() = Some(Bank::B);
+        // The owed bit, a pending reset and the missing boot witness are not
+        // vetoes; the selected bank B disagreeing with the bank this (pre-arm)
+        // process still runs (A) is.
         let err = b.commit_flash().await.unwrap_err();
         assert!(matches!(err, BackendError::Busy(_)));
         assert!(err.to_string().contains("running bank"), "{err}");
@@ -9481,7 +9347,7 @@ mod bank_provider_injection_tests {
     }
 
     #[tokio::test]
-    async fn reconstructed_trial_reports_awaiting_reboot_until_the_node_boot_id_changes() {
+    async fn reconstructed_trial_reports_awaiting_reboot_while_pending_reset() {
         let provider = Arc::new(SentinelProvider::new(Some(Bank::B)));
         let b = backend_with_commit_provider(provider.clone(), false)
             .with_node_boot_id("boot-x".into());
@@ -9503,11 +9369,16 @@ mod bank_provider_injection_tests {
             NvUpdateSession::boot_id_digest("boot-x")
         );
 
+        // The bank report carries the boot-id comparison (`pending_reset`: the
+        // install was sealed in the boot still running); the provider derives
+        // it, this stub states it.
+        provider.set_banks(true, true);
         let same_boot = reconstruct(&b, provider.clone()).with_node_boot_id("boot-x".into());
         assert_eq!(
             same_boot.get_activation_state().await.unwrap().state,
             FlashState::AwaitingReboot
         );
+        provider.set_banks(true, false);
         let rebooted = reconstruct(&b, provider.clone()).with_node_boot_id("boot-y".into());
         assert_eq!(
             rebooted.get_activation_state().await.unwrap().state,
@@ -9518,6 +9389,13 @@ mod bank_provider_injection_tests {
             unknown.get_activation_state().await.unwrap().state,
             FlashState::Activated
         );
+        // Out of trial: no active update.
+        provider.set_banks(false, false);
+        assert_eq!(
+            unknown.get_activation_state().await.unwrap().state,
+            FlashState::Complete
+        );
+        provider.set_banks(true, false);
 
         rebooted.commit_flash().await.unwrap();
         assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
@@ -9820,63 +9698,53 @@ mod bank_provider_injection_tests {
         )
     }
 
+    /// Whether NV's node reboot-owed record has `b`'s bit set (still written,
+    /// no longer read by the node-level readers).
+    pub(super) fn nv_owes<D: BlockDevice + Send + 'static>(b: &ComponentBackend<D>) -> bool {
+        b.nv.lock()
+            .unwrap()
+            .read_update_session()
+            .unwrap_or_default()
+            .owes(b.bank_set)
+    }
+
     #[test]
     fn reboot_owed_round_trips_through_nv() {
-        // The step-3 durable marker: set/clear this component's node reboot-owed
-        // bit and read it back via the same NvUpdateSession record the gate
-        // consults. (The refuse-on-RebootPending decision is covered by
-        // machine-mgr's node_update tests; this proves the component-mgr NV plumbing.)
+        // The durable marker: set/clear this component's node reboot-owed bit and
+        // read it back from the NvUpdateSession record (dual-run: still written).
         let b = backend(); // slots::VM1
-        assert!(b.node_reboot_owed().unwrap().reboot_owed.is_empty());
+        assert!(!nv_owes(&b));
 
         b.set_reboot_owed(true).unwrap();
-        assert_eq!(
-            b.node_reboot_owed().unwrap().reboot_owed,
-            vec![format!("bank-set {}", slots::VM1.as_index())]
-        );
+        assert!(nv_owes(&b));
 
         b.set_reboot_owed(false).unwrap();
-        assert!(b.node_reboot_owed().unwrap().reboot_owed.is_empty());
+        assert!(!nv_owes(&b));
     }
 
     #[test]
     fn commit_and_rollback_share_one_resolve_hook() {
         // Regression for the asymmetry saka caught: commit_flash cleared the node
         // transaction but rollback_flash did not, so a rolled-back banked component
-        // stayed wedged in Staging/RebootPending and the node never returned to
-        // Idle. Both paths now route through `resolve_node_transaction`; this proves
-        // the hook clears the durable reboot-owed bit AND drops the component from
-        // the coordinator's staging. The coordinator carries a node boot id so the
-        // armed-and-not-yet-rebooted state reads as RebootPending (without one,
-        // `rebooted_since_arming` is unknown and the phase is Trial).
-        let coord = Arc::new(
-            machine_mgr::node_update::NodeCoordinator::new(vec![(
-                slots::VM1.as_index(),
-                "vm1".to_string(),
-            )])
-            .with_node_boot_id("boot-x"),
-        );
+        // stayed wedged in Staging and the node never returned to Idle. Both paths
+        // now route through `resolve_node_transaction`; this proves the hook clears
+        // the durable reboot-owed bit AND drops the component from the
+        // coordinator's staging.
+        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
         let b = backend().with_node_coordinator(coord.clone());
         let id = b.entity_info().id.clone();
 
         // Stage it (what start_flash's gate does) + mark a reboot owed (finalize).
-        coord
-            .gate_new_session([0u8; 32], &id, &b.node_reboot_owed().unwrap(), &[])
-            .unwrap();
+        coord.gate_new_session(&id).unwrap();
         b.set_reboot_owed(true).unwrap();
-        let d = b.node_reboot_owed().unwrap();
-        assert_eq!(
-            coord.node_update_state(&d, &[]).phase.as_str(),
-            "RebootPending"
-        );
+        assert_eq!(coord.node_update_state().phase.as_str(), "Staging");
 
         // The single hook both commit_flash and rollback_flash call.
         b.resolve_node_transaction().unwrap();
 
-        let d = b.node_reboot_owed().unwrap();
-        assert!(d.reboot_owed.is_empty(), "reboot-owed must be cleared");
+        assert!(!nv_owes(&b), "reboot-owed must be cleared");
         assert_eq!(
-            coord.node_update_state(&d, &[]).phase.as_str(),
+            coord.node_update_state().phase.as_str(),
             "Idle",
             "staging must be cleared -> node Idle"
         );
@@ -12053,7 +11921,6 @@ mod copy_forward_tests {
         machine_mgr::InstallSource {
             cas_base_url: base,
             trust_anchor: key.public_key_bytes(),
-            session_id: None,
         }
     }
 
@@ -12385,12 +12252,10 @@ mod copy_forward_tests {
         );
     }
 
-    /// The pull route stamps the campaign id via `install_source`: siblings
-    /// Join ONE node update transaction, while an unrelated zero-id (push)
-    /// start is Mixing-refused. `abort_install` through the adapter resolves
-    /// the staging so the node returns to Idle.
+    /// Siblings Join ONE node update transaction; `abort_install` through the
+    /// adapter resolves the staging so the node returns to Idle.
     #[tokio::test]
-    async fn install_source_session_id_drives_the_node_gate() {
+    async fn siblings_join_one_node_transaction_and_abort_resolves_it() {
         let tmp = tempfile::tempdir().unwrap();
         let images_dir = tmp.path().to_path_buf();
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
@@ -12401,10 +12266,7 @@ mod copy_forward_tests {
         }
         nv.write_boot_state(&mut boot).unwrap();
         let nv = Arc::new(Mutex::new(nv));
-        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new(vec![
-            (slots::VM1.as_index(), "vm1".into()),
-            (slots::VM2.as_index(), "vm2".into()),
-        ]));
+        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
         let mk = |set: BankSet| {
             ComponentBackend::with_options(
                 set,
@@ -12420,27 +12282,14 @@ mod copy_forward_tests {
         let vm1 = mk(slots::VM1);
         let vm2 = mk(slots::VM2);
 
-        let campaign = [7u8; 32];
-        let source = |sid| machine_mgr::InstallSource {
-            cas_base_url: "http://cas".into(),
-            trust_anchor: Vec::new(),
-            session_id: Some(sid),
-        };
-        vm1.set_install_source(source(campaign));
         vm1.ensure_flash_can_start()
             .expect("first campaign member stages");
-
-        // An unrelated zero-id (push-path) start must not mix into the
-        // campaign's node transaction…
-        let err = vm2
-            .ensure_flash_can_start()
-            .expect_err("zero id must be Mixing-refused during campaign staging");
-        assert!(matches!(err, BackendError::Busy(_)), "got {err:?}");
-
-        // …but the campaign sibling Joins under the same id.
-        vm2.set_install_source(source(campaign));
         vm2.ensure_flash_can_start()
             .expect("sibling joins the same node transaction");
+        assert_eq!(
+            coord.node_update_state().phase,
+            machine_mgr::node_update::NodePhase::Staging
+        );
 
         // Adapter-level abort resolves the staging membership (not just the
         // backend session) — the node returns to Idle once both leave.
@@ -12453,57 +12302,61 @@ mod copy_forward_tests {
         a2.abort_install(&machine_mgr::FlashId::new("x"))
             .await
             .unwrap();
-        let st = coord.node_update_state(&machine_mgr::node_update::Durable::default(), &[]);
+        let st = coord.node_update_state();
         assert_eq!(st.phase, machine_mgr::node_update::NodePhase::Idle);
     }
 
-    /// The in-trial verdict gate: while a sibling's trial is LIVE (its armed bank
-    /// is uncommitted, the activation reboot has happened — `boot_count > 0` — and
-    /// NO node reboot is owed, since a Local-reset VM never sets the owed bit, so
-    /// the node phase is Trial, not RebootPending), a NEW flash of a DIFFERENT
-    /// component is refused with `Refused::Trial` — the node owes a
-    /// commit/rollback verdict first. Committing the in-trial component clears it.
-    /// The same-component case is caught one layer earlier by the per-bank-set
-    /// committed check ("in trial mode"), never the node gate.
+    /// The in-trial verdict gate: while a sibling is in trial and the node has
+    /// rebooted since arming (a Local-reset VM is never pending a node reset,
+    /// so the node phase is Trial, not RebootPending), a NEW flash of a
+    /// DIFFERENT component is refused with `Refused::Trial` — the node owes a
+    /// commit/rollback verdict first. Committing the in-trial component clears
+    /// it. The same-component case is caught one layer earlier by the
+    /// component's own in-trial check ("in trial mode"), never the node gate.
     #[tokio::test]
     async fn in_trial_component_refuses_a_new_flash_of_a_sibling() {
         let tmp = tempfile::tempdir().unwrap();
         let images_dir = tmp.path().to_path_buf();
 
-        // vm1 in a live trial: active bank B, uncommitted, booted into it once, no
-        // reboot owed. vm2 fully committed, so it clears its own bank-set check and
-        // reaches the node gate.
+        // vm1 in trial: active bank B, uncommitted. vm2 fully committed, so it
+        // clears its own in-trial check and reaches the node gate.
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
         boot.banks[slots::VM1.as_index()].active_bank = Bank::B;
         boot.banks[slots::VM1.as_index()].committed = false;
-        boot.banks[slots::VM1.as_index()].boot_count = 1;
         boot.banks[slots::VM2.as_index()].active_bank = Bank::A;
         boot.banks[slots::VM2.as_index()].committed = true;
         nv.write_boot_state(&mut boot).unwrap();
         let nv = Arc::new(Mutex::new(nv));
 
-        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new(vec![
-            (slots::VM1.as_index(), "vm1".into()),
-            (slots::VM2.as_index(), "vm2".into()),
-        ]));
-        let mk = |set: BankSet| {
-            ComponentBackend::with_options(
-                set,
-                nv.clone(),
-                Arc::new(NoopManifest),
-                ComponentConfig::default(),
-                None,
-                Some(images_dir.clone()),
-                None,
-            )
-            .with_node_coordinator(coord.clone())
+        // The node has rebooted since vm1 was armed: its trial awaits a verdict.
+        let coord = Arc::new(
+            machine_mgr::node_update::NodeCoordinator::new()
+                .with_rebooted_probe(Arc::new(|_| Some(true))),
+        );
+        let mk = |set: BankSet, id: &str| {
+            let backend = Arc::new(
+                ComponentBackend::with_options(
+                    set,
+                    nv.clone(),
+                    Arc::new(NoopManifest),
+                    ComponentConfig::default(),
+                    None,
+                    Some(images_dir.clone()),
+                    None,
+                )
+                .with_id(id.to_string())
+                .with_node_coordinator(coord.clone()),
+            );
+            // The adapter registers the component's bank report with the node.
+            crate::component_adapter::ComponentAdapter::new(backend.clone());
+            backend
         };
-        let vm1 = mk(slots::VM1);
-        let vm2 = mk(slots::VM2);
+        let vm1 = mk(slots::VM1, "vm1");
+        let vm2 = mk(slots::VM2, "vm2");
 
         // A DIFFERENT component is refused by the node gate: the node owes a
-        // verdict for the in-trial vm1 (the refusal names vm1, not "bank-set N").
+        // verdict for the in-trial vm1.
         let err = vm2
             .ensure_flash_can_start()
             .expect_err("a new flash must be refused while vm1 is in trial");
@@ -12516,25 +12369,24 @@ mod copy_forward_tests {
             "expected the node-gate Trial refusal naming vm1, got: {msg}"
         );
 
-        // The SAME component (vm1) is refused one layer earlier — the per-bank-set
-        // committed check ("in trial mode"), never the node gate. That layer must
+        // The SAME component (vm1) is refused one layer earlier — its own
+        // in-trial check ("in trial mode"), never the node gate. That layer must
         // stay intact.
         let err = vm1
             .ensure_flash_can_start()
-            .expect_err("vm1 itself is uncommitted → refused by the bank-set check");
+            .expect_err("vm1 itself is in trial → refused by its own check");
         let msg = match &err {
             BackendError::Busy(m) => m.clone(),
             other => panic!("expected Busy(bank-set trial mode), got {other:?}"),
         };
         assert!(
             msg.contains("is in trial mode"),
-            "expected the per-bank-set committed refusal, got: {msg}"
+            "expected the component's in-trial refusal, got: {msg}"
         );
 
-        // Commit vm1 — the gate's live-trial input is the NV committed flag (plus
-        // the boot_count that says the trial went live), so flipping it to
-        // committed is exactly what a commit verdict does here (no reboot owed and
-        // no staging entry for a Local-reset VM). The node returns to Idle and a
+        // Commit vm1 — without a boot selector its bank report derives
+        // `in_trial` from the NV committed flag, so flipping it to committed is
+        // exactly what a commit verdict does here. The node returns to Idle and a
         // new flash of vm2 is admitted.
         {
             let mut guard = nv.lock().unwrap();
@@ -12719,57 +12571,28 @@ mod copy_forward_tests {
     async fn banked_requires_ecu_reset_finalize_marks_reboot_owed() {
         let (backend, _nv, keystore, _tmp) = finalize_banked_requires_ecu_reset(None).await;
 
-        // The fix: arming a banked RequiresEcuReset component now owes a node reboot.
-        assert_eq!(
-            backend.node_reboot_owed().unwrap().reboot_owed,
-            vec![format!("bank-set {}", slots::VM1.as_index())]
-        );
+        // The fix: arming a banked RequiresEcuReset component now owes a node
+        // reboot (the NV record is still written; dual-run).
+        assert!(super::bank_provider_injection_tests::nv_owes(&backend));
 
         let _ = std::fs::remove_dir_all(&keystore);
     }
 
-    /// Arming records the node boot id it armed under, so a later process can
-    /// tell whether the node has rebooted since.
+    /// Arming records the node boot id it armed under into the NV record (still
+    /// written; dual-run).
     #[tokio::test]
     async fn finalize_records_armed_boot_id() {
-        let (backend, nv, keystore, _tmp) =
+        let (_backend, nv, keystore, _tmp) =
             finalize_banked_requires_ecu_reset(Some("boot-x")).await;
 
+        let session = nv.lock().unwrap().read_update_session().unwrap();
         assert_eq!(
-            nv.lock()
-                .unwrap()
-                .read_update_session()
-                .unwrap()
-                .armed_boot_id,
+            session.armed_boot_id,
             NvUpdateSession::boot_id_digest("boot-x")
         );
-        assert_eq!(
-            backend.node_reboot_owed().unwrap().rebooted_since_arming,
-            Some(false)
-        );
-        let on_nv = || {
-            ComponentBackend::with_options(
-                slots::VM1,
-                nv.clone(),
-                Arc::new(NoopManifest),
-                ComponentConfig::default(),
-                None,
-                None,
-                None,
-            )
-        };
-        assert_eq!(
-            on_nv()
-                .with_node_boot_id("boot-y".into())
-                .node_reboot_owed()
-                .unwrap()
-                .rebooted_since_arming,
-            Some(true)
-        );
-        assert_eq!(
-            on_nv().node_reboot_owed().unwrap().rebooted_since_arming,
-            None
-        );
+        assert_eq!(session.rebooted_since_arming(Some("boot-x")), Some(false));
+        assert_eq!(session.rebooted_since_arming(Some("boot-y")), Some(true));
+        assert_eq!(session.rebooted_since_arming(None), None);
 
         let _ = std::fs::remove_dir_all(&keystore);
     }
@@ -12833,7 +12656,7 @@ mod copy_forward_tests {
             backend.reset_kind(),
             machine_mgr::ResetKind::RequiresEcuReset
         );
-        assert!(backend.node_reboot_owed().unwrap().reboot_owed.is_empty());
+        assert!(!super::bank_provider_injection_tests::nv_owes(&backend));
 
         let manifest = detached_manifest("rootfs.img", &digest, content.len() as u64);
         let validated = ValidatedFirmware {

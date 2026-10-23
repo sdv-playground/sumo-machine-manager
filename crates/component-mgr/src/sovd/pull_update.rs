@@ -31,7 +31,6 @@ use axum::{Json, Router};
 use base64::Engine;
 use machine_mgr::{Component, FlashSession, InstallSource, Machine, MachineError};
 use puller::Puller;
-use sha2::{Digest, Sha256};
 use sovd_core::{OperationExecution, OperationStatus};
 
 pub const PULL_OP_ID: &str = "x-ota-pull-update";
@@ -515,11 +514,6 @@ async fn run_campaign(
         .await
         .map_err(|e| format!("dependency resolution: {e}"))?;
 
-    // The campaign identity: sha256 of the signed L1 envelope. Every sibling
-    // component stages under this id, Joining ONE node update transaction;
-    // anything unrelated gets Mixing-refused by the gate.
-    let session_id: [u8; 32] = Sha256::digest(l1_bytes).into();
-
     // Phase 1 — stage all: the banked group stages together before anything
     // applies (mirrors the offboard engine's stage_all / node-update design).
     let mut staged: Vec<Staged> = Vec::new();
@@ -556,13 +550,11 @@ async fn run_campaign(
             return Err(format!("dependency {i} ({target}): unauthorized: {e}"));
         }
 
-        // Session-scoped pull source: the finalize fetch fallback + the
-        // campaign session id for the node gate. A component that does not
-        // support it can still install an integrated-payload L2.
+        // Session-scoped pull source: the finalize fetch fallback. A component
+        // that does not support it can still install an integrated-payload L2.
         let source = InstallSource {
             cas_base_url: req.cas_base_url.clone(),
             trust_anchor: trust_anchor.to_vec(),
-            session_id: Some(session_id),
         };
         match comp.set_install_source(source).await {
             Ok(()) => {}

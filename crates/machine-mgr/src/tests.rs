@@ -460,55 +460,35 @@ fn registry_build_accepts_zero_components() {
 
 #[test]
 fn coordinator_owns_staging_across_gate_calls() {
-    use crate::node_update::{Admit, Durable, NodeCoordinator, NodePhase};
-    let c = NodeCoordinator::new(vec![(4, "vm1".to_string()), (5, "vm2".to_string())]);
-    let id_a: [u8; 32] = [1; 32];
-    let idle = Durable::default();
+    use crate::node_update::{Admit, NodeCoordinator, NodePhase};
+    let c = NodeCoordinator::new();
 
-    // First component opens the transaction; a sibling with the SAME id joins it
-    // — the coordinator persists the Staging session between calls.
-    assert_eq!(
-        c.gate_new_session(id_a, "vm1", &idle, &[]).unwrap(),
-        Admit::OpenedNew
-    );
-    assert_eq!(
-        c.gate_new_session(id_a, "vm2", &idle, &[]).unwrap(),
-        Admit::Joined
-    );
-    let st = c.node_update_state(&idle, &[]);
+    // First component opens the transaction; a sibling joins it — the
+    // coordinator persists the Staging session between calls.
+    assert_eq!(c.gate_new_session("vm1").unwrap(), Admit::OpenedNew);
+    assert_eq!(c.gate_new_session("vm2").unwrap(), Admit::Joined);
+    let st = c.node_update_state();
     assert_eq!(st.phase, NodePhase::Staging);
     assert_eq!(st.components, vec!["vm1".to_string(), "vm2".to_string()]);
 
-    // A DIFFERENT id is refused (would mix updates); the open session is untouched.
-    assert!(c.gate_new_session([9; 32], "vm3", &idle, &[]).is_err());
-    assert_eq!(c.node_update_state(&idle, &[]).components.len(), 2);
-
     // Promoting staging (reboot issued) clears it → back to Idle.
     assert!(c.take_staging().is_some());
-    assert_eq!(c.node_update_state(&idle, &[]).phase, NodePhase::Idle);
+    assert_eq!(c.node_update_state().phase, NodePhase::Idle);
 }
 
 #[test]
-fn coordinator_names_and_removes_from_staging() {
-    use crate::node_update::{Durable, NodeCoordinator, NodePhase};
-    let c = NodeCoordinator::new(vec![(4, "vm1".to_string()), (5, "vm2".to_string())]);
-    // label: known index → name; unknown → fallback.
-    assert_eq!(c.label(4), "vm1");
-    assert_eq!(c.label(9), "bank-set 9");
+fn coordinator_removes_from_staging() {
+    use crate::node_update::{NodeCoordinator, NodePhase};
+    let c = NodeCoordinator::new();
 
     // remove_from_staging drops a component as its flash resolves, and clears the
     // session when the last leaves → back to Idle (no stale Staging).
-    let id: [u8; 32] = [1; 32];
-    let idle = Durable::default();
-    c.gate_new_session(id, "vm1", &idle, &[]).unwrap();
-    c.gate_new_session(id, "vm2", &idle, &[]).unwrap();
+    c.gate_new_session("vm1").unwrap();
+    c.gate_new_session("vm2").unwrap();
     c.remove_from_staging("vm1");
-    assert_eq!(
-        c.node_update_state(&idle, &[]).components,
-        vec!["vm2".to_string()]
-    );
+    assert_eq!(c.node_update_state().components, vec!["vm2".to_string()]);
     c.remove_from_staging("vm2");
-    assert_eq!(c.node_update_state(&idle, &[]).phase, NodePhase::Idle);
+    assert_eq!(c.node_update_state().phase, NodePhase::Idle);
 }
 
 // ---------------------------------------------------------------------------
