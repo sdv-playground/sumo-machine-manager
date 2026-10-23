@@ -560,8 +560,8 @@ fn signed_blob(gen: u64, entries: &[(BankSet, Bank)]) -> SelectorBlob {
 /// Seed PRIMARY == SECONDARY at the given selection — the committed baseline
 /// (mirrors `seed_selector`'s seal+commit).
 fn seed_committed(store: &InMemorySelectorStore, gen: u64, entries: &[(BankSet, Bank)]) {
-    store.write_primary(&signed_blob(gen, entries));
-    store.write_secondary(&signed_blob(gen, entries));
+    store.write_primary(&signed_blob(gen, entries)).unwrap();
+    store.write_secondary(&signed_blob(gen, entries)).unwrap();
 }
 
 #[test]
@@ -603,8 +603,12 @@ fn selector_committed_does_not_touch_nv_count() {
 fn selector_trial_increments_boot_count() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // SECONDARY floor at host-os=A; PRIMARY booted at host-os=B → trial.
-    store.write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]));
-    store.write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]));
+    store
+        .write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]))
+        .unwrap();
+    store
+        .write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]))
+        .unwrap();
 
     let os = slots::OS.as_index();
     let actions = mgr.process_boot().unwrap();
@@ -635,14 +639,18 @@ fn selector_trial_increments_boot_count() {
 fn selector_trial_and_committed_sets_are_independent() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // host-os in trial (A floor, B booted); vm1 committed (A == A).
-    store.write_secondary(&signed_blob(
-        1,
-        &[(slots::OS, Bank::A), (slots::VM1, Bank::A)],
-    ));
-    store.write_primary(&signed_blob(
-        2,
-        &[(slots::OS, Bank::B), (slots::VM1, Bank::A)],
-    ));
+    store
+        .write_secondary(&signed_blob(
+            1,
+            &[(slots::OS, Bank::A), (slots::VM1, Bank::A)],
+        ))
+        .unwrap();
+    store
+        .write_primary(&signed_blob(
+            2,
+            &[(slots::OS, Bank::B), (slots::VM1, Bank::A)],
+        ))
+        .unwrap();
 
     let os = slots::OS.as_index();
     let vm1 = slots::VM1.as_index();
@@ -665,8 +673,12 @@ fn selector_trial_and_committed_sets_are_independent() {
 fn selector_global_rollback_after_max_trial_boots() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // SECONDARY floor host-os=A; PRIMARY booted host-os=B → trial.
-    store.write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]));
-    store.write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]));
+    store
+        .write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]))
+        .unwrap();
+    store
+        .write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]))
+        .unwrap();
 
     let os = slots::OS.as_index();
     // Boot MAX times — all trial.
@@ -721,8 +733,8 @@ fn selector_global_rollback_reverts_every_trialed_set_at_once() {
         (slots::VM1, Bank::A),
         (slots::VM2, Bank::B),
     ];
-    store.write_secondary(&signed_blob(1, &floor));
-    store.write_primary(&signed_blob(2, &booted));
+    store.write_secondary(&signed_blob(1, &floor)).unwrap();
+    store.write_primary(&signed_blob(2, &booted)).unwrap();
 
     // Drive host-os to the brink (count == MAX) but leave vm2 lower, so the
     // NEXT boot trips host-os over the budget and the GLOBAL rollback reverts
@@ -768,8 +780,12 @@ fn selector_auto_rollback_marks_committed() {
     // boot from the budget. The rollback must bring NV to the floor the node
     // now boots, or component-mgr keeps reading B as the running bank.
     let (mut mgr, store) = make_bootmgr_with_selector();
-    store.write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]));
-    store.write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]));
+    store
+        .write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]))
+        .unwrap();
+    store
+        .write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]))
+        .unwrap();
     let os = slots::OS.as_index();
     let mut st = NvBootState::default();
     st.banks[os].active_bank = Bank::B;
@@ -790,6 +806,60 @@ fn selector_auto_rollback_marks_committed() {
     assert_eq!(st.banks[os].active_bank, Bank::A, "NV follows the floor");
     assert!(st.banks[os].committed, "the reverted set is out of trial");
     assert_eq!(st.banks[os].boot_count, 0);
+}
+
+#[test]
+fn selector_auto_rollback_with_failing_store_keeps_nv_in_trial() {
+    // Same setup as above, but the PRIMARY revert fails: PRIMARY still names
+    // the trial bank, so NV must not be marked committed or moved to the
+    // floor — the set keeps trialing and the next boot retries the revert.
+    let (mut mgr, store) = make_bootmgr_with_selector();
+    store
+        .write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]))
+        .unwrap();
+    store
+        .write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]))
+        .unwrap();
+    let os = slots::OS.as_index();
+    let mut st = NvBootState::default();
+    st.banks[os].active_bank = Bank::B;
+    st.banks[os].committed = false;
+    st.banks[os].boot_count = MAX_TRIAL_BOOTS;
+    mgr.nv_mut().write_boot_state(&mut st).unwrap();
+
+    store.set_fail_writes(true);
+    let actions = mgr.process_boot().unwrap();
+    assert_eq!(
+        actions[os],
+        BootAction::TrialBoot {
+            bank: Bank::B,
+            boot_count: MAX_TRIAL_BOOTS + 1
+        }
+    );
+    assert_eq!(
+        store.read_primary().unwrap().selectors[&slots::OS].bank,
+        Bank::B
+    );
+    let st = mgr.nv().read_boot_state().unwrap();
+    assert_eq!(
+        st.banks[os].active_bank,
+        Bank::B,
+        "NV still names the trial"
+    );
+    assert!(!st.banks[os].committed, "NV not marked committed");
+    assert_eq!(st.banks[os].boot_count, MAX_TRIAL_BOOTS + 1);
+
+    // Once the store recovers, the next boot performs the revert.
+    store.set_fail_writes(false);
+    let actions = mgr.process_boot().unwrap();
+    assert_eq!(
+        actions[os],
+        BootAction::AutoRollback {
+            from: Bank::B,
+            to: Bank::A
+        }
+    );
+    assert!(mgr.nv().read_boot_state().unwrap().banks[os].committed);
 }
 
 #[test]

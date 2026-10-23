@@ -5,8 +5,8 @@ use nv_store::types::{BankBootState, BankSet};
 
 use crate::component::Component;
 use crate::system_bank_state::{
-    BootSelector, SelectorStore, SharedSystemBankState, Signer, StubSelectorStore, StubSigner,
-    SystemBankManager,
+    BootSelector, SelectorError, SelectorStore, SharedSystemBankState, Signer, StubSelectorStore,
+    StubSigner, SystemBankManager,
 };
 use crate::EntityInfo;
 
@@ -123,7 +123,13 @@ impl MachineRegistry {
     /// only gives it a starting selection. The host machine managers call it at
     /// startup when the selector is empty: a fresh node, a factory reset, or a
     /// blob that failed verification on [`SystemBankManager::load`].
-    pub fn seed_selector(&mut self, entries: impl IntoIterator<Item = (BankSet, BankBootState)>) {
+    ///
+    /// A failed selector write is returned as `Err`; the in-memory selector
+    /// then holds whatever the last successful write left.
+    pub fn seed_selector(
+        &mut self,
+        entries: impl IntoIterator<Item = (BankSet, BankBootState)>,
+    ) -> Result<(), SelectorError> {
         // One write lock for the whole seed: the compare and the stage/seal/
         // commit sequence must see a consistent view of the selector.
         let mut sb = self.system_bank.write().expect("selector poisoned");
@@ -132,7 +138,7 @@ impl MachineRegistry {
             .iter()
             .all(|(set, nv)| sb.active_bank(*set) == Some(nv.active_bank))
         {
-            return;
+            return Ok(());
         }
         for (set, nv) in &entries {
             let floor = if nv.committed {
@@ -142,13 +148,14 @@ impl MachineRegistry {
             };
             sb.stage(*set, floor);
         }
-        sb.seal();
-        sb.commit();
+        sb.seal()?;
+        sb.commit()?;
         for (set, nv) in entries.iter().filter(|(_, nv)| !nv.committed) {
             sb.stage(*set, nv.active_bank);
         }
         // A no-op when nothing is in trial: `seal` needs something staged.
-        sb.seal();
+        sb.seal()?;
+        Ok(())
     }
 }
 

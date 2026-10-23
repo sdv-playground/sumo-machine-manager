@@ -907,7 +907,7 @@ fn make_disable_router(
     {
         let mut g = selector.write().unwrap();
         g.stage(set, Bank::A);
-        g.seal();
+        g.seal().unwrap();
     }
 
     let tmp = tempfile::tempdir().unwrap();

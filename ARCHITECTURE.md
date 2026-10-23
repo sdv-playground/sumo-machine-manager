@@ -304,6 +304,15 @@ per-component NV boot state as the authority for "which bank each set boots from
 - `vm-boot` reads PRIMARY and drives the bank decision; trial/rollback is **global**
   (whole-blob copy of SECONDARY over PRIMARY — vm-boot has no signer at boot so it can't
   re-sign a per-set change).
+- **The store can fail.** `SelectorStore` writes return `Result`; `SystemBankManager`'s
+  `seal` / `commit` / `rollback` persist first and move their in-memory view only on
+  success, so memory never runs ahead of storage. A failed seal fails `activate`, which
+  leaves NV unarmed. A failed commit or rollback verdict is reported to the orchestrator;
+  NV is written before the boot vector, so NV is then one step ahead. A commit is safe to
+  retry (NV folds an already-committed set into success); a rollback retry is refused by
+  NV as not-in-trial, so that gap closes only once the write order changes. A failed
+  auto-rollback write at boot leaves the set in trial in both the boot vector and NV, so
+  the next boot retries it.
 - `BankSet` is a bare `pub struct BankSet(pub u8)` newtype — a slot *number*, nothing more.
   The library names no slot: a component's slot comes from its spec (`slot: N`, written by
   the platform profile), and what a slot holds is that profile's decision (a spec that still

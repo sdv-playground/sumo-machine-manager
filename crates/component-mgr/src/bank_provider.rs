@@ -723,23 +723,42 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         if let Some(sel) = &self.selector {
             let mut g = sel.write().expect("selector poisoned");
             g.stage(self.bank_set, bank);
-            let wrote = g.seal();
             // Boot-vector (selector PRIMARY) write is the load-bearing step that makes
             // the just-activated bank the one the node boots. It was previously silent
             // — a skipped/failed seal left the selector missing this component's slot,
             // so on the next boot the VM/host defaulted to an empty bank and never
             // launched (no way to tell from the log). Log EVERY seal with the outcome
-            // so a missing boot-vector write is diagnosable.
-            tracing::info!(
-                slot = self.bank_set.as_index(),
-                label = %self.dir_name,
-                bank_set = ?self.bank_set,
-                bank = ?bank,
-                wrote,
-                generation = g.generation(),
-                is_trial = g.is_trial(),
-                "boot-vector write: sealed selector PRIMARY for the activated bank"
-            );
+            // so a missing boot-vector write is diagnosable. A failed write fails the
+            // activation, so the caller never arms NV for a bank the boot vector
+            // does not name.
+            match g.seal() {
+                Ok(true) => tracing::info!(
+                    slot = self.bank_set.as_index(),
+                    label = %self.dir_name,
+                    bank_set = ?self.bank_set,
+                    bank = ?bank,
+                    wrote = true,
+                    generation = g.generation(),
+                    is_trial = g.is_trial(),
+                    "boot-vector write: sealed selector PRIMARY for the activated bank"
+                ),
+                Ok(false) => tracing::warn!(
+                    slot = self.bank_set.as_index(),
+                    label = %self.dir_name,
+                    bank_set = ?self.bank_set,
+                    bank = ?bank,
+                    wrote = false,
+                    generation = g.generation(),
+                    is_trial = g.is_trial(),
+                    "boot-vector NOT written — nothing staged at seal"
+                ),
+                Err(e) => {
+                    return Err(BankError::Failed(format!(
+                        "boot-vector write failed for {}: {e}",
+                        self.dir_name
+                    )))
+                }
+            }
         } else {
             tracing::warn!(
                 slot = self.bank_set.as_index(),
@@ -767,7 +786,10 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // Dual-write: promote the selector's PRIMARY to SECONDARY (rollback
         // floor) — see the GLOBAL-op caveat on `activate`.
         if let Some(sel) = &self.selector {
-            sel.write().expect("selector poisoned").commit();
+            sel.write()
+                .expect("selector poisoned")
+                .commit()
+                .map_err(|e| BankError::Failed(format!("boot-vector commit failed: {e}")))?;
         }
         Ok(())
     }
@@ -785,7 +807,10 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // Dual-write: roll the selector's PRIMARY back to the committed floor
         // (SECONDARY) — see the GLOBAL-op caveat on `activate`.
         if let Some(sel) = &self.selector {
-            sel.write().expect("selector poisoned").rollback();
+            sel.write()
+                .expect("selector poisoned")
+                .rollback()
+                .map_err(|e| BankError::Failed(format!("boot-vector rollback failed: {e}")))?;
         }
         Ok(())
     }
@@ -934,7 +959,7 @@ mod tests {
         {
             let mut g = shared.write().unwrap();
             g.stage(set, bank);
-            assert!(g.seal());
+            assert!(g.seal().unwrap());
             assert_eq!(g.active_bank(set), Some(bank));
         }
         shared
@@ -1052,6 +1077,76 @@ mod tests {
         );
         // And the provider now reads B as active through the same selector.
         assert_eq!(p.active_bank(), Bank::B);
+    }
+
+    /// [`selector_with`] that also hands back its store, so a test can make
+    /// the store's writes fail.
+    fn selector_with_store(
+        set: BankSet,
+        bank: Bank,
+    ) -> (SharedSystemBankState, InMemorySelectorStore) {
+        let store = InMemorySelectorStore::new();
+        let mut mgr = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        mgr.stage(set, bank);
+        assert!(mgr.seal().unwrap());
+        mgr.commit().unwrap();
+        (Arc::new(RwLock::new(mgr)), store)
+    }
+
+    #[test]
+    fn activate_with_failing_selector_errs_and_leaves_nv_unchanged() {
+        let set = slots::VM1;
+        let nv = nv_with_active(set, Bank::A);
+        let before = nv.lock().unwrap().read_boot_state();
+        let (selector, store) = selector_with_store(set, Bank::A);
+        let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
+
+        store.set_fail_writes(true);
+        assert!(p.activate(Bank::B).is_err(), "failed seal fails activate");
+
+        assert_eq!(selector.read().unwrap().active_bank(set), Some(Bank::A));
+        assert_eq!(
+            nv.lock().unwrap().read_boot_state(),
+            before,
+            "NV boot state untouched — the caller arms NV only after activate succeeds"
+        );
+    }
+
+    #[test]
+    fn commit_with_failing_selector_errs_after_nv_commit_and_retry_succeeds() {
+        let set = slots::VM1;
+        // NV in trial on B; selector trial B over floor A.
+        let nv = nv_with_active(set, Bank::B);
+        {
+            let mut g = nv.lock().unwrap();
+            let mut state = g.read_boot_state().unwrap();
+            state.banks[set.as_index()].committed = false;
+            g.write_boot_state(&mut state).unwrap();
+        }
+        let (selector, store) = selector_with_store(set, Bank::A);
+        {
+            let mut g = selector.write().unwrap();
+            g.stage(set, Bank::B);
+            assert!(g.seal().unwrap());
+        }
+        let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
+
+        store.set_fail_writes(true);
+        assert!(
+            p.commit().is_err(),
+            "failed vector commit fails the verdict"
+        );
+        // NV commits first (order unchanged), so NV is now one step ahead of
+        // the boot vector, whose floor is still A.
+        let nv_state = nv.lock().unwrap().read_boot_state().unwrap();
+        assert!(nv_state.banks[set.as_index()].committed);
+        assert!(selector.read().unwrap().is_trial());
+
+        // A retry succeeds: `ota::commit` folds AlreadyCommitted into Ok and
+        // the vector commit now lands.
+        store.set_fail_writes(false);
+        p.commit().expect("retry commit");
+        assert!(!selector.read().unwrap().is_trial());
     }
 
     // ---------------------------------------------------------------------

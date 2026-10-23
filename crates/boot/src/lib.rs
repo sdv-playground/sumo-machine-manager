@@ -305,15 +305,31 @@ impl<D: BlockDevice> BootManager<D> {
         // possible when SECONDARY exists — that is the blob we copy over
         // PRIMARY. Without it there is nothing signed to revert to, so we leave
         // the sets in trial.
-        let do_global_rollback = any_trial_exceeded && secondary.is_some();
-        if do_global_rollback {
-            let secondary = secondary.expect("checked is_some");
+        //
+        // If that write fails, PRIMARY still names the trial, so NV must keep
+        // the trial too (no `committed`, no `boot_count` reset): the sets keep
+        // trialing and the next boot (or the orchestrator) retries the revert.
+        let rolled_back = match secondary.filter(|_| any_trial_exceeded) {
             // Copy the already-signed SECONDARY over PRIMARY — the only write
             // vm-boot can make without a signer.
-            self.selector
+            Some(secondary) => match self
+                .selector
                 .as_ref()
                 .expect("selector present in this path")
-                .write_primary(secondary);
+                .write_primary(secondary)
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!(
+                        "[bootmgr] ERROR: auto-rollback boot vector PRIMARY write failed \
+                         ({e}) — trial left in place"
+                    );
+                    false
+                }
+            },
+            None => false,
+        };
+        if rolled_back {
             for &(idx, from, to) in &trialed {
                 state.banks[idx].active_bank = to;
                 state.banks[idx].committed = true;
