@@ -155,6 +155,7 @@ pub struct VmDefinition {
     #[serde(default)]
     pub arch: Option<String>,
     /// QEMU machine type override. If unset, uses the architecture default.
+    /// The bank config may override it (a bank's image decides what machine it boots on).
     #[serde(default)]
     pub machine: Option<String>,
     /// Number of virtual CPUs (default: 4).
@@ -463,6 +464,9 @@ impl VmDefinition {
         if let Some(ram) = overrides.ram_mb {
             merged.ram_mb = ram;
         }
+        if let Some(ref machine) = overrides.machine {
+            merged.machine = Some(machine.clone());
+        }
         if let Some(ref model) = overrides.cpu_model {
             merged.cpu_model = Some(model.clone());
         }
@@ -642,6 +646,9 @@ pub struct VmBankConfig {
     pub cpus: Option<u32>,
     #[serde(default)]
     pub ram_mb: Option<u32>,
+    /// QEMU machine type override for this bank's image (see VmDefinition::machine).
+    #[serde(default)]
+    pub machine: Option<String>,
     #[serde(default)]
     pub cpu_model: Option<String>,
     #[serde(default)]
@@ -729,6 +736,7 @@ mod tests {
             display_name: Some("VM1 — Debian v2.0".into()),
             cpus: Some(8),
             ram_mb: Some(8192),
+            machine: Some("q35".into()),
             cpu_model: Some("max".into()),
             extra_cmdline: Some("console=ttyS0 debug".into()),
             images: Some(ImagePaths {
@@ -742,6 +750,7 @@ mod tests {
         assert_eq!(merged.display_name.as_deref(), Some("VM1 — Debian v2.0"));
         assert_eq!(merged.cpus, 8);
         assert_eq!(merged.ram_mb, 8192);
+        assert_eq!(merged.machine.as_deref(), Some("q35"));
         assert_eq!(merged.cpu_model.as_deref(), Some("max"));
         assert_eq!(merged.extra_cmdline.as_deref(), Some("console=ttyS0 debug"));
         assert_eq!(merged.images.kernel.as_deref(), Some("vmlinuz"));
@@ -772,6 +781,7 @@ extra_cmdline: "debug"
         assert_eq!(config.ram_mb, Some(1024));
         assert_eq!(config.display_name.as_deref(), Some("Test VM v1.0"));
         assert_eq!(config.extra_cmdline.as_deref(), Some("debug"));
+        assert!(config.machine.is_none());
         assert!(config.cpu_model.is_none());
         assert!(config.images.is_none());
     }
