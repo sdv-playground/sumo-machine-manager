@@ -16,6 +16,7 @@ use tower::ServiceExt;
 
 use machine_mgr::bank_provider::BankProvider;
 use machine_mgr::node_update::NodeCoordinator;
+use machine_mgr::system_bank_state::{boot_id_digest, Outcome, Reason, Resolution, SelectorStore};
 use machine_mgr::{
     DeactivateError, DeactivateOutcome, Deactivator, EntityInfo, FileSelectorStore, ImageEntry,
     InMemorySelectorStore, MachineRegistry, SharedSystemBankState, SystemBankManager, TestSigner,
@@ -907,7 +908,7 @@ fn make_disable_router(
     {
         let mut g = selector.write().unwrap();
         g.stage(id, Bank::A, Default::default());
-        g.seal().unwrap();
+        g.seal(None).unwrap();
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1414,6 +1415,7 @@ fn seal_test_bank(
     id: &str,
     bank: Bank,
     files: &[(&str, &[u8])],
+    install_boot_id: Option<&str>,
 ) {
     let dir = images
         .join(id)
@@ -1422,13 +1424,33 @@ fn seal_test_bank(
     for (name, bytes) in files {
         std::fs::write(dir.join(name), bytes).unwrap();
     }
-    hsm::ivd::sign_bank_crypto(crypto, &dir, 1, hsm::ivd::IvdIdentity::default()).unwrap();
+    hsm::ivd::sign_bank_crypto_at(
+        crypto,
+        &dir,
+        1,
+        hsm::ivd::IvdIdentity::default(),
+        install_boot_id,
+    )
+    .unwrap();
+}
+
+/// Bank activator that needs a node reset to apply an activated bank.
+struct NodeResetActivator;
+impl machine_mgr::BankActivator for NodeResetActivator {
+    fn activate(&self, _dir: &Path) -> Result<(), machine_mgr::BankActivatorError> {
+        Ok(())
+    }
+    fn reset_kind(&self) -> machine_mgr::ResetKind {
+        machine_mgr::ResetKind::RequiresEcuReset
+    }
 }
 
 /// A node with vm1 + vm2 over on-disk `IvdBankProvider`s, served through
-/// `update_state_router`. vm1: bank A sealed with two files, bank B empty.
-/// vm2: both banks sealed. `selector` is attached to both providers when
-/// given. Hands back the tempdir to keep it alive.
+/// `update_state_router`, running in node boot "boot-a". vm1 (local reset):
+/// bank A sealed with two files in "boot-a", bank B empty. vm2 (node reset):
+/// bank A sealed in "boot-a", bank B sealed with no boot id. `selector` is
+/// attached to both providers when given. Hands back the tempdir to keep it
+/// alive.
 fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, tempfile::TempDir) {
     let keys = generate_test_keys();
     let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
@@ -1450,9 +1472,24 @@ fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, 
         "vm1",
         Bank::A,
         &[("kernel", b"kernel-a"), ("rootfs", b"rootfs-a-bytes")],
+        Some("boot-a"),
     );
-    seal_test_bank(&crypto, &images, "vm2", Bank::A, &[("kernel", b"vm2-a")]);
-    seal_test_bank(&crypto, &images, "vm2", Bank::B, &[("kernel", b"vm2-bb")]);
+    seal_test_bank(
+        &crypto,
+        &images,
+        "vm2",
+        Bank::A,
+        &[("kernel", b"vm2-a")],
+        Some("boot-a"),
+    );
+    seal_test_bank(
+        &crypto,
+        &images,
+        "vm2",
+        Bank::B,
+        &[("kernel", b"vm2-bb")],
+        None,
+    );
 
     let coord = Arc::new(NodeCoordinator::new(vec![
         (slots::VM1.as_index(), "vm1".to_string()),
@@ -1467,16 +1504,21 @@ fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, 
         status: None,
     });
     for (id, set) in [("vm1", slots::VM1), ("vm2", slots::VM2)] {
-        let provider = Arc::new(IvdBankProvider::new(
-            nv.clone(),
-            set,
-            false,
-            Some(images.clone()),
-            id.into(),
-            None,
-            None,
-            selector.clone(),
-        ));
+        let activator: Option<Arc<dyn machine_mgr::BankActivator>> =
+            (id == "vm2").then(|| Arc::new(NodeResetActivator) as _);
+        let provider = Arc::new(
+            IvdBankProvider::new(
+                nv.clone(),
+                set,
+                false,
+                Some(images.clone()),
+                id.into(),
+                None,
+                activator,
+                selector.clone(),
+            )
+            .with_node_boot_id(Some("boot-a".to_string())),
+        );
         let backend = Arc::new(
             ComponentBackend::new(
                 set,
@@ -1519,6 +1561,9 @@ async fn update_state_reports_bank_contents_per_component() {
     assert!(is_sha256_hex(&images["rootfs"]["sha256"]));
     assert_eq!(vm1["inactive"], serde_json::Value::Null);
     assert_eq!(vm1["in_trial"], false);
+    // Sealed in the running boot, but a local-reset component owes no node reset.
+    assert_eq!(vm1["active"]["install_boot_id"], "boot-a");
+    assert_eq!(vm1["pending_reset"], false);
 
     let vm2 = &banks[1];
     assert_eq!(vm2["id"], "vm2");
@@ -1530,6 +1575,10 @@ async fn update_state_reports_bank_contents_per_component() {
         &vm2["inactive"]["images"]["kernel"]["sha256"]
     ));
     assert_eq!(vm2["in_trial"], false);
+    // A node-reset component whose active bank was sealed in the running boot.
+    assert_eq!(vm2["active"]["install_boot_id"], "boot-a");
+    assert_eq!(vm2["inactive"]["install_boot_id"], serde_json::Value::Null);
+    assert_eq!(vm2["pending_reset"], true);
 
     // The x-ota alias serves the identical body.
     let (_, ota) = get(&router, "/vehicle/v1/data/x-ota-update-state").await;
@@ -1550,7 +1599,7 @@ async fn update_state_in_trial_follows_boot_vector() {
         );
         m.stage("vm1", Bank::A, Default::default());
         m.stage("vm2", Bank::A, Default::default());
-        m.seal().unwrap();
+        m.seal(None).unwrap();
         m.commit().unwrap();
         let images = [(
             "kernel".to_string(),
@@ -1562,7 +1611,7 @@ async fn update_state_in_trial_follows_boot_vector() {
         .into_iter()
         .collect();
         m.stage("vm1", Bank::B, images);
-        m.seal().unwrap();
+        m.seal(None).unwrap();
     }
     let selector: SharedSystemBankState =
         Arc::new(std::sync::RwLock::new(SystemBankManager::load(
@@ -1584,4 +1633,281 @@ async fn update_state_in_trial_follows_boot_vector() {
     let vm2 = &banks[1];
     assert_eq!(vm2["id"], "vm2");
     assert_eq!(vm2["in_trial"], false);
+}
+
+// --- boot-vector transaction header + trial boot limit ---
+
+/// vm1 + vm2 over on-disk `IvdBankProvider`s sharing one file-backed boot
+/// vector (floor: both on A). vm1 is then activated onto B at node boot
+/// "boot-a" and NV holds it in trial. With `vm2_nv_trial`, NV also holds vm2
+/// in trial while the boot vector does not (a component the vector says is not
+/// a member).
+struct TrialNode {
+    machine: Arc<MachineRegistry>,
+    nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
+    store_dir: PathBuf,
+    _tmp: tempfile::TempDir,
+}
+
+impl TrialNode {
+    fn new(vm2_nv_trial: bool) -> Self {
+        let keys = generate_test_keys();
+        let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
+        suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
+        let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store_dir = tmp.path().join("selector");
+        let selector: SharedSystemBankState =
+            Arc::new(std::sync::RwLock::new(SystemBankManager::load(
+                Box::new(FileSelectorStore::new(&store_dir)),
+                Box::new(TestSigner),
+            )));
+        {
+            let mut g = selector.write().unwrap();
+            g.stage("vm1", Bank::A, Default::default());
+            g.stage("vm2", Bank::A, Default::default());
+            g.seal(None).unwrap();
+            g.commit().unwrap();
+        }
+
+        let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+        let mut boot_state = NvBootState::default();
+        boot_state.banks[slots::VM1.as_index()] = BankBootState {
+            active_bank: Bank::B,
+            committed: false,
+            boot_count: 1,
+        };
+        if vm2_nv_trial {
+            boot_state.banks[slots::VM2.as_index()] = BankBootState {
+                active_bank: Bank::B,
+                committed: false,
+                boot_count: 1,
+            };
+        }
+        nv.write_boot_state(&mut boot_state).unwrap();
+        for set in [slots::VM1, slots::VM2] {
+            let mut meta = NvFwMeta {
+                gen: 1,
+                ..Default::default()
+            };
+            nv.write_fw_meta(set, Bank::A, &mut meta).unwrap();
+        }
+        let nv = Arc::new(Mutex::new(nv));
+
+        let images = tmp.path().join("images");
+        let mut machine = MachineRegistry::builder(EntityInfo {
+            id: "vehicle".into(),
+            name: "vehicle".into(),
+            entity_type: "vehicle".into(),
+            description: None,
+            href: "/vehicle/v1".into(),
+            status: None,
+        })
+        .with_shared_selector(selector.clone());
+        for (id, set) in [("vm1", slots::VM1), ("vm2", slots::VM2)] {
+            let provider = Arc::new(
+                IvdBankProvider::new(
+                    nv.clone(),
+                    set,
+                    false,
+                    Some(images.clone()),
+                    id.into(),
+                    None,
+                    None,
+                    Some(selector.clone()),
+                )
+                .with_node_boot_id(Some("boot-a".to_string())),
+            );
+            if id == "vm1" {
+                provider.activate(Bank::B).unwrap();
+            }
+            let backend = Arc::new(
+                ComponentBackend::new(
+                    set,
+                    nv.clone(),
+                    manifest_provider.clone(),
+                    ComponentConfig::default(),
+                )
+                .with_id(id.to_string())
+                .with_bank_provider(provider),
+            );
+            machine = machine.with(ComponentAdapter::new(backend));
+        }
+
+        Self {
+            machine: Arc::new(machine.build()),
+            nv,
+            store_dir,
+            _tmp: tmp,
+        }
+    }
+
+    /// The update-state and node verdict routes over this node, reporting
+    /// through `coord`.
+    fn router(&self, coord: Arc<NodeCoordinator>) -> axum::Router {
+        component_mgr::sovd::routes::update_state_router(
+            self.nv.clone(),
+            coord,
+            self.machine.clone(),
+        )
+        .merge(component_mgr::sovd::routes::node_verdict_router(
+            self.machine.clone(),
+        ))
+    }
+
+    fn store(&self) -> FileSelectorStore {
+        FileSelectorStore::new(&self.store_dir)
+    }
+}
+
+fn coord_at(boot_id: &str, limit: Option<u8>) -> Arc<NodeCoordinator> {
+    Arc::new(
+        NodeCoordinator::new(vec![
+            (slots::VM1.as_index(), "vm1".to_string()),
+            (slots::VM2.as_index(), "vm2".to_string()),
+        ])
+        .with_node_boot_id(boot_id)
+        .with_trial_boot_limit(limit),
+    )
+}
+
+#[tokio::test]
+async fn activate_arms_the_primary_transaction_header() {
+    let node = TrialNode::new(false);
+    let primary = node.store().read_primary().unwrap();
+    let t = primary.transaction.expect("PRIMARY carries the header");
+    assert_eq!(t.armed_boot_id, boot_id_digest("boot-a"));
+    assert_eq!(t.trial_boots, 0);
+    assert_eq!(t.resolution, None);
+    assert_eq!(node.store().read_secondary().unwrap().transaction, None);
+}
+
+#[tokio::test]
+async fn trial_boot_limit_rolls_the_node_back() {
+    let node = TrialNode::new(false);
+
+    let out = node
+        .machine
+        .observe_node_boot(&coord_at("boot-b", Some(2)))
+        .await;
+    assert_eq!(out.trial_boots, Some(1));
+    assert!(!out.bailed_out);
+    // A process restart within the same boot counts nothing.
+    let out = node
+        .machine
+        .observe_node_boot(&coord_at("boot-b", Some(2)))
+        .await;
+    assert_eq!(
+        out.trial_boots,
+        Some(1),
+        "same boot id is not counted twice"
+    );
+    assert!(!out.bailed_out);
+
+    let coord = coord_at("boot-c", Some(2));
+    let out = node.machine.observe_node_boot(&coord).await;
+    assert_eq!(out.trial_boots, Some(2));
+    assert_eq!(out.limit, Some(2));
+    assert!(out.bailed_out, "{out:?}");
+    assert!(out.errors.is_empty(), "{out:?}");
+
+    let (status, body) = get(&node.router(coord), "/vehicle/v1/data/x-update-state").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["banks"][0]["id"], "vm1");
+    assert_eq!(body["banks"][0]["in_trial"], false);
+    assert_eq!(body["banks"][0]["active"]["bank"], "A");
+    assert_eq!(
+        body["resolution"],
+        serde_json::json!({"outcome": "rolled_back", "reason": "trial_boot_limit"})
+    );
+    assert_eq!(body["trial_boots"], 2);
+    assert_eq!(body["trial_boot_limit"], 2);
+
+    let vm1 = bank_state(&node.nv, slots::VM1);
+    assert!(vm1.committed, "vm1 NV rolled back: {vm1:?}");
+    assert_eq!(vm1.active_bank, Bank::A);
+    // The per-component rollback found the vector already settled: its
+    // verdict-reason rollback was the no-op, so the limit reason survives.
+    let primary = node.store().read_primary().unwrap();
+    assert_eq!(primary.entries["vm1"].bank, Bank::A);
+    assert_eq!(
+        primary.transaction.unwrap().resolution,
+        Some(Resolution {
+            outcome: Outcome::RolledBack,
+            reason: Reason::TrialBootLimit,
+        })
+    );
+}
+
+#[tokio::test]
+async fn no_trial_boot_limit_never_bails_out() {
+    let node = TrialNode::new(false);
+    for (i, id) in ["boot-b", "boot-c", "boot-d", "boot-e", "boot-f"]
+        .iter()
+        .enumerate()
+    {
+        let out = node.machine.observe_node_boot(&coord_at(id, None)).await;
+        assert_eq!(out.trial_boots, Some(i as u8 + 1));
+        assert!(!out.bailed_out);
+    }
+    assert!(
+        !bank_state(&node.nv, slots::VM1).committed,
+        "still in trial"
+    );
+    assert_eq!(
+        node.store().read_primary().unwrap().entries["vm1"].bank,
+        Bank::B
+    );
+}
+
+#[tokio::test]
+async fn verdict_skips_a_component_the_boot_vector_says_is_not_in_trial() {
+    // NV holds vm2 in trial, the boot vector does not: vm2 is not a member.
+    let node = TrialNode::new(true);
+    let router = node.router(coord_at("boot-b", None));
+    let (status, body) = post_json(
+        &router,
+        "/vehicle/v1/operations/x-update-verdict/executions",
+        serde_json::json!({"verdict": "rollback"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["rolled_back"], serde_json::json!(["vm1"]));
+    assert_eq!(body["result"]["skipped"], serde_json::json!(["vm2"]));
+    assert!(bank_state(&node.nv, slots::VM1).committed);
+    assert!(
+        !bank_state(&node.nv, slots::VM2).committed,
+        "vm2 left alone"
+    );
+}
+
+#[tokio::test]
+async fn rollback_verdict_after_bail_out_is_idempotent() {
+    let node = TrialNode::new(false);
+    node.machine
+        .observe_node_boot(&coord_at("boot-b", Some(1)))
+        .await;
+    let router = node.router(coord_at("boot-b", Some(1)));
+    let (status, body) = post_json(
+        &router,
+        "/vehicle/v1/operations/x-update-verdict/executions",
+        serde_json::json!({"verdict": "rollback"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let skipped = body["result"]["skipped"].as_array().unwrap();
+    assert!(skipped.contains(&serde_json::json!("vm1")), "{body}");
+    assert_eq!(body["result"]["rolled_back"], serde_json::json!([]));
+    assert_eq!(
+        node.store()
+            .read_primary()
+            .unwrap()
+            .transaction
+            .unwrap()
+            .resolution
+            .unwrap()
+            .reason,
+        Reason::TrialBootLimit
+    );
 }

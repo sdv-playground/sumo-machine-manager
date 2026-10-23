@@ -1088,9 +1088,52 @@ fn canonical_bytes_are_pinned() {
     want.extend_from_slice(&[0x01, 0x02, 0, 0, 0, 0, 0, 0]);
     want.extend_from_slice(&[0xBB; 32]);
 
-    assert_eq!(SelectorBlob::canonical_bytes(0x0102, &entries), want);
+    assert_eq!(SelectorBlob::canonical_bytes(0x0102, &entries, None), want);
     assert_eq!(
-        hex::encode(SelectorBlob::compute_sha256(0x0102, &entries)),
+        hex::encode(SelectorBlob::compute_sha256(0x0102, &entries, None)),
         "78f3f1dce3158cc81010daa64d5fce7f3a3c6118d7717965966a89be4522784e"
+    );
+}
+
+#[test]
+fn canonical_bytes_with_transaction_header_are_pinned() {
+    use crate::selector::{ComponentEntry, Outcome, Reason, Resolution, SelectorBlob, Transaction};
+    use std::collections::BTreeMap;
+
+    let mut entries = BTreeMap::new();
+    entries.insert(
+        "os".to_string(),
+        ComponentEntry::new(Bank::A, BTreeMap::new()),
+    );
+    let t = Transaction {
+        armed_boot_id: [0x11; 16],
+        trial_boots: 3,
+        counted_boot_id: [0x22; 16],
+        resolution: Some(Resolution {
+            outcome: Outcome::RolledBack,
+            reason: Reason::TrialBootLimit,
+        }),
+    };
+
+    let mut want: Vec<u8> = vec![0x02, 0x01, 0, 0, 0, 0, 0, 0]; // generation
+    want.extend_from_slice(&[2, 0, b'o', b's', 0, 0, 0]); // "os", A, 0 images
+    want.push(0x01); // header tag
+    want.extend_from_slice(&[0x11; 16]); // armed
+    want.push(3); // trial_boots
+    want.extend_from_slice(&[0x22; 16]); // counted
+    want.extend_from_slice(&[2, 1]); // rolled_back, trial_boot_limit
+
+    assert_eq!(
+        SelectorBlob::canonical_bytes(0x0102, &entries, Some(&t)),
+        want
+    );
+    assert_eq!(
+        hex::encode(SelectorBlob::compute_sha256(0x0102, &entries, Some(&t))),
+        "76c8efc86955a091b983d1a5fbc220614065ae4354f9a38b4d977d28c1449b2f"
+    );
+    // The header is inside the digest: dropping it changes the digest.
+    assert_ne!(
+        SelectorBlob::compute_sha256(0x0102, &entries, Some(&t)),
+        SelectorBlob::compute_sha256(0x0102, &entries, None)
     );
 }

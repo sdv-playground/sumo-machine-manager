@@ -655,6 +655,13 @@
             "propertyNames": {
               "type": "string"
             }
+          },
+          "install_boot_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The node boot id the bank was sealed in; `null` when unknown."
           }
         }
       },
@@ -682,7 +689,8 @@
         "required": [
           "id",
           "active",
-          "in_trial"
+          "in_trial",
+          "pending_reset"
         ],
         "properties": {
           "active": {
@@ -703,6 +711,10 @@
                 "$ref": "#/components/schemas/BankContentsResponse"
               }
             ]
+          },
+          "pending_reset": {
+            "type": "boolean",
+            "description": "The newly installed content needs a node reset that has not happened\nyet: the component needs a node reset to apply an install, and its\nactive bank was sealed in the node boot that is still running. `false`\nwhen either boot id is unknown."
           }
         }
       },
@@ -889,9 +901,25 @@
           }
         }
       },
+      "ResolutionResponse": {
+        "type": "object",
+        "description": "How a node transaction ended: `outcome` is `committed` or `rolled_back`,\n`reason` is `verdict` or `trial_boot_limit`.",
+        "required": [
+          "outcome",
+          "reason"
+        ],
+        "properties": {
+          "outcome": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
       "UpdateStateResponse": {
         "type": "object",
-        "description": "The `x-ota-update-state` resource body — the node's update-transaction\nphase plus the component ids the transaction covers. `reboot_owed`:\ncomponents whose arming requires the node reboot and whose trial is\nunresolved; `rebooted_since_arming`: whether the node boot id has changed\nsince that arming (null = unknown); `node_boot_id`: the node's current boot\nid (null = unknown); `banks`: what each component's banks hold, per the\ninstalled manifests (not a verification).",
+        "description": "The `x-ota-update-state` resource body — the node's update-transaction\nphase plus the component ids the transaction covers. `reboot_owed`:\ncomponents whose arming requires the node reboot and whose trial is\nunresolved; `rebooted_since_arming`: whether the node boot id has changed\nsince that arming (null = unknown); `node_boot_id`: the node's current boot\nid (null = unknown); `banks`: what each component's banks hold, per the\ninstalled manifests (not a verification); `trial_boots`: node boots counted\nwhile armed without a verdict (null = no boot-vector trial open or\nresolved); `trial_boot_limit`: the count at which the node rolls itself\nback (null = disabled); `resolution`: how the last node transaction ended,\nper the boot vector (null = none recorded, or a trial is open).",
         "required": [
           "phase",
           "components",
@@ -931,6 +959,32 @@
               "boolean",
               "null"
             ]
+          },
+          "resolution": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ResolutionResponse"
+              }
+            ]
+          },
+          "trial_boot_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "trial_boots": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
           }
         }
       },

@@ -90,6 +90,9 @@ pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     /// yields the same bank the fallback would. A later piece removes the
     /// symlink fallback once the selector is the sole authority.
     selector: Option<machine_mgr::SharedSystemBankState>,
+    /// The node's current boot id, recorded in the boot vector's transaction
+    /// header when `activate` arms a trial. `None` = unknown (stored as zero).
+    node_boot_id: Option<String>,
 }
 
 impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
@@ -135,6 +138,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
             bank_activator,
             running_bank: Mutex::new(running_bank),
             selector,
+            node_boot_id: None,
         }
     }
 
@@ -149,42 +153,105 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         self
     }
 
+    /// The node's current boot id, armed into the boot vector's transaction
+    /// header by `activate`. Threaded from `FactoryDeps::node_boot_id`.
+    pub fn with_node_boot_id(mut self, id: Option<String>) -> Self {
+        self.node_boot_id = id;
+        self
+    }
+
     /// Key this provider's boot-vector entry by `id` (the component id).
     pub fn with_component_id(mut self, id: impl Into<String>) -> Self {
         self.component_id = id.into();
         self
     }
 
-    /// The images sealed into `bank`, by part name, for its boot-vector entry
-    /// and the [`banks`](BankProvider::banks) status report: size + SHA-256
-    /// from the bank's signed manifest (read without an HSM check, like
-    /// [`read_installed`](BankProvider::read_installed), which carries no
-    /// size). The disable record is not an image. Empty when the bank has no
-    /// readable manifest (in-memory test backends, a never-flashed bank).
+    /// [`banks`](BankProvider::banks) for a component whose reset kind is
+    /// `reset_kind`: a wrapping provider that overrides
+    /// [`reset_kind`](BankProvider::reset_kind) reports through this so
+    /// `pending_reset` follows its kind, not this provider's activator.
+    pub(crate) fn banks_for(&self, reset_kind: ResetKind) -> Option<ComponentBanks> {
+        // Unverified manifest reads only (`read_bank`): this backs a status
+        // poll, so it reports what each bank records, never re-hashes payloads.
+        let active = self.read_bank(self.active_bank());
+        let inactive = if self.single_bank {
+            None
+        } else {
+            Some(self.read_bank(active.bank.other())).filter(|c| !c.images.is_empty())
+        };
+        // With a boot vector attached, trial is structural: this component's
+        // booted entry differs from its committed floor. Without one, the NV
+        // committed flag for the set (the source `node_in_trial_labels` reads).
+        let in_trial = match &self.selector {
+            Some(sel) => sel
+                .read()
+                .expect("selector poisoned")
+                .component_in_trial(&self.component_id),
+            None => self
+                .nv
+                .lock()
+                .ok()
+                .and_then(|nv| nv.read_boot_state())
+                .is_some_and(|s| !s.banks[self.bank_set.as_index()].committed),
+        };
+        // Sealed in the boot the node still runs: the install's reset is owed.
+        let pending_reset = reset_kind == ResetKind::RequiresEcuReset
+            && active.install_boot_id.is_some()
+            && active.install_boot_id.as_deref() == self.node_boot_id.as_deref();
+        Some(ComponentBanks {
+            active,
+            inactive,
+            in_trial,
+            pending_reset,
+        })
+    }
+
+    /// The node's current boot id, as given to [`with_node_boot_id`](Self::with_node_boot_id).
+    pub fn node_boot_id(&self) -> Option<&str> {
+        self.node_boot_id.as_deref()
+    }
+
+    /// The images sealed into `bank`, by part name, for its boot-vector entry.
+    /// See [`read_bank`](Self::read_bank).
     fn sealed_images(&self, bank: Bank) -> BTreeMap<String, ImageEntry> {
+        self.read_bank(bank).images
+    }
+
+    /// What `bank`'s signed manifest records, for its boot-vector entry and
+    /// the [`banks`](BankProvider::banks) status report: each image's size +
+    /// SHA-256 and the node boot id the bank was sealed in (read without an
+    /// HSM check, like [`read_installed`](BankProvider::read_installed), which
+    /// carries no size). The disable record is not an image. Empty images and
+    /// no boot id when the bank has no readable manifest (in-memory test
+    /// backends, a never-flashed bank).
+    fn read_bank(&self, bank: Bank) -> BankContents {
         let manifest = self
             .target_bank_dir(bank)
             .ok_or_else(|| "no bank dir".to_string())
             .and_then(|dir| hsm::ivd::read_manifest_unverified(&dir).map_err(|e| e.to_string()));
         match manifest {
-            Ok(vm) => vm
-                .manifest
-                .files
-                .iter()
-                .filter(|f| !hsm::ivd::is_disabled_record(f))
-                .map(|f| {
-                    let mut sha256 = [0u8; 32];
-                    let n = f.sha256.len().min(32);
-                    sha256[..n].copy_from_slice(&f.sha256[..n]);
-                    (
-                        f.relative_path.clone(),
-                        ImageEntry {
-                            size: f.size,
-                            sha256,
-                        },
-                    )
-                })
-                .collect(),
+            Ok(vm) => BankContents {
+                bank,
+                images: vm
+                    .manifest
+                    .files
+                    .iter()
+                    .filter(|f| !hsm::ivd::is_disabled_record(f))
+                    .map(|f| {
+                        let mut sha256 = [0u8; 32];
+                        let n = f.sha256.len().min(32);
+                        sha256[..n].copy_from_slice(&f.sha256[..n]);
+                        (
+                            f.relative_path.clone(),
+                            ImageEntry {
+                                size: f.size,
+                                sha256,
+                            },
+                        )
+                    })
+                    .collect(),
+                install_boot_id: vm.manifest.install_boot_id,
+            },
             Err(e) => {
                 tracing::debug!(
                     component = %self.component_id,
@@ -192,7 +259,11 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
                     error = %e,
                     "no sealed manifest — no images recorded for this bank"
                 );
-                BTreeMap::new()
+                BankContents {
+                    bank,
+                    images: BTreeMap::new(),
+                    install_boot_id: None,
+                }
             }
         }
     }
@@ -654,8 +725,14 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
                 "ivd sign {bank_id}: no HSM crypto handle attached — IVD signing needs an HsmCryptoProvider (wiring bug)"
             ))
         })?;
-        hsm::ivd::sign_bank_crypto(crypto.as_ref(), &bank_dir, gen, identity)
-            .map_err(|e| BankError::Failed(format!("ivd sign {bank_id}: {e}")))?;
+        hsm::ivd::sign_bank_crypto_at(
+            crypto.as_ref(),
+            &bank_dir,
+            gen,
+            identity,
+            self.node_boot_id.as_deref(),
+        )
+        .map_err(|e| BankError::Failed(format!("ivd sign {bank_id}: {e}")))?;
         tracing::info!(
             bank_id = %bank_id,
             bank_dir = %bank_dir.display(),
@@ -787,7 +864,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             // so a missing boot-vector write is diagnosable. A failed write fails the
             // activation, so the caller never arms NV for a bank the boot vector
             // does not name.
-            match g.seal() {
+            match g.seal(self.node_boot_id.as_deref()) {
                 Ok(true) => tracing::info!(
                     slot = self.bank_set.as_index(),
                     label = %self.dir_name,
@@ -865,7 +942,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         if let Some(sel) = &self.selector {
             sel.write()
                 .expect("selector poisoned")
-                .rollback()
+                .rollback(machine_mgr::system_bank_state::Reason::Verdict)
                 .map_err(|e| BankError::Failed(format!("boot-vector rollback failed: {e}")))?;
         }
         Ok(())
@@ -951,42 +1028,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
     }
 
     fn banks(&self) -> Option<ComponentBanks> {
-        // Unverified manifest reads only (`sealed_images`): this backs a status
-        // poll, so it reports what each bank records, never re-hashes payloads.
-        let active = self.active_bank();
-        let inactive = if self.single_bank {
-            None
-        } else {
-            let other = active.other();
-            let images = self.sealed_images(other);
-            (!images.is_empty()).then_some(BankContents {
-                bank: other,
-                images,
-            })
-        };
-        // With a boot vector attached, trial is structural: this component's
-        // booted entry differs from its committed floor. Without one, the NV
-        // committed flag for the set (the source `node_in_trial_labels` reads).
-        let in_trial = match &self.selector {
-            Some(sel) => sel
-                .read()
-                .expect("selector poisoned")
-                .component_in_trial(&self.component_id),
-            None => self
-                .nv
-                .lock()
-                .ok()
-                .and_then(|nv| nv.read_boot_state())
-                .is_some_and(|s| !s.banks[self.bank_set.as_index()].committed),
-        };
-        Some(ComponentBanks {
-            active: BankContents {
-                bank: active,
-                images: self.sealed_images(active),
-            },
-            inactive,
-            in_trial,
-        })
+        self.banks_for(self.reset_kind())
     }
 }
 
@@ -1054,7 +1096,7 @@ mod tests {
         {
             let mut g = shared.write().unwrap();
             g.stage(id, bank, BTreeMap::new());
-            assert!(g.seal().unwrap());
+            assert!(g.seal(None).unwrap());
             assert_eq!(g.active_bank(id), Some(bank));
         }
         shared
@@ -1180,7 +1222,7 @@ mod tests {
         let store = InMemorySelectorStore::new();
         let mut mgr = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
         mgr.stage(id, bank, BTreeMap::new());
-        assert!(mgr.seal().unwrap());
+        assert!(mgr.seal(None).unwrap());
         mgr.commit().unwrap();
         (Arc::new(RwLock::new(mgr)), store)
     }
@@ -1219,7 +1261,7 @@ mod tests {
         {
             let mut g = selector.write().unwrap();
             g.stage("vm1", Bank::B, BTreeMap::new());
-            assert!(g.seal().unwrap());
+            assert!(g.seal(None).unwrap());
         }
         let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
 
@@ -1250,6 +1292,24 @@ mod tests {
     /// Provision a `SimHsm`, sign `gen` into `bank_dir`, and return the HSM +
     /// keystore path (to clean up). Mirrors hsm's own `provisioned_sim`.
     fn sign_bank_dir(name: &str, bank_dir: &Path, gen: u64) -> (hsm_sim_backend::SimHsm, PathBuf) {
+        let (hsm, keystore) = provisioned_sim(name);
+        std::fs::create_dir_all(bank_dir).unwrap();
+        std::fs::write(bank_dir.join("kernel"), b"kernel bytes").unwrap();
+        // Non-empty identity so the manifest's final CBOR byte is string
+        // content — flipping it in the tamper test keeps the CBOR decodable.
+        let identity = hsm::ivd::IvdIdentity {
+            version: "1.2.0".into(),
+            ecu_sw_number: "VM1-SW-001".into(),
+            tester_serial: "SOVD-OTA".into(),
+            ..Default::default()
+        };
+        hsm::ivd::sign_bank_crypto(&hsm, bank_dir, gen, identity).unwrap();
+        (hsm, keystore)
+    }
+
+    /// A `SimHsm` provisioned with the `ivd-signing` key, and its keystore path
+    /// (to clean up).
+    fn provisioned_sim(name: &str) -> (hsm_sim_backend::SimHsm, PathBuf) {
         use hsm::payload::*;
         let keystore = std::env::temp_dir().join(format!("component-mgr-readinstalled-ks-{name}"));
         let _ = std::fs::remove_dir_all(&keystore);
@@ -1272,18 +1332,6 @@ mod tests {
         };
         hsm.write_keystore(&ks).unwrap();
         std::fs::write(keystore.join("provision_state"), b"1\n").unwrap();
-
-        std::fs::create_dir_all(bank_dir).unwrap();
-        std::fs::write(bank_dir.join("kernel"), b"kernel bytes").unwrap();
-        // Non-empty identity so the manifest's final CBOR byte is string
-        // content — flipping it in the tamper test keeps the CBOR decodable.
-        let identity = hsm::ivd::IvdIdentity {
-            version: "1.2.0".into(),
-            ecu_sw_number: "VM1-SW-001".into(),
-            tester_serial: "SOVD-OTA".into(),
-            ..Default::default()
-        };
-        hsm::ivd::sign_bank_crypto(&hsm, bank_dir, gen, identity).unwrap();
         (hsm, keystore)
     }
 
@@ -1343,6 +1391,151 @@ mod tests {
                 },
             )])
         );
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    /// Activator that needs a node reset to apply an activated bank.
+    struct NodeResetActivator;
+    impl machine_mgr::BankActivator for NodeResetActivator {
+        fn activate(&self, _dir: &Path) -> Result<(), machine_mgr::BankActivatorError> {
+            Ok(())
+        }
+        fn reset_kind(&self) -> ResetKind {
+            ResetKind::RequiresEcuReset
+        }
+    }
+
+    /// A sealing provider over `images_dir` (component `vm1`, NV active A)
+    /// running in node boot `boot_id`, signing with the SimHsm at `keystore`.
+    fn boot_id_provider(
+        images_dir: &Path,
+        keystore: &Path,
+        selector: Option<SharedSystemBankState>,
+        activator: Option<Arc<dyn machine_mgr::BankActivator>>,
+        boot_id: Option<&str>,
+    ) -> IvdBankProvider<MemBlockDevice> {
+        let hsm: Arc<Mutex<dyn hsm::HsmProvider>> = Arc::new(Mutex::new(
+            hsm_sim_backend::SimHsm::new(keystore.to_path_buf()),
+        ));
+        IvdBankProvider::new(
+            nv_with_active(slots::VM1, Bank::A),
+            slots::VM1,
+            false,
+            Some(images_dir.to_path_buf()),
+            "vm1".into(),
+            Some(hsm),
+            activator,
+            selector,
+        )
+        .with_hsm_crypto(Arc::new(hsm_sim_backend::SimHsm::new(
+            keystore.to_path_buf(),
+        )))
+        .with_node_boot_id(boot_id.map(str::to_owned))
+    }
+
+    /// Seal bank B of `vm1` (a fresh `kernel`) and activate it, in boot `boot-a`.
+    fn seal_and_activate_b(
+        name: &str,
+        activator: Option<Arc<dyn machine_mgr::BankActivator>>,
+    ) -> (PathBuf, PathBuf, SharedSystemBankState) {
+        let images_dir = std::env::temp_dir().join(format!("component-mgr-boot-id-{name}"));
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let bank_dir = images_dir.join("vm1").join("bank_b");
+        std::fs::create_dir_all(&bank_dir).unwrap();
+        std::fs::write(bank_dir.join("kernel"), b"kernel bytes").unwrap();
+        let (_hsm, keystore) = provisioned_sim(&format!("boot-id-{name}"));
+        let (selector, _store) = selector_with_store("vm1", Bank::A);
+
+        let p = boot_id_provider(
+            &images_dir,
+            &keystore,
+            Some(Arc::clone(&selector)),
+            activator,
+            Some("boot-a"),
+        );
+        p.seal(Bank::B, FirmwareIdentity::default(), 2, &[])
+            .expect("seal B");
+        p.activate(Bank::B).expect("activate B");
+        (images_dir, keystore, selector)
+    }
+
+    #[test]
+    fn banks_reports_pending_reset_for_a_node_reset_install_sealed_this_boot() {
+        let (images_dir, keystore, selector) =
+            seal_and_activate_b("pending", Some(Arc::new(NodeResetActivator)));
+        let p = boot_id_provider(
+            &images_dir,
+            &keystore,
+            Some(selector),
+            Some(Arc::new(NodeResetActivator)),
+            Some("boot-a"),
+        );
+
+        let b = p.banks().expect("banks");
+        assert_eq!(b.active.bank, Bank::B);
+        assert_eq!(b.active.install_boot_id.as_deref(), Some("boot-a"));
+        assert!(b.pending_reset);
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn banks_no_pending_reset_for_a_local_reset_component() {
+        let (images_dir, keystore, selector) = seal_and_activate_b("local", None);
+        let p = boot_id_provider(&images_dir, &keystore, Some(selector), None, Some("boot-a"));
+
+        let b = p.banks().expect("banks");
+        assert_eq!(b.active.bank, Bank::B);
+        assert_eq!(b.active.install_boot_id.as_deref(), Some("boot-a"));
+        assert!(!b.pending_reset);
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn banks_no_pending_reset_once_the_node_booted_again() {
+        let (images_dir, keystore, selector) =
+            seal_and_activate_b("rebooted", Some(Arc::new(NodeResetActivator)));
+        let p = boot_id_provider(
+            &images_dir,
+            &keystore,
+            Some(selector),
+            Some(Arc::new(NodeResetActivator)),
+            Some("boot-b"),
+        );
+
+        let b = p.banks().expect("banks");
+        assert_eq!(b.active.install_boot_id.as_deref(), Some("boot-a"));
+        assert!(!b.pending_reset);
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
+    #[test]
+    fn banks_no_pending_reset_when_the_manifest_records_no_boot_id() {
+        let images_dir = std::env::temp_dir().join("component-mgr-boot-id-absent");
+        let _ = std::fs::remove_dir_all(&images_dir);
+        // NV active is A; sealed with the old sign fn, so no boot id recorded.
+        let (_hsm, keystore) =
+            sign_bank_dir("boot-id-absent", &images_dir.join("vm1").join("bank_a"), 1);
+        let p = boot_id_provider(
+            &images_dir,
+            &keystore,
+            None,
+            Some(Arc::new(NodeResetActivator)),
+            Some("boot-a"),
+        );
+
+        let b = p.banks().expect("banks");
+        assert_eq!(b.active.bank, Bank::A);
+        assert!(!b.active.images.is_empty());
+        assert_eq!(b.active.install_boot_id, None);
+        assert!(!b.pending_reset);
 
         let _ = std::fs::remove_dir_all(&images_dir);
         let _ = std::fs::remove_dir_all(&keystore);

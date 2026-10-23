@@ -75,6 +75,63 @@ impl ComponentEntry {
     }
 }
 
+/// The stored form of a node boot id: the first 16 bytes of SHA-256 over its
+/// UTF-8 bytes. A stored all-zero digest means "unknown" / "none", not a real
+/// boot id.
+pub fn boot_id_digest(id: &str) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let full: [u8; 32] = Sha256::digest(id.as_bytes()).into();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
+}
+
+/// How a node transaction ended, as recorded in the PRIMARY copy's
+/// [`Transaction`] header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Committed,
+    RolledBack,
+}
+
+/// Why a node transaction ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reason {
+    /// A verdict from the caller.
+    Verdict,
+    /// The node rolled itself back after the host-configured number of boots
+    /// while armed without a verdict.
+    TrialBootLimit,
+}
+
+/// The recorded end of a node transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolution {
+    pub outcome: Outcome,
+    pub reason: Reason,
+}
+
+/// The transaction header carried by the PRIMARY copy only (the backup never
+/// carries one), inside the signed digest. Meaningful only while the node is
+/// in trial (PRIMARY entries differ from the backup's) or when it carries a
+/// [`Resolution`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transaction {
+    /// [`boot_id_digest`] of the node boot id at arming. All-zero ⇒ unknown.
+    #[serde(with = "hex_array")]
+    pub armed_boot_id: [u8; 16],
+    /// Distinct node boots counted while armed without a verdict.
+    pub trial_boots: u8,
+    /// [`boot_id_digest`] of the last boot counted. All-zero ⇒ none counted.
+    #[serde(with = "hex_array")]
+    pub counted_boot_id: [u8; 16],
+    /// How the transaction ended, once it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<Resolution>,
+}
+
 /// The on-medium boot vector: which bank each component boots from and what
 /// was sealed into it, at a given global generation, signed.
 ///
@@ -94,7 +151,9 @@ impl ComponentEntry {
 /// }
 /// ```
 ///
-/// plus an optional `"selectors"` legacy slot map (see [`Self::selectors`]).
+/// plus an optional `"transaction"` header (PRIMARY only, see
+/// [`Transaction`]) and an optional `"selectors"` legacy slot map (see
+/// [`Self::selectors`]).
 ///
 /// # Canonical bytes
 ///
@@ -106,8 +165,13 @@ impl ComponentEntry {
 ///     u16 id.len(), id bytes, u8 bank (A = 0, B = 1), u16 images.len()
 ///     for each (name, image) in entry.images, ascending name:
 ///         u16 name.len(), name bytes, u64 size, 32 bytes sha256
+/// only when a transaction header is present:
+///     u8 0x01, 16 bytes armed_boot_id, u8 trial_boots, 16 bytes counted_boot_id,
+///     u8 resolution (0 none, 1 committed, 2 rolled_back),
+///     u8 reason (0 verdict, 1 trial_boot_limit; 0 when no resolution)
 /// ```
 ///
+/// A blob without a header digests exactly as before the header existed.
 /// Both maps are [`BTreeMap`]s precisely so this encoding is **stable**
 /// regardless of insertion order. The signature is over [`Self::sha256`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +181,10 @@ pub struct SelectorBlob {
     /// Component id -> boot selection, canonically ordered. Covered by the
     /// signature (see [`Self::canonical_bytes`]).
     pub entries: BTreeMap<String, ComponentEntry>,
-    /// SHA-256 over the canonical `(generation, entries)` bytes — the digest
+    /// The transaction header — PRIMARY only, covered by the signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<Transaction>,
+    /// SHA-256 over the canonical `(generation, entries, transaction)` bytes — the digest
     /// the signature covers. Serialized as a lowercase hex string.
     #[serde(with = "hex_array")]
     pub sha256: [u8; 32],
@@ -135,9 +202,13 @@ pub struct SelectorBlob {
 
 impl SelectorBlob {
     /// Build the canonical, order-stable byte encoding of `(generation,
-    /// entries)` that [`Self::sha256`] digests and the signature covers —
-    /// layout in the [type docs](Self).
-    pub fn canonical_bytes(generation: u64, entries: &BTreeMap<String, ComponentEntry>) -> Vec<u8> {
+    /// entries, transaction)` that [`Self::sha256`] digests and the signature
+    /// covers — layout in the [type docs](Self).
+    pub fn canonical_bytes(
+        generation: u64,
+        entries: &BTreeMap<String, ComponentEntry>,
+        transaction: Option<&Transaction>,
+    ) -> Vec<u8> {
         fn put_str(buf: &mut Vec<u8>, s: &str) {
             buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
@@ -154,26 +225,54 @@ impl SelectorBlob {
                 buf.extend_from_slice(&img.sha256);
             }
         }
+        if let Some(t) = transaction {
+            buf.push(0x01);
+            buf.extend_from_slice(&t.armed_boot_id);
+            buf.push(t.trial_boots);
+            buf.extend_from_slice(&t.counted_boot_id);
+            let (outcome, reason) = match t.resolution {
+                None => (0, 0),
+                Some(r) => (
+                    match r.outcome {
+                        Outcome::Committed => 1,
+                        Outcome::RolledBack => 2,
+                    },
+                    match r.reason {
+                        Reason::Verdict => 0,
+                        Reason::TrialBootLimit => 1,
+                    },
+                ),
+            };
+            buf.push(outcome);
+            buf.push(reason);
+        }
         buf
     }
 
-    /// Compute the canonical SHA-256 for `(generation, entries)`.
-    pub fn compute_sha256(generation: u64, entries: &BTreeMap<String, ComponentEntry>) -> [u8; 32] {
+    /// Compute the canonical SHA-256 for `(generation, entries, transaction)`.
+    pub fn compute_sha256(
+        generation: u64,
+        entries: &BTreeMap<String, ComponentEntry>,
+        transaction: Option<&Transaction>,
+    ) -> [u8; 32] {
         use sha2::{Digest, Sha256};
-        Sha256::digest(Self::canonical_bytes(generation, entries)).into()
+        Sha256::digest(Self::canonical_bytes(generation, entries, transaction)).into()
     }
 
-    /// Build + sign a blob for `entries` at `generation` using `signer`.
+    /// Build + sign a blob for `entries` (and `transaction`) at `generation`
+    /// using `signer`.
     pub fn signed(
         generation: u64,
         entries: BTreeMap<String, ComponentEntry>,
+        transaction: Option<Transaction>,
         signer: &dyn Signer,
     ) -> SelectorBlob {
-        let sha256 = Self::compute_sha256(generation, &entries);
+        let sha256 = Self::compute_sha256(generation, &entries, transaction.as_ref());
         let signature = signer.sign(&sha256);
         SelectorBlob {
             generation,
             entries,
+            transaction,
             sha256,
             signature,
             selectors: None,
@@ -185,7 +284,8 @@ impl SelectorBlob {
     /// contents, or whose signature doesn't verify, is rejected. The legacy
     /// slot map plays no part.
     pub fn is_valid(&self, signer: &dyn Signer) -> bool {
-        let recomputed = Self::compute_sha256(self.generation, &self.entries);
+        let recomputed =
+            Self::compute_sha256(self.generation, &self.entries, self.transaction.as_ref());
         recomputed == self.sha256 && signer.verify(&self.sha256, &self.signature)
     }
 }
@@ -198,14 +298,19 @@ impl SelectorBlob {
 
 mod hex_array {
     use serde::{Deserialize, Deserializer, Serializer};
-    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer, const N: usize>(
+        bytes: &[u8; N],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
         s.serialize_str(&hex::encode(bytes))
     }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(
+        d: D,
+    ) -> Result<[u8; N], D::Error> {
         let s = String::deserialize(d)?;
         let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
         v.try_into()
-            .map_err(|_| serde::de::Error::custom("sha256 must be 32 bytes"))
+            .map_err(|_| serde::de::Error::custom(format!("expected {N} bytes")))
     }
 }
 
@@ -561,7 +666,7 @@ mod tests {
             "os".to_string(),
             ComponentEntry::new(Bank::B, BTreeMap::new()),
         );
-        SelectorBlob::signed(generation, entries, &StubSigner)
+        SelectorBlob::signed(generation, entries, None, &StubSigner)
     }
 
     #[test]
@@ -603,7 +708,7 @@ mod tests {
             "vm1".to_string(),
             ComponentEntry::new(Bank::A, BTreeMap::new()),
         );
-        let written = SelectorBlob::signed(7, entries, &StubSigner);
+        let written = SelectorBlob::signed(7, entries, None, &StubSigner);
 
         // Not configured: no `selectors` key in the JSON.
         let plain_dir = temp_path("plain");

@@ -87,7 +87,7 @@ pub use component::Component;
 pub use deactivator::{DeactivateError, DeactivateOutcome, Deactivator};
 pub use error::{MachineError, MachineResult};
 pub use image_record::ImageRecord;
-pub use machine::{Machine, MachineRegistry};
+pub use machine::{Machine, MachineRegistry, NodeBootOutcome};
 pub use system_bank_state::{
     BootSelector, ComponentEntry, FileSelectorStore, ImageEntry, SelectorBlob, SelectorStore,
     SharedSystemBankState, Signer, StubSelectorStore, StubSigner, SystemBankManager,

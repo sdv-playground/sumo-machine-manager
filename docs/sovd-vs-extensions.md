@@ -82,7 +82,7 @@ spec; all are `x-`-namespaced.
 | `/operations/x-ota-pull-update/executions` | POST | onboard pull-update (gateway mode); async 202 + poll |
 
 Both update-state routes also carry `banks`: one entry per component that reports bank
-contents, `{id, active, inactive, in_trial}`. `active` is the bank the component boots from
+contents, `{id, active, inactive, in_trial, pending_reset}`. `active` is the bank the component boots from
 (the boot vector's selection when one is attached) with its `images` (part name →
 `{size, sha256}`, sha256 lowercase hex; empty when the bank has no readable manifest).
 `inactive` is the other bank in the same shape, `null` for a single-bank component or when
@@ -92,6 +92,24 @@ entry; without one, its bank set is not committed. The images come from the inst
 manifests as recorded at install time, read without signature check or payload hashing; this
 is a report, not a verification. Intended use: after any reboot the orchestrator compares
 `inactive` with its intended release and downloads only the images that differ.
+
+Each bank also carries `install_boot_id`: the node boot id current when the bank was sealed,
+as its installed manifest records it (`null` for a manifest sealed before the field existed,
+a node without a boot id, or no readable manifest). `pending_reset` is true when the
+component's newly installed content needs a node reset that has not happened yet: its reset
+kind is `requires_ecu_reset` and the active bank's `install_boot_id` is set and equal to the
+node's current boot id. Anything else, an unknown boot id on either side included, is
+`false`. It is a per-component fact read from the signed manifest, so it survives process
+restarts and holds for two-bank and single-bank components alike. Intended use: continue only
+when nothing you just wrote is pending a reset; whether and when to reset is the
+orchestrator's.
+
+They also carry the boot vector's transaction state. `trial_boots`: distinct node boots
+counted while armed without a verdict (`null` when the boot vector has no header, or the
+node is not in trial and has no recorded resolution). `trial_boot_limit`: the count
+at which the node rolls itself back (`null` = disabled; set by the host). `resolution`: how
+the last node transaction ended, `{"outcome": "committed"|"rolled_back", "reason":
+"verdict"|"trial_boot_limit"}`, `null` while a trial is open or when none is recorded.
 
 Residual concurrency limitation: the node commit/rollback routes serialize
 against each other inside sumo-mm, but SOVDd's component-level verdict routes do

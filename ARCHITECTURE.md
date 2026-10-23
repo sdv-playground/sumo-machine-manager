@@ -294,8 +294,8 @@ decrypt, decompression).
 The node has one signed boot record, the **selector**, that supersedes the original
 per-component NV boot state as the authority for "which bank each set boots from":
 
-- `SelectorBlob { generation: u64, entries: BTreeMap<String, ComponentEntry>, sha256,
-  signature, selectors: Option<…> }` (`nv-store::selector`) — the **boot vector**. Entries
+- `SelectorBlob { generation: u64, entries: BTreeMap<String, ComponentEntry>,
+  transaction: Option<Transaction>, sha256, signature, selectors: Option<…> }` (`nv-store::selector`) — the **boot vector**. Entries
   are keyed by **component id**; each carries the component's `bank` and the images sealed
   into that bank by part name (`ImageEntry { size, sha256 }`, possibly empty). Two slots
   via `SelectorStore`: **PRIMARY** (booted) and **SECONDARY** (rollback floor). A component
@@ -321,7 +321,23 @@ per-component NV boot state as the authority for "which bank each set boots from
   Canonical bytes under `sha256` (all integers little-endian): `u64 generation`, then per
   entry in ascending id order `u16 id.len()`, id bytes, `u8 bank` (A=0, B=1),
   `u16 images.len()`, then per image in ascending name order `u16 name.len()`, name bytes,
-  `u64 size`, 32 bytes sha256. The signature is over `sha256`.
+  `u64 size`, 32 bytes sha256; then, only when a transaction header is present, `u8 0x01`,
+  16 bytes `armed_boot_id`, `u8 trial_boots`, 16 bytes `counted_boot_id`, `u8 resolution`
+  (0 none, 1 committed, 2 rolled_back), `u8 reason` (0 verdict, 1 trial_boot_limit; 0 with
+  no resolution). A blob without a header digests exactly as before. The signature is over
+  `sha256`.
+
+  The **transaction header** (`transaction`) lives in the PRIMARY copy only — the backup
+  never carries one — and is inside the digest: `armed_boot_id` (node boot id at `seal`,
+  reduced to the first 16 bytes of its SHA-256; zero = unknown), `trial_boots` (distinct
+  node boots counted while armed without a verdict), `counted_boot_id` (the last boot
+  counted; zero = none) and `resolution` (`{outcome: committed|rolled_back, reason:
+  verdict|trial_boot_limit}`). It is meaningful only while the node is in trial (PRIMARY
+  entries differ from the backup's) or when it records a resolution; readers gate on that.
+  `seal` writes a fresh header; `commit` writes the backup only, so PRIMARY keeps its
+  header; `rollback` writes PRIMARY = the backup's entries plus the header with its
+  resolution set. A rollback on a node that is not in trial writes nothing and keeps the
+  recorded resolution, so a later verdict rollback does not overwrite an earlier reason.
 
   The optional **legacy slot map** `selectors: { "<slot>": { "bank": "A" } }` is emitted
   only by a `FileSelectorStore` built `with_legacy_slot_map(component id → slot)`, for a
@@ -329,14 +345,35 @@ per-component NV boot state as the authority for "which bank each set boots from
   back, and goes away when no deployed boot stage needs it.
 - **The orchestrator decides.** The node stages, seals, commits and rolls back on the
   orchestrator's verdicts; the boot stage only reads.
+- **One bounded exception: the trial boot limit.** A host may set
+  `NodeCoordinator::with_trial_boot_limit(Some(n))` (`None`, the default, disables it;
+  sumo has no default value). After `n` distinct node boots while armed without a
+  verdict, the node rolls the whole node back by itself — the same path a rollback verdict
+  takes, differing only in the recorded reason (`trial_boot_limit`): the boot vector first
+  (the authority), then each component that was in trial rolls back its own NV. The node
+  never commits by itself. Counting is per distinct boot id (the arming boot and an
+  already-counted boot count nothing), so a process restart within one boot counts
+  nothing. The host sets `n` below its boot stage's own bound, so the node, not the boot
+  stage, settles the trial.
+
+  Host contract: call `MachineRegistry::observe_node_boot(&coord)` once after the store is
+  loaded and before serving, with the coordinator carrying the current node boot id. A
+  failed count or a failed boot-vector rollback is logged and retried on the next boot;
+  per-component rollback failures after the vector moved are returned in
+  `NodeBootOutcome::errors`.
+- **Verdict membership is the structural trial set.** The node verdict skips a component
+  whose `banks()` reports it out of trial: with a boot vector, its PRIMARY entry equals the
+  backup's; without one, the NV committed flag.
 - **Signed by the HSM** with `ivd-signing` (a `Signer` impl supplied by the host-manager
   process, where the HSM is reachable; verified at `SystemBankManager::load`).
   Previously a `StubSigner` (empty signature) — now real ECDSA-P256. The store is the
   file-backed JSON `FileSelectorStore` (pretty, one key per line) until a host store is
   plugged in behind `SelectorStore`.
 - `vm-boot` is the reference reader: it reports each PRIMARY entry's bank and trial state
-  and writes nothing. The boot vector carries no slot, so it cannot drive the per-slot NV
-  trial counter; the NV path (no boot vector) keeps its trial counting + auto-rollback.
+  and writes nothing; it ignores the transaction header. The boot vector carries no slot,
+  so it cannot drive the per-slot NV trial counter; the NV path (no boot vector) keeps its
+  trial counting + auto-rollback, and the boot-vector path counts in the header instead
+  (`observe_node_boot`, above).
 - **Sumo has no opinion on component names or slot numbers** — both come from the host
   profile.
 - **The store can fail.** `SelectorStore` writes return `Result`; `SystemBankManager`'s
@@ -344,8 +381,12 @@ per-component NV boot state as the authority for "which bank each set boots from
   success, so memory never runs ahead of storage. A failed seal fails `activate`, which
   leaves NV unarmed. A failed commit or rollback verdict is reported to the orchestrator;
   NV is written before the boot vector, so NV is then one step ahead. A commit is safe to
-  retry (NV folds an already-committed set into success); a rollback retry is refused by
-  NV as not-in-trial, so that gap closes only once the write order changes.
+  retry (NV folds an already-committed set into success); a rollback verdict retry is
+  still refused by NV as not-in-trial (the provider still writes NV first). With a trial
+  boot limit set, the gap closes on its own: the vector is still in trial, so later boots
+  count and the bail-out rolls the vector back (the per-component NV rollback then reports
+  not-in-trial in `NodeBootOutcome::errors`). Without a limit it closes only once the write
+  order changes.
 - `BankSet` is a bare `pub struct BankSet(pub u8)` newtype — a slot *number*, nothing more.
   The library names no slot: a component's slot comes from its spec (`slot: N`, written by
   the platform profile), and what a slot holds is that profile's decision (a spec that still
@@ -440,6 +481,12 @@ The node-level `x-update-state` (alias `x-ota-update-state`) also reports, per c
 what each bank holds as `banks` (active / inactive bank with per-image size + SHA-256 from
 the installed manifests, plus `in_trial`), so an orchestrator can compare the inactive bank
 with its intent and download only what differs.
+The installed manifest also records `install_boot_id`, the node boot id current when the
+bank was sealed. It is covered by the manifest signature; `IVD_MANIFEST_VERSION` is
+unchanged because the key is optional, and a manifest sealed before it existed reads as
+unknown. `banks` reports it per bank and derives `pending_reset` from it: a component that
+needs a node reset, whose active bank was sealed in the boot still running, still waits for
+that reset.
 
 ## VM launch (vm-service)
 
