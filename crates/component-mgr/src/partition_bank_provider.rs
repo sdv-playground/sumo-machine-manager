@@ -271,8 +271,9 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         self.inner.disabled_record(bank)
     }
     fn banks(&self) -> Option<ComponentBanks> {
-        // The IVD manifests live in the metadata dir exactly as for a file bank.
-        self.inner.banks()
+        // The IVD manifests live in the metadata dir exactly as for a file bank;
+        // `pending_reset` follows this provider's reset kind, not the inner one's.
+        self.inner.banks_for(self.reset_kind())
     }
     fn reset_kind(&self) -> ResetKind {
         // A raw partition takes effect only after the node reboots + the
@@ -456,13 +457,14 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
                 "partition bank seal: no HSM crypto handle — IVD signing needs an HsmCryptoProvider (wiring bug)".into(),
             )
         })?;
-        hsm::ivd::sign_bank_with_files_crypto(
+        hsm::ivd::sign_bank_with_files_crypto_at(
             crypto.as_ref(),
             &metadata_dir,
             gen,
             firmware_to_ivd_identity(&identity),
             files,
             None,
+            self.inner.node_boot_id(),
         )
         .map_err(|e| BankError::Failed(format!("partition bank seal: ivd sign: {e}")))?;
         tracing::info!(metadata_dir = %metadata_dir.display(), gen, "partition bank sealed (IVD signed over partition hash)");
@@ -571,6 +573,18 @@ mod tests {
         nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
         selector: Option<SharedSystemBankState>,
     ) -> PartitionBankProvider<MemBlockDevice> {
+        build_in_boot(images_dir, parts, tag, nv, selector, None)
+    }
+
+    /// `build_with` running in node boot `boot_id`.
+    fn build_in_boot(
+        images_dir: PathBuf,
+        parts: Vec<PartitionPart>,
+        tag: &str,
+        nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
+        selector: Option<SharedSystemBankState>,
+        boot_id: Option<&str>,
+    ) -> PartitionBankProvider<MemBlockDevice> {
         let ks = provisioned_keystore(tag);
         // Two independent SimHsm handles over the same keystore dir — one as the
         // provisioning-gate HsmProvider, one as the signing HsmCryptoProvider.
@@ -588,7 +602,8 @@ mod tests {
             None, // activator = None → activate() is selector-flip only
             selector,
         )
-        .with_hsm_crypto(crypto.clone());
+        .with_hsm_crypto(crypto.clone())
+        .with_node_boot_id(boot_id.map(str::to_owned));
         PartitionBankProvider::new(inner, parts, Some(hsm), Some(crypto))
     }
 
@@ -744,6 +759,44 @@ mod tests {
             ["application.img"],
             "the IVD attests exactly what the install delivered"
         );
+    }
+
+    /// A raw partition always needs a node reset, so a bank sealed in the boot
+    /// still running is pending one, though the inner provider has no
+    /// activator (reset kind `Local`). After the node booted again it is not.
+    #[test]
+    fn banks_pending_reset_follows_the_partition_reset_kind() {
+        let base = tmp("pending-reset");
+        let appl = base.join("bankB-appl.img");
+        std::fs::write(&appl, b"the delivered application image").unwrap();
+        let parts = || vec![part("application.img", &base.join("bankA-appl.img"), &appl)];
+        let images = base.join("images");
+        let nv = nv_armed(Bank::B);
+
+        let p = build_in_boot(
+            images.clone(),
+            parts(),
+            "pending-reset",
+            nv.clone(),
+            None,
+            Some("boot-a"),
+        );
+        p.seal(
+            Bank::B,
+            FirmwareIdentity::default(),
+            1,
+            &["application.img".to_string()],
+        )
+        .unwrap();
+        let b = p.banks().expect("banks");
+        assert_eq!(b.active.bank, Bank::B);
+        assert_eq!(b.active.install_boot_id.as_deref(), Some("boot-a"));
+        assert!(b.pending_reset, "sealed in the running boot");
+
+        let p = build_in_boot(images, parts(), "pending-reset", nv, None, Some("boot-b"));
+        let b = p.banks().expect("banks");
+        assert_eq!(b.active.install_boot_id.as_deref(), Some("boot-a"));
+        assert!(!b.pending_reset, "the node booted since the seal");
     }
 
     #[test]

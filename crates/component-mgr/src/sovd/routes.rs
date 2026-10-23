@@ -126,6 +126,11 @@ pub(crate) struct ComponentBanksResponse {
     pub active: BankContentsResponse,
     pub inactive: Option<BankContentsResponse>,
     pub in_trial: bool,
+    /// The newly installed content needs a node reset that has not happened
+    /// yet: the component needs a node reset to apply an install, and its
+    /// active bank was sealed in the node boot that is still running. `false`
+    /// when either boot id is unknown.
+    pub pending_reset: bool,
 }
 
 /// What one bank holds, by part name, as its installed manifest records it.
@@ -135,6 +140,8 @@ pub(crate) struct BankContentsResponse {
     #[schema(value_type = String)]
     pub bank: Bank,
     pub images: BTreeMap<String, BankImageResponse>,
+    /// The node boot id the bank was sealed in; `null` when unknown.
+    pub install_boot_id: Option<String>,
 }
 
 /// One installed image: its size in bytes and SHA-256 (lowercase hex).
@@ -161,6 +168,7 @@ impl From<BankContents> for BankContentsResponse {
                     )
                 })
                 .collect(),
+            install_boot_id: c.install_boot_id,
         }
     }
 }
@@ -246,6 +254,7 @@ fn component_banks(machine: &dyn Machine) -> Vec<ComponentBanksResponse> {
                 active: b.active.into(),
                 inactive: b.inactive.map(Into::into),
                 in_trial: b.in_trial,
+                pending_reset: b.pending_reset,
             })
         })
         .collect()

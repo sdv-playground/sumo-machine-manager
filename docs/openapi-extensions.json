@@ -655,6 +655,13 @@
             "propertyNames": {
               "type": "string"
             }
+          },
+          "install_boot_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The node boot id the bank was sealed in; `null` when unknown."
           }
         }
       },
@@ -682,7 +689,8 @@
         "required": [
           "id",
           "active",
-          "in_trial"
+          "in_trial",
+          "pending_reset"
         ],
         "properties": {
           "active": {
@@ -703,6 +711,10 @@
                 "$ref": "#/components/schemas/BankContentsResponse"
               }
             ]
+          },
+          "pending_reset": {
+            "type": "boolean",
+            "description": "The newly installed content needs a node reset that has not happened\nyet: the component needs a node reset to apply an install, and its\nactive bank was sealed in the node boot that is still running. `false`\nwhen either boot id is unknown."
           }
         }
       },

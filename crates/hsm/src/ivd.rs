@@ -147,6 +147,17 @@ pub struct IvdManifest {
     /// duplicate identity copy that used to live in the FW Meta NV blob.
     #[serde(rename = "5")]
     pub identity: IvdIdentity,
+
+    /// Node boot id current when this bank was sealed: the opaque string the
+    /// host reports for the running boot. The sealing provider writes it; it
+    /// is inside the signed bytes, so the manifest signature covers it.
+    /// Together with the node's current boot id it tells whether the bank's
+    /// content still waits for a node reset. Absent (manifests sealed before
+    /// the field existed, or a node without a boot id) means "unknown",
+    /// treated as live. Optional key: `IVD_MANIFEST_VERSION` is unchanged and
+    /// a manifest without it encodes byte-identically to before.
+    #[serde(rename = "6", default, skip_serializing_if = "Option::is_none")]
+    pub install_boot_id: Option<String>,
 }
 
 /// Firmware SW identity carried inside the signed IVD manifest.
@@ -380,6 +391,7 @@ pub fn build_manifest_from_files(
         files,
         gen,
         identity,
+        install_boot_id: None,
     }
 }
 
@@ -496,8 +508,29 @@ pub fn sign_bank_crypto(
     gen: u64,
     identity: IvdIdentity,
 ) -> Result<IvdManifest, IvdError> {
+    sign_bank_crypto_at(hsm, bank_dir, gen, identity, None)
+}
+
+/// [`sign_bank_crypto`] that also records `install_boot_id` (the node boot id
+/// current at seal time) in the signed manifest.
+#[cfg(feature = "crypto")]
+pub fn sign_bank_crypto_at(
+    hsm: &dyn HsmCryptoProvider,
+    bank_dir: &Path,
+    gen: u64,
+    identity: IvdIdentity,
+    install_boot_id: Option<&str>,
+) -> Result<IvdManifest, IvdError> {
     let (files, hash_ms) = collect_with_timing(bank_dir)?;
-    sign_bank_with_files_crypto(hsm, bank_dir, gen, identity, files, Some(hash_ms))
+    sign_bank_with_files_crypto_at(
+        hsm,
+        bank_dir,
+        gen,
+        identity,
+        files,
+        Some(hash_ms),
+        install_boot_id,
+    )
 }
 
 /// Walk `bank_dir` hashing every file, returning the inventory plus the elapsed
@@ -544,6 +577,21 @@ pub fn sign_bank_with_files_crypto(
     files: Vec<IvdFile>,
     walk_hash_ms: Option<u64>,
 ) -> Result<IvdManifest, IvdError> {
+    sign_bank_with_files_crypto_at(hsm, bank_dir, gen, identity, files, walk_hash_ms, None)
+}
+
+/// [`sign_bank_with_files_crypto`] that also records `install_boot_id` (the
+/// node boot id current at seal time) in the signed manifest.
+#[cfg(feature = "crypto")]
+pub fn sign_bank_with_files_crypto_at(
+    hsm: &dyn HsmCryptoProvider,
+    bank_dir: &Path,
+    gen: u64,
+    identity: IvdIdentity,
+    files: Vec<IvdFile>,
+    walk_hash_ms: Option<u64>,
+    install_boot_id: Option<&str>,
+) -> Result<IvdManifest, IvdError> {
     sign_bank_with_files_inner(
         |handle, data| hsm.sign(handle, data),
         bank_dir,
@@ -551,6 +599,7 @@ pub fn sign_bank_with_files_crypto(
         identity,
         files,
         walk_hash_ms,
+        install_boot_id,
     )
 }
 
@@ -567,6 +616,7 @@ fn sign_bank_with_files_inner(
     identity: IvdIdentity,
     files: Vec<IvdFile>,
     walk_hash_ms: Option<u64>,
+    install_boot_id: Option<&str>,
 ) -> Result<IvdManifest, IvdError> {
     let started = std::time::Instant::now();
 
@@ -581,7 +631,8 @@ fn sign_bank_with_files_inner(
         }
     }
 
-    let manifest = build_manifest_from_files(files, gen, identity);
+    let mut manifest = build_manifest_from_files(files, gen, identity);
+    manifest.install_boot_id = install_boot_id.map(str::to_owned);
     let manifest_bytes = encode_manifest(&manifest)?;
     let hash_ms = walk_hash_ms.unwrap_or(0);
 
@@ -1528,6 +1579,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&keystore);
     }
 
+    /// The manifest as encoded before `install_boot_id` existed: keys 0..5, no
+    /// key "6".
+    #[derive(Serialize)]
+    struct ManifestWithoutBootId {
+        #[serde(rename = "0")]
+        ivd_version: u64,
+        #[serde(rename = "2")]
+        signed_at_unix: u64,
+        #[serde(rename = "3")]
+        files: Vec<IvdFile>,
+        #[serde(rename = "4")]
+        gen: u64,
+        #[serde(rename = "5")]
+        identity: IvdIdentity,
+    }
+
+    #[test]
+    fn manifest_without_install_boot_id_decodes_as_none_and_encodes_unchanged() {
+        let old = ManifestWithoutBootId {
+            ivd_version: IVD_MANIFEST_VERSION,
+            signed_at_unix: 7,
+            files: Vec::new(),
+            gen: 3,
+            identity: sample_identity(),
+        };
+        let mut old_bytes = Vec::new();
+        ciborium::into_writer(&old, &mut old_bytes).unwrap();
+
+        let back = decode_manifest(&old_bytes).unwrap();
+        assert_eq!(back.install_boot_id, None);
+        assert_eq!(back.gen, 3);
+        // An absent field encodes byte-identically to the old layout.
+        assert_eq!(encode_manifest(&back).unwrap(), old_bytes);
+    }
+
+    #[test]
+    fn manifest_install_boot_id_roundtrips() {
+        let mut m = build_manifest_from_files(Vec::new(), 4, sample_identity());
+        m.install_boot_id = Some("boot-a".into());
+        let back = decode_manifest(&encode_manifest(&m).unwrap()).unwrap();
+        assert_eq!(back.install_boot_id.as_deref(), Some("boot-a"));
+        assert_eq!(back.ivd_version, IVD_MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn sign_bank_crypto_at_records_install_boot_id() {
+        let bank = temp_bank("sign-at-boot-id");
+        write(&bank.join("kernel"), b"kernel bytes");
+        let (hsm, keystore) = provisioned_sim("sign-at-boot-id");
+
+        sign_bank_crypto_at(&hsm, &bank, 2, sample_identity(), Some("boot-a")).unwrap();
+        let vm = read_manifest_unverified(&bank).unwrap();
+        assert_eq!(vm.manifest.install_boot_id.as_deref(), Some("boot-a"));
+        verify_bank_crypto(&hsm, &bank, VerifyPins::default()).unwrap();
+
+        // The old name records no boot id.
+        sign_bank_crypto(&hsm, &bank, 3, sample_identity()).unwrap();
+        let vm = read_manifest_unverified(&bank).unwrap();
+        assert_eq!(vm.manifest.install_boot_id, None);
+
+        let _ = std::fs::remove_dir_all(&bank);
+        let _ = std::fs::remove_dir_all(&keystore);
+    }
+
     #[test]
     fn read_manifest_unverified_absent_is_io_not_found() {
         let bank = temp_bank("read-manifest-unverified-absent");
@@ -1822,6 +1937,7 @@ mod tests {
             5,
             sample_identity(),
             Vec::new(),
+            None,
             None,
         );
         assert!(failed.is_err());
