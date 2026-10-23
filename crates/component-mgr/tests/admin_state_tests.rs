@@ -183,25 +183,25 @@ fn backend_with_manifests(
     .with_id(id.to_string())
 }
 
-/// A shared boot selector with a booted selection for `set` (bank A) — the
-/// serving bank a component's disable record is read from.
-fn selector_for(set: BankSet) -> SharedSystemBankState {
+/// A shared boot selector with a booted selection for component `id` (bank
+/// A) — the serving bank a component's disable record is read from.
+fn selector_for(id: &str) -> SharedSystemBankState {
     let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner));
     let shared: SharedSystemBankState = Arc::new(std::sync::RwLock::new(mgr));
     {
         let mut g = shared.write().unwrap();
-        g.stage(set, Bank::A);
+        g.stage(id, Bank::A, Default::default());
         g.seal().unwrap();
     }
     shared
 }
 
-/// Point the selector's booted selection for `set` at `bank` — what a flash's
-/// `activate` does. Re-enable is structural: once the serving bank holds no
-/// sentinel, `admin_disabled()` reads enabled.
-fn serve_bank(sel: &SharedSystemBankState, set: BankSet, bank: Bank) {
+/// Point the selector's booted selection for component `id` at `bank` — what
+/// a flash's `activate` does. Re-enable is structural: once the serving bank
+/// holds no sentinel, `admin_disabled()` reads enabled.
+fn serve_bank(sel: &SharedSystemBankState, id: &str, bank: Bank) {
     let mut g = sel.write().unwrap();
-    g.stage(set, bank);
+    g.stage(id, bank, Default::default());
     g.seal().unwrap();
 }
 
@@ -465,7 +465,7 @@ async fn non_disableable_component_omits_admin_state() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
     let (b, provider) =
-        vm_backend_with_selector(&nv, slots::VM1, None, selector_for(slots::VM1), tmp.path());
+        vm_backend_with_selector(&nv, slots::VM1, None, selector_for("vm1"), tmp.path());
     assert!(!b.is_disableable());
 
     write_sentinel(&provider, &nv, slots::VM1, Bank::A);
@@ -494,7 +494,7 @@ async fn ensure_flash_can_start_admits_disabled() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
     let (b, provider) =
-        vm_backend_with_selector(&nv, slots::VM1, None, selector_for(slots::VM1), tmp.path());
+        vm_backend_with_selector(&nv, slots::VM1, None, selector_for("vm1"), tmp.path());
     let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
     b.ensure_flash_can_start()
         .expect("enabled component is flashable");
@@ -513,7 +513,7 @@ async fn read_entity_status_tri_state_and_probe_skip() {
     let nv = make_nv();
     let (addr, probes) = counting_server().await;
     let tmp = tempfile::tempdir().unwrap();
-    let sel = selector_for(slots::VM1);
+    let sel = selector_for("vm1");
     let (b, provider) =
         vm_backend_with_selector(&nv, slots::VM1, Some(addr), sel.clone(), tmp.path());
     let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
@@ -542,7 +542,7 @@ async fn read_entity_status_tri_state_and_probe_skip() {
     // sentinel (what a flash's activate does): the probe runs (our canned
     // server is not a healthy guest, so spec status stays notReady — honesty),
     // admin_state "enabled".
-    serve_bank(&sel, slots::VM1, Bank::B);
+    serve_bank(&sel, "vm1", Bank::B);
     let status = b.read_entity_status().await.unwrap();
     let rt = &status.extensions["x-runtime"];
     assert_eq!(rt["admin_state"], "enabled", "enabled read-back");
@@ -570,13 +570,8 @@ async fn disabled_status_and_runtime_state_agree() {
     let nv = make_nv();
     let (addr, _probes) = counting_server().await;
     let tmp = tempfile::tempdir().unwrap();
-    let (b, provider) = vm_backend_with_selector(
-        &nv,
-        slots::VM1,
-        Some(addr),
-        selector_for(slots::VM1),
-        tmp.path(),
-    );
+    let (b, provider) =
+        vm_backend_with_selector(&nv, slots::VM1, Some(addr), selector_for("vm1"), tmp.path());
     let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
     write_sentinel(&provider, &nv, slots::VM1, Bank::A);
 
@@ -652,7 +647,7 @@ async fn probe_component_status_rides_the_uniform_node() {
     // Probe not running ⇒ the standard status field is honest.
     let tmp = tempfile::tempdir().unwrap();
     let (b, provider) =
-        vm_backend_with_selector(&nv, slots::RT, None, selector_for(slots::RT), tmp.path());
+        vm_backend_with_selector(&nv, slots::RT, None, selector_for("vm1"), tmp.path());
     let b = b
         .with_deactivator(Arc::new(MockDeactivator::ok()))
         .with_health_probe(Arc::new(MockProbe { running: false }));
@@ -691,7 +686,7 @@ async fn probe_component_status_rides_the_uniform_node() {
     let nv2 = make_nv();
     let tmp2 = tempfile::tempdir().unwrap();
     let (b, provider2) =
-        vm_backend_with_selector(&nv2, slots::RT, None, selector_for(slots::RT), tmp2.path());
+        vm_backend_with_selector(&nv2, slots::RT, None, selector_for("vm1"), tmp2.path());
     let b = b
         .with_deactivator(Arc::new(MockDeactivator::ok()))
         .with_health_probe(Arc::new(MockProbe { running: true }));
@@ -715,7 +710,7 @@ async fn ecu_reset_skips_vm_service_when_disabled() {
     let nv = make_nv();
     let (addr, hits) = counting_server().await;
     let tmp = tempfile::tempdir().unwrap();
-    let sel = selector_for(slots::VM1);
+    let sel = selector_for("vm1");
     let (b, provider) =
         vm_backend_with_selector(&nv, slots::VM1, Some(addr), sel.clone(), tmp.path());
     let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
@@ -732,7 +727,7 @@ async fn ecu_reset_skips_vm_service_when_disabled() {
 
     // Enabled (the selector now serves a bank with no sentinel): the reset
     // notifies vm-service again.
-    serve_bank(&sel, slots::VM1, Bank::B);
+    serve_bank(&sel, "vm1", Bank::B);
     b.ecu_reset(0x01).await.unwrap();
     assert!(
         hits.load(Ordering::SeqCst) > 0,
@@ -783,7 +778,7 @@ async fn suit_disable_manifest_writes_sentinel_and_start_flash_admits() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
     installed_gen(&nv, slots::VM1, Bank::A);
-    let provider = signing_provider(&nv, slots::VM1, Some(selector_for(slots::VM1)), tmp.path());
+    let provider = signing_provider(&nv, slots::VM1, Some(selector_for("vm1")), tmp.path());
     let deact = Arc::new(MockDeactivator::ok());
     let b = backend_with_manifests(
         &nv,
@@ -1039,7 +1034,7 @@ async fn admin_disabled_is_false_for_a_stale_sentinel_gen() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
     let (b, provider) =
-        vm_backend_with_selector(&nv, slots::VM1, None, selector_for(slots::VM1), tmp.path());
+        vm_backend_with_selector(&nv, slots::VM1, None, selector_for("vm1"), tmp.path());
     let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
     let gen = installed_gen(&nv, slots::VM1, Bank::A);
     provider.write_disabled_record(Bank::A, gen + 1).unwrap();
@@ -1204,7 +1199,7 @@ async fn campaign_disable_manifest_enacts_at_finalize() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
     installed_gen(&nv, slots::VM1, Bank::A);
-    let sel = selector_for(slots::VM1);
+    let sel = selector_for("vm1");
     let deact = Arc::new(MockDeactivator::rebooting());
     let (b, provider) = campaign_backend(
         &nv,
@@ -1259,7 +1254,7 @@ async fn campaign_normal_flash_reenables_by_activating_a_real_ivd() {
     // it stays in the old bank, which is where a rollback would land.
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
-    let sel = selector_for(slots::VM1);
+    let sel = selector_for("vm1");
     let deact = Arc::new(MockDeactivator::ok());
     let (b, provider) = campaign_backend(
         &nv,
@@ -1304,7 +1299,7 @@ async fn rollback_of_reenable_lands_disabled_and_stops_the_guest() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
     installed_gen(&nv, slots::VM1, Bank::A);
-    let sel = selector_for(slots::VM1);
+    let sel = selector_for("vm1");
     let deact = Arc::new(MockDeactivator::ok());
 
     // Disabled by a real enact: the sentinel lands in A (deactivator run 1).
@@ -1568,7 +1563,7 @@ async fn unsigned_sentinel_reads_enabled_and_verify_refuses() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
     let (b, provider) =
-        vm_backend_with_selector(&nv, slots::VM1, None, selector_for(slots::VM1), tmp.path());
+        vm_backend_with_selector(&nv, slots::VM1, None, selector_for("vm1"), tmp.path());
     let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
     let gen = installed_gen(&nv, slots::VM1, Bank::A);
     // A real, validly-signed sentinel first — `b.admin_disabled()` is not
@@ -1604,7 +1599,7 @@ async fn reenable_flash_reads_enabled_before_ecu_reset_and_relaunches_once() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
     installed_gen(&nv, slots::VM1, Bank::A);
-    let sel = selector_for(slots::VM1);
+    let sel = selector_for("vm1");
     let (addr, hits) = counting_post_server().await;
     let deact = Arc::new(MockDeactivator::ok());
 
@@ -1663,7 +1658,7 @@ async fn reenable_flash_reads_enabled_before_ecu_reset_and_relaunches_once() {
 async fn startup_with_existing_sentinel_reports_disabled_before_any_nv_write() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
-    let sel = selector_for(slots::VM1);
+    let sel = selector_for("vm1");
     installed_gen(&nv, slots::VM1, Bank::A);
     let provider = signing_provider(&nv, slots::VM1, Some(sel), tmp.path());
     let b = backend_with_manifests(
@@ -1703,7 +1698,7 @@ async fn installed_manifest_shows_sentinel_when_disabled() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
     let (b, provider) =
-        vm_backend_with_selector(&nv, slots::VM1, None, selector_for(slots::VM1), tmp.path());
+        vm_backend_with_selector(&nv, slots::VM1, None, selector_for("vm1"), tmp.path());
     let b = b.with_deactivator(Arc::new(MockDeactivator::ok()));
     let gen = installed_gen(&nv, slots::VM1, Bank::A);
 
@@ -1756,7 +1751,7 @@ async fn installed_manifest_shows_sentinel_when_disabled() {
 async fn single_bank_rt_abort_keeps_the_sentinel() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
-    let sel = selector_for(slots::RT);
+    let sel = selector_for("rt");
     let provider = single_bank_signing_provider(&nv, slots::RT, "rt", Some(sel), tmp.path());
     let b = rt_backend_with_manifests(&nv, Arc::new(StubManifests), provider.clone())
         .with_deactivator(Arc::new(MockDeactivator::ok()));
@@ -1787,7 +1782,7 @@ async fn single_bank_rt_disable_then_reenable() {
     let nv = make_nv();
     let tmp = tempfile::tempdir().unwrap();
     installed_gen(&nv, slots::RT, Bank::A);
-    let sel = selector_for(slots::RT);
+    let sel = selector_for("rt");
     let provider = single_bank_signing_provider(&nv, slots::RT, "rt", Some(sel), tmp.path());
     let deact = Arc::new(MockDeactivator::ok());
 

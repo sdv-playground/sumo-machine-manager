@@ -1050,18 +1050,47 @@ fn owes_is_false_past_the_mask_width() {
 // --- Selector canonical encoding ---
 
 #[test]
-fn canonical_bytes_are_two_per_slot() {
-    use crate::selector::{SelectorBlob, SlotSelect};
+fn canonical_bytes_are_pinned() {
+    use crate::selector::{ComponentEntry, ImageEntry, SelectorBlob};
     use std::collections::BTreeMap;
 
-    // The signed bytes are the u64 LE generation, then `[set, bank]` per slot
-    // in ascending set order — inserted out of order to prove the ordering.
-    let mut selectors = BTreeMap::new();
-    selectors.insert(slots::VM1, SlotSelect::new(Bank::B));
-    selectors.insert(slots::OS, SlotSelect::new(Bank::A));
+    // Two components inserted out of order to prove the ordering: "vm1" with
+    // two images (also out of order), "os" with none.
+    let mut images = BTreeMap::new();
+    images.insert(
+        "rootfs".to_string(),
+        ImageEntry {
+            size: 0x0201,
+            sha256: [0xBB; 32],
+        },
+    );
+    images.insert(
+        "kernel".to_string(),
+        ImageEntry {
+            size: 0x10,
+            sha256: [0xAA; 32],
+        },
+    );
+    let mut entries = BTreeMap::new();
+    entries.insert("vm1".to_string(), ComponentEntry::new(Bank::B, images));
+    entries.insert(
+        "os".to_string(),
+        ComponentEntry::new(Bank::A, BTreeMap::new()),
+    );
 
+    let mut want: Vec<u8> = vec![0x02, 0x01, 0, 0, 0, 0, 0, 0]; // generation
+    want.extend_from_slice(&[2, 0, b'o', b's', 0, 0, 0]); // "os", A, 0 images
+    want.extend_from_slice(&[3, 0, b'v', b'm', b'1', 1, 2, 0]); // "vm1", B, 2 images
+    want.extend_from_slice(&[6, 0, b'k', b'e', b'r', b'n', b'e', b'l']);
+    want.extend_from_slice(&[0x10, 0, 0, 0, 0, 0, 0, 0]);
+    want.extend_from_slice(&[0xAA; 32]);
+    want.extend_from_slice(&[6, 0, b'r', b'o', b'o', b't', b'f', b's']);
+    want.extend_from_slice(&[0x01, 0x02, 0, 0, 0, 0, 0, 0]);
+    want.extend_from_slice(&[0xBB; 32]);
+
+    assert_eq!(SelectorBlob::canonical_bytes(0x0102, &entries), want);
     assert_eq!(
-        SelectorBlob::canonical_bytes(0x0102, &selectors),
-        [0x02, 0x01, 0, 0, 0, 0, 0, 0, 2, 0, 4, 1],
+        hex::encode(SelectorBlob::compute_sha256(0x0102, &entries)),
+        "78f3f1dce3158cc81010daa64d5fce7f3a3c6118d7717965966a89be4522784e"
     );
 }

@@ -906,7 +906,7 @@ fn make_disable_router(
     ));
     {
         let mut g = selector.write().unwrap();
-        g.stage(set, Bank::A);
+        g.stage(id, Bank::A, Default::default());
         g.seal().unwrap();
     }
 

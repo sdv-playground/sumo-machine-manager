@@ -26,6 +26,9 @@ use crate::bank_provider::BankError;
 
 /// The platform's own record of an image in a bank. See the module docs — the
 /// ordering guarantees are the point, not the payload.
+///
+/// **Deprecated:** the boot vector carries the sealed images; implement the
+/// store instead.
 pub trait ImageRecord: Send + Sync {
     /// An image is sealed into `bank`: `size` bytes hashing to `sha256`, as read
     /// BACK off the medium (never what the wire claimed). Called before the bank

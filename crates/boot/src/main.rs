@@ -9,9 +9,9 @@ fn usage() -> ! {
     eprintln!("Usage: vm-boot <nv-store-path> [--selector <dir>] [--init]");
     eprintln!();
     eprintln!("  <nv-store-path>   Path to the NV store file/device");
-    eprintln!("  --selector <dir>  Boot-selector dir (PRIMARY/SECONDARY slot files).");
-    eprintln!("                    When present and seeded, drives the bank decision;");
-    eprintln!("                    otherwise the NV boot state is used.");
+    eprintln!("  --selector <dir>  Boot-vector dir (PRIMARY/SECONDARY slot files).");
+    eprintln!("                    When present and seeded, its banks are reported per");
+    eprintln!("                    component; otherwise the NV boot state is used.");
     eprintln!("  --init            Create a new NV store file if it doesn't exist");
     std::process::exit(1);
 }
@@ -94,12 +94,20 @@ fn main() {
         }
     };
 
-    // A slot is a number: a component's slot comes from the platform
-    // profile, so this tool has no name to print for one. `actions` is
-    // one entry per ADDRESSABLE slot, indexed by `BankSet::as_index()`,
-    // so the index IS the slot.
+    // NV path: a slot is a number — a component's slot comes from the
+    // platform profile, so this tool has no name to print for one. `actions`
+    // is one entry per ADDRESSABLE slot, indexed by `BankSet::as_index()`, so
+    // the index IS the slot. Boot-vector path: one `Selected` per component.
     for (idx, action) in actions.iter().enumerate() {
         match action {
+            BootAction::Selected {
+                component,
+                bank,
+                trial,
+            } => {
+                let mode = if *trial { "trial" } else { "committed" };
+                println!("[bootmgr] component {component}: boot bank {bank:?} ({mode})");
+            }
             BootAction::FirstBoot => {
                 println!("[bootmgr] slot {idx}: first boot, initialized to bank A");
             }
@@ -138,19 +146,22 @@ fn main() {
         // has the image: the host's pre-launch verify.
     }
 
-    // Output active banks as machine-readable lines for scripts. Numeric,
-    // one per slot: no consumer parses these (host-boot.sh reads the boot
-    // selector by numeric slot), and the `ACTIVE_HOST-OS=`/`ACTIVE_VM1=`/
-    // `ACTIVE_VM2=` triple they replace was platform vocabulary leaking
-    // out of a slot-generic tool.
+    // Output active banks as machine-readable lines for scripts: per
+    // component on the boot-vector path, per numeric slot on the NV path.
+    // No consumer parses these.
+    let letter = |bank| match bank {
+        nv_store::types::Bank::A => "A",
+        nv_store::types::Bank::B => "B",
+    };
     println!();
-    for idx in 0..actions.len() {
-        if let Some(bank) = mgr.active_bank(BankSet(idx as u8)) {
-            let letter = match bank {
-                nv_store::types::Bank::A => "A",
-                nv_store::types::Bank::B => "B",
-            };
-            println!("ACTIVE_SLOT_{idx}={letter}");
+    for (idx, action) in actions.iter().enumerate() {
+        if let BootAction::Selected {
+            component, bank, ..
+        } = action
+        {
+            println!("ACTIVE_COMPONENT_{component}={}", letter(*bank));
+        } else if let Some(bank) = mgr.active_bank(BankSet(idx as u8)) {
+            println!("ACTIVE_SLOT_{idx}={}", letter(bank));
         }
     }
 }

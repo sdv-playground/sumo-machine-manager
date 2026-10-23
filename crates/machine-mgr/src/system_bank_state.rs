@@ -1,10 +1,12 @@
 //! SystemBankState — the node's single signed, generation-counted boot
-//! selector.
+//! vector.
 //!
 //! This is `nv_store::NvBootState` *grown up*. Where `NvBootState` records a
 //! per-bank-set `(active_bank, committed, boot_count)` triple with no global
 //! ordering and no attestation, `SystemBankState` is the **one** answer to
-//! "which bank does each component boot from", carrying:
+//! "which bank does each component boot from", keyed by component id. Each
+//! entry carries the bank and what was sealed into it (image sizes + SHA-256
+//! by part name), and the vector as a whole carries:
 //!
 //! - a **global generation** counter (anti-rollback across the whole node, not
 //!   per-bank-set), monotonic on `seal`;
@@ -35,49 +37,48 @@
 //!
 //! # Status: the boot / VM-launch authority
 //!
-//! This IS the authority for "which bank does each set boot from" on the
-//! supernova host: the OTA path
+//! This IS the authority for "which bank does each component boot from" on the
+//! host: the OTA path
 //! stages/seals/commits/rolls it back on every bank move, and boot + VM-launch
-//! read it (`vm-boot::process_boot` prefers the selector; supernova's auto-start
+//! read it (`vm-boot::process_boot` reports from it; the host's auto-start
 //! loop launches from `selector.active_bank`). `NvBootState` is NOT a
 //! second boot authority — it holds the RUNNING-bank / OTA-target anchor and the
 //! trial statistics (`boot_count` / `committed`), which the selector deliberately
 //! does not duplicate (it derives trial structurally from PRIMARY ≠ SECONDARY).
 //!
 //! Storage today is [`FileSelectorStore`] (two JSON slots, human-inspectable);
-//! the [`SelectorStore`] seam is the single JSON→C swap point (a future
-//! sector/`libbmft` impl of the same trait). The cache + transitions are unit-
+//! the [`SelectorStore`] seam is the single swap point for a host store. The cache + transitions are unit-
 //! tested against in-memory seams (`InMemorySelectorStore` / `TestSigner`, gated
 //! behind `test-seams`). `StubSelectorStore` / `StubSigner` remain the loud
 //! no-op default for builds that wire no store.
 
 use std::collections::BTreeMap;
 
-use nv_store::types::{Bank, BankSet};
+use nv_store::types::Bank;
 
 // The selector STORAGE primitives moved down into `nv-store` so a lower crate
 // can read the selector without depending up on `machine-mgr`. Re-exported here
 // so existing `machine_mgr::system_bank_state::*` paths still resolve.
 pub use nv_store::selector::{
-    FileSelectorStore, SelectorBlob, SelectorError, SelectorStore, Signer, SlotSelect,
-    StubSelectorStore, StubSigner,
+    ComponentEntry, FileSelectorStore, ImageEntry, SelectorBlob, SelectorError, SelectorStore,
+    Signer, SlotSelect, StubSelectorStore, StubSigner,
 };
 // In-memory test seams: only for test builds (this crate's own unit tests, or
 // downstream cfg(test) users via the forwarding `test-seams` feature).
 #[cfg(any(test, feature = "test-seams"))]
 pub use nv_store::selector::{InMemorySelectorStore, TestSigner};
 
-/// Compact one-line render of a selector map for logs, e.g.
-/// `{0:A 2:B 4:B}`. Slot order is
-/// ascending `BankSet`. Keeps the mutation logs greppable + diffable across
+/// Compact one-line render of a boot vector's entries for logs, e.g.
+/// `{os:A vm1:B}`. Order is
+/// ascending component id. Keeps the mutation logs greppable + diffable across
 /// boots so a lost/reverted slot is obvious at a glance.
-fn render_slots(m: &BTreeMap<BankSet, SlotSelect>) -> String {
+fn render_slots(m: &BTreeMap<String, ComponentEntry>) -> String {
     let mut s = String::from("{");
-    for (i, (set, sel)) in m.iter().enumerate() {
+    for (i, (id, entry)) in m.iter().enumerate() {
         if i > 0 {
             s.push(' ');
         }
-        s.push_str(&format!("{}:{:?}", set.as_index(), sel.bank));
+        s.push_str(&format!("{id}:{:?}", entry.bank));
     }
     s.push('}');
     s
@@ -104,15 +105,15 @@ pub struct SystemBankManager {
     store: Box<dyn SelectorStore>,
     signer: Box<dyn Signer>,
     /// PRIMARY / booted selection.
-    current: BTreeMap<BankSet, SlotSelect>,
+    current: BTreeMap<String, ComponentEntry>,
     /// Generation of `current`.
     generation: u64,
     /// SECONDARY / rollback-floor selection (+ its own generation).
-    committed: BTreeMap<BankSet, SlotSelect>,
+    committed: BTreeMap<String, ComponentEntry>,
     committed_generation: u64,
     /// In-memory staging; `None` until `stage` is called. Never persisted until
     /// `seal`.
-    pending: Option<BTreeMap<BankSet, SlotSelect>>,
+    pending: Option<BTreeMap<String, ComponentEntry>>,
 }
 
 impl SystemBankManager {
@@ -138,7 +139,7 @@ impl SystemBankManager {
                 if !valid {
                     tracing::warn!(
                         generation = b.generation,
-                        slots = %render_slots(&b.selectors),
+                        slots = %render_slots(&b.entries),
                         "boot selector {slot} failed verification — treated as absent (will be reseeded)"
                     );
                 }
@@ -148,13 +149,13 @@ impl SystemBankManager {
 
         let primary = verified("PRIMARY", store.read_primary());
         let (current, generation) = match primary {
-            Some(b) => (b.selectors, b.generation),
+            Some(b) => (b.entries, b.generation),
             None => (BTreeMap::new(), 0),
         };
 
         let secondary = verified("SECONDARY", store.read_secondary());
         let (committed, committed_generation) = match secondary {
-            Some(b) => (b.selectors, b.generation),
+            Some(b) => (b.entries, b.generation),
             None => (BTreeMap::new(), 0),
         };
 
@@ -169,15 +170,16 @@ impl SystemBankManager {
         }
     }
 
-    /// Stage `bank` for `set` in the **in-memory** pending selection. The first
+    /// Stage `bank` (with the `images` sealed into it, by part name) for
+    /// `component_id` in the **in-memory** pending selection. The first
     /// `stage` since the last `seal`/`rollback` clones `current` as the base so
-    /// the staged selection is a full selector map, then overlays this entry.
+    /// the staged selection is a full boot vector, then overlays this entry.
     ///
     /// **Nothing is written** — neither PRIMARY nor SECONDARY changes. This is
     /// exactly why a reboot here boots the old selection.
-    pub fn stage(&mut self, set: BankSet, bank: Bank) {
+    pub fn stage(&mut self, component_id: &str, bank: Bank, images: BTreeMap<String, ImageEntry>) {
         let mut pending = self.pending.take().unwrap_or_else(|| self.current.clone());
-        pending.insert(set, SlotSelect::new(bank));
+        pending.insert(component_id.to_string(), ComponentEntry::new(bank, images));
         self.pending = Some(pending);
     }
 
@@ -262,16 +264,15 @@ impl SystemBankManager {
         Ok(())
     }
 
-    /// The booted bank for `set` (from PRIMARY / `current`), or `None` if the
-    /// node has no selection for that set.
-    pub fn active_bank(&self, set: BankSet) -> Option<Bank> {
-        self.current.get(&set).map(|s| s.bank)
+    /// The booted bank for `component_id` (from PRIMARY / `current`), or `None`
+    /// if the node has no selection for that component.
+    pub fn active_bank(&self, component_id: &str) -> Option<Bank> {
+        self.current.get(component_id).map(|e| e.bank)
     }
 
-    /// Whether the node is in a trial: the booted BANK selection (PRIMARY)
-    /// differs from the committed floor (SECONDARY).
+    /// Whether the node is in a trial: the booted selection (PRIMARY) differs
+    /// from the committed floor (SECONDARY).
     pub fn is_trial(&self) -> bool {
-        // Bank-only by construction: a `SlotSelect` carries nothing but the bank.
         self.current != self.committed
     }
 
@@ -309,7 +310,7 @@ pub type SharedSystemBankState = std::sync::Arc<std::sync::RwLock<SystemBankMana
 /// Cheap, cloneable **read-only** view of the node's boot selector.
 ///
 /// Hands future readers (vm-service, the providers) the two questions they
-/// actually ask — "which bank does this set boot from?" and "are we in a
+/// actually ask — "which bank does this component boot from?" and "are we in a
 /// trial?" — without exposing any mutation seam. Each call takes a short-lived
 /// read lock on the shared [`SystemBankManager`]; a poisoned lock is a
 /// programming bug (a panic while a writer held the lock) and panics here too,
@@ -325,10 +326,13 @@ impl BootSelector {
         Self(inner)
     }
 
-    /// The booted bank for `set` (PRIMARY), or `None` if the node has no
-    /// selection for that set. See [`SystemBankManager::active_bank`].
-    pub fn active_bank(&self, set: BankSet) -> Option<Bank> {
-        self.0.read().expect("selector poisoned").active_bank(set)
+    /// The booted bank for `component_id` (PRIMARY), or `None` if the node has
+    /// no selection for that component. See [`SystemBankManager::active_bank`].
+    pub fn active_bank(&self, component_id: &str) -> Option<Bank> {
+        self.0
+            .read()
+            .expect("selector poisoned")
+            .active_bank(component_id)
     }
 
     /// Whether the node is in a trial (PRIMARY differs from SECONDARY). See
@@ -353,23 +357,23 @@ mod tests {
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
         // Establish a committed floor at A so the staged change is observable.
-        m.stage(slots::VM1, Bank::A);
+        m.stage("vm1", Bank::A, BTreeMap::new());
         assert!(m.seal().unwrap());
         m.commit().unwrap();
         assert!(!m.is_trial());
 
         // Stage B, seal.
-        m.stage(slots::VM1, Bank::B);
+        m.stage("vm1", Bank::B, BTreeMap::new());
         assert!(m.seal().unwrap());
 
-        assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
+        assert_eq!(m.active_bank("vm1"), Some(Bank::B));
         assert!(m.is_trial(), "current(B) != committed(A) => trial");
 
         // In-memory sectors: PRIMARY == new (B), SECONDARY == old (A).
         let primary = store.read_primary().expect("primary written");
         let secondary = store.read_secondary().expect("secondary written");
-        assert_eq!(primary.selectors[&slots::VM1].bank, Bank::B);
-        assert_eq!(secondary.selectors[&slots::VM1].bank, Bank::A);
+        assert_eq!(primary.entries["vm1"].bank, Bank::B);
+        assert_eq!(secondary.entries["vm1"].bank, Bank::A);
     }
 
     #[test]
@@ -377,19 +381,19 @@ mod tests {
         let store = InMemorySelectorStore::new();
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
-        m.stage(slots::VM1, Bank::A);
+        m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal().unwrap();
         m.commit().unwrap();
 
-        m.stage(slots::VM1, Bank::B);
+        m.stage("vm1", Bank::B, BTreeMap::new());
         m.seal().unwrap();
         m.commit().unwrap();
 
         assert!(!m.is_trial());
         let primary = store.read_primary().unwrap();
         let secondary = store.read_secondary().unwrap();
-        assert_eq!(primary.selectors[&slots::VM1].bank, Bank::B);
-        assert_eq!(secondary.selectors[&slots::VM1].bank, Bank::B);
+        assert_eq!(primary.entries["vm1"].bank, Bank::B);
+        assert_eq!(secondary.entries["vm1"].bank, Bank::B);
     }
 
     #[test]
@@ -397,20 +401,20 @@ mod tests {
         let store = InMemorySelectorStore::new();
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
 
-        m.stage(slots::VM1, Bank::A);
+        m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal().unwrap();
         m.commit().unwrap(); // floor = A
 
-        m.stage(slots::VM1, Bank::B);
+        m.stage("vm1", Bank::B, BTreeMap::new());
         m.seal().unwrap(); // trial = B
-        assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
+        assert_eq!(m.active_bank("vm1"), Some(Bank::B));
 
         m.rollback().unwrap();
-        assert_eq!(m.active_bank(slots::VM1), Some(Bank::A));
+        assert_eq!(m.active_bank("vm1"), Some(Bank::A));
         assert!(!m.is_trial());
         let primary = store.read_primary().unwrap();
         assert_eq!(
-            primary.selectors[&slots::VM1].bank,
+            primary.entries["vm1"].bank,
             Bank::A,
             "PRIMARY rewritten to floor on rollback"
         );
@@ -424,14 +428,14 @@ mod tests {
 
         {
             let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-            m.stage(slots::VM1, Bank::A);
+            m.stage("vm1", Bank::A, BTreeMap::new());
             m.seal().unwrap();
             m.commit().unwrap(); // committed floor = A, PRIMARY = A
 
             // Stage B but DO NOT seal, then drop the manager (== reboot).
-            m.stage(slots::VM1, Bank::B);
+            m.stage("vm1", Bank::B, BTreeMap::new());
             assert_eq!(
-                m.active_bank(slots::VM1),
+                m.active_bank("vm1"),
                 Some(Bank::A),
                 "pre-seal, current still reflects A"
             );
@@ -441,7 +445,7 @@ mod tests {
         // because the staged B was never persisted.
         let m2 = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
         assert_eq!(
-            m2.active_bank(slots::VM1),
+            m2.active_bank("vm1"),
             Some(Bank::A),
             "reboot mid-stage boots old selection"
         );
@@ -453,11 +457,11 @@ mod tests {
         let mut m = mgr();
         assert_eq!(m.generation(), 0);
 
-        m.stage(slots::VM1, Bank::A);
+        m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal().unwrap();
         assert_eq!(m.generation(), 1);
 
-        m.stage(slots::VM2, Bank::B);
+        m.stage("vm2", Bank::B, BTreeMap::new());
         m.seal().unwrap();
         assert_eq!(m.generation(), 2);
 
@@ -472,32 +476,37 @@ mod tests {
 
         // Plant a PRIMARY blob whose signature doesn't verify under TestSigner
         // (empty sig — StubSigner would have produced this).
-        let mut selectors = BTreeMap::new();
-        selectors.insert(slots::VM1, SlotSelect::new(Bank::B));
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "vm1".to_string(),
+            ComponentEntry::new(Bank::B, BTreeMap::new()),
+        );
         let generation = 9;
         let bad = SelectorBlob {
             generation,
-            selectors: selectors.clone(),
-            sha256: SelectorBlob::compute_sha256(generation, &selectors),
+            entries: entries.clone(),
+            sha256: SelectorBlob::compute_sha256(generation, &entries),
             signature: Vec::new(), // invalid under TestSigner
+            selectors: None,
         };
         store.write_primary(&bad).unwrap();
 
         let m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
         // Rejected => treated as absent => empty maps, generation 0.
-        assert_eq!(m.active_bank(slots::VM1), None);
+        assert_eq!(m.active_bank("vm1"), None);
         assert_eq!(m.generation(), 0);
 
         // Also reject a blob with a tampered digest (sig over a different sha).
         let tampered = SelectorBlob {
             generation,
-            selectors: selectors.clone(),
+            entries: entries.clone(),
             sha256: [0u8; 32], // doesn't match contents
             signature: TestSigner.sign(&[0u8; 32]),
+            selectors: None,
         };
         store.write_primary(&tampered).unwrap();
         let m2 = SystemBankManager::load(Box::new(store), Box::new(TestSigner));
-        assert_eq!(m2.active_bank(slots::VM1), None);
+        assert_eq!(m2.active_bank("vm1"), None);
     }
 
     #[test]
@@ -506,12 +515,12 @@ mod tests {
         // accept-all": load yields empty/gen-0, seal no-ops to a None read.
         let mut m = SystemBankManager::load(Box::new(StubSelectorStore), Box::new(StubSigner));
         assert_eq!(m.generation(), 0);
-        assert_eq!(m.active_bank(slots::VM1), None);
+        assert_eq!(m.active_bank("vm1"), None);
         assert!(!m.seal().unwrap(), "nothing staged => seal is a no-op");
 
-        m.stage(slots::VM1, Bank::B);
+        m.stage("vm1", Bank::B, BTreeMap::new());
         assert!(m.seal().unwrap()); // writes are dropped by the stub, but in-mem state advances
-        assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
+        assert_eq!(m.active_bank("vm1"), Some(Bank::B));
         assert_eq!(m.generation(), 1);
     }
 
@@ -521,25 +530,21 @@ mod tests {
     fn failed_seal_leaves_state_untouched_and_retry_uses_same_generation() {
         let store = InMemorySelectorStore::new();
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-        m.stage(slots::VM1, Bank::A);
+        m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal().unwrap();
         m.commit().unwrap(); // floor = A at gen 1
 
-        m.stage(slots::VM1, Bank::B);
+        m.stage("vm1", Bank::B, BTreeMap::new());
         store.set_fail_writes(true);
         assert!(m.seal().is_err());
-        assert_eq!(
-            m.active_bank(slots::VM1),
-            Some(Bank::A),
-            "current untouched"
-        );
+        assert_eq!(m.active_bank("vm1"), Some(Bank::A), "current untouched");
         assert_eq!(m.generation(), 1, "generation untouched");
         assert!(m.pending.is_some(), "pending kept for the retry");
         assert_eq!(store.read_primary().unwrap().generation, 1);
 
         store.set_fail_writes(false);
         assert!(m.seal().unwrap());
-        assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
+        assert_eq!(m.active_bank("vm1"), Some(Bank::B));
         assert_eq!(
             m.generation(),
             2,
@@ -553,15 +558,15 @@ mod tests {
     fn failed_commit_leaves_floor_untouched() {
         let store = InMemorySelectorStore::new();
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-        m.stage(slots::VM1, Bank::A);
+        m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal().unwrap();
         m.commit().unwrap();
-        m.stage(slots::VM1, Bank::B);
+        m.stage("vm1", Bank::B, BTreeMap::new());
         m.seal().unwrap(); // trial B over floor A
 
         store.set_fail_writes(true);
         assert!(m.commit().is_err());
-        assert_eq!(m.committed[&slots::VM1].bank, Bank::A);
+        assert_eq!(m.committed["vm1"].bank, Bank::A);
         assert_eq!(m.committed_generation, 1);
         assert!(m.is_trial(), "still in trial");
         assert_eq!(store.read_secondary().unwrap().generation, 1);
@@ -571,16 +576,16 @@ mod tests {
     fn failed_rollback_leaves_state_untouched() {
         let store = InMemorySelectorStore::new();
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-        m.stage(slots::VM1, Bank::A);
+        m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal().unwrap();
         m.commit().unwrap();
-        m.stage(slots::VM1, Bank::B);
+        m.stage("vm1", Bank::B, BTreeMap::new());
         m.seal().unwrap(); // trial B at gen 2
-        m.stage(slots::VM2, Bank::B); // something pending
+        m.stage("vm2", Bank::B, BTreeMap::new()); // something pending
 
         store.set_fail_writes(true);
         assert!(m.rollback().is_err());
-        assert_eq!(m.active_bank(slots::VM1), Some(Bank::B));
+        assert_eq!(m.active_bank("vm1"), Some(Bank::B));
         assert_eq!(m.generation(), 2);
         assert!(m.pending.is_some(), "pending untouched");
         assert_eq!(store.read_primary().unwrap().generation, 2);
@@ -599,7 +604,7 @@ mod tests {
     fn commit_twice_is_ok_with_one_write_each() {
         let store = InMemorySelectorStore::new();
         let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-        m.stage(slots::VM1, Bank::A);
+        m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal().unwrap();
         let before = store.write_count();
 
@@ -613,10 +618,17 @@ mod tests {
 
     /// Build a self-consistent signed blob (matching digest + TestSigner
     /// signature) for the file round-trip.
-    fn blob(generation: u64, set: BankSet, bank: Bank) -> SelectorBlob {
-        let mut selectors = BTreeMap::new();
-        selectors.insert(set, SlotSelect::new(bank));
-        SelectorBlob::signed(generation, selectors, &TestSigner)
+    fn blob(generation: u64, id: &str, bank: Bank) -> SelectorBlob {
+        let images = BTreeMap::from([(
+            "kernel".to_string(),
+            ImageEntry {
+                size: 4096,
+                sha256: [0xAB; 32],
+            },
+        )]);
+        let mut entries = BTreeMap::new();
+        entries.insert(id.to_string(), ComponentEntry::new(bank, images));
+        SelectorBlob::signed(generation, entries, &TestSigner)
     }
 
     #[test]
@@ -632,8 +644,8 @@ mod tests {
                 .as_nanos()
         ));
 
-        let primary = blob(7, slots::VM1, Bank::B);
-        let secondary = blob(3, slots::VM2, Bank::A);
+        let primary = blob(7, "vm1", Bank::B);
+        let secondary = blob(3, "vm2", Bank::A);
 
         // Write through one store...
         let writer = FileSelectorStore::new(&dir);
@@ -663,31 +675,39 @@ mod tests {
             raw.contains("\"signature\": \""),
             "signature is a hex string"
         );
+        // One key per line; no legacy slot map unless configured.
+        assert!(
+            raw.contains("\"size\": 4096,\n"),
+            "image size is a number:\n{raw}"
+        );
+        assert!(!raw.contains("selectors"), "no legacy slot map:\n{raw}");
 
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 
-    // --- blobs signed over the retired three-byte slot encoding ---
+    // --- blobs signed over the retired per-slot encoding ---
 
     #[test]
-    fn legacy_three_byte_blob_is_rejected_on_load() {
-        // A blob correctly signed over the OLD encoding — `[set, bank,
-        // enabled]` per slot — no longer verifies: its digest covers a byte the
-        // canonical encoding dropped. Both slots read as absent, so the node
-        // looks unseeded and the host reseeds it from NV.
+    fn legacy_slot_blob_is_rejected_on_load() {
+        // A blob correctly signed over the OLD encoding — `[set, bank]` per
+        // slot, the selection carried only in the slot map — no longer
+        // verifies: the digest is over the entries, and there are none. Both
+        // slots read as absent, so the node looks unseeded and the host
+        // reseeds it from NV.
         use sha2::{Digest, Sha256};
 
         let generation: u64 = 5;
         let mut legacy = generation.to_le_bytes().to_vec();
-        legacy.extend_from_slice(&[slots::VM1.0, Bank::A as u8, 1]);
+        legacy.extend_from_slice(&[slots::VM1.0, Bank::A as u8]);
         let sha256: [u8; 32] = Sha256::digest(&legacy).into();
         let mut selectors = BTreeMap::new();
         selectors.insert(slots::VM1, SlotSelect::new(Bank::A));
         let blob = SelectorBlob {
             generation,
-            selectors,
+            entries: BTreeMap::new(),
             sha256,
             signature: TestSigner.sign(&sha256),
+            selectors: Some(selectors),
         };
         assert!(
             TestSigner.verify(&blob.sha256, &blob.signature),

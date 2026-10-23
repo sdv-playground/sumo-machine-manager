@@ -19,6 +19,7 @@
 //! engine state, so a future host-os / RT provider is a sibling impl, not a
 //! fork of the engine.
 
+use std::collections::BTreeMap;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -30,7 +31,7 @@ use nv_store::types::{Bank, BankSet};
 use machine_mgr::bank_provider::{
     BankError, BankProvider, FirmwareIdentity, InstalledFile, InstalledFirmware,
 };
-use machine_mgr::ResetKind;
+use machine_mgr::{ImageEntry, ResetKind};
 
 use crate::ota;
 
@@ -40,6 +41,10 @@ use crate::ota;
 pub struct IvdBankProvider<D: BlockDevice + Send + 'static> {
     nv: Arc<Mutex<NvStore<D>>>,
     bank_set: BankSet,
+    /// The component id this provider's entry in the boot vector is keyed by.
+    /// Defaults to `dir_name`; the factory sets it via
+    /// [`with_component_id`](Self::with_component_id).
+    component_id: String,
     /// Whether this bank set is single-banked (HSM — always bank A, no trial).
     single_bank: bool,
     /// Root under which `<dir_name>/bank_{a,b}` live. `None` for in-memory
@@ -120,6 +125,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         Self {
             nv,
             bank_set,
+            component_id: dir_name.clone(),
             single_bank,
             images_dir,
             dir_name,
@@ -140,6 +146,53 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     pub fn with_hsm_crypto(mut self, crypto: Arc<dyn hsm::HsmCryptoProvider>) -> Self {
         self.hsm_crypto = Some(crypto);
         self
+    }
+
+    /// Key this provider's boot-vector entry by `id` (the component id).
+    pub fn with_component_id(mut self, id: impl Into<String>) -> Self {
+        self.component_id = id.into();
+        self
+    }
+
+    /// The images sealed into `bank`, by part name, for its boot-vector entry:
+    /// size + SHA-256 from the bank's signed manifest (read without an HSM
+    /// check, like [`read_installed`](BankProvider::read_installed), which
+    /// carries no size). The disable record is not an image. Empty when the
+    /// bank has no readable manifest (in-memory test backends).
+    fn sealed_images(&self, bank: Bank) -> BTreeMap<String, ImageEntry> {
+        let manifest = self
+            .target_bank_dir(bank)
+            .ok_or_else(|| "no bank dir".to_string())
+            .and_then(|dir| hsm::ivd::read_manifest_unverified(&dir).map_err(|e| e.to_string()));
+        match manifest {
+            Ok(vm) => vm
+                .manifest
+                .files
+                .iter()
+                .filter(|f| !hsm::ivd::is_disabled_record(f))
+                .map(|f| {
+                    let mut sha256 = [0u8; 32];
+                    let n = f.sha256.len().min(32);
+                    sha256[..n].copy_from_slice(&f.sha256[..n]);
+                    (
+                        f.relative_path.clone(),
+                        ImageEntry {
+                            size: f.size,
+                            sha256,
+                        },
+                    )
+                })
+                .collect(),
+            Err(e) => {
+                tracing::debug!(
+                    component = %self.component_id,
+                    bank = ?bank,
+                    error = %e,
+                    "no sealed manifest — boot-vector entry carries no images"
+                );
+                BTreeMap::new()
+            }
+        }
     }
 
     /// Path of the target bank directory under `images_dir`. `None` when no
@@ -452,7 +505,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         self.selector.as_ref().and_then(|s| {
             s.read()
                 .expect("selector poisoned")
-                .active_bank(self.bank_set)
+                .active_bank(&self.component_id)
         })
     }
 
@@ -721,8 +774,9 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // non-trial components have PRIMARY==SECONDARY so the global op no-ops
         // them). A future campaign coordinator handles concurrent trials.
         if let Some(sel) = &self.selector {
+            let images = self.sealed_images(bank);
             let mut g = sel.write().expect("selector poisoned");
-            g.stage(self.bank_set, bank);
+            g.stage(&self.component_id, bank, images);
             // Boot-vector (selector PRIMARY) write is the load-bearing step that makes
             // the just-activated bank the one the node boots. It was previously silent
             // — a skipped/failed seal left the selector missing this component's slot,
@@ -931,7 +985,7 @@ fn bank_dir_is_payload_empty(bank_dir: &Path) -> bool {
 mod tests {
     use super::*;
     use machine_mgr::system_bank_state::{
-        InMemorySelectorStore, SharedSystemBankState, SystemBankManager, TestSigner,
+        InMemorySelectorStore, SelectorStore, SharedSystemBankState, SystemBankManager, TestSigner,
     };
     use nv_store::block::MemBlockDevice;
     use nv_store::slots;
@@ -951,16 +1005,16 @@ mod tests {
         Arc::new(Mutex::new(nv))
     }
 
-    /// A shared boot selector seeded so `set` boots from `bank` (PRIMARY).
-    fn selector_with(set: BankSet, bank: Bank) -> SharedSystemBankState {
+    /// A shared boot selector seeded so `id` boots from `bank` (PRIMARY).
+    fn selector_with(id: &str, bank: Bank) -> SharedSystemBankState {
         let mgr =
             SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner));
         let shared: SharedSystemBankState = Arc::new(RwLock::new(mgr));
         {
             let mut g = shared.write().unwrap();
-            g.stage(set, bank);
+            g.stage(id, bank, BTreeMap::new());
             assert!(g.seal().unwrap());
-            assert_eq!(g.active_bank(set), Some(bank));
+            assert_eq!(g.active_bank(id), Some(bank));
         }
         shared
     }
@@ -980,7 +1034,7 @@ mod tests {
         // physically booted + is loopback-mounted), the selector says B (next-boot
         // intent). These MUST resolve differently for their two purposes.
         let nv = nv_with_active(set, Bank::A);
-        let selector = selector_with(set, Bank::B);
+        let selector = selector_with("vm1", Bank::B);
         let p = provider(nv, set, Some(selector));
 
         // SERVING authority = the selector (what boot will honour): B.
@@ -1011,7 +1065,7 @@ mod tests {
         // Consistent state: selector and NV/running both A → no reboot owed,
         // target is the clean sibling (B).
         let nv = nv_with_active(set, Bank::A);
-        let selector = selector_with(set, Bank::A);
+        let selector = selector_with("vm1", Bank::A);
         let p = provider(nv, set, Some(selector));
         assert!(
             !p.pending_reboot(),
@@ -1041,7 +1095,7 @@ mod tests {
         // active_bank falls through to the NV/running_bank fallback.
         let set = slots::VM1;
         let nv = nv_with_active(set, Bank::B);
-        let selector = selector_with(slots::VM2, Bank::A);
+        let selector = selector_with("vm2", Bank::A);
         let p = provider(nv, set, Some(selector));
 
         assert_eq!(
@@ -1059,11 +1113,11 @@ mod tests {
         let set = slots::VM1;
         // Selector + NV both start at A; activate(B) must flip PRIMARY to B.
         let nv = nv_with_active(set, Bank::A);
-        let selector = selector_with(set, Bank::A);
+        let selector = selector_with("vm1", Bank::A);
         // Keep a write-handle clone so we can read PRIMARY back after activate.
         let p = provider(nv, set, Some(Arc::clone(&selector)));
         assert_eq!(
-            selector.read().unwrap().active_bank(set),
+            selector.read().unwrap().active_bank("vm1"),
             Some(Bank::A),
             "precondition: selector PRIMARY is A"
         );
@@ -1071,7 +1125,7 @@ mod tests {
         p.activate(Bank::B).expect("activate B");
 
         assert_eq!(
-            selector.read().unwrap().active_bank(set),
+            selector.read().unwrap().active_bank("vm1"),
             Some(Bank::B),
             "activate(B) wrote the selector PRIMARY to B (OTA dual-write)"
         );
@@ -1081,13 +1135,10 @@ mod tests {
 
     /// [`selector_with`] that also hands back its store, so a test can make
     /// the store's writes fail.
-    fn selector_with_store(
-        set: BankSet,
-        bank: Bank,
-    ) -> (SharedSystemBankState, InMemorySelectorStore) {
+    fn selector_with_store(id: &str, bank: Bank) -> (SharedSystemBankState, InMemorySelectorStore) {
         let store = InMemorySelectorStore::new();
         let mut mgr = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-        mgr.stage(set, bank);
+        mgr.stage(id, bank, BTreeMap::new());
         assert!(mgr.seal().unwrap());
         mgr.commit().unwrap();
         (Arc::new(RwLock::new(mgr)), store)
@@ -1098,13 +1149,13 @@ mod tests {
         let set = slots::VM1;
         let nv = nv_with_active(set, Bank::A);
         let before = nv.lock().unwrap().read_boot_state();
-        let (selector, store) = selector_with_store(set, Bank::A);
+        let (selector, store) = selector_with_store("vm1", Bank::A);
         let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
 
         store.set_fail_writes(true);
         assert!(p.activate(Bank::B).is_err(), "failed seal fails activate");
 
-        assert_eq!(selector.read().unwrap().active_bank(set), Some(Bank::A));
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::A));
         assert_eq!(
             nv.lock().unwrap().read_boot_state(),
             before,
@@ -1123,10 +1174,10 @@ mod tests {
             state.banks[set.as_index()].committed = false;
             g.write_boot_state(&mut state).unwrap();
         }
-        let (selector, store) = selector_with_store(set, Bank::A);
+        let (selector, store) = selector_with_store("vm1", Bank::A);
         {
             let mut g = selector.write().unwrap();
-            g.stage(set, Bank::B);
+            g.stage("vm1", Bank::B, BTreeMap::new());
             assert!(g.seal().unwrap());
         }
         let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
@@ -1209,6 +1260,51 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn activate_stages_the_sealed_images_under_the_component_id() {
+        use sha2::{Digest, Sha256};
+
+        let images_dir = std::env::temp_dir().join("component-mgr-activate-images");
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let bank_dir = images_dir.join("vm1").join("bank_b");
+        let (_hsm, keystore) = sign_bank_dir("activate-images", &bank_dir, 3);
+
+        let (selector, store) = selector_with_store("vm-one", Bank::A);
+        let p = IvdBankProvider::new(
+            nv_with_active(slots::VM1, Bank::A),
+            slots::VM1,
+            false,
+            Some(images_dir.clone()),
+            "vm1".into(),
+            None,
+            None,
+            Some(Arc::clone(&selector)),
+        )
+        .with_component_id("vm-one");
+
+        p.activate(Bank::B).expect("activate B");
+
+        let g = selector.read().unwrap();
+        assert_eq!(g.active_bank("vm-one"), Some(Bank::B));
+        assert_eq!(g.active_bank("vm1"), None, "keyed by id, not dir name");
+        drop(g);
+        assert_eq!(p.selected_bank(), Some(Bank::B));
+        let primary = store.read_primary().expect("PRIMARY sealed");
+        assert_eq!(
+            primary.entries["vm-one"].images,
+            BTreeMap::from([(
+                "kernel".to_string(),
+                ImageEntry {
+                    size: b"kernel bytes".len() as u64,
+                    sha256: Sha256::digest(b"kernel bytes").into(),
+                },
+            )])
+        );
+
+        let _ = std::fs::remove_dir_all(&images_dir);
+        let _ = std::fs::remove_dir_all(&keystore);
     }
 
     #[test]

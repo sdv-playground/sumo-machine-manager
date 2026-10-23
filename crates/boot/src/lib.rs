@@ -1,43 +1,40 @@
 //! Boot manager core logic — runs before launching the hypervisor or
-//! guest VMs and decides, for each bank set, whether to boot the active
-//! bank, count a trial boot, or auto-rollback.
+//! guest VMs and reports, for each bank set or component, which bank boots.
+//!
+//! This crate is the **reference reader** of the boot-stage contract: it
+//! shows how a boot stage reads the signed two-copy boot vector.
 //!
 //! On every boot:
-//! 1. Read the boot selection (selector PRIMARY when a [`SelectorStore`]
-//!    is attached, else NV Boot State)
-//! 2. For each bank set, handle trial mode (increment `boot_count`;
-//!    auto-rollback once `boot_count > MAX_TRIAL_BOOTS`)
+//! 1. Read the boot selection (boot vector PRIMARY when a [`SelectorStore`]
+//!    is attached and seeded, else NV Boot State)
+//! 2. NV path only: for each bank set, handle trial mode (increment
+//!    `boot_count`; auto-rollback once `boot_count > MAX_TRIAL_BOOTS`)
 //! 3. Verify image hashes (SHA-256 recorded in FW Meta) against the
 //!    real image bytes
-//! 4. Return one `BootAction` per bank set for the caller to execute
+//! 4. Return the `BootAction`s for the caller to execute
 //!
-//! # Boot authority: selector vs. NV
+//! # Boot authority: boot vector vs. NV
 //!
-//! Two authorities for "which bank does each set boot from":
+//! Two authorities for "which bank boots":
 //!
-//! - **NV `NvBootState`** (the original): per-set `active_bank` +
-//!   `committed` + `boot_count`. Each set commits/rolls back on its own.
-//! - **Selector** (`nv_store::selector`): a single signed
+//! - **NV `NvBootState`** (the original): per-slot `active_bank` +
+//!   `committed` + `boot_count`. Each slot commits/rolls back on its own.
+//! - **Boot vector** (`nv_store::selector`): a single signed
 //!   [`SelectorBlob`] in a PRIMARY (booted) slot and a SECONDARY
-//!   (rollback-floor) slot. `bank = PRIMARY.selectors[set]`; a set is in
-//!   trial iff `PRIMARY.selectors[set] != SECONDARY.selectors[set]`.
+//!   (rollback-floor) slot, keyed by component id. `bank =
+//!   PRIMARY.entries[id].bank`; a component is in trial iff its PRIMARY entry
+//!   differs from its SECONDARY entry (or SECONDARY has none).
 //!
 //! When a [`SelectorStore`] is attached (via [`BootManager::with_selector`])
-//! **and** its PRIMARY slot exists, the selector drives the bank decision.
-//! Otherwise — no store, or PRIMARY absent (first boot: the host seeds the
-//! selector only *after* `vm-boot` has run once) — the original NV path runs
-//! unchanged.
+//! **and** its PRIMARY slot exists, the boot vector is reported and NV is not
+//! touched. Otherwise — no store, or PRIMARY absent (first boot: the host seeds
+//! the boot vector only *after* `vm-boot` has run once) — the original NV path
+//! runs unchanged.
 //!
-//! ## The trial / rollback is GLOBAL (whole-blob), not per-set
-//!
-//! `vm-boot` has no signer at boot, so the only selector write it can make is
-//! copying the whole **already-signed** SECONDARY blob over PRIMARY
-//! ([`SelectorStore::write_primary`]). A per-set rollback would change one
-//! entry → require re-signing → impossible here. So when *any* trialed set
-//! exceeds `MAX_TRIAL_BOOTS`, the rollback reverts **every** trialed set at
-//! once (committed sets have `PRIMARY == SECONDARY`, so the copy is a no-op
-//! for them). The per-set `boot_count` in `NvBootState` is reused purely as
-//! the trial-boot counter — no NV layout change.
+//! The boot vector carries no slot numbers, so the per-slot NV trial counter
+//! cannot be tied to a component: on the boot-vector path this reader counts
+//! no trial boots and performs no auto-rollback. The trial verdict (commit or
+//! rollback) is the orchestrator's.
 //!
 //! Platform-independent — runs against any [`nv_store::block::BlockDevice`]
 //! plus a byte slice for image verification. Actual VM launch is the
@@ -49,9 +46,17 @@ use nv_store::store::NvStore;
 use nv_store::types::*;
 use sha2::{Digest, Sha256};
 
-/// Result of processing boot for a single bank set.
+/// Result of processing boot for a single bank set (NV path) or component
+/// (boot-vector path).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootAction {
+    /// Boot-vector path: `component` boots `bank`; `trial` when its PRIMARY
+    /// entry differs from its SECONDARY entry (or SECONDARY has none).
+    Selected {
+        component: String,
+        bank: Bank,
+        trial: bool,
+    },
     /// Normal boot from committed bank.
     Boot { bank: Bank },
     /// Trial boot — bank was updated but not yet committed.
@@ -101,8 +106,8 @@ impl std::fmt::Display for BootError {
 
 pub struct BootManager<D: BlockDevice> {
     nv: NvStore<D>,
-    /// Optional boot selector. When attached **and** its PRIMARY slot exists,
-    /// the selector drives the bank decision (see the module docs); otherwise
+    /// Optional boot vector store. When attached **and** its PRIMARY slot
+    /// exists, the boot vector is reported (see the module docs); otherwise
     /// the NV path runs. `None` = NV-only (the fallback).
     selector: Option<Box<dyn SelectorStore>>,
 }
@@ -119,8 +124,8 @@ impl<D: BlockDevice> BootManager<D> {
 
     /// Attach a boot selector. Builder-style so call sites read
     /// `BootManager::new(dev).with_selector(Box::new(store))`. Once attached,
-    /// `process_boot` consults the selector's PRIMARY slot for the bank
-    /// decision (falling back to NV only while PRIMARY is absent — first boot).
+    /// `process_boot` reports the boot vector's PRIMARY slot (falling back to
+    /// NV only while PRIMARY is absent — first boot).
     pub fn with_selector(mut self, selector: Box<dyn SelectorStore>) -> Self {
         self.selector = Some(selector);
         self
@@ -134,22 +139,24 @@ impl<D: BlockDevice> BootManager<D> {
         &mut self.nv
     }
 
-    /// Process boot for all bank sets. Handles trial mode, auto-rollback,
-    /// and writes updated boot state to NV.
+    /// Process boot. Does NOT verify image hashes — call `verify_image`
+    /// separately for that.
     ///
-    /// Returns one BootAction per bank set the store can address — the Vec's
-    /// length is `nv().slot_count()`, indexed by `BankSet::as_index()`. Does
-    /// NOT verify image hashes — call `verify_image` separately for that.
+    /// Boot-vector path, when a [`SelectorStore`] is attached *and* its
+    /// PRIMARY slot exists: one [`BootAction::Selected`] per component in
+    /// PRIMARY, in ascending id order; nothing is written.
     ///
-    /// Selector-driven when a [`SelectorStore`] is attached *and* its PRIMARY
-    /// slot exists (see module docs); otherwise the NV path runs unchanged. An
-    /// absent PRIMARY is first boot — the host seeds the selector only after
-    /// `vm-boot` has run once — so it falls through to NV.
+    /// NV path otherwise (unchanged): handles trial mode and auto-rollback,
+    /// writes updated boot state to NV, and returns one BootAction per bank
+    /// set the store can address — the Vec's length is `nv().slot_count()`,
+    /// indexed by `BankSet::as_index()`. An absent PRIMARY is first boot — the
+    /// host seeds the boot vector only after `vm-boot` has run once — so it
+    /// falls through to NV.
     pub fn process_boot(&mut self) -> Result<Vec<BootAction>, BootError> {
         if let Some(selector) = self.selector.as_ref() {
             if let Some(primary) = selector.read_primary() {
                 let secondary = selector.read_secondary();
-                return self.process_boot_selector(&primary, secondary.as_ref());
+                return Ok(Self::process_boot_selector(&primary, secondary.as_ref()));
             }
             // PRIMARY absent — first boot before the selector is seeded. Fall
             // through to the NV path (unchanged) below.
@@ -212,187 +219,34 @@ impl<D: BlockDevice> BootManager<D> {
         Ok(actions)
     }
 
-    /// Selector-driven boot. The signed PRIMARY blob is the booted selection;
-    /// SECONDARY is the rollback floor. For each set the selector knows:
+    /// Boot-vector report. The signed PRIMARY blob is the booted selection;
+    /// SECONDARY is the rollback floor. For each component in PRIMARY
+    /// (ascending id): its bank, and whether it is in trial — its SECONDARY
+    /// entry is absent or differs.
     ///
-    /// - `bank = PRIMARY.selectors[set]`.
-    /// - The set is **committed** iff `PRIMARY.selectors[set] ==
-    ///   SECONDARY.selectors[set]` → emit [`BootAction::Boot`].
-    /// - Otherwise the set is in **trial**: increment its NV `boot_count`
-    ///   (reusing the per-set counter — no NV layout change) and emit
-    ///   [`BootAction::TrialBoot`].
-    ///
-    /// If **any** trialed set's `boot_count` exceeds `MAX_TRIAL_BOOTS`, the
-    /// whole node rolls back: the already-signed SECONDARY blob is copied
-    /// verbatim over PRIMARY ([`SelectorStore::write_primary`]) — a GLOBAL
-    /// revert (committed sets have `PRIMARY == SECONDARY`, so they no-op). Each
-    /// reverted set gets an [`BootAction::AutoRollback`], and its NV record
-    /// follows the floor it now boots (`active_bank` = the floor, `committed`,
-    /// `boot_count` 0), as the NV path's auto-rollback leaves it: component-mgr
-    /// reads NV `active_bank` as the running bank.
-    ///
-    /// Sets **absent** from the selector map fall back to their NV
-    /// per-set logic — the selector is authoritative only for the sets it
-    /// carries; NV remains authoritative for the rest (vm-boot drives both
-    /// during the flip, set by set).
+    /// Writes nothing: the boot vector carries no slot, so there is no NV
+    /// trial counter to advance for a component, and the trial verdict is the
+    /// orchestrator's.
     fn process_boot_selector(
-        &mut self,
         primary: &SelectorBlob,
         secondary: Option<&SelectorBlob>,
-    ) -> Result<Vec<BootAction>, BootError> {
-        let slots = self.nv.slot_count();
-        // NV state still backs the per-set trial-boot counter (and any
-        // not-in-selector sets). Initialize it on first sight, exactly like the
-        // NV path, so `boot_count` storage exists.
-        let mut state = match self.nv.read_boot_state() {
-            Some(s) => s,
-            None => {
-                let mut default = NvBootState::default();
-                self.nv.write_boot_state(&mut default)?;
-                default
-            }
-        };
-
-        let mut actions = vec![BootAction::FirstBoot; slots];
-        let mut state_changed = false;
-
-        // First pass: classify each selector-known set and accumulate trial
-        // boots. Defer the global-rollback decision until we know whether ANY
-        // trialed set blew its budget.
-        let mut any_trial_exceeded = false;
-        // (index, primary_bank, secondary_bank) for each trialed set — used to
-        // emit AutoRollback after a global revert.
-        let mut trialed: Vec<(usize, Bank, Bank)> = Vec::new();
-        let mut handled = vec![false; slots];
-
-        for (set, sel) in &primary.selectors {
-            let bank = sel.bank;
-            let idx = set.as_index();
-            if idx >= slots {
-                continue;
-            }
-            handled[idx] = true;
-            // Trial is a BANK-selection difference: compare the floor's bank.
-            let floor = secondary.and_then(|s| s.selectors.get(set).map(|s| s.bank));
-
-            if floor == Some(bank) {
-                // Committed: PRIMARY == SECONDARY for this set.
-                actions[idx] = BootAction::Boot { bank };
-            } else {
-                // Trial: PRIMARY diverges from the floor. Count the boot.
-                let bs = &mut state.banks[idx];
-                bs.boot_count += 1;
-                state_changed = true;
-                if bs.boot_count > MAX_TRIAL_BOOTS {
-                    any_trial_exceeded = true;
-                }
-                // `floor` is the bank we'd revert to. If SECONDARY is absent
-                // (or lacks this set) there is no floor to roll back to; the
-                // set stays in trial regardless of count.
-                if let Some(to) = floor {
-                    trialed.push((idx, bank, to));
-                } else {
-                    actions[idx] = BootAction::TrialBoot {
-                        bank,
-                        boot_count: bs.boot_count,
-                    };
-                }
-            }
-        }
-
-        // Second pass: a single trialed set over budget rolls back the WHOLE
-        // signed blob (we cannot re-sign a per-set change at boot). Only
-        // possible when SECONDARY exists — that is the blob we copy over
-        // PRIMARY. Without it there is nothing signed to revert to, so we leave
-        // the sets in trial.
-        //
-        // If that write fails, PRIMARY still names the trial, so NV must keep
-        // the trial too (no `committed`, no `boot_count` reset): the sets keep
-        // trialing and the next boot (or the orchestrator) retries the revert.
-        let rolled_back = match secondary.filter(|_| any_trial_exceeded) {
-            // Copy the already-signed SECONDARY over PRIMARY — the only write
-            // vm-boot can make without a signer.
-            Some(secondary) => match self
-                .selector
-                .as_ref()
-                .expect("selector present in this path")
-                .write_primary(secondary)
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!(
-                        "[bootmgr] ERROR: auto-rollback boot vector PRIMARY write failed \
-                         ({e}) — trial left in place"
-                    );
-                    false
-                }
-            },
-            None => false,
-        };
-        if rolled_back {
-            for &(idx, from, to) in &trialed {
-                state.banks[idx].active_bank = to;
-                state.banks[idx].committed = true;
-                state.banks[idx].boot_count = 0;
-                actions[idx] = BootAction::AutoRollback { from, to };
-            }
-        } else {
-            // No rollback: every trialed-with-floor set just keeps trialing.
-            for &(idx, bank, _to) in &trialed {
-                actions[idx] = BootAction::TrialBoot {
-                    bank,
-                    boot_count: state.banks[idx].boot_count,
-                };
-            }
-        }
-
-        // Sets the selector doesn't carry fall back to their NV per-set logic
-        // (committed → Boot; trial → count / NV-rollback). Keeps NV authority
-        // intact for components not yet flipped onto the selector.
-        for i in 0..slots {
-            if handled[i] {
-                continue;
-            }
-            let bs = &mut state.banks[i];
-            if bs.committed {
-                actions[i] = BootAction::Boot {
-                    bank: bs.active_bank,
-                };
-            } else {
-                bs.boot_count += 1;
-                state_changed = true;
-                if bs.boot_count > MAX_TRIAL_BOOTS {
-                    let old_bank = bs.active_bank;
-                    bs.active_bank = bs.active_bank.other();
-                    bs.committed = true;
-                    bs.boot_count = 0;
-                    actions[i] = BootAction::AutoRollback {
-                        from: old_bank,
-                        to: bs.active_bank,
-                    };
-                } else {
-                    actions[i] = BootAction::TrialBoot {
-                        bank: bs.active_bank,
-                        boot_count: bs.boot_count,
-                    };
-                }
-            }
-        }
-
-        if state_changed {
-            self.nv.write_boot_state(&mut state)?;
-        }
-
-        Ok(actions)
+    ) -> Vec<BootAction> {
+        primary
+            .entries
+            .iter()
+            .map(|(id, entry)| BootAction::Selected {
+                component: id.clone(),
+                bank: entry.bank,
+                trial: secondary.and_then(|s| s.entries.get(id)) != Some(entry),
+            })
+            .collect()
     }
 
     /// Verify an image's SHA-256 hash against the expected hash in FW Meta.
     ///
     /// NOTE: the hash logic stays per-bank FW-meta and its rollback path
-    /// ([`handle_hash_failure`](Self::handle_hash_failure)) is still NV-side
-    /// (`NvBootState`), independent of the selector. Aligning hash-driven
-    /// rollback with the selector's whole-blob revert is a later step; this
-    /// sub-step only moves the trial-counting bank decision onto the selector.
+    /// ([`handle_hash_failure`](Self::handle_hash_failure)) is NV-side
+    /// (`NvBootState`), independent of the boot vector.
     pub fn verify_image(&self, set: BankSet, bank: Bank, image_data: &[u8]) -> HashCheck {
         let meta = match self.nv.read_fw_meta(set, bank) {
             Some(m) => m,
@@ -442,21 +296,10 @@ impl<D: BlockDevice> BootManager<D> {
         }
     }
 
-    /// Get the current active bank for a bank set.
-    ///
-    /// Selector-resolved (`PRIMARY.selectors[set]`) when a [`SelectorStore`] is
-    /// attached and its PRIMARY slot carries this set; otherwise the NV
-    /// `active_bank`. (A selector whose PRIMARY lacks this set still falls back
-    /// to NV — a set may be selector-driven while another is still NV-driven
-    /// during the flip.)
+    /// Get the NV active bank for a bank set. The boot vector is keyed by
+    /// component id, not slot, so its banks are reported by
+    /// [`process_boot`](Self::process_boot) instead.
     pub fn active_bank(&self, set: BankSet) -> Option<Bank> {
-        if let Some(selector) = self.selector.as_ref() {
-            if let Some(primary) = selector.read_primary() {
-                if let Some(sel) = primary.selectors.get(&set) {
-                    return Some(sel.bank);
-                }
-            }
-        }
         self.nv
             .read_boot_state()
             .map(|s| s.banks[set.as_index()].active_bank)

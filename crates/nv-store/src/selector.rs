@@ -1,5 +1,5 @@
-//! Boot-selector STORAGE primitives — the signed, generation-counted selector
-//! blob plus its persistence + attestation seams.
+//! Boot-vector STORAGE primitives — the signed, generation-counted boot
+//! vector plus its persistence + attestation seams.
 //!
 //! These are the **lower-level** pieces of the node's single boot selector:
 //! the on-medium record ([`SelectorBlob`]), the two-slot persistence seam
@@ -13,12 +13,11 @@
 //! `machine-mgr::system_bank_state`, which re-exports everything here so the
 //! existing `machine_mgr::system_bank_state::*` import surface is unchanged.
 //!
-//! # Backends: JSON now, sectors/C later
+//! # Backends
 //!
 //! [`FileSelectorStore`] (two human-inspectable JSON slots) is today's backend;
-//! the [`SelectorStore`] trait is the single swap point for a future raw
-//! eMMC-sector / `libbmft` impl (the out-of-tree bootloader reads the same
-//! signed record). `StubSelectorStore` / `StubSigner` are the loud no-op default
+//! the [`SelectorStore`] trait is the single swap point for a host store (the
+//! boot stage reads the same signed record). `StubSelectorStore` / `StubSigner` are the loud no-op default
 //! for builds that wire no store; `InMemorySelectorStore` / `TestSigner` (gated
 //! behind `test-seams`) back the unit tests. The transition engine
 //! (`machine_mgr::system_bank_state::SystemBankManager`) is the load-bearing
@@ -31,11 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{Bank, BankSet};
 
-/// One slot's boot selection: which bank the node boots for that set, covered
-/// by the signature (see [`SelectorBlob::canonical_bytes`]).
-///
-/// A struct rather than a bare [`Bank`] so the on-disk JSON slot stays the
-/// object `{"bank":"A"}` — host-boot.sh reads the `"bank"` key inside it.
+/// One slot's entry in the **legacy slot map** ([`SelectorBlob::selectors`]):
+/// the object `{"bank":"A"}` a boot stage that still reads the previous shape
+/// looks up per slot. Not covered by the signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotSelect {
     /// The booted bank for this slot.
@@ -49,21 +46,78 @@ impl SlotSelect {
     }
 }
 
-/// The on-medium selector record: which bank each component boots from, at a
-/// given global generation, signed.
+/// One image sealed into a component's bank: its size and SHA-256, as the
+/// install recorded them. The sha256 is serialized as a lowercase hex string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageEntry {
+    /// Sealed size in bytes.
+    pub size: u64,
+    /// SHA-256 of the sealed image.
+    #[serde(with = "hex_array")]
+    pub sha256: [u8; 32],
+}
+
+/// One component's boot selection: the bank it boots from and what was sealed
+/// into that bank, keyed by part name. `images` may be empty (a bank whose
+/// sealed facts are unknown, e.g. one reseeded from NV).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentEntry {
+    /// The booted bank for this component.
+    pub bank: Bank,
+    /// Part name -> sealed image, canonically ordered.
+    pub images: BTreeMap<String, ImageEntry>,
+}
+
+impl ComponentEntry {
+    /// The selection of `bank` with the given sealed `images`.
+    pub fn new(bank: Bank, images: BTreeMap<String, ImageEntry>) -> Self {
+        Self { bank, images }
+    }
+}
+
+/// The on-medium boot vector: which bank each component boots from and what
+/// was sealed into it, at a given global generation, signed.
 ///
-/// `selectors` is an ordered collection ([`BTreeMap`]) precisely so the
-/// canonical byte encoding used for [`Self::sha256`] is **stable** regardless of
-/// insertion order — a `HashMap` would hash differently run to run and the
-/// signature would not reproduce.
+/// JSON (one key per line in [`FileSelectorStore`]):
+///
+/// ```json
+/// {
+///   "generation": 3,
+///   "entries": {
+///     "<component id>": {
+///       "bank": "B",
+///       "images": { "<part name>": { "size": 4096, "sha256": "<hex>" } }
+///     }
+///   },
+///   "sha256": "<hex>",
+///   "signature": "<hex>"
+/// }
+/// ```
+///
+/// plus an optional `"selectors"` legacy slot map (see [`Self::selectors`]).
+///
+/// # Canonical bytes
+///
+/// [`Self::sha256`] is the SHA-256 of (all integers little-endian):
+///
+/// ```text
+/// u64 generation
+/// for each (id, entry) in entries, ascending id:
+///     u16 id.len(), id bytes, u8 bank (A = 0, B = 1), u16 images.len()
+///     for each (name, image) in entry.images, ascending name:
+///         u16 name.len(), name bytes, u64 size, 32 bytes sha256
+/// ```
+///
+/// Both maps are [`BTreeMap`]s precisely so this encoding is **stable**
+/// regardless of insertion order. The signature is over [`Self::sha256`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectorBlob {
     /// Global anti-rollback generation. Monotonic on `seal`.
     pub generation: u64,
-    /// `BankSet -> {bank}` boot selection, canonically ordered. The bank is
-    /// covered by the signature (see [`Self::canonical_bytes`]).
-    pub selectors: BTreeMap<BankSet, SlotSelect>,
-    /// SHA-256 over the canonical `(generation, selectors)` bytes — the digest
+    /// Component id -> boot selection, canonically ordered. Covered by the
+    /// signature (see [`Self::canonical_bytes`]).
+    pub entries: BTreeMap<String, ComponentEntry>,
+    /// SHA-256 over the canonical `(generation, entries)` bytes — the digest
     /// the signature covers. Serialized as a lowercase hex string.
     #[serde(with = "hex_array")]
     pub sha256: [u8; 32],
@@ -71,54 +125,67 @@ pub struct SelectorBlob {
     /// Serialized as a lowercase hex string (empty -> `""`).
     #[serde(with = "hex_bytes")]
     pub signature: Vec<u8>,
+    /// Legacy slot map, `slot -> {bank}`, derived from `entries` by a
+    /// [`FileSelectorStore`] configured with
+    /// [`with_legacy_slot_map`](FileSelectorStore::with_legacy_slot_map). Never
+    /// part of the digest and never consulted on read; absent unless configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selectors: Option<BTreeMap<BankSet, SlotSelect>>,
 }
 
 impl SelectorBlob {
     /// Build the canonical, order-stable byte encoding of `(generation,
-    /// selectors)` that [`Self::sha256`] digests and the signature covers.
-    ///
-    /// Layout (little-endian, fixed-width — no length-prefixed text, so it is
-    /// reproducible byte-for-byte): the u64 generation, then each
-    /// `(BankSet.0: u8, Bank: u8)` selector pair in `BTreeMap` (ascending
-    /// `BankSet`) order. `BankSet` is a `u8` newtype and `Bank` is `repr(u8)`,
-    /// so two bytes per slot suffice.
-    pub fn canonical_bytes(generation: u64, selectors: &BTreeMap<BankSet, SlotSelect>) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + selectors.len() * 2);
+    /// entries)` that [`Self::sha256`] digests and the signature covers —
+    /// layout in the [type docs](Self).
+    pub fn canonical_bytes(generation: u64, entries: &BTreeMap<String, ComponentEntry>) -> Vec<u8> {
+        fn put_str(buf: &mut Vec<u8>, s: &str) {
+            buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        let mut buf = Vec::new();
         buf.extend_from_slice(&generation.to_le_bytes());
-        for (set, sel) in selectors {
-            buf.push(set.0);
-            buf.push(sel.bank as u8);
+        for (id, entry) in entries {
+            put_str(&mut buf, id);
+            buf.push(entry.bank as u8);
+            buf.extend_from_slice(&(entry.images.len() as u16).to_le_bytes());
+            for (name, img) in &entry.images {
+                put_str(&mut buf, name);
+                buf.extend_from_slice(&img.size.to_le_bytes());
+                buf.extend_from_slice(&img.sha256);
+            }
         }
         buf
     }
 
-    /// Compute the canonical SHA-256 for `(generation, selectors)`.
-    pub fn compute_sha256(generation: u64, selectors: &BTreeMap<BankSet, SlotSelect>) -> [u8; 32] {
+    /// Compute the canonical SHA-256 for `(generation, entries)`.
+    pub fn compute_sha256(generation: u64, entries: &BTreeMap<String, ComponentEntry>) -> [u8; 32] {
         use sha2::{Digest, Sha256};
-        Sha256::digest(Self::canonical_bytes(generation, selectors)).into()
+        Sha256::digest(Self::canonical_bytes(generation, entries)).into()
     }
 
-    /// Build + sign a blob for `selectors` at `generation` using `signer`.
+    /// Build + sign a blob for `entries` at `generation` using `signer`.
     pub fn signed(
         generation: u64,
-        selectors: BTreeMap<BankSet, SlotSelect>,
+        entries: BTreeMap<String, ComponentEntry>,
         signer: &dyn Signer,
     ) -> SelectorBlob {
-        let sha256 = Self::compute_sha256(generation, &selectors);
+        let sha256 = Self::compute_sha256(generation, &entries);
         let signature = signer.sign(&sha256);
         SelectorBlob {
             generation,
-            selectors,
+            entries,
             sha256,
             signature,
+            selectors: None,
         }
     }
 
     /// Verify both the embedded digest (recompute over the contents) and the
     /// signature over that digest. A blob whose `sha256` doesn't match its own
-    /// contents, or whose signature doesn't verify, is rejected.
+    /// contents, or whose signature doesn't verify, is rejected. The legacy
+    /// slot map plays no part.
     pub fn is_valid(&self, signer: &dyn Signer) -> bool {
-        let recomputed = Self::compute_sha256(self.generation, &self.selectors);
+        let recomputed = Self::compute_sha256(self.generation, &self.entries);
         recomputed == self.sha256 && signer.verify(&self.sha256, &self.signature)
     }
 }
@@ -185,7 +252,7 @@ impl std::error::Error for SelectorError {}
 /// The two-slot persistence seam for the selector partition: a PRIMARY (booted)
 /// slot and a SECONDARY (rollback floor) slot.
 ///
-/// The production impl writes raw eMMC sectors; the test impl keeps two
+/// The production impl is the host store; the test impl keeps two
 /// in-memory cells. Keeping this a trait makes the manager's cache + transition
 /// logic testable now and leaves the hardware edge swappable when the bootloader
 /// sector contract lands.
@@ -366,26 +433,40 @@ impl Signer for TestSigner {
 }
 
 // ---------------------------------------------------------------------------
-// File-backed store — the host/sim stand-in for the eMMC selector sectors
+// File-backed store — the host/sim stand-in for the host store
 // ---------------------------------------------------------------------------
 
 /// File-backed [`SelectorStore`]: the PRIMARY / SECONDARY slots are two JSON
 /// files (`dir/primary`, `dir/secondary`). This is the host/sim stand-in for
-/// the eventual eMMC sector layout — JSON (not the canonical binary encoding)
-/// purely so the slots are **human-inspectable** during bring-up. The selector
-/// digest + signature still travel inside the blob, so verification on `load`
-/// is unchanged; only the on-disk container differs from the future sectors.
+/// the host store — JSON (not the canonical binary encoding) purely so the
+/// slots are **human-inspectable** during bring-up. The digest + signature
+/// still travel inside the blob, so verification on `load` is unchanged.
 ///
 /// Writes are atomic per slot: serialize into `<slot>.tmp`, then `rename` over
 /// `<slot>` — a crash mid-write leaves the prior slot intact.
 #[derive(Debug, Clone)]
 pub struct FileSelectorStore {
     dir: PathBuf,
+    legacy_slot_map: Option<BTreeMap<String, BankSet>>,
 }
 
 impl FileSelectorStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            legacy_slot_map: None,
+        }
+    }
+
+    /// Also emit the legacy slot map (`selectors`, `slot -> {bank}`) on every
+    /// write, translating each entry's component id to its slot via `map`
+    /// (an id absent from `map` gets no slot). For a boot stage that still
+    /// reads the previous shape; removed when no deployed boot stage needs it.
+    /// Nothing reads the map back — it is outside the digest, so a tampered
+    /// map changes nothing.
+    pub fn with_legacy_slot_map(mut self, map: BTreeMap<String, BankSet>) -> Self {
+        self.legacy_slot_map = Some(map);
+        self
     }
 
     /// Read + parse a slot file, or `None` if it doesn't exist. A parse error
@@ -421,8 +502,15 @@ impl FileSelectorStore {
         std::fs::create_dir_all(&self.dir)?;
         let final_path = self.dir.join(name);
         let tmp_path = self.dir.join(format!("{name}.tmp"));
+        let mut blob = blob.clone();
+        blob.selectors = self.legacy_slot_map.as_ref().map(|map| {
+            blob.entries
+                .iter()
+                .filter_map(|(id, e)| map.get(id).map(|&set| (set, SlotSelect::new(e.bank))))
+                .collect()
+        });
         let file = std::fs::File::create(&tmp_path)?;
-        serde_json::to_writer_pretty(&file, blob)
+        serde_json::to_writer_pretty(&file, &blob)
             .map_err(|e| SelectorError::Serialize(e.to_string()))?;
         // Flush the payload to disk BEFORE the rename — the rename is only
         // atomic for ordering, not durability.
@@ -468,9 +556,12 @@ mod tests {
     }
 
     fn blob(generation: u64) -> SelectorBlob {
-        let mut selectors = BTreeMap::new();
-        selectors.insert(BankSet(0), SlotSelect::new(Bank::B));
-        SelectorBlob::signed(generation, selectors, &StubSigner)
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "os".to_string(),
+            ComponentEntry::new(Bank::B, BTreeMap::new()),
+        );
+        SelectorBlob::signed(generation, entries, &StubSigner)
     }
 
     #[test]
@@ -499,5 +590,50 @@ mod tests {
         assert_eq!(store.read_secondary(), Some(blob(2)));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_slot_map_only_when_configured_and_outside_the_digest() {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "os".to_string(),
+            ComponentEntry::new(Bank::B, BTreeMap::new()),
+        );
+        entries.insert(
+            "vm1".to_string(),
+            ComponentEntry::new(Bank::A, BTreeMap::new()),
+        );
+        let written = SelectorBlob::signed(7, entries, &StubSigner);
+
+        // Not configured: no `selectors` key in the JSON.
+        let plain_dir = temp_path("plain");
+        let plain = FileSelectorStore::new(&plain_dir);
+        plain.write_primary(&written).unwrap();
+        let json = std::fs::read_to_string(plain_dir.join("primary")).unwrap();
+        assert!(!json.contains("selectors"), "{json}");
+        assert_eq!(plain.read_primary(), Some(written.clone()));
+
+        // Configured: `slot -> {bank}` derived from the entries; an id with no
+        // slot is left out.
+        let legacy_dir = temp_path("legacy");
+        let map = BTreeMap::from([("os".to_string(), BankSet(0))]);
+        let legacy = FileSelectorStore::new(&legacy_dir).with_legacy_slot_map(map);
+        legacy.write_primary(&written).unwrap();
+        let read = legacy.read_primary().unwrap();
+        assert_eq!(
+            read.selectors,
+            Some(BTreeMap::from([(BankSet(0), SlotSelect::new(Bank::B))]))
+        );
+        assert_eq!(read.entries, written.entries);
+        assert!(read.is_valid(&StubSigner));
+
+        // A modified legacy map does not affect validity (the digest is
+        // recomputed over the entries alone).
+        let mut tampered = read;
+        tampered.selectors = Some(BTreeMap::from([(BankSet(0), SlotSelect::new(Bank::A))]));
+        assert!(tampered.is_valid(&StubSigner));
+
+        std::fs::remove_dir_all(&plain_dir).unwrap();
+        std::fs::remove_dir_all(&legacy_dir).unwrap();
     }
 }

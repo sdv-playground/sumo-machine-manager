@@ -992,7 +992,7 @@ mod tests {
 
         fn route(&self, bank: Bank) -> Result<(), BankError> {
             if let Some((sel, nv)) = &self.witness {
-                let selected = sel.read().unwrap().active_bank(slots::OS);
+                let selected = sel.read().unwrap().active_bank("os");
                 self.seen_at_route
                     .lock()
                     .unwrap()
@@ -1043,7 +1043,7 @@ mod tests {
         let shared: SharedSystemBankState = Arc::new(RwLock::new(mgr));
         {
             let mut g = shared.write().unwrap();
-            g.stage(slots::OS, bank);
+            g.stage("os", bank, Default::default());
             assert!(g.seal().unwrap());
         }
         shared
@@ -1055,7 +1055,7 @@ mod tests {
         {
             let mut g = shared.write().unwrap();
             g.commit().unwrap(); // floor := the booted selection
-            g.stage(slots::OS, armed);
+            g.stage("os", armed, Default::default());
             assert!(g.seal().unwrap()); // PRIMARY := the trial bank
         }
         shared
