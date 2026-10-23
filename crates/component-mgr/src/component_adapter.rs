@@ -16,9 +16,9 @@ use nv_store::block::BlockDevice;
 
 use machine_mgr::component::DidEntry;
 use machine_mgr::{
-    ActivationState, Capabilities, ClearFaultsResult, Component, Csr, DidFilter, DidKind,
-    DtcFilter, EnvelopeStream, Fault, FlashCaps, FlashId, FlashSession, FlashStatus, HsmCaps,
-    KeyDescriptor, KeyInventory, LifecycleCaps, MachineError, MachineResult, RuntimeState,
+    ActivationState, Capabilities, ClearFaultsResult, Component, ComponentBanks, Csr, DidFilter,
+    DidKind, DtcFilter, EnvelopeStream, Fault, FlashCaps, FlashId, FlashSession, FlashStatus,
+    HsmCaps, KeyDescriptor, KeyInventory, LifecycleCaps, MachineError, MachineResult, RuntimeState,
     SlotKind,
 };
 
@@ -145,6 +145,10 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
 
     fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    fn banks(&self) -> Option<ComponentBanks> {
+        self.inner.bank_provider().banks()
     }
 
     async fn start(&self) -> MachineResult<()> {

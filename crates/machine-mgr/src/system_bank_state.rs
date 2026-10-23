@@ -270,6 +270,28 @@ impl SystemBankManager {
         self.current.get(component_id).map(|e| e.bank)
     }
 
+    /// The booted entry for `component_id` (from PRIMARY / `current`), or
+    /// `None` if the node has no selection for that component.
+    pub fn entry(&self, component_id: &str) -> Option<&ComponentEntry> {
+        self.current.get(component_id)
+    }
+
+    /// The committed-floor entry for `component_id` (from SECONDARY /
+    /// `committed`), or `None` if the floor has no selection for it.
+    pub fn committed_entry(&self, component_id: &str) -> Option<&ComponentEntry> {
+        self.committed.get(component_id)
+    }
+
+    /// Whether `component_id` is in a trial: its booted entry (PRIMARY) differs
+    /// from its committed-floor entry (SECONDARY). An absent floor entry counts
+    /// as different; a component with no booted entry is never in a trial.
+    pub fn component_in_trial(&self, component_id: &str) -> bool {
+        match self.entry(component_id) {
+            Some(entry) => self.committed_entry(component_id) != Some(entry),
+            None => false,
+        }
+    }
+
     /// Whether the node is in a trial: the booted selection (PRIMARY) differs
     /// from the committed floor (SECONDARY).
     pub fn is_trial(&self) -> bool {
@@ -450,6 +472,49 @@ mod tests {
             "reboot mid-stage boots old selection"
         );
         assert!(!m2.is_trial());
+    }
+
+    #[test]
+    fn component_in_trial_true_when_floor_lacks_entry() {
+        let mut m = mgr();
+        m.stage("vm1", Bank::A, BTreeMap::new());
+        m.seal().unwrap();
+        assert!(m.committed_entry("vm1").is_none());
+        assert!(m.component_in_trial("vm1"));
+    }
+
+    #[test]
+    fn component_in_trial_true_when_banks_differ() {
+        let mut m = mgr();
+        m.stage("vm1", Bank::A, BTreeMap::new());
+        m.stage("vm2", Bank::A, BTreeMap::new());
+        m.seal().unwrap();
+        m.commit().unwrap();
+        m.stage("vm1", Bank::B, BTreeMap::new());
+        m.seal().unwrap();
+        assert_eq!(m.entry("vm1").map(|e| e.bank), Some(Bank::B));
+        assert_eq!(m.committed_entry("vm1").map(|e| e.bank), Some(Bank::A));
+        assert!(m.component_in_trial("vm1"));
+        assert!(!m.component_in_trial("vm2"), "vm2 unchanged since commit");
+    }
+
+    #[test]
+    fn component_in_trial_false_when_equal() {
+        let mut m = mgr();
+        m.stage("vm1", Bank::B, BTreeMap::new());
+        m.seal().unwrap();
+        m.commit().unwrap();
+        assert!(!m.component_in_trial("vm1"));
+    }
+
+    #[test]
+    fn component_in_trial_false_when_primary_lacks_entry() {
+        let mut m = mgr();
+        m.stage("vm1", Bank::A, BTreeMap::new());
+        m.seal().unwrap();
+        m.commit().unwrap();
+        assert!(m.entry("vm2").is_none());
+        assert!(!m.component_in_trial("vm2"));
     }
 
     #[test]

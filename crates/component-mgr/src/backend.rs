@@ -1272,6 +1272,12 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         &self.config
     }
 
+    /// The bank provider every bank touch routes through (the default
+    /// `IvdBankProvider`, or the one set by [`Self::with_bank_provider`]).
+    pub fn bank_provider(&self) -> &Arc<dyn BankProvider> {
+        &self.bank_provider
+    }
+
     pub fn bank_set(&self) -> BankSet {
         self.bank_set
     }

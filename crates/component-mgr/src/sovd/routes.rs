@@ -8,6 +8,7 @@
 //! routes into their own router
 //! to expose the same wire.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use axum::http::{header, StatusCode};
@@ -15,10 +16,10 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use machine_mgr::node_update::{Durable, NodeCoordinator, NodeUpdateState};
-use machine_mgr::{Component, FlashId, FlashState, Machine, MachineError};
+use machine_mgr::{BankContents, Component, FlashId, FlashState, Machine, MachineError};
 use nv_store::block::BlockDevice;
 use nv_store::store::NvStore;
-use nv_store::types::BankSet;
+use nv_store::types::{Bank, BankSet};
 use sovd_core::{OperationExecution, OperationStatus};
 
 /// `GET /vehicle/v1/data/x-ota-update-state` — the node's update-transaction
@@ -30,19 +31,27 @@ use sovd_core::{OperationExecution, OperationStatus};
 ///
 /// Also serves `GET /vehicle/v1/data/x-update-state`, an alias with the same
 /// body (both carry `node_boot_id`).
+///
+/// `machine` supplies the per-component `banks` member (what each bank holds,
+/// from the installed manifests). It is a deliberate signature change: hosts
+/// that merge this router pass the same `Arc<dyn Machine>` they hand
+/// [`node_verdict_router`] when they bump the pin.
 pub fn update_state_router<D: BlockDevice + Send + 'static>(
     nv: Arc<Mutex<NvStore<D>>>,
     coord: Arc<NodeCoordinator>,
+    machine: Arc<dyn Machine>,
 ) -> Router {
     let alias_nv = nv.clone();
     let alias_coord = coord.clone();
+    let alias_machine = machine.clone();
     Router::new()
         .route(
             "/vehicle/v1/data/x-ota-update-state",
             get(move || {
                 let nv = nv.clone();
                 let coord = coord.clone();
-                async move { update_state(nv, coord).await }
+                let machine = machine.clone();
+                async move { update_state(nv, coord, machine).await }
             }),
         )
         .route(
@@ -50,7 +59,8 @@ pub fn update_state_router<D: BlockDevice + Send + 'static>(
             get(move || {
                 let nv = alias_nv.clone();
                 let coord = alias_coord.clone();
-                async move { x_update_state(nv, coord).await }
+                let machine = alias_machine.clone();
+                async move { x_update_state(nv, coord, machine).await }
             }),
         )
 }
@@ -60,7 +70,8 @@ pub fn update_state_router<D: BlockDevice + Send + 'static>(
 /// components whose arming requires the node reboot and whose trial is
 /// unresolved; `rebooted_since_arming`: whether the node boot id has changed
 /// since that arming (null = unknown); `node_boot_id`: the node's current boot
-/// id (null = unknown).
+/// id (null = unknown); `banks`: what each component's banks hold, per the
+/// installed manifests (not a verification).
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct UpdateStateResponse {
     pub phase: String,
@@ -68,6 +79,57 @@ pub(crate) struct UpdateStateResponse {
     pub reboot_owed: Vec<String>,
     pub rebooted_since_arming: Option<bool>,
     pub(crate) node_boot_id: Option<String>,
+    pub banks: Vec<ComponentBanksResponse>,
+}
+
+/// One component's entry in the `banks` member: the active bank
+/// and, for a two-bank component whose other bank holds an installed manifest,
+/// the inactive one; `in_trial` = the component runs a not-yet-committed
+/// install. An orchestrator compares `inactive` with its intent and downloads
+/// only the images that differ.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct ComponentBanksResponse {
+    pub id: String,
+    pub active: BankContentsResponse,
+    pub inactive: Option<BankContentsResponse>,
+    pub in_trial: bool,
+}
+
+/// What one bank holds, by part name, as its installed manifest records it.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct BankContentsResponse {
+    /// `"A"` or `"B"`.
+    #[schema(value_type = String)]
+    pub bank: Bank,
+    pub images: BTreeMap<String, BankImageResponse>,
+}
+
+/// One installed image: its size in bytes and SHA-256 (lowercase hex).
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct BankImageResponse {
+    pub size: u64,
+    pub sha256: String,
+}
+
+impl From<BankContents> for BankContentsResponse {
+    fn from(c: BankContents) -> Self {
+        Self {
+            bank: c.bank,
+            images: c
+                .images
+                .into_iter()
+                .map(|(name, img)| {
+                    (
+                        name,
+                        BankImageResponse {
+                            size: img.size,
+                            sha256: hex::encode(img.sha256),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 /// `GET /vehicle/v1/data/x-ota-update-state` — the handler behind
@@ -83,8 +145,9 @@ pub(crate) struct UpdateStateResponse {
 pub(crate) async fn update_state<D: BlockDevice>(
     nv: Arc<Mutex<NvStore<D>>>,
     coord: Arc<NodeCoordinator>,
+    machine: Arc<dyn Machine>,
 ) -> Json<UpdateStateResponse> {
-    update_state_body(&nv, &coord)
+    update_state_body(&nv, &coord, machine.as_ref())
 }
 
 /// `GET /vehicle/v1/data/x-update-state` — alias of
@@ -100,14 +163,16 @@ pub(crate) async fn update_state<D: BlockDevice>(
 pub(crate) async fn x_update_state<D: BlockDevice>(
     nv: Arc<Mutex<NvStore<D>>>,
     coord: Arc<NodeCoordinator>,
+    machine: Arc<dyn Machine>,
 ) -> Json<UpdateStateResponse> {
-    update_state_body(&nv, &coord)
+    update_state_body(&nv, &coord, machine.as_ref())
 }
 
 /// The shared body of [`update_state`] and [`x_update_state`].
 fn update_state_body<D: BlockDevice>(
     nv: &Mutex<NvStore<D>>,
     coord: &NodeCoordinator,
+    machine: &dyn Machine,
 ) -> Json<UpdateStateResponse> {
     let st = derive_node_update_state(nv, coord);
     Json(UpdateStateResponse {
@@ -116,7 +181,26 @@ fn update_state_body<D: BlockDevice>(
         reboot_owed: st.reboot_owed,
         rebooted_since_arming: st.rebooted_since_arming,
         node_boot_id: coord.node_boot_id().map(str::to_string),
+        banks: component_banks(machine),
     })
+}
+
+/// The `banks` member: one entry per component that reports bank contents,
+/// in `machine.components()` order.
+fn component_banks(machine: &dyn Machine) -> Vec<ComponentBanksResponse> {
+    machine
+        .components()
+        .iter()
+        .filter_map(|c| {
+            let b = c.banks()?;
+            Some(ComponentBanksResponse {
+                id: c.id().to_string(),
+                active: b.active.into(),
+                inactive: b.inactive.map(Into::into),
+                in_trial: b.in_trial,
+            })
+        })
+        .collect()
 }
 
 /// Derive the node's update-transaction state from NV + the coordinator's
@@ -1379,7 +1463,7 @@ mod tests {
     #[tokio::test]
     async fn x_update_state_alias_matches_x_ota_update_state() {
         let coord = NodeCoordinator::new(vec![(4, "vm1".to_string())]).with_node_boot_id("boot-b");
-        let router = update_state_router(nv_armed_at("boot-a"), Arc::new(coord));
+        let router = update_state_router(nv_armed_at("boot-a"), Arc::new(coord), machine_with(&[]));
 
         let ota = get_json(&router, "/vehicle/v1/data/x-ota-update-state").await;
         let alias = get_json(&router, "/vehicle/v1/data/x-update-state").await;
@@ -1389,7 +1473,7 @@ mod tests {
 
         // No boot id configured: `node_boot_id` is an explicit null.
         let coord = NodeCoordinator::new(vec![(4, "vm1".to_string())]);
-        let router = update_state_router(nv_idle(), Arc::new(coord));
+        let router = update_state_router(nv_idle(), Arc::new(coord), machine_with(&[]));
         let alias = get_json(&router, "/vehicle/v1/data/x-update-state").await;
         assert_eq!(alias["node_boot_id"], serde_json::Value::Null);
         assert_eq!(
@@ -1408,7 +1492,7 @@ mod tests {
         boot_id: &str,
     ) -> serde_json::Value {
         let coord = NodeCoordinator::new(vec![(4, "vm1".to_string())]).with_node_boot_id(boot_id);
-        serde_json::to_value(update_state(nv, Arc::new(coord)).await.0).unwrap()
+        serde_json::to_value(update_state(nv, Arc::new(coord), machine_with(&[])).await.0).unwrap()
     }
 
     /// vm1 (slot 4) owed, armed while the node was booted as `boot_id`.
@@ -1434,6 +1518,7 @@ mod tests {
                 "reboot_owed": [],
                 "rebooted_since_arming": null,
                 "node_boot_id": "boot-a",
+                "banks": [],
             })
         );
         // In trial with nothing owed -> Trial, `reboot_owed` empty.
@@ -1445,6 +1530,7 @@ mod tests {
                 "reboot_owed": [],
                 "rebooted_since_arming": null,
                 "node_boot_id": "boot-a",
+                "banks": [],
             })
         );
         // Owed, arming boot id unknown (zero): not provably pre-reboot -> Trial.
@@ -1456,6 +1542,7 @@ mod tests {
                 "reboot_owed": ["vm1"],
                 "rebooted_since_arming": null,
                 "node_boot_id": "boot-a",
+                "banks": [],
             })
         );
         // Owed, still on the arming boot -> RebootPending.
@@ -1467,6 +1554,7 @@ mod tests {
                 "reboot_owed": ["vm1"],
                 "rebooted_since_arming": false,
                 "node_boot_id": "boot-a",
+                "banks": [],
             })
         );
         // Owed, booted since arming -> Trial.
@@ -1478,6 +1566,7 @@ mod tests {
                 "reboot_owed": ["vm1"],
                 "rebooted_since_arming": true,
                 "node_boot_id": "boot-b",
+                "banks": [],
             })
         );
     }

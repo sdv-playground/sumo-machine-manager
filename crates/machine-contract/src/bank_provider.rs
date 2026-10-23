@@ -20,6 +20,9 @@
 //! implement it without circular deps. The implementor holds its own NV / HSM /
 //! disk handles, so these signatures stay free of those crates.
 
+use std::collections::BTreeMap;
+
+use nv_store::selector::ImageEntry;
 use nv_store::types::Bank;
 
 use crate::ResetKind;
@@ -78,6 +81,27 @@ impl InstalledFirmware {
             && self.files[0].name == DISABLED_RECORD_PATH
             && self.files[0].sha256 == [0u8; 32]
     }
+}
+
+/// What one bank holds, by part name, as its installed manifest records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankContents {
+    pub bank: Bank,
+    pub images: BTreeMap<String, ImageEntry>,
+}
+
+/// Installed contents of each bank of one component, plus whether it is in a
+/// trial. See [`BankProvider::banks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentBanks {
+    /// The active bank and its contents (empty `images` when it has no
+    /// readable manifest).
+    pub active: BankContents,
+    /// The other bank, `None` for a single-bank component or when the other
+    /// bank has no readable manifest.
+    pub inactive: Option<BankContents>,
+    /// Whether the component runs a not-yet-committed install.
+    pub in_trial: bool,
 }
 
 /// Errors from [`BankProvider`] operations.
@@ -243,4 +267,11 @@ pub trait BankProvider: Send + Sync {
     /// signature does not verify all read `None` (the last with a warn). `Err`
     /// only when a record exists but cannot be read/decoded.
     fn disabled_record(&self, bank: Bank) -> Result<Option<u64>, BankError>;
+
+    /// Installed contents of each bank as recorded by the installed manifests,
+    /// for status reporting. Not a verification. Default `None` (a provider
+    /// that does not report bank contents).
+    fn banks(&self) -> Option<ComponentBanks> {
+        None
+    }
 }
