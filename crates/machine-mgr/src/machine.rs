@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
-use nv_store::types::{BankBootState, BankSet};
+use nv_store::types::BankBootState;
 
 use crate::component::Component;
 use crate::system_bank_state::{
@@ -100,7 +100,8 @@ impl MachineRegistry {
     }
 
     /// Seed the boot selector from the node's per-bank-set boot state so the
-    /// selector mirrors reality on startup: PRIMARY boots each set's NV
+    /// selector mirrors reality on startup. Each entry is `(component id, its
+    /// slot's NV boot state)`; the selector is staged by component id. PRIMARY boots each set's NV
     /// `active_bank`, and SECONDARY (the rollback floor) holds each set's
     /// COMMITTED bank — `active_bank` itself for a committed set,
     /// `active_bank.other()` for a set NV holds in trial (`committed ==
@@ -111,6 +112,10 @@ impl MachineRegistry {
     /// and commits (PRIMARY == SECONDARY == floor), and — iff any set is in
     /// trial — stages those sets' active banks and seals again, which arms the
     /// trial exactly as an OTA does: PRIMARY ahead of the committed floor.
+    ///
+    /// Every entry is staged with **no images**: NV records banks, not what was
+    /// sealed into them, so a reseed has no sealed facts to carry. The next
+    /// install of a component fills its images in.
     ///
     /// **Idempotent on purpose**: when the selector already matches the
     /// supplied entries (the steady-state case on every boot), nothing is
@@ -126,32 +131,32 @@ impl MachineRegistry {
     ///
     /// A failed selector write is returned as `Err`; the in-memory selector
     /// then holds whatever the last successful write left.
-    pub fn seed_selector(
+    pub fn seed_selector<'a>(
         &mut self,
-        entries: impl IntoIterator<Item = (BankSet, BankBootState)>,
+        entries: impl IntoIterator<Item = (&'a str, &'a BankBootState)>,
     ) -> Result<(), SelectorError> {
         // One write lock for the whole seed: the compare and the stage/seal/
         // commit sequence must see a consistent view of the selector.
         let mut sb = self.system_bank.write().expect("selector poisoned");
-        let entries: Vec<(BankSet, BankBootState)> = entries.into_iter().collect();
+        let entries: Vec<(&str, &BankBootState)> = entries.into_iter().collect();
         if entries
             .iter()
-            .all(|(set, nv)| sb.active_bank(*set) == Some(nv.active_bank))
+            .all(|(id, nv)| sb.active_bank(id) == Some(nv.active_bank))
         {
             return Ok(());
         }
-        for (set, nv) in &entries {
+        for (id, nv) in &entries {
             let floor = if nv.committed {
                 nv.active_bank
             } else {
                 nv.active_bank.other()
             };
-            sb.stage(*set, floor);
+            sb.stage(id, floor, BTreeMap::new());
         }
         sb.seal()?;
         sb.commit()?;
-        for (set, nv) in entries.iter().filter(|(_, nv)| !nv.committed) {
-            sb.stage(*set, nv.active_bank);
+        for (id, nv) in entries.iter().filter(|(_, nv)| !nv.committed) {
+            sb.stage(id, nv.active_bank, BTreeMap::new());
         }
         // A no-op when nothing is in trial: `seal` needs something staged.
         sb.seal()?;

@@ -278,7 +278,6 @@ fn nv_boot(active_bank: nv_store::types::Bank, committed: bool) -> nv_store::typ
 #[test]
 fn seed_selector_writes_on_first_seed_and_is_idempotent() {
     use crate::system_bank_state::{InMemorySelectorStore, SelectorStore, TestSigner};
-    use nv_store::slots;
     use nv_store::types::Bank;
 
     // A real two-slot store we can inspect after seeding.
@@ -295,18 +294,19 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
 
     // First seed of an empty selector: both entries differ from the (absent)
     // PRIMARY view, so both are staged and a single seal promotes them.
-    let entries = vec![
-        (slots::VM1, nv_boot(Bank::B, true)),
-        (slots::VM2, nv_boot(Bank::A, true)),
+    let entries = [
+        ("vm1", nv_boot(Bank::B, true)),
+        ("vm2", nv_boot(Bank::A, true)),
     ];
-    m.seed_selector(entries.clone()).unwrap();
+    m.seed_selector(entries.iter().map(|(id, nv)| (*id, nv)))
+        .unwrap();
 
     // The selector now mirrors the seed and the store's PRIMARY slot was
     // written with both entries at generation 1. Active-bank reads also go via
     // the read-only `boot_selector()` view to exercise that handle.
     let sel = m.boot_selector();
-    assert_eq!(sel.active_bank(slots::VM1), Some(Bank::B));
-    assert_eq!(sel.active_bank(slots::VM2), Some(Bank::A));
+    assert_eq!(sel.active_bank("vm1"), Some(Bank::B));
+    assert_eq!(sel.active_bank("vm2"), Some(Bank::A));
     assert_eq!(
         m.system_bank().read().unwrap().generation(),
         1,
@@ -314,8 +314,8 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
     );
     let primary = store.read_primary().expect("PRIMARY written by the seed");
     assert_eq!(primary.generation, 1);
-    assert_eq!(primary.selectors[&slots::VM1].bank, Bank::B);
-    assert_eq!(primary.selectors[&slots::VM2].bank, Bank::A);
+    assert_eq!(primary.entries["vm1"].bank, Bank::B);
+    assert_eq!(primary.entries["vm2"].bank, Bank::A);
 
     // The seed commits too, and both sets are committed in NV, so SECONDARY is
     // written equal to PRIMARY — the not-in-trial baseline (PRIMARY ==
@@ -324,12 +324,13 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
         .read_secondary()
         .expect("SECONDARY written by the seed's commit");
     assert_eq!(secondary.generation, 1);
-    assert_eq!(secondary.selectors, primary.selectors);
+    assert_eq!(secondary.entries, primary.entries);
     assert!(!sel.is_trial(), "seed leaves the node not-in-trial");
 
     // Second identical seed: every entry already matches PRIMARY, so nothing
     // is staged and seal is NOT called — the generation must not inflate.
-    m.seed_selector(entries).unwrap();
+    m.seed_selector(entries.iter().map(|(id, nv)| (*id, nv)))
+        .unwrap();
     assert_eq!(
         m.system_bank().read().unwrap().generation(),
         1,
@@ -362,9 +363,10 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
     selectors.insert(slots::VM1, SlotSelect::new(Bank::B));
     let blob = SelectorBlob {
         generation,
-        selectors,
+        entries: BTreeMap::new(),
         sha256,
         signature: TestSigner.sign(&sha256),
+        selectors: Some(selectors),
     };
     let store = InMemorySelectorStore::new();
     store.write_primary(&blob).unwrap();
@@ -377,11 +379,12 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
         .build();
     assert!(m.system_bank().read().unwrap().is_empty());
 
-    m.seed_selector(vec![
-        (slots::VM1, nv_boot(Bank::B, true)),
-        (slots::VM2, nv_boot(Bank::A, true)),
-    ])
-    .unwrap();
+    let entries = [
+        ("vm1", nv_boot(Bank::B, true)),
+        ("vm2", nv_boot(Bank::A, true)),
+    ];
+    m.seed_selector(entries.iter().map(|(id, nv)| (*id, nv)))
+        .unwrap();
 
     assert_eq!(m.system_bank().read().unwrap().generation(), 1);
     let primary = store.read_primary().expect("PRIMARY reseeded");
@@ -390,10 +393,10 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
         primary.is_valid(&TestSigner) && secondary.is_valid(&TestSigner),
         "the reseed signs over the current encoding"
     );
-    assert_eq!(primary.selectors[&slots::VM1].bank, Bank::B);
-    assert_eq!(primary.selectors[&slots::VM2].bank, Bank::A);
+    assert_eq!(primary.entries["vm1"].bank, Bank::B);
+    assert_eq!(primary.entries["vm2"].bank, Bank::A);
     assert_eq!(
-        secondary.selectors, primary.selectors,
+        secondary.entries, primary.entries,
         "committed sets: PRIMARY == SECONDARY"
     );
     assert!(!m.boot_selector().is_trial());
@@ -402,7 +405,6 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
 #[test]
 fn seed_uses_the_committed_bank_for_secondary() {
     use crate::system_bank_state::{InMemorySelectorStore, SelectorStore, TestSigner};
-    use nv_store::slots;
     use nv_store::types::Bank;
 
     let store = InMemorySelectorStore::new();
@@ -411,23 +413,24 @@ fn seed_uses_the_committed_bank_for_secondary() {
         .build();
 
     // NV holds VM1 in trial on B (its committed bank is A); VM2 committed on A.
-    let entries = vec![
-        (slots::VM1, nv_boot(Bank::B, false)),
-        (slots::VM2, nv_boot(Bank::A, true)),
+    let entries = [
+        ("vm1", nv_boot(Bank::B, false)),
+        ("vm2", nv_boot(Bank::A, true)),
     ];
-    m.seed_selector(entries.clone()).unwrap();
+    m.seed_selector(entries.iter().map(|(id, nv)| (*id, nv)))
+        .unwrap();
 
     // PRIMARY boots NV's active bank for both sets...
     let primary = store.read_primary().expect("PRIMARY written by the seed");
-    assert_eq!(primary.selectors[&slots::VM1].bank, Bank::B);
-    assert_eq!(primary.selectors[&slots::VM2].bank, Bank::A);
+    assert_eq!(primary.entries["vm1"].bank, Bank::B);
+    assert_eq!(primary.entries["vm2"].bank, Bank::A);
     // ...and SECONDARY is the committed floor: the other bank for the trial
     // set, the same bank for the committed one.
     let secondary = store
         .read_secondary()
         .expect("SECONDARY written by the seed");
-    assert_eq!(secondary.selectors[&slots::VM1].bank, Bank::A);
-    assert_eq!(secondary.selectors[&slots::VM2].bank, Bank::A);
+    assert_eq!(secondary.entries["vm1"].bank, Bank::A);
+    assert_eq!(secondary.entries["vm2"].bank, Bank::A);
     assert!(
         m.boot_selector().is_trial(),
         "the NV trial survives the seed"
@@ -438,7 +441,8 @@ fn seed_uses_the_committed_bank_for_secondary() {
     );
 
     // PRIMARY already mirrors NV, so a re-seed writes nothing.
-    m.seed_selector(entries).unwrap();
+    m.seed_selector(entries.iter().map(|(id, nv)| (*id, nv)))
+        .unwrap();
     assert_eq!(
         store.read_primary().map(|b| b.generation),
         Some(primary.generation),

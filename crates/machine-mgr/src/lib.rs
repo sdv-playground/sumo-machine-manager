@@ -89,8 +89,8 @@ pub use error::{MachineError, MachineResult};
 pub use image_record::ImageRecord;
 pub use machine::{Machine, MachineRegistry};
 pub use system_bank_state::{
-    BootSelector, FileSelectorStore, SelectorBlob, SelectorStore, SharedSystemBankState, Signer,
-    StubSelectorStore, StubSigner, SystemBankManager,
+    BootSelector, ComponentEntry, FileSelectorStore, ImageEntry, SelectorBlob, SelectorStore,
+    SharedSystemBankState, Signer, StubSelectorStore, StubSigner, SystemBankManager,
 };
 // In-memory test seams: only for test builds (see `system_bank_state`).
 #[cfg(any(test, feature = "test-seams"))]

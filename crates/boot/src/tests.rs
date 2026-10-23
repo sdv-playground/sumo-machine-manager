@@ -4,7 +4,7 @@
 
 use nv_store::block::MemBlockDevice;
 use nv_store::selector::{
-    InMemorySelectorStore, SelectorBlob, SelectorStore, SlotSelect, TestSigner,
+    ComponentEntry, InMemorySelectorStore, SelectorBlob, SelectorStore, TestSigner,
 };
 use nv_store::slots;
 use nv_store::store::{nv_device_size, MIN_NV_DEVICE_SIZE};
@@ -527,12 +527,11 @@ fn ota_trial_auto_rollback_cycle() {
 }
 
 // ===========================================================================
-// Selector-driven boot
+// Boot-vector report
 //
-// PRIMARY = booted selection, SECONDARY = rollback floor. A set is in trial
-// iff PRIMARY.selectors[set] != SECONDARY.selectors[set]. The trial/rollback
-// is GLOBAL: any trialed set over MAX_TRIAL_BOOTS copies the whole signed
-// SECONDARY blob over PRIMARY (vm-boot has no signer).
+// PRIMARY = booted selection, SECONDARY = rollback floor, keyed by component
+// id. A component is in trial iff its PRIMARY entry differs from its
+// SECONDARY entry. The boot-vector path reports and writes nothing.
 // ===========================================================================
 
 /// Build a `BootManager` over an in-memory NV device with an attached
@@ -545,321 +544,103 @@ fn make_bootmgr_with_selector() -> (BootManager<MemBlockDevice>, InMemorySelecto
     (mgr, store)
 }
 
-fn sel_map(entries: &[(BankSet, Bank)]) -> BTreeMap<BankSet, SlotSelect> {
-    entries
+/// Build a signed boot vector (via `TestSigner`) for `entries` at `gen`.
+fn signed_blob(gen: u64, entries: &[(&str, Bank)]) -> SelectorBlob {
+    let entries = entries
         .iter()
-        .map(|&(set, bank)| (set, SlotSelect::new(bank)))
-        .collect()
-}
-
-/// Build a signed selector blob (via `TestSigner`) for `entries` at `gen`.
-fn signed_blob(gen: u64, entries: &[(BankSet, Bank)]) -> SelectorBlob {
-    SelectorBlob::signed(gen, sel_map(entries), &TestSigner)
+        .map(|&(id, bank)| (id.to_string(), ComponentEntry::new(bank, BTreeMap::new())))
+        .collect();
+    SelectorBlob::signed(gen, entries, &TestSigner)
 }
 
 /// Seed PRIMARY == SECONDARY at the given selection — the committed baseline
 /// (mirrors `seed_selector`'s seal+commit).
-fn seed_committed(store: &InMemorySelectorStore, gen: u64, entries: &[(BankSet, Bank)]) {
+fn seed_committed(store: &InMemorySelectorStore, gen: u64, entries: &[(&str, Bank)]) {
     store.write_primary(&signed_blob(gen, entries)).unwrap();
     store.write_secondary(&signed_blob(gen, entries)).unwrap();
 }
 
-#[test]
-fn selector_committed_boots() {
-    let (mut mgr, store) = make_bootmgr_with_selector();
-    // PRIMARY == SECONDARY: host-os=B, vm1=A — both committed.
-    seed_committed(&store, 7, &[(slots::OS, Bank::B), (slots::VM1, Bank::A)]);
-
-    let actions = mgr.process_boot().unwrap();
-    assert_eq!(
-        actions[slots::OS.as_index()],
-        BootAction::Boot { bank: Bank::B }
-    );
-    assert_eq!(
-        actions[slots::VM1.as_index()],
-        BootAction::Boot { bank: Bank::A }
-    );
-
-    // active_bank() is selector-resolved.
-    assert_eq!(mgr.active_bank(slots::OS), Some(Bank::B));
-    assert_eq!(mgr.active_bank(slots::VM1), Some(Bank::A));
-}
-
-#[test]
-fn selector_committed_does_not_touch_nv_count() {
-    let (mut mgr, store) = make_bootmgr_with_selector();
-    seed_committed(&store, 1, &[(slots::OS, Bank::A)]);
-
-    for _ in 0..5 {
-        let actions = mgr.process_boot().unwrap();
-        assert_eq!(actions[0], BootAction::Boot { bank: Bank::A });
+fn selected(component: &str, bank: Bank, trial: bool) -> BootAction {
+    BootAction::Selected {
+        component: component.to_string(),
+        bank,
+        trial,
     }
-    // boot_count for a committed selector set stays 0.
-    let state = mgr.nv().read_boot_state().unwrap();
-    assert_eq!(state.banks[0].boot_count, 0);
 }
 
 #[test]
-fn selector_trial_increments_boot_count() {
+fn selector_committed_boots_by_component_id() {
     let (mut mgr, store) = make_bootmgr_with_selector();
-    // SECONDARY floor at host-os=A; PRIMARY booted at host-os=B → trial.
-    store
-        .write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]))
-        .unwrap();
-    store
-        .write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]))
-        .unwrap();
-
-    let os = slots::OS.as_index();
-    let actions = mgr.process_boot().unwrap();
-    assert_eq!(
-        actions[os],
-        BootAction::TrialBoot {
-            bank: Bank::B,
-            boot_count: 1
-        }
-    );
-    assert_eq!(mgr.nv().read_boot_state().unwrap().banks[os].boot_count, 1);
+    // PRIMARY == SECONDARY: os=B, vm1=A — both committed.
+    seed_committed(&store, 7, &[("vm1", Bank::A), ("os", Bank::B)]);
 
     let actions = mgr.process_boot().unwrap();
     assert_eq!(
-        actions[os],
-        BootAction::TrialBoot {
-            bank: Bank::B,
-            boot_count: 2
-        }
+        actions,
+        [
+            selected("os", Bank::B, false),
+            selected("vm1", Bank::A, false)
+        ],
+        "one action per component, ascending id"
     );
-    assert_eq!(mgr.nv().read_boot_state().unwrap().banks[os].boot_count, 2);
-
-    // active_bank() still reports the booted (PRIMARY) trial bank.
-    assert_eq!(mgr.active_bank(slots::OS), Some(Bank::B));
 }
 
 #[test]
-fn selector_trial_and_committed_sets_are_independent() {
+fn selector_path_writes_no_nv() {
     let (mut mgr, store) = make_bootmgr_with_selector();
-    // host-os in trial (A floor, B booted); vm1 committed (A == A).
     store
-        .write_secondary(&signed_blob(
-            1,
-            &[(slots::OS, Bank::A), (slots::VM1, Bank::A)],
-        ))
+        .write_secondary(&signed_blob(1, &[("os", Bank::A)]))
+        .unwrap();
+    store
+        .write_primary(&signed_blob(2, &[("os", Bank::B)]))
+        .unwrap();
+
+    for _ in 0..=MAX_TRIAL_BOOTS + 1 {
+        let actions = mgr.process_boot().unwrap();
+        assert_eq!(actions, [selected("os", Bank::B, true)]);
+    }
+    assert!(
+        mgr.nv().read_boot_state().is_none(),
+        "no trial counting, no rollback"
+    );
+    assert_eq!(store.read_primary().unwrap().generation, 2);
+}
+
+#[test]
+fn selector_trial_and_committed_components_are_independent() {
+    let (mut mgr, store) = make_bootmgr_with_selector();
+    // os in trial (A floor, B booted); vm1 committed (A == A); vm2 sealed
+    // after the floor (absent from SECONDARY) is in trial too.
+    store
+        .write_secondary(&signed_blob(1, &[("os", Bank::A), ("vm1", Bank::A)]))
         .unwrap();
     store
         .write_primary(&signed_blob(
             2,
-            &[(slots::OS, Bank::B), (slots::VM1, Bank::A)],
+            &[("os", Bank::B), ("vm1", Bank::A), ("vm2", Bank::B)],
         ))
         .unwrap();
 
-    let os = slots::OS.as_index();
-    let vm1 = slots::VM1.as_index();
     let actions = mgr.process_boot().unwrap();
     assert_eq!(
-        actions[os],
-        BootAction::TrialBoot {
-            bank: Bank::B,
-            boot_count: 1
-        }
+        actions,
+        [
+            selected("os", Bank::B, true),
+            selected("vm1", Bank::A, false),
+            selected("vm2", Bank::B, true),
+        ]
     );
-    assert_eq!(actions[vm1], BootAction::Boot { bank: Bank::A });
-    // Only the trialed set's count moved.
-    let state = mgr.nv().read_boot_state().unwrap();
-    assert_eq!(state.banks[os].boot_count, 1);
-    assert_eq!(state.banks[vm1].boot_count, 0);
 }
 
 #[test]
-fn selector_global_rollback_after_max_trial_boots() {
-    let (mut mgr, store) = make_bootmgr_with_selector();
-    // SECONDARY floor host-os=A; PRIMARY booted host-os=B → trial.
-    store
-        .write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]))
-        .unwrap();
-    store
-        .write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]))
-        .unwrap();
-
-    let os = slots::OS.as_index();
-    // Boot MAX times — all trial.
-    for i in 1..=MAX_TRIAL_BOOTS {
-        let actions = mgr.process_boot().unwrap();
-        assert_eq!(
-            actions[os],
-            BootAction::TrialBoot {
-                bank: Bank::B,
-                boot_count: i
-            }
-        );
-    }
-
-    // Next boot exceeds the budget → GLOBAL rollback.
-    let actions = mgr.process_boot().unwrap();
-    assert_eq!(
-        actions[os],
-        BootAction::AutoRollback {
-            from: Bank::B,
-            to: Bank::A
-        }
-    );
-
-    // PRIMARY now equals SECONDARY (the signed floor copied verbatim).
-    let primary = store.read_primary().unwrap();
-    let secondary = store.read_secondary().unwrap();
-    assert_eq!(primary.selectors, secondary.selectors);
-    assert_eq!(primary.selectors[&slots::OS].bank, Bank::A);
-    // The copied PRIMARY verifies (it is the already-signed SECONDARY blob).
-    assert!(primary.is_valid(&TestSigner));
-    // The trialed set's boot_count was reset.
-    assert_eq!(mgr.nv().read_boot_state().unwrap().banks[os].boot_count, 0);
-
-    // Subsequent boots are committed on A (PRIMARY == SECONDARY now).
-    let actions = mgr.process_boot().unwrap();
-    assert_eq!(actions[os], BootAction::Boot { bank: Bank::A });
-    assert_eq!(mgr.active_bank(slots::OS), Some(Bank::A));
-}
-
-#[test]
-fn selector_global_rollback_reverts_every_trialed_set_at_once() {
-    let (mut mgr, store) = make_bootmgr_with_selector();
-    // Two sets in trial (host-os: A→B, vm2: A→B); vm1 committed (A==A).
-    let floor = [
-        (slots::OS, Bank::A),
-        (slots::VM1, Bank::A),
-        (slots::VM2, Bank::A),
-    ];
-    let booted = [
-        (slots::OS, Bank::B),
-        (slots::VM1, Bank::A),
-        (slots::VM2, Bank::B),
-    ];
-    store.write_secondary(&signed_blob(1, &floor)).unwrap();
-    store.write_primary(&signed_blob(2, &booted)).unwrap();
-
-    // Drive host-os to the brink (count == MAX) but leave vm2 lower, so the
-    // NEXT boot trips host-os over the budget and the GLOBAL rollback reverts
-    // vm2 too even though vm2 is well under its own budget. Seed the NV
-    // boot_counts directly (the selector path reads NV for the per-set counter).
-    let os = slots::OS.as_index();
-    let vm1 = slots::VM1.as_index();
-    let vm2 = slots::VM2.as_index();
-    let mut st = NvBootState::default();
-    st.banks[os].boot_count = MAX_TRIAL_BOOTS; // host-os one boot from rollback
-    st.banks[vm2].boot_count = 2; // vm2 nowhere near
-    mgr.nv_mut().write_boot_state(&mut st).unwrap();
-
-    let actions = mgr.process_boot().unwrap();
-    // host-os tripped the budget → both trialed sets roll back.
-    assert_eq!(
-        actions[os],
-        BootAction::AutoRollback {
-            from: Bank::B,
-            to: Bank::A
-        }
-    );
-    assert_eq!(actions[vm1], BootAction::Boot { bank: Bank::A }); // vm1 was committed
-    assert_eq!(
-        actions[vm2],
-        BootAction::AutoRollback {
-            from: Bank::B,
-            to: Bank::A
-        }
-    );
-
-    // Whole blob reverted; both trialed counts reset.
-    let primary = store.read_primary().unwrap();
-    assert_eq!(primary.selectors, sel_map(&floor));
-    let st = mgr.nv().read_boot_state().unwrap();
-    assert_eq!(st.banks[os].boot_count, 0);
-    assert_eq!(st.banks[vm2].boot_count, 0);
-}
-
-#[test]
-fn selector_auto_rollback_marks_committed() {
-    // NV as the OTA activation leaves it: the trial bank (B), uncommitted, one
-    // boot from the budget. The rollback must bring NV to the floor the node
-    // now boots, or component-mgr keeps reading B as the running bank.
+fn selector_without_secondary_is_all_trial() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     store
-        .write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]))
+        .write_primary(&signed_blob(1, &[("os", Bank::A)]))
         .unwrap();
-    store
-        .write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]))
-        .unwrap();
-    let os = slots::OS.as_index();
-    let mut st = NvBootState::default();
-    st.banks[os].active_bank = Bank::B;
-    st.banks[os].committed = false;
-    st.banks[os].boot_count = MAX_TRIAL_BOOTS;
-    mgr.nv_mut().write_boot_state(&mut st).unwrap();
 
     let actions = mgr.process_boot().unwrap();
-    assert_eq!(
-        actions[os],
-        BootAction::AutoRollback {
-            from: Bank::B,
-            to: Bank::A
-        }
-    );
-
-    let st = mgr.nv().read_boot_state().unwrap();
-    assert_eq!(st.banks[os].active_bank, Bank::A, "NV follows the floor");
-    assert!(st.banks[os].committed, "the reverted set is out of trial");
-    assert_eq!(st.banks[os].boot_count, 0);
-}
-
-#[test]
-fn selector_auto_rollback_with_failing_store_keeps_nv_in_trial() {
-    // Same setup as above, but the PRIMARY revert fails: PRIMARY still names
-    // the trial bank, so NV must not be marked committed or moved to the
-    // floor — the set keeps trialing and the next boot retries the revert.
-    let (mut mgr, store) = make_bootmgr_with_selector();
-    store
-        .write_secondary(&signed_blob(1, &[(slots::OS, Bank::A)]))
-        .unwrap();
-    store
-        .write_primary(&signed_blob(2, &[(slots::OS, Bank::B)]))
-        .unwrap();
-    let os = slots::OS.as_index();
-    let mut st = NvBootState::default();
-    st.banks[os].active_bank = Bank::B;
-    st.banks[os].committed = false;
-    st.banks[os].boot_count = MAX_TRIAL_BOOTS;
-    mgr.nv_mut().write_boot_state(&mut st).unwrap();
-
-    store.set_fail_writes(true);
-    let actions = mgr.process_boot().unwrap();
-    assert_eq!(
-        actions[os],
-        BootAction::TrialBoot {
-            bank: Bank::B,
-            boot_count: MAX_TRIAL_BOOTS + 1
-        }
-    );
-    assert_eq!(
-        store.read_primary().unwrap().selectors[&slots::OS].bank,
-        Bank::B
-    );
-    let st = mgr.nv().read_boot_state().unwrap();
-    assert_eq!(
-        st.banks[os].active_bank,
-        Bank::B,
-        "NV still names the trial"
-    );
-    assert!(!st.banks[os].committed, "NV not marked committed");
-    assert_eq!(st.banks[os].boot_count, MAX_TRIAL_BOOTS + 1);
-
-    // Once the store recovers, the next boot performs the revert.
-    store.set_fail_writes(false);
-    let actions = mgr.process_boot().unwrap();
-    assert_eq!(
-        actions[os],
-        BootAction::AutoRollback {
-            from: Bank::B,
-            to: Bank::A
-        }
-    );
-    assert!(mgr.nv().read_boot_state().unwrap().banks[os].committed);
+    assert_eq!(actions, [selected("os", Bank::A, true)]);
 }
 
 #[test]
@@ -886,39 +667,6 @@ fn selector_absent_primary_falls_back_to_nv() {
     assert_eq!(actions[0], BootAction::Boot { bank: Bank::A });
     assert!(store.read_primary().is_none());
 
-    // active_bank() falls back to NV when PRIMARY is absent.
+    // active_bank() is the NV bank.
     assert_eq!(mgr.active_bank(slots::OS), Some(Bank::A));
-}
-
-#[test]
-fn selector_set_not_in_map_uses_nv_logic() {
-    // PRIMARY carries only host-os; vm1 is NOT in the selector → vm1 follows
-    // its NV per-set state (here: NV trial on B), proving both authorities run
-    // side by side during the flip.
-    let (mut mgr, store) = make_bootmgr_with_selector();
-    seed_committed(&store, 3, &[(slots::OS, Bank::A)]);
-
-    // Initialize NV, then put vm1 into NV trial on B.
-    let os = slots::OS.as_index();
-    let vm1 = slots::VM1.as_index();
-    mgr.process_boot().unwrap();
-    let mut st = mgr.nv().read_boot_state().unwrap();
-    st.banks[vm1].active_bank = Bank::B;
-    st.banks[vm1].committed = false;
-    st.banks[vm1].boot_count = 0;
-    mgr.nv_mut().write_boot_state(&mut st).unwrap();
-
-    let actions = mgr.process_boot().unwrap();
-    // host-os from the selector (committed Boot A); vm1 from NV (trial B).
-    assert_eq!(actions[os], BootAction::Boot { bank: Bank::A });
-    assert_eq!(
-        actions[vm1],
-        BootAction::TrialBoot {
-            bank: Bank::B,
-            boot_count: 1
-        }
-    );
-    // active_bank: host-os selector-resolved, vm1 NV-resolved.
-    assert_eq!(mgr.active_bank(slots::OS), Some(Bank::A));
-    assert_eq!(mgr.active_bank(slots::VM1), Some(Bank::B));
 }

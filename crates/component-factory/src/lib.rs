@@ -497,7 +497,7 @@ pub fn resolve_bank_set_spec(
 /// Build a selector-aware `IvdBankProvider` mirroring the args
 /// `ComponentBackend` would feed its in-backend provider, plus a **write** clone
 /// of the shared boot selector from `deps` (an `Arc` clone — the provider's OTA
-/// path mutates it). Returns `None` when no selector is configured (the backend
+/// path mutates it), keyed in the boot vector by `component_id`. Returns `None` when no selector is configured (the backend
 /// then keeps its own NV/symlink-only provider — behaviour-preserving).
 ///
 /// Injected via [`component_mgr::backend::ComponentBackend::with_bank_provider`] LAST
@@ -530,7 +530,8 @@ fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
             deps.hsm_provider.clone(),
             None, // partition provider owns the write; no byte-copy activator
             Some(selector),
-        );
+        )
+        .with_component_id(component_id);
         let inner = match deps.hsm_crypto.clone() {
             Some(crypto) => inner.with_hsm_crypto(crypto),
             None => inner,
@@ -553,7 +554,8 @@ fn selector_aware_provider<D: BlockDevice + Send + Sync + 'static>(
         deps.hsm_provider.clone(),
         activator,
         Some(selector),
-    );
+    )
+    .with_component_id(component_id);
     // When a crypto-only HSM handle is configured (the host's link-B client),
     // the IVD `seal` runs its lone `sign` over `HsmCryptoProvider` instead of the
     // lifecycle-bearing `dyn HsmProvider`. `None` keeps the `hsm_provider` path.

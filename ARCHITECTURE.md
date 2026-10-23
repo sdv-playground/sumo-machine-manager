@@ -32,7 +32,8 @@ manager is one of the components it updates).
 the platform** — it reads the HSM + the raw boot vectors and starts the RT side,
 then the host OS. This codebase only (1) does the A/B software update of each bank,
 (2) writes the boot vectors, and (3) HSM-signs that data. The Rust `vm-boot` crate
-is a **dev/sim stand-in** for the bootloader, not the boot authority. The raw
+is the **reference reader** of the boot-stage contract (a dev/sim stand-in), not the
+boot authority. The raw
 on-medium boot-vector format + the C-side verify are pending the platform spec;
 until then the selector is a human-inspectable JSON store, with a real HSM signature.
 
@@ -176,9 +177,9 @@ The core update/diagnostics path:
   `selector` — the signed, generation-counted **boot-selector** primitives
   (`SelectorBlob`, `SelectorStore`, `Signer`) that a low crate like `vm-boot` can read
   without depending up.
-- **vm-boot** (`crates/boot`, bin+lib): boot-time decision logic for all bank sets.
-  Reads the **selector** (PRIMARY/SECONDARY) when present, else NV boot state; counts
-  trial boots; global (whole-blob) auto-rollback. Dev/sim stand-in for the C bootloader.
+- **vm-boot** (`crates/boot`, bin+lib): the reference reader of the boot-stage contract.
+  Reports the **boot vector** (PRIMARY/SECONDARY) per component when present; else runs
+  the NV boot-state path (per-slot trial counting + auto-rollback).
 - **machine-contract** (lib): the out-of-tree implementer's surface — the four
   synchronous bank seams (`BankProvider`, `BankActivator`, `Deactivator`,
   `ImageRecord`) + `ResetKind`, over `nv-store` + `serde` and nothing else (a
@@ -293,26 +294,58 @@ decrypt, decompression).
 The node has one signed boot record, the **selector**, that supersedes the original
 per-component NV boot state as the authority for "which bank each set boots from":
 
-- `SelectorBlob { generation: u64, selectors: BTreeMap<BankSet, Bank>, sha256, signature }`
-  (`nv-store::selector`). Two slots via `SelectorStore`: **PRIMARY** (booted) and
-  **SECONDARY** (rollback floor). A set is in trial iff `PRIMARY[set] != SECONDARY[set]`.
+- `SelectorBlob { generation: u64, entries: BTreeMap<String, ComponentEntry>, sha256,
+  signature, selectors: Option<…> }` (`nv-store::selector`) — the **boot vector**. Entries
+  are keyed by **component id**; each carries the component's `bank` and the images sealed
+  into that bank by part name (`ImageEntry { size, sha256 }`, possibly empty). Two slots
+  via `SelectorStore`: **PRIMARY** (booted) and **SECONDARY** (rollback floor). A component
+  is in trial iff its PRIMARY entry differs from its SECONDARY entry. One bank per
+  component is structural: the map holds exactly one entry per id.
+
+  ```json
+  {
+    "generation": 3,
+    "entries": {
+      "vm1": {
+        "bank": "B",
+        "images": {
+          "kernel": { "size": 4096, "sha256": "abab…ab" }
+        }
+      }
+    },
+    "sha256": "…",
+    "signature": "…"
+  }
+  ```
+
+  Canonical bytes under `sha256` (all integers little-endian): `u64 generation`, then per
+  entry in ascending id order `u16 id.len()`, id bytes, `u8 bank` (A=0, B=1),
+  `u16 images.len()`, then per image in ascending name order `u16 name.len()`, name bytes,
+  `u64 size`, 32 bytes sha256. The signature is over `sha256`.
+
+  The optional **legacy slot map** `selectors: { "<slot>": { "bank": "A" } }` is emitted
+  only by a `FileSelectorStore` built `with_legacy_slot_map(component id → slot)`, for a
+  boot stage that still reads the previous shape; it is outside the digest, never read
+  back, and goes away when no deployed boot stage needs it.
+- **The orchestrator decides.** The node stages, seals, commits and rolls back on the
+  orchestrator's verdicts; the boot stage only reads.
 - **Signed by the HSM** with `ivd-signing` (a `Signer` impl supplied by the host-manager
   process, where the HSM is reachable; verified at `SystemBankManager::load`).
-  Previously a `StubSigner` (empty signature) — now real ECDSA-P256. The on-medium store
-  is the file-backed JSON `FileSelectorStore` — a sim stand-in until the C/hardware
-  boot-vector spec lands.
-- `vm-boot` reads PRIMARY and drives the bank decision; trial/rollback is **global**
-  (whole-blob copy of SECONDARY over PRIMARY — vm-boot has no signer at boot so it can't
-  re-sign a per-set change).
+  Previously a `StubSigner` (empty signature) — now real ECDSA-P256. The store is the
+  file-backed JSON `FileSelectorStore` (pretty, one key per line) until a host store is
+  plugged in behind `SelectorStore`.
+- `vm-boot` is the reference reader: it reports each PRIMARY entry's bank and trial state
+  and writes nothing. The boot vector carries no slot, so it cannot drive the per-slot NV
+  trial counter; the NV path (no boot vector) keeps its trial counting + auto-rollback.
+- **Sumo has no opinion on component names or slot numbers** — both come from the host
+  profile.
 - **The store can fail.** `SelectorStore` writes return `Result`; `SystemBankManager`'s
   `seal` / `commit` / `rollback` persist first and move their in-memory view only on
   success, so memory never runs ahead of storage. A failed seal fails `activate`, which
   leaves NV unarmed. A failed commit or rollback verdict is reported to the orchestrator;
   NV is written before the boot vector, so NV is then one step ahead. A commit is safe to
   retry (NV folds an already-committed set into success); a rollback retry is refused by
-  NV as not-in-trial, so that gap closes only once the write order changes. A failed
-  auto-rollback write at boot leaves the set in trial in both the boot vector and NV, so
-  the next boot retries it.
+  NV as not-in-trial, so that gap closes only once the write order changes.
 - `BankSet` is a bare `pub struct BankSet(pub u8)` newtype — a slot *number*, nothing more.
   The library names no slot: a component's slot comes from its spec (`slot: N`, written by
   the platform profile), and what a slot holds is that profile's decision (a spec that still
@@ -331,8 +364,7 @@ flowchart LR
         CB -- dual-write floor --> NV[(NvBootState)]
     end
     subgraph boot["boot path (no signer available)"]
-        BL["bootloader (C, platform)<br/>or vm-boot (dev/sim)"] -- read PRIMARY --> SEL
-        BL -- trial count / auto-rollback<br/>copy SECONDARY over PRIMARY --> SEL
+        BL["boot stage (platform)<br/>or vm-boot (reference reader)"] -- read PRIMARY + SECONDARY --> SEL
         BL --> VS[vm-service<br/>pre-launch IVD verify]
     end
 ```
