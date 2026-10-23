@@ -72,11 +72,13 @@ spec; all are `x-`-namespaced.
 | Route | Method | Purpose |
 |---|---|---|
 | `/data/x-ota-update-state` | GET | node update-transaction state: `phase` ∈ Idle/Staging/RebootPending/Trial, `components`, `reboot_owed`, `rebooted_since_arming` — polled between campaign steps |
+| `/data/x-update-state` | GET | alias of `x-ota-update-state` plus `node_boot_id` (the node's current boot id, `null` when unknown) |
 | `/components/hsm/data/keys` | GET | HSM key-slot inventory (public metadata only) |
 | `/components/hsm/operations/x-csr/executions` | POST | generate a PKCS#10 CSR for a key slot |
 | `/components/hsm/x-ecu-id` | GET | ECU id = HSM device-key thumbprint (the token `aud`); `text/plain` |
 | `/operations/x-ota-commit-trials/executions` | POST | node-level commit of all in-trial banked components |
 | `/operations/x-ota-rollback-trials/executions` | POST | node-level rollback of in-trial components |
+| `/operations/x-update-verdict/executions` | POST | alias of commit-trials / rollback-trials; the verdict is in the body (`{"verdict": "commit"\|"rollback", "nonce"?: …}`, 422 for a missing/unknown word); result key `committed`\|`rolled_back` follows the verdict |
 | `/operations/x-ota-pull-update/executions` | POST | onboard pull-update (gateway mode); async 202 + poll |
 
 Residual concurrency limitation: the node commit/rollback routes serialize
@@ -104,6 +106,13 @@ orchestrator decides:
   process (`running_bank` is seeded from NV `active_bank`). The orchestrator must compare
   the installed manifest / running release; on hardware the bootloader's boot-status
   record is the durable answer.
+
+The node `x-update-verdict` operation is the same operation as `x-ota-commit-trials` /
+`x-ota-rollback-trials` (same fan-out, same lock, same 200/409/500 rules), with the verdict
+carried in the body; `x-update-state` is `x-ota-update-state` plus `node_boot_id`.
+The per-update `x-update.state` / `reset_kind` on the update status and
+`capabilities.x-update.verdict` are served by SOVDd (see `SOVDd/docs/x-update.md`), derived
+from this backend's activation state and `update_shape()`.
 
 A new flash is still refused while any `reboot_owed` bit is set or a component is in
 trial (one update transaction per ECU) — that is transaction integrity, not a verdict.

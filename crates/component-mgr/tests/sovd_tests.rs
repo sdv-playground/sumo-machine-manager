@@ -1359,3 +1359,47 @@ async fn commit_trials_resolves_both_components_after_one_coalesced_reboot() {
         assert!(bank.committed, "{set:?} committed in NV: {bank:?}");
     }
 }
+
+#[tokio::test]
+async fn x_update_verdict_resolves_both_components_after_one_coalesced_reboot() {
+    // The whole banked step end to end: flash BOTH components (the sibling open
+    // that used to 409), take ONE activation reboot, then ONE node commit-trials
+    // resolves the pair — the multi-component node verdict the engine issues.
+    let (router, nv, keys) = make_node_router();
+
+    flash_to_awaiting_verdict(
+        &router,
+        "vm1",
+        make_test_suit_envelope(&keys, "vm1", 2, &vec![0xBB; 2048]),
+    )
+    .await;
+    flash_to_awaiting_verdict(
+        &router,
+        "vm2",
+        make_test_suit_envelope(&keys, "vm2", 2, &vec![0xCC; 2048]),
+    )
+    .await;
+
+    for component in ["vm1", "vm2"] {
+        activation_reset(&router, component).await;
+    }
+
+    let (status, body) = post_json(
+        &router,
+        "/vehicle/v1/operations/x-update-verdict/executions",
+        serde_json::json!({"verdict": "commit"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "x-update-verdict: {body}");
+    let committed = body["result"]["committed"].as_array().unwrap();
+    assert!(
+        committed.contains(&serde_json::json!("vm1"))
+            && committed.contains(&serde_json::json!("vm2")),
+        "one node verdict must resolve the whole step: {body}"
+    );
+
+    for set in [slots::VM1, slots::VM2] {
+        let bank = bank_state(&nv, set);
+        assert!(bank.committed, "{set:?} committed in NV: {bank:?}");
+    }
+}
