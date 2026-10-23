@@ -1415,6 +1415,7 @@ fn seal_test_bank(
     id: &str,
     bank: Bank,
     files: &[(&str, &[u8])],
+    install_boot_id: Option<&str>,
 ) {
     let dir = images
         .join(id)
@@ -1423,13 +1424,33 @@ fn seal_test_bank(
     for (name, bytes) in files {
         std::fs::write(dir.join(name), bytes).unwrap();
     }
-    hsm::ivd::sign_bank_crypto(crypto, &dir, 1, hsm::ivd::IvdIdentity::default()).unwrap();
+    hsm::ivd::sign_bank_crypto_at(
+        crypto,
+        &dir,
+        1,
+        hsm::ivd::IvdIdentity::default(),
+        install_boot_id,
+    )
+    .unwrap();
+}
+
+/// Bank activator that needs a node reset to apply an activated bank.
+struct NodeResetActivator;
+impl machine_mgr::BankActivator for NodeResetActivator {
+    fn activate(&self, _dir: &Path) -> Result<(), machine_mgr::BankActivatorError> {
+        Ok(())
+    }
+    fn reset_kind(&self) -> machine_mgr::ResetKind {
+        machine_mgr::ResetKind::RequiresEcuReset
+    }
 }
 
 /// A node with vm1 + vm2 over on-disk `IvdBankProvider`s, served through
-/// `update_state_router`. vm1: bank A sealed with two files, bank B empty.
-/// vm2: both banks sealed. `selector` is attached to both providers when
-/// given. Hands back the tempdir to keep it alive.
+/// `update_state_router`, running in node boot "boot-a". vm1 (local reset):
+/// bank A sealed with two files in "boot-a", bank B empty. vm2 (node reset):
+/// bank A sealed in "boot-a", bank B sealed with no boot id. `selector` is
+/// attached to both providers when given. Hands back the tempdir to keep it
+/// alive.
 fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, tempfile::TempDir) {
     let keys = generate_test_keys();
     let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
@@ -1451,9 +1472,24 @@ fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, 
         "vm1",
         Bank::A,
         &[("kernel", b"kernel-a"), ("rootfs", b"rootfs-a-bytes")],
+        Some("boot-a"),
     );
-    seal_test_bank(&crypto, &images, "vm2", Bank::A, &[("kernel", b"vm2-a")]);
-    seal_test_bank(&crypto, &images, "vm2", Bank::B, &[("kernel", b"vm2-bb")]);
+    seal_test_bank(
+        &crypto,
+        &images,
+        "vm2",
+        Bank::A,
+        &[("kernel", b"vm2-a")],
+        Some("boot-a"),
+    );
+    seal_test_bank(
+        &crypto,
+        &images,
+        "vm2",
+        Bank::B,
+        &[("kernel", b"vm2-bb")],
+        None,
+    );
 
     let coord = Arc::new(NodeCoordinator::new(vec![
         (slots::VM1.as_index(), "vm1".to_string()),
@@ -1468,16 +1504,21 @@ fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, 
         status: None,
     });
     for (id, set) in [("vm1", slots::VM1), ("vm2", slots::VM2)] {
-        let provider = Arc::new(IvdBankProvider::new(
-            nv.clone(),
-            set,
-            false,
-            Some(images.clone()),
-            id.into(),
-            None,
-            None,
-            selector.clone(),
-        ));
+        let activator: Option<Arc<dyn machine_mgr::BankActivator>> =
+            (id == "vm2").then(|| Arc::new(NodeResetActivator) as _);
+        let provider = Arc::new(
+            IvdBankProvider::new(
+                nv.clone(),
+                set,
+                false,
+                Some(images.clone()),
+                id.into(),
+                None,
+                activator,
+                selector.clone(),
+            )
+            .with_node_boot_id(Some("boot-a".to_string())),
+        );
         let backend = Arc::new(
             ComponentBackend::new(
                 set,
@@ -1520,6 +1561,9 @@ async fn update_state_reports_bank_contents_per_component() {
     assert!(is_sha256_hex(&images["rootfs"]["sha256"]));
     assert_eq!(vm1["inactive"], serde_json::Value::Null);
     assert_eq!(vm1["in_trial"], false);
+    // Sealed in the running boot, but a local-reset component owes no node reset.
+    assert_eq!(vm1["active"]["install_boot_id"], "boot-a");
+    assert_eq!(vm1["pending_reset"], false);
 
     let vm2 = &banks[1];
     assert_eq!(vm2["id"], "vm2");
@@ -1531,6 +1575,10 @@ async fn update_state_reports_bank_contents_per_component() {
         &vm2["inactive"]["images"]["kernel"]["sha256"]
     ));
     assert_eq!(vm2["in_trial"], false);
+    // A node-reset component whose active bank was sealed in the running boot.
+    assert_eq!(vm2["active"]["install_boot_id"], "boot-a");
+    assert_eq!(vm2["inactive"]["install_boot_id"], serde_json::Value::Null);
+    assert_eq!(vm2["pending_reset"], true);
 
     // The x-ota alias serves the identical body.
     let (_, ota) = get(&router, "/vehicle/v1/data/x-ota-update-state").await;

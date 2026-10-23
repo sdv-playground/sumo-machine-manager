@@ -88,6 +88,10 @@ impl InstalledFirmware {
 pub struct BankContents {
     pub bank: Bank,
     pub images: BTreeMap<String, ImageEntry>,
+    /// The node boot id the bank was sealed in, as its installed manifest
+    /// records it. `None` when the manifest predates the field, the node had
+    /// no boot id, or there is no readable manifest.
+    pub install_boot_id: Option<String>,
 }
 
 /// Installed contents of each bank of one component, plus whether it is in a
@@ -102,6 +106,12 @@ pub struct ComponentBanks {
     pub inactive: Option<BankContents>,
     /// Whether the component runs a not-yet-committed install.
     pub in_trial: bool,
+    /// The newly installed content needs a node reset that has not happened
+    /// yet: the component's reset kind is `RequiresEcuReset` and the active
+    /// bank's `install_boot_id` is `Some` and equal to the node's current boot
+    /// id (also `Some`). Anything else, including an unknown boot id on
+    /// either side, is `false`.
+    pub pending_reset: bool,
 }
 
 /// Errors from [`BankProvider`] operations.

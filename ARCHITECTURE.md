@@ -481,6 +481,12 @@ The node-level `x-update-state` (alias `x-ota-update-state`) also reports, per c
 what each bank holds as `banks` (active / inactive bank with per-image size + SHA-256 from
 the installed manifests, plus `in_trial`), so an orchestrator can compare the inactive bank
 with its intent and download only what differs.
+The installed manifest also records `install_boot_id`, the node boot id current when the
+bank was sealed. It is covered by the manifest signature; `IVD_MANIFEST_VERSION` is
+unchanged because the key is optional, and a manifest sealed before it existed reads as
+unknown. `banks` reports it per bank and derives `pending_reset` from it: a component that
+needs a node reset, whose active bank was sealed in the boot still running, still waits for
+that reset.
 
 ## VM launch (vm-service)
 
