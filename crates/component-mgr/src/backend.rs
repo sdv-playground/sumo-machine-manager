@@ -12795,7 +12795,14 @@ mod copy_forward_tests {
         nv.write_boot_state(&mut boot).unwrap();
         let nv = Arc::new(Mutex::new(nv));
 
-        let (hsm, crypto, keystore) = provisioned_hsm("banked-owed");
+        // One keystore dir per caller: the two tests that share this helper run
+        // in parallel, and a shared path lets one test's setup or cleanup delete
+        // the other's keys mid-write.
+        let tag = match node_boot_id {
+            Some(_) => "banked-owed-armed",
+            None => "banked-owed",
+        };
+        let (hsm, crypto, keystore) = provisioned_hsm(tag);
         let backend = ComponentBackend::with_options(
             slots::VM1,
             nv.clone(),
