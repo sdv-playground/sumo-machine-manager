@@ -6,7 +6,7 @@ use crate::types::{
     Capabilities, Csr, DidFilter, DidKind, DtcFilter, EnvelopeStream, FlashId, FlashSession,
     InstallSource, KeyInventory, RuntimeState,
 };
-use crate::{ActivationState, ClearFaultsResult, Fault, FlashStatus};
+use crate::{ActivationState, ClearFaultsResult, ComponentBanks, Fault, FlashStatus};
 use nv_store::types::BankSet;
 
 /// One independently-updatable thing on the machine: the host OS, a guest VM,
@@ -30,6 +30,13 @@ pub trait Component: Send + Sync {
     /// boolean phase still holds; it just can't name them). See
     /// [`node_update`](crate::node_update).
     fn bank_set(&self) -> Option<BankSet> {
+        None
+    }
+
+    /// Installed contents of each of this component's banks, for status
+    /// reporting (see [`BankProvider::banks`](crate::BankProvider::banks)).
+    /// `None` for components that do not report bank contents.
+    fn banks(&self) -> Option<ComponentBanks> {
         None
     }
 

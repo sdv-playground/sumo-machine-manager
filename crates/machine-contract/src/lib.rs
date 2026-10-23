@@ -67,7 +67,8 @@ pub mod wall_clock_floor;
 
 pub use bank_activator::{BankActivator, BankActivatorError};
 pub use bank_provider::{
-    BankError, BankProvider, FirmwareIdentity, InstalledFile, InstalledFirmware,
+    BankContents, BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFile,
+    InstalledFirmware,
 };
 pub use deactivator::{DeactivateError, DeactivateOutcome, Deactivator};
 pub use floor_sink::{FloorSink, NoopFloorSink};

@@ -29,7 +29,8 @@ use nv_store::store::NvStore;
 use nv_store::types::{Bank, BankSet};
 
 use machine_mgr::bank_provider::{
-    BankError, BankProvider, FirmwareIdentity, InstalledFile, InstalledFirmware,
+    BankContents, BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFile,
+    InstalledFirmware,
 };
 use machine_mgr::{ImageEntry, ResetKind};
 
@@ -154,11 +155,12 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         self
     }
 
-    /// The images sealed into `bank`, by part name, for its boot-vector entry:
-    /// size + SHA-256 from the bank's signed manifest (read without an HSM
-    /// check, like [`read_installed`](BankProvider::read_installed), which
-    /// carries no size). The disable record is not an image. Empty when the
-    /// bank has no readable manifest (in-memory test backends).
+    /// The images sealed into `bank`, by part name, for its boot-vector entry
+    /// and the [`banks`](BankProvider::banks) status report: size + SHA-256
+    /// from the bank's signed manifest (read without an HSM check, like
+    /// [`read_installed`](BankProvider::read_installed), which carries no
+    /// size). The disable record is not an image. Empty when the bank has no
+    /// readable manifest (in-memory test backends, a never-flashed bank).
     fn sealed_images(&self, bank: Bank) -> BTreeMap<String, ImageEntry> {
         let manifest = self
             .target_bank_dir(bank)
@@ -188,7 +190,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
                     component = %self.component_id,
                     bank = ?bank,
                     error = %e,
-                    "no sealed manifest — boot-vector entry carries no images"
+                    "no sealed manifest — no images recorded for this bank"
                 );
                 BTreeMap::new()
             }
@@ -946,6 +948,45 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             .as_ref()
             .map(|a| a.reset_kind())
             .unwrap_or(ResetKind::Local)
+    }
+
+    fn banks(&self) -> Option<ComponentBanks> {
+        // Unverified manifest reads only (`sealed_images`): this backs a status
+        // poll, so it reports what each bank records, never re-hashes payloads.
+        let active = self.active_bank();
+        let inactive = if self.single_bank {
+            None
+        } else {
+            let other = active.other();
+            let images = self.sealed_images(other);
+            (!images.is_empty()).then_some(BankContents {
+                bank: other,
+                images,
+            })
+        };
+        // With a boot vector attached, trial is structural: this component's
+        // booted entry differs from its committed floor. Without one, the NV
+        // committed flag for the set (the source `node_in_trial_labels` reads).
+        let in_trial = match &self.selector {
+            Some(sel) => sel
+                .read()
+                .expect("selector poisoned")
+                .component_in_trial(&self.component_id),
+            None => self
+                .nv
+                .lock()
+                .ok()
+                .and_then(|nv| nv.read_boot_state())
+                .is_some_and(|s| !s.banks[self.bank_set.as_index()].committed),
+        };
+        Some(ComponentBanks {
+            active: BankContents {
+                bank: active,
+                images: self.sealed_images(active),
+            },
+            inactive,
+            in_trial,
+        })
     }
 }
 

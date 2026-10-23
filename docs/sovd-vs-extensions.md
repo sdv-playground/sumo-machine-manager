@@ -81,6 +81,18 @@ spec; all are `x-`-namespaced.
 | `/operations/x-update-verdict/executions` | POST | alias of commit-trials / rollback-trials; the verdict is in the body (`{"verdict": "commit"\|"rollback", "nonce"?: …}`, 422 for a missing/unknown word); result key `committed`\|`rolled_back` follows the verdict |
 | `/operations/x-ota-pull-update/executions` | POST | onboard pull-update (gateway mode); async 202 + poll |
 
+Both update-state routes also carry `banks`: one entry per component that reports bank
+contents, `{id, active, inactive, in_trial}`. `active` is the bank the component boots from
+(the boot vector's selection when one is attached) with its `images` (part name →
+`{size, sha256}`, sha256 lowercase hex; empty when the bank has no readable manifest).
+`inactive` is the other bank in the same shape, `null` for a single-bank component or when
+the other bank has no installed manifest. `in_trial` is true while the component runs a
+not-yet-committed install: with a boot vector, its booted entry differs from its committed
+entry; without one, its bank set is not committed. The images come from the installed
+manifests as recorded at install time, read without signature check or payload hashing; this
+is a report, not a verification. Intended use: after any reboot the orchestrator compares
+`inactive` with its intended release and downloads only the images that differ.
+
 Residual concurrency limitation: the node commit/rollback routes serialize
 against each other inside sumo-mm, but SOVDd's component-level verdict routes do
 not share that mutex. Closing that cross-route TOCTOU window requires a shared

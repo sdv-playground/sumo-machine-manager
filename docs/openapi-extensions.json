@@ -635,6 +635,77 @@
   },
   "components": {
     "schemas": {
+      "BankContentsResponse": {
+        "type": "object",
+        "description": "What one bank holds, by part name, as its installed manifest records it.",
+        "required": [
+          "bank",
+          "images"
+        ],
+        "properties": {
+          "bank": {
+            "type": "string",
+            "description": "`\"A\"` or `\"B\"`."
+          },
+          "images": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/BankImageResponse"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "BankImageResponse": {
+        "type": "object",
+        "description": "One installed image: its size in bytes and SHA-256 (lowercase hex).",
+        "required": [
+          "size",
+          "sha256"
+        ],
+        "properties": {
+          "sha256": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ComponentBanksResponse": {
+        "type": "object",
+        "description": "One component's entry in the `banks` member: the active bank\nand, for a two-bank component whose other bank holds an installed manifest,\nthe inactive one; `in_trial` = the component runs a not-yet-committed\ninstall. An orchestrator compares `inactive` with its intent and downloads\nonly the images that differ.",
+        "required": [
+          "id",
+          "active",
+          "in_trial"
+        ],
+        "properties": {
+          "active": {
+            "$ref": "#/components/schemas/BankContentsResponse"
+          },
+          "id": {
+            "type": "string"
+          },
+          "in_trial": {
+            "type": "boolean"
+          },
+          "inactive": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BankContentsResponse"
+              }
+            ]
+          }
+        }
+      },
       "CsrRequest": {
         "type": "object",
         "description": "Body of the `x-csr` operation: which key slot to generate a CSR for.",
@@ -820,13 +891,20 @@
       },
       "UpdateStateResponse": {
         "type": "object",
-        "description": "The `x-ota-update-state` resource body — the node's update-transaction\nphase plus the component ids the transaction covers. `reboot_owed`:\ncomponents whose arming requires the node reboot and whose trial is\nunresolved; `rebooted_since_arming`: whether the node boot id has changed\nsince that arming (null = unknown); `node_boot_id`: the node's current boot\nid (null = unknown).",
+        "description": "The `x-ota-update-state` resource body — the node's update-transaction\nphase plus the component ids the transaction covers. `reboot_owed`:\ncomponents whose arming requires the node reboot and whose trial is\nunresolved; `rebooted_since_arming`: whether the node boot id has changed\nsince that arming (null = unknown); `node_boot_id`: the node's current boot\nid (null = unknown); `banks`: what each component's banks hold, per the\ninstalled manifests (not a verification).",
         "required": [
           "phase",
           "components",
-          "reboot_owed"
+          "reboot_owed",
+          "banks"
         ],
         "properties": {
+          "banks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ComponentBanksResponse"
+            }
+          },
           "components": {
             "type": "array",
             "items": {

@@ -70,6 +70,9 @@ there."
     ),
     components(schemas(
         super::routes::UpdateStateResponse,
+        super::routes::ComponentBanksResponse,
+        super::routes::BankContentsResponse,
+        super::routes::BankImageResponse,
         super::routes::HsmKeyEntry,
         super::routes::HsmKeysResponse,
         super::routes::CsrRequest,

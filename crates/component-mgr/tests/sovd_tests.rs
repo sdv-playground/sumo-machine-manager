@@ -17,8 +17,8 @@ use tower::ServiceExt;
 use machine_mgr::bank_provider::BankProvider;
 use machine_mgr::node_update::NodeCoordinator;
 use machine_mgr::{
-    DeactivateError, DeactivateOutcome, Deactivator, EntityInfo, InMemorySelectorStore,
-    MachineRegistry, SharedSystemBankState, SystemBankManager, TestSigner,
+    DeactivateError, DeactivateOutcome, Deactivator, EntityInfo, FileSelectorStore, ImageEntry,
+    InMemorySelectorStore, MachineRegistry, SharedSystemBankState, SystemBankManager, TestSigner,
 };
 use nv_store::block::MemBlockDevice;
 use nv_store::slots;
@@ -1402,4 +1402,186 @@ async fn x_update_verdict_resolves_both_components_after_one_coalesced_reboot() 
         let bank = bank_state(&nv, set);
         assert!(bank.committed, "{set:?} committed in NV: {bank:?}");
     }
+}
+
+// --- x-update-state `banks` member ---
+
+/// Write `files` (name, bytes) into `images/<id>/<bank_x>` and sign an IVD
+/// manifest over them with the test keystore's IVD key.
+fn seal_test_bank(
+    crypto: &dyn hsm::HsmCryptoProvider,
+    images: &Path,
+    id: &str,
+    bank: Bank,
+    files: &[(&str, &[u8])],
+) {
+    let dir = images
+        .join(id)
+        .join(component_mgr::bank_provider::bank_dir_name(bank));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, bytes) in files {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    hsm::ivd::sign_bank_crypto(crypto, &dir, 1, hsm::ivd::IvdIdentity::default()).unwrap();
+}
+
+/// A node with vm1 + vm2 over on-disk `IvdBankProvider`s, served through
+/// `update_state_router`. vm1: bank A sealed with two files, bank B empty.
+/// vm2: both banks sealed. `selector` is attached to both providers when
+/// given. Hands back the tempdir to keep it alive.
+fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, tempfile::TempDir) {
+    let keys = generate_test_keys();
+    let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
+    suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
+    let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
+
+    let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+    let mut boot_state = NvBootState::default();
+    nv.write_boot_state(&mut boot_state).unwrap();
+    let nv = Arc::new(Mutex::new(nv));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ks = provisioned_keystore(tmp.path());
+    let crypto = hsm_sim_backend::SimHsm::new(ks.clone());
+    let images = tmp.path().join("images");
+    seal_test_bank(
+        &crypto,
+        &images,
+        "vm1",
+        Bank::A,
+        &[("kernel", b"kernel-a"), ("rootfs", b"rootfs-a-bytes")],
+    );
+    seal_test_bank(&crypto, &images, "vm2", Bank::A, &[("kernel", b"vm2-a")]);
+    seal_test_bank(&crypto, &images, "vm2", Bank::B, &[("kernel", b"vm2-bb")]);
+
+    let coord = Arc::new(NodeCoordinator::new(vec![
+        (slots::VM1.as_index(), "vm1".to_string()),
+        (slots::VM2.as_index(), "vm2".to_string()),
+    ]));
+    let mut machine = MachineRegistry::builder(EntityInfo {
+        id: "vehicle".into(),
+        name: "vehicle".into(),
+        entity_type: "vehicle".into(),
+        description: None,
+        href: "/vehicle/v1".into(),
+        status: None,
+    });
+    for (id, set) in [("vm1", slots::VM1), ("vm2", slots::VM2)] {
+        let provider = Arc::new(IvdBankProvider::new(
+            nv.clone(),
+            set,
+            false,
+            Some(images.clone()),
+            id.into(),
+            None,
+            None,
+            selector.clone(),
+        ));
+        let backend = Arc::new(
+            ComponentBackend::new(
+                set,
+                nv.clone(),
+                manifest_provider.clone(),
+                ComponentConfig::default(),
+            )
+            .with_id(id.to_string())
+            .with_bank_provider(provider),
+        );
+        machine = machine.with(ComponentAdapter::new(backend));
+    }
+
+    let router =
+        component_mgr::sovd::routes::update_state_router(nv, coord, Arc::new(machine.build()));
+    (router, tmp)
+}
+
+fn is_sha256_hex(v: &serde_json::Value) -> bool {
+    v.as_str()
+        .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+#[tokio::test]
+async fn update_state_reports_bank_contents_per_component() {
+    let (router, _tmp) = make_banks_router(None);
+    let (status, body) = get(&router, "/vehicle/v1/data/x-update-state").await;
+    assert_eq!(status, StatusCode::OK);
+    let banks = body["banks"].as_array().expect("banks array");
+    assert_eq!(banks.len(), 2);
+
+    let vm1 = &banks[0];
+    assert_eq!(vm1["id"], "vm1");
+    assert_eq!(vm1["active"]["bank"], "A");
+    let images = vm1["active"]["images"].as_object().unwrap();
+    assert_eq!(images.len(), 2);
+    assert_eq!(images["kernel"]["size"], 8);
+    assert_eq!(images["rootfs"]["size"], 14);
+    assert!(is_sha256_hex(&images["kernel"]["sha256"]));
+    assert!(is_sha256_hex(&images["rootfs"]["sha256"]));
+    assert_eq!(vm1["inactive"], serde_json::Value::Null);
+    assert_eq!(vm1["in_trial"], false);
+
+    let vm2 = &banks[1];
+    assert_eq!(vm2["id"], "vm2");
+    assert_eq!(vm2["active"]["bank"], "A");
+    assert_eq!(vm2["active"]["images"]["kernel"]["size"], 5);
+    assert_eq!(vm2["inactive"]["bank"], "B");
+    assert_eq!(vm2["inactive"]["images"]["kernel"]["size"], 6);
+    assert!(is_sha256_hex(
+        &vm2["inactive"]["images"]["kernel"]["sha256"]
+    ));
+    assert_eq!(vm2["in_trial"], false);
+
+    // The x-ota alias serves the identical body.
+    let (_, ota) = get(&router, "/vehicle/v1/data/x-ota-update-state").await;
+    assert_eq!(ota, body);
+}
+
+#[tokio::test]
+async fn update_state_in_trial_follows_boot_vector() {
+    // Boot vector in a file store: committed floor has vm1 + vm2 on A; the
+    // booted selection moves vm1 to B (with images), vm2 unchanged.
+    let tmp = tempfile::tempdir().unwrap();
+    let store_dir = tmp.path().join("selector");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    {
+        let mut m = SystemBankManager::load(
+            Box::new(FileSelectorStore::new(&store_dir)),
+            Box::new(TestSigner),
+        );
+        m.stage("vm1", Bank::A, Default::default());
+        m.stage("vm2", Bank::A, Default::default());
+        m.seal().unwrap();
+        m.commit().unwrap();
+        let images = [(
+            "kernel".to_string(),
+            ImageEntry {
+                size: 8,
+                sha256: [0x11; 32],
+            },
+        )]
+        .into_iter()
+        .collect();
+        m.stage("vm1", Bank::B, images);
+        m.seal().unwrap();
+    }
+    let selector: SharedSystemBankState =
+        Arc::new(std::sync::RwLock::new(SystemBankManager::load(
+            Box::new(FileSelectorStore::new(&store_dir)),
+            Box::new(TestSigner),
+        )));
+
+    let (router, _banks_tmp) = make_banks_router(Some(selector));
+    let (status, body) = get(&router, "/vehicle/v1/data/x-update-state").await;
+    assert_eq!(status, StatusCode::OK);
+    let banks = body["banks"].as_array().expect("banks array");
+
+    let vm1 = &banks[0];
+    assert_eq!(vm1["id"], "vm1");
+    assert_eq!(vm1["active"]["bank"], "B");
+    assert_eq!(vm1["inactive"]["bank"], "A");
+    assert_eq!(vm1["in_trial"], true);
+
+    let vm2 = &banks[1];
+    assert_eq!(vm2["id"], "vm2");
+    assert_eq!(vm2["in_trial"], false);
 }

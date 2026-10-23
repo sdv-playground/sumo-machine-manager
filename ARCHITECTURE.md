@@ -436,6 +436,10 @@ signature for re-verification), and each component's update-mode as
 reset_kind}`, readable even pre-flash). Both are served from component-mgr's `read_data` hook
 over the SOVD server's generic vendor-parameter wire — **all `x-*` vendor surface
 is owned by this codebase**, keeping the SOVD server layer itself vendor-free.
+The node-level `x-update-state` (alias `x-ota-update-state`) also reports, per component,
+what each bank holds as `banks` (active / inactive bank with per-image size + SHA-256 from
+the installed manifests, plus `in_trial`), so an orchestrator can compare the inactive bank
+with its intent and download only what differs.
 
 ## VM launch (vm-service)
 

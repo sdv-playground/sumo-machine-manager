@@ -47,7 +47,9 @@ use std::sync::Arc;
 use nv_store::block::BlockDevice;
 use nv_store::types::Bank;
 
-use machine_mgr::bank_provider::{BankError, BankProvider, FirmwareIdentity, InstalledFirmware};
+use machine_mgr::bank_provider::{
+    BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFirmware,
+};
 use machine_mgr::{ImageRecord, ResetKind};
 
 use crate::bank_provider::{firmware_to_ivd_identity, IvdBankProvider};
@@ -267,6 +269,10 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
     }
     fn disabled_record(&self, bank: Bank) -> Result<Option<u64>, BankError> {
         self.inner.disabled_record(bank)
+    }
+    fn banks(&self) -> Option<ComponentBanks> {
+        // The IVD manifests live in the metadata dir exactly as for a file bank.
+        self.inner.banks()
     }
     fn reset_kind(&self) -> ResetKind {
         // A raw partition takes effect only after the node reboots + the
