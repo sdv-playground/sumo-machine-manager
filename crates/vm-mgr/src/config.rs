@@ -154,15 +154,24 @@ pub struct VmDefinition {
     /// Target architecture (default: aarch64).
     #[serde(default)]
     pub arch: Option<String>,
+    /// QEMU machine type override. If unset, uses the architecture default.
+    #[serde(default)]
+    pub machine: Option<String>,
     /// Number of virtual CPUs (default: 4).
     #[serde(default = "default_cpus")]
     pub cpus: u32,
     /// RAM in MB (default: 2048).
     #[serde(default = "default_ram")]
     pub ram_mb: u32,
-    /// CPU model override. If unset, uses arch default.
+    /// CPU model override. When set, it takes precedence over KVM host passthrough and must be
+    /// supported by the selected accelerator. If unset, uses `host` with KVM or the
+    /// architecture default.
     #[serde(default)]
     pub cpu_model: Option<String>,
+    /// Optional absolute path for QEMU serial output. When set, the display and
+    /// monitor are disabled and the guest serial console is written to this path.
+    #[serde(default)]
+    pub serial_log: Option<PathBuf>,
     /// Bank-set base for this VM's kernel + rootfs (e.g.
     /// `/var/lib/vms/vm1`) — the parent the `bank_a` / `bank_b` dirs
     /// live under.
@@ -670,9 +679,11 @@ mod tests {
             backend: BackendType::Dummy,
             os_type: OsType::Linux,
             arch: None,
+            machine: None,
             cpus: 4,
             ram_mb: 2048,
             cpu_model: None,
+            serial_log: None,
             image_dir: PathBuf::from("/tmp/test"),
             bank: None,
             images: ImagePaths {

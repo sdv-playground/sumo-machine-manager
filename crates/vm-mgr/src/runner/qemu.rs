@@ -168,21 +168,39 @@ impl QemuRunner {
         ivshmem_sockets: &IvshmemSockets,
     ) -> Result<Vec<String>, RunnerError> {
         let arch = def.arch();
-        let mut args: Vec<String> = Vec::new();
         let use_kvm = self.try_kvm && arch.kvm_available();
+        self.build_qemu_args_with_kvm(name, def, ivshmem_sockets, use_kvm)
+    }
 
-        let cpu = if use_kvm {
-            "host".to_string()
-        } else {
-            def.cpu_model
-                .clone()
-                .unwrap_or_else(|| arch.default_cpu().to_string())
-        };
+    fn build_qemu_args_with_kvm(
+        &self,
+        name: &str,
+        def: &VmDefinition,
+        ivshmem_sockets: &IvshmemSockets,
+        use_kvm: bool,
+    ) -> Result<Vec<String>, RunnerError> {
+        let arch = def.arch();
+        let mut args: Vec<String> = Vec::new();
+
+        // A configured model is an explicit compatibility choice and applies
+        // with KVM as well as TCG. Keep host passthrough as the default when
+        // KVM is available; otherwise use the architecture default.
+        let cpu = def.cpu_model.clone().unwrap_or_else(|| {
+            if use_kvm {
+                "host".to_string()
+            } else {
+                arch.default_cpu().to_string()
+            }
+        });
+        let machine = def
+            .machine
+            .clone()
+            .unwrap_or_else(|| arch.machine_type().to_string());
 
         args.extend_from_slice(&[
             self.resolve_qemu_bin(arch),
             "-machine".into(),
-            arch.machine_type().into(),
+            machine,
             "-cpu".into(),
             cpu,
         ]);
@@ -196,9 +214,32 @@ impl QemuRunner {
             format!("{}M", def.ram_mb),
             "-smp".into(),
             def.cpus.to_string(),
-            "-nographic".into(),
-            "-no-reboot".into(),
         ]);
+        if let Some(serial_log_path) = &def.serial_log {
+            let serial_log = serial_log_path.to_string_lossy();
+            if !serial_log_path.is_absolute()
+                || serial_log.is_empty()
+                || serial_log
+                    .chars()
+                    .any(|character| matches!(character, ',' | '\n' | '\r'))
+            {
+                return Err(RunnerError::Config(
+                    "serial_log must be an absolute non-empty path without commas or newlines"
+                        .into(),
+                ));
+            }
+            args.extend_from_slice(&[
+                "-display".into(),
+                "none".into(),
+                "-monitor".into(),
+                "none".into(),
+                "-serial".into(),
+                format!("file:{serial_log}"),
+            ]);
+        } else {
+            args.push("-nographic".into());
+        }
+        args.push("-no-reboot".into());
 
         // QMP socket for vCPU pause/resume (simulation stepping)
         let qmp_sock = format!("/tmp/vm-svc-{name}-qmp.sock");
@@ -703,6 +744,44 @@ impl Drop for QemuRunner {
 mod tests {
     use super::*;
 
+    fn qnx_x86_definition() -> VmDefinition {
+        VmDefinition {
+            display_name: Some("VM1".into()),
+            backend: BackendType::Qemu,
+            os_type: OsType::Qnx,
+            arch: Some("x86_64".into()),
+            machine: None,
+            cpus: 2,
+            ram_mb: 2048,
+            cpu_model: None,
+            serial_log: None,
+            image_dir: PathBuf::from("/tmp/vm1"),
+            bank: None,
+            images: ImagePaths {
+                kernel: Some("kernel".into()),
+                rootfs: Some("rootfs.img".into()),
+            },
+            devices: Vec::new(),
+            disks: Vec::new(),
+            partitions: Vec::new(),
+            health: None,
+            shutdown: None,
+            extra_cmdline: None,
+            sim_dir: None,
+            process_command: None,
+            process_args: Vec::new(),
+            qvm_config: None,
+            auto_start: false,
+        }
+    }
+
+    fn option_value<'a>(args: &'a [String], option: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|arg| arg == option)
+            .and_then(|index| args.get(index + 1))
+            .map(String::as_str)
+    }
+
     #[test]
     fn qnx_x86_gets_virtio_net_compatibility_features() {
         assert_eq!(
@@ -715,5 +794,69 @@ mod tests {
     fn other_guest_profiles_keep_default_virtio_net_features() {
         assert_eq!(virtio_net_compat_features(OsType::Linux, Arch::X86_64), "");
         assert_eq!(virtio_net_compat_features(OsType::Qnx, Arch::Aarch64), "");
+    }
+
+    #[test]
+    fn configured_qemu_options_apply_with_kvm() {
+        let mut def = qnx_x86_definition();
+        def.machine = Some("q35".into());
+        def.cpu_model = Some("qemu64".into());
+        def.serial_log = Some(PathBuf::from("/tmp/vm1-serial.log"));
+
+        let args = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), true)
+            .unwrap();
+
+        assert_eq!(option_value(&args, "-machine"), Some("q35"));
+        assert_eq!(option_value(&args, "-cpu"), Some("qemu64"));
+        assert_eq!(option_value(&args, "-m"), Some("2048M"));
+        assert_eq!(
+            option_value(&args, "-serial"),
+            Some("file:/tmp/vm1-serial.log")
+        );
+        assert!(args.iter().any(|arg| arg == "-enable-kvm"));
+        assert!(!args.iter().any(|arg| arg == "-nographic"));
+    }
+
+    #[test]
+    fn qemu_defaults_remain_host_cpu_and_nographic_with_kvm() {
+        let def = qnx_x86_definition();
+
+        let args = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), true)
+            .unwrap();
+
+        assert_eq!(option_value(&args, "-machine"), Some("q35"));
+        assert_eq!(option_value(&args, "-cpu"), Some("host"));
+        assert!(args.iter().any(|arg| arg == "-nographic"));
+        assert!(!args.iter().any(|arg| arg == "-serial"));
+    }
+
+    #[test]
+    fn serial_log_rejects_qemu_option_delimiters() {
+        let mut def = qnx_x86_definition();
+        def.serial_log = Some(PathBuf::from("/tmp/vm1,serial.log"));
+
+        let error = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), false)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("serial_log must be an absolute non-empty path"));
+    }
+
+    #[test]
+    fn serial_log_rejects_relative_paths() {
+        let mut def = qnx_x86_definition();
+        def.serial_log = Some(PathBuf::from("vm1-serial.log"));
+
+        let error = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), false)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("serial_log must be an absolute non-empty path"));
     }
 }
