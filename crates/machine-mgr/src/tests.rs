@@ -461,6 +461,76 @@ fn seed_uses_the_committed_bank_for_secondary() {
 }
 
 #[test]
+fn seed_writes_nothing_for_missing_ids_while_a_trial_stands() {
+    use crate::system_bank_state::{InMemorySelectorStore, SelectorStore};
+    use nv_store::types::Bank;
+
+    let store = InMemorySelectorStore::new();
+    let mut m = MachineRegistry::builder(entity("veh"))
+        .with_selector_store(Box::new(store.clone()))
+        .build();
+
+    // A vector in trial: os on B over its committed A.
+    let os = ("os", nv_boot(Bank::B, false));
+    m.seed_selector([(os.0, &os.1)]).unwrap();
+    assert!(m.boot_selector().is_trial());
+    let (primary, writes) = (store.read_primary(), store.write_count());
+
+    // vm1 has no entry, but committing it would settle the standing trial
+    // without a verdict: nothing is written.
+    let vm1 = nv_boot(Bank::A, true);
+    m.seed_selector([(os.0, &os.1), ("vm1", &vm1)]).unwrap();
+    assert_eq!(store.write_count(), writes, "no write while a trial stands");
+    assert_eq!(store.read_primary(), primary);
+    assert_eq!(m.boot_selector().active_bank("vm1"), None);
+    assert!(m.boot_selector().is_trial(), "the trial still stands");
+}
+
+#[test]
+fn seed_stages_only_the_missing_ids_and_keeps_record_images() {
+    use crate::system_bank_state::{InMemorySelectorStore, SelectorStore, SystemBankManager};
+    use nv_store::selector::ImageEntry;
+    use nv_store::types::Bank;
+    use std::collections::BTreeMap;
+
+    // A committed vector holding os on A with a sealed image.
+    let store = InMemorySelectorStore::new();
+    let image = ImageEntry {
+        size: 4096,
+        sha256: [0xAB; 32],
+    };
+    let mut pre = SystemBankManager::load(Box::new(store.clone()));
+    pre.stage(
+        "os",
+        Bank::A,
+        BTreeMap::from([("kernel".to_string(), image)]),
+    );
+    pre.seal(None).unwrap();
+    pre.commit().unwrap();
+    let mut m = MachineRegistry::builder(entity("veh"))
+        .with_selector_store(Box::new(store.clone()))
+        .build();
+    let writes = store.write_count();
+
+    let os = nv_boot(Bank::A, true);
+    let vm1 = nv_boot(Bank::B, true);
+    m.seed_selector([("os", &os), ("vm1", &vm1)]).unwrap();
+
+    let primary = store.read_primary().unwrap();
+    assert_eq!(primary.entries["vm1"].bank, Bank::B);
+    assert!(primary.entries["vm1"].images.is_empty());
+    assert_eq!(primary.entries["os"].bank, Bank::A);
+    assert_eq!(primary.entries["os"].images["kernel"], image);
+    assert_eq!(
+        store.write_count(),
+        writes + 2,
+        "one activate and one commit"
+    );
+    assert_eq!(store.read_secondary(), Some(primary));
+    assert!(!m.boot_selector().is_trial());
+}
+
+#[test]
 fn registry_build_accepts_zero_components() {
     let m = MachineRegistry::builder(entity("empty")).build();
     assert!(m.components().is_empty());

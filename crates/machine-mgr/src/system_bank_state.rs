@@ -47,8 +47,9 @@
 //! trial statistics (`boot_count` / `committed`), which the selector deliberately
 //! does not duplicate (it derives trial structurally from PRIMARY ≠ SECONDARY).
 //!
-//! Storage today is [`FileSelectorStore`] (three JSON files, human-inspectable);
-//! the [`SelectorStore`] seam is the single swap point for a host store. The cache + transitions are unit-
+//! Storage today is [`FileSelectorStore`] (JSON files, human-inspectable): the
+//! [`RecordSelectorStore`] over a file record. A host store is the same adapter
+//! over its own [`BootRecord`]; the [`SelectorStore`] seam is the single swap point. The cache + transitions are unit-
 //! tested against the in-memory seam (`InMemorySelectorStore`, gated behind
 //! `test-seams`). `StubSelectorStore` remains the loud no-op default for
 //! builds that wire no store.
@@ -69,6 +70,10 @@ pub use nv_store::selector::{
 // downstream cfg(test) users via the forwarding `test-seams` feature).
 #[cfg(any(test, feature = "test-seams"))]
 pub use nv_store::selector::{InMemorySelectorStore, TestSigner};
+// The boot-stage record seam and the one store over it.
+#[cfg(any(test, feature = "test-seams"))]
+pub use nv_store::boot_record::InMemoryBootRecord;
+pub use nv_store::boot_record::{BootRecord, FileBootRecord, RecordCopy, RecordSelectorStore};
 
 /// Compact one-line render of a boot vector's entries for logs, e.g.
 /// `{os:A vm1:B}`. Order is
@@ -431,6 +436,14 @@ impl SystemBankManager {
     /// path uses this; harmless today.
     pub fn is_empty(&self) -> bool {
         self.current.is_empty()
+    }
+
+    /// The ids among `ids` with no entry in the booted selection (PRIMARY).
+    pub fn missing_entries<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        ids.into_iter()
+            .filter(|id| !self.current.contains_key(*id))
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -1078,6 +1091,129 @@ mod tests {
         );
         assert_eq!(store.read_primary(), store.read_secondary());
         assert_eq!(store.read_transaction().unwrap().0, 1);
+    }
+
+    // --- over a boot stage record that routes part of the vector ---
+
+    fn raw_file(dir: &std::path::Path, name: &str) -> SelectorBlob {
+        serde_json::from_slice(&std::fs::read(dir.join(name)).unwrap()).unwrap()
+    }
+
+    fn partial_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "sumo-partial-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// `{os: A, vm1: vm1}` staged and sealed through a manager.
+    fn stage_os_vm1(m: &mut SystemBankManager, os: Bank, vm1: Bank) {
+        m.stage("os", os, BTreeMap::new());
+        m.stage("vm1", vm1, BTreeMap::new());
+        m.seal(None).unwrap();
+    }
+
+    #[test]
+    fn boot_stage_rollback_makes_manager_rows_follow_the_committed_copy_and_is_recorded() {
+        let dir = partial_dir("boot-stage-rollback");
+        let record = InMemoryBootRecord::routing(["os"]);
+        let store = RecordSelectorStore::over(record.clone(), &dir, Box::new(TestSigner));
+
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        stage_os_vm1(&mut m, Bank::A, Bank::A);
+        m.commit().unwrap();
+        let floor = m.generation();
+        // A vm1-only change arms a trial; two boots were counted.
+        m.stage("vm1", Bank::B, BTreeMap::new());
+        m.seal(Some("boot-a")).unwrap();
+        let trial = m.generation();
+        assert!(trial > floor);
+        let mut counted = m.transaction().unwrap().clone();
+        counted.trial_boots = 2;
+        store.write_transaction(trial, &counted).unwrap();
+
+        // The boot stage gives up on the trial while the node is down.
+        record.boot_stage_rollback();
+        assert_eq!(store.read_primary(), store.read_secondary());
+        let restored = store.read_primary().unwrap();
+        assert_eq!(restored.generation, floor);
+        assert_eq!(restored.entries["vm1"].bank, Bank::A);
+
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        assert_eq!(m.generation(), floor);
+        let tx = m
+            .transaction()
+            .expect("the boot-stage rollback is recorded");
+        assert_eq!(
+            tx.resolution,
+            Some(Resolution {
+                outcome: Outcome::RolledBack,
+                reason: Reason::BootStage
+            })
+        );
+        assert_eq!(tx.trial_boots, 2);
+        assert_eq!(raw_file(&dir, "transaction").generation, floor);
+        let rows = raw_file(&dir, "rows");
+        assert_eq!(rows.generation, trial, "the trial's rows are untouched");
+        assert_eq!(rows.entries["vm1"].bank, Bank::B);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_header_without_rows_at_its_generation_is_not_a_boot_stage_rollback() {
+        let dir = partial_dir("header-without-rows");
+        let record = InMemoryBootRecord::routing(["os"]);
+        let store = RecordSelectorStore::over(record.clone(), &dir, Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        stage_os_vm1(&mut m, Bank::A, Bank::A);
+        m.commit().unwrap();
+        let g = m.generation();
+
+        // A header left by an older layout: above the primary, no rows there.
+        let blob = SelectorBlob::signed(
+            g + 5,
+            BTreeMap::new(),
+            Some(Transaction {
+                armed_boot_id: [0; 16],
+                trial_boots: 1,
+                counted_boot_id: [0; 16],
+                resolution: None,
+            }),
+            &TestSigner,
+        );
+        std::fs::write(
+            dir.join("transaction"),
+            serde_json::to_vec_pretty(&blob).unwrap(),
+        )
+        .unwrap();
+        let file = std::fs::read(dir.join("transaction")).unwrap();
+        let writes = record.write_count();
+
+        assert_eq!(store.read_transaction(), None);
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        assert!(m.transaction().is_none());
+        assert_eq!(record.write_count(), writes);
+        assert_eq!(std::fs::read(dir.join("transaction")).unwrap(), file);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_entries_lists_ids_without_an_entry() {
+        let mut m = mgr();
+        m.stage("os", Bank::A, BTreeMap::new());
+        m.seal(None).unwrap();
+
+        assert_eq!(
+            m.missing_entries(["os", "vm1", "hsm"]),
+            vec!["vm1".to_string(), "hsm".to_string()]
+        );
+        assert!(m.missing_entries(["os"]).is_empty());
     }
 
     /// One component's entries with a sealed kernel image.

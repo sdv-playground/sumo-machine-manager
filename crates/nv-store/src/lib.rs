@@ -18,14 +18,20 @@
 //! - Runtime   — writable DIDs and DTCs (per bank set × bank; copy-on-update)
 
 pub mod block;
+pub mod boot_record;
 pub mod selector;
 pub mod store;
 pub mod types;
 
+#[cfg(feature = "test-seams")]
+pub use boot_record::InMemoryBootRecord;
+pub use boot_record::{
+    BootRecord, FileBootRecord, FileSelectorStore, RecordCopy, RecordSelectorStore,
+};
 pub use selector::{
-    boot_id_digest, BootVector, ComponentEntry, FileSelectorStore, ImageEntry, Outcome, Reason,
-    Resolution, SelectorBlob, SelectorError, SelectorStore, Signer, SlotSelect, StubSelectorStore,
-    StubSigner, Transaction,
+    boot_id_digest, BootVector, ComponentEntry, ImageEntry, Outcome, Reason, Resolution,
+    SelectorBlob, SelectorError, SelectorStore, Signer, SlotSelect, StubSelectorStore, StubSigner,
+    Transaction,
 };
 #[cfg(feature = "test-seams")]
 pub use selector::{InMemorySelectorStore, TestSigner};
