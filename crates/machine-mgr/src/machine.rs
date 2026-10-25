@@ -7,7 +7,7 @@ use crate::component::Component;
 use crate::node_update::NodeCoordinator;
 use crate::system_bank_state::{
     BootObservation, BootSelector, Reason, SelectorError, SelectorStore, SharedSystemBankState,
-    Signer, StubSelectorStore, StubSigner, SystemBankManager,
+    StubSelectorStore, SystemBankManager,
 };
 use crate::{EntityInfo, FlashId};
 
@@ -63,11 +63,11 @@ pub struct MachineRegistry {
     entity: EntityInfo,
     components: Vec<Arc<dyn Component>>,
     by_id: HashMap<String, usize>,
-    /// The node's single signed, generation-counted boot selector. The store +
-    /// signer are chosen at construction (see
+    /// The node's single signed, generation-counted boot selector. The store
+    /// is chosen at construction (see
     /// [`with_selector_store`](MachineRegistryBuilder::with_selector_store)):
-    /// the default is the loud production stubs
-    /// ([`StubSelectorStore`] / [`StubSigner`]); the host machine manager swaps in a
+    /// the default is the loud production stub
+    /// ([`StubSelectorStore`]); the host machine manager swaps in a
     /// file-backed store on the host/sim.
     ///
     /// TODO: wire component activate()->stage() and campaign commit->seal()/
@@ -91,7 +91,6 @@ impl MachineRegistry {
             entity,
             components: Vec::new(),
             selector_store: None,
-            signer: None,
             shared_selector: None,
         }
     }
@@ -148,7 +147,8 @@ impl MachineRegistry {
     /// The selector, not `NvBootState`, is the boot / VM-launch authority; this
     /// only gives it a starting selection. The host machine managers call it at
     /// startup when the selector is empty: a fresh node, a factory reset, or a
-    /// blob that failed verification on [`SystemBankManager::load`].
+    /// copy that failed the store's check (read as absent by
+    /// [`SystemBankManager::load`]).
     ///
     /// A failed selector write is returned as `Err`; the in-memory selector
     /// then holds whatever the last successful write left.
@@ -291,16 +291,15 @@ impl Machine for MachineRegistry {
 pub struct MachineRegistryBuilder {
     entity: EntityInfo,
     components: Vec<Arc<dyn Component>>,
-    /// Optional override for the boot-selector persistence + signing seams.
-    /// `None` falls back to the loud production stubs at build time.
+    /// Optional override for the boot-selector store. `None` falls back to
+    /// the loud production stub at build time.
     selector_store: Option<Box<dyn SelectorStore>>,
-    signer: Option<Box<dyn Signer>>,
     /// Optional pre-built shared selector. When set (via
     /// [`with_shared_selector`](Self::with_shared_selector)) the registry
     /// adopts this exact `Arc<RwLock<…>>` rather than loading its own from a
     /// store — so the binary can build the selector ONCE, inject a read view
     /// into the providers via the factory, AND hand the same write handle to
-    /// the registry. Wins over `selector_store` / `signer` when present.
+    /// the registry. Wins over `selector_store` when present.
     shared_selector: Option<SharedSystemBankState>,
 }
 
@@ -319,18 +318,13 @@ impl MachineRegistryBuilder {
         self
     }
 
-    /// Override the boot-selector persistence + signing seams. The host/sim
-    /// build passes a file-backed [`FileSelectorStore`](crate::system_bank_state::FileSelectorStore)
-    /// (still with [`StubSigner`] until HSM signing is wired) so the selector
-    /// vector survives restarts; when omitted, `build` falls back to the loud
-    /// stubs. Additive — the boot authority is still `NvBootState`.
-    pub fn with_selector_store(
-        mut self,
-        store: Box<dyn SelectorStore>,
-        signer: Box<dyn Signer>,
-    ) -> Self {
+    /// Override the boot-selector store. The host/sim build passes a
+    /// file-backed [`FileSelectorStore`](crate::system_bank_state::FileSelectorStore)
+    /// (which carries its own signer) so the selector vector survives
+    /// restarts; when omitted, `build` falls back to the loud stub. Additive —
+    /// the boot authority is still `NvBootState`.
+    pub fn with_selector_store(mut self, store: Box<dyn SelectorStore>) -> Self {
         self.selector_store = Some(store);
-        self.signer = Some(signer);
         self
     }
 
@@ -346,7 +340,7 @@ impl MachineRegistryBuilder {
     /// the very selector the providers read — a single source of truth.
     ///
     /// Wins over [`with_selector_store`](Self::with_selector_store): when this
-    /// is set, the store/signer are ignored (the caller already loaded the
+    /// is set, the store is ignored (the caller already loaded the
     /// manager from its store). Tests / the default path keep using
     /// `with_selector_store` (or neither, falling back to the loud stubs).
     pub fn with_shared_selector(mut self, selector: SharedSystemBankState) -> Self {
@@ -355,17 +349,15 @@ impl MachineRegistryBuilder {
     }
 
     /// Resolve the registry's `system_bank`: prefer a pre-built shared selector
-    /// (adopted as-is), else `load` one from the configured store/signer, else
-    /// the loud production stubs.
+    /// (adopted as-is), else `load` one from the configured store, else the
+    /// loud production stub.
     fn resolve_system_bank(
         shared_selector: Option<SharedSystemBankState>,
         selector_store: Option<Box<dyn SelectorStore>>,
-        signer: Option<Box<dyn Signer>>,
     ) -> SharedSystemBankState {
         shared_selector.unwrap_or_else(|| {
             Arc::new(RwLock::new(SystemBankManager::load(
                 selector_store.unwrap_or_else(|| Box::new(StubSelectorStore)),
-                signer.unwrap_or_else(|| Box::new(StubSigner)),
             )))
         })
     }
@@ -375,8 +367,7 @@ impl MachineRegistryBuilder {
         for (idx, c) in self.components.iter().enumerate() {
             by_id.insert(c.id().to_string(), idx);
         }
-        let system_bank =
-            Self::resolve_system_bank(self.shared_selector, self.selector_store, self.signer);
+        let system_bank = Self::resolve_system_bank(self.shared_selector, self.selector_store);
         MachineRegistry {
             entity: self.entity,
             components: self.components,
@@ -395,8 +386,7 @@ impl MachineRegistryBuilder {
             }
             by_id.insert(id, idx);
         }
-        let system_bank =
-            Self::resolve_system_bank(self.shared_selector, self.selector_store, self.signer);
+        let system_bank = Self::resolve_system_bank(self.shared_selector, self.selector_store);
         Ok(MachineRegistry {
             entity: self.entity,
             components: self.components,

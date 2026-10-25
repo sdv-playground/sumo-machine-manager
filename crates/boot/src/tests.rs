@@ -3,9 +3,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use nv_store::block::MemBlockDevice;
-use nv_store::selector::{
-    ComponentEntry, InMemorySelectorStore, SelectorBlob, SelectorStore, TestSigner,
-};
+use nv_store::selector::{ComponentEntry, InMemorySelectorStore, SelectorStore, Transaction};
 use nv_store::slots;
 use nv_store::store::{nv_device_size, MIN_NV_DEVICE_SIZE};
 use nv_store::types::*;
@@ -544,20 +542,27 @@ fn make_bootmgr_with_selector() -> (BootManager<MemBlockDevice>, InMemorySelecto
     (mgr, store)
 }
 
-/// Build a signed boot vector (via `TestSigner`) for `entries` at `gen`.
-fn signed_blob(gen: u64, entries: &[(&str, Bank)]) -> SelectorBlob {
+/// Make `entries` the store's PRIMARY via `activate`; returns the generation.
+fn activate(store: &InMemorySelectorStore, entries: &[(&str, Bank)]) -> u64 {
     let entries = entries
         .iter()
         .map(|&(id, bank)| (id.to_string(), ComponentEntry::new(bank, BTreeMap::new())))
         .collect();
-    SelectorBlob::signed(gen, entries, None, &TestSigner)
+    let header = Transaction {
+        armed_boot_id: [0; 16],
+        trial_boots: 0,
+        counted_boot_id: [0; 16],
+        resolution: None,
+    };
+    store.activate(&entries, &header).unwrap()
 }
 
 /// Seed PRIMARY == SECONDARY at the given selection — the committed baseline
 /// (mirrors `seed_selector`'s seal+commit).
 fn seed_committed(store: &InMemorySelectorStore, gen: u64, entries: &[(&str, Bank)]) {
-    store.write_primary(&signed_blob(gen, entries)).unwrap();
-    store.write_secondary(&signed_blob(gen, entries)).unwrap();
+    store.set_next_generation(gen);
+    activate(store, entries);
+    store.commit().unwrap();
 }
 
 fn selected(component: &str, bank: Bank, trial: bool) -> BootAction {
@@ -588,12 +593,9 @@ fn selector_committed_boots_by_component_id() {
 #[test]
 fn selector_path_writes_no_nv() {
     let (mut mgr, store) = make_bootmgr_with_selector();
-    store
-        .write_secondary(&signed_blob(1, &[("os", Bank::A)]))
-        .unwrap();
-    store
-        .write_primary(&signed_blob(2, &[("os", Bank::B)]))
-        .unwrap();
+    activate(&store, &[("os", Bank::A)]);
+    store.commit().unwrap();
+    assert_eq!(activate(&store, &[("os", Bank::B)]), 2);
 
     for _ in 0..=MAX_TRIAL_BOOTS + 1 {
         let actions = mgr.process_boot().unwrap();
@@ -611,15 +613,12 @@ fn selector_trial_and_committed_components_are_independent() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // os in trial (A floor, B booted); vm1 committed (A == A); vm2 sealed
     // after the floor (absent from SECONDARY) is in trial too.
-    store
-        .write_secondary(&signed_blob(1, &[("os", Bank::A), ("vm1", Bank::A)]))
-        .unwrap();
-    store
-        .write_primary(&signed_blob(
-            2,
-            &[("os", Bank::B), ("vm1", Bank::A), ("vm2", Bank::B)],
-        ))
-        .unwrap();
+    activate(&store, &[("os", Bank::A), ("vm1", Bank::A)]);
+    store.commit().unwrap();
+    activate(
+        &store,
+        &[("os", Bank::B), ("vm1", Bank::A), ("vm2", Bank::B)],
+    );
 
     let actions = mgr.process_boot().unwrap();
     assert_eq!(
@@ -635,9 +634,7 @@ fn selector_trial_and_committed_components_are_independent() {
 #[test]
 fn selector_without_secondary_is_all_trial() {
     let (mut mgr, store) = make_bootmgr_with_selector();
-    store
-        .write_primary(&signed_blob(1, &[("os", Bank::A)]))
-        .unwrap();
+    activate(&store, &[("os", Bank::A)]);
 
     let actions = mgr.process_boot().unwrap();
     assert_eq!(actions, [selected("os", Bank::A, true)]);

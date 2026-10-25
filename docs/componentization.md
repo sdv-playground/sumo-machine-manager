@@ -694,7 +694,7 @@ move that buys nothing:
   script.** Nothing in this repo or any sibling depends on the `vm-boot` lib and
   nothing invokes the bin; the only workspace-wide hits are its own
   `Cargo.toml`. It is a decision function, not a service — it reads the boot
-  selection (signed `SelectorBlob` PRIMARY when a `SelectorStore` is attached,
+  selection (the boot vector's PRIMARY when a `SelectorStore` is attached,
   else NV `NvBootState`), counts trial boots, auto-rolls-back past
   `MAX_TRIAL_BOOTS`, verifies SHA-256 image hashes from FW Meta, and returns one
   `BootAction` per bank set **for the caller to execute**. On the device that

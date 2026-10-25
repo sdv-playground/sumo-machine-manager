@@ -291,16 +291,79 @@ decrypt, decompression).
 
 ## Boot authority — the selector
 
-The node has one signed boot record, the **selector**, that supersedes the original
+**Who decides what.** An update must never leave the node unbootable, and the party that
+decides whether an update stands must be the one able to judge its result. Three actors,
+one responsibility each:
+
+- **The orchestrator decides.** Every software update comes from sumo's orchestrator; it
+  alone issues the commit or rollback verdict.
+- **The node executes and observes.** It stages, seals, commits and rolls back on those
+  verdicts, and records what it saw — how many trial boots it ran, how each transaction
+  ended — in the boot vector's transaction header.
+- **The boot stage restores the committed copy, and nothing else.** When the node fails to
+  start, its one act is primary := secondary on the boot vector. It understands primary,
+  secondary and generation, and nothing about the transaction.
+
+Two counters, by design, with distinct roles. The boot stage's own boot counter is the
+**safeguard** against bricking: it fires only when sumo never ran to settle the trial.
+The header's `trial_boots` is **information**: how many trial boots the node actually
+executed. A host-set trial boot limit is optional policy on top of that count and must sit
+strictly below the boot stage's bound.
+
+The store never leaves a header recorded above the primary generation (write order,
+below). So a header above the primary on a committed vector can mean only one thing — the
+boot stage acted — and `SystemBankManager::load` records it as resolved
+`rolled_back` / `boot_stage`, keeping the count.
+
+The goal: sumo stays authoritative over every update; the boot stage stays ignorant of
+update semantics; and the count plus the recorded resolution of each transaction survive
+the boot stage's action, which is what a future onboard orchestrator needs to tell "the
+part that must deliver the verdict booted N times and never reported".
+
+The node has one authenticated boot record, the **selector**, that supersedes the original
 per-component NV boot state as the authority for "which bank each set boots from":
 
-- `SelectorBlob { generation: u64, entries: BTreeMap<String, ComponentEntry>,
-  transaction: Option<Transaction>, sha256, signature, selectors: Option<…> }` (`nv-store::selector`) — the **boot vector**. Entries
-  are keyed by **component id**; each carries the component's `bank` and the images sealed
-  into that bank by part name (`ImageEntry { size, sha256 }`, possibly empty). Two slots
-  via `SelectorStore`: **PRIMARY** (booted) and **SECONDARY** (rollback floor). A component
-  is in trial iff its PRIMARY entry differs from its SECONDARY entry. One bank per
-  component is structural: the map holds exactly one entry per id.
+- `BootVector { generation: u64, entries: BTreeMap<String, ComponentEntry> }`
+  (`nv-store::selector`) — the **boot vector**. Entries are keyed by **component id**; each
+  carries the component's `bank` and the images sealed into that bank by part name
+  (`ImageEntry { size, sha256 }`, possibly empty). Two copies via `SelectorStore`:
+  **PRIMARY** (booted) and **SECONDARY** (rollback floor). A component is in trial iff its
+  PRIMARY entry differs from its SECONDARY entry. One bank per component is structural: the
+  map holds exactly one entry per id.
+
+  **The store issues the generation and authenticates its contents; the manager adopts what
+  the store returns.** `SystemBankManager` never computes a generation and never signs: it
+  calls the store's verbs and keeps, in memory, exactly what they report. The contract is
+  the same for every store — the reference file store, the in-memory test store, and a host
+  store over its own boot-stage record (whose boot stage may issue generations from a
+  hardware counter and bring its own rollback primitive) — and is executable:
+  `nv_store::selector::contract::exercise(&store)` (feature `test-seams`) asserts it against
+  any implementation.
+
+  | Verb | Contract | Reference file store |
+  |---|---|---|
+  | `read_primary` / `read_secondary` | the authenticated copy, or `None` (absent or failed check) | parse the file, `None` unless `is_valid` under its `Signer` |
+  | `activate(entries, header)` | primary := entries at a generation the store issues, strictly above both copies; header recorded for it; returns the generation. A header write that fails after the primary landed is logged as header loss and still `Ok` | `max(primary, secondary) + 1`; writes `primary` first, then `transaction` |
+  | `commit()` | secondary := primary (same generation); idempotent; no-op without a primary | rewrites `secondary` from `primary` |
+  | `rollback(header)` | primary := secondary; header recorded for the restored generation; returns it; `Err(NoTrial)` when there is nothing to restore | writes `transaction` first, then `primary` from `secondary` (a failed primary write leaves the header below it) |
+  | `read_transaction()` | the header and the generation it was recorded for | the `transaction` file (or, migrating, the header embedded in an older primary) |
+  | `write_transaction(gen, header)` | rewrite the header for `gen`, neither copy touched | rewrites `transaction` |
+
+  Two durability classes: the copies are **what boots** and sit under anti-rollback (only
+  `activate` / `commit` / `rollback` move them); the header is **what the node observed
+  about the transaction**, rewritten on every trial boot without touching either copy.
+  The header is tied to the primary generation: a header whose recorded generation differs
+  from the primary's is stale and is read as absent (`SystemBankManager::load` drops it with
+  a warning) — except a header above the primary on a committed vector, which is the boot
+  stage's rollback and is recorded (see **Who decides what**). The write order keeps that
+  reading unambiguous: no failed write verb leaves a header above the primary.
+
+  The reference `FileSelectorStore::new(dir, signer)` keeps three files, each a signed
+  `SelectorBlob { generation, entries, transaction, sha256, signature, selectors }` written
+  tmp + fsync + rename: `primary`, `secondary` (copies, no header) and `transaction` (a blob
+  with **empty** entries at the primary generation it belongs to, carrying the header). A
+  primary written by v0.1.14 still carries the header embedded in its own blob; it is read
+  as the header until the next header write replaces it with the `transaction` file.
 
   ```json
   {
@@ -321,40 +384,41 @@ per-component NV boot state as the authority for "which bank each set boots from
   Canonical bytes under `sha256` (all integers little-endian): `u64 generation`, then per
   entry in ascending id order `u16 id.len()`, id bytes, `u8 bank` (A=0, B=1),
   `u16 images.len()`, then per image in ascending name order `u16 name.len()`, name bytes,
-  `u64 size`, 32 bytes sha256; then, only when a transaction header is present, `u8 0x01`,
+  `u64 size`, 32 bytes sha256; then, only when a transaction header is present (the
+  `transaction` file, or a v0.1.14 primary), `u8 0x01`,
   16 bytes `armed_boot_id`, `u8 trial_boots`, 16 bytes `counted_boot_id`, `u8 resolution`
-  (0 none, 1 committed, 2 rolled_back), `u8 reason` (0 verdict, 1 trial_boot_limit; 0 with
-  no resolution). A blob without a header digests exactly as before. The signature is over
-  `sha256`.
+  (0 none, 1 committed, 2 rolled_back), `u8 reason` (0 verdict, 1 trial_boot_limit,
+  2 boot_stage; 0 with no resolution). A blob without a header digests exactly as before.
+  The signature is over `sha256`.
 
-  The **transaction header** (`transaction`) lives in the PRIMARY copy only — the backup
-  never carries one — and is inside the digest: `armed_boot_id` (node boot id at `seal`,
+  The **transaction header** (`Transaction`) is kept apart from both copies, recorded for
+  the primary generation: `armed_boot_id` (node boot id at `seal`,
   reduced to the first 16 bytes of its SHA-256; zero = unknown), `trial_boots` (distinct
   node boots counted while armed without a verdict), `counted_boot_id` (the last boot
   counted; zero = none) and `resolution` (`{outcome: committed|rolled_back, reason:
-  verdict|trial_boot_limit}`). It is meaningful only while the node is in trial (PRIMARY
-  entries differ from the backup's) or when it records a resolution; readers gate on that.
-  `seal` writes a fresh header; `commit` writes the backup only, so PRIMARY keeps its
-  header; `rollback` writes PRIMARY = the backup's entries plus the header with its
-  resolution set. A rollback on a node that is not in trial writes nothing and keeps the
-  recorded resolution, so a later verdict rollback does not overwrite an earlier reason.
+  verdict|trial_boot_limit|boot_stage}`). It is meaningful only while the node is in trial
+  (PRIMARY entries differ from the backup's) or when it records a resolution; readers gate
+  on that.
+  `seal` activates with a fresh header; `commit` moves the backup only, so the header
+  stays; `rollback` restores the backup and records the header with its resolution set;
+  counting a trial boot rewrites the header only. A rollback on a node that is not in trial
+  writes nothing and keeps the recorded resolution, so a later verdict rollback does not
+  overwrite an earlier reason.
 
   The optional **legacy slot map** `selectors: { "<slot>": { "bank": "A" } }` is emitted
   only by a `FileSelectorStore` built `with_legacy_slot_map(component id → slot)`, for a
   boot stage that still reads the previous shape; it is outside the digest, never read
   back, and goes away when no deployed boot stage needs it.
-- **The orchestrator decides.** The node stages, seals, commits and rolls back on the
-  orchestrator's verdicts; the boot stage only reads.
-- **One bounded exception: the trial boot limit.** A host may set
+- **Two counters.** The node counts trial boots in the header per distinct boot id (the
+  arming boot and an already-counted boot count nothing), so a process restart within one
+  boot counts nothing. On top of that count a host may set
   `NodeCoordinator::with_trial_boot_limit(Some(n))` (`None`, the default, disables it;
-  sumo has no default value). After `n` distinct node boots while armed without a
-  verdict, the node rolls the whole node back by itself — the same path a rollback verdict
-  takes, differing only in the recorded reason (`trial_boot_limit`): the boot vector first
-  (the authority), then each component that was in trial rolls back its own NV. The node
-  never commits by itself. Counting is per distinct boot id (the arming boot and an
-  already-counted boot count nothing), so a process restart within one boot counts
-  nothing. The host sets `n` below its boot stage's own bound, so the node, not the boot
-  stage, settles the trial.
+  sumo has no default value): after `n` counted boots without a verdict the node rolls the
+  whole node back by itself — the same path a rollback verdict takes, differing only in the
+  recorded reason (`trial_boot_limit`): the boot vector first (the authority), then each
+  component that was in trial rolls back its own NV. The node never commits by itself. The
+  host sets `n` below its boot stage's own bound, so the node, not the boot stage, settles
+  the trial; the boot stage's counter stays the safeguard for when sumo never runs.
 
   Host contract: call `MachineRegistry::observe_node_boot(&coord)` once after the store is
   loaded and before serving, with the coordinator carrying the current node boot id. A
@@ -364,22 +428,31 @@ per-component NV boot state as the authority for "which bank each set boots from
 - **Verdict membership is the structural trial set.** The node verdict skips a component
   whose `banks()` reports it out of trial: with a boot vector, its PRIMARY entry equals the
   backup's; without one, the NV committed flag.
-- **Signed by the HSM** with `ivd-signing` (a `Signer` impl supplied by the host-manager
-  process, where the HSM is reachable; verified at `SystemBankManager::load`).
-  Previously a `StubSigner` (empty signature) — now real ECDSA-P256. The store is the
-  file-backed JSON `FileSelectorStore` (pretty, one key per line) until a host store is
-  plugged in behind `SelectorStore`.
+- **Signed by the HSM** with `ivd-signing` (a `Signer` impl the host-manager process,
+  where the HSM is reachable, passes to `FileSelectorStore::new`; the store verifies every
+  blob it reads). Previously a `StubSigner` (empty signature) — now real ECDSA-P256. The
+  store is the file-backed JSON `FileSelectorStore` (pretty, one key per line) until a host
+  store is plugged in behind `SelectorStore`; a host store authenticates by its own means.
 - `vm-boot` is the reference reader: it reports each PRIMARY entry's bank and trial state
-  and writes nothing; it ignores the transaction header. The boot vector carries no slot,
+  and writes nothing; it ignores the transaction header. It opens the file store with a
+  `StubSigner` today (it has never verified); a verifying reader passes a real `Signer`. The boot vector carries no slot,
   so it cannot drive the per-slot NV trial counter; the NV path (no boot vector) keeps its
   trial counting + auto-rollback, and the boot-vector path counts in the header instead
   (`observe_node_boot`, above).
 - **Sumo has no opinion on component names or slot numbers** — both come from the host
   profile.
-- **The store can fail.** `SelectorStore` writes return `Result`; `SystemBankManager`'s
-  `seal` / `commit` / `rollback` persist first and move their in-memory view only on
-  success, so memory never runs ahead of storage. A failed seal fails `activate`, which
-  leaves NV unarmed. A failed commit or rollback verdict is reported to the orchestrator;
+- **The store can fail.** `SelectorStore` write verbs return `Result`, and an `Err` means
+  the primary is unchanged; `SystemBankManager`'s `seal` / `commit` / `rollback` /
+  `observe_node_boot` persist first and move their in-memory view only on success, so
+  memory never runs ahead of storage. `activate` writes the vector before the header; if
+  the header write then fails, the vector is the truth and the store logs the header loss:
+  trial-boot counting degrades (the previous header sits below the primary, reads as
+  absent, so that trial counts nothing), nothing else. `rollback` writes the header before
+  the vector, so a failed vector write leaves the trial in place and a stale header below
+  it. A header above the primary is therefore never a failed write: on a committed vector
+  `load` records it as the boot stage's rollback (written first, adopted after; a failed
+  record adopts no header), anywhere else it is dropped. A failed seal fails `activate`,
+  which leaves NV unarmed. A failed commit or rollback verdict is reported to the orchestrator;
   NV is written before the boot vector, so NV is then one step ahead. A commit is safe to
   retry (NV folds an already-committed set into success); a rollback verdict retry is
   still refused by NV as not-in-trial (the provider still writes NV first). With a trial
@@ -406,6 +479,7 @@ flowchart LR
     end
     subgraph boot["boot path (no signer available)"]
         BL["boot stage (platform)<br/>or vm-boot (reference reader)"] -- read PRIMARY + SECONDARY --> SEL
+        BL -.->|"boot stage only: rollback (primary := secondary)"| SEL
         BL --> VS[vm-service<br/>pre-launch IVD verify]
     end
 ```

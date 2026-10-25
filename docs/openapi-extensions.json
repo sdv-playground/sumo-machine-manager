@@ -903,7 +903,7 @@
       },
       "ResolutionResponse": {
         "type": "object",
-        "description": "How a node transaction ended: `outcome` is `committed` or `rolled_back`,\n`reason` is `verdict` or `trial_boot_limit`.",
+        "description": "How a node transaction ended: `outcome` is `committed` or `rolled_back`,\n`reason` is `verdict`, `trial_boot_limit` or `boot_stage` (the boot stage\nrestored the committed copy; recorded by the node at its next start).",
         "required": [
           "outcome",
           "reason"

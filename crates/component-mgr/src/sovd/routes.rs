@@ -85,7 +85,8 @@ pub(crate) struct UpdateStateResponse {
 }
 
 /// How a node transaction ended: `outcome` is `committed` or `rolled_back`,
-/// `reason` is `verdict` or `trial_boot_limit`.
+/// `reason` is `verdict`, `trial_boot_limit` or `boot_stage` (the boot stage
+/// restored the committed copy; recorded by the node at its next start).
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct ResolutionResponse {
     pub outcome: String,
@@ -103,6 +104,7 @@ impl From<Resolution> for ResolutionResponse {
             reason: match r.reason {
                 Reason::Verdict => "verdict",
                 Reason::TrialBootLimit => "trial_boot_limit",
+                Reason::BootStage => "boot_stage",
             }
             .to_string(),
         }

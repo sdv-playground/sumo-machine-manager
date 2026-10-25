@@ -109,7 +109,10 @@ counted while armed without a verdict (`null` when the boot vector has no header
 node is not in trial and has no recorded resolution). `trial_boot_limit`: the count
 at which the node rolls itself back (`null` = disabled; set by the host). `resolution`: how
 the last node transaction ended, `{"outcome": "committed"|"rolled_back", "reason":
-"verdict"|"trial_boot_limit"}`, `null` while a trial is open or when none is recorded.
+"verdict"|"trial_boot_limit"|"boot_stage"}`, `null` while a trial is open or when none is
+recorded. `boot_stage` means the boot stage restored the committed copy while the node was
+down (recorded at the next start); `trial_boots` then is the count sumo observed before the
+boot stage gave up (0 when the node never came up).
 
 Residual concurrency limitation: the node commit/rollback routes serialize
 against each other inside sumo-mm, but SOVDd's component-level verdict routes do

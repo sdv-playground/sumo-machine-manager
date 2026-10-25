@@ -1068,7 +1068,7 @@ fn bank_dir_is_payload_empty(bank_dir: &Path) -> bool {
 mod tests {
     use super::*;
     use machine_mgr::system_bank_state::{
-        InMemorySelectorStore, SelectorStore, SharedSystemBankState, SystemBankManager, TestSigner,
+        InMemorySelectorStore, SelectorStore, SharedSystemBankState, SystemBankManager,
     };
     use nv_store::block::MemBlockDevice;
     use nv_store::slots;
@@ -1090,8 +1090,7 @@ mod tests {
 
     /// A shared boot selector seeded so `id` boots from `bank` (PRIMARY).
     fn selector_with(id: &str, bank: Bank) -> SharedSystemBankState {
-        let mgr =
-            SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner));
+        let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()));
         let shared: SharedSystemBankState = Arc::new(RwLock::new(mgr));
         {
             let mut g = shared.write().unwrap();
@@ -1220,7 +1219,7 @@ mod tests {
     /// the store's writes fail.
     fn selector_with_store(id: &str, bank: Bank) -> (SharedSystemBankState, InMemorySelectorStore) {
         let store = InMemorySelectorStore::new();
-        let mut mgr = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let mut mgr = SystemBankManager::load(Box::new(store.clone()));
         mgr.stage(id, bank, BTreeMap::new());
         assert!(mgr.seal(None).unwrap());
         mgr.commit().unwrap();

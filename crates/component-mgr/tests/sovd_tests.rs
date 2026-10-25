@@ -904,7 +904,7 @@ fn make_disable_router(
     // Sealed, committed booted selection for the component: bank A serves,
     // not in trial.
     let selector: SharedSystemBankState = Arc::new(std::sync::RwLock::new(
-        SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner)),
+        SystemBankManager::load(Box::new(InMemorySelectorStore::new())),
     ));
     {
         let mut g = selector.write().unwrap();
@@ -1596,10 +1596,10 @@ async fn update_state_in_trial_follows_boot_vector() {
     let store_dir = tmp.path().join("selector");
     std::fs::create_dir_all(&store_dir).unwrap();
     {
-        let mut m = SystemBankManager::load(
-            Box::new(FileSelectorStore::new(&store_dir)),
+        let mut m = SystemBankManager::load(Box::new(FileSelectorStore::new(
+            &store_dir,
             Box::new(TestSigner),
-        );
+        )));
         m.stage("vm1", Bank::A, Default::default());
         m.stage("vm2", Bank::A, Default::default());
         m.seal(None).unwrap();
@@ -1617,10 +1617,9 @@ async fn update_state_in_trial_follows_boot_vector() {
         m.seal(None).unwrap();
     }
     let selector: SharedSystemBankState =
-        Arc::new(std::sync::RwLock::new(SystemBankManager::load(
-            Box::new(FileSelectorStore::new(&store_dir)),
-            Box::new(TestSigner),
-        )));
+        Arc::new(std::sync::RwLock::new(SystemBankManager::load(Box::new(
+            FileSelectorStore::new(&store_dir, Box::new(TestSigner)),
+        ))));
 
     let (router, _banks_tmp) = make_banks_router(Some(selector));
     let (status, body) = get(&router, "/vehicle/v1/data/x-update-state").await;
@@ -1662,10 +1661,9 @@ impl TrialNode {
         let tmp = tempfile::tempdir().unwrap();
         let store_dir = tmp.path().join("selector");
         let selector: SharedSystemBankState =
-            Arc::new(std::sync::RwLock::new(SystemBankManager::load(
-                Box::new(FileSelectorStore::new(&store_dir)),
-                Box::new(TestSigner),
-            )));
+            Arc::new(std::sync::RwLock::new(SystemBankManager::load(Box::new(
+                FileSelectorStore::new(&store_dir, Box::new(TestSigner)),
+            ))));
         {
             let mut g = selector.write().unwrap();
             g.stage("vm1", Bank::A, Default::default());
@@ -1755,7 +1753,7 @@ impl TrialNode {
     }
 
     fn store(&self) -> FileSelectorStore {
-        FileSelectorStore::new(&self.store_dir)
+        FileSelectorStore::new(&self.store_dir, Box::new(TestSigner))
     }
 }
 
@@ -1771,11 +1769,18 @@ fn coord_at(boot_id: &str, limit: Option<u8>) -> Arc<NodeCoordinator> {
 async fn activate_arms_the_primary_transaction_header() {
     let node = TrialNode::new(false);
     let primary = node.store().read_primary().unwrap();
-    let t = primary.transaction.expect("PRIMARY carries the header");
+    let (gen, t) = node
+        .store()
+        .read_transaction()
+        .expect("the header is recorded");
+    assert_eq!(
+        gen, primary.generation,
+        "recorded for the primary generation"
+    );
+    assert_ne!(gen, node.store().read_secondary().unwrap().generation);
     assert_eq!(t.armed_boot_id, boot_id_digest("boot-a"));
     assert_eq!(t.trial_boots, 0);
     assert_eq!(t.resolution, None);
-    assert_eq!(node.store().read_secondary().unwrap().transaction, None);
 }
 
 #[tokio::test]
@@ -1827,7 +1832,7 @@ async fn trial_boot_limit_rolls_the_node_back() {
     let primary = node.store().read_primary().unwrap();
     assert_eq!(primary.entries["vm1"].bank, Bank::A);
     assert_eq!(
-        primary.transaction.unwrap().resolution,
+        node.store().read_transaction().unwrap().1.resolution,
         Some(Resolution {
             outcome: Outcome::RolledBack,
             reason: Reason::TrialBootLimit,
@@ -1896,10 +1901,9 @@ async fn rollback_verdict_after_bail_out_is_idempotent() {
     assert_eq!(body["result"]["rolled_back"], serde_json::json!([]));
     assert_eq!(
         node.store()
-            .read_primary()
+            .read_transaction()
             .unwrap()
-            .transaction
-            .unwrap()
+            .1
             .resolution
             .unwrap()
             .reason,

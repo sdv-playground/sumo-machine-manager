@@ -19,9 +19,9 @@
 //!
 //! - **NV `NvBootState`** (the original): per-slot `active_bank` +
 //!   `committed` + `boot_count`. Each slot commits/rolls back on its own.
-//! - **Boot vector** (`nv_store::selector`): a single signed
-//!   [`SelectorBlob`] in a PRIMARY (booted) slot and a SECONDARY
-//!   (rollback-floor) slot, keyed by component id. `bank =
+//! - **Boot vector** (`nv_store::selector`): a single [`BootVector`],
+//!   authenticated by the store, in a PRIMARY (booted) copy and a SECONDARY
+//!   (rollback-floor) copy, keyed by component id. `bank =
 //!   PRIMARY.entries[id].bank`; a component is in trial iff its PRIMARY entry
 //!   differs from its SECONDARY entry (or SECONDARY has none).
 //!
@@ -41,7 +41,7 @@
 //! caller's job (QEMU on Linux dev, `qvm` on QNX).
 
 use nv_store::block::BlockDevice;
-use nv_store::selector::{SelectorBlob, SelectorStore};
+use nv_store::selector::{BootVector, SelectorStore};
 use nv_store::store::NvStore;
 use nv_store::types::*;
 use sha2::{Digest, Sha256};
@@ -219,7 +219,7 @@ impl<D: BlockDevice> BootManager<D> {
         Ok(actions)
     }
 
-    /// Boot-vector report. The signed PRIMARY blob is the booted selection;
+    /// Boot-vector report. The PRIMARY copy is the booted selection;
     /// SECONDARY is the rollback floor. For each component in PRIMARY
     /// (ascending id): its bank, and whether it is in trial — its SECONDARY
     /// entry is absent or differs.
@@ -228,8 +228,8 @@ impl<D: BlockDevice> BootManager<D> {
     /// trial counter to advance for a component, and the trial verdict is the
     /// orchestrator's.
     fn process_boot_selector(
-        primary: &SelectorBlob,
-        secondary: Option<&SelectorBlob>,
+        primary: &BootVector,
+        secondary: Option<&BootVector>,
     ) -> Vec<BootAction> {
         primary
             .entries

@@ -27,8 +27,9 @@
 //! # Layering
 //!
 //! The selector STORAGE primitives — the on-medium [`SelectorBlob`], the
-//! two-slot persistence seam ([`SelectorStore`] + stub / in-memory / file
-//! impls) and the attestation seam ([`Signer`] + stub / test impls) — now live
+//! store contract ([`SelectorStore`] + stub / in-memory / file impls; the
+//! store issues the generation and authenticates its contents) and the
+//! attestation seam ([`Signer`] + stub / test impls) — now live
 //! one crate down in [`nv_store::selector`], so a lower crate (e.g. `vm-boot`)
 //! can read the selector without depending **up** on `machine-mgr`. They are
 //! re-exported here so the `machine_mgr::system_bank_state::*` import surface is
@@ -46,11 +47,11 @@
 //! trial statistics (`boot_count` / `committed`), which the selector deliberately
 //! does not duplicate (it derives trial structurally from PRIMARY ≠ SECONDARY).
 //!
-//! Storage today is [`FileSelectorStore`] (two JSON slots, human-inspectable);
+//! Storage today is [`FileSelectorStore`] (three JSON files, human-inspectable);
 //! the [`SelectorStore`] seam is the single swap point for a host store. The cache + transitions are unit-
-//! tested against in-memory seams (`InMemorySelectorStore` / `TestSigner`, gated
-//! behind `test-seams`). `StubSelectorStore` / `StubSigner` remain the loud
-//! no-op default for builds that wire no store.
+//! tested against the in-memory seam (`InMemorySelectorStore`, gated behind
+//! `test-seams`). `StubSelectorStore` remains the loud no-op default for
+//! builds that wire no store.
 
 use std::collections::BTreeMap;
 
@@ -60,9 +61,9 @@ use nv_store::types::Bank;
 // can read the selector without depending up on `machine-mgr`. Re-exported here
 // so existing `machine_mgr::system_bank_state::*` paths still resolve.
 pub use nv_store::selector::{
-    boot_id_digest, ComponentEntry, FileSelectorStore, ImageEntry, Outcome, Reason, Resolution,
-    SelectorBlob, SelectorError, SelectorStore, Signer, SlotSelect, StubSelectorStore, StubSigner,
-    Transaction,
+    boot_id_digest, BootVector, ComponentEntry, FileSelectorStore, ImageEntry, Outcome, Reason,
+    Resolution, SelectorBlob, SelectorError, SelectorStore, Signer, SlotSelect, StubSelectorStore,
+    StubSigner, Transaction,
 };
 // In-memory test seams: only for test builds (this crate's own unit tests, or
 // downstream cfg(test) users via the forwarding `test-seams` feature).
@@ -116,7 +117,6 @@ pub enum BootObservation {
 /// reboot-mid-stage unit test.
 pub struct SystemBankManager {
     store: Box<dyn SelectorStore>,
-    signer: Box<dyn Signer>,
     /// PRIMARY / booted selection.
     current: BTreeMap<String, ComponentEntry>,
     /// Generation of `current`.
@@ -124,8 +124,8 @@ pub struct SystemBankManager {
     /// SECONDARY / rollback-floor selection (+ its own generation).
     committed: BTreeMap<String, ComponentEntry>,
     committed_generation: u64,
-    /// PRIMARY's transaction header (the backup's is never read). Meaningful
-    /// only while in trial or when it carries a resolution.
+    /// The transaction header recorded for `generation`. Meaningful only
+    /// while in trial or when it carries a resolution.
     transaction: Option<Transaction>,
     /// In-memory staging; `None` until `stage` is called. Never persisted until
     /// `seal`.
@@ -134,50 +134,82 @@ pub struct SystemBankManager {
 
 impl SystemBankManager {
     /// Reconstruct on startup from the store. PRIMARY → `current` (+ its
-    /// generation); SECONDARY → `committed`; `pending = None`.
+    /// generation); SECONDARY → `committed`; the transaction header iff it was
+    /// recorded for the primary generation; `pending = None`. Nothing is
+    /// re-read after load.
     ///
-    /// The store + signer are chosen at runtime (boxed trait objects) so the
-    /// same manager type backs both the production stubs and a real file- or
-    /// sector-backed store without a generic parameter rippling through
+    /// The store is chosen at runtime (a boxed trait object) so the same
+    /// manager type backs both the production stub and a real file- or
+    /// record-backed store without a generic parameter rippling through
     /// `MachineRegistry`.
     ///
-    /// A blob that fails verification (bad embedded digest or bad signature) is
-    /// **rejected and treated as absent** — a forged/garbled selector must not
-    /// drive boot. An absent PRIMARY (the stub case) yields empty maps at
+    /// The store authenticates its contents: a copy that fails its check reads
+    /// as absent. An absent PRIMARY (the stub case) yields empty maps at
     /// generation 0.
-    pub fn load(store: Box<dyn SelectorStore>, signer: Box<dyn Signer>) -> Self {
-        // A PRESENT blob that fails verification warns rather than vanishing
-        // silently: the slot reads as absent (an absent PRIMARY is the host's
-        // reseed-from-NV trigger), and this line is the only record of why.
-        let verified = |slot: &str, blob: Option<SelectorBlob>| {
-            blob.filter(|b| {
-                let valid = b.is_valid(&*signer);
-                if !valid {
-                    tracing::warn!(
-                        generation = b.generation,
-                        slots = %render_slots(&b.entries),
-                        "boot selector {slot} failed verification — treated as absent (will be reseeded)"
-                    );
-                }
-                valid
-            })
-        };
-
-        let primary = verified("PRIMARY", store.read_primary());
-        let (current, generation, transaction) = match primary {
-            Some(b) => (b.entries, b.generation, b.transaction),
-            None => (BTreeMap::new(), 0, None),
-        };
-
-        let secondary = verified("SECONDARY", store.read_secondary());
-        let (committed, committed_generation) = match secondary {
-            Some(b) => (b.entries, b.generation),
+    ///
+    /// A header recorded above the primary generation, on a committed vector
+    /// and with no resolution, can only mean the boot stage restored the
+    /// committed copy while the node was down (the store never leaves a header
+    /// above the primary — see [`SelectorStore`]). It is recorded as resolved
+    /// `rolled_back` / [`Reason::BootStage`], boot ids and count kept, for the
+    /// primary generation — written first, adopted after; if the write fails,
+    /// no header is adopted. Any other header recorded for another generation
+    /// is stale and ignored.
+    pub fn load(store: Box<dyn SelectorStore>) -> Self {
+        let (current, generation) = match store.read_primary() {
+            Some(v) => (v.entries, v.generation),
             None => (BTreeMap::new(), 0),
+        };
+        let (committed, committed_generation) = match store.read_secondary() {
+            Some(v) => (v.entries, v.generation),
+            None => (BTreeMap::new(), 0),
+        };
+        let transaction = match store.read_transaction() {
+            Some((gen, header)) if gen == generation => Some(header),
+            Some((gen, header))
+                if gen > generation && current == committed && header.resolution.is_none() =>
+            {
+                let header = Transaction {
+                    resolution: Some(Resolution {
+                        outcome: Outcome::RolledBack,
+                        reason: Reason::BootStage,
+                    }),
+                    ..header
+                };
+                match store.write_transaction(generation, &header) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            trial_generation = gen,
+                            generation,
+                            trial_boots = header.trial_boots,
+                            "boot-vector: trial ended by the boot stage — primary restored to the committed copy; recorded"
+                        );
+                        Some(header)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            trial_generation = gen,
+                            generation,
+                            error = %e,
+                            "boot-vector: boot-stage rollback could not be recorded"
+                        );
+                        None
+                    }
+                }
+            }
+            Some((gen, _)) => {
+                tracing::warn!(
+                    header_generation = gen,
+                    generation,
+                    "boot-vector: stale transaction header ignored"
+                );
+                None
+            }
+            None => None,
         };
 
         Self {
             store,
-            signer,
             current,
             generation,
             committed,
@@ -202,31 +234,27 @@ impl SystemBankManager {
 
     /// Atomically promote the staged selection to PRIMARY (booted).
     ///
-    /// Requires a prior `stage`. The new generation is `max(current,
-    /// committed) + 1` (so it always exceeds both the booted and the floor
-    /// generation). Builds + signs the blob from `pending` at that generation,
-    /// writes **PRIMARY only**, then makes `pending` the new `current`.
-    /// SECONDARY (the rollback floor) is deliberately untouched. PRIMARY gets a
-    /// fresh transaction header armed at `armed_boot_id` (`None` ⇒ unknown,
-    /// stored as zero), no boots counted, no resolution.
+    /// Requires a prior `stage`. Activates `pending` in the store with a fresh
+    /// transaction header armed at `armed_boot_id` (`None` ⇒ unknown, stored as
+    /// zero), no boots counted, no resolution; the store issues the new
+    /// generation (strictly above both copies) and the manager adopts it, then
+    /// makes `pending` the new `current`. SECONDARY (the rollback floor) is
+    /// deliberately untouched.
     ///
     /// Returns `Ok(false)` (no-op, nothing written) when there is nothing
-    /// staged. A failed PRIMARY write returns `Err` with `pending`, `current`
-    /// and `generation` untouched, so a retry seals the same selection at the
-    /// same generation.
+    /// staged. A failed activation returns `Err` with `pending`, `current` and
+    /// `generation` untouched, so a retry seals the same selection.
     pub fn seal(&mut self, armed_boot_id: Option<&str>) -> Result<bool, SelectorError> {
         let Some(pending) = self.pending.clone() else {
             return Ok(false);
         };
-        let gen = self.generation.max(self.committed_generation) + 1;
         let header = Transaction {
             armed_boot_id: armed_boot_id.map_or([0; 16], boot_id_digest),
             trial_boots: 0,
             counted_boot_id: [0; 16],
             resolution: None,
         };
-        let blob = SelectorBlob::signed(gen, pending.clone(), Some(header.clone()), &*self.signer);
-        self.store.write_primary(&blob)?;
+        let gen = self.store.activate(&pending, &header)?;
         self.pending = None;
         self.current = pending;
         self.generation = gen;
@@ -241,13 +269,11 @@ impl SystemBankManager {
     }
 
     /// Promote the booted (PRIMARY) selection to the rollback floor (SECONDARY)
-    /// — "the trial is over, this is now the floor". Builds + signs a blob from
-    /// `current` at the *current* generation and writes it to SECONDARY (which
-    /// never carries a transaction header). PRIMARY is untouched. A failed
-    /// write returns `Err` with the floor untouched. Idempotent.
+    /// — "the trial is over, this is now the floor" — at the *current*
+    /// generation. PRIMARY is untouched. A failed commit returns `Err` with the
+    /// floor untouched. Idempotent.
     pub fn commit(&mut self) -> Result<(), SelectorError> {
-        let blob = SelectorBlob::signed(self.generation, self.current.clone(), None, &*self.signer);
-        self.store.write_secondary(&blob)?;
+        self.store.commit()?;
         self.committed = self.current.clone();
         self.committed_generation = self.generation;
         tracing::info!(
@@ -260,11 +286,12 @@ impl SystemBankManager {
     }
 
     /// Roll the booted (PRIMARY) selection back to the committed floor
-    /// (SECONDARY). Builds a blob from `committed` at the committed generation
-    /// with the transaction header resolved as rolled back for `reason` (boot
-    /// ids and count kept), writes it to PRIMARY, makes `committed` the new
-    /// `current`, and clears any pending staging. A failed write returns `Err`
-    /// with `current`, `generation`, the header and `pending` untouched.
+    /// (SECONDARY): the store restores the secondary as the primary and records
+    /// the transaction header resolved as rolled back for `reason` (boot ids and
+    /// count kept) against the restored generation it reports; the manager
+    /// adopts that generation, makes `committed` the new `current`, and clears
+    /// any pending staging. A failed rollback returns `Err` with `current`,
+    /// `generation`, the header and `pending` untouched.
     ///
     /// When the node is not in trial this writes nothing and keeps the
     /// recorded resolution (so a later verdict rollback does not overwrite the
@@ -274,10 +301,6 @@ impl SystemBankManager {
             self.pending = None;
             return Ok(());
         }
-        // TODO(bootloader): anti-rollback floor is SECONDARY.generation, not
-        // last-seen-PRIMARY — a legitimate rollback writes an equal/lower
-        // generation to PRIMARY, so the bootloader must gate on >=
-        // SECONDARY.generation, not monotonic-on-PRIMARY.
         let header = Transaction {
             resolution: Some(Resolution {
                 outcome: Outcome::RolledBack,
@@ -290,25 +313,19 @@ impl SystemBankManager {
                 resolution: None,
             })
         };
-        let blob = SelectorBlob::signed(
-            self.committed_generation,
-            self.committed.clone(),
-            Some(header.clone()),
-            &*self.signer,
-        );
-        self.store.write_primary(&blob)?;
+        let gen = self.store.rollback(&header)?;
         // WARN, not info: a rollback DISCARDS the trial (overwrites PRIMARY with
         // the SECONDARY floor). If a freshly-sealed VM slot vanishes across a
         // reboot, THIS line firing is the smoking gun (active revert); its
         // ABSENCE means the loss was cache/durability, not a rollback.
         tracing::warn!(
             op = "rollback",
-            generation = self.committed_generation,
+            generation = gen,
             slots = %render_slots(&self.committed),
             "boot-selector ROLLBACK → PRIMARY overwritten with SECONDARY floor (trial discarded)"
         );
         self.current = self.committed.clone();
-        self.generation = self.committed_generation;
+        self.generation = gen;
         self.transaction = Some(header);
         self.pending = None;
         Ok(())
@@ -318,9 +335,9 @@ impl SystemBankManager {
     /// is not in trial or PRIMARY carries no armed boot id; `AlreadyCounted`
     /// when `current_boot_id` is the arming boot or the last counted one (so a
     /// process restart within one boot counts nothing); otherwise the count
-    /// goes up by one (saturating) and PRIMARY is rewritten at the same
-    /// generation with the same entries — persisted first, memory after, so a
-    /// failed write leaves everything untouched. Never decides on a limit.
+    /// goes up by one (saturating) and the header is rewritten for the same
+    /// generation — neither copy is touched — persisted first, memory after,
+    /// so a failed write leaves everything untouched. Never decides on a limit.
     pub fn observe_node_boot(
         &mut self,
         current_boot_id: &str,
@@ -342,25 +359,19 @@ impl SystemBankManager {
             counted_boot_id: id,
             ..t.clone()
         };
-        let blob = SelectorBlob::signed(
-            self.generation,
-            self.current.clone(),
-            Some(header.clone()),
-            &*self.signer,
-        );
-        self.store.write_primary(&blob)?;
+        self.store.write_transaction(self.generation, &header)?;
         let trial_boots = header.trial_boots;
         tracing::info!(
             op = "count_boot",
             generation = self.generation,
             trial_boots,
-            "boot-selector trial boot counted → PRIMARY"
+            "boot-selector trial boot counted → transaction header"
         );
         self.transaction = Some(header);
         Ok(BootObservation::Counted { trial_boots })
     }
 
-    /// PRIMARY's transaction header, if it carries one.
+    /// The transaction header recorded for the primary generation, if any.
     pub fn transaction(&self) -> Option<&Transaction> {
         self.transaction.as_ref()
     }
@@ -478,16 +489,15 @@ impl BootSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nv_store::slots;
 
     fn mgr() -> SystemBankManager {
-        SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner))
+        SystemBankManager::load(Box::new(InMemorySelectorStore::new()))
     }
 
     #[test]
     fn stage_then_seal_writes_primary_only_and_enters_trial() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
 
         // Establish a committed floor at A so the staged change is observable.
         m.stage("vm1", Bank::A, BTreeMap::new());
@@ -512,7 +522,7 @@ mod tests {
     #[test]
     fn stage_seal_commit_clears_trial_and_both_sectors_match() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
 
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
@@ -532,7 +542,7 @@ mod tests {
     #[test]
     fn stage_seal_rollback_returns_to_floor() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
 
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
@@ -560,7 +570,7 @@ mod tests {
         let store = InMemorySelectorStore::new();
 
         {
-            let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+            let mut m = SystemBankManager::load(Box::new(store.clone()));
             m.stage("vm1", Bank::A, BTreeMap::new());
             m.seal(None).unwrap();
             m.commit().unwrap(); // committed floor = A, PRIMARY = A
@@ -576,7 +586,7 @@ mod tests {
 
         // Fresh load from the SAME store: must see the old (A) selection,
         // because the staged B was never persisted.
-        let m2 = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let m2 = SystemBankManager::load(Box::new(store.clone()));
         assert_eq!(
             m2.active_bank("vm1"),
             Some(Bank::A),
@@ -647,51 +657,10 @@ mod tests {
     }
 
     #[test]
-    fn verify_failing_blob_is_rejected_on_load() {
-        let store = InMemorySelectorStore::new();
-
-        // Plant a PRIMARY blob whose signature doesn't verify under TestSigner
-        // (empty sig — StubSigner would have produced this).
-        let mut entries = BTreeMap::new();
-        entries.insert(
-            "vm1".to_string(),
-            ComponentEntry::new(Bank::B, BTreeMap::new()),
-        );
-        let generation = 9;
-        let bad = SelectorBlob {
-            generation,
-            entries: entries.clone(),
-            transaction: None,
-            sha256: SelectorBlob::compute_sha256(generation, &entries, None),
-            signature: Vec::new(), // invalid under TestSigner
-            selectors: None,
-        };
-        store.write_primary(&bad).unwrap();
-
-        let m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
-        // Rejected => treated as absent => empty maps, generation 0.
-        assert_eq!(m.active_bank("vm1"), None);
-        assert_eq!(m.generation(), 0);
-
-        // Also reject a blob with a tampered digest (sig over a different sha).
-        let tampered = SelectorBlob {
-            generation,
-            entries: entries.clone(),
-            transaction: None,
-            sha256: [0u8; 32], // doesn't match contents
-            signature: TestSigner.sign(&[0u8; 32]),
-            selectors: None,
-        };
-        store.write_primary(&tampered).unwrap();
-        let m2 = SystemBankManager::load(Box::new(store), Box::new(TestSigner));
-        assert_eq!(m2.active_bank("vm1"), None);
-    }
-
-    #[test]
     fn stub_seams_are_loud_and_nonfatal() {
         // The production stubs must not panic and must behave as "empty,
         // accept-all": load yields empty/gen-0, seal no-ops to a None read.
-        let mut m = SystemBankManager::load(Box::new(StubSelectorStore), Box::new(StubSigner));
+        let mut m = SystemBankManager::load(Box::new(StubSelectorStore));
         assert_eq!(m.generation(), 0);
         assert_eq!(m.active_bank("vm1"), None);
         assert!(!m.seal(None).unwrap(), "nothing staged => seal is a no-op");
@@ -707,7 +676,7 @@ mod tests {
     #[test]
     fn failed_seal_leaves_state_untouched_and_retry_uses_same_generation() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         m.commit().unwrap(); // floor = A at gen 1
@@ -735,7 +704,7 @@ mod tests {
     #[test]
     fn failed_commit_leaves_floor_untouched() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         m.commit().unwrap();
@@ -753,7 +722,7 @@ mod tests {
     #[test]
     fn failed_rollback_leaves_state_untouched() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         m.commit().unwrap();
@@ -772,7 +741,7 @@ mod tests {
     #[test]
     fn seal_with_nothing_staged_writes_nothing() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
         assert!(!m.seal(None).unwrap());
         assert_eq!(store.write_count(), 0);
         assert!(store.read_primary().is_none());
@@ -781,7 +750,7 @@ mod tests {
     #[test]
     fn commit_twice_is_ok_with_one_write_each() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         let before = store.write_count();
@@ -800,7 +769,7 @@ mod tests {
     /// `armed`.
     fn armed_trial(armed: Option<&str>) -> (InMemorySelectorStore, SystemBankManager) {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         m.commit().unwrap();
@@ -819,21 +788,27 @@ mod tests {
             resolution: None,
         };
         assert_eq!(m.transaction(), Some(&want));
-        assert_eq!(store.read_primary().unwrap().transaction, Some(want));
-
-        m.commit().unwrap();
-        assert_eq!(store.read_secondary().unwrap().transaction, None);
-        assert!(
-            store.read_primary().unwrap().transaction.is_some(),
-            "PRIMARY untouched"
+        assert_eq!(
+            store.read_transaction(),
+            Some((m.generation(), want.clone())),
+            "the header is recorded for the primary generation"
         );
 
-        // The header survives a reload and stays inside the digest.
-        let m2 = SystemBankManager::load(Box::new(store.clone()), Box::new(TestSigner));
+        m.commit().unwrap();
+        assert_eq!(
+            store.read_secondary(),
+            store.read_primary(),
+            "the backup is a plain vector"
+        );
+        assert_eq!(
+            store.read_transaction(),
+            Some((m.generation(), want)),
+            "header untouched by commit"
+        );
+
+        // The header survives a reload.
+        let m2 = SystemBankManager::load(Box::new(store.clone()));
         assert_eq!(m2.transaction(), m.transaction());
-        let mut tampered = store.read_primary().unwrap();
-        tampered.transaction.as_mut().unwrap().trial_boots = 9;
-        assert!(!tampered.is_valid(&TestSigner), "header is signed");
     }
 
     #[test]
@@ -846,7 +821,8 @@ mod tests {
         });
         let primary = store.read_primary().unwrap();
         assert_eq!(primary.entries["vm1"].bank, Bank::A);
-        let t = primary.transaction.unwrap();
+        let (gen, t) = store.read_transaction().unwrap();
+        assert_eq!(gen, primary.generation);
         assert_eq!(t.resolution, resolved);
         assert_eq!(t.armed_boot_id, boot_id_digest("boot-a"), "ids kept");
         assert_eq!(m.transaction().unwrap().resolution, resolved);
@@ -857,15 +833,7 @@ mod tests {
         m.rollback(Reason::Verdict).unwrap();
         assert_eq!(store.write_count(), writes);
         assert_eq!(m.transaction().unwrap().resolution, resolved);
-        assert_eq!(
-            store
-                .read_primary()
-                .unwrap()
-                .transaction
-                .unwrap()
-                .resolution,
-            resolved
-        );
+        assert_eq!(store.read_transaction().unwrap().1.resolution, resolved);
     }
 
     #[test]
@@ -924,10 +892,10 @@ mod tests {
         let primary = store.read_primary().unwrap();
         assert_eq!(primary.generation, gen, "same generation");
         assert_eq!(primary.entries["vm1"].bank, Bank::B, "same entries");
-        let t = primary.transaction.clone().unwrap();
+        let (header_gen, t) = store.read_transaction().unwrap();
+        assert_eq!(header_gen, gen, "header recorded for the same generation");
         assert_eq!(t.trial_boots, 2);
         assert_eq!(t.counted_boot_id, boot_id_digest("boot-c"));
-        assert!(primary.is_valid(&TestSigner));
         assert!(m.is_trial());
     }
 
@@ -945,9 +913,175 @@ mod tests {
         );
     }
 
-    /// Build a self-consistent signed blob (matching digest + TestSigner
-    /// signature) for the file round-trip.
-    fn blob(generation: u64, id: &str, bank: Bank) -> SelectorBlob {
+    #[test]
+    fn seal_adopts_the_generation_the_store_issued() {
+        let store = InMemorySelectorStore::new();
+        store.set_next_generation(42);
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
+
+        m.stage("vm1", Bank::A, BTreeMap::new());
+        m.seal(None).unwrap();
+        assert_eq!(m.generation(), 42);
+        m.commit().unwrap();
+
+        m.stage("vm1", Bank::B, BTreeMap::new());
+        m.seal(None).unwrap();
+        assert_eq!(m.generation(), 43);
+        assert_eq!(store.read_transaction().unwrap().0, 43);
+    }
+
+    #[test]
+    fn stale_transaction_header_is_ignored_on_load() {
+        let store = InMemorySelectorStore::new();
+        let h = Transaction {
+            armed_boot_id: boot_id_digest("x"),
+            trial_boots: 0,
+            counted_boot_id: [0; 16],
+            resolution: None,
+        };
+        let h2 = Transaction {
+            trial_boots: 4,
+            ..h.clone()
+        };
+        let e = BTreeMap::from([(
+            "vm1".to_string(),
+            ComponentEntry::new(Bank::A, BTreeMap::new()),
+        )]);
+        assert_eq!(store.activate(&e, &h).unwrap(), 1);
+        assert_eq!(store.activate(&e, &h).unwrap(), 2);
+
+        // A header below the primary generation.
+        store.write_transaction(1, &h2).unwrap();
+        let writes = store.write_count();
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        assert!(m.transaction().is_none(), "stale header dropped");
+        assert_eq!(m.generation(), 2);
+        assert_eq!(m.rebooted_since_arming(Some("x")), None);
+        assert_eq!(store.write_count(), writes, "load wrote nothing");
+
+        // A header above the primary while in trial (no committed copy) is
+        // not the boot stage's doing: dropped too.
+        store.write_transaction(5, &h2).unwrap();
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        assert!(m.is_trial());
+        assert!(m.transaction().is_none(), "stale header dropped");
+
+        // The same header recorded for the primary generation is kept.
+        store.write_transaction(2, &h2).unwrap();
+        let m = SystemBankManager::load(Box::new(store));
+        assert_eq!(m.transaction(), Some(&h2));
+    }
+
+    /// A committed vector at generation 1 and a trial at generation 2 whose
+    /// header has counted three boots — the state the boot stage acts on.
+    fn trial_with_three_counted_boots() -> (InMemorySelectorStore, Transaction) {
+        let store = InMemorySelectorStore::new();
+        let h = Transaction {
+            armed_boot_id: boot_id_digest("boot-a"),
+            trial_boots: 0,
+            counted_boot_id: [0; 16],
+            resolution: None,
+        };
+        assert_eq!(store.activate(&entries("vm1", Bank::A), &h).unwrap(), 1);
+        store.commit().unwrap();
+        assert_eq!(store.activate(&entries("vm1", Bank::B), &h).unwrap(), 2);
+        let counted = Transaction {
+            trial_boots: 3,
+            counted_boot_id: boot_id_digest("boot-d"),
+            ..h
+        };
+        store.write_transaction(2, &counted).unwrap();
+        (store, counted)
+    }
+
+    #[test]
+    fn boot_stage_rollback_is_recorded_at_load_with_the_count_kept() {
+        let (store, counted) = trial_with_three_counted_boots();
+        store.boot_stage_rollback();
+
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        let recorded = Transaction {
+            resolution: Some(Resolution {
+                outcome: Outcome::RolledBack,
+                reason: Reason::BootStage,
+            }),
+            ..counted
+        };
+        assert_eq!(m.generation(), 1);
+        assert!(!m.is_trial());
+        assert_eq!(m.transaction(), Some(&recorded));
+        assert_eq!(
+            store.read_transaction(),
+            Some((1, recorded.clone())),
+            "persisted for the restored generation"
+        );
+
+        let writes = store.write_count();
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        assert_eq!(m.transaction(), Some(&recorded), "read back as recorded");
+        assert_eq!(store.write_count(), writes, "a second load writes nothing");
+    }
+
+    #[test]
+    fn boot_stage_rollback_record_failure_leaves_no_header() {
+        let (store, _) = trial_with_three_counted_boots();
+        store.boot_stage_rollback();
+        store.set_fail_writes(true);
+
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        assert!(m.transaction().is_none());
+        assert_eq!(m.generation(), 1);
+    }
+
+    #[test]
+    fn observe_node_boot_rewrites_only_the_header() {
+        let (store, mut m) = armed_trial(Some("boot-a"));
+        let writes = store.write_count();
+        let (primary, secondary) = (store.read_primary(), store.read_secondary());
+
+        assert_eq!(
+            m.observe_node_boot("boot-b").unwrap(),
+            BootObservation::Counted { trial_boots: 1 }
+        );
+
+        assert_eq!(store.write_count(), writes + 1, "exactly one write");
+        assert_eq!(store.read_primary(), primary, "primary untouched");
+        assert_eq!(store.read_secondary(), secondary, "secondary untouched");
+        let (gen, t) = store.read_transaction().unwrap();
+        assert_eq!(gen, m.generation());
+        assert_eq!(t.trial_boots, 1);
+        assert_eq!(t.counted_boot_id, boot_id_digest("boot-b"));
+    }
+
+    #[test]
+    fn rollback_restores_the_committed_generation_the_store_reports() {
+        let store = InMemorySelectorStore::new();
+        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        m.stage("vm1", Bank::A, BTreeMap::new());
+        m.seal(None).unwrap();
+        m.commit().unwrap();
+        assert_eq!(m.generation(), 1);
+        m.stage("vm1", Bank::B, BTreeMap::new());
+        m.seal(None).unwrap();
+        assert_eq!(m.generation(), 2);
+
+        m.rollback(Reason::Verdict).unwrap();
+
+        assert_eq!(m.generation(), 1);
+        assert!(!m.is_trial());
+        assert_eq!(
+            m.transaction().unwrap().resolution,
+            Some(Resolution {
+                outcome: Outcome::RolledBack,
+                reason: Reason::Verdict
+            })
+        );
+        assert_eq!(store.read_primary(), store.read_secondary());
+        assert_eq!(store.read_transaction().unwrap().0, 1);
+    }
+
+    /// One component's entries with a sealed kernel image.
+    fn entries(id: &str, bank: Bank) -> BTreeMap<String, ComponentEntry> {
         let images = BTreeMap::from([(
             "kernel".to_string(),
             ImageEntry {
@@ -955,9 +1089,7 @@ mod tests {
                 sha256: [0xAB; 32],
             },
         )]);
-        let mut entries = BTreeMap::new();
-        entries.insert(id.to_string(), ComponentEntry::new(bank, images));
-        SelectorBlob::signed(generation, entries, None, &TestSigner)
+        BTreeMap::from([(id.to_string(), ComponentEntry::new(bank, images))])
     }
 
     #[test]
@@ -973,18 +1105,36 @@ mod tests {
                 .as_nanos()
         ));
 
-        let primary = blob(7, "vm1", Bank::B);
-        let secondary = blob(3, "vm2", Bank::A);
+        let header = Transaction {
+            armed_boot_id: [0; 16],
+            trial_boots: 0,
+            counted_boot_id: [0; 16],
+            resolution: None,
+        };
 
         // Write through one store...
-        let writer = FileSelectorStore::new(&dir);
-        writer.write_primary(&primary).unwrap();
-        writer.write_secondary(&secondary).unwrap();
+        let writer = FileSelectorStore::new(&dir, Box::new(TestSigner));
+        assert_eq!(
+            writer.activate(&entries("vm2", Bank::A), &header).unwrap(),
+            1
+        );
+        writer.commit().unwrap();
+        assert_eq!(
+            writer.activate(&entries("vm1", Bank::B), &header).unwrap(),
+            2
+        );
 
         // ...read back through a fresh one (no shared in-process state).
-        let reader = FileSelectorStore::new(&dir);
-        assert_eq!(reader.read_primary().as_ref(), Some(&primary));
-        assert_eq!(reader.read_secondary().as_ref(), Some(&secondary));
+        let reader = FileSelectorStore::new(&dir, Box::new(TestSigner));
+        let vector = |generation, entries| {
+            Some(BootVector {
+                generation,
+                entries,
+            })
+        };
+        assert_eq!(reader.read_primary(), vector(2, entries("vm1", Bank::B)));
+        assert_eq!(reader.read_secondary(), vector(1, entries("vm2", Bank::A)));
+        assert_eq!(reader.read_transaction(), Some((2, header)));
 
         // The slots are the named files, not the .tmp staging files.
         assert!(dir.join("primary").exists());
@@ -1012,55 +1162,5 @@ mod tests {
         assert!(!raw.contains("selectors"), "no legacy slot map:\n{raw}");
 
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
-    }
-
-    // --- blobs signed over the retired per-slot encoding ---
-
-    #[test]
-    fn legacy_slot_blob_is_rejected_on_load() {
-        // A blob correctly signed over the OLD encoding — `[set, bank]` per
-        // slot, the selection carried only in the slot map — no longer
-        // verifies: the digest is over the entries, and there are none. Both
-        // slots read as absent, so the node looks unseeded and the host
-        // reseeds it from NV.
-        use sha2::{Digest, Sha256};
-
-        let generation: u64 = 5;
-        let mut legacy = generation.to_le_bytes().to_vec();
-        legacy.extend_from_slice(&[slots::VM1.0, Bank::A as u8]);
-        let sha256: [u8; 32] = Sha256::digest(&legacy).into();
-        let mut selectors = BTreeMap::new();
-        selectors.insert(slots::VM1, SlotSelect::new(Bank::A));
-        let blob = SelectorBlob {
-            generation,
-            entries: BTreeMap::new(),
-            transaction: None,
-            sha256,
-            signature: TestSigner.sign(&sha256),
-            selectors: Some(selectors),
-        };
-        assert!(
-            TestSigner.verify(&blob.sha256, &blob.signature),
-            "the signature itself is good — only the digest is stale"
-        );
-
-        let store = InMemorySelectorStore::new();
-        store.write_primary(&blob).unwrap();
-        store.write_secondary(&blob).unwrap();
-
-        let m = SystemBankManager::load(Box::new(store), Box::new(TestSigner));
-        assert!(m.is_empty(), "PRIMARY rejected");
-        assert_eq!(m.generation(), 0);
-        // current is empty, so a trial would mean SECONDARY survived.
-        assert!(!m.is_trial(), "SECONDARY rejected");
-    }
-
-    #[test]
-    fn slot_json_with_legacy_enabled_key_still_parses() {
-        // A slot written with the retired `enabled` key still parses (unknown
-        // keys are ignored); its blob then fails `is_valid`, not the parse.
-        let json = serde_json::json!({ "bank": "A", "enabled": false });
-        let sel: SlotSelect = serde_json::from_value(json).expect("slot parses");
-        assert_eq!(sel, SlotSelect { bank: Bank::A });
     }
 }
