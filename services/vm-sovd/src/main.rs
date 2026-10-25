@@ -499,7 +499,13 @@ async fn main() {
         }
     }
 
-    let machine: Arc<dyn Machine> = Arc::new(machine_builder.build());
+    let machine: Arc<dyn Machine> = match machine_builder.build() {
+        Ok(machine) => Arc::new(machine),
+        Err(e) => {
+            tracing::error!("boot selector store unreadable: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let router = if gateway_mode {
         // In-guest federating gateway: local onboard pull-update (route-scoped

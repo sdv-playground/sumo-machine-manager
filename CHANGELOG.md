@@ -8,6 +8,44 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+An unreadable boot record is no longer mistaken for an absent one, and the committed copy is defined
+by the floor, not by which copy of the record holds it.
+
+- Reads carry an error channel: `BootRecord::read(copy)` and `SelectorStore::read_primary` /
+  `read_secondary` return `Result<Option<BootVector>, SelectorError>`. `Ok(None)` is absent (erased,
+  never written, or a failed authenticity check); `Err` is a record that could not be read (I/O,
+  allocation, a check that could not run). `SelectorError::Unreadable(String)` is new, for a backend
+  that reports a check could not run.
+- `RecordSelectorStore` propagates the record's `Err` from every verb that reads a copy, and an I/O
+  error on its own side files (`rows`, `committed`, `transaction`) likewise; `commit` over an
+  unreadable primary is `Err`, never `Ok`. A side file that is missing, does not parse or fails
+  verification is still absent; `read_transaction` logs an unreadable header and reads none.
+  `FileBootRecord::read`: a missing file is `Ok(None)`, one that exists and cannot be read is
+  `Err(Io)`; a parse or verification failure is still absent.
+- `SystemBankManager::load` and `MachineRegistryBuilder::build` return `Result`: an unreadable record
+  no longer loads as an empty vector, is never seeded, never commits and is never read as a
+  boot-stage rollback. `try_build` returns `BuildError` (duplicate id or unreadable store);
+  `BootManager::process_boot` returns `BootError::Selector` instead of falling through to NV.
+  `SystemBankManager::committed_generation()` is new.
+- `RecordCopy::Secondary` is the committed copy: the rows at the floor, whichever copy of the record
+  holds them; absent when no copy is at the floor. A vector with no committed copy is not a trial
+  the node can resolve by rollback: `seed_selector` anchors it by committing what stands, adding any
+  missing ids first through the ordinary seed sequence (an NV trial among them is re-armed over the
+  new floor) — even when every id is present and matches NV. A committed vector in trial is still
+  left alone.
+- Executable contracts (feature `test-seams`): `contract::exercise_with_ids(&store, ids)` and
+  `contract::exercise_record_with_ids(&record, ids)` write the ids the record already holds plus
+  `ids`, compare generations and banks only (never images), and `exercise_record` reads the committed
+  copy between activate and commit. `exercise` / `exercise_record` keep their signatures (over `os`,
+  `vm1`). `InMemoryBootRecord` gains `set_fail_reads` and `tear_committed`.
+
+Host-facing: three signature changes. `BootRecord::read` returns
+`Result<Option<BootVector>, SelectorError>` (a record maps "could not determine" to `Err`, never to
+`None`); `SelectorStore::read_primary` / `read_secondary` likewise; `SystemBankManager::load` and
+`MachineRegistryBuilder::build` return `Result<_, SelectorError>` — retry or fail the boot-vector
+subsystem on `Err`, never serve a fabricated empty vector. A host record runs
+`exercise_record_with_ids` with the ids it routes. The file store's bytes and layout are unchanged.
+
 ## v0.1.16 — boot record seam: the record holds what boots, sumo holds the rest, tied by generation
 
 Tag on `f694bf3` (2026-10-25), PR #22.

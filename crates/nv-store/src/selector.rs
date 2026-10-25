@@ -347,12 +347,17 @@ pub struct BootVector {
     pub entries: BTreeMap<String, ComponentEntry>,
 }
 
-/// A [`SelectorStore`] write that did not land. The store must not be treated
-/// as written.
+/// A [`SelectorStore`] write that did not land — the store must not be treated
+/// as written — or a read that could not determine a copy — the copy must not
+/// be treated as absent.
 #[derive(Debug)]
 pub enum SelectorError {
     Io(std::io::Error),
     Serialize(String),
+    /// The record could not be read: its backend reports that a check could
+    /// not run (or another failure that is not a filesystem error). Transient
+    /// as far as the store knows: retry or fail, never read it as absent.
+    Unreadable(String),
     /// A rollback found nothing to restore: no committed copy, or the primary
     /// already is the committed copy.
     NoTrial,
@@ -369,6 +374,7 @@ impl std::fmt::Display for SelectorError {
         match self {
             SelectorError::Io(e) => write!(f, "boot vector store I/O error: {e}"),
             SelectorError::Serialize(e) => write!(f, "boot vector serialize error: {e}"),
+            SelectorError::Unreadable(e) => write!(f, "boot vector record unreadable: {e}"),
             SelectorError::NoTrial => write!(
                 f,
                 "nothing to roll back: the primary already is the committed copy"
@@ -380,7 +386,7 @@ impl std::fmt::Display for SelectorError {
 impl std::error::Error for SelectorError {}
 
 /// The boot-vector store: a PRIMARY copy (what boots), a SECONDARY copy (the
-/// committed rollback floor) and the transaction header (what the node observed
+/// committed copy, the rollback floor) and the transaction header (what the node observed
 /// about the transaction at the primary generation).
 ///
 /// The store **issues the generation and authenticates its contents**; the
@@ -416,12 +422,13 @@ impl std::error::Error for SelectorError {}
 /// primary's, on a committed vector (primary = secondary), can only mean the
 /// boot stage restored the secondary while the node was down.
 pub trait SelectorStore: Send + Sync {
-    /// Authenticated contents of the primary copy, or `None` (absent or failed
-    /// check).
-    fn read_primary(&self) -> Option<BootVector>;
-    /// Authenticated contents of the secondary copy, or `None` (absent or
-    /// failed check).
-    fn read_secondary(&self) -> Option<BootVector>;
+    /// Authenticated contents of the primary copy (what boots): `Ok(None)` when
+    /// absent (or it failed its authenticity check), `Err` when the store could
+    /// not read it — never to be treated as absent.
+    fn read_primary(&self) -> Result<Option<BootVector>, SelectorError>;
+    /// Authenticated contents of the secondary copy (the committed copy):
+    /// `Ok(None)` when there is none, `Err` when the store could not read it.
+    fn read_secondary(&self) -> Result<Option<BootVector>, SelectorError>;
     /// Make `entries` the primary at a generation the store issues, strictly
     /// above both copies, and record `header` as that generation's
     /// transaction. Returns the generation. The secondary is untouched.
@@ -435,7 +442,8 @@ pub trait SelectorStore: Send + Sync {
         header: &Transaction,
     ) -> Result<u64, SelectorError>;
     /// secondary := primary (same generation) — "the trial is over, this is
-    /// now the floor". Idempotent; `Ok` and a no-op without a primary.
+    /// now the floor". Idempotent; `Ok` and a no-op without a primary, `Err`
+    /// when the primary could not be read.
     fn commit(&self) -> Result<(), SelectorError>;
     /// primary := secondary, record `header` against the restored generation,
     /// and return that generation. The header is written before the primary.
@@ -479,7 +487,7 @@ const STUB_STORE_WARNING: &str =
     "TODO(bootloader): SystemBankState sector I/O unimplemented — selector partition layout pending bootloader support";
 
 /// Production [`SelectorStore`] placeholder. Every method warns loudly and
-/// stores nothing: reads return `None`; `commit` / `write_transaction` report
+/// stores nothing: reads return `Ok(None)`; `commit` / `write_transaction` report
 /// `Ok(())`, `activate` reports generation 1 and `rollback` generation 0 — a
 /// loud no-op for builds that wire no store. **Non-fatal on purpose**, so a node
 /// with only the stub wired keeps booting via `NvBootState`.
@@ -487,13 +495,13 @@ const STUB_STORE_WARNING: &str =
 pub struct StubSelectorStore;
 
 impl SelectorStore for StubSelectorStore {
-    fn read_primary(&self) -> Option<BootVector> {
+    fn read_primary(&self) -> Result<Option<BootVector>, SelectorError> {
         tracing::warn!("{STUB_STORE_WARNING}");
-        None
+        Ok(None)
     }
-    fn read_secondary(&self) -> Option<BootVector> {
+    fn read_secondary(&self) -> Result<Option<BootVector>, SelectorError> {
         tracing::warn!("{STUB_STORE_WARNING}");
-        None
+        Ok(None)
     }
     fn activate(
         &self,
@@ -599,7 +607,7 @@ impl InMemorySelectorStore {
     /// outside the contract, so it ignores [`Self::set_fail_writes`] and is
     /// not counted in [`Self::write_count`].
     pub fn boot_stage_rollback(&self) {
-        let secondary = self.read_secondary();
+        let secondary = self.secondary.lock().expect("secondary poisoned").clone();
         *self.primary.lock().expect("primary poisoned") = secondary;
     }
 
@@ -621,11 +629,11 @@ impl InMemorySelectorStore {
 
 #[cfg(feature = "test-seams")]
 impl SelectorStore for InMemorySelectorStore {
-    fn read_primary(&self) -> Option<BootVector> {
-        self.primary.lock().expect("primary poisoned").clone()
+    fn read_primary(&self) -> Result<Option<BootVector>, SelectorError> {
+        Ok(self.primary.lock().expect("primary poisoned").clone())
     }
-    fn read_secondary(&self) -> Option<BootVector> {
-        self.secondary.lock().expect("secondary poisoned").clone()
+    fn read_secondary(&self) -> Result<Option<BootVector>, SelectorError> {
+        Ok(self.secondary.lock().expect("secondary poisoned").clone())
     }
     fn activate(
         &self,
@@ -633,14 +641,13 @@ impl SelectorStore for InMemorySelectorStore {
         header: &Transaction,
     ) -> Result<u64, SelectorError> {
         self.check_writable()?;
+        let (primary, secondary) = (self.read_primary()?, self.read_secondary()?);
         let generation = self
             .next_generation
             .lock()
             .expect("generation poisoned")
             .take()
-            .unwrap_or_else(|| {
-                next_generation(self.read_primary().as_ref(), self.read_secondary().as_ref())
-            });
+            .unwrap_or_else(|| next_generation(primary.as_ref(), secondary.as_ref()));
         *self.primary.lock().expect("primary poisoned") = Some(BootVector {
             generation,
             entries: entries.clone(),
@@ -652,7 +659,7 @@ impl SelectorStore for InMemorySelectorStore {
     }
     fn commit(&self) -> Result<(), SelectorError> {
         self.check_writable()?;
-        if let Some(primary) = self.read_primary() {
+        if let Some(primary) = self.read_primary()? {
             *self.secondary.lock().expect("secondary poisoned") = Some(primary);
         }
         self.count_write();
@@ -660,9 +667,10 @@ impl SelectorStore for InMemorySelectorStore {
     }
     fn rollback(&self, header: &Transaction) -> Result<u64, SelectorError> {
         self.check_writable()?;
+        let primary = self.read_primary()?;
         let secondary = self
-            .read_secondary()
-            .filter(|s| self.read_primary().as_ref() != Some(s))
+            .read_secondary()?
+            .filter(|s| primary.as_ref() != Some(s))
             .ok_or(SelectorError::NoTrial)?;
         *self.transaction.lock().expect("transaction poisoned") =
             Some((secondary.generation, header.clone()));
@@ -738,81 +746,154 @@ pub mod contract {
         }
     }
 
-    fn entries(list: &[(&str, Bank)]) -> BTreeMap<String, ComponentEntry> {
-        list.iter()
-            .map(|(id, bank)| (id.to_string(), ComponentEntry::new(*bank, BTreeMap::new())))
+    /// The ids the contract writes: every id `held` already holds, plus `ids`.
+    fn routed(held: Option<BootVector>, ids: &[&str]) -> Vec<String> {
+        let mut all: std::collections::BTreeSet<String> = held
+            .into_iter()
+            .flat_map(|v| v.entries.into_keys())
+            .collect();
+        all.extend(ids.iter().map(|id| id.to_string()));
+        all.into_iter().collect()
+    }
+
+    /// Every id in `ids` at `bank`, no images.
+    fn at(ids: &[String], bank: Bank) -> BTreeMap<String, ComponentEntry> {
+        ids.iter()
+            .map(|id| (id.clone(), ComponentEntry::new(bank, BTreeMap::new())))
             .collect()
     }
 
-    /// Drive `record` through activate / commit / rollback and assert the
-    /// [`BootRecord`] contract. Asserts only relative facts, so it may run
-    /// against a record that starts non-empty. Panics on the first violation.
+    /// What the contract compares of a copy: its generation and the bank of
+    /// each of `ids` — never the images, which a record need not carry.
+    fn banks(v: Option<BootVector>, ids: &[String]) -> Option<(u64, BTreeMap<String, Bank>)> {
+        v.map(|v| {
+            let banks = ids
+                .iter()
+                .filter_map(|id| v.entries.get(id).map(|e| (id.clone(), e.bank)))
+                .collect();
+            (v.generation, banks)
+        })
+    }
+
+    /// [`exercise_record_with_ids`] over `os` and `vm1`.
     pub fn exercise_record(record: &dyn BootRecord) {
-        let e1 = entries(&[("os", Bank::A)]);
-        let e2 = entries(&[("os", Bank::B)]);
+        exercise_record_with_ids(record, &["os", "vm1"]);
+    }
+
+    /// Drive `record` through activate / commit / rollback and assert the
+    /// [`BootRecord`] contract, writing every id the record already holds plus
+    /// `ids` (pass the ids the record routes). Compares generations and banks
+    /// only. Asserts only relative facts, so it may run against a record that
+    /// starts non-empty. Panics on the first violation.
+    ///
+    /// Between an activate and the commit, the secondary is read and must be
+    /// the committed copy from before the activate (absent on a record that
+    /// had none).
+    pub fn exercise_record_with_ids(record: &dyn BootRecord, ids: &[&str]) {
+        let read = |copy: RecordCopy| record.read(copy).expect("the record reads");
+        let ids = routed(read(RecordCopy::Primary), ids);
+        let view = |copy: RecordCopy| banks(read(copy), &ids);
+        let want = |generation: u64, entries: &BTreeMap<String, ComponentEntry>| {
+            banks(
+                Some(BootVector {
+                    generation,
+                    entries: entries.clone(),
+                }),
+                &ids,
+            )
+        };
+        let (e1, e2) = (at(&ids, Bank::A), at(&ids, Bank::B));
         let gen = |v: Option<BootVector>| v.map_or(0, |v| v.generation);
 
-        // activate issues a generation strictly above both copies.
-        let floor =
-            gen(record.read(RecordCopy::Primary)).max(gen(record.read(RecordCopy::Secondary)));
+        // activate issues a generation strictly above both copies and leaves
+        // the committed copy where it was.
+        let committed = view(RecordCopy::Secondary);
+        let floor = gen(read(RecordCopy::Primary)).max(gen(read(RecordCopy::Secondary)));
         let g1 = record.activate(&e1).expect("activate e1");
         assert!(
             g1 > floor,
             "activate issues above both copies: {g1} > {floor}"
         );
+        assert_eq!(view(RecordCopy::Primary), want(g1, &e1));
         assert_eq!(
-            record.read(RecordCopy::Primary),
-            Some(BootVector {
-                generation: g1,
-                entries: e1.clone()
-            })
+            view(RecordCopy::Secondary),
+            committed,
+            "the committed copy is the one from before the activate"
         );
         let g2 = record.activate(&e2).expect("activate e2");
         assert!(g2 > g1, "a second activate issues higher: {g2} > {g1}");
+        assert_eq!(
+            view(RecordCopy::Secondary),
+            committed,
+            "the committed copy is the one from before the activates"
+        );
 
         // commit makes the copies equal, idempotently.
         record.commit().expect("commit");
-        let primary = record.read(RecordCopy::Primary);
-        assert_eq!(record.read(RecordCopy::Secondary), primary);
+        let primary = view(RecordCopy::Primary);
+        assert_eq!(primary, want(g2, &e2));
+        assert_eq!(view(RecordCopy::Secondary), primary);
         record.commit().expect("second commit");
-        assert_eq!(record.read(RecordCopy::Secondary), primary);
-        assert_eq!(record.read(RecordCopy::Primary), primary);
+        assert_eq!(view(RecordCopy::Secondary), primary);
+        assert_eq!(view(RecordCopy::Primary), primary);
 
         // rollback restores the secondary's generation and entries.
         let g3 = record.activate(&e1).expect("activate e1 again");
         assert!(g3 > g2, "activate over a committed floor: {g3} > {g2}");
+        assert_eq!(
+            view(RecordCopy::Secondary),
+            primary,
+            "the committed copy is the one committed before the activate"
+        );
         assert_eq!(record.rollback().expect("rollback"), g2);
-        assert_eq!(record.read(RecordCopy::Primary), primary);
+        assert_eq!(view(RecordCopy::Primary), primary);
 
         // Nothing left to restore.
         assert!(record.rollback().is_err(), "rollback without a trial");
-        assert_eq!(record.read(RecordCopy::Primary), primary);
+        assert_eq!(view(RecordCopy::Primary), primary);
+    }
+
+    /// [`exercise_with_ids`] over `os` and `vm1`.
+    pub fn exercise(store: &dyn SelectorStore) {
+        exercise_with_ids(store, &["os", "vm1"]);
     }
 
     /// Drive `store` through activate / commit / write_transaction / rollback
-    /// and assert the contract. Asserts only relative facts, so it may run
-    /// against a store that starts non-empty. Panics on the first violation.
-    pub fn exercise(store: &dyn SelectorStore) {
+    /// and assert the contract, writing every id the store already holds plus
+    /// `ids`. Compares generations and banks only. Asserts only relative
+    /// facts, so it may run against a store that starts non-empty. Panics on
+    /// the first violation.
+    pub fn exercise_with_ids(store: &dyn SelectorStore, ids: &[&str]) {
+        let primary_of = || store.read_primary().expect("the store reads the primary");
+        let secondary_of = || {
+            store
+                .read_secondary()
+                .expect("the store reads the secondary")
+        };
+        let ids = routed(primary_of(), ids);
+        let (primary_view, secondary_view) =
+            (|| banks(primary_of(), &ids), || banks(secondary_of(), &ids));
+        let want = |generation: u64, entries: &BTreeMap<String, ComponentEntry>| {
+            banks(
+                Some(BootVector {
+                    generation,
+                    entries: entries.clone(),
+                }),
+                &ids,
+            )
+        };
         let (h1, h2, h3, h4, h5) = (header(1), header(2), header(3), header(4), header(5));
-        let e1 = entries(&[("os", Bank::A)]);
-        let e2 = entries(&[("os", Bank::B), ("vm1", Bank::A)]);
-        let e3 = entries(&[("os", Bank::A), ("vm1", Bank::B)]);
+        let (e1, e2, e3) = (at(&ids, Bank::A), at(&ids, Bank::B), at(&ids, Bank::A));
         let gen = |v: Option<BootVector>| v.map_or(0, |v| v.generation);
 
         // activate issues a generation strictly above both copies.
-        let floor = gen(store.read_primary()).max(gen(store.read_secondary()));
+        let floor = gen(primary_of()).max(gen(secondary_of()));
         let g1 = store.activate(&e1, &h1).expect("activate e1");
         assert!(
             g1 > floor,
             "activate issues above both copies: {g1} > {floor}"
         );
-        assert_eq!(
-            store.read_primary(),
-            Some(BootVector {
-                generation: g1,
-                entries: e1
-            })
-        );
+        assert_eq!(primary_view(), want(g1, &e1));
         assert_eq!(store.read_transaction(), Some((g1, h1)));
 
         let g2 = store.activate(&e2, &h2).expect("activate e2");
@@ -820,29 +901,30 @@ pub mod contract {
 
         // commit copies the primary to the secondary, idempotently.
         store.commit().expect("commit");
-        let primary = store.read_primary();
-        assert_eq!(store.read_secondary(), primary);
+        let primary = primary_view();
+        assert_eq!(primary, want(g2, &e2));
+        assert_eq!(secondary_view(), primary);
         store.commit().expect("second commit");
-        assert_eq!(store.read_secondary(), primary);
-        assert_eq!(store.read_primary(), primary);
+        assert_eq!(secondary_view(), primary);
+        assert_eq!(primary_view(), primary);
 
         // write_transaction changes the header and neither copy.
         store.write_transaction(g2, &h3).expect("write_transaction");
         assert_eq!(store.read_transaction(), Some((g2, h3)));
-        assert_eq!(store.read_primary(), primary);
-        assert_eq!(store.read_secondary(), primary);
+        assert_eq!(primary_view(), primary);
+        assert_eq!(secondary_view(), primary);
 
         // rollback restores the secondary and records the header at it.
         let g3 = store.activate(&e3, &h4).expect("activate e3");
         assert!(g3 > g2, "activate over a committed floor: {g3} > {g2}");
         assert_eq!(store.rollback(&h5).expect("rollback"), g2);
-        assert_eq!(store.read_primary(), store.read_secondary());
-        assert_eq!(store.read_primary(), primary);
+        assert_eq!(primary_view(), secondary_view());
+        assert_eq!(primary_view(), primary);
         assert_eq!(store.read_transaction(), Some((g2, h5.clone())));
 
         // Nothing left to restore.
         assert!(store.rollback(&h5).is_err(), "rollback without a trial");
-        assert_eq!(store.read_primary(), primary);
+        assert_eq!(primary_view(), primary);
     }
 }
 
@@ -915,13 +997,16 @@ mod tests {
 
         store.activate(&entries("os", Bank::A), &header()).unwrap();
         store.commit().unwrap();
-        let (primary, secondary) = (store.read_primary(), store.read_secondary());
+        let (primary, secondary) = (
+            store.read_primary().unwrap(),
+            store.read_secondary().unwrap(),
+        );
         assert!(matches!(
             store.rollback(&header()),
             Err(SelectorError::NoTrial)
         ));
-        assert_eq!(store.read_primary(), primary);
-        assert_eq!(store.read_secondary(), secondary);
+        assert_eq!(store.read_primary().unwrap(), primary);
+        assert_eq!(store.read_secondary().unwrap(), secondary);
     }
 
     #[cfg(feature = "test-seams")]

@@ -1071,7 +1071,7 @@ mod tests {
         for s in stubs {
             builder = builder.with_arc(s.clone() as Arc<dyn Component>);
         }
-        Arc::new(builder.build())
+        Arc::new(builder.build().unwrap())
     }
 
     /// A coordinator booted as `boot_id` with vm1's bank report fixed at

@@ -94,7 +94,8 @@ mod tests {
             .with_arc(Arc::new(BareStub {
                 caps: Capabilities::default(),
             }) as Arc<dyn Component>)
-            .build(),
+            .build()
+            .unwrap(),
         )
     }
 

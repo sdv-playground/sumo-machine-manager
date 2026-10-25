@@ -1097,7 +1097,7 @@ mod tests {
 
     /// A boot selector whose PRIMARY (booted selection) for Os is `bank`.
     fn selector_on(bank: Bank) -> SharedSystemBankState {
-        let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()));
+        let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new())).unwrap();
         let shared: SharedSystemBankState = Arc::new(RwLock::new(mgr));
         {
             let mut g = shared.write().unwrap();

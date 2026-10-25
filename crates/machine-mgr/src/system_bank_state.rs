@@ -150,7 +150,9 @@ impl SystemBankManager {
     ///
     /// The store authenticates its contents: a copy that fails its check reads
     /// as absent. An absent PRIMARY (the stub case) yields empty maps at
-    /// generation 0.
+    /// generation 0; an absent SECONDARY, an empty committed copy at
+    /// generation 0. A copy the store could not read is `Err`: nothing is
+    /// loaded, so an unreadable record is never taken for an empty vector.
     ///
     /// A header recorded above the primary generation, on a committed vector
     /// and with no resolution, can only mean the boot stage restored the
@@ -158,14 +160,15 @@ impl SystemBankManager {
     /// above the primary — see [`SelectorStore`]). It is recorded as resolved
     /// `rolled_back` / [`Reason::BootStage`], boot ids and count kept, for the
     /// primary generation — written first, adopted after; if the write fails,
-    /// no header is adopted. Any other header recorded for another generation
-    /// is stale and ignored.
-    pub fn load(store: Box<dyn SelectorStore>) -> Self {
-        let (current, generation) = match store.read_primary() {
+    /// no header is adopted. An unreadable record never reaches this rule: it
+    /// is `Err` before the header is read. Any other header recorded for
+    /// another generation is stale and ignored.
+    pub fn load(store: Box<dyn SelectorStore>) -> Result<Self, SelectorError> {
+        let (current, generation) = match store.read_primary()? {
             Some(v) => (v.entries, v.generation),
             None => (BTreeMap::new(), 0),
         };
-        let (committed, committed_generation) = match store.read_secondary() {
+        let (committed, committed_generation) = match store.read_secondary()? {
             Some(v) => (v.entries, v.generation),
             None => (BTreeMap::new(), 0),
         };
@@ -213,7 +216,7 @@ impl SystemBankManager {
             None => None,
         };
 
-        Self {
+        Ok(Self {
             store,
             current,
             generation,
@@ -221,7 +224,7 @@ impl SystemBankManager {
             committed_generation,
             transaction,
             pending: None,
-        }
+        })
     }
 
     /// Stage `bank` (with the `images` sealed into it, by part name) for
@@ -430,6 +433,12 @@ impl SystemBankManager {
         self.generation
     }
 
+    /// The generation of the committed copy (SECONDARY); 0 when there is no
+    /// committed copy.
+    pub fn committed_generation(&self) -> u64 {
+        self.committed_generation
+    }
+
     /// Whether the node has **no** booted selection at all (PRIMARY is the
     /// empty map). True on a fresh node whose selector has never been sealed
     /// (the stub case, or before the first seed). A later bootstrap-if-empty
@@ -504,13 +513,13 @@ mod tests {
     use super::*;
 
     fn mgr() -> SystemBankManager {
-        SystemBankManager::load(Box::new(InMemorySelectorStore::new()))
+        SystemBankManager::load(Box::new(InMemorySelectorStore::new())).unwrap()
     }
 
     #[test]
     fn stage_then_seal_writes_primary_only_and_enters_trial() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
 
         // Establish a committed floor at A so the staged change is observable.
         m.stage("vm1", Bank::A, BTreeMap::new());
@@ -526,8 +535,8 @@ mod tests {
         assert!(m.is_trial(), "current(B) != committed(A) => trial");
 
         // In-memory sectors: PRIMARY == new (B), SECONDARY == old (A).
-        let primary = store.read_primary().expect("primary written");
-        let secondary = store.read_secondary().expect("secondary written");
+        let primary = store.read_primary().unwrap().expect("primary written");
+        let secondary = store.read_secondary().unwrap().expect("secondary written");
         assert_eq!(primary.entries["vm1"].bank, Bank::B);
         assert_eq!(secondary.entries["vm1"].bank, Bank::A);
     }
@@ -535,7 +544,7 @@ mod tests {
     #[test]
     fn stage_seal_commit_clears_trial_and_both_sectors_match() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
 
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
@@ -546,8 +555,8 @@ mod tests {
         m.commit().unwrap();
 
         assert!(!m.is_trial());
-        let primary = store.read_primary().unwrap();
-        let secondary = store.read_secondary().unwrap();
+        let primary = store.read_primary().unwrap().unwrap();
+        let secondary = store.read_secondary().unwrap().unwrap();
         assert_eq!(primary.entries["vm1"].bank, Bank::B);
         assert_eq!(secondary.entries["vm1"].bank, Bank::B);
     }
@@ -555,7 +564,7 @@ mod tests {
     #[test]
     fn stage_seal_rollback_returns_to_floor() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
 
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
@@ -568,7 +577,7 @@ mod tests {
         m.rollback(Reason::Verdict).unwrap();
         assert_eq!(m.active_bank("vm1"), Some(Bank::A));
         assert!(!m.is_trial());
-        let primary = store.read_primary().unwrap();
+        let primary = store.read_primary().unwrap().unwrap();
         assert_eq!(
             primary.entries["vm1"].bank,
             Bank::A,
@@ -583,7 +592,7 @@ mod tests {
         let store = InMemorySelectorStore::new();
 
         {
-            let mut m = SystemBankManager::load(Box::new(store.clone()));
+            let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
             m.stage("vm1", Bank::A, BTreeMap::new());
             m.seal(None).unwrap();
             m.commit().unwrap(); // committed floor = A, PRIMARY = A
@@ -599,7 +608,7 @@ mod tests {
 
         // Fresh load from the SAME store: must see the old (A) selection,
         // because the staged B was never persisted.
-        let m2 = SystemBankManager::load(Box::new(store.clone()));
+        let m2 = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert_eq!(
             m2.active_bank("vm1"),
             Some(Bank::A),
@@ -673,7 +682,7 @@ mod tests {
     fn stub_seams_are_loud_and_nonfatal() {
         // The production stubs must not panic and must behave as "empty,
         // accept-all": load yields empty/gen-0, seal no-ops to a None read.
-        let mut m = SystemBankManager::load(Box::new(StubSelectorStore));
+        let mut m = SystemBankManager::load(Box::new(StubSelectorStore)).unwrap();
         assert_eq!(m.generation(), 0);
         assert_eq!(m.active_bank("vm1"), None);
         assert!(!m.seal(None).unwrap(), "nothing staged => seal is a no-op");
@@ -689,7 +698,7 @@ mod tests {
     #[test]
     fn failed_seal_leaves_state_untouched_and_retry_uses_same_generation() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         m.commit().unwrap(); // floor = A at gen 1
@@ -700,7 +709,7 @@ mod tests {
         assert_eq!(m.active_bank("vm1"), Some(Bank::A), "current untouched");
         assert_eq!(m.generation(), 1, "generation untouched");
         assert!(m.pending.is_some(), "pending kept for the retry");
-        assert_eq!(store.read_primary().unwrap().generation, 1);
+        assert_eq!(store.read_primary().unwrap().unwrap().generation, 1);
 
         store.set_fail_writes(false);
         assert!(m.seal(None).unwrap());
@@ -711,13 +720,13 @@ mod tests {
             "same gen the first attempt would have had"
         );
         assert!(m.pending.is_none());
-        assert_eq!(store.read_primary().unwrap().generation, 2);
+        assert_eq!(store.read_primary().unwrap().unwrap().generation, 2);
     }
 
     #[test]
     fn failed_commit_leaves_floor_untouched() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         m.commit().unwrap();
@@ -729,13 +738,13 @@ mod tests {
         assert_eq!(m.committed["vm1"].bank, Bank::A);
         assert_eq!(m.committed_generation, 1);
         assert!(m.is_trial(), "still in trial");
-        assert_eq!(store.read_secondary().unwrap().generation, 1);
+        assert_eq!(store.read_secondary().unwrap().unwrap().generation, 1);
     }
 
     #[test]
     fn failed_rollback_leaves_state_untouched() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         m.commit().unwrap();
@@ -748,22 +757,22 @@ mod tests {
         assert_eq!(m.active_bank("vm1"), Some(Bank::B));
         assert_eq!(m.generation(), 2);
         assert!(m.pending.is_some(), "pending untouched");
-        assert_eq!(store.read_primary().unwrap().generation, 2);
+        assert_eq!(store.read_primary().unwrap().unwrap().generation, 2);
     }
 
     #[test]
     fn seal_with_nothing_staged_writes_nothing() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert!(!m.seal(None).unwrap());
         assert_eq!(store.write_count(), 0);
-        assert!(store.read_primary().is_none());
+        assert!(store.read_primary().unwrap().is_none());
     }
 
     #[test]
     fn commit_twice_is_ok_with_one_write_each() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         let before = store.write_count();
@@ -773,7 +782,7 @@ mod tests {
         m.commit().unwrap();
         assert_eq!(store.write_count(), before + 2);
         assert!(!m.is_trial());
-        assert_eq!(store.read_secondary().unwrap().generation, 1);
+        assert_eq!(store.read_secondary().unwrap().unwrap().generation, 1);
     }
 
     // --- the PRIMARY transaction header ---
@@ -782,7 +791,7 @@ mod tests {
     /// `armed`.
     fn armed_trial(armed: Option<&str>) -> (InMemorySelectorStore, SystemBankManager) {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         m.commit().unwrap();
@@ -809,8 +818,8 @@ mod tests {
 
         m.commit().unwrap();
         assert_eq!(
-            store.read_secondary(),
-            store.read_primary(),
+            store.read_secondary().unwrap(),
+            store.read_primary().unwrap(),
             "the backup is a plain vector"
         );
         assert_eq!(
@@ -820,7 +829,7 @@ mod tests {
         );
 
         // The header survives a reload.
-        let m2 = SystemBankManager::load(Box::new(store.clone()));
+        let m2 = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert_eq!(m2.transaction(), m.transaction());
     }
 
@@ -832,7 +841,7 @@ mod tests {
             outcome: Outcome::RolledBack,
             reason: Reason::TrialBootLimit,
         });
-        let primary = store.read_primary().unwrap();
+        let primary = store.read_primary().unwrap().unwrap();
         assert_eq!(primary.entries["vm1"].bank, Bank::A);
         let (gen, t) = store.read_transaction().unwrap();
         assert_eq!(gen, primary.generation);
@@ -902,7 +911,7 @@ mod tests {
             BootObservation::Counted { trial_boots: 2 }
         );
 
-        let primary = store.read_primary().unwrap();
+        let primary = store.read_primary().unwrap().unwrap();
         assert_eq!(primary.generation, gen, "same generation");
         assert_eq!(primary.entries["vm1"].bank, Bank::B, "same entries");
         let (header_gen, t) = store.read_transaction().unwrap();
@@ -930,7 +939,7 @@ mod tests {
     fn seal_adopts_the_generation_the_store_issued() {
         let store = InMemorySelectorStore::new();
         store.set_next_generation(42);
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
 
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
@@ -966,7 +975,7 @@ mod tests {
         // A header below the primary generation.
         store.write_transaction(1, &h2).unwrap();
         let writes = store.write_count();
-        let m = SystemBankManager::load(Box::new(store.clone()));
+        let m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert!(m.transaction().is_none(), "stale header dropped");
         assert_eq!(m.generation(), 2);
         assert_eq!(m.rebooted_since_arming(Some("x")), None);
@@ -975,13 +984,13 @@ mod tests {
         // A header above the primary while in trial (no committed copy) is
         // not the boot stage's doing: dropped too.
         store.write_transaction(5, &h2).unwrap();
-        let m = SystemBankManager::load(Box::new(store.clone()));
+        let m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert!(m.is_trial());
         assert!(m.transaction().is_none(), "stale header dropped");
 
         // The same header recorded for the primary generation is kept.
         store.write_transaction(2, &h2).unwrap();
-        let m = SystemBankManager::load(Box::new(store));
+        let m = SystemBankManager::load(Box::new(store)).unwrap();
         assert_eq!(m.transaction(), Some(&h2));
     }
 
@@ -1012,7 +1021,7 @@ mod tests {
         let (store, counted) = trial_with_three_counted_boots();
         store.boot_stage_rollback();
 
-        let m = SystemBankManager::load(Box::new(store.clone()));
+        let m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         let recorded = Transaction {
             resolution: Some(Resolution {
                 outcome: Outcome::RolledBack,
@@ -1030,7 +1039,7 @@ mod tests {
         );
 
         let writes = store.write_count();
-        let m = SystemBankManager::load(Box::new(store.clone()));
+        let m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert_eq!(m.transaction(), Some(&recorded), "read back as recorded");
         assert_eq!(store.write_count(), writes, "a second load writes nothing");
     }
@@ -1041,7 +1050,7 @@ mod tests {
         store.boot_stage_rollback();
         store.set_fail_writes(true);
 
-        let m = SystemBankManager::load(Box::new(store.clone()));
+        let m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert!(m.transaction().is_none());
         assert_eq!(m.generation(), 1);
     }
@@ -1050,7 +1059,10 @@ mod tests {
     fn observe_node_boot_rewrites_only_the_header() {
         let (store, mut m) = armed_trial(Some("boot-a"));
         let writes = store.write_count();
-        let (primary, secondary) = (store.read_primary(), store.read_secondary());
+        let (primary, secondary) = (
+            store.read_primary().unwrap(),
+            store.read_secondary().unwrap(),
+        );
 
         assert_eq!(
             m.observe_node_boot("boot-b").unwrap(),
@@ -1058,8 +1070,12 @@ mod tests {
         );
 
         assert_eq!(store.write_count(), writes + 1, "exactly one write");
-        assert_eq!(store.read_primary(), primary, "primary untouched");
-        assert_eq!(store.read_secondary(), secondary, "secondary untouched");
+        assert_eq!(store.read_primary().unwrap(), primary, "primary untouched");
+        assert_eq!(
+            store.read_secondary().unwrap(),
+            secondary,
+            "secondary untouched"
+        );
         let (gen, t) = store.read_transaction().unwrap();
         assert_eq!(gen, m.generation());
         assert_eq!(t.trial_boots, 1);
@@ -1069,7 +1085,7 @@ mod tests {
     #[test]
     fn rollback_restores_the_committed_generation_the_store_reports() {
         let store = InMemorySelectorStore::new();
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         m.stage("vm1", Bank::A, BTreeMap::new());
         m.seal(None).unwrap();
         m.commit().unwrap();
@@ -1089,7 +1105,10 @@ mod tests {
                 reason: Reason::Verdict
             })
         );
-        assert_eq!(store.read_primary(), store.read_secondary());
+        assert_eq!(
+            store.read_primary().unwrap(),
+            store.read_secondary().unwrap()
+        );
         assert_eq!(store.read_transaction().unwrap().0, 1);
     }
 
@@ -1118,12 +1137,39 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_record_fails_the_load_and_is_never_loaded_as_empty() {
+        let dir = partial_dir("unreadable-load");
+        let record = InMemoryBootRecord::routing(["os"]);
+        let store = RecordSelectorStore::over(record.clone(), &dir, Box::new(TestSigner));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
+        stage_os_vm1(&mut m, Bank::A, Bank::A);
+
+        record.set_fail_reads(true);
+        assert!(store.read_primary().is_err());
+        assert!(
+            store.commit().is_err(),
+            "never Ok over an unreadable primary"
+        );
+        assert!(matches!(
+            SystemBankManager::load(Box::new(store.clone())),
+            Err(SelectorError::Unreadable(_))
+        ));
+
+        record.set_fail_reads(false);
+        let m = SystemBankManager::load(Box::new(store)).unwrap();
+        assert_eq!(m.active_bank("vm1"), Some(Bank::A));
+        assert_eq!(m.committed_generation(), 0, "nothing was committed");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn boot_stage_rollback_makes_manager_rows_follow_the_committed_copy_and_is_recorded() {
         let dir = partial_dir("boot-stage-rollback");
         let record = InMemoryBootRecord::routing(["os"]);
         let store = RecordSelectorStore::over(record.clone(), &dir, Box::new(TestSigner));
 
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         stage_os_vm1(&mut m, Bank::A, Bank::A);
         m.commit().unwrap();
         let floor = m.generation();
@@ -1138,12 +1184,15 @@ mod tests {
 
         // The boot stage gives up on the trial while the node is down.
         record.boot_stage_rollback();
-        assert_eq!(store.read_primary(), store.read_secondary());
-        let restored = store.read_primary().unwrap();
+        assert_eq!(
+            store.read_primary().unwrap(),
+            store.read_secondary().unwrap()
+        );
+        let restored = store.read_primary().unwrap().unwrap();
         assert_eq!(restored.generation, floor);
         assert_eq!(restored.entries["vm1"].bank, Bank::A);
 
-        let m = SystemBankManager::load(Box::new(store.clone()));
+        let m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert_eq!(m.generation(), floor);
         let tx = m
             .transaction()
@@ -1169,7 +1218,7 @@ mod tests {
         let dir = partial_dir("header-without-rows");
         let record = InMemoryBootRecord::routing(["os"]);
         let store = RecordSelectorStore::over(record.clone(), &dir, Box::new(TestSigner));
-        let mut m = SystemBankManager::load(Box::new(store.clone()));
+        let mut m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         stage_os_vm1(&mut m, Bank::A, Bank::A);
         m.commit().unwrap();
         let g = m.generation();
@@ -1195,7 +1244,7 @@ mod tests {
         let writes = record.write_count();
 
         assert_eq!(store.read_transaction(), None);
-        let m = SystemBankManager::load(Box::new(store.clone()));
+        let m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert!(m.transaction().is_none());
         assert_eq!(record.write_count(), writes);
         assert_eq!(std::fs::read(dir.join("transaction")).unwrap(), file);
@@ -1268,8 +1317,14 @@ mod tests {
                 entries,
             })
         };
-        assert_eq!(reader.read_primary(), vector(2, entries("vm1", Bank::B)));
-        assert_eq!(reader.read_secondary(), vector(1, entries("vm2", Bank::A)));
+        assert_eq!(
+            reader.read_primary().unwrap(),
+            vector(2, entries("vm1", Bank::B))
+        );
+        assert_eq!(
+            reader.read_secondary().unwrap(),
+            vector(1, entries("vm2", Bank::A))
+        );
         assert_eq!(reader.read_transaction(), Some((2, header)));
 
         // The slots are the named files, not the .tmp staging files.

@@ -1090,7 +1090,7 @@ mod tests {
 
     /// A shared boot selector seeded so `id` boots from `bank` (PRIMARY).
     fn selector_with(id: &str, bank: Bank) -> SharedSystemBankState {
-        let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()));
+        let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new())).unwrap();
         let shared: SharedSystemBankState = Arc::new(RwLock::new(mgr));
         {
             let mut g = shared.write().unwrap();
@@ -1219,7 +1219,7 @@ mod tests {
     /// the store's writes fail.
     fn selector_with_store(id: &str, bank: Bank) -> (SharedSystemBankState, InMemorySelectorStore) {
         let store = InMemorySelectorStore::new();
-        let mut mgr = SystemBankManager::load(Box::new(store.clone()));
+        let mut mgr = SystemBankManager::load(Box::new(store.clone())).unwrap();
         mgr.stage(id, bank, BTreeMap::new());
         assert!(mgr.seal(None).unwrap());
         mgr.commit().unwrap();
@@ -1379,7 +1379,7 @@ mod tests {
         assert_eq!(g.active_bank("vm1"), None, "keyed by id, not dir name");
         drop(g);
         assert_eq!(p.selected_bank(), Some(Bank::B));
-        let primary = store.read_primary().expect("PRIMARY sealed");
+        let primary = store.read_primary().unwrap().expect("PRIMARY sealed");
         assert_eq!(
             primary.entries["vm-one"].images,
             BTreeMap::from([(

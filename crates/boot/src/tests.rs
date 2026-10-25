@@ -605,7 +605,7 @@ fn selector_path_writes_no_nv() {
         mgr.nv().read_boot_state().is_none(),
         "no trial counting, no rollback"
     );
-    assert_eq!(store.read_primary().unwrap().generation, 2);
+    assert_eq!(store.read_primary().unwrap().unwrap().generation, 2);
 }
 
 #[test]
@@ -645,7 +645,7 @@ fn selector_absent_primary_falls_back_to_nv() {
     let (mut mgr, store) = make_bootmgr_with_selector();
     // Selector attached but NOT seeded — PRIMARY absent (first boot before
     // the host seeds it). Must behave exactly like the NV path.
-    assert!(store.read_primary().is_none());
+    assert!(store.read_primary().unwrap().is_none());
 
     let actions = mgr.process_boot().unwrap();
     // NV first-boot path: every set FirstBoot, NV initialized.
@@ -662,7 +662,7 @@ fn selector_absent_primary_falls_back_to_nv() {
     // selector store was never written by vm-boot.
     let actions = mgr.process_boot().unwrap();
     assert_eq!(actions[0], BootAction::Boot { bank: Bank::A });
-    assert!(store.read_primary().is_none());
+    assert!(store.read_primary().unwrap().is_none());
 
     // active_bank() is the NV bank.
     assert_eq!(mgr.active_bank(slots::OS), Some(Bank::A));

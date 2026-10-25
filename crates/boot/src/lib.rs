@@ -41,7 +41,7 @@
 //! caller's job (QEMU on Linux dev, `qvm` on QNX).
 
 use nv_store::block::BlockDevice;
-use nv_store::selector::{BootVector, SelectorStore};
+use nv_store::selector::{BootVector, SelectorError, SelectorStore};
 use nv_store::store::NvStore;
 use nv_store::types::*;
 use sha2::{Digest, Sha256};
@@ -88,6 +88,8 @@ pub enum HashCheck {
 #[derive(Debug)]
 pub enum BootError {
     Nv(nv_store::block::BlockError),
+    /// The attached boot vector store could not be read — not first boot.
+    Selector(SelectorError),
 }
 
 impl From<nv_store::block::BlockError> for BootError {
@@ -96,10 +98,17 @@ impl From<nv_store::block::BlockError> for BootError {
     }
 }
 
+impl From<SelectorError> for BootError {
+    fn from(e: SelectorError) -> Self {
+        BootError::Selector(e)
+    }
+}
+
 impl std::fmt::Display for BootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BootError::Nv(e) => write!(f, "NV store error: {e}"),
+            BootError::Selector(e) => write!(f, "boot vector error: {e}"),
         }
     }
 }
@@ -151,11 +160,12 @@ impl<D: BlockDevice> BootManager<D> {
     /// set the store can address — the Vec's length is `nv().slot_count()`,
     /// indexed by `BankSet::as_index()`. An absent PRIMARY is first boot — the
     /// host seeds the boot vector only after `vm-boot` has run once — so it
-    /// falls through to NV.
+    /// falls through to NV. A store that could not be read is
+    /// [`BootError::Selector`], never first boot.
     pub fn process_boot(&mut self) -> Result<Vec<BootAction>, BootError> {
         if let Some(selector) = self.selector.as_ref() {
-            if let Some(primary) = selector.read_primary() {
-                let secondary = selector.read_secondary();
+            if let Some(primary) = selector.read_primary()? {
+                let secondary = selector.read_secondary()?;
                 return Ok(Self::process_boot_selector(&primary, secondary.as_ref()));
             }
             // PRIMARY absent — first boot before the selector is seeded. Fall
