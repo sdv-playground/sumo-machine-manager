@@ -57,7 +57,7 @@ pub struct NodeBootOutcome {
 ///     .with(VmComponent::real("vm1", ...))
 ///     .with(VmComponent::real("vm2", ...))
 ///     .with(HsmComponent::real(...))
-///     .build();
+///     .build()?;
 /// ```
 pub struct MachineRegistry {
     entity: EntityInfo,
@@ -151,11 +151,18 @@ impl MachineRegistry {
     /// trial stands nothing is written either (a commit would settle the
     /// trial without a verdict): the missing ids are seeded after the verdict.
     ///
+    /// A vector with no committed copy is not a trial the node can resolve by
+    /// rollback: the seed anchors it by committing what stands, adding any
+    /// missing ids first — the ordinary sequence over the missing ids
+    /// (possibly none), with no trial guard and even when every id matches NV,
+    /// so a missing id NV holds in trial is re-armed over the new floor.
+    ///
     /// The selector, not `NvBootState`, is the boot / VM-launch authority; this
     /// only gives it a starting selection. The host machine managers call it at
     /// startup when the selector is empty — a fresh node, a factory reset, or a
     /// copy that failed the store's check (read as absent by
-    /// [`SystemBankManager::load`]) — or when some id has no entry (a vector
+    /// [`SystemBankManager::load`]; a record that could not be read fails the
+    /// load and is never seeded) — or when some id has no entry (a vector
     /// holding the boot stage's rows but no manager rows).
     ///
     /// A failed selector write is returned as `Err`; the in-memory selector
@@ -168,24 +175,31 @@ impl MachineRegistry {
         // commit sequence must see a consistent view of the selector.
         let mut sb = self.system_bank.write().expect("selector poisoned");
         let mut entries: Vec<(&str, &BankBootState)> = entries.into_iter().collect();
-        if entries
-            .iter()
-            .all(|(id, nv)| sb.active_bank(id) == Some(nv.active_bank))
+        // No committed copy: not a trial the node can resolve by rollback.
+        // The seed anchors it — the missing ids (possibly none) through the
+        // ordinary sequence — whatever NV says and whatever stands.
+        let unanchored = !sb.is_empty() && sb.committed_generation() == 0;
+        if !unanchored
+            && entries
+                .iter()
+                .all(|(id, nv)| sb.active_bank(id) == Some(nv.active_bank))
         {
             return Ok(());
         }
         if !sb.is_empty() {
             let missing = sb.missing_entries(entries.iter().map(|(id, _)| *id));
-            if missing.is_empty() {
-                return Ok(());
-            }
-            if sb.is_trial() {
-                tracing::warn!(
-                    missing = ?missing,
-                    "boot-vector: {} components have no entry while a trial stands; seeded after the verdict",
-                    missing.len()
-                );
-                return Ok(());
+            if !unanchored {
+                if missing.is_empty() {
+                    return Ok(());
+                }
+                if sb.is_trial() {
+                    tracing::warn!(
+                        missing = ?missing,
+                        "boot-vector: {} components have no entry while a trial stands; seeded after the verdict",
+                        missing.len()
+                    );
+                    return Ok(());
+                }
             }
             entries.retain(|(id, _)| missing.iter().any(|m| m == id));
         }
@@ -197,6 +211,7 @@ impl MachineRegistry {
             };
             sb.stage(id, floor, BTreeMap::new());
         }
+        // A no-op when nothing is staged (an anchor with no id missing).
         sb.seal(None)?;
         sb.commit()?;
         for (id, nv) in entries.iter().filter(|(_, nv)| !nv.committed) {
@@ -373,43 +388,48 @@ impl MachineRegistryBuilder {
 
     /// Resolve the registry's `system_bank`: prefer a pre-built shared selector
     /// (adopted as-is), else `load` one from the configured store, else the
-    /// loud production stub.
+    /// loud production stub. A store that could not be read is `Err`.
     fn resolve_system_bank(
         shared_selector: Option<SharedSystemBankState>,
         selector_store: Option<Box<dyn SelectorStore>>,
-    ) -> SharedSystemBankState {
-        shared_selector.unwrap_or_else(|| {
-            Arc::new(RwLock::new(SystemBankManager::load(
+    ) -> Result<SharedSystemBankState, SelectorError> {
+        match shared_selector {
+            Some(selector) => Ok(selector),
+            None => Ok(Arc::new(RwLock::new(SystemBankManager::load(
                 selector_store.unwrap_or_else(|| Box::new(StubSelectorStore)),
-            )))
-        })
+            )?))),
+        }
     }
 
-    pub fn build(self) -> MachineRegistry {
+    /// Build the registry, loading the boot selector from the configured store
+    /// unless a shared one was adopted; `Err` when the store could not be read.
+    pub fn build(self) -> Result<MachineRegistry, SelectorError> {
         let mut by_id = HashMap::with_capacity(self.components.len());
         for (idx, c) in self.components.iter().enumerate() {
             by_id.insert(c.id().to_string(), idx);
         }
-        let system_bank = Self::resolve_system_bank(self.shared_selector, self.selector_store);
-        MachineRegistry {
+        let system_bank = Self::resolve_system_bank(self.shared_selector, self.selector_store)?;
+        Ok(MachineRegistry {
             entity: self.entity,
             components: self.components,
             by_id,
             system_bank,
-        }
+        })
     }
 
-    /// Like `build` but returns an error if any two components share an id.
-    pub fn try_build(self) -> Result<MachineRegistry, DuplicateComponentId> {
+    /// Like `build` but also returns an error if any two components share an
+    /// id.
+    pub fn try_build(self) -> Result<MachineRegistry, BuildError> {
         let mut by_id = HashMap::with_capacity(self.components.len());
         for (idx, c) in self.components.iter().enumerate() {
             let id = c.id().to_string();
             if by_id.contains_key(&id) {
-                return Err(DuplicateComponentId(id));
+                return Err(BuildError::DuplicateComponentId(DuplicateComponentId(id)));
             }
             by_id.insert(id, idx);
         }
-        let system_bank = Self::resolve_system_bank(self.shared_selector, self.selector_store);
+        let system_bank = Self::resolve_system_bank(self.shared_selector, self.selector_store)
+            .map_err(BuildError::Selector)?;
         Ok(MachineRegistry {
             entity: self.entity,
             components: self.components,
@@ -429,3 +449,22 @@ impl std::fmt::Display for DuplicateComponentId {
 }
 
 impl std::error::Error for DuplicateComponentId {}
+
+/// Why [`MachineRegistryBuilder::try_build`] failed.
+#[derive(Debug)]
+pub enum BuildError {
+    DuplicateComponentId(DuplicateComponentId),
+    /// The boot selector's store could not be read.
+    Selector(SelectorError),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::DuplicateComponentId(e) => e.fmt(f),
+            BuildError::Selector(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}

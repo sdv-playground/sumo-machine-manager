@@ -329,8 +329,9 @@ generation. The mechanism is sumo's, the same for every port: a host implements 
 `BootRecord` (`routes`, `read(copy)`, `activate`, `commit`, `rollback`) and builds its store
 with `RecordSelectorStore::over(record, dir, signer)`. The reference `FileSelectorStore` is
 that same adapter over a `FileBootRecord` that routes every component. A host runs both
-executable contracts (feature `test-seams`): `contract::exercise_record(&record)` and
-`contract::exercise(&store)`.
+executable contracts (feature `test-seams`): `contract::exercise_record_with_ids(&record, ids)`
+and `contract::exercise_with_ids(&store, ids)` with the ids it routes (`exercise_record` /
+`exercise` run them over `os` and `vm1`); they compare generations and banks only.
 
 The node has one authenticated boot record, the **selector**, that supersedes the original
 per-component NV boot state as the authority for "which bank each set boots from":
@@ -339,7 +340,9 @@ per-component NV boot state as the authority for "which bank each set boots from
   (`nv-store::selector`) — the **boot vector**. Entries are keyed by **component id**; each
   carries the component's `bank` and the images sealed into that bank by part name
   (`ImageEntry { size, sha256 }`, possibly empty). Two copies via `SelectorStore`:
-  **PRIMARY** (booted) and **SECONDARY** (rollback floor). A component is in trial iff its
+  **PRIMARY** (booted) and **SECONDARY** (the committed copy: the rows at the floor,
+  whichever copy of the record holds them; absent when no copy is at the floor — then there
+  is nothing to roll back to, and the seed or a commit anchors the vector). A component is in trial iff its
   PRIMARY entry differs from its SECONDARY entry. One bank per component is structural: the
   map holds exactly one entry per id.
 
@@ -354,9 +357,9 @@ per-component NV boot state as the authority for "which bank each set boots from
 
   | Verb | Contract | Record adapter (`RecordSelectorStore`) | File record |
   |---|---|---|---|
-  | `read_primary` / `read_secondary` | the authenticated copy, or `None` (absent or failed check) | the record's copy ∪ the manager rows at its generation (primary: `rows`, else `committed`; secondary: `committed`, else `rows` when the record is committed at that generation; else the newest, with a warning); the record wins a key collision | parse the file, `None` unless `is_valid` under its `Signer` |
+  | `read_primary` / `read_secondary` | `Ok(Some)` the authenticated copy; `Ok(None)` absent (or a failed authenticity check); `Err` the copy could not be read — never treated as absent (`SystemBankManager::load` and `MachineRegistryBuilder::build` fail) | the record's `Err` propagates; otherwise the record's copy ∪ the manager rows at its generation (primary: `rows`, else `committed`; secondary: `committed`, else `rows` when the record is committed at that generation; else the newest, with a warning); the record wins a key collision | parse the file, `None` unless `is_valid` under its `Signer`; a missing file is `None`, one that cannot be read is `Err` |
   | `activate(entries, header)` | primary := entries at a generation the store issues, strictly above both copies; header recorded for it; returns the generation. A header write that fails after the primary landed is logged as header loss and still `Ok` | splits by `routes`; record first, then `rows` and `transaction` at the generation it returned | `max(primary, secondary) + 1`; writes `primary` |
-  | `commit()` | secondary := primary (same generation); idempotent; no-op without a primary | record, then `committed` from `rows` | rewrites `secondary` from `primary` |
+  | `commit()` | secondary := primary (same generation); idempotent; no-op without a primary, `Err` over an unreadable one | record, then `committed` from `rows` | rewrites `secondary` from `primary` |
   | `rollback(header)` | primary := secondary; header recorded for the restored generation; returns it; `Err(NoTrial)` when there is nothing to restore | `NoTrial` checked first; `transaction`, then the record, then `rows` from `committed` | `primary` from `secondary` |
   | `read_transaction()` | the header and the generation it was recorded for | the `transaction` file, else the record's legacy header | the header embedded in a v0.1.14 primary |
   | `write_transaction(gen, header)` | rewrite the header for `gen`, neither copy touched | rewrites `transaction`; rows untouched | — |

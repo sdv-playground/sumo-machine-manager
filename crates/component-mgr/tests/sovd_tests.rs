@@ -904,7 +904,7 @@ fn make_disable_router(
     // Sealed, committed booted selection for the component: bank A serves,
     // not in trial.
     let selector: SharedSystemBankState = Arc::new(std::sync::RwLock::new(
-        SystemBankManager::load(Box::new(InMemorySelectorStore::new())),
+        SystemBankManager::load(Box::new(InMemorySelectorStore::new())).unwrap(),
     ));
     {
         let mut g = selector.write().unwrap();
@@ -1218,7 +1218,7 @@ fn make_node_router_with(
     }
 
     let router = sovd_api::create_router(sovd_api::AppState::new(backends)).merge(
-        component_mgr::sovd::routes::node_verdict_router(Arc::new(machine.build())),
+        component_mgr::sovd::routes::node_verdict_router(Arc::new(machine.build().unwrap())),
     );
     (router, nv, keys)
 }
@@ -1536,7 +1536,8 @@ fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, 
         machine = machine.with(ComponentAdapter::new(backend));
     }
 
-    let router = component_mgr::sovd::routes::update_state_router(coord, Arc::new(machine.build()));
+    let router =
+        component_mgr::sovd::routes::update_state_router(coord, Arc::new(machine.build().unwrap()));
     (router, tmp)
 }
 
@@ -1599,7 +1600,8 @@ async fn update_state_in_trial_follows_boot_vector() {
         let mut m = SystemBankManager::load(Box::new(FileSelectorStore::new(
             &store_dir,
             Box::new(TestSigner),
-        )));
+        )))
+        .unwrap();
         m.stage("vm1", Bank::A, Default::default());
         m.stage("vm2", Bank::A, Default::default());
         m.seal(None).unwrap();
@@ -1616,10 +1618,13 @@ async fn update_state_in_trial_follows_boot_vector() {
         m.stage("vm1", Bank::B, images);
         m.seal(None).unwrap();
     }
-    let selector: SharedSystemBankState =
-        Arc::new(std::sync::RwLock::new(SystemBankManager::load(Box::new(
-            FileSelectorStore::new(&store_dir, Box::new(TestSigner)),
-        ))));
+    let selector: SharedSystemBankState = Arc::new(std::sync::RwLock::new(
+        SystemBankManager::load(Box::new(FileSelectorStore::new(
+            &store_dir,
+            Box::new(TestSigner),
+        )))
+        .unwrap(),
+    ));
 
     let (router, _banks_tmp) = make_banks_router(Some(selector));
     let (status, body) = get(&router, "/vehicle/v1/data/x-update-state").await;
@@ -1660,10 +1665,13 @@ impl TrialNode {
 
         let tmp = tempfile::tempdir().unwrap();
         let store_dir = tmp.path().join("selector");
-        let selector: SharedSystemBankState =
-            Arc::new(std::sync::RwLock::new(SystemBankManager::load(Box::new(
-                FileSelectorStore::new(&store_dir, Box::new(TestSigner)),
-            ))));
+        let selector: SharedSystemBankState = Arc::new(std::sync::RwLock::new(
+            SystemBankManager::load(Box::new(FileSelectorStore::new(
+                &store_dir,
+                Box::new(TestSigner),
+            )))
+            .unwrap(),
+        ));
         {
             let mut g = selector.write().unwrap();
             g.stage("vm1", Bank::A, Default::default());
@@ -1737,7 +1745,7 @@ impl TrialNode {
         }
 
         Self {
-            machine: Arc::new(machine.build()),
+            machine: Arc::new(machine.build().unwrap()),
             nv,
             store_dir,
             _tmp: tmp,
@@ -1768,7 +1776,7 @@ fn coord_at(boot_id: &str, limit: Option<u8>) -> Arc<NodeCoordinator> {
 #[tokio::test]
 async fn activate_arms_the_primary_transaction_header() {
     let node = TrialNode::new(false);
-    let primary = node.store().read_primary().unwrap();
+    let primary = node.store().read_primary().unwrap().unwrap();
     let (gen, t) = node
         .store()
         .read_transaction()
@@ -1777,7 +1785,10 @@ async fn activate_arms_the_primary_transaction_header() {
         gen, primary.generation,
         "recorded for the primary generation"
     );
-    assert_ne!(gen, node.store().read_secondary().unwrap().generation);
+    assert_ne!(
+        gen,
+        node.store().read_secondary().unwrap().unwrap().generation
+    );
     assert_eq!(t.armed_boot_id, boot_id_digest("boot-a"));
     assert_eq!(t.trial_boots, 0);
     assert_eq!(t.resolution, None);
@@ -1829,7 +1840,7 @@ async fn trial_boot_limit_rolls_the_node_back() {
     assert_eq!(vm1.active_bank, Bank::A);
     // The per-component rollback found the vector already settled: its
     // verdict-reason rollback was the no-op, so the limit reason survives.
-    let primary = node.store().read_primary().unwrap();
+    let primary = node.store().read_primary().unwrap().unwrap();
     assert_eq!(primary.entries["vm1"].bank, Bank::A);
     assert_eq!(
         node.store().read_transaction().unwrap().1.resolution,
@@ -1856,7 +1867,7 @@ async fn no_trial_boot_limit_never_bails_out() {
         "still in trial"
     );
     assert_eq!(
-        node.store().read_primary().unwrap().entries["vm1"].bank,
+        node.store().read_primary().unwrap().unwrap().entries["vm1"].bank,
         Bank::B
     );
 }

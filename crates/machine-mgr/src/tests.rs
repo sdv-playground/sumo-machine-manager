@@ -9,7 +9,7 @@
 use crate::bank_activator::BankActivator;
 use crate::component::{Component, DidEntry};
 use crate::error::{MachineError, MachineResult};
-use crate::machine::{DuplicateComponentId, Machine, MachineRegistry};
+use crate::machine::{BuildError, DuplicateComponentId, Machine, MachineRegistry};
 use crate::types::{
     Capabilities, Csr, DidFilter, DidKind, DtcFilter, FlashCaps, FlashId, FlashSession, HsmCaps,
     LifecycleCaps, ResetKind, RuntimeState, RuntimeStatus,
@@ -206,7 +206,8 @@ fn registry_build_preserves_component_order() {
         .with(bare("host"))
         .with(bare("vm1"))
         .with(bare("vm2"))
-        .build();
+        .build()
+        .unwrap();
 
     let ids: Vec<&str> = m.components().iter().map(|c| c.id()).collect();
     assert_eq!(ids, ["host", "vm1", "vm2"]);
@@ -217,7 +218,8 @@ fn registry_component_lookup_by_id() {
     let m = MachineRegistry::builder(entity("veh"))
         .with(bare("host"))
         .with(bare("vm1"))
-        .build();
+        .build()
+        .unwrap();
 
     assert_eq!(m.component("host").unwrap().id(), "host");
     assert_eq!(m.component("vm1").unwrap().id(), "vm1");
@@ -227,7 +229,7 @@ fn registry_component_lookup_by_id() {
 #[test]
 fn registry_entity_accessor_returns_whats_provided() {
     let e = entity("my-vehicle");
-    let m = MachineRegistry::builder(e.clone()).build();
+    let m = MachineRegistry::builder(e.clone()).build().unwrap();
     assert_eq!(m.entity().id, e.id);
     assert_eq!(m.entity().name, e.name);
 }
@@ -240,7 +242,7 @@ fn registry_try_build_detects_duplicate_ids() {
         .with(bare("host")) // duplicate
         .try_build();
     let err = result.err().expect("duplicate should fail");
-    assert_eq!(err.0, "host");
+    assert!(matches!(err, BuildError::DuplicateComponentId(ref d) if d.0 == "host"));
 }
 
 #[test]
@@ -260,7 +262,8 @@ fn registry_with_arc_accepts_prebuilt_arcs() {
     let comp: Arc<dyn Component> = Arc::new(bare("vm1"));
     let m = MachineRegistry::builder(entity("veh"))
         .with_arc(comp)
-        .build();
+        .build()
+        .unwrap();
     assert_eq!(m.components().len(), 1);
     assert_eq!(m.component("vm1").unwrap().id(), "vm1");
 }
@@ -284,12 +287,13 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
     let store = InMemorySelectorStore::new();
     let mut m = MachineRegistry::builder(entity("veh"))
         .with_selector_store(Box::new(store.clone()))
-        .build();
+        .build()
+        .unwrap();
 
     // Selector starts empty (no PRIMARY blob, generation 0). Read through a
     // short-lived lock on the now-shared (Arc<RwLock>) manager.
-    assert!(store.read_primary().is_none());
-    assert!(store.read_secondary().is_none());
+    assert!(store.read_primary().unwrap().is_none());
+    assert!(store.read_secondary().unwrap().is_none());
     assert_eq!(m.system_bank().read().unwrap().generation(), 0);
 
     // First seed of an empty selector: both entries differ from the (absent)
@@ -312,7 +316,10 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
         1,
         "one seal => generation 1"
     );
-    let primary = store.read_primary().expect("PRIMARY written by the seed");
+    let primary = store
+        .read_primary()
+        .unwrap()
+        .expect("PRIMARY written by the seed");
     assert_eq!(primary.generation, 1);
     assert_eq!(primary.entries["vm1"].bank, Bank::B);
     assert_eq!(primary.entries["vm2"].bank, Bank::A);
@@ -322,6 +329,7 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
     // SECONDARY).
     let secondary = store
         .read_secondary()
+        .unwrap()
         .expect("SECONDARY written by the seed's commit");
     assert_eq!(secondary.generation, 1);
     assert_eq!(secondary.entries, primary.entries);
@@ -337,7 +345,7 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
         "idempotent re-seed must not bump the generation"
     );
     assert_eq!(
-        store.read_primary().map(|b| b.generation),
+        store.read_primary().unwrap().map(|b| b.generation),
         Some(1),
         "no second PRIMARY write on an idempotent re-seed"
     );
@@ -387,7 +395,8 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
     // host's reseed trigger.
     let mut m = MachineRegistry::builder(entity("veh"))
         .with_selector_store(Box::new(store.clone()))
-        .build();
+        .build()
+        .unwrap();
     assert!(m.system_bank().read().unwrap().is_empty());
 
     let entries = [
@@ -400,8 +409,8 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
     assert_eq!(m.system_bank().read().unwrap().generation(), 1);
     // Read back through the verifying store: the reseed signs over the
     // current encoding.
-    let primary = store.read_primary().expect("PRIMARY reseeded");
-    let secondary = store.read_secondary().expect("SECONDARY reseeded");
+    let primary = store.read_primary().unwrap().expect("PRIMARY reseeded");
+    let secondary = store.read_secondary().unwrap().expect("SECONDARY reseeded");
     assert_eq!(primary.entries["vm1"].bank, Bank::B);
     assert_eq!(primary.entries["vm2"].bank, Bank::A);
     assert_eq!(
@@ -420,7 +429,8 @@ fn seed_uses_the_committed_bank_for_secondary() {
     let store = InMemorySelectorStore::new();
     let mut m = MachineRegistry::builder(entity("veh"))
         .with_selector_store(Box::new(store.clone()))
-        .build();
+        .build()
+        .unwrap();
 
     // NV holds VM1 in trial on B (its committed bank is A); VM2 committed on A.
     let entries = [
@@ -431,13 +441,17 @@ fn seed_uses_the_committed_bank_for_secondary() {
         .unwrap();
 
     // PRIMARY boots NV's active bank for both sets...
-    let primary = store.read_primary().expect("PRIMARY written by the seed");
+    let primary = store
+        .read_primary()
+        .unwrap()
+        .expect("PRIMARY written by the seed");
     assert_eq!(primary.entries["vm1"].bank, Bank::B);
     assert_eq!(primary.entries["vm2"].bank, Bank::A);
     // ...and SECONDARY is the committed floor: the other bank for the trial
     // set, the same bank for the committed one.
     let secondary = store
         .read_secondary()
+        .unwrap()
         .expect("SECONDARY written by the seed");
     assert_eq!(secondary.entries["vm1"].bank, Bank::A);
     assert_eq!(secondary.entries["vm2"].bank, Bank::A);
@@ -454,7 +468,7 @@ fn seed_uses_the_committed_bank_for_secondary() {
     m.seed_selector(entries.iter().map(|(id, nv)| (*id, nv)))
         .unwrap();
     assert_eq!(
-        store.read_primary().map(|b| b.generation),
+        store.read_primary().unwrap().map(|b| b.generation),
         Some(primary.generation),
         "idempotent re-seed of a trial"
     );
@@ -468,22 +482,132 @@ fn seed_writes_nothing_for_missing_ids_while_a_trial_stands() {
     let store = InMemorySelectorStore::new();
     let mut m = MachineRegistry::builder(entity("veh"))
         .with_selector_store(Box::new(store.clone()))
-        .build();
+        .build()
+        .unwrap();
 
     // A vector in trial: os on B over its committed A.
     let os = ("os", nv_boot(Bank::B, false));
     m.seed_selector([(os.0, &os.1)]).unwrap();
     assert!(m.boot_selector().is_trial());
-    let (primary, writes) = (store.read_primary(), store.write_count());
+    let (primary, writes) = (store.read_primary().unwrap(), store.write_count());
 
     // vm1 has no entry, but committing it would settle the standing trial
     // without a verdict: nothing is written.
     let vm1 = nv_boot(Bank::A, true);
     m.seed_selector([(os.0, &os.1), ("vm1", &vm1)]).unwrap();
     assert_eq!(store.write_count(), writes, "no write while a trial stands");
-    assert_eq!(store.read_primary(), primary);
+    assert_eq!(store.read_primary().unwrap(), primary);
     assert_eq!(m.boot_selector().active_bank("vm1"), None);
     assert!(m.boot_selector().is_trial(), "the trial still stands");
+}
+
+#[test]
+fn seed_anchors_a_vector_with_no_committed_copy() {
+    use crate::system_bank_state::{InMemorySelectorStore, SelectorStore, Transaction};
+    use nv_store::types::Bank;
+    use std::collections::BTreeMap;
+
+    // A primary with no committed copy: os on B, never committed.
+    let store = InMemorySelectorStore::new();
+    let header = Transaction {
+        armed_boot_id: [0; 16],
+        trial_boots: 0,
+        counted_boot_id: [0; 16],
+        resolution: None,
+    };
+    store
+        .activate(
+            &BTreeMap::from([(
+                "os".to_string(),
+                nv_store::selector::ComponentEntry::new(Bank::B, BTreeMap::new()),
+            )]),
+            &header,
+        )
+        .unwrap();
+    let mut m = MachineRegistry::builder(entity("veh"))
+        .with_selector_store(Box::new(store.clone()))
+        .build()
+        .unwrap();
+    assert_eq!(m.system_bank().read().unwrap().committed_generation(), 0);
+
+    // Not a trial the node can roll back: the seed stages vm1 at its NV
+    // floor, seals and commits, then re-arms vm1's NV trial over that floor.
+    let os = nv_boot(Bank::B, true);
+    let vm1 = nv_boot(Bank::B, false);
+    m.seed_selector([("os", &os), ("vm1", &vm1)]).unwrap();
+
+    let primary = store.read_primary().unwrap().unwrap();
+    let secondary = store.read_secondary().unwrap().unwrap();
+    assert_eq!(primary.entries["os"].bank, Bank::B);
+    assert_eq!(
+        primary.entries["vm1"].bank,
+        Bank::B,
+        "vm1 at its active bank"
+    );
+    assert_eq!(secondary.entries["os"].bank, Bank::B);
+    assert_eq!(
+        secondary.entries["vm1"].bank,
+        Bank::A,
+        "over the committed floor"
+    );
+    {
+        let sb = m.system_bank().read().unwrap();
+        assert_eq!(sb.committed_generation(), secondary.generation);
+        assert!(sb.committed_generation() > 0);
+        assert!(sb.generation() > sb.committed_generation());
+        assert!(sb.is_trial());
+        assert!(sb.component_in_trial("vm1"));
+        assert!(!sb.component_in_trial("os"));
+    }
+
+    // No id missing and NV matching, but no committed copy: one commit, no
+    // seal — the generation stays.
+    let store = InMemorySelectorStore::new();
+    store
+        .activate(
+            &BTreeMap::from([(
+                "os".to_string(),
+                nv_store::selector::ComponentEntry::new(Bank::B, BTreeMap::new()),
+            )]),
+            &header,
+        )
+        .unwrap();
+    let mut m = MachineRegistry::builder(entity("veh"))
+        .with_selector_store(Box::new(store.clone()))
+        .build()
+        .unwrap();
+    let (generation, writes) = (
+        m.system_bank().read().unwrap().generation(),
+        store.write_count(),
+    );
+    m.seed_selector([("os", &os)]).unwrap();
+    assert_eq!(store.write_count(), writes + 1, "one commit, no seal");
+    let sb = m.system_bank().read().unwrap();
+    assert_eq!(sb.generation(), generation, "generation unchanged");
+    assert_eq!(sb.committed_generation(), generation);
+    assert!(sb.committed_generation() > 0);
+    assert!(!sb.is_trial());
+    assert_eq!(
+        store.read_secondary().unwrap(),
+        store.read_primary().unwrap()
+    );
+}
+
+#[test]
+fn registry_build_is_err_over_an_unreadable_store() {
+    use crate::system_bank_state::{InMemoryBootRecord, RecordSelectorStore, TestSigner};
+
+    let dir = std::env::temp_dir().join(format!("machine-mgr-unreadable-{}", std::process::id()));
+    let record = InMemoryBootRecord::routing(["os"]);
+    record.set_fail_reads(true);
+    let result = MachineRegistry::builder(entity("veh"))
+        .with_selector_store(Box::new(RecordSelectorStore::over(
+            record,
+            &dir,
+            Box::new(TestSigner),
+        )))
+        .build();
+    assert!(result.is_err());
 }
 
 #[test]
@@ -499,7 +623,7 @@ fn seed_stages_only_the_missing_ids_and_keeps_record_images() {
         size: 4096,
         sha256: [0xAB; 32],
     };
-    let mut pre = SystemBankManager::load(Box::new(store.clone()));
+    let mut pre = SystemBankManager::load(Box::new(store.clone())).unwrap();
     pre.stage(
         "os",
         Bank::A,
@@ -509,14 +633,15 @@ fn seed_stages_only_the_missing_ids_and_keeps_record_images() {
     pre.commit().unwrap();
     let mut m = MachineRegistry::builder(entity("veh"))
         .with_selector_store(Box::new(store.clone()))
-        .build();
+        .build()
+        .unwrap();
     let writes = store.write_count();
 
     let os = nv_boot(Bank::A, true);
     let vm1 = nv_boot(Bank::B, true);
     m.seed_selector([("os", &os), ("vm1", &vm1)]).unwrap();
 
-    let primary = store.read_primary().unwrap();
+    let primary = store.read_primary().unwrap().unwrap();
     assert_eq!(primary.entries["vm1"].bank, Bank::B);
     assert!(primary.entries["vm1"].images.is_empty());
     assert_eq!(primary.entries["os"].bank, Bank::A);
@@ -526,13 +651,13 @@ fn seed_stages_only_the_missing_ids_and_keeps_record_images() {
         writes + 2,
         "one activate and one commit"
     );
-    assert_eq!(store.read_secondary(), Some(primary));
+    assert_eq!(store.read_secondary().unwrap(), Some(primary));
     assert!(!m.boot_selector().is_trial());
 }
 
 #[test]
 fn registry_build_accepts_zero_components() {
-    let m = MachineRegistry::builder(entity("empty")).build();
+    let m = MachineRegistry::builder(entity("empty")).build().unwrap();
     assert!(m.components().is_empty());
     assert!(m.component("anything").is_none());
 }

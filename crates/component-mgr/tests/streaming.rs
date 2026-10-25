@@ -1243,7 +1243,7 @@ fn pull_machine(stubs: Vec<Arc<dyn Component>>) -> Arc<dyn Machine> {
     for s in stubs {
         b = b.with_arc(s);
     }
-    Arc::new(b.build())
+    Arc::new(b.build().unwrap())
 }
 
 /// The composed pull-update router over `stubs` + a Tiered authorizer.

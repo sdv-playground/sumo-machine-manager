@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn with_system_bank_reads_the_transaction_header() {
         use crate::system_bank_state::{InMemorySelectorStore, SystemBankManager};
-        let mut m = SystemBankManager::load(Box::new(InMemorySelectorStore::new()));
+        let mut m = SystemBankManager::load(Box::new(InMemorySelectorStore::new())).unwrap();
         m.stage("vm1", Bank::A, Default::default());
         m.seal(None).unwrap();
         m.commit().unwrap();

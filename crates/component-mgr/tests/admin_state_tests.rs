@@ -187,7 +187,7 @@ fn backend_with_manifests(
 /// `id` (bank A) — the serving bank a component's disable record is read
 /// from. Committed, so the component is not in trial.
 fn selector_for(id: &str) -> SharedSystemBankState {
-    let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()));
+    let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new())).unwrap();
     let shared: SharedSystemBankState = Arc::new(std::sync::RwLock::new(mgr));
     {
         let mut g = shared.write().unwrap();
