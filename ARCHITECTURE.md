@@ -320,6 +320,18 @@ update semantics; and the count plus the recorded resolution of each transaction
 the boot stage's action, which is what a future onboard orchestrator needs to tell "the
 part that must deliver the verdict booted N times and never reported".
 
+**Two kinds of rows.** The boot stage's record holds only the rows of the components it
+routes (**record rows**), and stays minimal: nothing goes into it that the boot stage does
+not need to boot, since every field there would have to be implemented in each port's
+record. The rest — the **manager rows** (components whose bank the machine manager selects
+after boot) and the transaction header — lives in sumo's side files, tied to the record by
+generation. The mechanism is sumo's, the same for every port: a host implements only
+`BootRecord` (`routes`, `read(copy)`, `activate`, `commit`, `rollback`) and builds its store
+with `RecordSelectorStore::over(record, dir, signer)`. The reference `FileSelectorStore` is
+that same adapter over a `FileBootRecord` that routes every component. A host runs both
+executable contracts (feature `test-seams`): `contract::exercise_record(&record)` and
+`contract::exercise(&store)`.
+
 The node has one authenticated boot record, the **selector**, that supersedes the original
 per-component NV boot state as the authority for "which bank each set boots from":
 
@@ -340,14 +352,14 @@ per-component NV boot state as the authority for "which bank each set boots from
   `nv_store::selector::contract::exercise(&store)` (feature `test-seams`) asserts it against
   any implementation.
 
-  | Verb | Contract | Reference file store |
-  |---|---|---|
-  | `read_primary` / `read_secondary` | the authenticated copy, or `None` (absent or failed check) | parse the file, `None` unless `is_valid` under its `Signer` |
-  | `activate(entries, header)` | primary := entries at a generation the store issues, strictly above both copies; header recorded for it; returns the generation. A header write that fails after the primary landed is logged as header loss and still `Ok` | `max(primary, secondary) + 1`; writes `primary` first, then `transaction` |
-  | `commit()` | secondary := primary (same generation); idempotent; no-op without a primary | rewrites `secondary` from `primary` |
-  | `rollback(header)` | primary := secondary; header recorded for the restored generation; returns it; `Err(NoTrial)` when there is nothing to restore | writes `transaction` first, then `primary` from `secondary` (a failed primary write leaves the header below it) |
-  | `read_transaction()` | the header and the generation it was recorded for | the `transaction` file (or, migrating, the header embedded in an older primary) |
-  | `write_transaction(gen, header)` | rewrite the header for `gen`, neither copy touched | rewrites `transaction` |
+  | Verb | Contract | Record adapter (`RecordSelectorStore`) | File record |
+  |---|---|---|---|
+  | `read_primary` / `read_secondary` | the authenticated copy, or `None` (absent or failed check) | the record's copy ∪ the manager rows at its generation (primary: `rows`, else `committed`; secondary: `committed`, else `rows` when the record is committed at that generation; else the newest, with a warning); the record wins a key collision | parse the file, `None` unless `is_valid` under its `Signer` |
+  | `activate(entries, header)` | primary := entries at a generation the store issues, strictly above both copies; header recorded for it; returns the generation. A header write that fails after the primary landed is logged as header loss and still `Ok` | splits by `routes`; record first, then `rows` and `transaction` at the generation it returned | `max(primary, secondary) + 1`; writes `primary` |
+  | `commit()` | secondary := primary (same generation); idempotent; no-op without a primary | record, then `committed` from `rows` | rewrites `secondary` from `primary` |
+  | `rollback(header)` | primary := secondary; header recorded for the restored generation; returns it; `Err(NoTrial)` when there is nothing to restore | `NoTrial` checked first; `transaction`, then the record, then `rows` from `committed` | `primary` from `secondary` |
+  | `read_transaction()` | the header and the generation it was recorded for | the `transaction` file, else the record's legacy header | the header embedded in a v0.1.14 primary |
+  | `write_transaction(gen, header)` | rewrite the header for `gen`, neither copy touched | rewrites `transaction`; rows untouched | — |
 
   Two durability classes: the copies are **what boots** and sit under anti-rollback (only
   `activate` / `commit` / `rollback` move them); the header is **what the node observed
@@ -358,12 +370,17 @@ per-component NV boot state as the authority for "which bank each set boots from
   stage's rollback and is recorded (see **Who decides what**). The write order keeps that
   reading unambiguous: no failed write verb leaves a header above the primary.
 
-  The reference `FileSelectorStore::new(dir, signer)` keeps three files, each a signed
-  `SelectorBlob { generation, entries, transaction, sha256, signature, selectors }` written
-  tmp + fsync + rename: `primary`, `secondary` (copies, no header) and `transaction` (a blob
-  with **empty** entries at the primary generation it belongs to, carrying the header). A
-  primary written by v0.1.14 still carries the header embedded in its own blob; it is read
-  as the header until the next header write replaces it with the `transaction` file.
+  The adapter's side files, in its `dir`, are signed
+  `SelectorBlob { generation, entries, transaction, sha256, signature, selectors }`s written
+  tmp + fsync + rename: `rows` (manager rows at the record's primary generation), `committed`
+  (manager rows at its secondary generation) and `transaction` (**empty** entries at the
+  primary generation it belongs to, carrying the header). The reference
+  `FileSelectorStore::new(dir, signer)` keeps its record in the same directory under the same
+  signer — `primary` and `secondary` (copies, no header) — so its `rows` and `committed`
+  carry empty entries, and `primary` / `secondary` / `transaction` are byte-identical to the
+  earlier three-file store. A primary written by v0.1.14 still carries the header embedded in
+  its own blob; it is read as the header until the next header write replaces it with the
+  `transaction` file.
 
   ```json
   {
@@ -425,6 +442,15 @@ per-component NV boot state as the authority for "which bank each set boots from
   failed count or a failed boot-vector rollback is logged and retried on the next boot;
   per-component rollback failures after the vector moved are returned in
   `NodeBootOutcome::errors`.
+
+  Seed: call `MachineRegistry::seed_selector` when `SystemBankManager::is_empty()` or
+  `!missing_entries(ids).is_empty()`. A vector holding record rows but no manager rows (the
+  first start over a record, or a double fault) would otherwise leave those components
+  without an entry, and they would never launch. On a non-empty vector the seed adds only
+  the missing ids, at their NV floor with no images, then commits and re-seals the NV trials
+  among them; existing entries and their sealed images are untouched. While a trial stands
+  it writes nothing — the commit would settle the trial without a verdict — and the missing
+  ids are seeded after the verdict.
 - **Verdict membership is the structural trial set.** The node verdict skips a component
   whose `banks()` reports it out of trial: with a boot vector, its PRIMARY entry equals the
   backup's; without one, the NV committed flag.
@@ -432,7 +458,8 @@ per-component NV boot state as the authority for "which bank each set boots from
   where the HSM is reachable, passes to `FileSelectorStore::new`; the store verifies every
   blob it reads). Previously a `StubSigner` (empty signature) — now real ECDSA-P256. The
   store is the file-backed JSON `FileSelectorStore` (pretty, one key per line) until a host
-  store is plugged in behind `SelectorStore`; a host store authenticates by its own means.
+  plugs its record in with `RecordSelectorStore::over`; the record authenticates by its own
+  means, the side files with the signer passed to `over`.
 - `vm-boot` is the reference reader: it reports each PRIMARY entry's bank and trial state
   and writes nothing; it ignores the transaction header. It opens the file store with a
   `StubSigner` today (it has never verified); a verifying reader passes a real `Signer`. The boot vector carries no slot,
@@ -460,6 +487,18 @@ per-component NV boot state as the authority for "which bank each set boots from
   count and the bail-out rolls the vector back (the per-component NV rollback then reports
   not-in-trial in `NodeBootOutcome::errors`). Without a limit it closes only once the write
   order changes.
+
+  The record adapter adds its own rules, record first throughout. `activate`: a failed
+  `rows` write rolls the record back when it was not in trial before and returns `Err`; with
+  a trial standing it returns `Err` and leaves the record alone (a rollback would discard
+  the trial; the retry heals). `commit`: a failed `committed` write is `Err` after the
+  record committed; the retry is idempotent, and until then the rows at the committed
+  generation read as committed. `rollback`: `NoTrial` is checked before any write; the
+  header goes first, the record next, `rows` last (a failed `rows` write is logged, and
+  reads follow `committed`). Manager rows are never written empty as a fallback, except over
+  a record that routes everything. Attribution: a header recorded for a generation other
+  than the record's primary is read only when manager rows exist at its generation, so a
+  header left by an older layout is dropped, never read as the boot stage's rollback.
 - `BankSet` is a bare `pub struct BankSet(pub u8)` newtype — a slot *number*, nothing more.
   The library names no slot: a component's slot comes from its spec (`slot: N`, written by
   the platform profile), and what a slot holds is that profile's decision (a spec that still
@@ -472,9 +511,12 @@ per-component NV boot state as the authority for "which bank each set boots from
 flowchart LR
     subgraph write["update path (host manager, HSM present)"]
         CB[ComponentBackend<br/>activate / commit] --> SBM[SystemBankManager]
-        SBM -- stage/seal/commit --> SEL[(SelectorBlob<br/>PRIMARY + SECONDARY)]
-        SBM -- digest --> SGN[Signer: ivd-signing<br/>ECDSA-P256 via HSM]
-        SGN -- signature --> SEL
+        SBM -- stage/seal/commit --> RSS[RecordSelectorStore]
+        RSS -- record rows --> SEL[(boot record<br/>PRIMARY + SECONDARY)]
+        RSS -- by generation --> SIDE[(side files<br/>rows / committed / transaction)]
+        RSS -- digest --> SGN[Signer: ivd-signing<br/>ECDSA-P256 via HSM]
+        SGN -- signature --> SIDE
+        SGN -.->|file record| SEL
         CB -- dual-write floor --> NV[(NvBootState)]
     end
     subgraph boot["boot path (no signer available)"]

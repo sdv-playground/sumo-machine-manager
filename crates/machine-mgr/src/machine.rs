@@ -128,7 +128,7 @@ impl MachineRegistry {
     /// false`), so a trial survives the reseed as a trial over its floor.
     ///
     /// The seed runs **only when some entry's `active_bank` differs** from the
-    /// selector's current PRIMARY view. It then stages every set's floor, seals
+    /// selector's current PRIMARY view. On an empty vector it stages every set's floor, seals
     /// and commits (PRIMARY == SECONDARY == floor), and — iff any set is in
     /// trial — stages those sets' active banks and seals again, which arms the
     /// trial exactly as an OTA does: PRIMARY ahead of the committed floor.
@@ -140,15 +140,23 @@ impl MachineRegistry {
     /// **Idempotent on purpose**: when the selector already matches the
     /// supplied entries (the steady-state case on every boot), nothing is
     /// staged and `seal` is *not* called — so the global generation does not
-    /// inflate on every startup. It only advances when the boot state actually
-    /// changed (e.g. after an OTA bank flip) and the selector needs to catch
-    /// up.
+    /// inflate on every startup. It only advances when the selector is empty
+    /// or lacks an entry.
+    ///
+    /// A **non-empty** vector is never restaged as a whole: only the ids with
+    /// no entry ([`SystemBankManager::missing_entries`]) are added, at their NV
+    /// floor with no images, over the booted selection — the existing entries
+    /// and their sealed images are untouched — then committed, and the NV
+    /// trials among them re-sealed. Nothing missing writes nothing. While a
+    /// trial stands nothing is written either (a commit would settle the
+    /// trial without a verdict): the missing ids are seeded after the verdict.
     ///
     /// The selector, not `NvBootState`, is the boot / VM-launch authority; this
     /// only gives it a starting selection. The host machine managers call it at
-    /// startup when the selector is empty: a fresh node, a factory reset, or a
+    /// startup when the selector is empty — a fresh node, a factory reset, or a
     /// copy that failed the store's check (read as absent by
-    /// [`SystemBankManager::load`]).
+    /// [`SystemBankManager::load`]) — or when some id has no entry (a vector
+    /// holding the boot stage's rows but no manager rows).
     ///
     /// A failed selector write is returned as `Err`; the in-memory selector
     /// then holds whatever the last successful write left.
@@ -159,12 +167,27 @@ impl MachineRegistry {
         // One write lock for the whole seed: the compare and the stage/seal/
         // commit sequence must see a consistent view of the selector.
         let mut sb = self.system_bank.write().expect("selector poisoned");
-        let entries: Vec<(&str, &BankBootState)> = entries.into_iter().collect();
+        let mut entries: Vec<(&str, &BankBootState)> = entries.into_iter().collect();
         if entries
             .iter()
             .all(|(id, nv)| sb.active_bank(id) == Some(nv.active_bank))
         {
             return Ok(());
+        }
+        if !sb.is_empty() {
+            let missing = sb.missing_entries(entries.iter().map(|(id, _)| *id));
+            if missing.is_empty() {
+                return Ok(());
+            }
+            if sb.is_trial() {
+                tracing::warn!(
+                    missing = ?missing,
+                    "boot-vector: {} components have no entry while a trial stands; seeded after the verdict",
+                    missing.len()
+                );
+                return Ok(());
+            }
+            entries.retain(|(id, _)| missing.iter().any(|m| m == id));
         }
         for (id, nv) in &entries {
             let floor = if nv.committed {
