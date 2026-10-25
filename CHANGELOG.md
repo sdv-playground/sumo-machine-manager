@@ -8,6 +8,10 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+## v0.1.17 — reads carry an error channel; the committed copy is the copy at the floor
+
+Tag on `969fba2` (2026-10-25), PR #24.
+
 An unreadable boot record is no longer mistaken for an absent one, and the committed copy is defined
 by the floor, not by which copy of the record holds it.
 
