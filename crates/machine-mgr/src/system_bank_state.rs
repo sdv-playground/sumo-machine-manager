@@ -145,8 +145,16 @@ impl SystemBankManager {
     ///
     /// The store authenticates its contents: a copy that fails its check reads
     /// as absent. An absent PRIMARY (the stub case) yields empty maps at
-    /// generation 0. A header recorded for another generation is stale and
-    /// ignored.
+    /// generation 0.
+    ///
+    /// A header recorded above the primary generation, on a committed vector
+    /// and with no resolution, can only mean the boot stage restored the
+    /// committed copy while the node was down (the store never leaves a header
+    /// above the primary — see [`SelectorStore`]). It is recorded as resolved
+    /// `rolled_back` / [`Reason::BootStage`], boot ids and count kept, for the
+    /// primary generation — written first, adopted after; if the write fails,
+    /// no header is adopted. Any other header recorded for another generation
+    /// is stale and ignored.
     pub fn load(store: Box<dyn SelectorStore>) -> Self {
         let (current, generation) = match store.read_primary() {
             Some(v) => (v.entries, v.generation),
@@ -158,6 +166,37 @@ impl SystemBankManager {
         };
         let transaction = match store.read_transaction() {
             Some((gen, header)) if gen == generation => Some(header),
+            Some((gen, header))
+                if gen > generation && current == committed && header.resolution.is_none() =>
+            {
+                let header = Transaction {
+                    resolution: Some(Resolution {
+                        outcome: Outcome::RolledBack,
+                        reason: Reason::BootStage,
+                    }),
+                    ..header
+                };
+                match store.write_transaction(generation, &header) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            trial_generation = gen,
+                            generation,
+                            trial_boots = header.trial_boots,
+                            "boot-vector: trial ended by the boot stage — primary restored to the committed copy; recorded"
+                        );
+                        Some(header)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            trial_generation = gen,
+                            generation,
+                            error = %e,
+                            "boot-vector: boot-stage rollback could not be recorded"
+                        );
+                        None
+                    }
+                }
+            }
             Some((gen, _)) => {
                 tracing::warn!(
                     header_generation = gen,
@@ -909,18 +948,89 @@ mod tests {
             ComponentEntry::new(Bank::A, BTreeMap::new()),
         )]);
         assert_eq!(store.activate(&e, &h).unwrap(), 1);
+        assert_eq!(store.activate(&e, &h).unwrap(), 2);
 
-        // A header for a generation the primary does not have.
-        store.write_transaction(5, &h2).unwrap();
+        // A header below the primary generation.
+        store.write_transaction(1, &h2).unwrap();
+        let writes = store.write_count();
         let m = SystemBankManager::load(Box::new(store.clone()));
         assert!(m.transaction().is_none(), "stale header dropped");
-        assert_eq!(m.generation(), 1);
+        assert_eq!(m.generation(), 2);
         assert_eq!(m.rebooted_since_arming(Some("x")), None);
+        assert_eq!(store.write_count(), writes, "load wrote nothing");
+
+        // A header above the primary while in trial (no committed copy) is
+        // not the boot stage's doing: dropped too.
+        store.write_transaction(5, &h2).unwrap();
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        assert!(m.is_trial());
+        assert!(m.transaction().is_none(), "stale header dropped");
 
         // The same header recorded for the primary generation is kept.
-        store.write_transaction(1, &h2).unwrap();
+        store.write_transaction(2, &h2).unwrap();
         let m = SystemBankManager::load(Box::new(store));
         assert_eq!(m.transaction(), Some(&h2));
+    }
+
+    /// A committed vector at generation 1 and a trial at generation 2 whose
+    /// header has counted three boots — the state the boot stage acts on.
+    fn trial_with_three_counted_boots() -> (InMemorySelectorStore, Transaction) {
+        let store = InMemorySelectorStore::new();
+        let h = Transaction {
+            armed_boot_id: boot_id_digest("boot-a"),
+            trial_boots: 0,
+            counted_boot_id: [0; 16],
+            resolution: None,
+        };
+        assert_eq!(store.activate(&entries("vm1", Bank::A), &h).unwrap(), 1);
+        store.commit().unwrap();
+        assert_eq!(store.activate(&entries("vm1", Bank::B), &h).unwrap(), 2);
+        let counted = Transaction {
+            trial_boots: 3,
+            counted_boot_id: boot_id_digest("boot-d"),
+            ..h
+        };
+        store.write_transaction(2, &counted).unwrap();
+        (store, counted)
+    }
+
+    #[test]
+    fn boot_stage_rollback_is_recorded_at_load_with_the_count_kept() {
+        let (store, counted) = trial_with_three_counted_boots();
+        store.boot_stage_rollback();
+
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        let recorded = Transaction {
+            resolution: Some(Resolution {
+                outcome: Outcome::RolledBack,
+                reason: Reason::BootStage,
+            }),
+            ..counted
+        };
+        assert_eq!(m.generation(), 1);
+        assert!(!m.is_trial());
+        assert_eq!(m.transaction(), Some(&recorded));
+        assert_eq!(
+            store.read_transaction(),
+            Some((1, recorded.clone())),
+            "persisted for the restored generation"
+        );
+
+        let writes = store.write_count();
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        assert_eq!(m.transaction(), Some(&recorded), "read back as recorded");
+        assert_eq!(store.write_count(), writes, "a second load writes nothing");
+    }
+
+    #[test]
+    fn boot_stage_rollback_record_failure_leaves_no_header() {
+        let (store, _) = trial_with_three_counted_boots();
+        store.boot_stage_rollback();
+        store.set_fail_writes(true);
+
+        let m = SystemBankManager::load(Box::new(store.clone()));
+        assert!(m.transaction().is_none());
+        assert_eq!(m.generation(), 1);
     }
 
     #[test]

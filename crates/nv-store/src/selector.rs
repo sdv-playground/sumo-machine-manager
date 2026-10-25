@@ -104,6 +104,10 @@ pub enum Reason {
     /// The node rolled itself back after the host-configured number of boots
     /// while armed without a verdict.
     TrialBootLimit,
+    /// The primary was restored to the committed copy outside the node's
+    /// verdict path — the boot stage's rollback. Recorded by the manager at
+    /// load from a header left above the primary.
+    BootStage,
 }
 
 /// The recorded end of a node transaction.
@@ -168,7 +172,7 @@ pub struct Transaction {
 /// only when a transaction header is present:
 ///     u8 0x01, 16 bytes armed_boot_id, u8 trial_boots, 16 bytes counted_boot_id,
 ///     u8 resolution (0 none, 1 committed, 2 rolled_back),
-///     u8 reason (0 verdict, 1 trial_boot_limit; 0 when no resolution)
+///     u8 reason (0 verdict, 1 trial_boot_limit, 2 boot_stage; 0 when no resolution)
 /// ```
 ///
 /// A blob without a header digests exactly as before the header existed.
@@ -240,6 +244,7 @@ impl SelectorBlob {
                     match r.reason {
                         Reason::Verdict => 0,
                         Reason::TrialBootLimit => 1,
+                        Reason::BootStage => 2,
                     },
                 ),
             };
@@ -396,6 +401,17 @@ impl std::error::Error for SelectorError {}
 ///
 /// Every write verb is fallible: an `Err` means the primary is unchanged, and
 /// the caller must not move its in-memory view ahead of the store.
+///
+/// **Write order.** No failed write verb may leave a header recorded for a
+/// generation *above* the primary's. So [`activate`](Self::activate) writes
+/// the primary first, then the header — if the header write then fails, the
+/// store logs the header loss and still returns `Ok`: the vector is the truth,
+/// and trial-boot counting for that trial degrades. [`rollback`](Self::rollback)
+/// writes the header first (it is for the restored, lower generation), then
+/// the primary — a failed primary write leaves a header below the primary,
+/// stale and ignored. Consequence: a header whose generation is above the
+/// primary's, on a committed vector (primary = secondary), can only mean the
+/// boot stage restored the secondary while the node was down.
 pub trait SelectorStore: Send + Sync {
     /// Authenticated contents of the primary copy, or `None` (absent or failed
     /// check).
@@ -407,6 +423,8 @@ pub trait SelectorStore: Send + Sync {
     /// above both copies, and record `header` as that generation's
     /// transaction. Returns the generation. The secondary is untouched.
     ///
+    /// The primary is written before the header; a header write that fails
+    /// after the primary landed is logged and the call still returns `Ok`.
     /// On `Err` the primary is unchanged.
     fn activate(
         &self,
@@ -417,7 +435,7 @@ pub trait SelectorStore: Send + Sync {
     /// now the floor". Idempotent; `Ok` and a no-op without a primary.
     fn commit(&self) -> Result<(), SelectorError>;
     /// primary := secondary, record `header` against the restored generation,
-    /// and return that generation.
+    /// and return that generation. The header is written before the primary.
     ///
     /// `Err(NoTrial)` when there is nothing to restore (no secondary, or
     /// the primary already is the secondary); on `Err` the primary is
@@ -537,7 +555,8 @@ impl Signer for StubSigner {
 /// case: drop the manager, `load` a fresh one from the *same* store) without
 /// any hardware. Clones share the cells. [`Self::set_fail_writes`] makes every
 /// write verb fail and change nothing; [`Self::set_next_generation`] makes the
-/// next `activate` issue a chosen generation.
+/// next `activate` issue a chosen generation; [`Self::boot_stage_rollback`]
+/// models the boot stage restoring the secondary.
 #[cfg(feature = "test-seams")]
 #[derive(Debug, Default, Clone)]
 pub struct InMemorySelectorStore {
@@ -570,6 +589,15 @@ impl InMemorySelectorStore {
     /// ones follow the usual rule again.
     pub fn set_next_generation(&self, generation: u64) {
         *self.next_generation.lock().expect("generation poisoned") = Some(generation);
+    }
+
+    /// What the boot stage does when the node fails to start: primary :=
+    /// secondary, header untouched. Not a contract verb — it models an actor
+    /// outside the contract, so it ignores [`Self::set_fail_writes`] and is
+    /// not counted in [`Self::write_count`].
+    pub fn boot_stage_rollback(&self) {
+        let secondary = self.read_secondary();
+        *self.primary.lock().expect("primary poisoned") = secondary;
     }
 
     /// `Err` while writes are set to fail.
@@ -610,12 +638,12 @@ impl SelectorStore for InMemorySelectorStore {
             .unwrap_or_else(|| {
                 next_generation(self.read_primary().as_ref(), self.read_secondary().as_ref())
             });
-        *self.transaction.lock().expect("transaction poisoned") =
-            Some((generation, header.clone()));
         *self.primary.lock().expect("primary poisoned") = Some(BootVector {
             generation,
             entries: entries.clone(),
         });
+        *self.transaction.lock().expect("transaction poisoned") =
+            Some((generation, header.clone()));
         self.count_write();
         Ok(generation)
     }
@@ -786,10 +814,12 @@ const TRANSACTION: &str = "transaction";
 /// - `transaction`: a blob with EMPTY entries at the primary generation it
 ///   belongs to, carrying the header.
 ///
-/// The store issues `max(primary, secondary) + 1` on `activate`, and writes
-/// the header BEFORE the copy in `activate` / `rollback`: a failed copy write
-/// leaves a header recorded for a generation the primary does not have — stale,
-/// ignored by the reader — and the primary unchanged.
+/// The store issues `max(primary, secondary) + 1` on `activate`. It never
+/// leaves a header above the primary (see [`SelectorStore`], write order):
+/// `activate` writes the primary, then the header, and logs a failed header
+/// write as header loss; `rollback` writes the header, then the primary, so a
+/// failed primary write leaves a header below it — stale, ignored — and the
+/// primary unchanged.
 ///
 /// Migration: a primary written by an earlier version carries the header
 /// inside its own blob; [`read_transaction`](SelectorStore::read_transaction)
@@ -948,8 +978,14 @@ impl SelectorStore for FileSelectorStore {
     ) -> Result<u64, SelectorError> {
         let generation =
             next_generation(self.read_primary().as_ref(), self.read_secondary().as_ref());
-        self.write_header(generation, header)?;
         self.write_copy(PRIMARY, generation, entries.clone())?;
+        if let Err(e) = self.write_header(generation, header) {
+            tracing::warn!(
+                generation,
+                error = %e,
+                "boot vector activated but its transaction header was lost — trial boots of this trial are not counted"
+            );
+        }
         Ok(generation)
     }
     fn commit(&self) -> Result<(), SelectorError> {
@@ -1220,29 +1256,74 @@ mod tests {
 
     #[cfg(feature = "test-seams")]
     #[test]
-    fn activate_writes_the_header_before_the_primary_so_a_failed_primary_leaves_a_stale_header() {
-        let dir = temp_path("header-first");
+    fn activate_writes_the_primary_before_the_header_so_a_failed_header_leaves_the_trial_without_one(
+    ) {
+        let dir = temp_path("primary-first");
         let store = FileSelectorStore::new(&dir, Box::new(TestSigner));
         assert_eq!(
             store.activate(&entries("os", Bank::A), &header()).unwrap(),
             1
         );
         store.commit().unwrap();
-        let before = store.read_primary().unwrap();
-        let primary_bytes = std::fs::read(dir.join(PRIMARY)).unwrap();
 
-        // Fault injection: a directory at `primary.tmp` makes
-        // `File::create` fail in `write_slot` for the primary only; the
-        // header goes through `transaction.tmp`, which is unaffected.
-        std::fs::create_dir(dir.join("primary.tmp")).unwrap();
+        // Fault injection: a directory at `transaction.tmp` makes
+        // `File::create` fail in `write_slot` for the header only; the
+        // primary goes through `primary.tmp`, which is unaffected.
+        std::fs::create_dir(dir.join("transaction.tmp")).unwrap();
         let mut armed = header();
         armed.trial_boots = 1;
+        assert_eq!(
+            store.activate(&entries("os", Bank::B), &armed).unwrap(),
+            2,
+            "a lost header does not fail the activation"
+        );
+
+        assert_eq!(
+            store.read_primary(),
+            Some(BootVector {
+                generation: 2,
+                entries: entries("os", Bank::B)
+            }),
+            "the primary moved"
+        );
+        assert_eq!(
+            store.read_transaction(),
+            Some((1, header())),
+            "the previous header is left, below the primary"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn rollback_writes_the_header_before_the_primary_so_a_failed_primary_leaves_the_trial_in_place()
+    {
+        let dir = temp_path("rollback-header-first");
+        let store = FileSelectorStore::new(&dir, Box::new(TestSigner));
+        store.activate(&entries("os", Bank::A), &header()).unwrap();
+        store.commit().unwrap();
+        assert_eq!(
+            store.activate(&entries("os", Bank::B), &header()).unwrap(),
+            2
+        );
+        let trial = store.read_primary().unwrap();
+        let primary_bytes = std::fs::read(dir.join(PRIMARY)).unwrap();
+
+        // Fault injection: a directory at `primary.tmp` makes the primary
+        // write fail; the header goes through `transaction.tmp`.
+        std::fs::create_dir(dir.join("primary.tmp")).unwrap();
+        let mut resolved = header();
+        resolved.resolution = Some(Resolution {
+            outcome: Outcome::RolledBack,
+            reason: Reason::Verdict,
+        });
         assert!(
-            store.activate(&entries("os", Bank::B), &armed).is_err(),
+            store.rollback(&resolved).is_err(),
             "the primary write fails"
         );
 
-        assert_eq!(store.read_primary(), Some(before), "primary unchanged");
+        assert_eq!(store.read_primary(), Some(trial), "primary unchanged");
         assert_eq!(
             std::fs::read(dir.join(PRIMARY)).unwrap(),
             primary_bytes,
@@ -1250,11 +1331,26 @@ mod tests {
         );
         assert_eq!(
             store.read_transaction(),
-            Some((2, armed)),
-            "the header was written for a generation the primary does not have"
+            Some((1, resolved)),
+            "the rollback header sits at the committed generation, below the primary"
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn boot_stage_reason_is_byte_two_in_the_canonical_bytes() {
+        let mut t = header();
+        t.resolution = Some(Resolution {
+            outcome: Outcome::RolledBack,
+            reason: Reason::BootStage,
+        });
+        let bytes = SelectorBlob::canonical_bytes(1, &BTreeMap::new(), Some(&t));
+        assert_eq!(bytes[bytes.len() - 2..], [2, 2], "rolled_back, boot_stage");
+        assert_eq!(
+            serde_json::to_value(Reason::BootStage).unwrap(),
+            serde_json::json!("boot_stage")
+        );
     }
 
     #[cfg(feature = "test-seams")]
