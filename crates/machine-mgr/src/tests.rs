@@ -277,13 +277,13 @@ fn nv_boot(active_bank: nv_store::types::Bank, committed: bool) -> nv_store::typ
 
 #[test]
 fn seed_selector_writes_on_first_seed_and_is_idempotent() {
-    use crate::system_bank_state::{InMemorySelectorStore, SelectorStore, TestSigner};
+    use crate::system_bank_state::{InMemorySelectorStore, SelectorStore};
     use nv_store::types::Bank;
 
     // A real two-slot store we can inspect after seeding.
     let store = InMemorySelectorStore::new();
     let mut m = MachineRegistry::builder(entity("veh"))
-        .with_selector_store(Box::new(store.clone()), Box::new(TestSigner))
+        .with_selector_store(Box::new(store.clone()))
         .build();
 
     // Selector starts empty (no PRIMARY blob, generation 0). Read through a
@@ -346,7 +346,7 @@ fn seed_selector_writes_on_first_seed_and_is_idempotent() {
 #[test]
 fn seed_selector_reseeds_after_rejected_legacy_blob() {
     use crate::system_bank_state::{
-        InMemorySelectorStore, SelectorBlob, SelectorStore, Signer, SlotSelect, TestSigner,
+        FileSelectorStore, SelectorBlob, SelectorStore, Signer, SlotSelect, TestSigner,
     };
     use nv_store::slots;
     use nv_store::types::Bank;
@@ -369,14 +369,24 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
         signature: TestSigner.sign(&sha256),
         selectors: Some(selectors),
     };
-    let store = InMemorySelectorStore::new();
-    store.write_primary(&blob).unwrap();
-    store.write_secondary(&blob).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "sumo-reseed-legacy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for slot in ["primary", "secondary"] {
+        std::fs::write(dir.join(slot), serde_json::to_vec_pretty(&blob).unwrap()).unwrap();
+    }
+    let store = FileSelectorStore::new(&dir, Box::new(TestSigner));
 
-    // The load rejects it, so the registry's selector reads as unseeded — the
+    // The store rejects it, so the registry's selector reads as unseeded — the
     // host's reseed trigger.
     let mut m = MachineRegistry::builder(entity("veh"))
-        .with_selector_store(Box::new(store.clone()), Box::new(TestSigner))
+        .with_selector_store(Box::new(store.clone()))
         .build();
     assert!(m.system_bank().read().unwrap().is_empty());
 
@@ -388,12 +398,10 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
         .unwrap();
 
     assert_eq!(m.system_bank().read().unwrap().generation(), 1);
+    // Read back through the verifying store: the reseed signs over the
+    // current encoding.
     let primary = store.read_primary().expect("PRIMARY reseeded");
     let secondary = store.read_secondary().expect("SECONDARY reseeded");
-    assert!(
-        primary.is_valid(&TestSigner) && secondary.is_valid(&TestSigner),
-        "the reseed signs over the current encoding"
-    );
     assert_eq!(primary.entries["vm1"].bank, Bank::B);
     assert_eq!(primary.entries["vm2"].bank, Bank::A);
     assert_eq!(
@@ -401,16 +409,17 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
         "committed sets: PRIMARY == SECONDARY"
     );
     assert!(!m.boot_selector().is_trial());
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn seed_uses_the_committed_bank_for_secondary() {
-    use crate::system_bank_state::{InMemorySelectorStore, SelectorStore, TestSigner};
+    use crate::system_bank_state::{InMemorySelectorStore, SelectorStore};
     use nv_store::types::Bank;
 
     let store = InMemorySelectorStore::new();
     let mut m = MachineRegistry::builder(entity("veh"))
-        .with_selector_store(Box::new(store.clone()), Box::new(TestSigner))
+        .with_selector_store(Box::new(store.clone()))
         .build();
 
     // NV holds VM1 in trial on B (its committed bank is A); VM2 committed on A.

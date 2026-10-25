@@ -1,5 +1,5 @@
 use nv_store::block::{BlockDevice, FileBlockDevice};
-use nv_store::selector::FileSelectorStore;
+use nv_store::selector::{FileSelectorStore, StubSigner};
 use nv_store::store::nv_device_size;
 use nv_store::types::{BankSet, DEFAULT_SLOTS};
 use std::path::PathBuf;
@@ -83,7 +83,11 @@ fn main() {
     );
     if let Some(dir) = &selector_dir {
         eprintln!("[bootmgr] using boot selector: {}", dir.display());
-        mgr = mgr.with_selector(Box::new(FileSelectorStore::new(dir.clone())));
+        // vm-boot has never verified the boot vector; a verifying reader passes a real Signer.
+        mgr = mgr.with_selector(Box::new(FileSelectorStore::new(
+            dir.clone(),
+            Box::new(StubSigner),
+        )));
     }
 
     let actions = match mgr.process_boot() {

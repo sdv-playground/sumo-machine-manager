@@ -501,7 +501,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
 mod tests {
     use super::*;
     use machine_mgr::system_bank_state::{
-        InMemorySelectorStore, SharedSystemBankState, SystemBankManager, TestSigner,
+        InMemorySelectorStore, SharedSystemBankState, SystemBankManager,
     };
     use nv_store::block::MemBlockDevice;
     use nv_store::slots;
@@ -1097,8 +1097,7 @@ mod tests {
 
     /// A boot selector whose PRIMARY (booted selection) for Os is `bank`.
     fn selector_on(bank: Bank) -> SharedSystemBankState {
-        let mgr =
-            SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner));
+        let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()));
         let shared: SharedSystemBankState = Arc::new(RwLock::new(mgr));
         {
             let mut g = shared.write().unwrap();

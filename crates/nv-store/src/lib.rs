@@ -23,8 +23,9 @@ pub mod store;
 pub mod types;
 
 pub use selector::{
-    ComponentEntry, FileSelectorStore, ImageEntry, SelectorBlob, SelectorError, SelectorStore,
-    Signer, SlotSelect, StubSelectorStore, StubSigner,
+    boot_id_digest, BootVector, ComponentEntry, FileSelectorStore, ImageEntry, Outcome, Reason,
+    Resolution, SelectorBlob, SelectorError, SelectorStore, Signer, SlotSelect, StubSelectorStore,
+    StubSigner, Transaction,
 };
 #[cfg(feature = "test-seams")]
 pub use selector::{InMemorySelectorStore, TestSigner};

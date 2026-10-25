@@ -18,7 +18,7 @@ use nv_store::types::*;
 use machine_mgr::bank_provider::{BankProvider, FirmwareIdentity};
 use machine_mgr::{
     DeactivateError, DeactivateOutcome, Deactivator, InMemorySelectorStore, SharedSystemBankState,
-    SystemBankManager, TestSigner,
+    SystemBankManager,
 };
 use sovd_core::{BackendError, DiagnosticBackend, EntityStatus, PackageStream};
 
@@ -187,7 +187,7 @@ fn backend_with_manifests(
 /// `id` (bank A) — the serving bank a component's disable record is read
 /// from. Committed, so the component is not in trial.
 fn selector_for(id: &str) -> SharedSystemBankState {
-    let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()), Box::new(TestSigner));
+    let mgr = SystemBankManager::load(Box::new(InMemorySelectorStore::new()));
     let shared: SharedSystemBankState = Arc::new(std::sync::RwLock::new(mgr));
     {
         let mut g = shared.write().unwrap();
