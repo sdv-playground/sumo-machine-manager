@@ -48,7 +48,7 @@ use nv_store::block::BlockDevice;
 use nv_store::types::Bank;
 
 use machine_mgr::bank_provider::{
-    BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFirmware,
+    BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFirmware, StagingRecord,
 };
 use machine_mgr::{ImageRecord, ResetKind};
 
@@ -230,6 +230,12 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         // overwritten by the stream. Reuses the inner's dir prep.
         self.inner.prepare_target(bank)
     }
+    fn prune_target(&self, bank: Bank, _keep: &[String]) -> Result<(), BankError> {
+        // The parts are devices, not files in the metadata dir: nothing there
+        // to keep. Clearing it still unseals the bank — its old IVD pair would
+        // otherwise vouch for partitions this install is about to overwrite.
+        self.inner.prepare_target(bank)
+    }
     fn read_installed(&self, bank: Bank) -> Result<InstalledFirmware, BankError> {
         // The IVD manifest+sig live in the metadata dir exactly as for a file
         // bank, so the inner's report-only read works unchanged.
@@ -279,6 +285,17 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         // A raw partition takes effect only after the node reboots + the
         // bootloader re-selects — always a full ECU reset.
         ResetKind::RequiresEcuReset
+    }
+    fn staging_record(&self, bank: Bank) -> Result<Option<StagingRecord>, BankError> {
+        // The record sits beside the metadata dir exactly as for a file bank.
+        self.inner.staging_record(bank)
+    }
+    fn write_staging_record(
+        &self,
+        bank: Bank,
+        record: Option<&StagingRecord>,
+    ) -> Result<(), BankError> {
+        self.inner.write_staging_record(bank, record)
     }
 
     // --- device-facing overrides ----------------------------------------------
@@ -465,9 +482,11 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
             files,
             None,
             self.inner.node_boot_id(),
+            self.inner.staged_update_id(bank).as_deref(),
         )
         .map_err(|e| BankError::Failed(format!("partition bank seal: ivd sign: {e}")))?;
         tracing::info!(metadata_dir = %metadata_dir.display(), gen, "partition bank sealed (IVD signed over partition hash)");
+        self.inner.clear_staging(bank);
         Ok(())
     }
 
@@ -1449,5 +1468,37 @@ mod tests {
             Bank::A,
             "…and leaves the boot authority alone"
         );
+    }
+
+    /// The partition provider keeps its staging record through the inner
+    /// provider: beside the metadata dir, round-tripping, `None` removes it,
+    /// a corrupt file reads as absent.
+    #[test]
+    fn staging_record_delegates_to_the_inner_provider() {
+        use machine_mgr::bank_provider::StagedPart;
+        let base = tmp("staging-record");
+        let p = build(base.join("images"), Vec::new(), "staging-record");
+        let rec = StagingRecord {
+            version: StagingRecord::VERSION,
+            update_id: None,
+            node_boot_id: None,
+            started_unix: 1,
+            parts: vec![StagedPart {
+                name: "application.img".into(),
+                size: 19,
+                sha256: "ab".repeat(32),
+            }],
+        };
+        p.write_staging_record(Bank::B, Some(&rec)).unwrap();
+        assert_eq!(p.staging_record(Bank::B).unwrap(), Some(rec));
+        let path = base.join("images").join("os").join("staging-bank_b.cbor");
+        assert!(path.is_file());
+
+        p.write_staging_record(Bank::B, None).unwrap();
+        assert!(!path.exists());
+        assert_eq!(p.staging_record(Bank::B).unwrap(), None);
+
+        std::fs::write(&path, [0xffu8, 0x00, 0x13]).unwrap();
+        assert_eq!(p.staging_record(Bank::B).unwrap(), None);
     }
 }

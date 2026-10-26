@@ -112,8 +112,8 @@ impl From<Resolution> for ResolutionResponse {
 }
 
 /// One component's entry in the `banks` member: the active bank
-/// and, for a two-bank component whose other bank holds an installed manifest,
-/// the inactive one; `in_trial` = the component runs a not-yet-committed
+/// and, for a two-bank component whose other bank holds an installed manifest
+/// or the verified parts of an update still being staged, the inactive one; `in_trial` = the component runs a not-yet-committed
 /// install. An orchestrator compares `inactive` with its intent and downloads
 /// only the images that differ.
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -129,7 +129,8 @@ pub(crate) struct ComponentBanksResponse {
     pub pending_reset: bool,
 }
 
-/// What one bank holds, by part name, as its installed manifest records it.
+/// What one bank holds, by part name: as its installed manifest records it,
+/// or — `sealed: false` — the verified parts of an update still being staged.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct BankContentsResponse {
     /// `"A"` or `"B"`.
@@ -138,6 +139,13 @@ pub(crate) struct BankContentsResponse {
     pub images: BTreeMap<String, BankImageResponse>,
     /// The node boot id the bank was sealed in; `null` when unknown.
     pub install_boot_id: Option<String>,
+    /// The client's update the bank holds, when the executor was told it;
+    /// absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_id: Option<String>,
+    /// Whether `images` is a sealed (signed) manifest's inventory; `false`
+    /// for the parts of an update still being staged.
+    pub sealed: bool,
 }
 
 /// One installed image: its size in bytes and SHA-256 (lowercase hex).
@@ -165,6 +173,8 @@ impl From<BankContents> for BankContentsResponse {
                 })
                 .collect(),
             install_boot_id: c.install_boot_id,
+            update_id: c.update_id,
+            sealed: c.sealed,
         }
     }
 }
@@ -1181,6 +1191,8 @@ mod tests {
                             bank: Bank::B,
                             images: BTreeMap::new(),
                             install_boot_id: None,
+                            update_id: None,
+                            sealed: false,
                         },
                         inactive: None,
                         in_trial,

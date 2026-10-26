@@ -30,7 +30,7 @@ use nv_store::types::{Bank, BankSet};
 
 use machine_mgr::bank_provider::{
     BankContents, BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFile,
-    InstalledFirmware,
+    InstalledFirmware, StagingHandle, StagingRecord,
 };
 use machine_mgr::{ImageEntry, ResetKind};
 
@@ -177,7 +177,10 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         let inactive = if self.single_bank {
             None
         } else {
-            Some(self.read_bank(active.bank.other())).filter(|c| !c.images.is_empty())
+            let other = active.bank.other();
+            Some(self.read_bank(other))
+                .filter(|c| !c.images.is_empty())
+                .or_else(|| self.staged_bank(other))
         };
         // With a boot vector attached, trial is structural: this component's
         // booted entry differs from its committed floor. Without one, the NV
@@ -251,6 +254,8 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
                     })
                     .collect(),
                 install_boot_id: vm.manifest.install_boot_id,
+                update_id: vm.manifest.update_id,
+                sealed: true,
             },
             Err(e) => {
                 tracing::debug!(
@@ -263,9 +268,122 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
                     bank,
                     images: BTreeMap::new(),
                     install_boot_id: None,
+                    update_id: None,
+                    sealed: false,
                 }
             }
         }
+    }
+
+    /// What `bank`'s staging record says it holds toward an update not yet
+    /// sealed: each verified part, and the update id when known. `None`
+    /// without a record.
+    fn staged_bank(&self, bank: Bank) -> Option<BankContents> {
+        let record = self.read_staging_record(bank)?;
+        let images = record
+            .parts
+            .iter()
+            .filter_map(|p| {
+                let sha256 = <[u8; 32]>::try_from(hex::decode(&p.sha256).ok()?).ok()?;
+                Some((
+                    p.name.clone(),
+                    ImageEntry {
+                        size: p.size,
+                        sha256,
+                    },
+                ))
+            })
+            .collect();
+        Some(BankContents {
+            bank,
+            images,
+            install_boot_id: None,
+            update_id: record.update_id,
+            sealed: false,
+        })
+    }
+
+    /// The set dir under `images_dir` — the one holding `bank_a/` and
+    /// `bank_b/`. `None` when no images_dir is configured.
+    fn set_dir(&self) -> Option<PathBuf> {
+        self.images_dir
+            .as_ref()
+            .map(|images_dir| images_dir.join(&self.dir_name))
+    }
+
+    /// Where `bank`'s staging record lives: `<set>/staging-<bank>.cbor`,
+    /// beside the bank, never inside it — the IVD signer attests every file
+    /// in the bank dir.
+    fn staging_record_path(&self, bank: Bank) -> Option<PathBuf> {
+        self.set_dir()
+            .map(|set| set.join(format!("staging-{}.cbor", bank_dir_name(bank))))
+    }
+
+    /// The staging record for `bank`; an unreadable or undecodable record
+    /// reads as absent (with a warn) — the next manifest rebuilds it.
+    fn read_staging_record(&self, bank: Bank) -> Option<StagingRecord> {
+        let path = self.staging_record_path(bank)?;
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "staging record unreadable — treated as absent");
+                return None;
+            }
+        };
+        match ciborium::from_reader::<StagingRecord, _>(bytes.as_slice()) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "staging record undecodable — treated as absent");
+                None
+            }
+        }
+    }
+
+    /// Replace (`Some`) or remove (`None`) the staging record for `bank`:
+    /// written to a temp file, renamed over the record, then the set dir
+    /// fsync'd, so a power cut leaves the old record or the new one.
+    fn store_staging_record(
+        &self,
+        bank: Bank,
+        record: Option<&StagingRecord>,
+    ) -> Result<(), BankError> {
+        let Some(path) = self.staging_record_path(bank) else {
+            return Ok(());
+        };
+        let dir = path
+            .parent()
+            .expect("record path has a parent")
+            .to_path_buf();
+        match record {
+            Some(record) => {
+                use std::io::Write;
+                let mut bytes = Vec::new();
+                ciborium::into_writer(record, &mut bytes)
+                    .map_err(|e| BankError::Failed(format!("encode staging record: {e}")))?;
+                std::fs::create_dir_all(&dir)?;
+                let tmp = path.with_extension("cbor.tmp");
+                let written = std::fs::File::create(&tmp)
+                    .and_then(|mut f| {
+                        f.write_all(&bytes)?;
+                        f.sync_all()
+                    })
+                    .and_then(|()| std::fs::rename(&tmp, &path));
+                if let Err(e) = written {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+            }
+            None => match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e.into()),
+            },
+        }
+        if let Err(e) = std::fs::File::open(&dir).and_then(|d| d.sync_all()) {
+            tracing::debug!(dir = %dir.display(), error = %e, "staging record dir fsync skipped");
+        }
+        Ok(())
     }
 
     /// Path of the target bank directory under `images_dir`. `None` when no
@@ -340,9 +458,54 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     /// couple of call sites use directly, separately from the bundled
     /// `prepare_target`) can reach it.
     pub fn prepare_target_bank_dir(&self, target: Bank) -> Result<(), BankError> {
+        self.prune_bank_dir(target, &[])
+    }
+
+    /// Where payloads stage for `bank` before their part is known:
+    /// `<set>/staging/<bank>/`, beside the bank so a commit is a rename.
+    fn staging_dir(&self, bank: Bank) -> Option<PathBuf> {
+        self.set_dir()
+            .map(|set| set.join("staging").join(bank_dir_name(bank)))
+    }
+
+    /// Remove `bank`'s staging dir — torn uploads a crash left behind, or
+    /// leftovers once the bank is sealed. Best-effort.
+    fn clear_staging_dir(&self, bank: Bank) {
+        let Some(dir) = self.staging_dir(bank) else {
+            return;
+        };
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!(dir = %dir.display(), "staging leftovers removed"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "staging leftovers not removed")
+            }
+        }
+    }
+
+    /// The update id `bank`'s staging record names — what its seal carries
+    /// into the signed manifest.
+    pub(crate) fn staged_update_id(&self, bank: Bank) -> Option<String> {
+        self.read_staging_record(bank).and_then(|r| r.update_id)
+    }
+
+    /// The bank is sealed: its staging record and staging leftovers are no
+    /// longer facts about it. Best-effort — a record left behind names parts
+    /// the next manifest re-verifies anyway.
+    pub(crate) fn clear_staging(&self, bank: Bank) {
+        if let Err(e) = self.store_staging_record(bank, None) {
+            tracing::warn!(bank = ?bank, error = %e, "staging record not removed after seal");
+        }
+        self.clear_staging_dir(bank);
+    }
+
+    /// [`prepare_target_bank_dir`](Self::prepare_target_bank_dir) that keeps
+    /// the regular files named in `keep`, and removes torn staging leftovers.
+    fn prune_bank_dir(&self, target: Bank, keep: &[String]) -> Result<(), BankError> {
         let Some(images_dir) = self.images_dir.as_ref() else {
             return Ok(());
         };
+        self.clear_staging_dir(target);
         let set_name = &self.dir_name;
         let bank_dir = images_dir.join(set_name).join(bank_dir_name(target));
         std::fs::create_dir_all(&bank_dir).map_err(|e| {
@@ -353,8 +516,18 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
-                    // Single bank: the target IS the live bank, wiped here at
-                    // flash START. Keep its IVD pair — it may be the disable
+                    // A part the staging record proves (re-verified by the
+                    // engine): kept, so the update resumes instead of
+                    // re-sending it.
+                    if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| keep.iter().any(|k| k == n))
+                    {
+                        continue;
+                    }
+                    // Single bank: the target IS the live bank, cleared here when
+                    // the manifest arrives. Keep its IVD pair — it may be the disable
                     // sentinel, which must survive a flash that aborts before
                     // `seal` (a seal that signs rewrites both files anyway).
                     if self.single_bank
@@ -375,6 +548,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         tracing::info!(
             target = %bank_dir.display(),
             cleared,
+            kept = keep.len(),
             "prepared target bank dir for {set_name}"
         );
 
@@ -626,6 +800,69 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         self.prepare_target_bank_dir(bank)
     }
 
+    fn prune_target(&self, bank: Bank, keep: &[String]) -> Result<(), BankError> {
+        self.prune_bank_dir(bank, keep)
+    }
+
+    fn open_staging_writer(
+        &self,
+        bank: Bank,
+    ) -> Result<(Box<dyn std::io::Write + Send>, StagingHandle), BankError> {
+        let dir = self
+            .staging_dir(bank)
+            .ok_or_else(|| BankError::Failed("no images_dir configured".into()))?;
+        std::fs::create_dir_all(&dir)?;
+        let name = format!("upload-{}.part", uuid::Uuid::new_v4());
+        let file = std::fs::File::create(dir.join(&name))?;
+        // Same 4 MiB buffer as `open_payload_writer`.
+        const WRITE_BUF: usize = 4 * 1024 * 1024;
+        Ok((
+            Box::new(BufWriter::with_capacity(WRITE_BUF, file)),
+            StagingHandle(name),
+        ))
+    }
+
+    fn commit_staged(
+        &self,
+        bank: Bank,
+        handle: StagingHandle,
+        name: &str,
+    ) -> Result<(), BankError> {
+        let staged = self
+            .staging_dir(bank)
+            .ok_or_else(|| BankError::Failed("no images_dir configured".into()))?
+            .join(&handle.0);
+        let bank_dir = self
+            .target_bank_dir(bank)
+            .ok_or_else(|| BankError::Failed("no images_dir configured".into()))?;
+        let dest = bank_dir.join(name);
+        let dest_dir = dest.parent().unwrap_or(&bank_dir).to_path_buf();
+        std::fs::create_dir_all(&dest_dir)?;
+        // The rename replaces an older part of that name in one step.
+        std::fs::rename(&staged, &dest).map_err(|e| {
+            BankError::Failed(format!(
+                "commit staged {} as {}: {e}",
+                staged.display(),
+                dest.display()
+            ))
+        })?;
+        if let Err(e) = std::fs::File::open(&dest_dir).and_then(|d| d.sync_all()) {
+            tracing::debug!(dir = %dest_dir.display(), error = %e, "bank dir fsync skipped");
+        }
+        Ok(())
+    }
+
+    fn discard_staged(&self, bank: Bank, handle: StagingHandle) -> Result<(), BankError> {
+        let Some(dir) = self.staging_dir(bank) else {
+            return Ok(());
+        };
+        match std::fs::remove_file(dir.join(&handle.0)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn open_payload_writer(
         &self,
         bank: Bank,
@@ -733,6 +970,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             gen,
             identity,
             self.node_boot_id.as_deref(),
+            self.staged_update_id(bank).as_deref(),
         )
         .map_err(|e| BankError::Failed(format!("ivd sign {bank_id}: {e}")))?;
         tracing::info!(
@@ -741,6 +979,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             gen,
             "ivd sign OK",
         );
+        self.clear_staging(bank);
         Ok(())
     }
 
@@ -1036,6 +1275,18 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
 
     fn banks(&self) -> Option<ComponentBanks> {
         self.banks_for(self.reset_kind())
+    }
+
+    fn staging_record(&self, bank: Bank) -> Result<Option<StagingRecord>, BankError> {
+        Ok(self.read_staging_record(bank))
+    }
+
+    fn write_staging_record(
+        &self,
+        bank: Bank,
+        record: Option<&StagingRecord>,
+    ) -> Result<(), BankError> {
+        self.store_staging_record(bank, record)
     }
 }
 
@@ -1779,5 +2030,55 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&images_dir);
+    }
+
+    fn sample_record(update_id: Option<&str>) -> StagingRecord {
+        StagingRecord {
+            version: StagingRecord::VERSION,
+            update_id: update_id.map(str::to_owned),
+            node_boot_id: Some("boot-a".into()),
+            started_unix: 1_700_000_000,
+            parts: vec![machine_mgr::bank_provider::StagedPart {
+                name: "rootfs.img".into(),
+                size: 4,
+                sha256: "00".repeat(32),
+            }],
+        }
+    }
+
+    /// The record round-trips beside the bank (never inside it), `None`
+    /// removes it, and a corrupt file reads as absent.
+    #[test]
+    fn staging_record_round_trips_beside_the_bank() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = disk_provider_no_hsm(tmp.path().to_path_buf());
+        assert_eq!(p.staging_record(Bank::B).unwrap(), None);
+
+        let rec = sample_record(Some("upd-1"));
+        p.write_staging_record(Bank::B, Some(&rec)).unwrap();
+        assert_eq!(p.staging_record(Bank::B).unwrap(), Some(rec));
+        let path = tmp.path().join("vm1").join("staging-bank_b.cbor");
+        assert!(
+            path.is_file(),
+            "the record lives at <set>/staging-<bank>.cbor"
+        );
+        assert!(
+            !tmp.path().join("vm1").join("bank_b").exists(),
+            "nothing lands in the bank"
+        );
+        assert_eq!(p.staging_record(Bank::A).unwrap(), None, "per bank");
+
+        p.write_staging_record(Bank::B, None).unwrap();
+        assert!(!path.exists());
+        assert_eq!(p.staging_record(Bank::B).unwrap(), None);
+        // Removing an absent record is not an error.
+        p.write_staging_record(Bank::B, None).unwrap();
+
+        std::fs::write(&path, b"not cbor at all").unwrap();
+        assert_eq!(
+            p.staging_record(Bank::B).unwrap(),
+            None,
+            "corrupt reads as absent"
+        );
     }
 }

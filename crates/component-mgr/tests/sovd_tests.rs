@@ -1481,6 +1481,7 @@ fn seal_test_bank(
         1,
         hsm::ivd::IvdIdentity::default(),
         install_boot_id,
+        None,
     )
     .unwrap();
 }

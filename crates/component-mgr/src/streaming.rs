@@ -188,7 +188,7 @@ pub async fn process_envelope_stream(
                     comp_idx,
                     &trust_anchor,
                     key_unwrap.as_deref(),
-                    &expected_digest_clone,
+                    Some(&expected_digest_clone),
                     writer,
                 )
             }))
@@ -581,7 +581,7 @@ fn process_payload_sync(
     component_index: usize,
     _trust_anchor: &[u8],
     key_unwrap: Option<&(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)>,
-    expected_digest: &[u8],
+    expected_digest: Option<&[u8]>,
     writer: Option<Box<dyn IoWrite + Send>>,
 ) -> Result<(usize, [u8; 32]), String> {
     let crypto = RustCryptoBackend::new();
@@ -640,7 +640,7 @@ fn process_payload_sync(
 /// before returning so the BufWriter's tail reaches the sink.
 fn process_plain<R: Read>(
     mut reader: R,
-    expected_digest: &[u8],
+    expected_digest: Option<&[u8]>,
     mut writer: Option<Box<dyn IoWrite + Send>>,
 ) -> Result<(usize, [u8; 32]), String> {
     let mut hasher = Sha256::new();
@@ -725,7 +725,7 @@ impl<R: Read> Read for TimedReader<R> {
 /// `writer` contract as [`process_plain`] (flushed before return).
 fn process_decompressed<R: Read>(
     reader: R,
-    expected_digest: &[u8],
+    expected_digest: Option<&[u8]>,
     writer: Option<Box<dyn IoWrite + Send>>,
 ) -> Result<(usize, [u8; 32]), String> {
     use std::sync::mpsc::sync_channel;
@@ -848,15 +848,17 @@ fn process_decompressed<R: Read>(
         "payload pipeline stage timing (pipelined; sum > wall_ms)",
     );
 
-    if digest.as_slice() != expected_digest {
+    if expected_digest.is_some_and(|e| digest.as_slice() != e) {
         return Err("image digest mismatch".into());
     }
     Ok((total, digest))
 }
 
-fn verify_digest(hasher: Sha256, expected: &[u8]) -> Result<[u8; 32], String> {
+/// The digest `hasher` computed, refused when it is not `expected` (`None`:
+/// the caller matches the digest itself).
+fn verify_digest(hasher: Sha256, expected: Option<&[u8]>) -> Result<[u8; 32], String> {
     let computed: [u8; 32] = hasher.finalize().into();
-    if computed.as_slice() != expected {
+    if expected.is_some_and(|e| computed.as_slice() != e) {
         return Err("image digest mismatch".into());
     }
     Ok(computed)
@@ -1181,10 +1183,10 @@ pub fn process_raw_payload(
 
         if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
             let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
-            process_decompressed(prefixed, expected_digest, Some(writer))
+            process_decompressed(prefixed, Some(expected_digest), Some(writer))
         } else {
             let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
-            process_plain(prefixed, expected_digest, Some(writer))
+            process_plain(prefixed, Some(expected_digest), Some(writer))
         }
     } else {
         // Unencrypted — detect zstd
@@ -1193,10 +1195,10 @@ pub fn process_raw_payload(
 
         if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
             let prefixed = PrefixReader::new(&first_buf[..first_n], reader);
-            process_decompressed(prefixed, expected_digest, Some(writer))
+            process_decompressed(prefixed, Some(expected_digest), Some(writer))
         } else {
             let prefixed = PrefixReader::new(&first_buf[..first_n], reader);
-            process_plain(prefixed, expected_digest, Some(writer))
+            process_plain(prefixed, Some(expected_digest), Some(writer))
         }
     }
 }
@@ -1385,14 +1387,18 @@ pub async fn resolve_campaign_dependencies(
 ///   stream (i.e. the "on-wire" size — useful for compression-ratio
 ///   logging).
 /// - `image_size`: plaintext + decompressed bytes written to disk.
-/// - `image_sha256`: digest of the written bytes (matches the
-///   manifest's `image_digest` for this component).
+/// - `image_sha256`: digest of the written bytes (matches
+///   `expected_digest` when one is given; with `None` the caller names the
+///   component by this digest).
+///
+/// `component_index` supplies the decryption context of an encrypted
+/// payload.
 pub async fn process_payload_stream(
     stream: PackageStream,
     manifest_bytes: Vec<u8>,
     component_index: usize,
     key_unwrap: Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>,
-    expected_digest: Vec<u8>,
+    expected_digest: Option<Vec<u8>>,
     writer: Box<dyn IoWrite + Send>,
 ) -> Result<(u64, usize, [u8; 32]), BackendError> {
     let envelope = sumo_codec::decode::decode_envelope(&manifest_bytes)
@@ -1415,7 +1421,7 @@ pub async fn process_payload_stream(
                 component_index,
                 &[],
                 key_unwrap.as_deref(),
-                &expected_digest,
+                expected_digest.as_deref(),
                 Some(writer),
             )
         }))
@@ -1553,7 +1559,7 @@ mod tests {
         let out = Arc::new(Mutex::new(Vec::new()));
         let writer: Box<dyn IoWrite + Send> = Box::new(VecSink(out.clone()));
         let (total, digest) =
-            process_decompressed(Cursor::new(compressed), &expected, Some(writer)).unwrap();
+            process_decompressed(Cursor::new(compressed), Some(&expected), Some(writer)).unwrap();
 
         assert_eq!(total, original.len(), "byte count");
         assert_eq!(digest.as_slice(), expected.as_slice(), "digest");
@@ -1567,7 +1573,7 @@ mod tests {
         let compressed = zstd::encode_all(&original[..], 3).unwrap();
         let out = Arc::new(Mutex::new(Vec::new()));
         let writer: Box<dyn IoWrite + Send> = Box::new(VecSink(out));
-        let res = process_decompressed(Cursor::new(compressed), &[0u8; 32], Some(writer));
+        let res = process_decompressed(Cursor::new(compressed), Some(&[0u8; 32]), Some(writer));
         assert!(res.is_err(), "wrong digest must be rejected");
     }
 }

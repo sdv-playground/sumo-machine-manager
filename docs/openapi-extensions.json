@@ -774,10 +774,11 @@
     "schemas": {
       "BankContentsResponse": {
         "type": "object",
-        "description": "What one bank holds, by part name, as its installed manifest records it.",
+        "description": "What one bank holds, by part name: as its installed manifest records it,\nor — `sealed: false` — the verified parts of an update still being staged.",
         "required": [
           "bank",
-          "images"
+          "images",
+          "sealed"
         ],
         "properties": {
           "bank": {
@@ -799,6 +800,17 @@
               "null"
             ],
             "description": "The node boot id the bank was sealed in; `null` when unknown."
+          },
+          "sealed": {
+            "type": "boolean",
+            "description": "Whether `images` is a sealed (signed) manifest's inventory; `false`\nfor the parts of an update still being staged."
+          },
+          "update_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's update the bank holds, when the executor was told it;\nabsent otherwise."
           }
         }
       },
@@ -822,7 +834,7 @@
       },
       "ComponentBanksResponse": {
         "type": "object",
-        "description": "One component's entry in the `banks` member: the active bank\nand, for a two-bank component whose other bank holds an installed manifest,\nthe inactive one; `in_trial` = the component runs a not-yet-committed\ninstall. An orchestrator compares `inactive` with its intent and downloads\nonly the images that differ.",
+        "description": "One component's entry in the `banks` member: the active bank\nand, for a two-bank component whose other bank holds an installed manifest\nor the verified parts of an update still being staged, the inactive one; `in_trial` = the component runs a not-yet-committed\ninstall. An orchestrator compares `inactive` with its intent and downloads\nonly the images that differ.",
         "required": [
           "id",
           "active",
