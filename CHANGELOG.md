@@ -6,7 +6,9 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
-## Unreleased
+## v0.1.21 — SOVDd v0.1.3, held updates served
+
+Tag on `03aeb27` (2026-10-26), PR #34.
 
 - deps: SOVDd v0.1.3 — the embedded server lists, describes and reports the updates this executor
   holds (`held_updates`) and marks parts `present`; no wire change for clients that do not use the
