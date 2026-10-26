@@ -8,6 +8,13 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- x-update: node verdict as `x-update-commit` / `x-update-rollback` operations (body: optional
+  `nonce`); `x-update-verdict` stays as an alias until the x-ota names retire; OpenAPI and discovery
+  list all three; the per-update path carriers follow SOVDd's `x-update-commit` /
+  `x-update-rollback`.
+
+Host-facing: hosts inherit the routes through `node_verdict_router`; no host change beyond the pin.
+
 ## v0.1.18 — the seed anchors only its own baseline; the vector rolls back before NV
 
 Tag on `048820d` (2026-10-26), PR #26.

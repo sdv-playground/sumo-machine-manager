@@ -219,13 +219,13 @@
         }
       }
     },
-    "/vehicle/v1/components/{component_id}/updates/{update_id}/x-update-verdict": {
+    "/vehicle/v1/components/{component_id}/updates/{update_id}/x-update-commit": {
       "put": {
         "tags": [
           "x-extensions"
         ],
         "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); see\nSOVDd `docs/x-update.md`.",
-        "operationId": "x_update_verdict",
+        "operationId": "x_update_commit",
         "parameters": [
           {
             "name": "component_id",
@@ -246,21 +246,9 @@
             }
           }
         ],
-        "requestBody": {
-          "description": "`{\"verdict\": \"commit\" | \"rollback\"}`.",
-          "content": {
-            "application/json": {
-              "schema": {},
-              "example": {
-                "verdict": "commit"
-              }
-            }
-          },
-          "required": true
-        },
         "responses": {
           "202": {
-            "description": "Verdict posted; poll .../status.",
+            "description": "Commit verdict posted; poll .../status.",
             "headers": {
               "Location": {
                 "schema": {
@@ -274,10 +262,55 @@
             "description": "Unknown update."
           },
           "409": {
-            "description": "The update is not awaiting a verdict; `commit` additionally requires the new software running (state TRIAL)."
+            "description": "The update is not awaiting a verdict, or the new software is not running (state TRIAL)."
+          }
+        }
+      }
+    },
+    "/vehicle/v1/components/{component_id}/updates/{update_id}/x-update-rollback": {
+      "put": {
+        "tags": [
+          "x-extensions"
+        ],
+        "summary": "Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); see\nSOVDd `docs/x-update.md`.",
+        "operationId": "x_update_rollback",
+        "parameters": [
+          {
+            "name": "component_id",
+            "in": "path",
+            "description": "Target component.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
           },
-          "422": {
-            "description": "`verdict` missing or not one of `commit`, `rollback`."
+          {
+            "name": "update_id",
+            "in": "path",
+            "description": "The /updates entry; must be paused at execute/awaiting-verdict.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Rollback verdict posted; poll .../status.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "URL of the update status resource."
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown update."
+          },
+          "409": {
+            "description": "The update is not awaiting a verdict."
           }
         }
       }
@@ -355,7 +388,7 @@
           "x-extensions"
         ],
         "summary": "Build the node-level commit/rollback verdict routes.",
-        "description": "Wire (ISO 17978-3 §7.14 operation executions, at the **entity root**):\n\n  `POST /vehicle/v1/operations/x-ota-commit-trials/executions`\n  `POST /vehicle/v1/operations/x-ota-rollback-trials/executions`\n  `POST /vehicle/v1/operations/x-update-verdict/executions` — the same two\n       verdicts with `{\"verdict\": \"commit\"|\"rollback\"}` in a required body,\n       on the same lock\n\nThe orchestrator issues ONE verdict per node per campaign step — the update\n*session* is the commit unit, never a single component. Entity-root\naddressing (no `{id}` segment) keeps these clear of the dynamic\n`/components/{id}/operations/{op_id}/...` routes (mirrors the entity-root\n`factory-reset` op) and means there is no per-component `/updates` session\nto re-attach after the node reboot — membership is the NV-derived in-trial\nset, identical before and after the reboot. Vendor extensions live here in\nsumo-mm, not SOVDd (the three-layer rule, like `csr_router`).\n`POST /vehicle/v1/operations/x-ota-commit-trials/executions` — the node\ncommit verdict; see [`node_verdict_router`] for the wire contract.",
+        "description": "Wire (ISO 17978-3 §7.14 operation executions, at the **entity root**):\n\n  `POST /vehicle/v1/operations/x-ota-commit-trials/executions`\n  `POST /vehicle/v1/operations/x-ota-rollback-trials/executions`\n  `POST /vehicle/v1/operations/x-update-commit/executions`\n  `POST /vehicle/v1/operations/x-update-rollback/executions`\n  `POST /vehicle/v1/operations/x-update-verdict/executions` — the same two\n       verdicts with `{\"verdict\": \"commit\"|\"rollback\"}` in a required body\n       (alias, retired together with the x-ota names)\n\nAll five share one lock.\n\nThe orchestrator issues ONE verdict per node per campaign step — the update\n*session* is the commit unit, never a single component. Entity-root\naddressing (no `{id}` segment) keeps these clear of the dynamic\n`/components/{id}/operations/{op_id}/...` routes (mirrors the entity-root\n`factory-reset` op) and means there is no per-component `/updates` session\nto re-attach after the node reboot — membership is the NV-derived in-trial\nset, identical before and after the reboot. Vendor extensions live here in\nsumo-mm, not SOVDd (the three-layer rule, like `csr_router`).\n`POST /vehicle/v1/operations/x-ota-commit-trials/executions` — the node\ncommit verdict; see [`node_verdict_router`] for the wire contract.",
         "operationId": "commit_trials",
         "requestBody": {
           "description": "Optional replay nonce; an absent or non-JSON body means no nonce (old-client shape).",
@@ -580,12 +613,116 @@
         }
       }
     },
+    "/vehicle/v1/operations/x-update-commit/executions": {
+      "post": {
+        "tags": [
+          "x-extensions"
+        ],
+        "summary": "`POST /vehicle/v1/operations/x-update-commit/executions` — the node commit\nverdict; see [`node_verdict_router`] for the wire contract.",
+        "operationId": "x_update_commit",
+        "requestBody": {
+          "description": "Optional JSON body: a replay `nonce` echoed in the execution.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerdictRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Verdict applied across the node's in-trial components (`result.committed` / `skipped`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Refused: every failure was a transient Busy refusal (e.g. a component's commit preflight).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "One or more components failed to commit (failed execution).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/vehicle/v1/operations/x-update-rollback/executions": {
+      "post": {
+        "tags": [
+          "x-extensions"
+        ],
+        "summary": "`POST /vehicle/v1/operations/x-update-rollback/executions` — the node\nrollback verdict; see [`node_verdict_router`] for the wire contract.",
+        "operationId": "x_update_rollback",
+        "requestBody": {
+          "description": "Optional JSON body: a replay `nonce` echoed in the execution.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerdictRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Verdict applied across the node's in-trial components (`result.rolled_back` / `skipped`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Refused: every failure was a transient Busy refusal.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "One or more components failed to roll back (failed execution).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerdictExecution"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/vehicle/v1/operations/x-update-verdict/executions": {
       "post": {
         "tags": [
           "x-extensions"
         ],
-        "summary": "`POST /vehicle/v1/operations/x-update-verdict/executions` — the node verdict\nwith the verdict in the body; exactly `x-ota-commit-trials` /\n`x-ota-rollback-trials` under one operation id. See [`node_verdict_router`].",
+        "summary": "`POST /vehicle/v1/operations/x-update-verdict/executions` — the node verdict\nwith the verdict in the body; exactly `x-ota-commit-trials` /\n`x-ota-rollback-trials` under one operation id. Alias of `x-update-commit` /\n`x-update-rollback`, retired together with the x-ota names. See\n[`node_verdict_router`].",
         "operationId": "x_update_verdict",
         "requestBody": {
           "description": "Required JSON body: `verdict` (`commit` | `rollback`) plus an optional replay `nonce`. A missing or unknown `verdict` word is rejected with 422 (400 for malformed JSON, 415 without `Content-Type: application/json`).",

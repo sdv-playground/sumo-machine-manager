@@ -60,13 +60,16 @@ there."
         super::routes::device_id,
         super::routes::commit_trials,
         super::routes::rollback_trials,
+        super::routes::x_update_commit,
+        super::routes::x_update_rollback,
         super::routes::x_update_verdict,
         super::pull_update::handle_post,
         super::pull_update::get_pull_update_status,
         doc::x_ota_commit,
         doc::x_ota_rollback,
         doc::x_ota_force_rollback,
-        doc::x_update_verdict,
+        doc::x_update_commit,
+        doc::x_update_rollback,
     ),
     components(schemas(
         super::routes::UpdateStateResponse,
@@ -182,19 +185,35 @@ pub(crate) mod doc {
     /// SOVDd `docs/x-update.md`.
     #[utoipa::path(
         put,
-        path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-update-verdict",
+        path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-update-commit",
         tag = "x-extensions",
         params(
             ("component_id" = String, Path, description = "Target component."),
             ("update_id" = String, Path, description = "The /updates entry; must be paused at execute/awaiting-verdict."),
         ),
-        request_body(content = serde_json::Value, description = "`{\"verdict\": \"commit\" | \"rollback\"}`.", content_type = "application/json", example = json!({"verdict": "commit"})),
         responses(
-            (status = 202, description = "Verdict posted; poll .../status.", headers(("Location" = String, description = "URL of the update status resource."))),
+            (status = 202, description = "Commit verdict posted; poll .../status.", headers(("Location" = String, description = "URL of the update status resource."))),
             (status = 404, description = "Unknown update."),
-            (status = 409, description = "The update is not awaiting a verdict; `commit` additionally requires the new software running (state TRIAL)."),
-            (status = 422, description = "`verdict` missing or not one of `commit`, `rollback`."),
+            (status = 409, description = "The update is not awaiting a verdict, or the new software is not running (state TRIAL)."),
         ),
     )]
-    pub(crate) fn x_update_verdict() {}
+    pub(crate) fn x_update_commit() {}
+
+    /// Path carrier — handler lives in SOVDd (`sovd-api` updates.rs); see
+    /// SOVDd `docs/x-update.md`.
+    #[utoipa::path(
+        put,
+        path = "/vehicle/v1/components/{component_id}/updates/{update_id}/x-update-rollback",
+        tag = "x-extensions",
+        params(
+            ("component_id" = String, Path, description = "Target component."),
+            ("update_id" = String, Path, description = "The /updates entry; must be paused at execute/awaiting-verdict."),
+        ),
+        responses(
+            (status = 202, description = "Rollback verdict posted; poll .../status.", headers(("Location" = String, description = "URL of the update status resource."))),
+            (status = 404, description = "Unknown update."),
+            (status = 409, description = "The update is not awaiting a verdict."),
+        ),
+    )]
+    pub(crate) fn x_update_rollback() {}
 }
