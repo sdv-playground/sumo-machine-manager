@@ -315,8 +315,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     /// beside the bank, never inside it — the IVD signer attests every file
     /// in the bank dir.
     fn staging_record_path(&self, bank: Bank) -> Option<PathBuf> {
-        self.set_dir()
-            .map(|set| set.join(format!("staging-{}.cbor", bank_dir_name(bank))))
+        self.set_dir().map(|set| staging_record_path(&set, bank))
     }
 
     /// The staging record for `bank`; an unreadable or undecodable record
@@ -362,7 +361,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
                 ciborium::into_writer(record, &mut bytes)
                     .map_err(|e| BankError::Failed(format!("encode staging record: {e}")))?;
                 std::fs::create_dir_all(&dir)?;
-                let tmp = path.with_extension("cbor.tmp");
+                let tmp = staging_record_tmp_path(&path);
                 let written = std::fs::File::create(&tmp)
                     .and_then(|mut f| {
                         f.write_all(&bytes)?;
@@ -465,7 +464,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     /// `<set>/staging/<bank>/`, beside the bank so a commit is a rename.
     fn staging_dir(&self, bank: Bank) -> Option<PathBuf> {
         self.set_dir()
-            .map(|set| set.join("staging").join(bank_dir_name(bank)))
+            .map(|set| set.join(STAGING_DIR).join(bank_dir_name(bank)))
     }
 
     /// Remove `bank`'s staging dir — torn uploads a crash left behind, or
@@ -1320,6 +1319,40 @@ pub fn bank_dir_name(bank: Bank) -> &'static str {
     }
 }
 
+/// The set-level dir payloads stage under: `<set>/staging/<bank>/`.
+const STAGING_DIR: &str = "staging";
+
+/// `<set>/staging-<bank>.cbor` — `bank`'s staging record.
+fn staging_record_path(set_dir: &Path, bank: Bank) -> PathBuf {
+    set_dir.join(format!("staging-{}.cbor", bank_dir_name(bank)))
+}
+
+/// The temp file a staging record is written to before its rename.
+fn staging_record_tmp_path(record: &Path) -> PathBuf {
+    record.with_extension("cbor.tmp")
+}
+
+/// Forget `set_dir`'s staging state: both banks' staging records (and any
+/// temp file a torn record write left) and the whole `staging/` dir, each
+/// only if present, then fsync `set_dir`. For a factory reset or any
+/// "forget this set" path; the bank dirs themselves are the caller's.
+pub fn wipe_staging(set_dir: &Path) -> std::io::Result<()> {
+    let ignore_absent = |r: std::io::Result<()>| match r {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    };
+    for bank in [Bank::A, Bank::B] {
+        let record = staging_record_path(set_dir, bank);
+        ignore_absent(std::fs::remove_file(&record))?;
+        ignore_absent(std::fs::remove_file(staging_record_tmp_path(&record)))?;
+    }
+    ignore_absent(std::fs::remove_dir_all(set_dir.join(STAGING_DIR)))?;
+    if let Err(e) = std::fs::File::open(set_dir).and_then(|d| d.sync_all()) {
+        tracing::debug!(dir = %set_dir.display(), error = %e, "staging wipe dir fsync skipped");
+    }
+    Ok(())
+}
+
 /// `true` if `bank_dir` has no files that IVD signing would attest to. Skips
 /// IVD's own outputs (manifest + signature) so a re-sign doesn't trip on a
 /// previous run's artefacts.
@@ -2103,5 +2136,42 @@ mod tests {
             None,
             "corrupt reads as absent"
         );
+    }
+
+    /// `wipe_staging` removes both records and the staging dir (a torn
+    /// payload included) and leaves the bank dirs alone; a set without
+    /// staging state wipes as Ok.
+    #[test]
+    fn wipe_staging_forgets_only_the_staging_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = disk_provider_no_hsm(tmp.path().to_path_buf());
+        let set = tmp.path().join("vm1");
+        for bank in [Bank::A, Bank::B] {
+            let dir = set.join(bank_dir_name(bank));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("rootfs.img"), b"bank").unwrap();
+            p.write_staging_record(bank, Some(&sample_record(Some("upd-1"))))
+                .unwrap();
+        }
+        let torn = p.staging_dir(Bank::B).unwrap();
+        std::fs::create_dir_all(&torn).unwrap();
+        std::fs::write(torn.join("torn.part"), b"half").unwrap();
+
+        wipe_staging(&set).unwrap();
+
+        assert_eq!(p.staging_record(Bank::A).unwrap(), None);
+        assert_eq!(p.staging_record(Bank::B).unwrap(), None);
+        let mut left: Vec<_> = std::fs::read_dir(&set)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["bank_a", "bank_b"]);
+        for bank in [Bank::A, Bank::B] {
+            let file = set.join(bank_dir_name(bank)).join("rootfs.img");
+            assert_eq!(std::fs::read(file).unwrap(), b"bank");
+        }
+
+        wipe_staging(&set).unwrap();
     }
 }

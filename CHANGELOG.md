@@ -63,6 +63,8 @@ Host-facing:
 - File-bank hosts gain `<set>/staging-<bank>.cbor` and `<set>/staging/<bank>/` beside the bank
   dirs; a payload is renamed from the latter into the bank, so both must sit on the bank's
   filesystem.
+- A host's factory reset calls `wipe_staging(set_dir)` (`component_mgr::bank_provider`) for every
+  file-bank set, so the staging record and temporary payloads are forgotten with the banks.
 - Partition-bank hosts gain the record beside the metadata dir.
 - Partition-bank hosts' intake is addressed (order-free) when the client names its parts; a client
   that does not keeps manifest order.
