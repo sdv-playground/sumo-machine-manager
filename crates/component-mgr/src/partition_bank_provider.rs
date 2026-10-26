@@ -48,7 +48,7 @@ use nv_store::block::BlockDevice;
 use nv_store::types::Bank;
 
 use machine_mgr::bank_provider::{
-    BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFirmware,
+    BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFirmware, StagingRecord,
 };
 use machine_mgr::{ImageRecord, ResetKind};
 
@@ -279,6 +279,17 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         // A raw partition takes effect only after the node reboots + the
         // bootloader re-selects — always a full ECU reset.
         ResetKind::RequiresEcuReset
+    }
+    fn staging_record(&self, bank: Bank) -> Result<Option<StagingRecord>, BankError> {
+        // The record sits beside the metadata dir exactly as for a file bank.
+        self.inner.staging_record(bank)
+    }
+    fn write_staging_record(
+        &self,
+        bank: Bank,
+        record: Option<&StagingRecord>,
+    ) -> Result<(), BankError> {
+        self.inner.write_staging_record(bank, record)
     }
 
     // --- device-facing overrides ----------------------------------------------
@@ -1449,5 +1460,37 @@ mod tests {
             Bank::A,
             "…and leaves the boot authority alone"
         );
+    }
+
+    /// The partition provider keeps its staging record through the inner
+    /// provider: beside the metadata dir, round-tripping, `None` removes it,
+    /// a corrupt file reads as absent.
+    #[test]
+    fn staging_record_delegates_to_the_inner_provider() {
+        use machine_mgr::bank_provider::StagedPart;
+        let base = tmp("staging-record");
+        let p = build(base.join("images"), Vec::new(), "staging-record");
+        let rec = StagingRecord {
+            version: StagingRecord::VERSION,
+            update_id: None,
+            node_boot_id: None,
+            started_unix: 1,
+            parts: vec![StagedPart {
+                name: "application.img".into(),
+                size: 19,
+                sha256: "ab".repeat(32),
+            }],
+        };
+        p.write_staging_record(Bank::B, Some(&rec)).unwrap();
+        assert_eq!(p.staging_record(Bank::B).unwrap(), Some(rec));
+        let path = base.join("images").join("os").join("staging-bank_b.cbor");
+        assert!(path.is_file());
+
+        p.write_staging_record(Bank::B, None).unwrap();
+        assert!(!path.exists());
+        assert_eq!(p.staging_record(Bank::B).unwrap(), None);
+
+        std::fs::write(&path, [0xffu8, 0x00, 0x13]).unwrap();
+        assert_eq!(p.staging_record(Bank::B).unwrap(), None);
     }
 }

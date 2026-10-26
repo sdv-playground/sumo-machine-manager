@@ -94,6 +94,39 @@ pub struct BankContents {
     pub install_boot_id: Option<String>,
 }
 
+/// What an unsealed bank holds toward an update, kept beside the bank so a
+/// half-staged update survives a restart as facts: each part the bank holds,
+/// verified against the digest it was staged under. The bank's seal removes
+/// it; a record without an `update_id` is a part cache, not a held update.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StagingRecord {
+    /// Record layout version, `1`.
+    pub version: u32,
+    /// The client's update this staging belongs to, when the executor was
+    /// told it.
+    pub update_id: Option<String>,
+    /// The node boot id the staging (re)started in.
+    pub node_boot_id: Option<String>,
+    /// Wall-clock seconds when the staging (re)started.
+    pub started_unix: u64,
+    /// The parts the bank holds, each verified on intake.
+    pub parts: Vec<StagedPart>,
+}
+
+impl StagingRecord {
+    /// The layout version this crate writes.
+    pub const VERSION: u32 = 1;
+}
+
+/// One part an unsealed bank holds: its on-medium name, size and SHA-256
+/// (lowercase hex).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StagedPart {
+    pub name: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
 /// Installed contents of each bank of one component, plus whether it is in a
 /// trial. See [`BankProvider::banks`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,5 +316,21 @@ pub trait BankProvider: Send + Sync {
     /// that does not report bank contents).
     fn banks(&self) -> Option<ComponentBanks> {
         None
+    }
+
+    /// The staging record kept beside `bank`, `None` when there is none (or
+    /// it cannot be read). Default `None` (a provider that keeps no record).
+    fn staging_record(&self, _bank: Bank) -> Result<Option<StagingRecord>, BankError> {
+        Ok(None)
+    }
+
+    /// Replace the staging record kept beside `bank`; `None` removes it.
+    /// Durable on `Ok`. Default no-op (a provider that keeps no record).
+    fn write_staging_record(
+        &self,
+        _bank: Bank,
+        _record: Option<&StagingRecord>,
+    ) -> Result<(), BankError> {
+        Ok(())
     }
 }

@@ -81,7 +81,7 @@ mod tests;
 pub use bank_activator::{BankActivator, BankActivatorError};
 pub use bank_provider::{
     BankContents, BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFile,
-    InstalledFirmware, DISABLED_RECORD_PATH,
+    InstalledFirmware, StagedPart, StagingRecord, DISABLED_RECORD_PATH,
 };
 pub use component::Component;
 pub use deactivator::{DeactivateError, DeactivateOutcome, Deactivator};

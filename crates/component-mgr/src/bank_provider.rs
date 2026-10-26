@@ -30,7 +30,7 @@ use nv_store::types::{Bank, BankSet};
 
 use machine_mgr::bank_provider::{
     BankContents, BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFile,
-    InstalledFirmware,
+    InstalledFirmware, StagingRecord,
 };
 use machine_mgr::{ImageEntry, ResetKind};
 
@@ -266,6 +266,89 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
                 }
             }
         }
+    }
+
+    /// The set dir under `images_dir` — the one holding `bank_a/` and
+    /// `bank_b/`. `None` when no images_dir is configured.
+    fn set_dir(&self) -> Option<PathBuf> {
+        self.images_dir
+            .as_ref()
+            .map(|images_dir| images_dir.join(&self.dir_name))
+    }
+
+    /// Where `bank`'s staging record lives: `<set>/staging-<bank>.cbor`,
+    /// beside the bank, never inside it — the IVD signer attests every file
+    /// in the bank dir.
+    fn staging_record_path(&self, bank: Bank) -> Option<PathBuf> {
+        self.set_dir()
+            .map(|set| set.join(format!("staging-{}.cbor", bank_dir_name(bank))))
+    }
+
+    /// The staging record for `bank`; an unreadable or undecodable record
+    /// reads as absent (with a warn) — the next manifest rebuilds it.
+    fn read_staging_record(&self, bank: Bank) -> Option<StagingRecord> {
+        let path = self.staging_record_path(bank)?;
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "staging record unreadable — treated as absent");
+                return None;
+            }
+        };
+        match ciborium::from_reader::<StagingRecord, _>(bytes.as_slice()) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "staging record undecodable — treated as absent");
+                None
+            }
+        }
+    }
+
+    /// Replace (`Some`) or remove (`None`) the staging record for `bank`:
+    /// written to a temp file, renamed over the record, then the set dir
+    /// fsync'd, so a power cut leaves the old record or the new one.
+    fn store_staging_record(
+        &self,
+        bank: Bank,
+        record: Option<&StagingRecord>,
+    ) -> Result<(), BankError> {
+        let Some(path) = self.staging_record_path(bank) else {
+            return Ok(());
+        };
+        let dir = path
+            .parent()
+            .expect("record path has a parent")
+            .to_path_buf();
+        match record {
+            Some(record) => {
+                use std::io::Write;
+                let mut bytes = Vec::new();
+                ciborium::into_writer(record, &mut bytes)
+                    .map_err(|e| BankError::Failed(format!("encode staging record: {e}")))?;
+                std::fs::create_dir_all(&dir)?;
+                let tmp = path.with_extension("cbor.tmp");
+                let written = std::fs::File::create(&tmp)
+                    .and_then(|mut f| {
+                        f.write_all(&bytes)?;
+                        f.sync_all()
+                    })
+                    .and_then(|()| std::fs::rename(&tmp, &path));
+                if let Err(e) = written {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+            }
+            None => match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e.into()),
+            },
+        }
+        if let Err(e) = std::fs::File::open(&dir).and_then(|d| d.sync_all()) {
+            tracing::debug!(dir = %dir.display(), error = %e, "staging record dir fsync skipped");
+        }
+        Ok(())
     }
 
     /// Path of the target bank directory under `images_dir`. `None` when no
@@ -1037,6 +1120,18 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
     fn banks(&self) -> Option<ComponentBanks> {
         self.banks_for(self.reset_kind())
     }
+
+    fn staging_record(&self, bank: Bank) -> Result<Option<StagingRecord>, BankError> {
+        Ok(self.read_staging_record(bank))
+    }
+
+    fn write_staging_record(
+        &self,
+        bank: Bank,
+        record: Option<&StagingRecord>,
+    ) -> Result<(), BankError> {
+        self.store_staging_record(bank, record)
+    }
 }
 
 /// On-disk dir name for a bank (`bank_a` / `bank_b`).
@@ -1779,5 +1874,55 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&images_dir);
+    }
+
+    fn sample_record(update_id: Option<&str>) -> StagingRecord {
+        StagingRecord {
+            version: StagingRecord::VERSION,
+            update_id: update_id.map(str::to_owned),
+            node_boot_id: Some("boot-a".into()),
+            started_unix: 1_700_000_000,
+            parts: vec![machine_mgr::bank_provider::StagedPart {
+                name: "rootfs.img".into(),
+                size: 4,
+                sha256: "00".repeat(32),
+            }],
+        }
+    }
+
+    /// The record round-trips beside the bank (never inside it), `None`
+    /// removes it, and a corrupt file reads as absent.
+    #[test]
+    fn staging_record_round_trips_beside_the_bank() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = disk_provider_no_hsm(tmp.path().to_path_buf());
+        assert_eq!(p.staging_record(Bank::B).unwrap(), None);
+
+        let rec = sample_record(Some("upd-1"));
+        p.write_staging_record(Bank::B, Some(&rec)).unwrap();
+        assert_eq!(p.staging_record(Bank::B).unwrap(), Some(rec));
+        let path = tmp.path().join("vm1").join("staging-bank_b.cbor");
+        assert!(
+            path.is_file(),
+            "the record lives at <set>/staging-<bank>.cbor"
+        );
+        assert!(
+            !tmp.path().join("vm1").join("bank_b").exists(),
+            "nothing lands in the bank"
+        );
+        assert_eq!(p.staging_record(Bank::A).unwrap(), None, "per bank");
+
+        p.write_staging_record(Bank::B, None).unwrap();
+        assert!(!path.exists());
+        assert_eq!(p.staging_record(Bank::B).unwrap(), None);
+        // Removing an absent record is not an error.
+        p.write_staging_record(Bank::B, None).unwrap();
+
+        std::fs::write(&path, b"not cbor at all").unwrap();
+        assert_eq!(
+            p.staging_record(Bank::B).unwrap(),
+            None,
+            "corrupt reads as absent"
+        );
     }
 }
