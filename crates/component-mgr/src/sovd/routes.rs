@@ -1547,6 +1547,138 @@ mod tests {
         assert_eq!(component.max_verdicts_in_flight.load(Ordering::SeqCst), 1);
     }
 
+    const X_UPDATE_COMMIT_URI: &str = "/vehicle/v1/operations/x-update-commit/executions";
+    const X_UPDATE_ROLLBACK_URI: &str = "/vehicle/v1/operations/x-update-rollback/executions";
+
+    #[tokio::test]
+    async fn x_update_commit_matches_commit_trials() {
+        let ota_stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let ota = body_json(
+            node_verdict_router(machine_with(std::slice::from_ref(&ota_stub)))
+                .oneshot(post(COMMIT_URI, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let resp = node_verdict_router(machine_with(std::slice::from_ref(&stub)))
+            .oneshot(post(X_UPDATE_COMMIT_URI, None))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(stub.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.rollbacks.load(Ordering::SeqCst), 0);
+        let body = body_json(resp).await;
+        assert_eq!(body["operation_id"], "x-update-commit");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["result"], ota["result"]);
+        assert_eq!(body["result"]["committed"], serde_json::json!(["vm1"]));
+    }
+
+    #[tokio::test]
+    async fn x_update_rollback_reports_rolled_back_key() {
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
+
+        let resp = router
+            .oneshot(post(X_UPDATE_ROLLBACK_URI, None))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(stub.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.commits.load(Ordering::SeqCst), 0);
+        let body = body_json(resp).await;
+        assert_eq!(body["operation_id"], "x-update-rollback");
+        assert_eq!(body["result"]["rolled_back"], serde_json::json!(["vm1"]));
+        assert!(body["result"].get("committed").is_none());
+    }
+
+    #[tokio::test]
+    async fn x_update_commit_and_rollback_accept_no_body_and_echo_a_nonce() {
+        for (uri, op) in [
+            (X_UPDATE_COMMIT_URI, "x-update-commit"),
+            (X_UPDATE_ROLLBACK_URI, "x-update-rollback"),
+        ] {
+            let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
+            let router = node_verdict_router(machine_with(&[stub]));
+
+            let resp = router.clone().oneshot(post(uri, None)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{op}");
+            let without = body_json(resp).await;
+            assert!(without.get("nonce").is_none(), "{op}");
+
+            let resp = router
+                .oneshot(post_json(uri, serde_json::json!({"nonce": "n1"})))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{op}");
+            let with_nonce = body_json(resp).await;
+            assert_eq!(with_nonce["nonce"], "n1", "{op}");
+
+            assert_ne!(with_nonce["execution_id"], without["execution_id"], "{op}");
+            assert_ne!(with_nonce["execution_id"], op);
+            assert_ne!(without["execution_id"], op);
+        }
+    }
+
+    #[tokio::test]
+    async fn x_update_commit_busy_failure_returns_409() {
+        let refusing = Arc::new(VerdictStub::refusing_commit("vm1"));
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&refusing)));
+
+        let resp = router
+            .oneshot(post(X_UPDATE_COMMIT_URI, None))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(refusing.commits.load(Ordering::SeqCst), 0);
+        assert!(body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("boot witness missing"));
+    }
+
+    #[tokio::test]
+    async fn x_update_verb_operations_share_the_lock_with_the_alias_and_x_ota_trials() {
+        let component = Arc::new(VerdictStub::slow("vm1"));
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&component)));
+
+        let (verb, alias, ota) = tokio::join!(
+            router.clone().oneshot(post(X_UPDATE_COMMIT_URI, None)),
+            router.clone().oneshot(post_json(
+                VERDICT_URI,
+                serde_json::json!({"verdict": "rollback"})
+            )),
+            router.oneshot(post(ROLLBACK_URI, None))
+        );
+
+        assert!(verb.unwrap().status().is_success());
+        assert!(alias.unwrap().status().is_success());
+        assert!(ota.unwrap().status().is_success());
+        assert_eq!(component.max_verdicts_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn x_update_verdict_alias_still_served() {
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let router = node_verdict_router(machine_with(&[stub]));
+
+        let resp = router
+            .oneshot(post_json(
+                VERDICT_URI,
+                serde_json::json!({"verdict": "commit"}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["operation_id"], "x-update-verdict");
+    }
+
     async fn get_json(router: &Router, uri: &str) -> serde_json::Value {
         let resp = router
             .clone()

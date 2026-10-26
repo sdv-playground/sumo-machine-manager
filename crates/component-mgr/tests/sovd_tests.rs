@@ -1412,6 +1412,50 @@ async fn x_update_verdict_resolves_both_components_after_one_coalesced_reboot() 
     }
 }
 
+#[tokio::test]
+async fn x_update_commit_resolves_both_components_after_one_coalesced_reboot() {
+    // Same banked step as the alias test above, driven through the verb
+    // operation with no request body.
+    let (router, nv, keys) = make_node_router();
+
+    flash_to_awaiting_verdict(
+        &router,
+        "vm1",
+        make_test_suit_envelope(&keys, "vm1", 2, &vec![0xBB; 2048]),
+    )
+    .await;
+    flash_to_awaiting_verdict(
+        &router,
+        "vm2",
+        make_test_suit_envelope(&keys, "vm2", 2, &vec![0xCC; 2048]),
+    )
+    .await;
+
+    for component in ["vm1", "vm2"] {
+        activation_reset(&router, component).await;
+    }
+
+    let (status, body) = post_json(
+        &router,
+        "/vehicle/v1/operations/x-update-commit/executions",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "x-update-commit: {body}");
+    assert_eq!(body["operation_id"], "x-update-commit");
+    let committed = body["result"]["committed"].as_array().unwrap();
+    assert!(
+        committed.contains(&serde_json::json!("vm1"))
+            && committed.contains(&serde_json::json!("vm2")),
+        "one node commit must resolve the whole step: {body}"
+    );
+
+    for set in [slots::VM1, slots::VM2] {
+        let bank = bank_state(&nv, set);
+        assert!(bank.committed, "{set:?} committed in NV: {bank:?}");
+    }
+}
+
 // --- x-update-state `banks` member ---
 
 /// Write `files` (name, bytes) into `images/<id>/<bank_x>` and sign an IVD
