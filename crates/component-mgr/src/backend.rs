@@ -9324,6 +9324,8 @@ mod bank_provider_injection_tests {
                     bank: Bank::B,
                     images: Default::default(),
                     install_boot_id: None,
+                    update_id: None,
+                    sealed: false,
                 },
                 inactive: None,
                 in_trial,

@@ -177,7 +177,10 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         let inactive = if self.single_bank {
             None
         } else {
-            Some(self.read_bank(active.bank.other())).filter(|c| !c.images.is_empty())
+            let other = active.bank.other();
+            Some(self.read_bank(other))
+                .filter(|c| !c.images.is_empty())
+                .or_else(|| self.staged_bank(other))
         };
         // With a boot vector attached, trial is structural: this component's
         // booted entry differs from its committed floor. Without one, the NV
@@ -251,6 +254,8 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
                     })
                     .collect(),
                 install_boot_id: vm.manifest.install_boot_id,
+                update_id: vm.manifest.update_id,
+                sealed: true,
             },
             Err(e) => {
                 tracing::debug!(
@@ -263,9 +268,39 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
                     bank,
                     images: BTreeMap::new(),
                     install_boot_id: None,
+                    update_id: None,
+                    sealed: false,
                 }
             }
         }
+    }
+
+    /// What `bank`'s staging record says it holds toward an update not yet
+    /// sealed: each verified part, and the update id when known. `None`
+    /// without a record.
+    fn staged_bank(&self, bank: Bank) -> Option<BankContents> {
+        let record = self.read_staging_record(bank)?;
+        let images = record
+            .parts
+            .iter()
+            .filter_map(|p| {
+                let sha256 = <[u8; 32]>::try_from(hex::decode(&p.sha256).ok()?).ok()?;
+                Some((
+                    p.name.clone(),
+                    ImageEntry {
+                        size: p.size,
+                        sha256,
+                    },
+                ))
+            })
+            .collect();
+        Some(BankContents {
+            bank,
+            images,
+            install_boot_id: None,
+            update_id: record.update_id,
+            sealed: false,
+        })
     }
 
     /// The set dir under `images_dir` — the one holding `bank_a/` and
@@ -446,6 +481,12 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
                 tracing::warn!(dir = %dir.display(), error = %e, "staging leftovers not removed")
             }
         }
+    }
+
+    /// The update id `bank`'s staging record names — what its seal carries
+    /// into the signed manifest.
+    pub(crate) fn staged_update_id(&self, bank: Bank) -> Option<String> {
+        self.read_staging_record(bank).and_then(|r| r.update_id)
     }
 
     /// The bank is sealed: its staging record and staging leftovers are no
@@ -929,6 +970,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             gen,
             identity,
             self.node_boot_id.as_deref(),
+            self.staged_update_id(bank).as_deref(),
         )
         .map_err(|e| BankError::Failed(format!("ivd sign {bank_id}: {e}")))?;
         tracing::info!(

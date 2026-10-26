@@ -482,6 +482,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
             files,
             None,
             self.inner.node_boot_id(),
+            self.inner.staged_update_id(bank).as_deref(),
         )
         .map_err(|e| BankError::Failed(format!("partition bank seal: ivd sign: {e}")))?;
         tracing::info!(metadata_dir = %metadata_dir.display(), gen, "partition bank sealed (IVD signed over partition hash)");

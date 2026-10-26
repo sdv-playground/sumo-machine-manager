@@ -83,7 +83,9 @@ impl InstalledFirmware {
     }
 }
 
-/// What one bank holds, by part name, as its installed manifest records it.
+/// What one bank holds, by part name: as its installed manifest records it
+/// when the bank is sealed, else as its staging record does (the verified
+/// parts of an update still being staged).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BankContents {
     pub bank: Bank,
@@ -92,6 +94,13 @@ pub struct BankContents {
     /// records it. `None` when the manifest predates the field, the node had
     /// no boot id, or there is no readable manifest.
     pub install_boot_id: Option<String>,
+    /// The client's update the bank holds, when the executor was told it: as
+    /// the installed manifest records it for a sealed bank, as the staging
+    /// record does for an unsealed one.
+    pub update_id: Option<String>,
+    /// Whether `images` comes from a sealed (signed) manifest. `false` for
+    /// the parts of an update still being staged.
+    pub sealed: bool,
 }
 
 /// What an unsealed bank holds toward an update, kept beside the bank so a
@@ -135,7 +144,7 @@ pub struct ComponentBanks {
     /// readable manifest).
     pub active: BankContents,
     /// The other bank, `None` for a single-bank component or when the other
-    /// bank has no readable manifest.
+    /// bank has neither a readable manifest nor a staging record.
     pub inactive: Option<BankContents>,
     /// Whether the component runs a not-yet-committed install.
     pub in_trial: bool,
