@@ -91,6 +91,20 @@ contents, `{id, active, inactive, in_trial, pending_reset}`. `active` is the ban
 the other bank has neither an installed manifest nor a staging record. Each bank carries
 `sealed` (`false` for an unsealed inactive bank, which reports the verified parts of an update
 still being staged) and, when the executor was told it, the client's `update_id`.
+
+A client that names its parts (`PUT …/bulk-data/{part_id}`, SOVDd's `receive_package_part`)
+has them taken by name: the part id is a manifest component's payload `uri` (`#kernel`), its
+on-medium name, or that name behind a `#`. A part the bank already holds is accepted with
+nothing written; an absent part streams under its declared digest and is refused on a
+mismatch, on file banks and raw-partition banks alike, so parts arrive in any order. An id
+that names no part keeps the unnamed intake.
+
+The updates a component holds (SOVDd's `held_updates`) come from its facts: the staging record
+the target bank keeps, named by the client's registration id, is `PREPARING` while parts arrive
+and `PREPARED` once sealed (the seal marks the record; activating the bank removes it); the
+armed bank's sealed `update_id` is `EXECUTING` while its node reset is pending and `EXECUTED`
+during the trial. Parts are reported by on-medium name. A committed or rolled-back component,
+and a record an abort stripped of its id, hold nothing.
 `in_trial` is true while the component runs a not-yet-committed install: with a boot vector, its booted entry differs from its committed
 entry; without one, its bank set is not committed. The images come from the installed
 manifests as recorded at install time, read without signature check or payload hashing; this
