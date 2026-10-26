@@ -8,6 +8,10 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+## v0.1.18 — the seed anchors only its own baseline; the vector rolls back before NV
+
+Tag on `048820d` (2026-10-26), PR #26.
+
 A vector with no committed copy is anchored only when it is the seed's own baseline, and a rollback
 verdict rolls the boot vector back before NV, so neither path can settle or split a standing trial.
 
