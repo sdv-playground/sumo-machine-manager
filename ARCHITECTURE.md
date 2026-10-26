@@ -606,6 +606,8 @@ unchanged because the key is optional, and a manifest sealed before it existed r
 unknown. `banks` reports it per bank and derives `pending_reset` from it: a component that
 needs a node reset, whose active bank was sealed in the boot still running, still waits for
 that reset.
+An unsealed inactive bank reports the verified parts its staging record names, with
+`sealed: false`; each bank's `update_id` names the client's update when the executor was told it.
 
 ### Node update transaction
 

@@ -415,6 +415,8 @@ mod tests {
                 bank: Bank::A,
                 images: Default::default(),
                 install_boot_id: None,
+                update_id: None,
+                sealed: false,
             },
             inactive: None,
             in_trial,

@@ -88,8 +88,10 @@ contents, `{id, active, inactive, in_trial, pending_reset}`. `active` is the ban
 (the boot vector's selection when one is attached) with its `images` (part name →
 `{size, sha256}`, sha256 lowercase hex; empty when the bank has no readable manifest).
 `inactive` is the other bank in the same shape, `null` for a single-bank component or when
-the other bank has no installed manifest. `in_trial` is true while the component runs a
-not-yet-committed install: with a boot vector, its booted entry differs from its committed
+the other bank has neither an installed manifest nor a staging record. Each bank carries
+`sealed` (`false` for an unsealed inactive bank, which reports the verified parts of an update
+still being staged) and, when the executor was told it, the client's `update_id`.
+`in_trial` is true while the component runs a not-yet-committed install: with a boot vector, its booted entry differs from its committed
 entry; without one, its bank set is not committed. The images come from the installed
 manifests as recorded at install time, read without signature check or payload hashing; this
 is a report, not a verification. Intended use: after any reboot the orchestrator compares

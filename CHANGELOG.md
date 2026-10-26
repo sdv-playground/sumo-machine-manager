@@ -8,6 +8,8 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- deps: SOVDd v0.1.2 (x-update contract: explicit verbs, client-owned ids; backend hooks
+  `note_update_id`, `receive_package_part`, `held_updates`, not yet implemented here).
 - x-update: node verdict as `x-update-commit` / `x-update-rollback` operations (body: optional
   `nonce`); `x-update-verdict` stays as an alias until the x-ota names retire; OpenAPI and discovery
   list all three; the per-update path carriers follow SOVDd's `x-update-commit` /
@@ -15,9 +17,50 @@ what a consumer has to touch when it moves its pin.
 - deps: SOVDd v0.1.2 (x-update contract: explicit verbs, client-owned ids; backend hooks
   `note_update_id`, `receive_package_part`, `held_updates`, not yet implemented here).
 
-Host-facing: hosts inherit the routes through `node_verdict_router`; no host change beyond the pin.
-SOVDd v0.1.2 refuses a registration without `id` (400): every client that registers an update sends
-one (the sumo-sovd engine already does).
+A half-staged update survives a restart and a reboot as facts the node can prove: the inactive
+bank's verified parts are kept and reported with their digests, a staging record beside the bank
+names the update and the parts present, and the sealed bank carries the update id. The boot vector
+still seals only from a complete manifest.
+
+- Staging record: `machine-contract` gains `StagingRecord` (`version`, `update_id`,
+  `node_boot_id`, `started_unix`, `parts`) and `StagedPart` (`name`, `size`, `sha256` hex), with
+  `BankProvider::staging_record` / `write_staging_record` (defaulted: no record). Every part is
+  noted in it before its upload is acknowledged; a seal removes it. An unreadable record reads as
+  absent.
+- Keep by digest, no wipe at start: `start_flash` no longer clears the target bank. At the manifest,
+  each part the record names is kept when it is the on-medium part of a manifest component, its
+  recorded digest is that component's `image_digest`, and the bytes still hash to it;
+  `BankProvider::prune_target(bank, keep)` (defaulted to `prepare_target`) removes the rest and
+  torn staging leftovers. The session tracks the components present; finalize reconciles exactly
+  the absent ones. When the kept parts are every part, the bank seals at the manifest.
+- An abort (DELETE) keeps the parts and the record and clears the record's `update_id`: a record
+  without one is a part cache, not a held update.
+- Content-addressed intake on file banks: a payload stages through
+  `BankProvider::open_staging_writer`, its inner digest names the first absent component it is,
+  and `commit_staged` renames it into the bank as that part, so parts arrive in any order. A
+  payload matching no component is discarded and refused; one matching a present part is accepted
+  and discarded. A provider that answers the new `BankError::Unsupported` keeps the sequential
+  intake. Encrypted payloads still decrypt with the next absent component's context.
+- IVD manifest key 7, `update_id` (optional, `IVD_MANIFEST_VERSION` unchanged; a manifest without
+  it encodes byte-identically). `sign_bank_crypto_at` / `sign_bank_with_files_crypto_at` take
+  `update_id: Option<&str>`; both sealers pass the staging record's id.
+- `banks[]`: each bank carries `sealed` and, when known, `update_id` (`BankContents` gains both).
+  An inactive bank with no manifest but a staging record reports the record's parts with
+  `sealed: false` instead of `null`.
+
+Host-facing:
+
+- Verdict operations: hosts inherit the routes through `node_verdict_router`; no host change beyond the pin.
+- SOVDd v0.1.2 refuses a registration without `id` (400): every client that registers an update sends
+  one (the sumo-sovd engine already does).
+- File-bank hosts gain `<set>/staging-<bank>.cbor` and `<set>/staging/<bank>/` beside the bank
+  dirs; a payload is renamed from the latter into the bank, so both must sit on the bank's
+  filesystem.
+- Partition-bank hosts gain the record beside the metadata dir; intake order is unchanged until the
+  addressed-part hook lands.
+- Out-of-tree code that builds `BankContents` adds `update_id` and `sealed`; an exhaustive match on
+  `BankError` adds `Unsupported`. Direct callers of the two `_at` signers add the `update_id`
+  argument.
 
 ## v0.1.18 — the seed anchors only its own baseline; the vector rolls back before NV
 
