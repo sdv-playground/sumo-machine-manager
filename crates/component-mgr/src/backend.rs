@@ -235,6 +235,22 @@ fn absent_parts(parts: &[usize], present: &BTreeSet<usize>) -> Vec<usize> {
         .collect()
 }
 
+/// The component of `parts` the client's `part_id` names: its payload `uri`
+/// (`#kernel`), its on-medium name (`kernel`), or that name behind a `#`.
+/// `None` when the id names no part of the manifest.
+fn resolve_part(
+    manifest: &sumo_onboard::manifest::Manifest,
+    parts: &[usize],
+    part_id: &str,
+) -> Option<usize> {
+    let bare = part_id.strip_prefix('#').unwrap_or(part_id);
+    parts.iter().copied().find(|&i| {
+        manifest.uri(i) == Some(part_id)
+            || crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))
+                .is_ok_and(|n| n == bare)
+    })
+}
+
 /// Where an uploaded file_id was placed, so `verify_part` can re-confirm
 /// the part's integrity post-upload.
 ///
@@ -2887,19 +2903,26 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Handle payload upload (subsequent files in flash session).
     /// Streams directly through decrypt → decompress → verify → write to bank.
     ///
-    /// A provider that can stage bytes before their part is known (a file
-    /// bank) takes the payload by CONTENT: the stream lands in a staging file,
-    /// its inner digest names the manifest component it is, and only then is
-    /// it renamed into the bank as that component's part — so parts arrive in
-    /// any order. A provider that cannot (fixed devices) takes them in
-    /// manifest order, each streamed straight to its part.
+    /// A part the client names (`addressed`, a component index resolved by
+    /// [`resolve_part`]) is taken as that component: one the bank already
+    /// holds is accepted without a byte written; an absent one streams under
+    /// its declared digest — through a staging file renamed into the bank on
+    /// a provider that stages (a file bank), straight to its part on one that
+    /// cannot (fixed devices). Either way, parts arrive in any order.
+    ///
+    /// An unnamed part keeps the older intake: a provider that can stage bytes
+    /// before their part is known takes the payload by CONTENT — the stream
+    /// lands in a staging file, its inner digest names the manifest component
+    /// it is, and only then is it renamed into the bank as that component's
+    /// part. A provider that cannot takes them in manifest order, each
+    /// streamed straight to its part.
     async fn handle_payload_upload(
         &self,
         stream: PackageStream,
-        _content_length: Option<u64>,
+        addressed: Option<usize>,
     ) -> BackendResult<String> {
         // Extract session state
-        let (manifest_bytes, absent, total) = {
+        let (manifest_bytes, parts, present) = {
             let session = self.flash_session.lock().unwrap();
             match session.as_ref() {
                 Some(FlashSessionState::AwaitingPayload {
@@ -2907,11 +2930,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     parts,
                     present,
                     ..
-                }) => (
-                    manifest_bytes.clone(),
-                    absent_parts(parts, present),
-                    parts.len(),
-                ),
+                }) => (manifest_bytes.clone(), parts.clone(), present.clone()),
                 _ => {
                     return Err(BackendError::InvalidRequest(
                         "no active flash session".into(),
@@ -2919,13 +2938,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 }
             }
         };
-        // The next part in manifest order: what a sequential intake expects,
-        // and whose decryption context a content-addressed intake uses.
-        let Some(&next) = absent.first() else {
-            return Err(BackendError::InvalidRequest(
-                "every part of the manifest is already staged".into(),
-            ));
-        };
+        let absent = absent_parts(&parts, &present);
+        let total = parts.len();
 
         let key_unwrap = self.manifest_provider.key_unwrap_for_decryption();
 
@@ -2942,6 +2956,42 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
         let target_bank = self.determine_target_bank()?;
 
+        // A part the bank already holds, sent again: accepted as it stands,
+        // nothing written.
+        let already_staged = |i: usize, image_hash: [u8; 32]| -> BackendResult<String> {
+            let name = crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))?;
+            tracing::info!(component = i, part = %name, "payload is a part already staged — accepted, discarded");
+            let id = self.next_id();
+            self.uploaded_parts.lock().unwrap().insert(
+                id.clone(),
+                UploadedPartLocation::OnDisk {
+                    bank: target_bank,
+                    name,
+                    inner_sha256: image_hash,
+                },
+            );
+            Ok(id)
+        };
+        if let Some(i) = addressed.filter(|i| present.contains(i)) {
+            use futures::StreamExt;
+            let mut stream = stream;
+            while let Some(chunk) = stream.next().await {
+                chunk.map_err(|e| BackendError::Internal(format!("stream: {e}")))?;
+            }
+            let digest = <[u8; 32]>::try_from(digest_of(i)?.as_slice())
+                .map_err(|_| BackendError::Internal(format!("digest of component {i}")))?;
+            return already_staged(i, digest);
+        }
+
+        // The part this upload streams as: the one named, else the next in
+        // manifest order — what a sequential intake expects, and whose
+        // decryption context a content-addressed intake uses.
+        let Some(next) = addressed.or_else(|| absent.first().copied()) else {
+            return Err(BackendError::InvalidRequest(
+                "every part of the manifest is already staged".into(),
+            ));
+        };
+
         // Stream straight through: network → decrypt → decompress →
         // hash → sink. No on-disk ciphertext scratch — flash I/O
         // is the dominant cost on the device and writing the payload
@@ -2953,16 +3003,21 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         {
             Ok((writer, handle)) => {
                 tracing::info!(
-                    "processing payload ({} of {} parts still owed) — matched by content",
+                    "processing payload ({} of {} parts still owed) — {}",
                     absent.len(),
                     total,
+                    if addressed.is_some() {
+                        "addressed by name"
+                    } else {
+                        "matched by content"
+                    },
                 );
                 let processed = crate::streaming::process_payload_stream(
                     stream,
                     manifest_bytes.clone(),
                     next,
                     key_unwrap.clone(),
-                    None,
+                    addressed.map(digest_of).transpose()?,
                     writer,
                 )
                 .await;
@@ -2978,33 +3033,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                         .image_digest(*i)
                         .is_some_and(|d| d.0.bytes.as_slice() == image_hash.as_slice())
                 };
-                let Some(comp_idx) = absent.iter().copied().find(matches) else {
+                let found = addressed.or_else(|| absent.iter().copied().find(matches));
+                let Some(comp_idx) = found else {
                     let _ = self.bank_provider.discard_staged(target_bank, handle);
-                    let already = {
-                        let session = self.flash_session.lock().unwrap();
-                        match session.as_ref() {
-                            Some(FlashSessionState::AwaitingPayload { parts, .. }) => {
-                                parts.iter().copied().find(matches)
-                            }
-                            _ => None,
-                        }
-                    };
-                    // A part the bank already holds, sent again: accepted
-                    // as it stands, nothing written.
-                    if let Some(i) = already {
-                        let name =
-                            crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))?;
-                        tracing::info!(component = i, part = %name, "payload is a part already staged — accepted, discarded");
-                        let id = self.next_id();
-                        self.uploaded_parts.lock().unwrap().insert(
-                            id.clone(),
-                            UploadedPartLocation::OnDisk {
-                                bank: target_bank,
-                                name,
-                                inner_sha256: image_hash,
-                            },
-                        );
-                        return Ok(id);
+                    if let Some(i) = parts.iter().copied().find(matches) {
+                        return already_staged(i, image_hash);
                     }
                     return Err(BackendError::Internal(
                         "payload matches no component of the manifest".into(),
@@ -4665,7 +4698,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 return self.handle_manifest_upload(stream, content_length).await;
             }
             Some("payload") => {
-                return self.handle_payload_upload(stream, content_length).await;
+                return self.handle_payload_upload(stream, None).await;
             }
             _ => {
                 // No active flash session — legacy integrated envelope path
@@ -4775,6 +4808,47 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         );
 
         Ok(id)
+    }
+
+    /// A part the client names. While payloads are owed, a name that
+    /// resolves to a part of the manifest ([`resolve_part`]) is taken as that
+    /// part, in any order; one that resolves to nothing keeps the unnamed
+    /// intake. Anything else — the manifest, a legacy envelope — is
+    /// [`receive_package_stream`](Self::receive_package_stream).
+    async fn receive_package_part(
+        &self,
+        part_id: &str,
+        stream: PackageStream,
+        content_length: Option<u64>,
+    ) -> BackendResult<String> {
+        let addressed = {
+            let session = self.flash_session.lock().unwrap();
+            match session.as_ref() {
+                Some(FlashSessionState::AwaitingPayload {
+                    manifest_bytes,
+                    parts,
+                    ..
+                }) if part_id != "manifest" => {
+                    let envelope = sumo_codec::decode::decode_envelope(manifest_bytes)
+                        .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
+                    Some(resolve_part(
+                        &sumo_onboard::manifest::Manifest { envelope },
+                        parts,
+                        part_id,
+                    ))
+                }
+                _ => None,
+            }
+        };
+        match addressed {
+            Some(addressed) => {
+                if addressed.is_none() {
+                    tracing::info!(part = %part_id, "part id names no part of the manifest — unnamed intake");
+                }
+                self.handle_payload_upload(stream, addressed).await
+            }
+            None => self.receive_package_stream(stream, content_length).await,
+        }
     }
 
     async fn list_packages(&self) -> BackendResult<Vec<PackageInfo>> {
