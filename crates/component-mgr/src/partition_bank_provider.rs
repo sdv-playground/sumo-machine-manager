@@ -230,6 +230,12 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         // overwritten by the stream. Reuses the inner's dir prep.
         self.inner.prepare_target(bank)
     }
+    fn prune_target(&self, bank: Bank, _keep: &[String]) -> Result<(), BankError> {
+        // The parts are devices, not files in the metadata dir: nothing there
+        // to keep. Clearing it still unseals the bank — its old IVD pair would
+        // otherwise vouch for partitions this install is about to overwrite.
+        self.inner.prepare_target(bank)
+    }
     fn read_installed(&self, bank: Bank) -> Result<InstalledFirmware, BankError> {
         // The IVD manifest+sig live in the metadata dir exactly as for a file
         // bank, so the inner's report-only read works unchanged.
@@ -479,6 +485,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         )
         .map_err(|e| BankError::Failed(format!("partition bank seal: ivd sign: {e}")))?;
         tracing::info!(metadata_dir = %metadata_dir.display(), gen, "partition bank sealed (IVD signed over partition hash)");
+        self.inner.clear_staging(bank);
         Ok(())
     }
 

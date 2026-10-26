@@ -30,7 +30,7 @@ use nv_store::types::{Bank, BankSet};
 
 use machine_mgr::bank_provider::{
     BankContents, BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFile,
-    InstalledFirmware, StagingRecord,
+    InstalledFirmware, StagingHandle, StagingRecord,
 };
 use machine_mgr::{ImageEntry, ResetKind};
 
@@ -423,9 +423,48 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     /// couple of call sites use directly, separately from the bundled
     /// `prepare_target`) can reach it.
     pub fn prepare_target_bank_dir(&self, target: Bank) -> Result<(), BankError> {
+        self.prune_bank_dir(target, &[])
+    }
+
+    /// Where payloads stage for `bank` before their part is known:
+    /// `<set>/staging/<bank>/`, beside the bank so a commit is a rename.
+    fn staging_dir(&self, bank: Bank) -> Option<PathBuf> {
+        self.set_dir()
+            .map(|set| set.join("staging").join(bank_dir_name(bank)))
+    }
+
+    /// Remove `bank`'s staging dir — torn uploads a crash left behind, or
+    /// leftovers once the bank is sealed. Best-effort.
+    fn clear_staging_dir(&self, bank: Bank) {
+        let Some(dir) = self.staging_dir(bank) else {
+            return;
+        };
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!(dir = %dir.display(), "staging leftovers removed"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "staging leftovers not removed")
+            }
+        }
+    }
+
+    /// The bank is sealed: its staging record and staging leftovers are no
+    /// longer facts about it. Best-effort — a record left behind names parts
+    /// the next manifest re-verifies anyway.
+    pub(crate) fn clear_staging(&self, bank: Bank) {
+        if let Err(e) = self.store_staging_record(bank, None) {
+            tracing::warn!(bank = ?bank, error = %e, "staging record not removed after seal");
+        }
+        self.clear_staging_dir(bank);
+    }
+
+    /// [`prepare_target_bank_dir`](Self::prepare_target_bank_dir) that keeps
+    /// the regular files named in `keep`, and removes torn staging leftovers.
+    fn prune_bank_dir(&self, target: Bank, keep: &[String]) -> Result<(), BankError> {
         let Some(images_dir) = self.images_dir.as_ref() else {
             return Ok(());
         };
+        self.clear_staging_dir(target);
         let set_name = &self.dir_name;
         let bank_dir = images_dir.join(set_name).join(bank_dir_name(target));
         std::fs::create_dir_all(&bank_dir).map_err(|e| {
@@ -436,8 +475,18 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
-                    // Single bank: the target IS the live bank, wiped here at
-                    // flash START. Keep its IVD pair — it may be the disable
+                    // A part the staging record proves (re-verified by the
+                    // engine): kept, so the update resumes instead of
+                    // re-sending it.
+                    if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| keep.iter().any(|k| k == n))
+                    {
+                        continue;
+                    }
+                    // Single bank: the target IS the live bank, cleared here when
+                    // the manifest arrives. Keep its IVD pair — it may be the disable
                     // sentinel, which must survive a flash that aborts before
                     // `seal` (a seal that signs rewrites both files anyway).
                     if self.single_bank
@@ -458,6 +507,7 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         tracing::info!(
             target = %bank_dir.display(),
             cleared,
+            kept = keep.len(),
             "prepared target bank dir for {set_name}"
         );
 
@@ -709,6 +759,69 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         self.prepare_target_bank_dir(bank)
     }
 
+    fn prune_target(&self, bank: Bank, keep: &[String]) -> Result<(), BankError> {
+        self.prune_bank_dir(bank, keep)
+    }
+
+    fn open_staging_writer(
+        &self,
+        bank: Bank,
+    ) -> Result<(Box<dyn std::io::Write + Send>, StagingHandle), BankError> {
+        let dir = self
+            .staging_dir(bank)
+            .ok_or_else(|| BankError::Failed("no images_dir configured".into()))?;
+        std::fs::create_dir_all(&dir)?;
+        let name = format!("upload-{}.part", uuid::Uuid::new_v4());
+        let file = std::fs::File::create(dir.join(&name))?;
+        // Same 4 MiB buffer as `open_payload_writer`.
+        const WRITE_BUF: usize = 4 * 1024 * 1024;
+        Ok((
+            Box::new(BufWriter::with_capacity(WRITE_BUF, file)),
+            StagingHandle(name),
+        ))
+    }
+
+    fn commit_staged(
+        &self,
+        bank: Bank,
+        handle: StagingHandle,
+        name: &str,
+    ) -> Result<(), BankError> {
+        let staged = self
+            .staging_dir(bank)
+            .ok_or_else(|| BankError::Failed("no images_dir configured".into()))?
+            .join(&handle.0);
+        let bank_dir = self
+            .target_bank_dir(bank)
+            .ok_or_else(|| BankError::Failed("no images_dir configured".into()))?;
+        let dest = bank_dir.join(name);
+        let dest_dir = dest.parent().unwrap_or(&bank_dir).to_path_buf();
+        std::fs::create_dir_all(&dest_dir)?;
+        // The rename replaces an older part of that name in one step.
+        std::fs::rename(&staged, &dest).map_err(|e| {
+            BankError::Failed(format!(
+                "commit staged {} as {}: {e}",
+                staged.display(),
+                dest.display()
+            ))
+        })?;
+        if let Err(e) = std::fs::File::open(&dest_dir).and_then(|d| d.sync_all()) {
+            tracing::debug!(dir = %dest_dir.display(), error = %e, "bank dir fsync skipped");
+        }
+        Ok(())
+    }
+
+    fn discard_staged(&self, bank: Bank, handle: StagingHandle) -> Result<(), BankError> {
+        let Some(dir) = self.staging_dir(bank) else {
+            return Ok(());
+        };
+        match std::fs::remove_file(dir.join(&handle.0)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn open_payload_writer(
         &self,
         bank: Bank,
@@ -824,6 +937,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             gen,
             "ivd sign OK",
         );
+        self.clear_staging(bank);
         Ok(())
     }
 

@@ -159,9 +159,18 @@ pub enum BankError {
     /// provider with a fixed part map (a raw-partition bank) refuses the name
     /// rather than staging the bytes somewhere nothing will ever read them.
     UnknownPart(String),
+    /// The provider does not offer this operation (e.g. staging bytes before
+    /// their part is known, on a medium whose parts are fixed devices).
+    Unsupported(String),
     /// Any other kind-specific failure.
     Failed(String),
 }
+
+/// The provider's token for bytes staged by
+/// [`BankProvider::open_staging_writer`] before their part is known; handed
+/// back to [`BankProvider::commit_staged`] or [`BankProvider::discard_staged`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingHandle(pub String);
 
 impl std::fmt::Display for BankError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -170,6 +179,7 @@ impl std::fmt::Display for BankError {
             BankError::NotInstalled => write!(f, "bank not installed"),
             BankError::Unverifiable(m) => write!(f, "bank firmware unverifiable: {m}"),
             BankError::UnknownPart(p) => write!(f, "part not declared for this bank: {p}"),
+            BankError::Unsupported(m) => write!(f, "bank operation not supported: {m}"),
             BankError::Failed(m) => write!(f, "bank operation failed: {m}"),
         }
     }
@@ -194,7 +204,9 @@ impl From<std::io::Error> for BankError {
 /// holds an `Arc<dyn BankProvider>` and routes every bank operation through it.
 ///
 /// Lifecycle the engine drives for an install:
-/// `prepare_target` → `open_payload_writer`* (one per part) → `seal` →
+/// `prune_target` (keep the parts the staging record proves) →
+/// `open_staging_writer` + `commit_staged`, or `open_payload_writer`, per part
+/// (each noted in the staging record) → `seal` (removes the record) →
 /// `activate` → (trial reboot) → `commit` | `rollback`.
 pub trait BankProvider: Send + Sync {
     /// The bank currently booted / active.
@@ -228,6 +240,49 @@ pub trait BankProvider: Send + Sync {
     /// Ready `bank` for a fresh install — clear it / reclaim space, seed
     /// unchanged files from the active bank if the medium supports partial OTA.
     fn prepare_target(&self, bank: Bank) -> Result<(), BankError>;
+
+    /// Ready `bank` for an install that keeps the parts named in `keep` (the
+    /// staging record's parts, each re-verified by the engine): remove
+    /// everything else the bank holds toward an install, and any torn staging
+    /// leftovers. Default [`Self::prepare_target`] (keeps nothing).
+    fn prune_target(&self, bank: Bank, keep: &[String]) -> Result<(), BankError> {
+        let _ = keep;
+        self.prepare_target(bank)
+    }
+
+    /// Open a sink for one payload whose part is not known yet: the engine
+    /// hashes the bytes as they stream, then names the part by its digest
+    /// ([`Self::commit_staged`]) or drops them ([`Self::discard_staged`]).
+    /// Default `Unsupported`: the engine then takes parts in manifest order
+    /// through [`Self::open_payload_writer`].
+    fn open_staging_writer(
+        &self,
+        bank: Bank,
+    ) -> Result<(Box<dyn std::io::Write + Send>, StagingHandle), BankError> {
+        let _ = bank;
+        Err(BankError::Unsupported(
+            "staging a payload before its part is known".into(),
+        ))
+    }
+
+    /// Place the bytes behind `handle` into `bank` as part `name`, replacing
+    /// an older part of that name; durable on `Ok`. Default `Unsupported`.
+    fn commit_staged(
+        &self,
+        bank: Bank,
+        handle: StagingHandle,
+        name: &str,
+    ) -> Result<(), BankError> {
+        let _ = (bank, handle, name);
+        Err(BankError::Unsupported("committing a staged payload".into()))
+    }
+
+    /// Drop the bytes behind `handle` (a payload that matched no part, or
+    /// failed on the way in). Default no-op.
+    fn discard_staged(&self, bank: Bank, handle: StagingHandle) -> Result<(), BankError> {
+        let _ = (bank, handle);
+        Ok(())
+    }
 
     /// Open a sink for one staged payload `name` in `bank`. The engine streams
     /// already-decrypted, hash-verified bytes; the provider decides where they

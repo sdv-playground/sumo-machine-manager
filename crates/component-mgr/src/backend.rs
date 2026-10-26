@@ -33,7 +33,9 @@ use sovd_core::error::{BackendError, BackendResult};
 use sovd_core::models::*;
 use sovd_core::PackageStream;
 
-use machine_mgr::bank_provider::{BankError, BankProvider, FirmwareIdentity, InstalledFirmware};
+use machine_mgr::bank_provider::{
+    BankError, BankProvider, FirmwareIdentity, InstalledFirmware, StagedPart, StagingRecord,
+};
 
 use crate::bank_provider::IvdBankProvider;
 use crate::did;
@@ -197,27 +199,40 @@ fn render_component_path(segments: &[Vec<u8>]) -> String {
 // Flash session: sequential upload state machine
 // ---------------------------------------------------------------------------
 
-/// Tracks the sequential upload state within a flash session.
+/// Tracks the upload state within a flash session.
 ///
 /// After start_flash(): AwaitingManifest
-/// After manifest upload: AwaitingPayload(0)
-/// After payload N: AwaitingPayload(N+1)
+/// After manifest upload: AwaitingPayload, with the parts the bank already
+/// holds (kept by digest from an earlier staging) present
+/// After each payload: its component present
 /// After all payloads: Complete
 enum FlashSessionState {
     /// Waiting for manifest upload (first file in sequence).
     AwaitingManifest,
-    /// Manifest received, waiting for payload at component index N.
+    /// Manifest received, waiting for the payloads still absent.
     AwaitingPayload {
         manifest_bytes: Vec<u8>,
         /// The validated manifest, parked with the session. `finalize_flash`
         /// reads its `disable_target` to route a no-payload disable manifest to
         /// the enact path instead of reconcile/activate.
         validated: ValidatedFirmware,
-        next_component: usize,
-        total_components: usize,
+        /// Component indices that owe a payload (those with an `image_digest`).
+        parts: Vec<usize>,
+        /// Component indices whose payload the target bank holds.
+        present: BTreeSet<usize>,
     },
     /// All uploads received.
     Complete,
+}
+
+/// The components of `parts` not yet `present`, in manifest order. The first
+/// is the next part a sequential intake expects.
+fn absent_parts(parts: &[usize], present: &BTreeSet<usize>) -> Vec<usize> {
+    parts
+        .iter()
+        .copied()
+        .filter(|i| !present.contains(i))
+        .collect()
 }
 
 /// Where an uploaded file_id was placed, so `verify_part` can re-confirm
@@ -459,6 +474,11 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// session ends (`clear_flash_session` / successful `finalize_flash`).
     /// Never set on the push path.
     install_source: Mutex<Option<machine_mgr::InstallSource>>,
+    /// The client's id for the update being staged, when the executor was
+    /// told it: written into the staging record at each manifest and part, and
+    /// from there sealed into the bank. `None` until something sets it
+    /// ([`set_update_id`](Self::set_update_id)); an abort clears it.
+    update_id: Mutex<Option<String>>,
     /// The bank the ECU is actually running on. Only changes on ecu_reset().
     /// NV active_bank may differ after install (it's the "next boot" bank).
     running_bank: Mutex<Bank>,
@@ -765,6 +785,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             flash_session: Mutex::new(None),
             flash_transfer: Mutex::new(None),
             install_source: Mutex::new(None),
+            update_id: Mutex::new(None),
             running_bank: Mutex::new(running_bank),
             next_id: Mutex::new(1),
             vm_service_addr,
@@ -1545,8 +1566,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .unwrap_or_default()
     }
 
-    /// Reconcile the manifested-but-un-pushed components
-    /// `[next_component .. total_components)` so the target bank is
+    /// Reconcile the manifested-but-un-pushed components `absent` (component
+    /// indices, in manifest order) so the target bank is
     /// content-complete, each part DIGEST-VERIFIED against the manifest's
     /// declared plaintext image digest. Per part, in order:
     ///
@@ -1569,11 +1590,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     async fn reconcile_unpushed(
         &self,
         manifest_bytes: &[u8],
-        next_component: usize,
-        total_components: usize,
+        absent: &[usize],
         target: Bank,
     ) -> BackendResult<Vec<hsm::ivd::IvdFile>> {
-        if next_component >= total_components {
+        if absent.is_empty() {
             return Ok(Vec::new());
         }
         let images_dir = self.images_dir.as_ref().ok_or_else(|| {
@@ -1618,8 +1638,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // needs a fetch — push-path finalizes never pay for it.
         let mut cas_puller: Option<puller::Puller> = None;
 
-        let mut done = Vec::with_capacity(total_components - next_component);
-        for i in next_component..total_components {
+        let mut done = Vec::with_capacity(absent.len());
+        for &i in absent {
             let expected = manifest
                 .image_digest(i)
                 .map(|d| d.0.bytes.clone())
@@ -1680,8 +1700,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                         ))
                     })?;
                     // CAS temp lives beside the bank dirs (NOT inside the
-                    // target bank) so start_flash's bank wipe never destroys a
-                    // resumable partial.
+                    // target bank) so the bank's prune at the next manifest
+                    // never destroys a resumable partial.
                     let cas_tmp = images_dir.join(set_name).join("cas");
                     std::fs::create_dir_all(&cas_tmp).map_err(|e| {
                         BackendError::Internal(format!("reconcile: create cas tmp dir: {e}"))
@@ -1910,32 +1930,160 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         *self.install_source.lock().unwrap() = Some(source);
     }
 
+    /// Name the client's update being staged (`None` forgets it). The next
+    /// manifest and every part after it record the id beside the bank, and
+    /// the seal carries it into the bank's signed manifest.
+    pub fn set_update_id(&self, id: Option<String>) {
+        *self.update_id.lock().unwrap() = id;
+    }
+
     /// Terminal session teardown shared by every abort path: drop the staging
     /// session AND resolve this component's node-transaction membership (the
     /// gate staged it at `start_flash`). Pre-finalize only — callers reject
-    /// post-finalize aborts first. Also wipes the staging bank dir: a failed
-    /// upload (e.g. ENOSPC mid-payload) leaves partial files behind that
-    /// nothing else reclaims until the NEXT flash's `prepare_target` — on a
-    /// space-constrained partition that partial is what makes the retry fail
-    /// again. Best-effort: a wipe error logs but doesn't mask the abort.
+    /// post-finalize aborts first. The verified parts the target bank holds
+    /// stay, with the staging record; the record forgets the update id, so
+    /// it is a part cache now, not a held update. The next manifest keeps
+    /// the parts it can re-verify and removes the rest. Best-effort: a record
+    /// error logs but doesn't mask the abort.
     pub fn abort_session(&self) -> BackendResult<()> {
         let had_session = self.flash_session.lock().unwrap().is_some();
         self.clear_flash_session();
-        // Only wipe when a session was actually in flight: with no session,
-        // target_bank() may be the LIVE bank (single-bank components target
-        // their only bank) and this is called as a stale-DELETE no-op.
+        *self.update_id.lock().unwrap() = None;
+        // Only touch the record when a session was actually in flight: with
+        // no session, target_bank() may be the LIVE bank (single-bank
+        // components target their only bank) and this is called as a
+        // stale-DELETE no-op.
         if had_session {
-            if let Err(e) = self
+            let bank = self.bank_provider.target_bank();
+            let forgotten = self
                 .bank_provider
-                .prepare_target(self.bank_provider.target_bank())
-            {
-                tracing::warn!(
-                    error = %e,
-                    "abort: staging bank dir not wiped — space reclaims at next flash"
-                );
+                .staging_record(bank)
+                .and_then(|rec| match rec {
+                    Some(mut rec) if rec.update_id.is_some() => {
+                        rec.update_id = None;
+                        self.bank_provider.write_staging_record(bank, Some(&rec))
+                    }
+                    _ => Ok(()),
+                });
+            if let Err(e) = forgotten {
+                tracing::warn!(error = %e, "abort: staging record still names the update");
             }
         }
         self.resolve_node_transaction()
+    }
+
+    /// A fresh staging record for `parts`, stamped with this session's update
+    /// id, the node boot id and the time now.
+    fn new_staging_record(&self, parts: Vec<StagedPart>) -> StagingRecord {
+        StagingRecord {
+            version: StagingRecord::VERSION,
+            update_id: self.update_id.lock().unwrap().clone(),
+            node_boot_id: self.node_boot_id.clone(),
+            started_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            parts,
+        }
+    }
+
+    /// Settle `bank` against a freshly validated manifest before any payload
+    /// arrives. Each part the staging record names is kept when it is the
+    /// on-medium part of a manifest component, its recorded digest is that
+    /// component's `image_digest`, and the bytes still hash to it; anything
+    /// else the bank holds toward an install goes (`prune_target`), and torn
+    /// staging leftovers with it. The record is rewritten with the kept parts
+    /// — or removed when the manifest owes no payload.
+    ///
+    /// Returns the kept parts as the transfer's inventory, with the component
+    /// index each one settles.
+    fn reconcile_staging(
+        &self,
+        bank: Bank,
+        manifest: &sumo_onboard::manifest::Manifest,
+        parts: &[usize],
+    ) -> BackendResult<Vec<(usize, hsm::ivd::IvdFile)>> {
+        let record = self
+            .bank_provider
+            .staging_record(bank)
+            .map_err(|e| BackendError::Internal(format!("read staging record: {e}")))?;
+        let mut kept: Vec<(usize, hsm::ivd::IvdFile)> = Vec::new();
+        for staged in record.iter().flat_map(|r| r.parts.iter()) {
+            let component = parts.iter().copied().find(|&i| {
+                !kept.iter().any(|(k, _)| *k == i)
+                    && crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))
+                        .is_ok_and(|n| n == staged.name)
+                    && manifest
+                        .image_digest(i)
+                        .is_some_and(|d| hex::encode(&d.0.bytes) == staged.sha256)
+            });
+            let Some(i) = component else {
+                tracing::info!(part = %staged.name, "staged part is not a part of this manifest — dropped");
+                continue;
+            };
+            let declared = &manifest.image_digest(i).expect("matched on digest").0.bytes;
+            let Ok(digest) = <[u8; 32]>::try_from(declared.as_slice()) else {
+                continue;
+            };
+            match self
+                .bank_provider
+                .verify_payload(bank, &staged.name, &digest)
+            {
+                Ok(()) => {
+                    tracing::info!(component = i, part = %staged.name, "staged part kept — re-verified by digest");
+                    kept.push((
+                        i,
+                        hsm::ivd::IvdFile {
+                            relative_path: staged.name.clone(),
+                            sha256: digest.to_vec(),
+                            size: staged.size,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(part = %staged.name, error = %e, "staged part no longer verifies — dropped");
+                }
+            }
+        }
+        let keep: Vec<String> = kept.iter().map(|(_, f)| f.relative_path.clone()).collect();
+        self.bank_provider
+            .prune_target(bank, &keep)
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
+        let record = (!parts.is_empty()).then(|| {
+            self.new_staging_record(
+                kept.iter()
+                    .map(|(_, f)| StagedPart {
+                        name: f.relative_path.clone(),
+                        size: f.size,
+                        sha256: hex::encode(&f.sha256),
+                    })
+                    .collect(),
+            )
+        });
+        self.bank_provider
+            .write_staging_record(bank, record.as_ref())
+            .map_err(|e| BackendError::Internal(format!("write staging record: {e}")))?;
+        Ok(kept)
+    }
+
+    /// Note one verified part in `bank`'s staging record, BEFORE the upload
+    /// is acknowledged: a part the record names survives a restart.
+    fn record_staged_part(&self, bank: Bank, part: &hsm::ivd::IvdFile) -> BackendResult<()> {
+        let mut record = self
+            .bank_provider
+            .staging_record(bank)
+            .map_err(|e| BackendError::Internal(format!("read staging record: {e}")))?
+            .unwrap_or_else(|| self.new_staging_record(Vec::new()));
+        record.update_id = self.update_id.lock().unwrap().clone();
+        record.parts.retain(|p| p.name != part.relative_path);
+        record.parts.push(StagedPart {
+            name: part.relative_path.clone(),
+            size: part.size,
+            sha256: hex::encode(&part.sha256),
+        });
+        self.bank_provider
+            .write_staging_record(bank, Some(&record))
+            .map_err(|e| BackendError::Internal(format!("write staging record: {e}")))
     }
 
     /// Whether a flash session is currently in flight.
@@ -2541,9 +2689,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // per part. An administrative-disable manifest carries one component and
         // NO digest, so it owes ZERO uploads; counting components instead told
         // the session to await a payload that could never arrive.
-        let payload_parts = (0..total_components)
+        let parts: Vec<usize> = (0..total_components)
             .filter(|i| manifest.image_digest(*i).is_some())
-            .count();
+            .collect();
+        let payload_parts = parts.len();
         // Fail-closed pre-flight for a bank that declares its parts (a
         // raw-partition bank): a manifest naming a part this bank does not have
         // is refused HERE — before the session moves out of AwaitingManifest and
@@ -2578,6 +2727,18 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         if validated.disable_target.is_none() {
             validated.disable_target = manifest.disable_target();
         }
+
+        // The target bank is settled against this manifest now, not at
+        // `start_flash`: the parts an earlier staging left and that still
+        // verify against this manifest's digests are kept; the rest of the
+        // bank is cleared. An integrated envelope carries its payloads inline,
+        // so it keeps nothing.
+        let target_bank = self.determine_target_bank()?;
+        let kept = self.reconcile_staging(
+            target_bank,
+            &manifest,
+            if has_integrated { &[] } else { &parts },
+        )?;
 
         let id = self.next_id();
 
@@ -2643,7 +2804,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             // provider's `seal`) first seeds unstreamed files from the active
             // bank so the signature covers a complete bank, then signs;
             // soft-skips when the HSM has no ivd-signing slot yet.
-            let target_bank = self.determine_target_bank()?;
             self.ivd_sign_staged_bank(target_bank)?;
 
             return Ok(id);
@@ -2659,10 +2819,13 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 tracing::info!(
                     manifest_id = %id,
                     components = total_components,
+                    kept = kept.len(),
                     "manifest validated — awaiting {} payload(s)",
-                    payload_parts,
+                    payload_parts - kept.len(),
                 );
             }
+            let present: BTreeSet<usize> = kept.iter().map(|(i, _)| *i).collect();
+            let all_present = payload_parts > 0 && present.len() == payload_parts;
 
             // Store as package so finalize_flash can find it
             {
@@ -2688,23 +2851,33 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             // flash-settled wait would otherwise burn its whole window and time
             // out. The session still parks in `AwaitingPayload` — that is what
             // `finalize_flash` reads at execute to route a disable to enact.
+            //
+            // The kept parts are the transfer's inventory from the start; when
+            // they are every part, the bank is content-complete already and is
+            // sealed here, exactly as the final payload upload would.
             {
                 let mut ft = self.flash_transfer.lock().unwrap();
                 if let Some(ref mut t) = *ft {
                     t.package_id = id.clone();
-                    if payload_parts == 0 {
+                    t.streamed_files = kept.into_iter().map(|(_, f)| f).collect();
+                    if payload_parts == 0 || all_present {
                         t.state = FlashState::AwaitingActivation;
                     }
                 }
             }
 
-            let mut session = self.flash_session.lock().unwrap();
-            *session = Some(FlashSessionState::AwaitingPayload {
-                manifest_bytes: data,
-                validated,
-                next_component: 0,
-                total_components: payload_parts,
-            });
+            if all_present {
+                *self.flash_session.lock().unwrap() = Some(FlashSessionState::Complete);
+                tracing::info!("every part already staged — ready for transferexit");
+                self.ivd_sign_staged_bank(target_bank)?;
+            } else {
+                *self.flash_session.lock().unwrap() = Some(FlashSessionState::AwaitingPayload {
+                    manifest_bytes: data,
+                    validated,
+                    parts,
+                    present,
+                });
+            }
         }
 
         Ok(id)
@@ -2712,27 +2885,45 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
     /// Handle payload upload (subsequent files in flash session).
     /// Streams directly through decrypt → decompress → verify → write to bank.
+    ///
+    /// A provider that can stage bytes before their part is known (a file
+    /// bank) takes the payload by CONTENT: the stream lands in a staging file,
+    /// its inner digest names the manifest component it is, and only then is
+    /// it renamed into the bank as that component's part — so parts arrive in
+    /// any order. A provider that cannot (fixed devices) takes them in
+    /// manifest order, each streamed straight to its part.
     async fn handle_payload_upload(
         &self,
         stream: PackageStream,
         _content_length: Option<u64>,
     ) -> BackendResult<String> {
         // Extract session state
-        let (manifest_bytes, comp_idx, total) = {
+        let (manifest_bytes, absent, total) = {
             let session = self.flash_session.lock().unwrap();
             match session.as_ref() {
                 Some(FlashSessionState::AwaitingPayload {
                     manifest_bytes,
-                    next_component,
-                    total_components,
+                    parts,
+                    present,
                     ..
-                }) => (manifest_bytes.clone(), *next_component, *total_components),
+                }) => (
+                    manifest_bytes.clone(),
+                    absent_parts(parts, present),
+                    parts.len(),
+                ),
                 _ => {
                     return Err(BackendError::InvalidRequest(
                         "no active flash session".into(),
                     ))
                 }
             }
+        };
+        // The next part in manifest order: what a sequential intake expects,
+        // and whose decryption context a content-addressed intake uses.
+        let Some(&next) = absent.first() else {
+            return Err(BackendError::InvalidRequest(
+                "every part of the manifest is already staged".into(),
+            ));
         };
 
         let key_unwrap = self.manifest_provider.key_unwrap_for_decryption();
@@ -2741,51 +2932,130 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         let envelope = sumo_codec::decode::decode_envelope(&manifest_bytes)
             .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
         let manifest = sumo_onboard::manifest::Manifest { envelope };
-
-        let expected_digest = manifest
-            .image_digest(comp_idx)
-            .map(|d| d.0.bytes.clone())
-            .ok_or_else(|| BackendError::Internal(format!("no digest for component {comp_idx}")))?;
-
-        let uri = manifest.uri(comp_idx).unwrap_or("#firmware").to_string();
+        let digest_of = |i: usize| -> BackendResult<Vec<u8>> {
+            manifest
+                .image_digest(i)
+                .map(|d| d.0.bytes.clone())
+                .ok_or_else(|| BackendError::Internal(format!("no digest for component {i}")))
+        };
 
         let target_bank = self.determine_target_bank()?;
-        // Name the bank file from the component-id part, NOT the payload uri: the
-        // uri is the content-address fetch reference (sha256:<outer>) and would
-        // otherwise land the file as `sha256:…` (un-bootable).
-        let target_name =
-            crate::bank_spec::payload_target_name_for_id(manifest.component_id(comp_idx))?;
-
-        // Open the payload sink through the bank provider — it owns where the
-        // bytes land and creates the bank dir as needed.
-        let writer = self
-            .bank_provider
-            .open_payload_writer(target_bank, &target_name)
-            .map_err(|e| sink_error(&format!("open payload sink {target_name}"), e))?;
-
-        tracing::info!(
-            component = comp_idx,
-            uri = %uri,
-            target = %target_name,
-            "processing payload {}/{}",
-            comp_idx + 1, total,
-        );
 
         // Stream straight through: network → decrypt → decompress →
-        // hash → final file. No on-disk ciphertext scratch — flash I/O
+        // hash → sink. No on-disk ciphertext scratch — flash I/O
         // is the dominant cost on the device and writing the payload
         // twice (once as .tmp, once unpacked) doubles it for nothing.
         let process_started = std::time::Instant::now();
-        let (inbound, image_size, image_hash) = crate::streaming::process_payload_stream(
-            stream,
-            manifest_bytes.clone(),
-            comp_idx,
-            key_unwrap.clone(),
-            expected_digest.clone(),
-            writer,
-        )
-        .await?;
+        let (comp_idx, target_name, inbound, image_size, image_hash) = match self
+            .bank_provider
+            .open_staging_writer(target_bank)
+        {
+            Ok((writer, handle)) => {
+                tracing::info!(
+                    "processing payload ({} of {} parts still owed) — matched by content",
+                    absent.len(),
+                    total,
+                );
+                let processed = crate::streaming::process_payload_stream(
+                    stream,
+                    manifest_bytes.clone(),
+                    next,
+                    key_unwrap.clone(),
+                    None,
+                    writer,
+                )
+                .await;
+                let (inbound, image_size, image_hash) = match processed {
+                    Ok(x) => x,
+                    Err(e) => {
+                        let _ = self.bank_provider.discard_staged(target_bank, handle);
+                        return Err(e);
+                    }
+                };
+                let matches = |i: &usize| {
+                    manifest
+                        .image_digest(*i)
+                        .is_some_and(|d| d.0.bytes.as_slice() == image_hash.as_slice())
+                };
+                let Some(comp_idx) = absent.iter().copied().find(matches) else {
+                    let _ = self.bank_provider.discard_staged(target_bank, handle);
+                    let already = {
+                        let session = self.flash_session.lock().unwrap();
+                        match session.as_ref() {
+                            Some(FlashSessionState::AwaitingPayload { parts, .. }) => {
+                                parts.iter().copied().find(matches)
+                            }
+                            _ => None,
+                        }
+                    };
+                    // A part the bank already holds, sent again: accepted
+                    // as it stands, nothing written.
+                    if let Some(i) = already {
+                        let name =
+                            crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))?;
+                        tracing::info!(component = i, part = %name, "payload is a part already staged — accepted, discarded");
+                        let id = self.next_id();
+                        self.uploaded_parts.lock().unwrap().insert(
+                            id.clone(),
+                            UploadedPartLocation::OnDisk {
+                                bank: target_bank,
+                                name,
+                                inner_sha256: image_hash,
+                            },
+                        );
+                        return Ok(id);
+                    }
+                    return Err(BackendError::Internal(
+                        "payload matches no component of the manifest".into(),
+                    ));
+                };
+                let target_name =
+                    crate::bank_spec::payload_target_name_for_id(manifest.component_id(comp_idx))?;
+                if let Err(e) =
+                    self.bank_provider
+                        .commit_staged(target_bank, handle.clone(), &target_name)
+                {
+                    let _ = self.bank_provider.discard_staged(target_bank, handle);
+                    return Err(sink_error(&format!("commit staged {target_name}"), e));
+                }
+                (comp_idx, target_name, inbound, image_size, image_hash)
+            }
+            Err(BankError::Unsupported(_)) => {
+                let comp_idx = next;
+                // Name the bank file from the component-id part, NOT the
+                // payload uri: the uri is the content-address fetch
+                // reference (sha256:<outer>) and would otherwise land the
+                // file as `sha256:…` (un-bootable).
+                let target_name =
+                    crate::bank_spec::payload_target_name_for_id(manifest.component_id(comp_idx))?;
+                // Open the payload sink through the bank provider — it owns
+                // where the bytes land and creates the bank dir as needed.
+                let writer = self
+                    .bank_provider
+                    .open_payload_writer(target_bank, &target_name)
+                    .map_err(|e| sink_error(&format!("open payload sink {target_name}"), e))?;
+                tracing::info!(
+                    component = comp_idx,
+                    target = %target_name,
+                    "processing payload {}/{}",
+                    comp_idx + 1,
+                    total,
+                );
+                let (inbound, image_size, image_hash) = crate::streaming::process_payload_stream(
+                    stream,
+                    manifest_bytes.clone(),
+                    comp_idx,
+                    key_unwrap.clone(),
+                    Some(digest_of(comp_idx)?),
+                    writer,
+                )
+                .await?;
+                (comp_idx, target_name, inbound, image_size, image_hash)
+            }
+            Err(e) => return Err(sink_error("open staging sink", e)),
+        };
         let process_elapsed = process_started.elapsed();
+        let uri = manifest.uri(comp_idx).unwrap_or("#firmware").to_string();
 
         // Readback-verify BEFORE this upload is acked: re-hash the bytes now on
         // the medium and confirm they match what the streaming pipeline wrote.
@@ -2809,17 +3079,20 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .verify_payload(target_bank, &target_name, &image_hash)
             .map_err(|e| sink_error(&format!("staging verify {target_name}"), e))?;
 
-        // Record the freshly-hashed file for `ivd_sign_staged_bank` so
-        // it doesn't need to re-walk + re-hash this payload from disk
-        // when sealing the bank.
+        // Note the part beside the bank BEFORE the upload is acked, then
+        // record the freshly-hashed file for `ivd_sign_staged_bank` so it
+        // doesn't need to re-walk + re-hash this payload from disk when
+        // sealing the bank.
+        let staged = hsm::ivd::IvdFile {
+            relative_path: target_name.clone(),
+            sha256: image_hash.to_vec(),
+            size: image_size as u64,
+        };
+        self.record_staged_part(target_bank, &staged)?;
         {
             let mut ft = self.flash_transfer.lock().unwrap();
             if let Some(ref mut t) = *ft {
-                t.streamed_files.push(hsm::ivd::IvdFile {
-                    relative_path: target_name.clone(),
-                    sha256: image_hash.to_vec(),
-                    size: image_size as u64,
-                });
+                t.streamed_files.push(staged);
             }
         }
 
@@ -2843,10 +3116,20 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         );
 
         // Advance session state
-        let next = comp_idx + 1;
         let all_done = {
             let mut session = self.flash_session.lock().unwrap();
-            if next >= total {
+            let all_present = match *session {
+                Some(FlashSessionState::AwaitingPayload {
+                    ref parts,
+                    ref mut present,
+                    ..
+                }) => {
+                    present.insert(comp_idx);
+                    absent_parts(parts, present).is_empty()
+                }
+                _ => false,
+            };
+            if all_present {
                 // All payloads received
                 *session = Some(FlashSessionState::Complete);
                 tracing::info!("all payloads received — ready for transferexit");
@@ -2857,18 +3140,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     t.state = FlashState::AwaitingActivation;
                     t.image_size = image_size as u64;
                 }
-                true
-            } else {
-                // Update to next component
-                if let Some(FlashSessionState::AwaitingPayload {
-                    ref mut next_component,
-                    ..
-                }) = *session
-                {
-                    *next_component = next;
-                }
-                false
             }
+            all_present
         };
 
         if all_done {
@@ -2876,7 +3149,6 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             // to finalize_flash. `ivd_sign_staged_bank` (via the provider's
             // `seal`) seeds unstreamed files from the active bank first so the
             // signature covers a complete bank.
-            let target_bank = self.determine_target_bank()?;
             self.ivd_sign_staged_bank(target_bank)?;
         }
 
@@ -4633,12 +4905,11 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
 
     async fn start_flash(&self) -> BackendResult<String> {
         self.ensure_flash_can_start()?;
-
-        // Clear the target bank dir (and any orphaned staged files) BEFORE
-        // any payload starts streaming in. Frees ~1 image worth of space on
-        // the partition that's about to receive the new bank.
-        let target_bank = self.determine_target_bank()?;
-        self.prepare_target_bank_dir(target_bank)?;
+        // The target bank is NOT cleared here: what it holds is settled against
+        // the manifest when it arrives (`reconcile_staging`), which keeps the
+        // parts an earlier staging left that still verify and removes the rest
+        // before any payload streams in. Refuse a pending reboot as before.
+        self.determine_target_bank()?;
 
         // Initialize flash session — next upload will be treated as manifest
         {
@@ -5013,7 +5284,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // final payload upload normally fires never ran — finalize would
         // otherwise activate an empty, unsigned target bank (the guest can't
         // boot it → trial-boot exhaustion → auto-rollback). Detect the
-        // un-pushed tail `[next_component .. total_components)` and reconcile
+        // un-pushed (absent) components and reconcile
         // it per part: copy-forward from the active bank (digest-verified),
         // else fetch by the signed content-address when the pull route
         // provided a session source; then seal the now-complete bank. Only
@@ -5024,21 +5295,20 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             match session.as_ref() {
                 Some(FlashSessionState::AwaitingPayload {
                     manifest_bytes,
-                    next_component,
-                    total_components,
+                    parts,
+                    present,
                     ..
-                }) if *next_component < *total_components => {
-                    Some((manifest_bytes.clone(), *next_component, *total_components))
-                }
+                }) => Some((manifest_bytes.clone(), absent_parts(parts, present)))
+                    .filter(|(_, absent)| !absent.is_empty()),
                 _ => None,
             }
         } else {
             None
         };
-        if let Some((manifest_bytes, next_component, total_components)) = manifest_only {
+        if let Some((manifest_bytes, absent)) = manifest_only {
             let target = self.determine_target_bank()?;
             let reconciled = self
-                .reconcile_unpushed(&manifest_bytes, next_component, total_components, target)
+                .reconcile_unpushed(&manifest_bytes, &absent, target)
                 .await?;
             // Fold the reconciled files into the transfer inventory (parity with
             // the streamed path) — that inventory IS the declared part list the
@@ -5063,7 +5333,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             tracing::info!(
                 bank_set = ?self.bank_set,
                 target = ?target,
-                reconciled_components = total_components - next_component,
+                reconciled_components = absent.len(),
                 "manifest-only push reconciled: un-pushed components copied forward or fetched; target sealed",
             );
         }
@@ -11699,12 +11969,13 @@ mod abort_flash_tests {
         }
     }
 
-    /// Abort with a session in flight wipes the staging bank dir — the ENOSPC
-    /// incident left a 394 MB partial rootfs in the target bank that nothing
-    /// reclaimed until the NEXT flash, which then failed again on a full disk.
-    /// With a real images_dir-backed provider, the partial must be gone.
+    /// Abort with a session in flight keeps the verified parts the target
+    /// bank holds and their staging record, and only forgets the update id:
+    /// the record is a part cache now, not a held update. (A torn upload
+    /// never reaches the bank — it stages beside it and goes at the next
+    /// manifest.)
     #[tokio::test]
-    async fn abort_session_with_staged_partial_wipes_target_bank() {
+    async fn abort_session_keeps_staged_parts_and_forgets_the_update_id() {
         let dir = tempfile::tempdir().unwrap();
         let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
         let mut boot = NvBootState::default();
@@ -11722,19 +11993,32 @@ mod abort_flash_tests {
         .with_bank_spec(crate::bank_spec::BankSetSpec {
             dir_name: "vm1".into(),
         });
-        // Active = A ⇒ target = B. Stage a partial file in bank_b.
+        // Active = A ⇒ target = B. Stage a verified part in bank_b.
         let bank_b = dir.path().join("vm1").join("bank_b");
         std::fs::create_dir_all(&bank_b).unwrap();
         std::fs::write(bank_b.join("rootfs.img"), vec![0u8; 1024]).unwrap();
+        b.set_update_id(Some("upd-1".into()));
+        let part = hsm::ivd::IvdFile {
+            relative_path: "rootfs.img".into(),
+            sha256: vec![7u8; 32],
+            size: 1024,
+        };
+        b.record_staged_part(Bank::B, &part).unwrap();
+        let before = b.bank_provider.staging_record(Bank::B).unwrap().unwrap();
+        assert_eq!(before.update_id.as_deref(), Some("upd-1"));
 
         *b.flash_session.lock().unwrap() = Some(FlashSessionState::Complete);
         b.abort_session().unwrap();
 
         assert!(b.flash_session.lock().unwrap().is_none());
         assert!(
-            !bank_b.join("rootfs.img").exists(),
-            "abort must wipe the staged partial from the target bank"
+            bank_b.join("rootfs.img").exists(),
+            "abort keeps the staged part in the target bank"
         );
+        let after = b.bank_provider.staging_record(Bank::B).unwrap().unwrap();
+        assert_eq!(after.update_id, None, "abort forgets the update id");
+        assert_eq!(after.parts, before.parts, "…and keeps the parts");
+        assert_eq!(*b.update_id.lock().unwrap(), None);
     }
 
     /// Abort with NO session in flight must NOT touch the target bank — with
@@ -11846,7 +12130,7 @@ mod copy_forward_tests {
         let backend = vm1_backend(images_dir.clone());
 
         let copied = backend
-            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .reconcile_unpushed(&manifest, &[0], Bank::B)
             .await
             .expect("digest matches → copy-forward");
         assert_eq!(copied.len(), 1);
@@ -11876,7 +12160,7 @@ mod copy_forward_tests {
         let backend = vm1_backend(images_dir.clone());
 
         let err = backend
-            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .reconcile_unpushed(&manifest, &[0], Bank::B)
             .await
             .expect_err("digest mismatch → install must fail");
         assert!(matches!(err, BackendError::Internal(_)), "got {err:?}");
@@ -11894,7 +12178,7 @@ mod copy_forward_tests {
         let manifest = detached_manifest("rootfs.img", &[0u8; 32], 0);
         let backend = vm1_backend(images_dir);
         let copied = backend
-            .reconcile_unpushed(&manifest, 1, 1, Bank::B)
+            .reconcile_unpushed(&manifest, &[], Bank::B)
             .await
             .expect("no un-pushed components");
         assert!(copied.is_empty());
@@ -12060,7 +12344,7 @@ mod copy_forward_tests {
         backend.set_install_source(test_source(base));
 
         let done = backend
-            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .reconcile_unpushed(&manifest, &[0], Bank::B)
             .await
             .expect("missing active + content-addressed uri → fetch");
         assert_eq!(done.len(), 1);
@@ -12140,7 +12424,7 @@ mod copy_forward_tests {
         backend.set_install_source(test_source(base));
 
         let done = backend
-            .reconcile_unpushed(&manifest, 0, 3, Bank::B)
+            .reconcile_unpushed(&manifest, &[0, 1, 2], Bank::B)
             .await
             .expect("2 copies + 1 fetch");
         assert_eq!(done.len(), 3);
@@ -12187,7 +12471,7 @@ mod copy_forward_tests {
         backend.set_install_source(test_source(base));
 
         let err = backend
-            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .reconcile_unpushed(&manifest, &[0], Bank::B)
             .await
             .expect_err("tampered CDN content must be rejected");
         assert!(matches!(err, BackendError::Internal(_)), "got {err:?}");
@@ -12198,7 +12482,7 @@ mod copy_forward_tests {
     }
 
     /// A transport failure mid-blob keeps the resumable `.part` (outside the
-    /// bank dirs, so a session restart's bank wipe can't destroy it); the
+    /// bank dirs, so the bank's prune at the next manifest can't destroy it); the
     /// retry resumes with a Range request and completes.
     #[tokio::test]
     async fn reconcile_fetch_failure_is_retry_safe_and_resumes() {
@@ -12225,7 +12509,7 @@ mod copy_forward_tests {
         backend.set_install_source(test_source(base));
 
         backend
-            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .reconcile_unpushed(&manifest, &[0], Bank::B)
             .await
             .expect_err("truncated transfer must fail the first attempt");
         let part = images_dir.join(format!("vm1/cas/cas-{outer_hex}.part"));
@@ -12235,7 +12519,7 @@ mod copy_forward_tests {
         assert_eq!(std::fs::metadata(&part).unwrap().len(), 1000);
 
         let done = backend
-            .reconcile_unpushed(&manifest, 0, 1, Bank::B)
+            .reconcile_unpushed(&manifest, &[0], Bank::B)
             .await
             .expect("retry resumes the partial and completes");
         assert_eq!(done[0].sha256, digest.to_vec());
@@ -12510,8 +12794,8 @@ mod copy_forward_tests {
         *backend.flash_session.lock().unwrap() = Some(FlashSessionState::AwaitingPayload {
             manifest_bytes: manifest,
             validated,
-            next_component: 0,
-            total_components: 1,
+            parts: vec![0],
+            present: BTreeSet::new(),
         });
 
         // Precondition: target bank is empty (would brick if activated as-is).
@@ -12691,8 +12975,8 @@ mod copy_forward_tests {
         *backend.flash_session.lock().unwrap() = Some(FlashSessionState::AwaitingPayload {
             manifest_bytes: manifest,
             validated,
-            next_component: 0,
-            total_components: 1,
+            parts: vec![0],
+            present: BTreeSet::new(),
         });
 
         DiagnosticBackend::finalize_flash(&backend)
@@ -12783,8 +13067,8 @@ mod copy_forward_tests {
         *backend.flash_session.lock().unwrap() = Some(FlashSessionState::AwaitingPayload {
             manifest_bytes: manifest,
             validated,
-            next_component: 0,
-            total_components: 1,
+            parts: vec![0],
+            present: BTreeSet::new(),
         });
 
         DiagnosticBackend::finalize_flash(&backend)
@@ -13210,8 +13494,8 @@ mod declared_parts_tests {
         *backend.flash_session.lock().unwrap() = Some(FlashSessionState::AwaitingPayload {
             manifest_bytes: manifest,
             validated: CannedManifest.validate(&[], 0).unwrap(),
-            next_component: 0,
-            total_components: 1,
+            parts: vec![0],
+            present: BTreeSet::new(),
         });
 
         let err = backend
