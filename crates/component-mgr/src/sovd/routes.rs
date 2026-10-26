@@ -758,9 +758,13 @@ async fn handle_verdict(
 ///
 ///   `POST /vehicle/v1/operations/x-ota-commit-trials/executions`
 ///   `POST /vehicle/v1/operations/x-ota-rollback-trials/executions`
+///   `POST /vehicle/v1/operations/x-update-commit/executions`
+///   `POST /vehicle/v1/operations/x-update-rollback/executions`
 ///   `POST /vehicle/v1/operations/x-update-verdict/executions` — the same two
-///        verdicts with `{"verdict": "commit"|"rollback"}` in a required body,
-///        on the same lock
+///        verdicts with `{"verdict": "commit"|"rollback"}` in a required body
+///        (alias, retired together with the x-ota names)
+///
+/// All five share one lock.
 ///
 /// The orchestrator issues ONE verdict per node per campaign step — the update
 /// *session* is the commit unit, never a single component. Entity-root
@@ -828,7 +832,9 @@ pub(crate) async fn rollback_trials(
 
 /// `POST /vehicle/v1/operations/x-update-verdict/executions` — the node verdict
 /// with the verdict in the body; exactly `x-ota-commit-trials` /
-/// `x-ota-rollback-trials` under one operation id. See [`node_verdict_router`].
+/// `x-ota-rollback-trials` under one operation id. Alias of `x-update-commit` /
+/// `x-update-rollback`, retired together with the x-ota names. See
+/// [`node_verdict_router`].
 #[utoipa::path(
     post,
     path = "/vehicle/v1/operations/x-update-verdict/executions",
@@ -859,12 +865,72 @@ pub(crate) async fn x_update_verdict(
     .await
 }
 
+/// `POST /vehicle/v1/operations/x-update-commit/executions` — the node commit
+/// verdict; see [`node_verdict_router`] for the wire contract.
+#[utoipa::path(
+    post,
+    path = "/vehicle/v1/operations/x-update-commit/executions",
+    tag = "x-extensions",
+    request_body(content = VerdictRequest, description = "Optional JSON body: a replay `nonce` echoed in the execution."),
+    responses(
+        (status = 200, description = "Verdict applied across the node's in-trial components (`result.committed` / `skipped`).", body = VerdictExecution),
+        (status = 409, description = "Refused: every failure was a transient Busy refusal (e.g. a component's commit preflight).", body = VerdictExecution),
+        (status = 500, description = "One or more components failed to commit (failed execution).", body = VerdictExecution),
+    ),
+)]
+pub(crate) async fn x_update_commit(
+    machine: Arc<dyn Machine>,
+    req: Option<VerdictRequest>,
+    verdict_lock: Arc<tokio::sync::Mutex<()>>,
+) -> axum::response::Response {
+    handle_verdict(
+        machine,
+        Verdict::Commit,
+        req,
+        verdict_lock,
+        "x-update-commit",
+    )
+    .await
+}
+
+/// `POST /vehicle/v1/operations/x-update-rollback/executions` — the node
+/// rollback verdict; see [`node_verdict_router`] for the wire contract.
+#[utoipa::path(
+    post,
+    path = "/vehicle/v1/operations/x-update-rollback/executions",
+    tag = "x-extensions",
+    request_body(content = VerdictRequest, description = "Optional JSON body: a replay `nonce` echoed in the execution."),
+    responses(
+        (status = 200, description = "Verdict applied across the node's in-trial components (`result.rolled_back` / `skipped`).", body = VerdictExecution),
+        (status = 409, description = "Refused: every failure was a transient Busy refusal.", body = VerdictExecution),
+        (status = 500, description = "One or more components failed to roll back (failed execution).", body = VerdictExecution),
+    ),
+)]
+pub(crate) async fn x_update_rollback(
+    machine: Arc<dyn Machine>,
+    req: Option<VerdictRequest>,
+    verdict_lock: Arc<tokio::sync::Mutex<()>>,
+) -> axum::response::Response {
+    handle_verdict(
+        machine,
+        Verdict::Rollback,
+        req,
+        verdict_lock,
+        "x-update-rollback",
+    )
+    .await
+}
+
 pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
     let verdict_lock = Arc::new(tokio::sync::Mutex::new(()));
     let commit_machine = machine.clone();
     let commit_lock = verdict_lock.clone();
     let alias_machine = machine.clone();
     let alias_lock = verdict_lock.clone();
+    let update_commit_machine = machine.clone();
+    let update_commit_lock = verdict_lock.clone();
+    let update_rollback_machine = machine.clone();
+    let update_rollback_lock = verdict_lock.clone();
     Router::new()
         .route(
             "/vehicle/v1/operations/x-ota-commit-trials/executions",
@@ -888,6 +954,22 @@ pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
                 let machine = alias_machine.clone();
                 let verdict_lock = alias_lock.clone();
                 async move { x_update_verdict(machine, req, verdict_lock).await }
+            }),
+        )
+        .route(
+            "/vehicle/v1/operations/x-update-commit/executions",
+            post(move |req: Option<Json<VerdictRequest>>| {
+                let machine = update_commit_machine.clone();
+                let verdict_lock = update_commit_lock.clone();
+                async move { x_update_commit(machine, req.map(|Json(r)| r), verdict_lock).await }
+            }),
+        )
+        .route(
+            "/vehicle/v1/operations/x-update-rollback/executions",
+            post(move |req: Option<Json<VerdictRequest>>| {
+                let machine = update_rollback_machine.clone();
+                let verdict_lock = update_rollback_lock.clone();
+                async move { x_update_rollback(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
         )
 }

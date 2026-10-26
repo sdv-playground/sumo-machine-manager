@@ -78,7 +78,9 @@ spec; all are `x-`-namespaced.
 | `/components/hsm/x-ecu-id` | GET | ECU id = HSM device-key thumbprint (the token `aud`); `text/plain` |
 | `/operations/x-ota-commit-trials/executions` | POST | node-level commit of all in-trial banked components |
 | `/operations/x-ota-rollback-trials/executions` | POST | node-level rollback of in-trial components |
-| `/operations/x-update-verdict/executions` | POST | alias of commit-trials / rollback-trials; the verdict is in the body (`{"verdict": "commit"\|"rollback", "nonce"?: …}`, 422 for a missing/unknown word); result key `committed`\|`rolled_back` follows the verdict |
+| `/operations/x-update-commit/executions` | POST | node-level commit, same as commit-trials; optional body `{"nonce"?: …}` |
+| `/operations/x-update-rollback/executions` | POST | node-level rollback, same as rollback-trials; optional body `{"nonce"?: …}` |
+| `/operations/x-update-verdict/executions` | POST | alias of `x-update-commit` / `x-update-rollback`, retired together with the x-ota names; the verdict is in the body (`{"verdict": "commit"\|"rollback", "nonce"?: …}`, 422 for a missing/unknown word); result key `committed`\|`rolled_back` follows the verdict |
 | `/operations/x-ota-pull-update/executions` | POST | onboard pull-update (gateway mode); async 202 + poll |
 
 Both update-state routes also carry `banks`: one entry per component that reports bank
@@ -142,9 +144,13 @@ node reset. The device reports facts and the orchestrator decides:
   the installed manifest / running release; on hardware the bootloader's boot-status
   record is the durable answer.
 
-The node `x-update-verdict` operation is the same operation as `x-ota-commit-trials` /
-`x-ota-rollback-trials` (same fan-out, same lock, same 200/409/500 rules), with the verdict
-carried in the body; `x-update-state` is `x-ota-update-state` plus `node_boot_id`.
+The node `x-update-commit` / `x-update-rollback` operations are the same operations as
+`x-ota-commit-trials` / `x-ota-rollback-trials` (same fan-out, same lock, same 200/409/500
+rules, optional `nonce` body); `x-update-verdict` is their alias with the verdict carried in
+the body, retired together with the x-ota names. `x-update-state` is `x-ota-update-state`
+plus `node_boot_id`. The per-update `…/updates/{update_id}/x-update-commit` /
+`x-update-rollback` verbs are SOVDd's and are for single-component executors and component
+resets; node transactions take these operations.
 The per-update `x-update.state` / `reset_kind` on the update status and
 `capabilities.x-update.verdict` are served by SOVDd (see `SOVDd/docs/x-update.md`), derived
 from this backend's activation state and `update_shape()`.
