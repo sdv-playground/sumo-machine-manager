@@ -3,7 +3,7 @@
 //! installs a three-payload SUIT manifest with every byte landing on its own
 //! device and a signed IVD attesting exactly those parts; a manifest naming
 //! an undeclared fourth part is refused with HTTP 415 at manifest time,
-//! before any device is touched.
+//! before any device is touched; parts the client names land in any order.
 //!
 //! The provider/HSM construction mirrors
 //! `partition_bank_provider::tests::build_with` (an integration test can't
@@ -403,4 +403,124 @@ async fn a_manifest_naming_an_undeclared_part_is_refused_at_manifest_time() {
         .receive_package_stream(stream_of(good_manifest), None)
         .await
         .expect("a manifest within the declared parts is accepted");
+}
+
+async fn upload_part(backend: &ComponentBackend<MemBlockDevice>, part_id: &str, bytes: Vec<u8>) {
+    backend
+        .receive_package_part(part_id, stream_of(bytes), None)
+        .await
+        .unwrap_or_else(|e| panic!("{part_id}: part refused: {e:?}"));
+}
+
+/// Parts named by the client stream to their own devices out of manifest
+/// order. After a restart the next manifest keeps the part the record names
+/// (re-hashed on its device), and that part sent again is accepted without
+/// a byte written.
+#[tokio::test]
+async fn addressed_parts_land_in_any_order_and_a_present_part_is_skipped_after_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parts = make_parts(tmp.path());
+    let (provider, nv, crypto) = partition_provider(tmp.path(), &parts);
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let declared = ["application.img", "ifs", "rootfs"];
+    let manifest_parts: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|p| (p.name, p.payload.as_slice()))
+        .collect();
+    let manifest = signed_manifest(&key, &manifest_parts);
+
+    {
+        let backend = host_backend(
+            provider.clone(),
+            nv.clone(),
+            crypto.clone(),
+            &declared,
+            key.public_key_bytes(),
+        );
+        backend.start_flash().await.unwrap();
+        upload_part(&backend, "manifest", manifest.clone()).await;
+        // The last part first.
+        upload_part(&backend, "#rootfs", parts[2].payload.clone()).await;
+        assert_eq!(std::fs::read(&parts[2].dev_b).unwrap(), parts[2].payload);
+        for part in &parts[..2] {
+            assert_eq!(
+                std::fs::read(&part.dev_b).unwrap(),
+                vec![0u8; part.payload.len()],
+                "{}: waits for its part",
+                part.name
+            );
+        }
+    } // the machine manager goes away mid-update
+
+    let backend = host_backend(
+        provider.clone(),
+        nv,
+        crypto,
+        &declared,
+        key.public_key_bytes(),
+    );
+    backend.start_flash().await.unwrap();
+    upload_part(&backend, "manifest", manifest).await;
+    let record = provider.staging_record(Bank::B).unwrap().unwrap();
+    assert_eq!(
+        record
+            .parts
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["rootfs"],
+        "kept by digest"
+    );
+
+    let written = std::fs::metadata(&parts[2].dev_b)
+        .unwrap()
+        .modified()
+        .unwrap();
+    upload_part(&backend, "rootfs", parts[2].payload.clone()).await;
+    assert_eq!(
+        std::fs::metadata(&parts[2].dev_b)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        written,
+        "a present part is not written again"
+    );
+
+    upload_part(&backend, "ifs", parts[1].payload.clone()).await;
+    upload_part(&backend, "#application.img", parts[0].payload.clone()).await;
+    assert!(provider.read_installed(Bank::B).is_ok(), "sealed");
+    for part in &parts {
+        assert_eq!(
+            std::fs::read(&part.dev_b).unwrap(),
+            part.payload,
+            "{}",
+            part.name
+        );
+    }
+}
+
+/// A part id that names no part keeps the unnamed intake: manifest order on
+/// a partition bank.
+#[tokio::test]
+async fn an_unresolvable_part_id_falls_back_to_manifest_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parts = make_parts(tmp.path());
+    let (provider, nv, crypto) = partition_provider(tmp.path(), &parts);
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let backend = host_backend(
+        provider,
+        nv,
+        crypto,
+        &["application.img", "ifs", "rootfs"],
+        key.public_key_bytes(),
+    );
+    let manifest_parts: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|p| (p.name, p.payload.as_slice()))
+        .collect();
+
+    backend.start_flash().await.unwrap();
+    upload_part(&backend, "manifest", signed_manifest(&key, &manifest_parts)).await;
+    upload_part(&backend, "payload-1", parts[0].payload.clone()).await;
+    assert_eq!(std::fs::read(&parts[0].dev_b).unwrap(), parts[0].payload);
 }

@@ -3,7 +3,9 @@
 //! keeps the parts its staging record names (re-verified by digest) across a
 //! new backend over the same dir, takes parts by content in any order, refuses
 //! a payload that is no part of the manifest, and seals the update id into the
-//! bank. A partition bank keeps its record the same way.
+//! bank. A partition bank keeps its record the same way. Parts named by the
+//! client land as that part under its digest, and `held_updates` reads the
+//! update the bank holds from the same facts.
 //!
 //! The provider/HSM/manifest construction mirrors `tests/partition_bank.rs`.
 
@@ -19,7 +21,7 @@ use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::{Bank, BankSet, NvBootState};
 
 use machine_mgr::bank_provider::{BankContents, BankProvider};
-use sovd_core::{DiagnosticBackend, PackageStream};
+use sovd_core::{DiagnosticBackend, HeldState, PackageStream};
 
 use component_mgr::backend::{ComponentBackend, ComponentConfig};
 use component_mgr::bank_provider::IvdBankProvider;
@@ -258,10 +260,12 @@ async fn a_half_staged_update_survives_a_restart_and_seals_with_its_id() {
         image_names(&sealed),
         ["kernel", "rootfs.img", "vm-config.yaml"]
     );
-    assert!(
-        !tmp.path().join("images/vm1/staging-bank_b.cbor").exists(),
-        "the seal removes the staging record"
-    );
+    let record = provider
+        .staging_record(Bank::B)
+        .unwrap()
+        .expect("the seal keeps the record");
+    assert!(record.sealed, "the seal marks the record sealed");
+    assert_eq!(record.update_id.as_deref(), Some("upd-7"));
     assert!(!tmp.path().join("images/vm1/staging/bank_b").exists());
 }
 
@@ -434,10 +438,10 @@ async fn the_seal_attests_only_the_parts() {
 }
 
 /// A partition bank writes its record beside the metadata dir as parts
-/// arrive (in manifest order, as before), leaves the devices to the stream,
-/// and the seal removes the record.
+/// arrive (in manifest order), leaves the devices to the stream; the seal
+/// marks the record sealed and activate removes it.
 #[tokio::test]
-async fn partition_bank_keeps_a_record_and_the_seal_removes_it() {
+async fn partition_bank_keeps_a_record_the_seal_marks_it_and_activate_removes_it() {
     let tmp = tempfile::tempdir().unwrap();
     let nv = fresh_nv();
     let key = keygen::generate_signing_key(keygen::ES256).unwrap();
@@ -512,7 +516,10 @@ async fn partition_bank_keeps_a_record_and_the_seal_removes_it() {
 
     upload(&backend, parts[1].1.clone()).await;
     assert!(provider.read_installed(Bank::B).is_ok(), "sealed");
-    assert!(!record.exists(), "the seal removes the record");
+    assert!(record.is_file(), "the seal keeps the record");
+    assert!(provider.staging_record(Bank::B).unwrap().unwrap().sealed);
+    provider.activate(Bank::B).unwrap();
+    assert!(!record.exists(), "activate removes the record");
 }
 
 /// `prune_target` leaves partition devices alone: they are not files of the
@@ -542,4 +549,311 @@ fn partition_prune_target_leaves_the_devices_alone() {
     provider.prune_target(Bank::B, &["ifs".into()]).unwrap();
     assert_eq!(std::fs::read(&dev_a).unwrap(), b"A image");
     assert_eq!(std::fs::read(&dev_b).unwrap(), b"B image");
+}
+
+async fn upload_part(backend: &ComponentBackend<MemBlockDevice>, part_id: &str, bytes: Vec<u8>) {
+    backend
+        .receive_package_part(part_id, stream_of(bytes), None)
+        .await
+        .unwrap_or_else(|e| panic!("{part_id}: part refused: {e:?}"));
+}
+
+/// Each held update as `(id, bank, state, part names)`.
+async fn held(
+    backend: &ComponentBackend<MemBlockDevice>,
+) -> Vec<(String, String, HeldState, Vec<String>)> {
+    backend
+        .held_updates()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| {
+            (
+                h.id,
+                h.bank,
+                h.state,
+                h.parts.into_iter().map(|p| p.name).collect(),
+            )
+        })
+        .collect()
+}
+
+fn names(parts: &[(&str, Vec<u8>)]) -> Vec<String> {
+    let mut n: Vec<String> = parts.iter().map(|(n, _)| n.to_string()).collect();
+    n.sort();
+    n
+}
+
+/// A part named by uri, by name or by `#name` lands as that part, in any
+/// order, and the bank seals.
+#[tokio::test]
+async fn file_bank_takes_addressed_parts_in_any_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let parts = parts();
+    let (backend, provider) = file_backend(tmp.path(), &nv, &key);
+
+    backend.start_flash().await.unwrap();
+    upload_part(&backend, "manifest", signed_manifest(&key, "vm1", &parts)).await;
+    upload_part(&backend, "vm-config.yaml", parts[2].1.clone()).await;
+    upload_part(&backend, "#rootfs.img", parts[1].1.clone()).await;
+    // Present already: accepted, nothing written.
+    upload_part(&backend, "#rootfs.img", parts[1].1.clone()).await;
+    upload_part(&backend, "#kernel", parts[0].1.clone()).await;
+    assert!(inactive(&provider).unwrap().sealed);
+    for (name, payload) in &parts {
+        assert_eq!(
+            std::fs::read(tmp.path().join("images/vm1/bank_b").join(name)).unwrap(),
+            *payload
+        );
+    }
+}
+
+/// An addressed part whose bytes are not that part's digest is refused in
+/// the stream and nothing lands.
+#[tokio::test]
+async fn an_addressed_part_with_the_wrong_digest_is_refused_and_leaves_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let parts = parts();
+    let (backend, provider) = file_backend(tmp.path(), &nv, &key);
+
+    backend.start_flash().await.unwrap();
+    upload_part(&backend, "manifest", signed_manifest(&key, "vm1", &parts)).await;
+    // Another part's bytes under this name: a real part, the wrong digest.
+    backend
+        .receive_package_part("#kernel", stream_of(parts[1].1.clone()), None)
+        .await
+        .expect_err("refused");
+    assert!(files_under(&tmp.path().join("images/vm1/bank_b")).is_empty());
+    assert!(files_under(&tmp.path().join("images/vm1/staging")).is_empty());
+    assert!(inactive(&provider).unwrap().images.is_empty());
+    let record = provider.staging_record(Bank::B).unwrap().unwrap();
+    assert!(record.parts.is_empty());
+
+    upload_part(&backend, "#kernel", parts[0].1.clone()).await;
+    assert_eq!(image_names(&inactive(&provider).unwrap()), ["kernel"]);
+}
+
+/// A part id that names no part keeps the unnamed intake: by content on a
+/// file bank.
+#[tokio::test]
+async fn an_unresolvable_part_id_is_taken_by_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let parts = parts();
+    let (backend, provider) = file_backend(tmp.path(), &nv, &key);
+
+    backend.start_flash().await.unwrap();
+    upload_part(&backend, "manifest", signed_manifest(&key, "vm1", &parts)).await;
+    upload_part(&backend, "payload-2", parts[1].1.clone()).await;
+    assert_eq!(image_names(&inactive(&provider).unwrap()), ["rootfs.img"]);
+}
+
+/// The client's registration id, noted before `start_flash` (the order SOVDd
+/// calls them in), ends up in the record and in IVD key 7; noted again while
+/// the session is open, it renames the record.
+#[tokio::test]
+async fn note_update_id_before_start_flash_reaches_the_record_and_the_seal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let parts = parts();
+    let (backend, provider) = file_backend(tmp.path(), &nv, &key);
+
+    backend.note_update_id("upd-1").await.unwrap();
+    backend.start_flash().await.unwrap();
+    upload(&backend, signed_manifest(&key, "vm1", &parts)).await;
+    let record = provider.staging_record(Bank::B).unwrap().unwrap();
+    assert_eq!(record.update_id.as_deref(), Some("upd-1"));
+
+    upload(&backend, parts[0].1.clone()).await;
+    backend.note_update_id("upd-2").await.unwrap();
+    let record = provider.staging_record(Bank::B).unwrap().unwrap();
+    assert_eq!(
+        record.update_id.as_deref(),
+        Some("upd-2"),
+        "renamed in session"
+    );
+
+    upload(&backend, parts[1].1.clone()).await;
+    upload(&backend, parts[2].1.clone()).await;
+    let vm = hsm::ivd::read_manifest_unverified(&tmp.path().join("images/vm1/bank_b")).unwrap();
+    assert_eq!(vm.manifest.update_id.as_deref(), Some("upd-2"), "IVD key 7");
+}
+
+/// Preparing while parts arrive, Prepared once sealed — across a restart —
+/// and Executed in trial; a commit leaves nothing held.
+#[tokio::test]
+async fn held_updates_follow_the_facts_through_to_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let parts = parts();
+    let manifest = signed_manifest(&key, "vm1", &parts);
+
+    {
+        let (backend, _) = file_backend(tmp.path(), &nv, &key);
+        assert!(held(&backend).await.is_empty(), "nothing before an update");
+        backend.note_update_id("upd-3").await.unwrap();
+        backend.start_flash().await.unwrap();
+        upload(&backend, manifest.clone()).await;
+        upload(&backend, parts[0].1.clone()).await;
+        assert_eq!(
+            held(&backend).await,
+            [(
+                "upd-3".into(),
+                "B".into(),
+                HeldState::Preparing,
+                vec!["kernel".into()]
+            )]
+        );
+        upload(&backend, parts[1].1.clone()).await;
+        upload(&backend, parts[2].1.clone()).await;
+        assert_eq!(
+            held(&backend).await,
+            [(
+                "upd-3".into(),
+                "B".into(),
+                HeldState::Prepared,
+                names(&parts)
+            )]
+        );
+    } // restart between seal and activate
+
+    let (backend, provider) = file_backend(tmp.path(), &nv, &key);
+    assert_eq!(
+        held(&backend).await,
+        [(
+            "upd-3".into(),
+            "B".into(),
+            HeldState::Prepared,
+            names(&parts)
+        )],
+        "Prepared is a fact on disk"
+    );
+
+    // The client resumes: every part is kept, the bank seals at the manifest,
+    // and executing arms it — the record goes, the trial carries the update.
+    backend.note_update_id("upd-3").await.unwrap();
+    backend.start_flash().await.unwrap();
+    upload(&backend, manifest).await;
+    backend.finalize_flash().await.unwrap();
+    assert!(provider.staging_record(Bank::B).unwrap().is_none());
+    drop(backend);
+
+    // The node comes back up on the armed bank (no boot vector here: the
+    // provider reads it from NV at start).
+    let (backend, _) = file_backend(tmp.path(), &nv, &key);
+    assert_eq!(
+        held(&backend).await,
+        [(
+            "upd-3".into(),
+            "B".into(),
+            HeldState::Executed,
+            names(&parts)
+        )]
+    );
+
+    backend.commit_flash().await.unwrap();
+    assert!(
+        held(&backend).await.is_empty(),
+        "a committed bank is not held"
+    );
+}
+
+/// A rolled-back update is not held: the record went at activate and the
+/// trial is over.
+#[tokio::test]
+async fn a_rolled_back_update_is_not_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let parts = parts();
+    {
+        let (backend, _) = file_backend(tmp.path(), &nv, &key);
+        backend.note_update_id("upd-4").await.unwrap();
+        backend.start_flash().await.unwrap();
+        upload(&backend, signed_manifest(&key, "vm1", &parts)).await;
+        for (_, payload) in &parts {
+            upload(&backend, payload.clone()).await;
+        }
+        backend.finalize_flash().await.unwrap();
+    }
+    let (backend, provider) = file_backend(tmp.path(), &nv, &key);
+    assert_eq!(held(&backend).await[0].2, HeldState::Executed);
+    backend.rollback_flash().await.unwrap();
+    assert!(
+        held(&backend).await.is_empty(),
+        "a rolled-back bank is not held"
+    );
+    drop((backend, provider));
+
+    // Back on the committed bank after the reboot: still nothing.
+    let (backend, provider) = file_backend(tmp.path(), &nv, &key);
+    assert_eq!(provider.banks().unwrap().active.bank, Bank::A);
+    assert!(provider.staging_record(Bank::B).unwrap().is_none());
+    assert!(
+        held(&backend).await.is_empty(),
+        "a rolled-back bank is not held"
+    );
+}
+
+/// A record an abort stripped of its id is a part cache, not held.
+#[tokio::test]
+async fn a_record_without_an_id_is_not_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let parts = parts();
+    let (backend, provider) = file_backend(tmp.path(), &nv, &key);
+
+    backend.note_update_id("upd-5").await.unwrap();
+    let transfer = backend.start_flash().await.unwrap();
+    upload(&backend, signed_manifest(&key, "vm1", &parts)).await;
+    upload(&backend, parts[0].1.clone()).await;
+    assert_eq!(held(&backend).await.len(), 1);
+    backend.abort_flash(&transfer).await.unwrap();
+    assert!(provider.staging_record(Bank::B).unwrap().is_some());
+    assert!(held(&backend).await.is_empty());
+}
+
+/// Stage every part under `id`, execute, and come back up on the armed bank
+/// to commit it.
+async fn install_and_commit(tmp: &Path, nv: &Nv, key: &CoseKey, id: &str) {
+    let parts = parts();
+    {
+        let (backend, _) = file_backend(tmp, nv, key);
+        backend.note_update_id(id).await.unwrap();
+        backend.start_flash().await.unwrap();
+        upload(&backend, signed_manifest(key, "vm1", &parts)).await;
+        for (_, payload) in &parts {
+            upload(&backend, payload.clone()).await;
+        }
+        backend.finalize_flash().await.unwrap();
+    }
+    let (backend, _) = file_backend(tmp, nv, key);
+    backend.commit_flash().await.unwrap();
+}
+
+/// After a second committed update, the previous bank still carries the
+/// first update's seal and id, and is not held.
+#[tokio::test]
+async fn a_committed_previous_bank_is_not_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    install_and_commit(tmp.path(), &nv, &key, "upd-6").await;
+    install_and_commit(tmp.path(), &nv, &key, "upd-7").await;
+
+    let (backend, provider) = file_backend(tmp.path(), &nv, &key);
+    let banks = provider.banks().unwrap();
+    assert_eq!(banks.active.update_id.as_deref(), Some("upd-7"));
+    let previous = banks.inactive.expect("the previous bank is reported");
+    assert!(previous.sealed);
+    assert_eq!(previous.update_id.as_deref(), Some("upd-6"));
+    assert!(held(&backend).await.is_empty());
 }

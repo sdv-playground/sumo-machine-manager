@@ -10,14 +10,21 @@ what a consumer has to touch when it moves its pin.
 
 Tag on `35967a2` (2026-10-26), PRs #28, #29, #30.
 
-- deps: SOVDd v0.1.2 (x-update contract: explicit verbs, client-owned ids; backend hooks
-  `note_update_id`, `receive_package_part`, `held_updates`, not yet implemented here).
 - x-update: node verdict as `x-update-commit` / `x-update-rollback` operations (body: optional
   `nonce`); `x-update-verdict` stays as an alias until the x-ota names retire; OpenAPI and discovery
   list all three; the per-update path carriers follow SOVDd's `x-update-commit` /
   `x-update-rollback`.
 - deps: SOVDd v0.1.2 (x-update contract: explicit verbs, client-owned ids; backend hooks
-  `note_update_id`, `receive_package_part`, `held_updates`, not yet implemented here).
+  `note_update_id`, `receive_package_part`, `held_updates`).
+- The three SOVDd hooks, implemented: `note_update_id` records the client's registration id (into
+  the staging record when a session is open); `receive_package_part` takes a part named by its
+  payload `uri`, on-medium name or `#name` as that part, in any order, under its declared digest
+  (a present part is accepted with nothing written; an unresolved id keeps the unnamed intake);
+  `held_updates` reports `PREPARING` / `PREPARED` from the staging record with an id and
+  `EXECUTING` / `EXECUTED` from the armed bank's sealed id while its reset is pending / in trial.
+  `InstallRouterDiag` forwards `note_update_id` and `held_updates` to its engine.
+- `StagingRecord` gains `sealed` (serde default `false`, version unchanged): the seal marks the
+  record sealed over the sealed parts and keeps it; `activate` removes it.
 
 A half-staged update survives a restart and a reboot as facts the node can prove: the inactive
 bank's verified parts are kept and reported with their digests, a staging record beside the bank
@@ -27,8 +34,8 @@ still seals only from a complete manifest.
 - Staging record: `machine-contract` gains `StagingRecord` (`version`, `update_id`,
   `node_boot_id`, `started_unix`, `parts`) and `StagedPart` (`name`, `size`, `sha256` hex), with
   `BankProvider::staging_record` / `write_staging_record` (defaulted: no record). Every part is
-  noted in it before its upload is acknowledged; a seal removes it. An unreadable record reads as
-  absent.
+  noted in it before its upload is acknowledged; activate removes it, the seal marks it sealed. An
+  unreadable record reads as absent.
 - Keep by digest, no wipe at start: `start_flash` no longer clears the target bank. At the manifest,
   each part the record names is kept when it is the on-medium part of a manifest component, its
   recorded digest is that component's `image_digest`, and the bytes still hash to it;
@@ -58,8 +65,13 @@ Host-facing:
 - File-bank hosts gain `<set>/staging-<bank>.cbor` and `<set>/staging/<bank>/` beside the bank
   dirs; a payload is renamed from the latter into the bank, so both must sit on the bank's
   filesystem.
-- Partition-bank hosts gain the record beside the metadata dir; intake order is unchanged until the
-  addressed-part hook lands.
+- A host's factory reset calls `wipe_staging(set_dir)` (`component_mgr::bank_provider`) for every
+  file-bank set, so the staging record and temporary payloads are forgotten with the banks.
+- Partition-bank hosts gain the record beside the metadata dir.
+- Partition-bank hosts' intake is addressed (order-free) when the client names its parts; a client
+  that does not keeps manifest order.
+- The staging record's `update_id` comes from the client's registration (`note_update_id`); the
+  record now outlives the seal and is removed at activate.
 - Out-of-tree code that builds `BankContents` adds `update_id` and `sealed`; an exhaustive match on
   `BankError` adds `Unsupported`. Direct callers of the two `_at` signers add the `update_id`
   argument.

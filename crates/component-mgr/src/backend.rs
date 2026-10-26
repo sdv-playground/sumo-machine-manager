@@ -235,6 +235,22 @@ fn absent_parts(parts: &[usize], present: &BTreeSet<usize>) -> Vec<usize> {
         .collect()
 }
 
+/// The component of `parts` the client's `part_id` names: its payload `uri`
+/// (`#kernel`), its on-medium name (`kernel`), or that name behind a `#`.
+/// `None` when the id names no part of the manifest.
+fn resolve_part(
+    manifest: &sumo_onboard::manifest::Manifest,
+    parts: &[usize],
+    part_id: &str,
+) -> Option<usize> {
+    let bare = part_id.strip_prefix('#').unwrap_or(part_id);
+    parts.iter().copied().find(|&i| {
+        manifest.uri(i) == Some(part_id)
+            || crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))
+                .is_ok_and(|n| n == bare)
+    })
+}
+
 /// Where an uploaded file_id was placed, so `verify_part` can re-confirm
 /// the part's integrity post-upload.
 ///
@@ -477,7 +493,8 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// The client's id for the update being staged, when the executor was
     /// told it: written into the staging record at each manifest and part, and
     /// from there sealed into the bank. `None` until something sets it
-    /// ([`set_update_id`](Self::set_update_id)); an abort clears it.
+    /// ([`set_update_id`](Self::set_update_id), or the client's registration
+    /// through `note_update_id`); an abort clears it.
     update_id: Mutex<Option<String>>,
     /// The bank the ECU is actually running on. Only changes on ecu_reset().
     /// NV active_bank may differ after install (it's the "next boot" bank).
@@ -1984,6 +2001,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             parts,
+            sealed: false,
         }
     }
 
@@ -2886,19 +2904,26 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Handle payload upload (subsequent files in flash session).
     /// Streams directly through decrypt → decompress → verify → write to bank.
     ///
-    /// A provider that can stage bytes before their part is known (a file
-    /// bank) takes the payload by CONTENT: the stream lands in a staging file,
-    /// its inner digest names the manifest component it is, and only then is
-    /// it renamed into the bank as that component's part — so parts arrive in
-    /// any order. A provider that cannot (fixed devices) takes them in
-    /// manifest order, each streamed straight to its part.
+    /// A part the client names (`addressed`, a component index resolved by
+    /// [`resolve_part`]) is taken as that component: one the bank already
+    /// holds is accepted without a byte written; an absent one streams under
+    /// its declared digest — through a staging file renamed into the bank on
+    /// a provider that stages (a file bank), straight to its part on one that
+    /// cannot (fixed devices). Either way, parts arrive in any order.
+    ///
+    /// An unnamed part keeps the older intake: a provider that can stage bytes
+    /// before their part is known takes the payload by CONTENT — the stream
+    /// lands in a staging file, its inner digest names the manifest component
+    /// it is, and only then is it renamed into the bank as that component's
+    /// part. A provider that cannot takes them in manifest order, each
+    /// streamed straight to its part.
     async fn handle_payload_upload(
         &self,
         stream: PackageStream,
-        _content_length: Option<u64>,
+        addressed: Option<usize>,
     ) -> BackendResult<String> {
         // Extract session state
-        let (manifest_bytes, absent, total) = {
+        let (manifest_bytes, parts, present) = {
             let session = self.flash_session.lock().unwrap();
             match session.as_ref() {
                 Some(FlashSessionState::AwaitingPayload {
@@ -2906,11 +2931,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     parts,
                     present,
                     ..
-                }) => (
-                    manifest_bytes.clone(),
-                    absent_parts(parts, present),
-                    parts.len(),
-                ),
+                }) => (manifest_bytes.clone(), parts.clone(), present.clone()),
                 _ => {
                     return Err(BackendError::InvalidRequest(
                         "no active flash session".into(),
@@ -2918,13 +2939,8 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 }
             }
         };
-        // The next part in manifest order: what a sequential intake expects,
-        // and whose decryption context a content-addressed intake uses.
-        let Some(&next) = absent.first() else {
-            return Err(BackendError::InvalidRequest(
-                "every part of the manifest is already staged".into(),
-            ));
-        };
+        let absent = absent_parts(&parts, &present);
+        let total = parts.len();
 
         let key_unwrap = self.manifest_provider.key_unwrap_for_decryption();
 
@@ -2941,6 +2957,42 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
 
         let target_bank = self.determine_target_bank()?;
 
+        // A part the bank already holds, sent again: accepted as it stands,
+        // nothing written.
+        let already_staged = |i: usize, image_hash: [u8; 32]| -> BackendResult<String> {
+            let name = crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))?;
+            tracing::info!(component = i, part = %name, "payload is a part already staged — accepted, discarded");
+            let id = self.next_id();
+            self.uploaded_parts.lock().unwrap().insert(
+                id.clone(),
+                UploadedPartLocation::OnDisk {
+                    bank: target_bank,
+                    name,
+                    inner_sha256: image_hash,
+                },
+            );
+            Ok(id)
+        };
+        if let Some(i) = addressed.filter(|i| present.contains(i)) {
+            use futures::StreamExt;
+            let mut stream = stream;
+            while let Some(chunk) = stream.next().await {
+                chunk.map_err(|e| BackendError::Internal(format!("stream: {e}")))?;
+            }
+            let digest = <[u8; 32]>::try_from(digest_of(i)?.as_slice())
+                .map_err(|_| BackendError::Internal(format!("digest of component {i}")))?;
+            return already_staged(i, digest);
+        }
+
+        // The part this upload streams as: the one named, else the next in
+        // manifest order — what a sequential intake expects, and whose
+        // decryption context a content-addressed intake uses.
+        let Some(next) = addressed.or_else(|| absent.first().copied()) else {
+            return Err(BackendError::InvalidRequest(
+                "every part of the manifest is already staged".into(),
+            ));
+        };
+
         // Stream straight through: network → decrypt → decompress →
         // hash → sink. No on-disk ciphertext scratch — flash I/O
         // is the dominant cost on the device and writing the payload
@@ -2952,16 +3004,21 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         {
             Ok((writer, handle)) => {
                 tracing::info!(
-                    "processing payload ({} of {} parts still owed) — matched by content",
+                    "processing payload ({} of {} parts still owed) — {}",
                     absent.len(),
                     total,
+                    if addressed.is_some() {
+                        "addressed by name"
+                    } else {
+                        "matched by content"
+                    },
                 );
                 let processed = crate::streaming::process_payload_stream(
                     stream,
                     manifest_bytes.clone(),
                     next,
                     key_unwrap.clone(),
-                    None,
+                    addressed.map(digest_of).transpose()?,
                     writer,
                 )
                 .await;
@@ -2977,33 +3034,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                         .image_digest(*i)
                         .is_some_and(|d| d.0.bytes.as_slice() == image_hash.as_slice())
                 };
-                let Some(comp_idx) = absent.iter().copied().find(matches) else {
+                let found = addressed.or_else(|| absent.iter().copied().find(matches));
+                let Some(comp_idx) = found else {
                     let _ = self.bank_provider.discard_staged(target_bank, handle);
-                    let already = {
-                        let session = self.flash_session.lock().unwrap();
-                        match session.as_ref() {
-                            Some(FlashSessionState::AwaitingPayload { parts, .. }) => {
-                                parts.iter().copied().find(matches)
-                            }
-                            _ => None,
-                        }
-                    };
-                    // A part the bank already holds, sent again: accepted
-                    // as it stands, nothing written.
-                    if let Some(i) = already {
-                        let name =
-                            crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))?;
-                        tracing::info!(component = i, part = %name, "payload is a part already staged — accepted, discarded");
-                        let id = self.next_id();
-                        self.uploaded_parts.lock().unwrap().insert(
-                            id.clone(),
-                            UploadedPartLocation::OnDisk {
-                                bank: target_bank,
-                                name,
-                                inner_sha256: image_hash,
-                            },
-                        );
-                        return Ok(id);
+                    if let Some(i) = parts.iter().copied().find(matches) {
+                        return already_staged(i, image_hash);
                     }
                     return Err(BackendError::Internal(
                         "payload matches no component of the manifest".into(),
@@ -4664,7 +4699,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 return self.handle_manifest_upload(stream, content_length).await;
             }
             Some("payload") => {
-                return self.handle_payload_upload(stream, content_length).await;
+                return self.handle_payload_upload(stream, None).await;
             }
             _ => {
                 // No active flash session — legacy integrated envelope path
@@ -4774,6 +4809,47 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         );
 
         Ok(id)
+    }
+
+    /// A part the client names. While payloads are owed, a name that
+    /// resolves to a part of the manifest ([`resolve_part`]) is taken as that
+    /// part, in any order; one that resolves to nothing keeps the unnamed
+    /// intake. Anything else — the manifest, a legacy envelope — is
+    /// [`receive_package_stream`](Self::receive_package_stream).
+    async fn receive_package_part(
+        &self,
+        part_id: &str,
+        stream: PackageStream,
+        content_length: Option<u64>,
+    ) -> BackendResult<String> {
+        let addressed = {
+            let session = self.flash_session.lock().unwrap();
+            match session.as_ref() {
+                Some(FlashSessionState::AwaitingPayload {
+                    manifest_bytes,
+                    parts,
+                    ..
+                }) if part_id != "manifest" => {
+                    let envelope = sumo_codec::decode::decode_envelope(manifest_bytes)
+                        .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
+                    Some(resolve_part(
+                        &sumo_onboard::manifest::Manifest { envelope },
+                        parts,
+                        part_id,
+                    ))
+                }
+                _ => None,
+            }
+        };
+        match addressed {
+            Some(addressed) => {
+                if addressed.is_none() {
+                    tracing::info!(part = %part_id, "part id names no part of the manifest — unnamed intake");
+                }
+                self.handle_payload_upload(stream, addressed).await
+            }
+            None => self.receive_package_stream(stream, content_length).await,
+        }
     }
 
     async fn list_packages(&self) -> BackendResult<Vec<PackageInfo>> {
@@ -5999,6 +6075,103 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             // type, so the contract enum crosses the edge here.
             reset_kind: machine_mgr::reset_kind_to_sovd(self.reset_kind()),
         })
+    }
+
+    /// The client's id for the update being registered. Recorded before
+    /// `start_flash` (the registration order), so the manifest and every part
+    /// after it carry it; with a session already open, the staging record
+    /// the target bank keeps is renamed to it now.
+    async fn note_update_id(&self, update_id: &str) -> BackendResult<()> {
+        self.set_update_id(Some(update_id.to_string()));
+        if !self.flash_in_progress() {
+            return Ok(());
+        }
+        let bank = self.bank_provider.target_bank();
+        match self
+            .bank_provider
+            .staging_record(bank)
+            .map_err(|e| BackendError::Internal(format!("read staging record: {e}")))?
+        {
+            Some(mut rec) if rec.update_id.as_deref() != Some(update_id) => {
+                rec.update_id = Some(update_id.to_string());
+                self.bank_provider
+                    .write_staging_record(bank, Some(&rec))
+                    .map_err(|e| BackendError::Internal(format!("write staging record: {e}")))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The update this component holds, from its facts alone: the target
+    /// bank's staging record names one being staged (`Preparing`) or sealed
+    /// and not yet armed (`Prepared`); once armed, the record is gone and the
+    /// armed bank's sealed update id is `Executing` until the reboot is
+    /// observed, then `Executed` while the trial runs. A committed or
+    /// rolled-back component holds nothing; nor does a record without an id
+    /// (a part cache).
+    async fn held_updates(&self) -> BackendResult<Vec<HeldUpdate>> {
+        fn letter(bank: Bank) -> String {
+            match bank {
+                Bank::A => "A",
+                Bank::B => "B",
+            }
+            .to_string()
+        }
+        let mut held = Vec::new();
+        let bank = self.bank_provider.target_bank();
+        let record = self
+            .bank_provider
+            .staging_record(bank)
+            .map_err(|e| BackendError::Internal(format!("read staging record: {e}")))?;
+        if let Some(rec) = record {
+            if let Some(id) = rec.update_id {
+                held.push(HeldUpdate {
+                    id,
+                    bank: letter(bank),
+                    state: if rec.sealed {
+                        HeldState::Prepared
+                    } else {
+                        HeldState::Preparing
+                    },
+                    parts: rec
+                        .parts
+                        .into_iter()
+                        .map(|p| HeldPart {
+                            name: p.name,
+                            size: p.size,
+                            sha256: p.sha256,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        if let Some(banks) = self.bank_provider.banks() {
+            let state = if banks.pending_reset {
+                Some(HeldState::Executing)
+            } else if banks.in_trial {
+                Some(HeldState::Executed)
+            } else {
+                None
+            };
+            let active = banks.active;
+            if let (Some(state), Some(id)) = (state, active.update_id) {
+                held.push(HeldUpdate {
+                    id,
+                    bank: letter(active.bank),
+                    state,
+                    parts: active
+                        .images
+                        .into_iter()
+                        .map(|(name, img)| HeldPart {
+                            name,
+                            size: img.size,
+                            sha256: hex::encode(img.sha256),
+                        })
+                        .collect(),
+                });
+            }
+        }
+        Ok(held)
     }
 
     async fn commit_flash(&self) -> BackendResult<()> {

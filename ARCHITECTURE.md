@@ -609,6 +609,23 @@ that reset.
 An unsealed inactive bank reports the verified parts its staging record names, with
 `sealed: false`; each bank's `update_id` names the client's update when the executor was told it.
 
+Parts are addressed by name when the client names them (`receive_package_part`): the part id
+resolves to a manifest component by its payload `uri` (`#kernel`), its on-medium name, or that
+name behind a `#`. A part the bank already holds is accepted and nothing is written; an absent
+one streams under its declared digest, so a mismatch is refused in the stream. A file bank
+stages it and renames it into the bank as that part; a raw-partition bank streams it straight
+to that part's device. Either way parts arrive in any order, and a restart keeps the parts the
+record proves. A part id that resolves to nothing keeps the unnamed intake (content-addressed
+on a file bank, manifest order on a partition bank), as does every client that never names one.
+
+The updates a component holds (`held_updates`) are read from the same facts. The client's
+update id comes from its registration (`note_update_id`) into the staging record; the seal
+marks the record sealed and keeps it, and activating the bank removes it. A record with an id
+is `Preparing` until sealed and `Prepared` after; once armed, the active bank's sealed id is
+`Executing` while its node reset is pending and `Executed` while it runs in trial. After a
+commit or rollback nothing is held, and a record without an id (an abort cleared it) is a part
+cache.
+
 ### Node update transaction
 
 One update transaction at a time per ECU, coordinated by `NodeCoordinator`
