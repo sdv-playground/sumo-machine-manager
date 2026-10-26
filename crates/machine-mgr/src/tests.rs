@@ -593,6 +593,181 @@ fn seed_anchors_a_vector_with_no_committed_copy() {
     );
 }
 
+/// A fresh scratch directory for the seed tests that need side files.
+fn seed_scratch_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "machine-mgr-seed-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Over `store`: stage `os` and `vm1` at A, seal and commit; then stage `vm1`
+/// at B and seal, so a trial stands over a committed copy. Returns the trial's
+/// generation.
+fn stand_a_trial(store: Box<dyn crate::system_bank_state::SelectorStore>) -> u64 {
+    use crate::system_bank_state::SystemBankManager;
+    use nv_store::types::Bank;
+    use std::collections::BTreeMap;
+
+    let mut pre = SystemBankManager::load(store).unwrap();
+    pre.stage("os", Bank::A, BTreeMap::new());
+    pre.stage("vm1", Bank::A, BTreeMap::new());
+    pre.seal(None).unwrap();
+    pre.commit().unwrap();
+    pre.stage("vm1", Bank::B, BTreeMap::new());
+    pre.seal(None).unwrap();
+    assert!(pre.is_trial());
+    pre.generation()
+}
+
+#[test]
+fn seed_leaves_a_standing_trial_whose_committed_copy_is_gone() {
+    use crate::system_bank_state::BootRecord;
+    use crate::system_bank_state::{
+        InMemoryBootRecord, RecordCopy, RecordSelectorStore, SelectorStore, TestSigner,
+    };
+    use nv_store::types::Bank;
+
+    let dir = seed_scratch_dir("record-trial");
+    let record = InMemoryBootRecord::routing(["os"]);
+    let store = RecordSelectorStore::over(record.clone(), &dir, Box::new(TestSigner));
+    let trial = stand_a_trial(Box::new(store.clone()));
+
+    // The committed copy is gone; a fresh manager sees the trial's primary.
+    record.tear_committed();
+    let mut m = MachineRegistry::builder(entity("veh"))
+        .with_selector_store(Box::new(store.clone()))
+        .build()
+        .unwrap();
+    {
+        let sb = m.system_bank().read().unwrap();
+        assert_eq!(sb.committed_generation(), 0);
+        assert_eq!(sb.generation(), trial);
+        assert_eq!(sb.active_bank("vm1"), Some(Bank::B));
+    }
+    let primary = store.read_primary().unwrap();
+    let writes = record.write_count();
+
+    let os = nv_boot(Bank::A, true);
+    let vm1 = nv_boot(Bank::B, false);
+    for _ in 0..2 {
+        m.seed_selector([("os", &os), ("vm1", &vm1)]).unwrap();
+
+        assert_eq!(record.write_count(), writes, "no seal, no commit");
+        assert_eq!(store.read_primary().unwrap(), primary);
+        assert!(matches!(record.read(RecordCopy::Secondary), Ok(None)));
+        let sb = m.system_bank().read().unwrap();
+        assert_eq!(sb.generation(), trial);
+        assert_eq!(sb.committed_generation(), 0);
+        assert_eq!(sb.active_bank("vm1"), Some(Bank::B));
+        assert_eq!(sb.active_bank("os"), Some(Bank::A));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn seed_leaves_a_standing_trial_in_the_file_store_too() {
+    use crate::system_bank_state::{FileSelectorStore, SelectorStore, TestSigner};
+    use nv_store::types::Bank;
+
+    let dir = seed_scratch_dir("file-trial");
+    let store = FileSelectorStore::new(&dir, Box::new(TestSigner));
+    let trial = stand_a_trial(Box::new(store.clone()));
+
+    // The committed copy is gone.
+    std::fs::remove_file(dir.join("secondary")).unwrap();
+    let mut m = MachineRegistry::builder(entity("veh"))
+        .with_selector_store(Box::new(store.clone()))
+        .build()
+        .unwrap();
+    {
+        let sb = m.system_bank().read().unwrap();
+        assert_eq!(sb.committed_generation(), 0);
+        assert_eq!(sb.generation(), trial);
+    }
+    let primary_bytes = std::fs::read(dir.join("primary")).unwrap();
+
+    let os = nv_boot(Bank::A, true);
+    let vm1 = nv_boot(Bank::B, false);
+    for _ in 0..2 {
+        m.seed_selector([("os", &os), ("vm1", &vm1)]).unwrap();
+
+        assert_eq!(std::fs::read(dir.join("primary")).unwrap(), primary_bytes);
+        assert!(!dir.join("secondary").exists(), "no commit happened");
+        assert!(store.read_secondary().unwrap().is_none());
+        let sb = m.system_bank().read().unwrap();
+        assert_eq!(sb.generation(), trial);
+        assert_eq!(sb.committed_generation(), 0);
+        assert_eq!(sb.active_bank("vm1"), Some(Bank::B));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn seed_anchors_its_own_stopped_anchor_with_an_id_nv_holds_in_trial() {
+    use crate::system_bank_state::{InMemorySelectorStore, SelectorStore, Transaction};
+    use nv_store::types::Bank;
+    use std::collections::BTreeMap;
+
+    // The seed's own anchor stopped between seal and commit: both rows sit at
+    // the floor the seed stages (vm1's NV is in trial on B over A), and
+    // nothing is committed.
+    let store = InMemorySelectorStore::new();
+    let header = Transaction {
+        armed_boot_id: [0; 16],
+        trial_boots: 0,
+        counted_boot_id: [0; 16],
+        resolution: None,
+    };
+    let entry = |bank| nv_store::selector::ComponentEntry::new(bank, BTreeMap::new());
+    store
+        .activate(
+            &BTreeMap::from([
+                ("os".to_string(), entry(Bank::A)),
+                ("vm1".to_string(), entry(Bank::A)),
+            ]),
+            &header,
+        )
+        .unwrap();
+    let mut m = MachineRegistry::builder(entity("veh"))
+        .with_selector_store(Box::new(store.clone()))
+        .build()
+        .unwrap();
+    let stopped = {
+        let sb = m.system_bank().read().unwrap();
+        assert_eq!(sb.committed_generation(), 0);
+        sb.generation()
+    };
+
+    let os = nv_boot(Bank::A, true);
+    let vm1 = nv_boot(Bank::B, false);
+    m.seed_selector([("os", &os), ("vm1", &vm1)]).unwrap();
+
+    let secondary = store.read_secondary().unwrap().expect("anchored");
+    assert_eq!(
+        secondary.generation, stopped,
+        "the commit anchors the primary"
+    );
+    assert_eq!(secondary.entries["vm1"].bank, Bank::A);
+    let sb = m.system_bank().read().unwrap();
+    assert_eq!(sb.committed_generation(), stopped);
+    assert!(
+        sb.generation() > stopped,
+        "vm1 re-armed in a new generation"
+    );
+    assert!(sb.is_trial());
+    assert_eq!(sb.active_bank("vm1"), Some(Bank::B));
+    assert_eq!(sb.active_bank("os"), Some(Bank::A));
+    assert!(sb.component_in_trial("vm1"));
+    assert!(!sb.component_in_trial("os"));
+}
+
 #[test]
 fn registry_build_is_err_over_an_unreadable_store() {
     use crate::system_bank_state::{InMemoryBootRecord, RecordSelectorStore, TestSigner};

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
-use nv_store::types::BankBootState;
+use nv_store::types::{Bank, BankBootState};
 
 use crate::component::Component;
 use crate::node_update::NodeCoordinator;
@@ -152,18 +152,29 @@ impl MachineRegistry {
     /// trial without a verdict): the missing ids are seeded after the verdict.
     ///
     /// A vector with no committed copy is not a trial the node can resolve by
-    /// rollback: the seed anchors it by committing what stands, adding any
-    /// missing ids first — the ordinary sequence over the missing ids
-    /// (possibly none), with no trial guard and even when every id matches NV,
-    /// so a missing id NV holds in trial is re-armed over the new floor.
+    /// rollback. The seed anchors it — the ordinary sequence over the missing
+    /// ids (possibly none), then a commit — but only when every row it has an
+    /// NV view of stands at the floor it would itself stage (`active_bank`
+    /// where NV is committed, `active_bank.other()` where NV is in trial): the
+    /// seed's own stopped anchor, or a committed baseline whose committed copy
+    /// was lost. Any row not at that floor it leaves alone and writes nothing
+    /// (one ERROR line). A row at NV's `active_bank` while NV is in trial is a
+    /// standing trial whose committed copy is gone; a commit here would settle
+    /// it before any verdict and raise the floor for good, and a later rollback
+    /// verdict would find no trial in the vector. After the anchor every id NV
+    /// holds in trial whose row is at the floor is re-armed over the new floor,
+    /// not only the ids that were missing.
     ///
     /// The selector, not `NvBootState`, is the boot / VM-launch authority; this
     /// only gives it a starting selection. The host machine managers call it at
-    /// startup when the selector is empty — a fresh node, a factory reset, or a
-    /// copy that failed the store's check (read as absent by
-    /// [`SystemBankManager::load`]; a record that could not be read fails the
-    /// load and is never seeded) — or when some id has no entry (a vector
-    /// holding the boot stage's rows but no manager rows).
+    /// **every** start — it is idempotent and decides itself which case holds:
+    /// an empty selector (a fresh node, a factory reset, or a copy that failed
+    /// the store's check, read as absent by [`SystemBankManager::load`]; a
+    /// record that could not be read fails the load and is never seeded), an
+    /// id with no entry (a vector holding the boot stage's rows but no manager
+    /// rows), or a vector with no committed copy. The old host-side gate (empty
+    /// or missing ids) is no longer needed, and hid the same hole whenever an id
+    /// was missing.
     ///
     /// A failed selector write is returned as `Err`; the in-memory selector
     /// then holds whatever the last successful write left.
@@ -177,8 +188,31 @@ impl MachineRegistry {
         let mut entries: Vec<(&str, &BankBootState)> = entries.into_iter().collect();
         // No committed copy: not a trial the node can resolve by rollback.
         // The seed anchors it — the missing ids (possibly none) through the
-        // ordinary sequence — whatever NV says and whatever stands.
+        // ordinary sequence — when what stands is its own baseline.
         let unanchored = !sb.is_empty() && sb.committed_generation() == 0;
+        if unanchored {
+            // Anchor only the seed's own baseline: every row NV describes at
+            // the floor the seed itself would stage. Any other row is left
+            // alone; a standing trial among them is the verdict's to settle.
+            let standing: Vec<(&str, Bank, Bank)> = entries
+                .iter()
+                .filter_map(|(id, nv)| {
+                    let floor = nv_floor(nv);
+                    sb.active_bank(id)
+                        .filter(|bank| *bank != floor)
+                        .map(|bank| (*id, bank, floor))
+                })
+                .collect();
+            if !standing.is_empty() {
+                tracing::error!(
+                    standing = ?standing,
+                    generation = sb.generation(),
+                    "boot-vector: no committed copy, and the primary is not the seed's own baseline — {} rows are not at the floor NV describes. Nothing written; a standing trial is the verdict's to settle",
+                    standing.len()
+                );
+                return Ok(());
+            }
+        }
         if !unanchored
             && entries
                 .iter()
@@ -186,6 +220,7 @@ impl MachineRegistry {
         {
             return Ok(());
         }
+        let all = entries.clone();
         if !sb.is_empty() {
             let missing = sb.missing_entries(entries.iter().map(|(id, _)| *id));
             if !unanchored {
@@ -204,18 +239,30 @@ impl MachineRegistry {
             entries.retain(|(id, _)| missing.iter().any(|m| m == id));
         }
         for (id, nv) in &entries {
-            let floor = if nv.committed {
-                nv.active_bank
-            } else {
-                nv.active_bank.other()
-            };
-            sb.stage(id, floor, BTreeMap::new());
+            sb.stage(id, nv_floor(nv), BTreeMap::new());
         }
         // A no-op when nothing is staged (an anchor with no id missing).
         sb.seal(None)?;
         sb.commit()?;
-        for (id, nv) in entries.iter().filter(|(_, nv)| !nv.committed) {
-            sb.stage(id, nv.active_bank, BTreeMap::new());
+        // Re-arm the NV trials over the floor. Un-anchored: every id NV holds
+        // in trial whose row is at the floor (the missing ids just staged
+        // included), so a stopped anchor's trial survives. Anchored: only the
+        // ids just added — a row at the floor there may be a boot-stage
+        // rollback NV has not mirrored yet.
+        let rearm: Vec<(&str, Bank)> = if unanchored {
+            all.iter()
+                .filter(|(id, nv)| !nv.committed && sb.active_bank(id) == Some(nv_floor(nv)))
+                .map(|(id, nv)| (*id, nv.active_bank))
+                .collect()
+        } else {
+            entries
+                .iter()
+                .filter(|(_, nv)| !nv.committed)
+                .map(|(id, nv)| (*id, nv.active_bank))
+                .collect()
+        };
+        for (id, bank) in rearm {
+            sb.stage(id, bank, BTreeMap::new());
         }
         // A no-op when nothing is in trial: `seal` needs something staged.
         sb.seal(None)?;
@@ -304,6 +351,16 @@ impl MachineRegistry {
             }
         }
         out
+    }
+}
+
+/// The floor the seed stages for a set: its committed bank — `active_bank`
+/// where NV is committed, `active_bank.other()` where NV is in trial.
+fn nv_floor(nv: &BankBootState) -> Bank {
+    if nv.committed {
+        nv.active_bank
+    } else {
+        nv.active_bank.other()
     }
 }
 
