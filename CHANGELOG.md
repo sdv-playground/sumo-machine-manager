@@ -8,6 +8,31 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+A vector with no committed copy is anchored only when it is the seed's own baseline, and a rollback
+verdict rolls the boot vector back before NV, so neither path can settle or split a standing trial.
+
+- `MachineRegistry::seed_selector` anchors a vector with no committed copy only when every row it has
+  an NV view of stands at the floor the seed would itself stage (`active_bank` where NV is
+  committed, `active_bank.other()` where NV is in trial): the seed's own stopped anchor, or a
+  committed baseline whose committed copy was lost. Any row not at that floor it leaves alone: it
+  writes nothing and logs one ERROR line naming each such id, its row's bank and the floor. A row at
+  NV's `active_bank` while NV is in trial is a standing trial whose committed copy is gone;
+  committing there would settle the trial before any verdict and raise the floor for good, and a
+  later rollback verdict would find no trial in the vector. After the anchor, every id NV holds in
+  trial whose row is at the floor is re-armed, not only the ids that were missing.
+- `IvdBankProvider::rollback` checks the NV precondition first (`rollback_target`, refusing a
+  committed set with the error `ota::rollback` gives), then rolls the boot vector back, then NV. The
+  vector is the authority: a vector rollback that fails (`NoTrial`, e.g. a torn committed copy)
+  leaves NV untouched and in trial, and the caller sees the error.
+
+Host-facing:
+
+- Call `seed_selector` at every start and keep no gate of your own: the seed is idempotent and
+  decides which case holds. This supersedes the v0.1.16 line asking hosts to gate the seed on
+  `is_empty() || !missing_entries(ids).is_empty()`; that gate hid the same hole whenever an id was
+  missing.
+- No wire or API change.
+
 ## v0.1.17 — reads carry an error channel; the committed copy is the copy at the floor
 
 Tag on `969fba2` (2026-10-25), PR #24.
@@ -78,7 +103,8 @@ sumo's own side files, tied to the record by generation, through one mechanism f
 
 Host-facing: a file-store host changes nothing. A host with its own boot-stage record implements
 `BootRecord`, builds `RecordSelectorStore::over(record, dir, signer)`, gates the seed on
-`is_empty() || !missing_entries(ids).is_empty()`, and removes file-era `primary` / `secondary` from
+`is_empty() || !missing_entries(ids).is_empty()` (superseded in v0.1.18: call the seed at every
+start), and removes file-era `primary` / `secondary` from
 the directory at the switch. Every seal, VM-only updates included, is one record activate (one step
 of the record's generation counter). SOVDd pin stays v0.1.1.
 

@@ -311,7 +311,9 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
     /// `PartitionBankProvider::rollback`); it fails exactly as the `rollback` it
     /// precedes would — same error for a missing boot state and for a committed
     /// set with no trial to discard — so acting on the target first never
-    /// changes what the caller sees.
+    /// changes what the caller sees. [`rollback`](BankProvider::rollback)
+    /// itself relies on it as the NV precondition, checked before anything is
+    /// written.
     pub fn rollback_target(&self) -> Result<Bank, BankError> {
         let nv = self
             .nv
@@ -928,24 +930,29 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
     }
 
     fn rollback(&self) -> Result<(), BankError> {
-        {
-            let mut nv = self
-                .nv
-                .lock()
-                .map_err(|_| BankError::Failed("nv lock poisoned".into()))?;
-            ota::rollback(&mut nv, self.bank_set)
-                .map(|_| ())
-                .map_err(|e| BankError::Failed(e.to_string()))?;
-        }
-        // Dual-write: roll the selector's PRIMARY back to the committed floor
-        // (SECONDARY) — see the GLOBAL-op caveat on `activate`.
+        // The NV precondition first, before anything is written: a committed
+        // set is refused with the error `ota::rollback` would give.
+        let _target = self.rollback_target()?;
+        // Dual-write, the vector first: it is the authority, so it rolls its
+        // PRIMARY back to the committed floor (SECONDARY) and NV follows only
+        // on success — the same order `MachineRegistry::observe_node_boot`
+        // uses. A vector rollback that cannot find a trial (`NoTrial`, e.g.
+        // its committed copy is torn) therefore leaves NV in trial too,
+        // instead of splitting NV from the vector. See the GLOBAL-op caveat on
+        // `activate`.
         if let Some(sel) = &self.selector {
             sel.write()
                 .expect("selector poisoned")
                 .rollback(machine_mgr::system_bank_state::Reason::Verdict)
                 .map_err(|e| BankError::Failed(format!("boot-vector rollback failed: {e}")))?;
         }
-        Ok(())
+        let mut nv = self
+            .nv
+            .lock()
+            .map_err(|_| BankError::Failed("nv lock poisoned".into()))?;
+        ota::rollback(&mut nv, self.bank_set)
+            .map(|_| ())
+            .map_err(|e| BankError::Failed(e.to_string()))
     }
 
     fn can_persist_disabled_record(&self) -> Result<(), BankError> {
@@ -1280,6 +1287,99 @@ mod tests {
         store.set_fail_writes(false);
         p.commit().expect("retry commit");
         assert!(!selector.read().unwrap().is_trial());
+    }
+
+    /// Put `set` of `nv` into trial (`committed = false`) on `active`.
+    fn nv_enter_trial(nv: &Arc<Mutex<NvStore<MemBlockDevice>>>, set: BankSet, active: Bank) {
+        let mut g = nv.lock().unwrap();
+        let mut state = g.read_boot_state().unwrap();
+        state.banks[set.as_index()].active_bank = active;
+        state.banks[set.as_index()].committed = false;
+        g.write_boot_state(&mut state).unwrap();
+    }
+
+    /// `(active_bank, committed)` of `set` as NV reads it.
+    fn nv_bank_state(nv: &Arc<Mutex<NvStore<MemBlockDevice>>>, set: BankSet) -> (Bank, bool) {
+        let state = nv.lock().unwrap().read_boot_state().unwrap();
+        let b = &state.banks[set.as_index()];
+        (b.active_bank, b.committed)
+    }
+
+    #[test]
+    fn rollback_rolls_the_vector_back_then_nv() {
+        let set = slots::VM1;
+        let nv = nv_with_active(set, Bank::B);
+        nv_enter_trial(&nv, set, Bank::B);
+        // Vector trial on B over the committed floor A.
+        let (selector, _store) = selector_with_store("vm1", Bank::A);
+        {
+            let mut g = selector.write().unwrap();
+            g.stage("vm1", Bank::B, BTreeMap::new());
+            assert!(g.seal(None).unwrap());
+        }
+        assert!(selector.read().unwrap().is_trial());
+        let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
+
+        p.rollback().expect("rollback");
+
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::A));
+        assert!(!selector.read().unwrap().is_trial());
+        assert_eq!(nv_bank_state(&nv, set), (Bank::A, true));
+    }
+
+    #[test]
+    fn rollback_leaves_nv_in_trial_when_the_vector_rollback_fails() {
+        let set = slots::VM1;
+        let nv = nv_with_active(set, Bank::B);
+        nv_enter_trial(&nv, set, Bank::B);
+        // Sealed on B but never committed: no committed copy, so the vector
+        // is in trial yet has nothing to roll back to.
+        let selector = selector_with("vm1", Bank::B);
+        assert!(selector.read().unwrap().is_trial());
+        let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
+
+        let err = p.rollback().expect_err("vector rollback must fail");
+
+        assert!(
+            err.to_string().contains("boot-vector rollback failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            nv_bank_state(&nv, set),
+            (Bank::B, false),
+            "NV untouched: still in trial on B"
+        );
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::B));
+    }
+
+    #[test]
+    fn rollback_refuses_a_committed_set_before_touching_the_vector() {
+        let set = slots::VM1;
+        // NV committed on A.
+        let nv = nv_with_active(set, Bank::A);
+        assert_eq!(nv_bank_state(&nv, set), (Bank::A, true));
+        // Vector in a real trial: committed A, primary B.
+        let (selector, _store) = selector_with_store("vm1", Bank::A);
+        {
+            let mut g = selector.write().unwrap();
+            g.stage("vm1", Bank::B, BTreeMap::new());
+            assert!(g.seal(None).unwrap());
+        }
+        let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
+
+        let err = p.rollback().expect_err("committed set refuses rollback");
+
+        assert!(
+            err.to_string()
+                .contains(&ota::OtaError::NotInTrial.to_string()),
+            "unexpected error: {err}"
+        );
+        assert!(
+            selector.read().unwrap().is_trial(),
+            "vector not rolled back"
+        );
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::B));
+        assert_eq!(nv_bank_state(&nv, set), (Bank::A, true));
     }
 
     // ---------------------------------------------------------------------
