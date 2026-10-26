@@ -8,10 +8,14 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- deps: SOVDd v0.1.2 (x-update contract: explicit verbs, client-owned ids; backend hooks
+  `note_update_id`, `receive_package_part`, `held_updates`, not yet implemented here).
 - x-update: node verdict as `x-update-commit` / `x-update-rollback` operations (body: optional
   `nonce`); `x-update-verdict` stays as an alias until the x-ota names retire; OpenAPI and discovery
   list all three; the per-update path carriers follow SOVDd's `x-update-commit` /
   `x-update-rollback`.
+- deps: SOVDd v0.1.2 (x-update contract: explicit verbs, client-owned ids; backend hooks
+  `note_update_id`, `receive_package_part`, `held_updates`, not yet implemented here).
 
 A half-staged update survives a restart and a reboot as facts the node can prove: the inactive
 bank's verified parts are kept and reported with their digests, a staging record beside the bank
@@ -47,6 +51,8 @@ still seals only from a complete manifest.
 Host-facing:
 
 - Verdict operations: hosts inherit the routes through `node_verdict_router`; no host change beyond the pin.
+- SOVDd v0.1.2 refuses a registration without `id` (400): every client that registers an update sends
+  one (the sumo-sovd engine already does).
 - File-bank hosts gain `<set>/staging-<bank>.cbor` and `<set>/staging/<bank>/` beside the bank
   dirs; a payload is renamed from the latter into the bank, so both must sit on the bank's
   filesystem.

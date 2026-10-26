@@ -13,7 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tracing = "0.1"
-sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.1" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.2" }
 nv-store = { path = "../nv-store" }
 # The synchronous bank traits + `ResetKind`. Re-exported wholesale below the
 # `bank_provider` / `bank_activator` / `deactivator` / `image_record` module
