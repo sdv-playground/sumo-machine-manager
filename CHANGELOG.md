@@ -6,6 +6,14 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- deps: SOVDd v0.1.3 — the embedded server lists, describes and reports the updates this executor
+  holds (`held_updates`) and marks parts `present`; no wire change for clients that do not use the
+  listing.
+
+Host-facing: pin bump only.
+
 ## v0.1.20 — the SOVDd hooks implemented; the staging record outlives the seal; wipe_staging
 
 Tag on `524cfa3` (2026-10-26), PR #32.
