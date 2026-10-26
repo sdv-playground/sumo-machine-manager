@@ -40,6 +40,13 @@ use sumo_offboard::ImageManifestBuilder;
 
 // --- Test helpers ---
 
+/// A fresh client update id. SOVDd refuses a registration without one, and
+/// the id is the catalog key, so two registrations in one router never share it.
+fn next_update_id() -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!("upd-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 struct TestKeys {
     signing_key: sumo_offboard::CoseKey,
     trust_anchor: Vec<u8>,
@@ -441,14 +448,14 @@ async fn flash_full_suit_flow() {
     let image = vec![0xBB; 2048];
     let envelope = make_test_suit_envelope(&keys, "vm1", 2, &image);
 
-    // 1. POST /updates — server allocates update_id and calls
-    //    backend.start_flash up-front (puts ComponentBackend in
+    // 1. POST /updates — the client's id becomes the update_id; the server
+    //    calls backend.start_flash up-front (puts ComponentBackend in
     //    AwaitingManifest so the upload goes through the staging
     //    pipeline, not the legacy integrated-envelope path).
     let (status, body) = post_json(
         &router,
         "/vehicle/v1/components/vm1/updates",
-        serde_json::json!({}),
+        serde_json::json!({"id": "upd-flash-full-suit-flow"}),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
@@ -538,11 +545,11 @@ async fn get_update_detail_enriched_from_suit_manifest() {
         "Quarterly security rollup",
     );
 
-    // Register the update (server allocates the id + opens a flash session).
+    // Register the update under the client's id (opens a flash session).
     let (status, body) = post_json(
         &router,
         "/vehicle/v1/components/vm1/updates",
-        serde_json::json!({}),
+        serde_json::json!({"id": "upd-update-detail"}),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
@@ -644,7 +651,7 @@ async fn flash_to_awaiting_verdict(
     let (status, body) = post_json(
         router,
         &format!("/vehicle/v1/components/{component}/updates"),
-        serde_json::json!({}),
+        serde_json::json!({"id": next_update_id()}),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
@@ -980,7 +987,7 @@ async fn register_and_upload_manifest(
     let (status, body) = post_json(
         router,
         &format!("/vehicle/v1/components/{component}/updates"),
-        serde_json::json!({}),
+        serde_json::json!({"id": next_update_id()}),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
@@ -1270,7 +1277,7 @@ async fn armed_pre_reboot_component_does_not_block_a_sibling_open() {
     let (status, body) = post_json(
         &router,
         "/vehicle/v1/components/vm2/updates",
-        serde_json::json!({}),
+        serde_json::json!({"id": next_update_id()}),
     )
     .await;
     assert_eq!(
@@ -1313,7 +1320,7 @@ async fn live_trial_still_refuses_a_new_flash() {
     let (status, body) = post_json(
         &router,
         "/vehicle/v1/components/vm2/updates",
-        serde_json::json!({}),
+        serde_json::json!({"id": next_update_id()}),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "open_update: {body}");

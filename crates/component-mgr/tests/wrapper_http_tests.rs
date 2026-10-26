@@ -155,7 +155,7 @@ async fn read_spec_status_through_wrapper() {
         .oneshot(
             Request::post("/vehicle/v1/components/vm1/updates")
                 .header("content-type", "application/json")
-                .body(Body::from("{}"))
+                .body(Body::from(r#"{"id":"upd-spec-status"}"#))
                 .unwrap(),
         )
         .await

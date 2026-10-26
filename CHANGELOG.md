@@ -12,8 +12,12 @@ what a consumer has to touch when it moves its pin.
   `nonce`); `x-update-verdict` stays as an alias until the x-ota names retire; OpenAPI and discovery
   list all three; the per-update path carriers follow SOVDd's `x-update-commit` /
   `x-update-rollback`.
+- deps: SOVDd v0.1.2 (x-update contract: explicit verbs, client-owned ids; backend hooks
+  `note_update_id`, `receive_package_part`, `held_updates`, not yet implemented here).
 
 Host-facing: hosts inherit the routes through `node_verdict_router`; no host change beyond the pin.
+SOVDd v0.1.2 refuses a registration without `id` (400): every client that registers an update sends
+one (the sumo-sovd engine already does).
 
 ## v0.1.18 — the seed anchors only its own baseline; the vector rolls back before NV
 
