@@ -477,7 +477,8 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// The client's id for the update being staged, when the executor was
     /// told it: written into the staging record at each manifest and part, and
     /// from there sealed into the bank. `None` until something sets it
-    /// ([`set_update_id`](Self::set_update_id)); an abort clears it.
+    /// ([`set_update_id`](Self::set_update_id), or the client's registration
+    /// through `note_update_id`); an abort clears it.
     update_id: Mutex<Option<String>>,
     /// The bank the ECU is actually running on. Only changes on ecu_reset().
     /// NV active_bank may differ after install (it's the "next boot" bank).
@@ -5999,6 +6000,31 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             // type, so the contract enum crosses the edge here.
             reset_kind: machine_mgr::reset_kind_to_sovd(self.reset_kind()),
         })
+    }
+
+    /// The client's id for the update being registered. Recorded before
+    /// `start_flash` (the registration order), so the manifest and every part
+    /// after it carry it; with a session already open, the staging record
+    /// the target bank keeps is renamed to it now.
+    async fn note_update_id(&self, update_id: &str) -> BackendResult<()> {
+        self.set_update_id(Some(update_id.to_string()));
+        if !self.flash_in_progress() {
+            return Ok(());
+        }
+        let bank = self.bank_provider.target_bank();
+        match self
+            .bank_provider
+            .staging_record(bank)
+            .map_err(|e| BackendError::Internal(format!("read staging record: {e}")))?
+        {
+            Some(mut rec) if rec.update_id.as_deref() != Some(update_id) => {
+                rec.update_id = Some(update_id.to_string());
+                self.bank_provider
+                    .write_staging_record(bank, Some(&rec))
+                    .map_err(|e| BackendError::Internal(format!("write staging record: {e}")))
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn commit_flash(&self) -> BackendResult<()> {
