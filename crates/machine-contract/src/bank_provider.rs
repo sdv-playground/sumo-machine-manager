@@ -103,10 +103,11 @@ pub struct BankContents {
     pub sealed: bool,
 }
 
-/// What an unsealed bank holds toward an update, kept beside the bank so a
-/// half-staged update survives a restart as facts: each part the bank holds,
-/// verified against the digest it was staged under. The bank's seal removes
-/// it; a record without an `update_id` is a part cache, not a held update.
+/// What a bank holds toward an update not yet armed, kept beside the bank so
+/// a half-staged or prepared update survives a restart as facts: each part
+/// the bank holds, verified against the digest it was staged under. The
+/// bank's seal marks it `sealed`; activating the bank removes it. A record
+/// without an `update_id` is a part cache, not a held update.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StagingRecord {
     /// Record layout version, `1`.
@@ -120,6 +121,11 @@ pub struct StagingRecord {
     pub started_unix: u64,
     /// The parts the bank holds, each verified on intake.
     pub parts: Vec<StagedPart>,
+    /// The bank is sealed over exactly `parts` and not yet activated: the
+    /// update is prepared. Absent (`false`) in a record written before the
+    /// field existed.
+    #[serde(default)]
+    pub sealed: bool,
 }
 
 impl StagingRecord {
@@ -215,8 +221,8 @@ impl From<std::io::Error> for BankError {
 /// Lifecycle the engine drives for an install:
 /// `prune_target` (keep the parts the staging record proves) →
 /// `open_staging_writer` + `commit_staged`, or `open_payload_writer`, per part
-/// (each noted in the staging record) → `seal` (removes the record) →
-/// `activate` → (trial reboot) → `commit` | `rollback`.
+/// (each noted in the staging record) → `seal` (marks the record sealed) →
+/// `activate` (removes the record) → (trial reboot) → `commit` | `rollback`.
 pub trait BankProvider: Send + Sync {
     /// The bank currently booted / active.
     fn active_bank(&self) -> Bank;

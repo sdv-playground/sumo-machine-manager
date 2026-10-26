@@ -226,6 +226,18 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.upload_via_install_pipeline(stream).await
     }
 
+    // The update id and the held updates are the engine's facts (its staging
+    // record and bank seals). `receive_package_part` keeps the default: a
+    // named part still goes through the router, unnamed, so the
+    // container-vs-VM decision is made for it.
+    async fn note_update_id(&self, update_id: &str) -> BackendResult<()> {
+        self.engine.note_update_id(update_id).await
+    }
+
+    async fn held_updates(&self) -> BackendResult<Vec<HeldUpdate>> {
+        self.engine.held_updates().await
+    }
+
     async fn start_flash(&self) -> BackendResult<String> {
         match self.router.start_install().await {
             Ok(session) => Ok(session.id.to_string()),

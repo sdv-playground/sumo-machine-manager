@@ -486,7 +486,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         )
         .map_err(|e| BankError::Failed(format!("partition bank seal: ivd sign: {e}")))?;
         tracing::info!(metadata_dir = %metadata_dir.display(), gen, "partition bank sealed (IVD signed over partition hash)");
-        self.inner.clear_staging(bank);
+        self.inner.seal_staging(bank);
         Ok(())
     }
 
@@ -1488,6 +1488,7 @@ mod tests {
                 size: 19,
                 sha256: "ab".repeat(32),
             }],
+            sealed: false,
         };
         p.write_staging_record(Bank::B, Some(&rec)).unwrap();
         assert_eq!(p.staging_record(Bank::B).unwrap(), Some(rec));

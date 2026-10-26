@@ -30,7 +30,7 @@ use nv_store::types::{Bank, BankSet};
 
 use machine_mgr::bank_provider::{
     BankContents, BankError, BankProvider, ComponentBanks, FirmwareIdentity, InstalledFile,
-    InstalledFirmware, StagingHandle, StagingRecord,
+    InstalledFirmware, StagedPart, StagingHandle, StagingRecord,
 };
 use machine_mgr::{ImageEntry, ResetKind};
 
@@ -489,12 +489,28 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         self.read_staging_record(bank).and_then(|r| r.update_id)
     }
 
-    /// The bank is sealed: its staging record and staging leftovers are no
-    /// longer facts about it. Best-effort — a record left behind names parts
-    /// the next manifest re-verifies anyway.
-    pub(crate) fn clear_staging(&self, bank: Bank) {
-        if let Err(e) = self.store_staging_record(bank, None) {
-            tracing::warn!(bank = ?bank, error = %e, "staging record not removed after seal");
+    /// The bank is sealed: its staging record is marked `sealed`, with the
+    /// sealed manifest's images as its parts (the seal may have settled parts
+    /// the stream did not ship), and the staging leftovers go. The record
+    /// stays until the bank is activated — it is what makes the update
+    /// prepared. Best-effort — a record left unmarked names parts the next
+    /// manifest re-verifies anyway.
+    pub(crate) fn seal_staging(&self, bank: Bank) {
+        if let Some(mut record) = self.read_staging_record(bank) {
+            record.sealed = true;
+            record.parts = self
+                .read_bank(bank)
+                .images
+                .into_iter()
+                .map(|(name, img)| StagedPart {
+                    name,
+                    size: img.size,
+                    sha256: hex::encode(img.sha256),
+                })
+                .collect();
+            if let Err(e) = self.store_staging_record(bank, Some(&record)) {
+                tracing::warn!(bank = ?bank, error = %e, "staging record not marked sealed");
+            }
         }
         self.clear_staging_dir(bank);
     }
@@ -979,7 +995,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             gen,
             "ivd sign OK",
         );
-        self.clear_staging(bank);
+        self.seal_staging(bank);
         Ok(())
     }
 
@@ -1142,6 +1158,12 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
                 "boot-vector NOT written — no selector wired to this provider (the activated \
                  bank will not be reflected in the boot selector)"
             );
+        }
+        // The bank is armed: the update is no longer staged or prepared, and
+        // its record is no longer a fact about it. Best-effort — the bank's
+        // seal and the trial state carry the update from here.
+        if let Err(e) = self.store_staging_record(bank, None) {
+            tracing::warn!(bank = ?bank, error = %e, "staging record not removed at activate");
         }
         Ok(self.reset_kind())
     }
@@ -2038,11 +2060,12 @@ mod tests {
             update_id: update_id.map(str::to_owned),
             node_boot_id: Some("boot-a".into()),
             started_unix: 1_700_000_000,
-            parts: vec![machine_mgr::bank_provider::StagedPart {
+            parts: vec![StagedPart {
                 name: "rootfs.img".into(),
                 size: 4,
                 sha256: "00".repeat(32),
             }],
+            sealed: false,
         }
     }
 

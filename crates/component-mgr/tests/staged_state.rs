@@ -258,10 +258,12 @@ async fn a_half_staged_update_survives_a_restart_and_seals_with_its_id() {
         image_names(&sealed),
         ["kernel", "rootfs.img", "vm-config.yaml"]
     );
-    assert!(
-        !tmp.path().join("images/vm1/staging-bank_b.cbor").exists(),
-        "the seal removes the staging record"
-    );
+    let record = provider
+        .staging_record(Bank::B)
+        .unwrap()
+        .expect("the seal keeps the record");
+    assert!(record.sealed, "the seal marks the record sealed");
+    assert_eq!(record.update_id.as_deref(), Some("upd-7"));
     assert!(!tmp.path().join("images/vm1/staging/bank_b").exists());
 }
 
@@ -434,10 +436,10 @@ async fn the_seal_attests_only_the_parts() {
 }
 
 /// A partition bank writes its record beside the metadata dir as parts
-/// arrive (in manifest order, as before), leaves the devices to the stream,
-/// and the seal removes the record.
+/// arrive (in manifest order), leaves the devices to the stream; the seal
+/// marks the record sealed and activate removes it.
 #[tokio::test]
-async fn partition_bank_keeps_a_record_and_the_seal_removes_it() {
+async fn partition_bank_keeps_a_record_the_seal_marks_it_and_activate_removes_it() {
     let tmp = tempfile::tempdir().unwrap();
     let nv = fresh_nv();
     let key = keygen::generate_signing_key(keygen::ES256).unwrap();
@@ -512,7 +514,10 @@ async fn partition_bank_keeps_a_record_and_the_seal_removes_it() {
 
     upload(&backend, parts[1].1.clone()).await;
     assert!(provider.read_installed(Bank::B).is_ok(), "sealed");
-    assert!(!record.exists(), "the seal removes the record");
+    assert!(record.is_file(), "the seal keeps the record");
+    assert!(provider.staging_record(Bank::B).unwrap().unwrap().sealed);
+    provider.activate(Bank::B).unwrap();
+    assert!(!record.exists(), "activate removes the record");
 }
 
 /// `prune_target` leaves partition devices alone: they are not files of the

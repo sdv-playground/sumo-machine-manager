@@ -2001,6 +2001,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             parts,
+            sealed: false,
         }
     }
 
@@ -6099,6 +6100,78 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             }
             _ => Ok(()),
         }
+    }
+
+    /// The update this component holds, from its facts alone: the target
+    /// bank's staging record names one being staged (`Preparing`) or sealed
+    /// and not yet armed (`Prepared`); once armed, the record is gone and the
+    /// armed bank's sealed update id is `Executing` until the reboot is
+    /// observed, then `Executed` while the trial runs. A committed or
+    /// rolled-back component holds nothing; nor does a record without an id
+    /// (a part cache).
+    async fn held_updates(&self) -> BackendResult<Vec<HeldUpdate>> {
+        fn letter(bank: Bank) -> String {
+            match bank {
+                Bank::A => "A",
+                Bank::B => "B",
+            }
+            .to_string()
+        }
+        let mut held = Vec::new();
+        let bank = self.bank_provider.target_bank();
+        let record = self
+            .bank_provider
+            .staging_record(bank)
+            .map_err(|e| BackendError::Internal(format!("read staging record: {e}")))?;
+        if let Some(rec) = record {
+            if let Some(id) = rec.update_id {
+                held.push(HeldUpdate {
+                    id,
+                    bank: letter(bank),
+                    state: if rec.sealed {
+                        HeldState::Prepared
+                    } else {
+                        HeldState::Preparing
+                    },
+                    parts: rec
+                        .parts
+                        .into_iter()
+                        .map(|p| HeldPart {
+                            name: p.name,
+                            size: p.size,
+                            sha256: p.sha256,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        if let Some(banks) = self.bank_provider.banks() {
+            let state = if banks.pending_reset {
+                Some(HeldState::Executing)
+            } else if banks.in_trial {
+                Some(HeldState::Executed)
+            } else {
+                None
+            };
+            let active = banks.active;
+            if let (Some(state), Some(id)) = (state, active.update_id) {
+                held.push(HeldUpdate {
+                    id,
+                    bank: letter(active.bank),
+                    state,
+                    parts: active
+                        .images
+                        .into_iter()
+                        .map(|(name, img)| HeldPart {
+                            name,
+                            size: img.size,
+                            sha256: hex::encode(img.sha256),
+                        })
+                        .collect(),
+                });
+            }
+        }
+        Ok(held)
     }
 
     async fn commit_flash(&self) -> BackendResult<()> {
