@@ -97,6 +97,10 @@ impl QnxRunner {
         format!("qvmdisk-{vm_name}")
     }
 
+    fn rootfs_device(vm_name: &str) -> String {
+        format!("/dev/{}0", Self::rootfs_prefix(vm_name))
+    }
+
     /// Prefix an extra-disk devb-loopback registers under in `/dev`. Single
     /// hyphen — matches the rootfs `qvmdisk-{vm}` pattern. Empirically, two
     /// hyphens in the prefix made the device node never appear (devb-loopback
@@ -303,6 +307,24 @@ fn splice_verity_cmdline(base: &str, frag: &str) -> String {
     out
 }
 
+/// True if a non-comment `hostdev` line of a qvm.conf names `device` (a leading
+/// `<` read-only / `>` output marker is ignored). The runner only spawns a
+/// devb-loopback for a node the conf actually wires: a conf that backs a bank
+/// image directly with `hostdev <file` (relative to the bank dir, like
+/// `load kernel`) needs no loopback, and skipping it keeps the image openable
+/// by the verifier / seeder instead of EBUSY behind a second opener.
+fn conf_references_hostdev(conf: &str, device: &str) -> bool {
+    conf.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or("").trim();
+        match line.strip_prefix("hostdev") {
+            Some(arg) if arg.starts_with(char::is_whitespace) => {
+                arg.trim().trim_start_matches(['<', '>']) == device
+            }
+            _ => false,
+        }
+    })
+}
+
 impl VmRunner for QnxRunner {
     /// Slay orphan qvm + devb-loopback for this VM. Called by
     /// VmManager BEFORE the pre-launch verify hook runs so the
@@ -357,10 +379,28 @@ impl VmRunner for QnxRunner {
             self.vm_name = Some(name.to_string());
         }
 
+        // A loopback is spawned only for a /dev node the bank's qvm.conf wires as
+        // a `hostdev` (see `conf_references_hostdev`); an image the conf backs
+        // directly with `hostdev <file` gets none. The conf ships in the same
+        // bank as the images, so the two always agree — including on rollback.
+        // Unreadable conf → spawn, as before.
+        let conf_text = std::fs::read_to_string(&qvm_config).ok();
+        let wired = |device: &str| {
+            conf_text
+                .as_deref()
+                .is_none_or(|conf| conf_references_hostdev(conf, device))
+        };
+
         // Rootfs: per-VM prefix lets multiple VMs run concurrently with
         // distinct /dev/qvmdisk-vmX0 nodes.
         if let Some(rootfs) = def.rootfs_path() {
-            if rootfs.exists() {
+            if !wired(&Self::rootfs_device(name)) {
+                tracing::info!(
+                    vm = %name, path = %rootfs.display(),
+                    "rootfs not wired as {} in qvm.conf — file-backed, no loopback",
+                    Self::rootfs_device(name)
+                );
+            } else if rootfs.exists() {
                 let prefix = Self::rootfs_prefix(name);
                 self.spawn_loopback(&prefix, &rootfs)?;
             } else {
@@ -381,12 +421,18 @@ impl VmRunner for QnxRunner {
         // missing source is skipped (the guest just doesn't see it).
         for part in &def.partitions {
             let path = def.partition_path(part);
-            if path.exists() {
+            let device = Self::extra_device(name, &part.role);
+            if !wired(&device) {
+                tracing::info!(
+                    vm = %name, role = %part.role, path = %path.display(),
+                    "partition not wired as {device} in qvm.conf — file-backed, no loopback"
+                );
+            } else if path.exists() {
                 let prefix = Self::extra_prefix(name, &part.role);
                 self.spawn_loopback(&prefix, &path)?;
                 tracing::info!(
                     vm = %name, role = %part.role,
-                    device = %Self::extra_device(name, &part.role),
+                    device = %device,
                     path = %path.display(),
                     "partition attached"
                 );
@@ -411,9 +457,16 @@ impl VmRunner for QnxRunner {
                 );
                 continue;
             }
+            let device = Self::extra_device(name, &disk.role);
+            if !wired(&device) {
+                tracing::info!(
+                    vm = %name, role = %disk.role, path = %disk.path.display(),
+                    "extra disk not wired as {device} in qvm.conf — file-backed, no loopback"
+                );
+                continue;
+            }
             let prefix = Self::extra_prefix(name, &disk.role);
             self.spawn_loopback(&prefix, &disk.path)?;
-            let device = Self::extra_device(name, &disk.role);
             tracing::info!(vm = %name, role = %disk.role, device, path = %disk.path.display(), "extra disk attached");
         }
 
@@ -425,8 +478,8 @@ impl VmRunner for QnxRunner {
         // Run qvm FROM the bank dir (the dir holding this qvm.conf, which also
         // holds the kernel) so the conf's relative `load kernel` resolves to the
         // selector-chosen bank's kernel — bank-agnostic, no `current` symlink
-        // (retired). Everything else in the conf is an absolute /dev/... node the
-        // setup above created, so cwd affects only the kernel load.
+        // (retired). The same cwd resolves relative file-backed `hostdev <file`
+        // entries to this bank's images.
         let bank_dir = qvm_config.parent().unwrap_or_else(|| Path::new("."));
 
         // dm-verity guests ship a `verity-cmdline` bank part — the
@@ -650,5 +703,69 @@ mod verity_splice_tests {
             splice_verity_cmdline(base, "dm-mod.create=\"y\" root=/dev/dm-0 ro"),
             base
         );
+    }
+}
+
+#[cfg(test)]
+mod hostdev_reference_tests {
+    use super::{conf_references_hostdev, QnxRunner};
+
+    const CONF: &str = "\
+# Rootfs: hostdev /dev/qvmcab-vm10 mentioned only in a comment
+vdev virtio-blk
+        loc 0x1c0d0000
+        hostdev /dev/qvmdisk-vm10
+        name virtio-blk_rootfs
+vdev virtio-blk
+        hostdev <sumo-config
+vdev virtio-blk
+        hostdev </dev/qvmtpf-vm10 # trailing comment
+vdev pl011
+        hostdev >-
+#        hostdev /dev/qvmdiag-vm10
+";
+
+    #[test]
+    fn plain_and_readonly_device_hostdevs_are_wired() {
+        assert!(conf_references_hostdev(
+            CONF,
+            &QnxRunner::rootfs_device("vm1")
+        ));
+        assert!(conf_references_hostdev(
+            CONF,
+            &QnxRunner::extra_device("vm1", "tpf")
+        ));
+    }
+
+    #[test]
+    fn file_backed_commented_and_other_vm_devices_are_not_wired() {
+        // `hostdev <sumo-config` backs the image directly — no loopback node.
+        assert!(!conf_references_hostdev(
+            CONF,
+            &QnxRunner::extra_device("vm1", "cfg")
+        ));
+        // Only in a comment (whole-line and inline).
+        assert!(!conf_references_hostdev(
+            CONF,
+            &QnxRunner::extra_device("vm1", "diag")
+        ));
+        assert!(!conf_references_hostdev(
+            CONF,
+            &QnxRunner::extra_device("vm1", "cab")
+        ));
+        // Another VM's node, and a prefix of a wired one.
+        assert!(!conf_references_hostdev(
+            CONF,
+            &QnxRunner::rootfs_device("vm2")
+        ));
+        assert!(!conf_references_hostdev(CONF, "/dev/qvmdisk-vm1"));
+    }
+
+    #[test]
+    fn hostdev_must_be_a_whole_keyword() {
+        assert!(!conf_references_hostdev(
+            "hostdevice /dev/qvmdisk-vm10\n",
+            &QnxRunner::rootfs_device("vm1")
+        ));
     }
 }
