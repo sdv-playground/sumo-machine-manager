@@ -6,6 +6,14 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- vm-mgr (QNX runner): the per-VM qvm console file follows the VM's `serial_log` in
+  vm-service.yaml when it is an absolute path; without one it stays
+  `/mnt/common-rw/log/<name>-console.log`. **Host-facing:** a host without
+  `/mnt/common-rw` (e.g. the CVC 21-layout secure-boot host) sets
+  `serial_log: /var/log/mmgr/<vm>-console.log` per VM; nothing to do otherwise.
+
 ## v0.1.21 — SOVDd v0.1.3, held updates served
 
 Tag on `03aeb27` (2026-10-26), PR #34.
