@@ -165,6 +165,10 @@ what a consumer has to touch when it moves its pin.
   Verified: a scripted sequence (seed, activate, trial boots, commit, activate, rollback, reseed after
   deleting the primary) with the deterministic test signer writes byte-identical files and returns
   identical values before and after.
+- hsm: a `LinkBClient` made by `connect` survives its backend restarting. A call that meets a dead
+  connection fails and drops it (the op is not retried: it may have run), and the next call
+  connects to the same socket again. `link_b::spawn_backend` starts a backend without connecting,
+  with the command `spawn_and_connect` runs. **Host-facing:** none.
 
 ## v0.1.29 — SOVDd v0.1.12: /v1 execute is orchestrated without x-ota-control
 
