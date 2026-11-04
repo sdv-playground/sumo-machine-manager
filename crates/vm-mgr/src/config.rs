@@ -169,8 +169,10 @@ pub struct VmDefinition {
     /// architecture default.
     #[serde(default)]
     pub cpu_model: Option<String>,
-    /// Optional absolute path for QEMU serial output. When set, the display and
-    /// monitor are disabled and the guest serial console is written to this path.
+    /// Optional absolute path for the guest console. QEMU: the display and
+    /// monitor are disabled and the guest serial console is written here. QNX
+    /// (qvm): qvm's stdout/stderr — the guest console — are appended here instead
+    /// of the default `/mnt/common-rw/log/<name>-console.log`.
     #[serde(default)]
     pub serial_log: Option<PathBuf>,
     /// Bank-set base for this VM's kernel + rootfs (e.g.
