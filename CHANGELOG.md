@@ -6,6 +6,13 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- vhsm-server: a KEY_GENERATE the backend refuses for want of a slot (`HsmError::KeyNotFound`)
+  answers `INVALID_PARAM`, as an unsupported algorithm already did, not `INTERNAL`. A failed
+  KEY_GENERATE removes the handle it allocated, so no entry without a key stays in the table.
+  **Host-facing:** none; a guest that matched `INTERNAL` for such a refusal sees `INVALID_PARAM`.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.
