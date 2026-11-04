@@ -283,6 +283,23 @@ fn stub_example_does_not_conform() {
         "I4 (counter present) must pass — the stub now lists the time-floor:\n{inv}"
     );
 
+    // GET_SLOT_BACKING answers from the same slot map: a key in a (hypothetical)
+    // hardware slot is hardware, a virtual anchor is a public key the service
+    // keeps itself, and an unknown handle has no slot.
+    use hsm::{HsmError, KeyHandle, SlotBacking};
+    assert_eq!(
+        client.slot_backing(KeyHandle(0x0006)).unwrap(),
+        SlotBacking::Hardware
+    );
+    assert_eq!(
+        client.slot_backing(KeyHandle(0x0005)).unwrap(),
+        SlotBacking::Software
+    );
+    assert!(matches!(
+        client.slot_backing(KeyHandle(0x000B)),
+        Err(HsmError::KeyNotFound(_))
+    ));
+
     drop(client);
     let _ = child.kill();
     let _ = child.wait();

@@ -31,7 +31,9 @@ pub use types::*;
 // the `hsm-contract` crate; re-export so existing `hsm::HsmCryptoProvider` /
 // `hsm::HsmError` / `hsm::SlotInfo` / `hsm::SlotKind` / `hsm::KeyType` /
 // `hsm::KeyHandle` paths keep resolving.
-pub use hsm_contract::{HsmCryptoProvider, HsmError, KeyHandle, KeyType, SlotInfo, SlotKind};
+pub use hsm_contract::{
+    HsmCryptoProvider, HsmError, KeyHandle, KeyType, SlotBacking, SlotInfo, SlotKind,
+};
 // Re-export the wire/slot-registry crate so consumers can map key_id ↔ handle
 // (e.g. component-mgr's CSR endpoint) without taking a separate dependency.
 pub use vhsm_proto;
@@ -179,6 +181,17 @@ pub trait HsmProvider: Send {
         Err(HsmError::NotSupported(
             "HsmProvider::raise_monotonic".into(),
         ))
+    }
+
+    /// What holds slot `handle`'s material: the HSM, a software key sealed under
+    /// it, or plain software ([`SlotBacking`]). `KeyNotFound` for a handle the
+    /// backend has no slot for.
+    ///
+    /// Default impl returns `NotSupported`, which a caller reads as "unknown":
+    /// a backend that predates the question cannot answer it.
+    fn slot_backing(&self, handle: KeyHandle) -> Result<SlotBacking, HsmError> {
+        let _ = handle;
+        Err(HsmError::NotSupported("HsmProvider::slot_backing".into()))
     }
 }
 
