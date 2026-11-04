@@ -6,24 +6,26 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
-## Unreleased
+## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
+
+Tag on `bb2ad95` (2026-11-04), PR #36, #37.
 
 - vm-mgr: `QnxRunner::start()` spawns a `devb-loopback` for the rootfs, a `partitions:` entry or a
   `disks:` entry only when a non-comment `hostdev` line in the bank's `qvm.conf` names that `/dev`
   node (a leading `<`/`>` is ignored). An image the conf backs directly with `hostdev <file`
   (relative to the bank dir) gets no loopback and logs `… not wired as /dev/… in qvm.conf —
   file-backed, no loopback`, so it stays openable by the pre-launch verify and the bank seeder
-  instead of `EBUSY`. A conf that wires `/dev` nodes, and an unreadable conf, keep the old behaviour.
-
-Host-facing: no config change needed. A bank whose `qvm.conf` uses `hostdev <file` for its rootfs
-and declares `partitions: []` needs a host with this version; an older host still holds the file
-behind its loopback and qvm fails with `EBUSY`.
-
+  instead of `EBUSY`. A conf that wires `/dev` nodes, and an unreadable conf, keep the old behaviour
+  (PR #36, LYNXION-9004).
 - vm-mgr (QNX runner): the per-VM qvm console file follows the VM's `serial_log` in
-  vm-service.yaml when it is an absolute path; without one it stays
-  `/mnt/common-rw/log/<name>-console.log`. **Host-facing:** a host without
-  `/mnt/common-rw` (e.g. the CVC 21-layout secure-boot host) sets
-  `serial_log: /var/log/mmgr/<vm>-console.log` per VM; nothing to do otherwise.
+  vm-service.yaml when it is an absolute path; a relative one is ignored with a warning; without
+  one it stays `/mnt/common-rw/log/<name>-console.log` (PR #37, LYNXION-9028).
+
+Host-facing: no config change needed on a host that has `/mnt/common-rw`. A host without it (e.g.
+the CVC 21-layout secure-boot host) sets `serial_log: /var/log/mmgr/<vm>-console.log` per VM. A
+bank whose `qvm.conf` uses `hostdev <file` for its rootfs and declares `partitions: []` needs a host
+with this version; an older host still holds the file behind its loopback and qvm fails with
+`EBUSY`.
 
 ## v0.1.21 — SOVDd v0.1.3, held updates served
 
