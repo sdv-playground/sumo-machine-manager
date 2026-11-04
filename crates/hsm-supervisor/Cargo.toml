@@ -10,8 +10,8 @@ and the vhsm-ssd proxy guests reach over /dev/vhsm. Deliberately dep-light \
 must not be reachable only from a machine manager that also links SOVD."""
 
 [dependencies]
-# `HsmProvider` (what standup returns), `link_b::{spawn_and_connect, LinkBClient}`
-# (the backend handshake) and `LinkBProvider` (the wrapper that IS the node's
+# `HsmProvider` (what standup returns), `link_b::{spawn_and_connect, spawn_backend, LinkBClient}`
+# (the backend handshake, and its respawn) and `LinkBProvider` (the wrapper that IS the node's
 # HsmProvider once the daemon lifecycle is owned locally).
 hsm = { path = "../hsm" }
 tracing = "0.1"
