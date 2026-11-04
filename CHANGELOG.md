@@ -16,6 +16,11 @@ what a consumer has to touch when it moves its pin.
   changes. **Host-facing:** none; a host with a provisioning window (a lifecycle read, say)
   passes it as the gate.
 
+- hsm-sim-backend: `SimHsm`'s PROVISION checks a re-provision against the installed key authority
+  alone. One that is installed but cannot be read refuses the envelope; it used to fall back to
+  the factory key. A keystore provisioned without a key authority keeps the factory key, as
+  before. **Host-facing:** none.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.

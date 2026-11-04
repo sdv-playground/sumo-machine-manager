@@ -569,11 +569,28 @@ impl SimHsm {
         Ok(keys)
     }
 
+    /// The anchor a provisioning envelope must verify against: the factory
+    /// signing key for a first provision, then the installed key authority. A
+    /// keystore provisioned without a key authority keeps the factory key. One
+    /// that is installed but cannot be read is an error, never a fallback to the
+    /// publicly known factory key.
+    #[cfg(feature = "suit")]
+    fn provisioning_anchor(&self, is_factory: bool) -> Result<Vec<u8>, HsmError> {
+        let installed = self
+            .keys_dir()
+            .join(format!("{}.pub", KeyRole::KeyAuthority.key_id()))
+            .exists();
+        if is_factory || !installed {
+            return Ok(Self::factory_provisioning_authority());
+        }
+        self.get_public_key(KeyRole::KeyAuthority)
+    }
+
     /// Extract the CBOR payload from a SUIT envelope.
     ///
     /// All envelopes are encrypted to the device decryption key (slot 2).
-    /// Signature is verified against the provisioning authority (factory signing
-    /// key on first provision, key authority from HSM on subsequent ones).
+    /// Signature is verified against the provisioning authority
+    /// ([`Self::provisioning_anchor`]).
     #[cfg(feature = "suit")]
     fn extract_payload(
         &self,
@@ -586,14 +603,7 @@ impl SimHsm {
 
         let crypto = RustCryptoBackend::new();
 
-        // Select trust anchor: factory signing key for first provision,
-        // key authority from HSM for subsequent ones.
-        let trust_anchor = if is_factory {
-            Self::factory_provisioning_authority()
-        } else {
-            self.get_public_key(KeyRole::KeyAuthority)
-                .unwrap_or_else(|_| Self::factory_provisioning_authority())
-        };
+        let trust_anchor = self.provisioning_anchor(is_factory)?;
 
         let mut validator = Validator::new(&trust_anchor, None);
         if !is_factory {
@@ -1395,6 +1405,41 @@ mod tests {
         assert_eq!(got, der);
         // An unprovisioned anchor id is a clean error (delegation stays OFF).
         assert!(hsm.get_trust_anchor_der("nope").is_err());
+    }
+
+    /// The provisioning anchor: the factory key for a first provision, and for a
+    /// keystore provisioned without a key authority. Once one is installed it is
+    /// the only anchor, and one that cannot be read refuses instead of falling
+    /// back to the factory key.
+    #[test]
+    #[cfg(all(feature = "suit", feature = "crypto"))]
+    fn an_unreadable_key_authority_refuses_instead_of_trusting_the_factory_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hsm = SimHsm::new(tmp.path().to_path_buf());
+        hsm.write_keystore(&sample_keystore()).unwrap();
+        let factory = SimHsm::factory_provisioning_authority();
+        let key_authority = hsm.keys_dir().join("key-authority.pub");
+
+        // Provisioned, no key authority installed: the factory key stays.
+        assert_eq!(hsm.provisioning_anchor(true).unwrap(), factory);
+        assert_eq!(hsm.provisioning_anchor(false).unwrap(), factory);
+
+        // Installed and readable: it is the anchor.
+        let signer = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let point = signer.verifying_key().to_encoded_point(false);
+        write_pem_ec_public(&key_authority, point.as_bytes()).unwrap();
+        let installed = hsm.provisioning_anchor(false).unwrap();
+        assert_ne!(installed, factory);
+        assert_eq!(
+            installed,
+            hsm.get_public_key(KeyRole::KeyAuthority).unwrap()
+        );
+
+        // Installed but unreadable: refused. A first provision still takes the
+        // factory key.
+        std::fs::write(&key_authority, "not a PEM public key").unwrap();
+        assert!(hsm.provisioning_anchor(false).is_err());
+        assert_eq!(hsm.provisioning_anchor(true).unwrap(), factory);
     }
 
     #[test]
