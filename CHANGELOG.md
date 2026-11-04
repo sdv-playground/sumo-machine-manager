@@ -13,6 +13,11 @@ what a consumer has to touch when it moves its pin.
   KEY_GENERATE removes the handle it allocated, so no entry without a key stays in the table.
   **Host-facing:** none; a guest that matched `INTERNAL` for such a refusal sees `INVALID_PARAM`.
 
+- vhsm-server: `dispatch_request` persists exactly the handle a successful, persistent KEY_GENERATE
+  answered with. It used to persist the table's last entry whenever the table grew, so a failed
+  generate could be persisted, and two concurrent generates could persist one entry twice and
+  lose the other. **Host-facing:** none.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.
