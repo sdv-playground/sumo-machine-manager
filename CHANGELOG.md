@@ -169,6 +169,12 @@ what a consumer has to touch when it moves its pin.
   connection fails and drops it (the op is not retried: it may have run), and the next call
   connects to the same socket again. `link_b::spawn_backend` starts a backend without connecting,
   with the command `spawn_and_connect` runs. **Host-facing:** none.
+- hsm-supervisor: a watchdog respawns the link-B backend when it exits, with the same command,
+  after a delay that starts at 1 s and doubles while the backend keeps dying within a minute (at
+  most 30 s). The node's link-B client and vhsm-ssd's reconnect on their next call, so a backend
+  crash no longer needs a node restart. `HsmDaemons::shutdown` stops the watchdog first.
+  **Host-facing:** `HsmDaemons::backend_child` is now `Arc<Mutex<Child>>`; code that touched it
+  locks it first.
 
 ## v0.1.29 — SOVDd v0.1.12: /v1 execute is orchestrated without x-ota-control
 
