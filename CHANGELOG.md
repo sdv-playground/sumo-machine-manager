@@ -6,6 +6,21 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- component-mgr: the ECU id (the token `aud`, and the HSM component's device id) can come from the
+  host. `sovd::identity::EcuId` is `Thumbprint` (the device-key thumbprint, as before),
+  `Injected(id)` or `Unavailable`. `HsmAuthorizerDeps::ecu_id`, `FactoryDeps::ecu_id` (passed to
+  `ComponentAdapter::with_ecu_id`) and a new `build_authorizer_now` argument carry it. With no id
+  (an empty one, `Unavailable`, or no device key under `Thumbprint`) the authorizer trusts no
+  issuer. It used to check tokens against `aud = ""`, which every ECU without a device key
+  accepted alike.
+
+Host-facing: code that builds `HsmAuthorizerDeps` or `FactoryDeps` adds `ecu_id`
+(`EcuId::Thumbprint` keeps today's id); direct callers of `build_authorizer_now` pass `&EcuId`.
+A device with neither a device-decrypt key nor an injected id now rejects every token on the
+enforcing surfaces.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.

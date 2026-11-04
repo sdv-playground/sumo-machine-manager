@@ -347,6 +347,47 @@ async fn get_device_id_returns_a_stable_device_key_thumbprint() {
     assert_eq!(id, again, "stable across calls");
 }
 
+/// A host-injected id is the device id, whatever the device key holds. An id the
+/// host marks unavailable is none: the thumbprint does not stand in for it.
+#[tokio::test]
+async fn get_device_id_reports_the_injected_id_and_falls_back_to_nothing() {
+    use component_mgr::sovd::identity::EcuId;
+    use std::path::PathBuf;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let keystore = PathBuf::from(tmp.path());
+    let setup = hsm_sim_backend::SimHsm::new(keystore.clone());
+    setup.ensure_device_keys().expect("device keys created");
+
+    let hsm_adapter = |ecu_id: EcuId| {
+        let vm = vm_backend(
+            "hsm",
+            make_nv(),
+            slots::HSM,
+            ComponentConfig {
+                supports_rollback: false,
+                single_bank: true,
+                entity_type: "hsm".into(),
+                log_sources: Vec::new(),
+                test_agent_url: None,
+                diag_agent_url: None,
+                host_diagnostics: false,
+            },
+        );
+        ComponentAdapter::new(vm)
+            .with_csr_keystore(keystore.clone())
+            .with_ecu_id(ecu_id)
+    };
+
+    let injected = hsm_adapter(EcuId::Injected("4b334ebada044b60".into()));
+    assert_eq!(
+        injected.get_device_id().await.expect("ok").as_deref(),
+        Some("4b334ebada044b60")
+    );
+    let unavailable = hsm_adapter(EcuId::Unavailable);
+    assert_eq!(unavailable.get_device_id().await.expect("ok"), None);
+}
+
 #[tokio::test]
 async fn abort_install_clears_session_pre_finalize() {
     use machine_mgr::FlashId;
