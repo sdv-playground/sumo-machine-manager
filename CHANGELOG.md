@@ -19,6 +19,12 @@ Host-facing: no config change needed. A bank whose `qvm.conf` uses `hostdev <fil
 and declares `partitions: []` needs a host with this version; an older host still holds the file
 behind its loopback and qvm fails with `EBUSY`.
 
+- vm-mgr (QNX runner): the per-VM qvm console file follows the VM's `serial_log` in
+  vm-service.yaml when it is an absolute path; without one it stays
+  `/mnt/common-rw/log/<name>-console.log`. **Host-facing:** a host without
+  `/mnt/common-rw` (e.g. the CVC 21-layout secure-boot host) sets
+  `serial_log: /var/log/mmgr/<vm>-console.log` per VM; nothing to do otherwise.
+
 ## v0.1.21 — SOVDd v0.1.3, held updates served
 
 Tag on `03aeb27` (2026-10-26), PR #34.

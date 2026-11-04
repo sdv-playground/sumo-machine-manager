@@ -9,7 +9,7 @@
 //! `VmManager` via `HeartbeatDevice` + `PowerCommandDevice` over the
 //! configured `DeviceTransport`. The runner has nothing to do with it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -278,6 +278,27 @@ fn wait_for_device(path: &str, timeout: Duration) -> Result<(), RunnerError> {
     )))
 }
 
+/// The per-VM qvm console file: the VM's `serial_log` when it is an absolute
+/// path, else `/mnt/common-rw/log/<name>-console.log` (the managed-cvc host-bank
+/// layout this runner was written for). A host without `/mnt/common-rw` sets
+/// `serial_log` in vm-service.yaml; a relative one is ignored with a warning,
+/// since it would resolve against whatever the service's cwd happens to be.
+fn console_path(name: &str, def: &VmDefinition) -> PathBuf {
+    match &def.serial_log {
+        Some(p) if p.is_absolute() => p.clone(),
+        Some(p) => {
+            tracing::warn!(vm = %name, serial_log = %p.display(),
+                "serial_log is not absolute — ignored, qvm console goes to the default path");
+            default_console_path(name)
+        }
+        None => default_console_path(name),
+    }
+}
+
+fn default_console_path(name: &str) -> PathBuf {
+    PathBuf::from(format!("/mnt/common-rw/log/{name}-console.log"))
+}
+
 /// Splice a dm-verity `dm-mod.create=… root=/dev/dm-0 ro` fragment into the
 /// first `cmdline "…"` line of a qvm.conf, escaping the fragment's inner `"` as
 /// `\"` (qvm's `cmdline` value is itself a double-quoted string). Returns `base`
@@ -520,12 +541,12 @@ impl VmRunner for QnxRunner {
         // the in-guest log-agent (surfaced over SOVD §7.21); this console file is a
         // separate best-effort capture, per VM, for boot-time / no-agent debugging.
         // Best-effort: if the file won't open we fall back to inherited fds rather
-        // than block the launch (a missing /mnt/common-rw/log must not stop a VM).
-        let console_path = format!("/mnt/common-rw/log/{name}-console.log");
+        // than block the launch (a missing log dir must not stop a VM).
+        let console_file = console_path(name, def);
         let console = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&console_path);
+            .open(&console_file);
         let mut cmd = Command::new("qvm");
         cmd.current_dir(bank_dir)
             .arg(format!("@{}", launch_config.display()));
@@ -537,10 +558,10 @@ impl VmRunner for QnxRunner {
                 })?;
                 cmd.stdout(std::process::Stdio::from(f))
                     .stderr(std::process::Stdio::from(f2));
-                tracing::info!(vm = %name, console = %console_path, "qvm console → per-VM file (kept out of the host log)");
+                tracing::info!(vm = %name, console = %console_file.display(), "qvm console → per-VM file (kept out of the host log)");
             }
             Err(e) => {
-                tracing::warn!(vm = %name, console = %console_path, error = %e,
+                tracing::warn!(vm = %name, console = %console_file.display(), error = %e,
                     "could not open per-VM console file — qvm console falls back to inherited fds (may leak into the host log)");
             }
         }
@@ -767,5 +788,41 @@ vdev pl011
             "hostdevice /dev/qvmdisk-vm10\n",
             &QnxRunner::rootfs_device("vm1")
         ));
+    }
+}
+
+#[cfg(test)]
+mod console_path_tests {
+    use super::console_path;
+    use crate::config::VmDefinition;
+    use std::path::PathBuf;
+
+    fn def(extra: &str) -> VmDefinition {
+        serde_yaml::from_str(&format!("backend: qnx\nimage_dir: /mnt/vm1_root\n{extra}"))
+            .expect("VmDefinition yaml")
+    }
+
+    #[test]
+    fn defaults_to_the_common_rw_log_dir() {
+        assert_eq!(
+            console_path("vm1", &def("")),
+            PathBuf::from("/mnt/common-rw/log/vm1-console.log")
+        );
+    }
+
+    #[test]
+    fn an_absolute_serial_log_wins() {
+        assert_eq!(
+            console_path("vm1", &def("serial_log: /var/log/mmgr/vm1-console.log\n")),
+            PathBuf::from("/var/log/mmgr/vm1-console.log")
+        );
+    }
+
+    #[test]
+    fn a_relative_serial_log_falls_back_to_the_default() {
+        assert_eq!(
+            console_path("vm1", &def("serial_log: log/vm1-console.log\n")),
+            PathBuf::from("/mnt/common-rw/log/vm1-console.log")
+        );
     }
 }
