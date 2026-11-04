@@ -1247,4 +1247,84 @@ mod tests {
             "an unreadable identity root must be reported, got: {err}"
         );
     }
+
+    /// No host-only handle is reachable from a guest, even under a policy that
+    /// grants every principal every op on every handle. `init_handle_table`
+    /// registers only the `guest_exposed` slots, so a guest's request on a
+    /// host-only core handle, or on a handle the platform vhsmd serves, finds no
+    /// entry. Every core key exists on disk here, host-only ones included, so the
+    /// registry's flag is the only thing keeping them out.
+    #[test]
+    fn a_guest_granted_everything_reaches_no_host_only_handle() {
+        use vhsm_server::handler::handle_request;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sim = SimHsm::new(dir.path().to_path_buf());
+        for slot in SUMO_CORE_SLOTS.iter().filter(|s| s.alg != ALG_MONOTONIC) {
+            sim.generate_key(hsm::KeyHandle(slot.handle), slot.alg)
+                .unwrap_or_else(|e| panic!("generate {}: {e}", slot.key_id));
+        }
+
+        let mut table = init_handle_table(&sim);
+        for slot in SUMO_CORE_SLOTS {
+            assert_eq!(
+                table.get(slot.handle).is_some(),
+                slot.guest_exposed,
+                "{} (0x{:04x}) registered iff guest-exposed",
+                slot.key_id,
+                slot.handle
+            );
+        }
+
+        let iam = IamPolicy::parse(
+            r#"
+version: 1
+statements:
+  - principals: ["*"]
+    handles: ["*"]
+    ops: ["*"]
+"#,
+        )
+        .expect("grant-everything policy parses");
+        let guest = CallerId {
+            peer_ip: "10.0.200.2".parse().expect("ip"),
+            vm_id: "vm1".to_string(),
+            cert_thumbprint: [0u8; 32],
+        };
+
+        let host_only = SUMO_CORE_SLOTS
+            .iter()
+            .filter(|s| !s.guest_exposed)
+            .map(|s| s.handle)
+            .chain([HANDLE_SIL_AUTH_VER, HANDLE_RPMB_HMAC, HANDLE_DEVICE_UUID]);
+        for handle in host_only {
+            for op in [
+                Op::Encrypt,
+                Op::Decrypt,
+                Op::MacGenerate,
+                Op::MacVerify,
+                Op::Sign,
+                Op::Verify,
+                Op::GetHandleInfo,
+                Op::GetPubkey,
+                Op::GetCert,
+            ] {
+                // The handle, then enough bytes to pass every op's length check,
+                // so the answer is the handle lookup's.
+                let mut payload = handle.to_le_bytes().to_vec();
+                payload.extend_from_slice(&[0u8; 64]);
+                let req = Request {
+                    op: op as u32,
+                    session_id: 1,
+                    payload,
+                };
+                let (resp, _) = handle_request(&req, &guest, &mut table, &iam, &sim);
+                assert_eq!(
+                    resp.status,
+                    StatusCode::InvalidHandle as u32,
+                    "{op:?} on host-only handle 0x{handle:04x}"
+                );
+            }
+        }
+    }
 }
