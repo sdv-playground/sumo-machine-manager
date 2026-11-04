@@ -6,6 +6,19 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- vm-mgr: `QnxRunner::start()` spawns a `devb-loopback` for the rootfs, a `partitions:` entry or a
+  `disks:` entry only when a non-comment `hostdev` line in the bank's `qvm.conf` names that `/dev`
+  node (a leading `<`/`>` is ignored). An image the conf backs directly with `hostdev <file`
+  (relative to the bank dir) gets no loopback and logs `… not wired as /dev/… in qvm.conf —
+  file-backed, no loopback`, so it stays openable by the pre-launch verify and the bank seeder
+  instead of `EBUSY`. A conf that wires `/dev` nodes, and an unreadable conf, keep the old behaviour.
+
+Host-facing: no config change needed. A bank whose `qvm.conf` uses `hostdev <file` for its rootfs
+and declares `partitions: []` needs a host with this version; an older host still holds the file
+behind its loopback and qvm fails with `EBUSY`.
+
 ## v0.1.21 — SOVDd v0.1.3, held updates served
 
 Tag on `03aeb27` (2026-10-26), PR #34.
