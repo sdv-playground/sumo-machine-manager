@@ -6,6 +6,24 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- vhsm-server: a KEY_GENERATE the backend refuses for want of a slot (`HsmError::KeyNotFound`)
+  answers `INVALID_PARAM`, as an unsupported algorithm already did, not `INTERNAL`. A failed
+  KEY_GENERATE removes the handle it allocated, so no entry without a key stays in the table.
+  **Host-facing:** none; a guest that matched `INTERNAL` for such a refusal sees `INVALID_PARAM`.
+
+- vhsm-server: `dispatch_request` persists exactly the handle a successful, persistent KEY_GENERATE
+  answered with. It used to persist the table's last entry whenever the table grew, so a failed
+  generate could be persisted, and two concurrent generates could persist one entry twice and
+  lose the other. **Host-facing:** none.
+
+- vhsm-ssd: dynamic handles persisted with `--persist-dir` come back under their saved numbers
+  (`HandleTable::restore`), so a guest's persistent handle still names its own key after a
+  restart. The old reload numbered them afresh from 0x0100, and a backend that names keys by
+  handle then served another key under it. **Host-facing:** none; a store an older vhsm-ssd wrote
+  may hold entries of failed generates, which come back as handles with no key.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.
