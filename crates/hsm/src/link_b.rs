@@ -30,7 +30,7 @@
 
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -287,36 +287,74 @@ fn proto_err(e: ProtoError) -> HsmError {
 /// A link-B client: forwards every [`HsmCryptoProvider`] op over a `UnixStream`
 /// to a backend running [`serve_crypto`]. The stream is mutex-guarded so the
 /// request/response exchange is atomic across concurrent callers.
+///
+/// A client made by [`Self::connect`] survives its backend restarting: a call
+/// that meets a dead connection fails and drops it, and the next call connects
+/// to the same socket again.
 pub struct LinkBClient {
-    stream: Mutex<UnixStream>,
+    /// The live connection; `None` from a transport error until the next call
+    /// reconnects.
+    stream: Mutex<Option<UnixStream>>,
+    /// The socket to reconnect to. `None` for a client wrapping a stream it was
+    /// handed ([`Self::from_stream`]), which cannot reconnect.
+    socket: Option<PathBuf>,
 }
 
 impl LinkBClient {
     /// Connect to a link-B service listening on the Unix socket at `path`.
     pub fn connect(path: &Path) -> io::Result<Self> {
         Ok(Self {
-            stream: Mutex::new(UnixStream::connect(path)?),
+            stream: Mutex::new(Some(UnixStream::connect(path)?)),
+            socket: Some(path.to_path_buf()),
         })
     }
 
     /// Wrap an already-connected stream (e.g. one accepted/dialed elsewhere).
+    /// Such a client has no socket path, so it cannot reconnect.
     pub fn from_stream(stream: UnixStream) -> Self {
         Self {
-            stream: Mutex::new(stream),
+            stream: Mutex::new(Some(stream)),
+            socket: None,
         }
     }
 
     /// Send one op + payload, read the response; map a non-`ST_OK` status back
     /// to an [`HsmError`].
+    ///
+    /// A transport error (the backend died or was restarted) drops the connection
+    /// and fails this call. The op may or may not have run, so it is never
+    /// retried here. The next call connects again, so once the backend is back,
+    /// so is the client.
     fn call(&self, op: u32, payload: Vec<u8>) -> Result<Vec<u8>, HsmError> {
-        let mut stream = self
+        let mut slot = self
             .stream
             .lock()
             .map_err(|_| HsmError::ProcessError("link-b stream mutex poisoned".into()))?;
-        write_frame(&mut *stream, op, FLAGS_NONE, &payload)
-            .map_err(|e| HsmError::ProcessError(format!("link-b write: {e}")))?;
-        let (status, _flags, result) = read_frame(&mut *stream)
-            .map_err(|e| HsmError::ProcessError(format!("link-b read: {e}")))?;
+        if slot.is_none() {
+            let socket = self.socket.as_ref().ok_or_else(|| {
+                HsmError::ProcessError(
+                    "link-b connection lost, and this client has no socket to reconnect to".into(),
+                )
+            })?;
+            let stream = UnixStream::connect(socket).map_err(|e| {
+                HsmError::ProcessError(format!("link-b reconnect {}: {e}", socket.display()))
+            })?;
+            tracing::info!(socket = %socket.display(), "link-b reconnected");
+            *slot = Some(stream);
+        }
+        let stream = slot.as_mut().expect("connected above");
+        let exchange = write_frame(stream, op, FLAGS_NONE, &payload)
+            .map_err(|e| HsmError::ProcessError(format!("link-b write: {e}")))
+            .and_then(|()| {
+                read_frame(stream).map_err(|e| HsmError::ProcessError(format!("link-b read: {e}")))
+            });
+        let (status, _flags, result) = match exchange {
+            Ok(frame) => frame,
+            Err(e) => {
+                *slot = None;
+                return Err(e);
+            }
+        };
         if status == ST_OK {
             Ok(result)
         } else {
@@ -681,6 +719,41 @@ impl HsmProvider for LinkBProvider {
 const CONNECT_ATTEMPTS: u32 = 50;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// Spawn the link-B backend `backend_cmd` on the Unix socket `socket`, without
+/// connecting: the command [`spawn_and_connect`] runs, so a supervisor's respawn
+/// starts exactly the backend it started first. Removes a stale `socket` file
+/// first, as `spawn_and_connect` does. Clients made by [`LinkBClient::connect`]
+/// reconnect to the new backend on their next call.
+pub fn spawn_backend(
+    backend_cmd: &Path,
+    keystore: Option<&Path>,
+    socket: &Path,
+) -> io::Result<Child> {
+    // Clear a stale socket from a previous run so the backend's bind() and our
+    // connect() both see a fresh path (mirrors hsm-sim-service's own cleanup).
+    if socket.exists() {
+        std::fs::remove_file(socket).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("remove stale backend socket {}: {e}", socket.display()),
+            )
+        })?;
+    }
+
+    let mut cmd = Command::new(backend_cmd);
+    if let Some(ks) = keystore {
+        cmd.arg("--keystore").arg(ks);
+    }
+    cmd.arg("--listen").arg(socket);
+
+    cmd.spawn().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("spawn link-B backend {}: {e}", backend_cmd.display()),
+        )
+    })
+}
+
 /// Spawn the link-B backend `backend_cmd` (serving on the Unix socket `socket`)
 /// and connect a [`LinkBClient`] to it. The single home for this logic: both
 /// `vhsm-ssd` (its own backend) and the `hsm-conformance` harness (its reference
@@ -708,29 +781,7 @@ pub fn spawn_and_connect(
     keystore: Option<&Path>,
     socket: &Path,
 ) -> io::Result<(LinkBClient, Child)> {
-    // Clear a stale socket from a previous run so the backend's bind() and our
-    // connect() both see a fresh path (mirrors hsm-sim-service's own cleanup).
-    if socket.exists() {
-        std::fs::remove_file(socket).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("remove stale backend socket {}: {e}", socket.display()),
-            )
-        })?;
-    }
-
-    let mut cmd = Command::new(backend_cmd);
-    if let Some(ks) = keystore {
-        cmd.arg("--keystore").arg(ks);
-    }
-    cmd.arg("--listen").arg(socket);
-
-    let mut child = cmd.spawn().map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("spawn link-B backend {}: {e}", backend_cmd.display()),
-        )
-    })?;
+    let mut child = spawn_backend(backend_cmd, keystore, socket)?;
 
     let mut last_err: Option<io::Error> = None;
     for attempt in 0..CONNECT_ATTEMPTS {
@@ -1200,6 +1251,61 @@ mod tests {
         // Drop the client → server's read hits EOF → serve_crypto returns.
         drop(client);
         server.join().unwrap();
+    }
+
+    /// A client made by `connect` outlives its backend. The call that meets the
+    /// dead connection fails and is not retried; with nothing on the socket the
+    /// reconnect fails too; once a backend serves the socket again, the next
+    /// call reconnects and succeeds.
+    #[test]
+    fn a_client_reconnects_after_its_backend_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("link-b.sock");
+
+        // The first backend answers one request, then dies with its connection.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let first = thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let (op, _flags, payload) = read_frame(&mut stream).unwrap();
+            let result = run_crypto_op(op, &payload, &TestCrypto).unwrap().unwrap();
+            write_frame(&mut stream, ST_OK, FLAGS_NONE, &result).unwrap();
+        });
+        let client = LinkBClient::connect(&sock).unwrap();
+        assert_eq!(client.sign(KeyHandle(1), b"m").unwrap(), vec![0xAB; 64]);
+        first.join().unwrap();
+        std::fs::remove_file(&sock).unwrap();
+
+        assert!(matches!(
+            client.sign(KeyHandle(1), b"m"),
+            Err(HsmError::ProcessError(_))
+        ));
+        assert!(matches!(
+            client.sign(KeyHandle(1), b"m"),
+            Err(HsmError::ProcessError(e)) if e.contains("reconnect")
+        ));
+
+        // The respawned backend, on the same socket.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let second = thread::spawn(move || {
+            let (stream, _addr) = listener.accept().unwrap();
+            serve_crypto(stream, &TestCrypto);
+        });
+        assert_eq!(client.sign(KeyHandle(1), b"m").unwrap(), vec![0xAB; 64]);
+        drop(client);
+        second.join().unwrap();
+    }
+
+    /// A client wrapping a handed-over stream has no socket to go back to.
+    #[test]
+    fn a_client_from_a_stream_cannot_reconnect() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let client = LinkBClient::from_stream(ours);
+        drop(theirs);
+        assert!(client.sign(KeyHandle(1), b"m").is_err());
+        assert!(matches!(
+            client.sign(KeyHandle(1), b"m"),
+            Err(HsmError::ProcessError(e)) if e.contains("no socket to reconnect to")
+        ));
     }
 
     #[test]
