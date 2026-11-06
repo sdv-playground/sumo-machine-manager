@@ -44,12 +44,16 @@
 //!
 //! A failed build yields a `TieredAuthorizer` with **no** trusted issuers, so
 //! every token is rejected. The failure mode of "cannot read the keystore" is
-//! locked out, never wide open.
+//! locked out, never wide open. So is a missing ECU id: with no id to bind a
+//! token's `aud` to, nothing is trusted, rather than an empty `aud` that every
+//! ECU would share.
 //!
 //! # What the deployment still owns
 //!
 //! - **The keystore path** — one `PathBuf`, not a config type. (It was a clone of
 //!   an entire deployment `Config` struct held to reach exactly this field.)
+//! - **The ECU id** — [`EcuId`]: the device-key thumbprint by default, or a
+//!   platform id the host injects.
 //! - **The floor sink** — making a floor advance durable needs the host's clock;
 //!   injected as [`FloorSink`] (`host_clock::ClockDiscipliningFloorSink` on a real
 //!   node, `NoopFloorSink` elsewhere).
@@ -67,7 +71,8 @@ use hsm::HsmCryptoProvider;
 use sovd_api::Authorizer;
 
 use super::authz::{FloorSink, TieredAuthorizer};
-use super::{identity, issuer_keys};
+use super::identity::EcuId;
+use super::issuer_keys;
 
 /// An out-of-keystore anchor lookup by key id, consulted only when the keystore
 /// itself has no key for that id. See the module docs.
@@ -97,6 +102,9 @@ pub struct HsmAuthorizerDeps {
     pub floor_sink: Arc<dyn FloorSink>,
     /// Optional out-of-keystore anchor lookup. See [`ExtraAnchor`].
     pub extra_anchor: Option<ExtraAnchor>,
+    /// This ECU's id, the `aud` every accepted token must carry.
+    /// [`EcuId::Thumbprint`] keeps the device-key thumbprint.
+    pub ecu_id: EcuId,
 }
 
 impl HsmAuthorizerDeps {
@@ -148,9 +156,10 @@ fn anchor_der(
 /// `get_trust_anchor_der`) and construct the tiered authorizer. Re-run whenever
 /// the keystore changes. `boot_id = Some` binds accepted tokens to the current
 /// boot (destructive routes); `read_open` serves tokenless reads anonymously
-/// (general path).
+/// (general path). `ecu_id` names the `aud` every accepted token must carry.
 ///
-/// Fails closed: a build error yields an authorizer trusting no issuer.
+/// Fails closed: a build error, or no ECU id, yields an authorizer trusting no
+/// issuer.
 pub fn build_authorizer_now(
     crypto: &dyn HsmCryptoProvider,
     boot_id: Option<&str>,
@@ -158,6 +167,7 @@ pub fn build_authorizer_now(
     time_floor_secs: Arc<AtomicU64>,
     floor_sink: Arc<dyn FloorSink>,
     extra_anchor: Option<&ExtraAnchor>,
+    ecu_id: &EcuId,
 ) -> Arc<dyn Authorizer> {
     let from_keystore = |id: &str| -> Option<Vec<u8>> {
         let h = hsm::vhsm_proto::handle_for_key_id(id)?;
@@ -172,14 +182,25 @@ pub fn build_authorizer_now(
     // High-consequence reset / factory-reset routes. Absent = delegation stays
     // off, only the pinned issuers are trusted.
     let anchor_for = |id: &str| crypto.get_trust_anchor_der(id).ok();
-    // `audience` = this ECU's own id (its device-key thumbprint), the cross-ECU
-    // replay guard.
-    let audience = identity::ecu_id(der_for).unwrap_or_default();
-    let base = match issuer_keys::authorizer_from_anchors(der_for, anchor_for, &audience) {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!("authorizer build failed: {e}");
+    // `audience` = this ECU's own id (the host's, or its device-key thumbprint),
+    // the cross-ECU replay guard. With no id there is nothing to bind a token to:
+    // trust no issuer rather than an empty `aud` that every ECU would accept.
+    let base = match ecu_id.resolve(der_for) {
+        None => {
+            tracing::warn!(
+                source = ?ecu_id,
+                "authorizer trusts no issuer: no ECU id to bind a token's aud to"
+            );
             TieredAuthorizer::new(Vec::new())
+        }
+        Some(audience) => {
+            match issuer_keys::authorizer_from_anchors(der_for, anchor_for, &audience) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::error!("authorizer build failed: {e}");
+                    TieredAuthorizer::new(Vec::new())
+                }
+            }
         }
     };
     // boot_id binding (destructive routes only) + read-open (general path only).
@@ -256,6 +277,7 @@ impl Authorizer for CachedHsmAuthorizer {
                         self.deps.time_floor_secs.clone(),
                         self.deps.floor_sink.clone(),
                         self.deps.extra_anchor.as_ref(),
+                        &self.deps.ecu_id,
                     ),
                 ));
             }
@@ -332,5 +354,188 @@ mod tests {
             anchor_der(|_| Some(b"k".to_vec()), None, "x").as_deref(),
             Some(&b"k"[..])
         );
+    }
+
+    mod ecu_id {
+        use super::super::*;
+        use std::collections::HashMap;
+
+        use hsm::{HsmError, KeyHandle, KeyRole, SlotInfo};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use p256::ecdsa::SigningKey;
+        use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        use sovd_api::{AccessRequest, Capability};
+
+        use crate::sovd::authz::NoopFloorSink;
+        use crate::sovd::identity::ecu_id_from_spki_der;
+
+        /// A provider that holds only public keys, by handle.
+        struct PublicKeys(HashMap<u32, Vec<u8>>);
+
+        impl HsmCryptoProvider for PublicKeys {
+            fn get_public_key_der(&self, h: KeyHandle) -> Result<Vec<u8>, HsmError> {
+                self.0
+                    .get(&h.0)
+                    .cloned()
+                    .ok_or_else(|| HsmError::KeyNotFound(format!("{h}")))
+            }
+            fn sign(&self, _: KeyHandle, _: &[u8]) -> Result<Vec<u8>, HsmError> {
+                Err(HsmError::NotSupported("public keys only".into()))
+            }
+            fn verify(&self, _: KeyHandle, _: &[u8], _: &[u8]) -> Result<bool, HsmError> {
+                Err(HsmError::NotSupported("public keys only".into()))
+            }
+            fn encrypt(&self, _: KeyHandle, _: &[u8]) -> Result<Vec<u8>, HsmError> {
+                Err(HsmError::NotSupported("public keys only".into()))
+            }
+            fn decrypt(&self, _: KeyHandle, _: &[u8]) -> Result<Vec<u8>, HsmError> {
+                Err(HsmError::NotSupported("public keys only".into()))
+            }
+            fn mac_generate(&self, _: KeyHandle, _: &[u8]) -> Result<Vec<u8>, HsmError> {
+                Err(HsmError::NotSupported("public keys only".into()))
+            }
+            fn mac_verify(&self, _: KeyHandle, _: &[u8], _: &[u8]) -> Result<bool, HsmError> {
+                Err(HsmError::NotSupported("public keys only".into()))
+            }
+            fn derive(&self, _: KeyHandle, _: &[u8], _: usize) -> Result<Vec<u8>, HsmError> {
+                Err(HsmError::NotSupported("public keys only".into()))
+            }
+            fn random(&self, _: usize) -> Result<Vec<u8>, HsmError> {
+                Err(HsmError::NotSupported("public keys only".into()))
+            }
+            fn get_certificate_der(&self, _: KeyHandle) -> Result<Vec<u8>, HsmError> {
+                Err(HsmError::NotSupported("public keys only".into()))
+            }
+            fn get_slot_info(&self, _: KeyHandle) -> Result<SlotInfo, HsmError> {
+                Err(HsmError::NotSupported("public keys only".into()))
+            }
+        }
+
+        fn key(scalar: u8) -> SigningKey {
+            let mut s = [0u8; 32];
+            s[31] = scalar;
+            SigningKey::from_bytes(&p256::FieldBytes::from(s)).unwrap()
+        }
+
+        fn spki(sk: &SigningKey) -> Vec<u8> {
+            sk.verifying_key().to_public_key_der().unwrap().into_vec()
+        }
+
+        /// The factory-reset issuer's anchor, and the device key if `with_device_key`.
+        fn keystore(issuer: &SigningKey, with_device_key: bool) -> PublicKeys {
+            let mut keys = HashMap::new();
+            keys.insert(KeyRole::FactoryResetIssuer.handle().0, spki(issuer));
+            if with_device_key {
+                keys.insert(KeyRole::DeviceDecryption.handle().0, spki(&key(7)));
+            }
+            PublicKeys(keys)
+        }
+
+        fn reset_token(issuer: &SigningKey, aud: &str) -> String {
+            let kid = KeyRole::FactoryResetIssuer.key_id();
+            let pem = issuer.to_pkcs8_pem(LineEnding::LF).unwrap();
+            let enc = EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
+            let mut header = Header::new(Algorithm::ES256);
+            header.kid = Some(kid.to_string());
+            let claims = serde_json::json!({
+                "sub": "operator", "iss": kid, "aud": aud,
+                "exp": 9_999_999_999u64, "scope": "factory-reset",
+            });
+            format!("Bearer {}", encode(&header, &claims, &enc).unwrap())
+        }
+
+        async fn accepts(crypto: &PublicKeys, ecu_id: &EcuId, bearer: &str) -> bool {
+            let authz = build_authorizer_now(
+                crypto,
+                None,
+                false,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(NoopFloorSink),
+                None,
+                ecu_id,
+            );
+            let req = AccessRequest {
+                bearer: Some(bearer),
+                method: &axum::http::Method::POST,
+                path: "/x",
+                component: None,
+                capability: Capability::FactoryReset,
+            };
+            authz.authorize(&req).await.is_ok()
+        }
+
+        /// An injected id is the audience: a token for it passes, and one for the
+        /// device-key thumbprint, which the id replaces, does not.
+        #[tokio::test]
+        async fn an_injected_id_is_the_audience() {
+            let issuer = key(1);
+            let crypto = keystore(&issuer, true);
+            let injected = EcuId::Injected("4b334ebada044b60".into());
+            let thumbprint = ecu_id_from_spki_der(&spki(&key(7)));
+
+            assert!(
+                accepts(
+                    &crypto,
+                    &injected,
+                    &reset_token(&issuer, "4b334ebada044b60")
+                )
+                .await
+            );
+            assert!(!accepts(&crypto, &injected, &reset_token(&issuer, &thumbprint)).await);
+            // The default keeps today's audience, the thumbprint.
+            assert!(
+                accepts(
+                    &crypto,
+                    &EcuId::Thumbprint,
+                    &reset_token(&issuer, &thumbprint)
+                )
+                .await
+            );
+        }
+
+        /// No id, no trust. With no device key the thumbprint is missing, and the
+        /// old `unwrap_or_default()` made the audience `""`: a token minted with an
+        /// empty `aud` then passed on every such ECU. An id the host marks
+        /// unavailable does not fall back to the thumbprint either.
+        #[tokio::test]
+        async fn without_an_ecu_id_no_token_passes() {
+            let issuer = key(1);
+            let no_device_key = keystore(&issuer, false);
+            assert!(
+                !accepts(
+                    &no_device_key,
+                    &EcuId::Thumbprint,
+                    &reset_token(&issuer, "")
+                )
+                .await
+            );
+            assert!(
+                !accepts(
+                    &no_device_key,
+                    &EcuId::Injected(String::new()),
+                    &reset_token(&issuer, "")
+                )
+                .await
+            );
+
+            let with_device_key = keystore(&issuer, true);
+            let thumbprint = ecu_id_from_spki_der(&spki(&key(7)));
+            assert!(
+                !accepts(
+                    &with_device_key,
+                    &EcuId::Unavailable,
+                    &reset_token(&issuer, &thumbprint)
+                )
+                .await
+            );
+            assert!(
+                !accepts(
+                    &with_device_key,
+                    &EcuId::Unavailable,
+                    &reset_token(&issuer, "")
+                )
+                .await
+            );
+        }
     }
 }

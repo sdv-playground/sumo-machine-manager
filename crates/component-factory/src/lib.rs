@@ -244,6 +244,11 @@ pub struct FactoryDeps<D: BlockDevice> {
     pub hsm_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
     pub hsm_keystore: Option<PathBuf>,
     pub hsm_port: u16,
+    /// The ECU id the HSM component reports as its device id
+    /// (`ComponentAdapter::with_ecu_id`). Hand the authorizer the same value
+    /// (`HsmAuthorizerDeps::ecu_id`), so the id served is the `aud` tokens are
+    /// checked against. `EcuId::Thumbprint` keeps the device-key thumbprint.
+    pub ecu_id: component_mgr::sovd::identity::EcuId,
     /// Per-component bank activators, keyed by component id.
     /// Only components with an entry here get post-install activation.
     pub bank_activators: HashMap<String, Arc<dyn machine_mgr::BankActivator>>,
@@ -867,6 +872,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 if let Some(ref crypto) = deps.hsm_crypto {
                     component_inner = component_inner.with_csr_crypto(crypto.clone());
                 }
+                component_inner = component_inner.with_ecu_id(deps.ecu_id.clone());
             }
 
             let component: Arc<dyn Component> = Arc::new(component_inner);
@@ -968,6 +974,7 @@ mod tests {
             hsm_crypto: None,
             hsm_keystore: None,
             hsm_port: 5100,
+            ecu_id: Default::default(),
             bank_activators: HashMap::new(),
             partition_parts: HashMap::new(),
             health_probes: HashMap::new(),
