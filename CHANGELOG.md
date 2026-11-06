@@ -6,6 +6,20 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- hsm (docs): the `link_b` module docs name the monotonic-counter ops (`0x28`, `0x29`), which
+  `serve` routes to the provider half beside the provisioning ops (`0x20..=0x27`). **Host-facing:**
+  none; docs only.
+
+- hsm, hsm-link-b: a backend can say what holds each slot. `SlotBacking` (`Hardware`,
+  `SoftwareSealed`, `Software`), `HsmProvider::slot_backing` (default: `NotSupported`), and the
+  additive link-B op `GET_SLOT_BACKING` (`0x2A`, handle → `BACKING_*`) in the Rust contract, the C
+  header and the reference skeleton. The frozen `SlotInfo` record is unchanged; a backend that
+  predates the op answers `NOT_SUPPORTED`, which a caller reads as unknown. `SimHsm` reports its
+  slots as `Software`. **Host-facing:** none; a backend that keeps some keys in software overrides
+  `slot_backing`, so its inventory stops implying hardware protection it does not have.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.

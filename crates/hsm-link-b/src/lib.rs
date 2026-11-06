@@ -66,6 +66,7 @@
 //! | `GET_PUBLIC_KEY` | role:u32 (slot handle) | SPKI DER |
 //! | `READ_MONOTONIC` | handle:u32 | value:u64 |
 //! | `RAISE_MONOTONIC` | handle:u32, value:u64 | value:u64 |
+//! | `GET_SLOT_BACKING` | handle:u32 | backing:u32 (`BACKING_*`) |
 //!
 //! `SlotInfo` = `handle:u32, kind:u32, has_certificate:u8, key_id:bytes(utf-8),
 //! allowed_guests:optlist, allowed_ops:optlist`, where
@@ -129,6 +130,11 @@ pub const OP_READ_MONOTONIC: u32 = 0x28;
 /// `max(current, arg)`; returns the resulting value. Backend-monotonic: a lower
 /// arg is a no-op.
 pub const OP_RAISE_MONOTONIC: u32 = 0x29;
+/// What holds slot `handle`'s material: one of the `BACKING_*` constants. Added
+/// after the `SlotInfo` record was frozen, so the record does not carry it; a
+/// backend that predates the op answers `ST_NOT_SUPPORTED`, which a caller reads
+/// as "unknown".
+pub const OP_GET_SLOT_BACKING: u32 = 0x2A;
 
 // ── Status codes (mirror the HsmError categories) ─────────────────────────────
 pub const ST_OK: u32 = 0;
@@ -163,6 +169,14 @@ pub const KEYTYPE_HMAC_SHA256: u32 = 5;
 /// clear of the real key-type range (1..5) with wide headroom; this is the
 /// on-wire promotion of the marker the C reference formerly kept process-local.
 pub const KEYTYPE_MONOTONIC: u32 = 0xFF;
+
+// ── Slot-backing wire constants — `GET_SLOT_BACKING` result `backing:u32` ──────
+/// In the HSM; the key never leaves it.
+pub const BACKING_HARDWARE: u32 = 1;
+/// A software key sealed under a key in the HSM, opened into host memory per use.
+pub const BACKING_SOFTWARE_SEALED: u32 = 2;
+/// A software key with no hardware protection.
+pub const BACKING_SOFTWARE: u32 = 3;
 
 // ── ProvisioningState wire constants — `PROVISIONING_STATE` result `state:u32` ─
 pub const PROV_STATE_UNPROVISIONED: u32 = 0;

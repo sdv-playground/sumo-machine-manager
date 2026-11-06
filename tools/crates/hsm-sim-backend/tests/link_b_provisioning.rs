@@ -253,3 +253,53 @@ fn link_b_provider_satisfies_hsm_provider_and_delegates() {
     drop(provider);
     server.join().unwrap();
 }
+
+/// `GET_SLOT_BACKING` against the real sim: every slot it holds is software
+/// (keys as files, the counter as a file), through the client and through
+/// `LinkBProvider` alike, and a handle with no slot is `KeyNotFound`.
+#[test]
+fn link_b_reports_the_sims_slots_as_software() {
+    use hsm::{KeyHandle, SlotBacking};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("hsm-sim-backing.sock");
+    let hsm = Arc::new(Mutex::new(SimHsm::new(dir.path().to_path_buf())));
+    hsm.lock()
+        .unwrap()
+        .write_keystore(&provisioned_keystore())
+        .unwrap();
+
+    let listener = UnixListener::bind(&sock).unwrap();
+    let hsm_for_server = Arc::clone(&hsm);
+    let server = thread::spawn(move || {
+        let (stream, _addr) = listener.accept().unwrap();
+        serve(stream, &*hsm_for_server);
+    });
+
+    let client = Arc::new(LinkBClient::connect(&sock).unwrap());
+    assert_eq!(
+        client.slot_backing(KeyRole::JwtSigning.handle()).unwrap(),
+        SlotBacking::Software
+    );
+    assert_eq!(
+        client
+            .slot_backing(KeyHandle(hsm::vhsm_proto::HANDLE_TIME_FLOOR))
+            .unwrap(),
+        SlotBacking::Software
+    );
+    // 0x000B is the retired gap: no slot.
+    assert!(matches!(
+        client.slot_backing(KeyHandle(0x000B)),
+        Err(HsmError::KeyNotFound(_))
+    ));
+
+    let provider = LinkBProvider::new(Arc::clone(&client));
+    assert_eq!(
+        provider.slot_backing(KeyRole::Storage.handle()).unwrap(),
+        SlotBacking::Software
+    );
+
+    drop(provider);
+    drop(client);
+    server.join().unwrap();
+}
