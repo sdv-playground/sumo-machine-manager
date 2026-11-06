@@ -37,6 +37,17 @@ use hsm_sim_backend::SimHsm;
 
 fn print_usage() {
     eprintln!("usage: hsm-sim-service --keystore <path> --listen <unix-socket-path>");
+    eprintln!("  {HSE_PARITY_ENV}=1 in the environment refuses dynamic handles, as hardware does");
+}
+
+/// The environment variable that turns on [`SimHsm::with_hse_parity`]. An
+/// environment variable rather than a flag: the supervisor that spawns this
+/// backend passes it only `--keystore` and `--listen`.
+const HSE_PARITY_ENV: &str = "HSM_SIM_HSE_PARITY";
+
+/// HSE parity is on only for the exact value `1`.
+fn hse_parity_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
 }
 
 /// Minimal hand parse of `--keystore` / `--listen` (no clap — `hsm` doesn't
@@ -129,7 +140,13 @@ fn main() {
 
     // SimHsm is a pure keystore + crypto backend over `--keystore`; we serve
     // crypto + provisioning directly via link_b::serve.
-    let hsm = SimHsm::new(keystore_path.clone());
+    let hse_parity = hse_parity_requested(std::env::var_os(HSE_PARITY_ENV).as_deref());
+    let hsm = SimHsm::new(keystore_path.clone()).with_hse_parity(hse_parity);
+    if hse_parity {
+        tracing::info!(
+            "hsm-sim-service: HSE parity on ({HSE_PARITY_ENV}=1): dynamic handles are refused"
+        );
+    }
 
     // Self-bootstrap the device-side key pairs before serving (idempotent): a
     // fresh keystore must have its device-generated slots before the first key
@@ -237,5 +254,56 @@ mod tests {
         );
 
         drop(client);
+    }
+
+    /// Only the exact value `1` turns HSE parity on.
+    #[test]
+    fn hse_parity_is_on_only_for_one() {
+        use std::ffi::OsStr;
+        assert!(hse_parity_requested(Some(OsStr::new("1"))));
+        for off in ["", "0", "true", "yes", "11"] {
+            assert!(!hse_parity_requested(Some(OsStr::new(off))), "{off:?}");
+        }
+        assert!(!hse_parity_requested(None));
+    }
+
+    /// With HSE parity, a dynamic handle crosses link-B as `KeyNotFound`, both
+    /// for a generate and for an op on a key made before parity was on; the
+    /// well-known slots are served as before.
+    #[test]
+    fn hse_parity_refuses_dynamic_handles_over_link_b() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("sim-parity.sock");
+        let dynamic = KeyHandle(vhsm_proto::HANDLE_DYNAMIC_BASE);
+
+        // A dynamic key made while parity was off.
+        SimHsm::new(dir.path().to_path_buf())
+            .generate_key(dynamic, vhsm_proto::ALG_ECC_P256)
+            .expect("dynamic key without parity");
+
+        let hsm = SimHsm::new(dir.path().to_path_buf()).with_hse_parity(true);
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            link_b::serve(stream, &Mutex::new(hsm));
+        });
+        let client = LinkBClient::connect(&sock).expect("connect");
+
+        assert!(matches!(
+            client.generate_key(dynamic, vhsm_proto::ALG_ECC_P256),
+            Err(hsm::HsmError::KeyNotFound(_))
+        ));
+        assert!(matches!(
+            client.sign(dynamic, b"m"),
+            Err(hsm::HsmError::KeyNotFound(_))
+        ));
+        let well_known = KeyHandle(vhsm_proto::HANDLE_JWT_SIGNING);
+        client
+            .generate_key(well_known, vhsm_proto::ALG_ECC_P256)
+            .expect("a well-known slot is still served");
+        assert!(!client.sign(well_known, b"m").expect("sign").is_empty());
+
+        drop(client);
+        server.join().expect("server thread");
     }
 }
