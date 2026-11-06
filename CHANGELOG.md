@@ -6,6 +6,12 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- hsm (docs): the `link_b` module docs name the monotonic-counter ops (`0x28`, `0x29`), which
+  `serve` routes to the provider half beside the provisioning ops (`0x20..=0x27`). **Host-facing:**
+  none; docs only.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.
