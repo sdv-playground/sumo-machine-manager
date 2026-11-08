@@ -6,6 +6,11 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- vm-sovd: the plain (non-gateway) server mounts `node_verdict_router`, so `x-update-commit` /
+  `x-update-rollback` (and the `x-ota-*-trials` aliases) are served there too, not only by `--gateway`.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.
