@@ -145,7 +145,15 @@ machine-mgr    — Abstract trait layer connecting them all
 
 ```
 crates/component-mgr/src/
-  backend.rs              — ComponentBackend: per-component state machine
+  backend/                — ComponentBackend: per-component state machine (split by responsibility)
+    mod.rs                  struct, builders, accessors, NV lock helpers
+    types.rs                ComponentConfig, LogSource, staging/flash/admin-cache records
+    flash.rs                upload staging + flash session state machine (impl block)
+    bank_ops.rs             bank identity/activate/commit/rollback, admin state, time floor (impl block)
+    diagnostic.rs           the DiagnosticBackend trait impl
+    did_registry.rs         DID table + DID<->JSON conversion
+    health.rs, agents.rs, logs.rs   guest health probe, agent HTTP clients, host/slog2 log readers
+    tests/                  scenario tests
   component_adapter.rs    — ComponentAdapter: exposes ComponentBackend via Component
   dispatcher.rs           — F.D3 SUIT target component-name check (peek_target_component / check_target)
   suit_provider.rs        — SUIT envelope validation
