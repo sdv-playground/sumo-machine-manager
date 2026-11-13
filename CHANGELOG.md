@@ -6,6 +6,30 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- vm-mgr (QEMU runner): QNX aarch64 guests boot their IFS with `-kernel` (`images.kernel`, no BIOS,
+  no kernel cmdline); the rootfs, `partitions:` and `disks:` attach as `virtio-blk-device`. The
+  legacy QNX non-x86 path (bare `-drive` on AHCI, at most 6 disks) is gone; it could not boot an
+  aarch64 QNX image.
+- vm-mgr (config): optional virtio-mmio placement for aarch64 guests (Linux and QNX): `slot` (0–31)
+  on `partitions:`, `disks:`, `network` and `bridge` devices, and `images.rootfs_slot`. Once one
+  device of a VM names a slot, every block device and NIC must; a missing slot, a slot outside 0–31
+  or a slot used twice fails the launch with a config error (partitions are checked before their
+  image is flashed). The Linux RNG then goes after the placed devices. No slot anywhere keeps QEMU's
+  own placement. Ignored on x86_64 and by the qvm backend.
+- vm-mgr (config): optional per-VM `accel: auto | kvm | tcg`. `auto` (default) keeps today's choice
+  (KVM when the host can run the guest arch); `kvm` fails the launch when KVM is unavailable; `tcg`
+  always emulates. `cpus` is always honoured.
+- vm-mgr (config): optional per-VM `virtio_net_features` replaces the built-in virtio-net property
+  set for that VM's NICs (`""` = QEMU defaults). The built-in set stays QNX x86_64 only.
+
+Host-facing: every new field is optional, and nothing guest-specific is built in: a guest image's
+slot map, CPU model (`cpu_model`), NIC features and accelerator come from its config. x86_64 QNX,
+Linux without slots and the qvm backend build the same command line as before. `arch` defaults to
+`aarch64`, so a `backend: qemu`, `os_type: qnx` VM without `arch:` now takes the `-kernel` path; it
+could not boot on the old AHCI path either. Set `arch: x86_64` for an x86 QNX guest.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.
