@@ -6,6 +6,31 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- vm-mgr (QEMU runner): QNX aarch64 guests boot guest-vm-qnx's arm64 image. `images.kernel`
+  (boot.img, an ELF IFS) is loaded with `-kernel`; the rootfs, `partitions:` and `disks:` attach as
+  `virtio-blk-device` on a fixed `virtio-mmio-bus.<slot>`, and NICs as `virtio-net-device` on theirs.
+  The legacy QNX non-x86 path (bare `-drive` on AHCI, at most 6 disks) is gone; it could not boot
+  that image. A device without a slot, a slot outside 0–31 or a slot used twice fails the launch
+  with a config error. `cpus` is always honoured; under TCG the CPU defaults to `cortex-a57`. Under
+  KVM with more than 1 vCPU a warning says the guest (or QEMU) needs the GICv3 NISV fix — an
+  unfixed QNX 7.1 IFS hangs at GIC init with SMP. The QNX virtio-net feature set now applies on
+  aarch64 too.
+- vm-mgr (config): optional per-VM `accel: auto | kvm | tcg`. `auto` (default) keeps today's choice
+  (KVM when the host can run the guest arch); `kvm` fails the launch when KVM is unavailable; `tcg`
+  always emulates, e.g. a multi-vCPU QNX aarch64 guest on an arm64 KVM host.
+- vm-mgr (config): optional `slot` on `partitions:`, `disks:`, `network` and `bridge` devices, and
+  `images.rootfs_slot` (default 31). Read only by the QNX aarch64 QEMU path.
+- vm-mgr (config): optional per-VM `virtio_net_features` replaces the built-in virtio-net property
+  set for that VM's NICs (`""` = QEMU defaults), e.g. to also turn guest receive offloads off.
+
+Host-facing: every new field is optional; x86_64 QNX, Linux (x86_64 and aarch64) and the qvm backend
+build the same command line as before. A QNX aarch64 QEMU VM must give each partition, disk and NIC
+a `slot`. `arch` defaults to `aarch64`, so a `backend: qemu`, `os_type: qnx` VM without `arch:` now
+takes this path and fails without slots; it could not boot on the old AHCI path either. Set
+`arch: x86_64` for an x86 QNX guest.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.

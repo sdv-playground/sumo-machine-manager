@@ -161,6 +161,11 @@ pub struct VmDefinition {
     /// Number of virtual CPUs (default: 4).
     #[serde(default = "default_cpus")]
     pub cpus: u32,
+    /// QEMU accelerator: `auto` (default — KVM when the host can run this
+    /// guest arch, else TCG), `kvm` (fail if unavailable) or `tcg` (always
+    /// emulate, e.g. a multi-vCPU QNX aarch64 guest on an arm64 KVM host).
+    #[serde(default)]
+    pub accel: Accel,
     /// RAM in MB (default: 2048).
     #[serde(default = "default_ram")]
     pub ram_mb: u32,
@@ -217,6 +222,12 @@ pub struct VmDefinition {
     /// Extra kernel command-line arguments.
     #[serde(default)]
     pub extra_cmdline: Option<String>,
+    /// QEMU only: virtio-net device properties appended to every NIC
+    /// (comma-separated, e.g. `event_idx=off,guest_tso4=off`). Replaces the
+    /// built-in set for the guest profile (QNX gets a qualified set; Linux
+    /// none). An empty string attaches the NICs with QEMU's defaults.
+    #[serde(default)]
+    pub virtio_net_features: Option<String>,
     /// Directory for host simulator binaries.
     #[serde(default)]
     pub sim_dir: Option<PathBuf>,
@@ -253,6 +264,16 @@ pub enum OsType {
     /// QNX guest: boots from disk image (IFS + QNX6 filesystem).
     /// No separate kernel — bootloader in the disk image.
     Qnx,
+}
+
+/// QEMU accelerator choice for a VM; see [`VmDefinition::accel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Accel {
+    #[default]
+    Auto,
+    Kvm,
+    Tcg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -303,7 +324,14 @@ pub struct ImagePaths {
     /// Root filesystem filename (e.g., "rootfs.qcow2").
     #[serde(default)]
     pub rootfs: Option<String>,
+    /// virtio-mmio bus number for the rootfs (QEMU, QNX aarch64 guests only;
+    /// default [`QNX_AARCH64_ROOTFS_SLOT`]). See [`Partition::slot`].
+    #[serde(default)]
+    pub rootfs_slot: Option<u8>,
 }
+
+/// Where the guest-vm-qnx arm64 image's device tree expects its rootfs.
+pub const QNX_AARCH64_ROOTFS_SLOT: u8 = 31;
 
 /// One extra read-only image the host exposes to the guest as a block
 /// device (devb-loopback → `/dev/qvm{role}-{vm}0`, wired to the guest's
@@ -320,6 +348,12 @@ pub struct Partition {
     /// Attach read-only (default true — these are RO partitions).
     #[serde(default = "default_true")]
     pub readonly: bool,
+    /// virtio-mmio bus number (0–31) the device is attached to. Required by
+    /// the QEMU runner for QNX aarch64 guests, whose device tree and
+    /// `layers.conf` find each disk by its fixed mmio address
+    /// (`0x0a000000 + 0x200 * slot`, IRQ `48 + slot`). Ignored elsewhere.
+    #[serde(default)]
+    pub slot: Option<u8>,
 }
 
 fn default_true() -> bool {
@@ -336,6 +370,9 @@ pub struct DiskConfig {
     /// Mount read-only.
     #[serde(default)]
     pub readonly: bool,
+    /// virtio-mmio bus number; see [`Partition::slot`].
+    #[serde(default)]
+    pub slot: Option<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -482,6 +519,9 @@ impl VmDefinition {
             if imgs.rootfs.is_some() {
                 merged.images.rootfs = imgs.rootfs.clone();
             }
+            if imgs.rootfs_slot.is_some() {
+                merged.images.rootfs_slot = imgs.rootfs_slot;
+            }
         }
         // Partitions are declared wholesale per-bank (vm-config.yaml),
         // not field-merged: a present list replaces the base entirely.
@@ -611,9 +651,18 @@ pub enum DeviceConfig {
         mac: Option<String>,
         #[serde(default)]
         ssh_port: Option<u16>,
+        /// virtio-mmio bus number; see [`Partition::slot`].
+        #[serde(default)]
+        slot: Option<u8>,
     },
     #[serde(rename = "bridge")]
-    Bridge { bridge: String, mac: String },
+    Bridge {
+        bridge: String,
+        mac: String,
+        /// virtio-mmio bus number; see [`Partition::slot`].
+        #[serde(default)]
+        slot: Option<u8>,
+    },
     #[serde(rename = "console")]
     Console,
 }
@@ -690,6 +739,7 @@ mod tests {
             arch: None,
             machine: None,
             cpus: 4,
+            accel: Accel::Auto,
             ram_mb: 2048,
             cpu_model: None,
             serial_log: None,
@@ -698,6 +748,7 @@ mod tests {
             images: ImagePaths {
                 kernel: Some("bzImage".into()),
                 rootfs: Some("rootfs.img".into()),
+                rootfs_slot: None,
             },
             devices: vec![],
             disks: vec![],
@@ -705,6 +756,7 @@ mod tests {
             health: None,
             shutdown: None,
             extra_cmdline: Some("console=ttyS0".into()),
+            virtio_net_features: None,
             sim_dir: None,
             process_command: None,
             process_args: Vec::new(),
@@ -744,6 +796,7 @@ mod tests {
             images: Some(ImagePaths {
                 kernel: Some("vmlinuz".into()),
                 rootfs: Some("root.ext4".into()),
+                rootfs_slot: None,
             }),
             partitions: None,
         };
@@ -819,6 +872,7 @@ extra_cmdline: "debug"
             images: Some(ImagePaths {
                 kernel: Some("vmlinuz-new".into()),
                 rootfs: None,
+                rootfs_slot: None,
             }),
             ..Default::default()
         };
@@ -838,11 +892,13 @@ extra_cmdline: "debug"
                     role: "cfg".into(),
                     source: "sumo-config".into(),
                     readonly: true,
+                    slot: None,
                 },
                 Partition {
                     role: "cab".into(),
                     source: "ca-bundle".into(),
                     readonly: true,
+                    slot: None,
                 },
             ]),
             ..Default::default()
@@ -851,6 +907,42 @@ extra_cmdline: "debug"
         assert_eq!(merged.partitions.len(), 2);
         assert_eq!(merged.partitions[0].role, "cfg");
         assert_eq!(merged.partitions[0].source, "sumo-config");
+    }
+
+    #[test]
+    fn mmio_slots_parse_and_default_to_none() {
+        let yaml = r#"
+backend: qemu
+image_dir: /x
+accel: tcg
+images: { kernel: boot.img, rootfs: rootfs.img, rootfs_slot: 31 }
+virtio_net_features: "event_idx=off"
+disks:
+  - { role: data, path: /d.img, slot: 30 }
+  - { role: swap, path: /s.img }
+devices:
+  - { type: network, slot: 29 }
+  - { type: bridge, bridge: br0, mac: "52:54:00:00:00:01" }
+"#;
+        let v: VmDefinition = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(v.accel, Accel::Tcg);
+        assert_eq!(minimal_vm("/x").accel, Accel::Auto);
+        assert_eq!(v.images.rootfs_slot, Some(31));
+        assert_eq!(v.virtio_net_features.as_deref(), Some("event_idx=off"));
+        assert_eq!(v.disks[0].slot, Some(30));
+        assert_eq!(v.disks[1].slot, None);
+        assert!(matches!(
+            v.devices[0],
+            DeviceConfig::Network { slot: Some(29), .. }
+        ));
+        assert!(matches!(
+            v.devices[1],
+            DeviceConfig::Bridge { slot: None, .. }
+        ));
+
+        let bank: VmBankConfig =
+            serde_yaml::from_str("partitions:\n  - { role: cfg, source: c, slot: 20 }\n").unwrap();
+        assert_eq!(bank.partitions.unwrap()[0].slot, Some(20));
     }
 
     #[test]
