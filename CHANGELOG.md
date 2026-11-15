@@ -6,6 +6,15 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- vhsm-proto: `HANDLE_SIL_AUTH_VER` (0x0010), `HANDLE_RPMB_HMAC` (0x0011) and `HANDLE_DEVICE_UUID`
+  (0x0013) reserve the host-only handles the platform's vhsmd serves inside the core range, so a
+  new core handle or slot cannot take their numbers (both registry tests say so). No sumo daemon
+  serves them, and the guest C header does not define them. vhsm-ssd's tests show that a guest
+  reaches no host-only handle, these three included, even under a policy that grants everything.
+  **Host-facing:** none.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.
