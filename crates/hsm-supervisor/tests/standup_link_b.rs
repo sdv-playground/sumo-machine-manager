@@ -128,7 +128,32 @@ fn standup_drives_link_b_and_shuts_down_clean() {
         "backend should be serving its link-B socket"
     );
 
-    // (4) Shutdown via the SAME path the machine manager uses.
+    // (4) The backend dies: the watchdog respawns it with the same command, and
+    //     the node's link-B client reconnects on a later call. The call that
+    //     meets the dead connection fails, so poll.
+    let first_pid = daemons.backend_child.lock().unwrap().id();
+    // SAFETY: the backend is this process's child; SIGKILL is a valid signal.
+    unsafe {
+        libc::kill(first_pid as i32, libc::SIGKILL);
+    }
+    assert!(
+        poll_until(Duration::from_secs(20), || {
+            let mut backend = daemons.backend_child.lock().unwrap();
+            backend.id() != first_pid && backend.try_wait().unwrap().is_none()
+        }),
+        "the watchdog never respawned the killed backend"
+    );
+    assert!(
+        poll_until(Duration::from_secs(20), || hsm::HsmCryptoProvider::sign(
+            &*daemons.crypto_client,
+            KeyRole::IamSigning.handle(),
+            b"after-respawn",
+        )
+        .is_ok()),
+        "the link-B client never reconnected to the respawned backend"
+    );
+
+    // (5) Shutdown via the SAME path the machine manager uses.
     daemons.shutdown();
     assert!(
         daemons
@@ -141,7 +166,13 @@ fn standup_drives_link_b_and_shuts_down_clean() {
         "vhsm-ssd must be reaped after shutdown"
     );
     assert!(
-        daemons.backend_child.try_wait().unwrap().is_some(),
+        daemons
+            .backend_child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_some(),
         "backend must be reaped after shutdown"
     );
 
