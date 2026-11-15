@@ -9,20 +9,23 @@
 //!   per the frozen payload table, sending it over a `UnixStream`, and decoding
 //!   the response. It also carries the provisioning / key-management half
 //!   (`is_provisioned`, `provision`, `list_slots`, `provisioning_state`,
-//!   `get_public_key`, `arm_enrollment`, `is_enrolled`, `clear_enrolled`) as
-//!   inherent methods. It is what the host proxy uses to reach the backend.
+//!   `get_public_key`, `arm_enrollment`, `is_enrolled`, `clear_enrolled`) and
+//!   the monotonic counter (`read_monotonic`, `raise_monotonic`) as inherent
+//!   methods. It is what the host proxy uses to reach the backend.
 //! - [`serve_crypto`] is the inverse harness for a **crypto-only** backend: it
 //!   reads frames off a stream, dispatches each crypto op to a concrete
-//!   [`HsmCryptoProvider`], and answers provisioning ops `ST_NOT_SUPPORTED`.
+//!   [`HsmCryptoProvider`], and answers every op `>= 0x20` `ST_NOT_SUPPORTED`.
 //! - [`serve`] is the inverse harness for a **full** backend that implements
 //!   both [`HsmCryptoProvider`] and [`HsmProvider`]: it routes crypto ops
-//!   (`< 0x20`) to the crypto trait and provisioning ops (`0x20..=0x27`) to the
-//!   provisioning methods. The backend is held behind a `Mutex` because some
-//!   provisioning methods (`provision`, `arm_enrollment`, `clear_enrolled`) take
+//!   (`< 0x20`) to the crypto trait, and the provisioning ops (`0x20..=0x27`) and
+//!   the monotonic-counter ops (`0x28`, `0x29`) to the provider methods. The
+//!   backend is held behind a `Mutex` because some provider methods
+//!   (`provision`, `arm_enrollment`, `clear_enrolled`, `raise_monotonic`) take
 //!   `&mut self`; the lock is taken per op, not per connection.
 //!
-//! Both the crypto ops (`OP_*` `< 0x20`) and the provisioning ops
-//! (`0x20..=0x27`) are wired; an unknown op answers `ST_NOT_SUPPORTED`.
+//! The crypto ops (`OP_*` `< 0x20`), the provisioning ops (`0x20..=0x27`) and
+//! the monotonic-counter ops (`0x28`, `0x29`) are all wired; an unknown op
+//! answers `ST_NOT_SUPPORTED`.
 //!
 //! The [`SlotInfo`] struct and the `HsmError <-> status` mapping are encoded here
 //! (the `hsm-link-b` crate is intentionally dep-free and carries only the
@@ -871,9 +874,10 @@ fn run_crypto_op(
 /// closes the connection (read EOF), at which point this returns cleanly.
 ///
 /// Crypto ops (`< 0x20`) route to the backend's [`HsmCryptoProvider`] half;
-/// provisioning ops (`0x20..=0x27`) to its [`HsmProvider`] half. The backend is
-/// held behind a `Mutex` so the `&mut self` provisioning methods (`provision`,
-/// `arm_enrollment`, `clear_enrolled`) can run; the lock is taken per op (not per
+/// provisioning ops (`0x20..=0x27`) and the monotonic-counter ops (`0x28`,
+/// `0x29`) to its [`HsmProvider`] half. The backend is held behind a `Mutex` so
+/// the `&mut self` provider methods (`provision`, `arm_enrollment`,
+/// `clear_enrolled`, `raise_monotonic`) can run; the lock is taken per op (not per
 /// connection), so a client idle on `read_frame` never stalls another. A request
 /// whose payload doesn't match the op's layout answers `ST_PROTOCOL_ERROR`; an
 /// unknown op answers `ST_NOT_SUPPORTED`.
@@ -915,7 +919,8 @@ where
 }
 
 /// Decode one provisioning request, run it on `backend`, and encode the result.
-/// Mirror of [`run_crypto_op`] for the `0x20..=0x27` op space.
+/// Mirror of [`run_crypto_op`] for the `0x20..=0x29` op space: the provisioning
+/// ops and the monotonic counter.
 ///
 /// All but one map to [`HsmProvider`]. `OP_GET_PUBLIC_KEY` resolves the role's
 /// SubjectPublicKeyInfo DER via the crypto half (`get_public_key_der(handle)`) —
