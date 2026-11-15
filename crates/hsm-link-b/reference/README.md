@@ -68,6 +68,10 @@ Handle handling, already wired:
   handle return `ST_KEY_NOT_FOUND`. It holds no key, so a **crypto** op on it is
   rejected — but it DOES appear in the slot inventory (`LIST_SLOTS` /
   `GET_SLOT_INFO`) with kind `KEYTYPE_MONOTONIC`, alongside the key slots.
+- `GET_SLOT_BACKING` says what holds each slot: `BACKING_HARDWARE` for an HSE key
+  slot or counter, `BACKING_SOFTWARE` for a virtual anchor (a public key the
+  service keeps itself). A role whose private key is a software key sealed under
+  an HSE key answers `BACKING_SOFTWARE_SEALED`.
 
 ## What you replace: the slot map (the per-silicon part)
 

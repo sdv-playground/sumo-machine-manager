@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 
 use hsm::payload::{self, HsmKeystore, KeySlot, KEY_TYPE_AES_256, KEY_TYPE_EC_P256};
 use hsm::{
-    HsmError, HsmProvider, KeyHandle, KeyRole, KeyType, ProvisioningState, SlotInfo, SlotKind,
+    HsmError, HsmProvider, KeyHandle, KeyRole, KeyType, ProvisioningState, SlotBacking, SlotInfo,
+    SlotKind,
 };
 
 /// Software HSM — the sim/dev backend. **No hardware key protection.**
@@ -979,6 +980,14 @@ impl HsmProvider for SimHsm {
 
     fn raise_monotonic(&mut self, handle: KeyHandle, new_value: u64) -> Result<u64, HsmError> {
         self.ratchet_monotonic(handle.get(), new_value)
+    }
+
+    /// Every slot the sim holds is software: its keys are files, and so is its
+    /// counter.
+    #[cfg(feature = "crypto")]
+    fn slot_backing(&self, handle: KeyHandle) -> Result<SlotBacking, HsmError> {
+        use hsm::HsmCryptoProvider;
+        self.get_slot_info(handle).map(|_| SlotBacking::Software)
     }
 }
 

@@ -9,20 +9,25 @@
 //!   per the frozen payload table, sending it over a `UnixStream`, and decoding
 //!   the response. It also carries the provisioning / key-management half
 //!   (`is_provisioned`, `provision`, `list_slots`, `provisioning_state`,
-//!   `get_public_key`, `arm_enrollment`, `is_enrolled`, `clear_enrolled`) as
-//!   inherent methods. It is what the host proxy uses to reach the backend.
+//!   `get_public_key`, `arm_enrollment`, `is_enrolled`, `clear_enrolled`), the
+//!   monotonic counter (`read_monotonic`, `raise_monotonic`) and
+//!   `slot_backing` as inherent methods. It is what the host proxy uses to reach
+//!   the backend.
 //! - [`serve_crypto`] is the inverse harness for a **crypto-only** backend: it
 //!   reads frames off a stream, dispatches each crypto op to a concrete
-//!   [`HsmCryptoProvider`], and answers provisioning ops `ST_NOT_SUPPORTED`.
+//!   [`HsmCryptoProvider`], and answers every op `>= 0x20` `ST_NOT_SUPPORTED`.
 //! - [`serve`] is the inverse harness for a **full** backend that implements
 //!   both [`HsmCryptoProvider`] and [`HsmProvider`]: it routes crypto ops
-//!   (`< 0x20`) to the crypto trait and provisioning ops (`0x20..=0x27`) to the
-//!   provisioning methods. The backend is held behind a `Mutex` because some
-//!   provisioning methods (`provision`, `arm_enrollment`, `clear_enrolled`) take
+//!   (`< 0x20`) to the crypto trait, and the provisioning ops (`0x20..=0x27`),
+//!   the monotonic-counter ops (`0x28`, `0x29`) and `GET_SLOT_BACKING` (`0x2A`)
+//!   to the provider methods. The
+//!   backend is held behind a `Mutex` because some provider methods
+//!   (`provision`, `arm_enrollment`, `clear_enrolled`, `raise_monotonic`) take
 //!   `&mut self`; the lock is taken per op, not per connection.
 //!
-//! Both the crypto ops (`OP_*` `< 0x20`) and the provisioning ops
-//! (`0x20..=0x27`) are wired; an unknown op answers `ST_NOT_SUPPORTED`.
+//! The crypto ops (`OP_*` `< 0x20`), the provisioning ops (`0x20..=0x27`), the
+//! monotonic-counter ops (`0x28`, `0x29`) and `GET_SLOT_BACKING` (`0x2A`) are all
+//! wired; an unknown op answers `ST_NOT_SUPPORTED`.
 //!
 //! The [`SlotInfo`] struct and the `HsmError <-> status` mapping are encoded here
 //! (the `hsm-link-b` crate is intentionally dep-free and carries only the
@@ -38,8 +43,8 @@ use std::time::Duration;
 use hsm_link_b::*;
 
 use crate::{
-    HsmCryptoProvider, HsmError, HsmProvider, KeyHandle, KeyType, ProvisioningState, SlotInfo,
-    SlotKind,
+    HsmCryptoProvider, HsmError, HsmProvider, KeyHandle, KeyType, ProvisioningState, SlotBacking,
+    SlotInfo, SlotKind,
 };
 
 // ── SPKI DER → COSE_Key trust-anchor converter ────────────────────────────────
@@ -183,6 +188,27 @@ fn kind_from_wire(v: u32) -> Result<SlotKind, HsmError> {
         KEYTYPE_MONOTONIC => Ok(SlotKind::Monotonic),
         other => Err(HsmError::CryptoError(format!(
             "link-b: unknown slot kind {other}"
+        ))),
+    }
+}
+
+// ── SlotBacking <-> BACKING_* mapping ─────────────────────────────────────────
+
+fn backing_to_wire(backing: SlotBacking) -> u32 {
+    match backing {
+        SlotBacking::Hardware => BACKING_HARDWARE,
+        SlotBacking::SoftwareSealed => BACKING_SOFTWARE_SEALED,
+        SlotBacking::Software => BACKING_SOFTWARE,
+    }
+}
+
+fn backing_from_wire(v: u32) -> Result<SlotBacking, HsmError> {
+    match v {
+        BACKING_HARDWARE => Ok(SlotBacking::Hardware),
+        BACKING_SOFTWARE_SEALED => Ok(SlotBacking::SoftwareSealed),
+        BACKING_SOFTWARE => Ok(SlotBacking::Software),
+        other => Err(HsmError::CryptoError(format!(
+            "link-b: unknown slot backing {other}"
         ))),
     }
 }
@@ -417,6 +443,16 @@ impl LinkBClient {
             Writer::new().u32(handle.get()).u64(new_value).finish(),
         )?;
         Reader::new(&result).u64().map_err(proto_err)
+    }
+
+    /// `OP_GET_SLOT_BACKING` — what holds slot `handle`'s material. A backend
+    /// that predates the op answers `NotSupported`: unknown.
+    pub fn slot_backing(&self, handle: KeyHandle) -> Result<SlotBacking, HsmError> {
+        let result = self.call(
+            OP_GET_SLOT_BACKING,
+            Writer::new().u32(handle.get()).finish(),
+        )?;
+        backing_from_wire(Reader::new(&result).u32().map_err(proto_err)?)
     }
 
     /// `OP_GET_PUBLIC_KEY` — the public key for `role`, as the COSE_Key CBOR
@@ -671,6 +707,10 @@ impl HsmProvider for LinkBProvider {
     fn raise_monotonic(&mut self, handle: KeyHandle, new_value: u64) -> Result<u64, HsmError> {
         self.client.raise_monotonic(handle, new_value)
     }
+
+    fn slot_backing(&self, handle: KeyHandle) -> Result<SlotBacking, HsmError> {
+        self.client.slot_backing(handle)
+    }
 }
 
 // ── Spawn + connect a link-B backend ──────────────────────────────────────────
@@ -871,9 +911,10 @@ fn run_crypto_op(
 /// closes the connection (read EOF), at which point this returns cleanly.
 ///
 /// Crypto ops (`< 0x20`) route to the backend's [`HsmCryptoProvider`] half;
-/// provisioning ops (`0x20..=0x27`) to its [`HsmProvider`] half. The backend is
-/// held behind a `Mutex` so the `&mut self` provisioning methods (`provision`,
-/// `arm_enrollment`, `clear_enrolled`) can run; the lock is taken per op (not per
+/// provisioning ops (`0x20..=0x27`), the monotonic-counter ops (`0x28`, `0x29`)
+/// and `GET_SLOT_BACKING` (`0x2A`) to its [`HsmProvider`] half. The backend is held behind a `Mutex` so
+/// the `&mut self` provider methods (`provision`, `arm_enrollment`,
+/// `clear_enrolled`, `raise_monotonic`) can run; the lock is taken per op (not per
 /// connection), so a client idle on `read_frame` never stalls another. A request
 /// whose payload doesn't match the op's layout answers `ST_PROTOCOL_ERROR`; an
 /// unknown op answers `ST_NOT_SUPPORTED`.
@@ -915,7 +956,8 @@ where
 }
 
 /// Decode one provisioning request, run it on `backend`, and encode the result.
-/// Mirror of [`run_crypto_op`] for the `0x20..=0x27` op space.
+/// Mirror of [`run_crypto_op`] for the `0x20..=0x2A` op space: the provisioning
+/// ops, the monotonic counter and the slot backing.
 ///
 /// All but one map to [`HsmProvider`]. `OP_GET_PUBLIC_KEY` resolves the role's
 /// SubjectPublicKeyInfo DER via the crypto half (`get_public_key_der(handle)`) —
@@ -977,6 +1019,9 @@ where
                 .raise_monotonic(handle, new_value)
                 .map(|v| Writer::new().u64(v).finish())
         }
+        OP_GET_SLOT_BACKING => backend
+            .slot_backing(KeyHandle(r.u32()?))
+            .map(|b| Writer::new().u32(backing_to_wire(b)).finish()),
         _ => return Ok(Err(HsmError::NotSupported(format!("link-b op {op:#06x}")))),
     };
     Ok(out)
@@ -1264,5 +1309,73 @@ mod tests {
             status_to_error(9999, b"boom"),
             HsmError::CryptoError(s) if s == "link-b status 9999: boom"
         ));
+    }
+
+    #[test]
+    fn slot_backing_wire_mapping_is_inverse() {
+        for b in [
+            SlotBacking::Hardware,
+            SlotBacking::SoftwareSealed,
+            SlotBacking::Software,
+        ] {
+            assert_eq!(backing_from_wire(backing_to_wire(b)).unwrap(), b);
+        }
+        assert!(backing_from_wire(0).is_err());
+        assert!(backing_from_wire(4).is_err());
+    }
+
+    /// The provider half of a full backend that predates `GET_SLOT_BACKING`: only
+    /// the required methods, so `slot_backing` is the trait default.
+    impl HsmProvider for TestCrypto {
+        fn is_provisioned(&self) -> Result<bool, HsmError> {
+            Ok(true)
+        }
+        fn provision(&mut self, _: &[u8]) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn list_slots(&self) -> Result<Vec<SlotInfo>, HsmError> {
+            Ok(Vec::new())
+        }
+        fn get_public_key(&self, _: crate::KeyRole) -> Result<Vec<u8>, HsmError> {
+            Err(HsmError::KeyNotFound("none".into()))
+        }
+        fn provisioning_state(&self) -> Result<ProvisioningState, HsmError> {
+            Ok(ProvisioningState::Provisioned)
+        }
+    }
+
+    /// A full backend that does not answer `slot_backing` (the trait default)
+    /// takes the op as `NotSupported`, and so does a crypto-only one: the client
+    /// sees `NotSupported` either way, which it reads as "unknown".
+    #[test]
+    fn a_backend_that_predates_get_slot_backing_answers_not_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = dir.path().join("full.sock");
+        let listener = UnixListener::bind(&full).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _addr) = listener.accept().unwrap();
+            serve(stream, &Mutex::new(TestCrypto));
+        });
+        let client = LinkBClient::connect(&full).unwrap();
+        assert!(matches!(
+            client.slot_backing(KeyHandle(1)),
+            Err(HsmError::NotSupported(_))
+        ));
+        drop(client);
+        server.join().unwrap();
+
+        let crypto_only = dir.path().join("crypto-only.sock");
+        let listener = UnixListener::bind(&crypto_only).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _addr) = listener.accept().unwrap();
+            serve_crypto(stream, &TestCrypto);
+        });
+        let client = LinkBClient::connect(&crypto_only).unwrap();
+        assert!(matches!(
+            client.slot_backing(KeyHandle(1)),
+            Err(HsmError::NotSupported(_))
+        ));
+        drop(client);
+        server.join().unwrap();
     }
 }

@@ -347,7 +347,8 @@ static void wr_slot_info(wtr_t *w, const binding_t *b) {
 
 /* ===================================================================== */
 /* Link-B dispatch — every op: crypto (0x01..0x11), provisioning         */
-/* (0x20..0x27), and the monotonic-counter ops (0x28..0x29).             */
+/* (0x20..0x27), the monotonic-counter ops (0x28..0x29) and               */
+/* GET_SLOT_BACKING (0x2A).                                               */
 /*                                                                       */
 /* Pattern per handle-addressed op: decode the request fields per the     */
 /* frozen table, resolve the logical handle through the slot map (unknown */
@@ -722,6 +723,21 @@ static uint32_t handle_op(uint32_t op, const uint8_t *payload, uint32_t plen,
          * NV counter for b->slot instead of this RAM cell. */
         if (new_value > c->value) c->value = new_value;
         wr_u64(&w, c->value);
+        *out_len = w.len;
+        return ST_OK;
+    }
+
+    case OP_GET_SLOT_BACKING: {
+        uint32_t handle = rd_u32(&r);
+        const binding_t *b;
+        if (!r.ok) return ST_PROTOCOL_ERROR;
+        b = resolve(handle);
+        if (!b) return ST_KEY_NOT_FOUND;
+        /* What holds the slot. An HSE key slot or counter is BACKING_HARDWARE;
+         * a virtual anchor is a public key this service keeps itself, so
+         * BACKING_SOFTWARE. TODO(vendor): a role whose private key is a software
+         * key sealed under an HSE key answers BACKING_SOFTWARE_SEALED. */
+        wr_u32(&w, b->is_virtual ? BACKING_SOFTWARE : BACKING_HARDWARE);
         *out_len = w.len;
         return ST_OK;
     }
