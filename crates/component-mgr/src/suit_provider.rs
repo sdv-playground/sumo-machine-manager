@@ -81,6 +81,13 @@ pub fn factory_provisioning_authority() -> Vec<u8> {
         .expect("COSE_Key serialization")
 }
 
+/// Asked before an HSM-keys envelope is checked against the factory authority,
+/// which happens only while no key authority is installed: may an empty keystore
+/// trust the factory key now? A host ties the answer to its own provisioning
+/// window, such as a lifecycle read. Without a gate the factory authority is
+/// trusted there, as before.
+pub type FirstProvisionGate = Arc<dyn Fn() -> bool + Send + Sync>;
+
 pub struct SuitProvider {
     /// Factory signing key — fallback trust anchor for HSM key envelopes.
     factory_authority: Vec<u8>,
@@ -92,6 +99,9 @@ pub struct SuitProvider {
     /// hood so the EC private scalar never reaches host memory. Old
     /// design held the raw bytes here; the HSE refactor inverted that.
     device_unwrap: Arc<RwLock<Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>>>,
+    /// Whether the factory authority may be trusted now. See
+    /// [`FirstProvisionGate`]; `None` = no gate.
+    first_provision_gate: Option<FirstProvisionGate>,
 }
 
 impl SuitProvider {
@@ -101,11 +111,21 @@ impl SuitProvider {
             key_authority: Arc::new(RwLock::new(None)),
             software_authority: Arc::new(RwLock::new(None)),
             device_unwrap: Arc::new(RwLock::new(None)),
+            first_provision_gate: None,
         }
     }
 
     pub fn with_factory_authority() -> Self {
         Self::new(factory_provisioning_authority())
+    }
+
+    /// Consult `gate` before an HSM-keys envelope is checked against the factory
+    /// authority. While it answers `false`, such an envelope is refused, and an
+    /// empty keystore can only stay empty. An installed key authority is never
+    /// gated: an envelope it signed is checked against it alone.
+    pub fn with_first_provision_gate(mut self, gate: FirstProvisionGate) -> Self {
+        self.first_provision_gate = Some(gate);
+        self
     }
 
     /// Load all trust keys from HSM after provisioning.
@@ -135,12 +155,25 @@ impl SuitProvider {
     /// Select the trust anchor based on manifest type.
     fn trust_anchor_for(&self, manifest_type: ManifestType) -> Result<Vec<u8>, ManifestError> {
         match manifest_type {
-            ManifestType::HsmKeys => Ok(self
-                .key_authority
-                .read()
-                .unwrap()
-                .clone()
-                .unwrap_or_else(|| self.factory_authority.clone())),
+            ManifestType::HsmKeys => {
+                if let Some(key_authority) = self.key_authority.read().unwrap().clone() {
+                    return Ok(key_authority);
+                }
+                // No key authority installed: only the factory authority can sign
+                // a first provision, and only while the host's gate is open.
+                if self
+                    .first_provision_gate
+                    .as_ref()
+                    .is_some_and(|open| !open())
+                {
+                    return Err(ManifestError::SignatureInvalid(
+                        "no key authority is installed and first provisioning is closed: \
+                         the factory authority is not trusted now"
+                            .into(),
+                    ));
+                }
+                Ok(self.factory_authority.clone())
+            }
             ManifestType::Firmware => {
                 self.software_authority
                     .read()
@@ -538,5 +571,67 @@ mod tests {
         let validated = provider.validate(&envelope, 0).expect("validates");
         assert_eq!(validated.component_name, "co-processor");
         assert_eq!(validated.manifest_type, ManifestType::Firmware);
+    }
+
+    /// An HSM-keys envelope (component `["hsm", "keys"]`) signed by `key`.
+    fn hsm_keys_envelope(key: &sumo_offboard::CoseKey) -> Vec<u8> {
+        let payload = b"keystore payload";
+        let digest = RustCryptoBackend::new().sha256(payload);
+        ImageManifestBuilder::new()
+            .signing_time(1_700_000_000)
+            .component_id(vec!["hsm".into(), "keys".into()])
+            .sequence_number(1)
+            .payload_digest(&digest, payload.len() as u64)
+            .payload_uri("#firmware".into())
+            .integrated_payload("#firmware".into(), payload.to_vec())
+            .build(key)
+            .unwrap()
+    }
+
+    /// The factory authority signs a first provision only while the host's gate
+    /// is open; with no gate it always does, as before.
+    #[test]
+    fn the_factory_authority_is_trusted_only_while_the_gate_is_open() {
+        let factory = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let envelope = hsm_keys_envelope(&factory);
+
+        let ungated = SuitProvider::new(factory.public_key_bytes());
+        let v = ungated
+            .validate(&envelope, 0)
+            .expect("no gate: factory trusted");
+        assert_eq!(v.manifest_type, ManifestType::HsmKeys);
+
+        let open = SuitProvider::new(factory.public_key_bytes())
+            .with_first_provision_gate(Arc::new(|| true));
+        assert!(open.validate(&envelope, 0).is_ok());
+
+        let closed = SuitProvider::new(factory.public_key_bytes())
+            .with_first_provision_gate(Arc::new(|| false));
+        match closed.validate(&envelope, 0) {
+            Err(ManifestError::SignatureInvalid(why)) => {
+                assert!(why.contains("first provisioning is closed"), "{why}")
+            }
+            Err(other) => panic!("a closed gate must refuse the factory key, got {other}"),
+            Ok(_) => panic!("a closed gate must refuse the factory key, but it validated"),
+        }
+    }
+
+    /// An installed key authority is the only anchor, gate or no gate: what it
+    /// signed passes even with the gate closed, and the factory key's envelope
+    /// does not.
+    #[test]
+    fn an_installed_key_authority_is_never_gated() {
+        let factory = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let authority = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let provider = SuitProvider::new(factory.public_key_bytes())
+            .with_first_provision_gate(Arc::new(|| false));
+        provider.update_keys(
+            factory.public_key_bytes(),
+            None,
+            Some(authority.public_key_bytes()),
+        );
+
+        assert!(provider.validate(&hsm_keys_envelope(&authority), 0).is_ok());
+        assert!(provider.validate(&hsm_keys_envelope(&factory), 0).is_err());
     }
 }

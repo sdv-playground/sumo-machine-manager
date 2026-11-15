@@ -6,6 +6,21 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- component-mgr: `SuitProvider::with_first_provision_gate(gate)` asks the host before an HSM-keys
+  envelope is checked against the factory authority, which happens only while no key authority
+  is installed. While the gate answers `false` such an envelope is refused (`SignatureInvalid`),
+  so an empty keystore cannot be first-provisioned with the factory key outside the host's
+  provisioning window. An installed key authority is never gated; without a gate nothing
+  changes. **Host-facing:** none; a host with a provisioning window (a lifecycle read, say)
+  passes it as the gate.
+
+- hsm-sim-backend: `SimHsm`'s PROVISION checks a re-provision against the installed key authority
+  alone. One that is installed but cannot be read refuses the envelope; it used to fall back to
+  the factory key. A keystore provisioned without a key authority keeps the factory key, as
+  before. **Host-facing:** none.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.
