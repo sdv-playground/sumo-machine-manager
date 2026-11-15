@@ -45,7 +45,7 @@ use vhsm_server::bootstrap::BootstrapState;
 use vhsm_server::cert::EcuSigner;
 use vhsm_server::codec;
 use vhsm_server::crossnode;
-use vhsm_server::handle_table::HandleTable;
+use vhsm_server::handle_table::{HandleEntry, HandleTable};
 use vhsm_server::handler::CallerId;
 use vhsm_server::iam::IamPolicy;
 use vhsm_server::proto::*;
@@ -56,7 +56,7 @@ use vhsm_server::transport::{Connection, TcpListener};
 use rustls::pki_types::CertificateDer;
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
-use secstore::{FileBackend, LinuxSimEncryptor, Secstore};
+use secstore::{FileBackend, KeyMetadata, LinuxSimEncryptor, Secstore};
 
 const DEFAULT_LISTEN: &str = "10.0.200.1:5100";
 const DEFAULT_CERT_LIFETIME_SECS: u64 = 365 * 24 * 60 * 60; // 1 year
@@ -497,21 +497,12 @@ fn main() {
             let s = Secstore::new(LinuxSimEncryptor::default_test(), FileBackend::new(dir));
             match s.load_all() {
                 Ok(metas) => {
-                    for m in &metas {
-                        let mut label = [0u8; LABEL_LEN];
-                        let bytes = m.label.as_bytes();
-                        let copy_len = bytes.len().min(LABEL_LEN - 1);
-                        label[..copy_len].copy_from_slice(&bytes[..copy_len]);
-                        table.allocate(
-                            &m.key_id,
-                            m.algorithm,
-                            m.permitted_ops,
-                            &m.owner_vm_id,
-                            m.persistent,
-                            &label,
-                        );
-                    }
-                    tracing::info!(count = metas.len(), "loaded persisted handles");
+                    let restored = restore_persisted(&mut table, &metas);
+                    tracing::info!(
+                        count = restored,
+                        saved = metas.len(),
+                        "loaded persisted handles"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to load persisted handles");
@@ -1126,6 +1117,39 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     table
 }
 
+/// Put the handles a previous run persisted back into `table`, each under its
+/// saved number, so a guest's persistent handle still names its own key after a
+/// restart. Returns how many came back; one that cannot (outside the dynamic
+/// range, a duplicate, a full table) is logged and skipped.
+fn restore_persisted(table: &mut HandleTable, metas: &[KeyMetadata]) -> usize {
+    let mut restored = 0;
+    for m in metas {
+        let mut label = [0u8; LABEL_LEN];
+        let bytes = m.label.as_bytes();
+        let copy_len = bytes.len().min(LABEL_LEN - 1);
+        label[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        let entry = HandleEntry {
+            handle: m.vhsm_handle,
+            key_id: m.key_id.clone(),
+            algorithm: m.algorithm,
+            permitted_ops: m.permitted_ops,
+            owner_vm_id: m.owner_vm_id.clone(),
+            persistent: m.persistent,
+            label,
+        };
+        if table.restore(entry) {
+            restored += 1;
+        } else {
+            tracing::warn!(
+                handle = m.vhsm_handle,
+                key_id = %m.key_id,
+                "persisted handle not restored: below the dynamic range, a duplicate, or the table is full"
+            );
+        }
+    }
+    restored
+}
+
 /// Short lower-hex prefix of a SHA-256 (first 8 bytes / 16 hex chars).
 /// Enough for log-line correlation; full thumbprint is in the audit log.
 fn hex_short(tp: &[u8; 32]) -> String {
@@ -1217,6 +1241,38 @@ mod tests {
     // SimHsm is only needed by these cross-node config tests now that the
     // daemon's crypto backend is an out-of-process link-B client (see backend.rs).
     use hsm_sim_backend::SimHsm;
+
+    /// Saved handles come back under their own numbers, gaps and all; a
+    /// duplicate and a well-known number are skipped. The old reload numbered
+    /// them afresh from the dynamic base.
+    #[test]
+    fn persisted_handles_come_back_under_their_saved_numbers() {
+        let meta = |handle: u32| KeyMetadata {
+            vhsm_handle: handle,
+            key_id: format!("gen-vm1-{handle:x}"),
+            algorithm: ALG_AES_256,
+            permitted_ops: PERM_ENCRYPT | PERM_DECRYPT,
+            owner_vm_id: "vm1".to_string(),
+            persistent: true,
+            label: "kept".to_string(),
+        };
+        let metas = [
+            meta(HANDLE_DYNAMIC_BASE + 3),
+            meta(HANDLE_DYNAMIC_BASE + 1),
+            meta(HANDLE_DYNAMIC_BASE + 3),
+            meta(HANDLE_STORAGE),
+        ];
+
+        let mut table = HandleTable::new();
+        assert_eq!(restore_persisted(&mut table, &metas), 2);
+        for h in [HANDLE_DYNAMIC_BASE + 1, HANDLE_DYNAMIC_BASE + 3] {
+            let entry = table.resolve(h, "vm1").expect("restored");
+            assert_eq!(entry.key_id, format!("gen-vm1-{h:x}"));
+            assert_eq!(&entry.label[..4], b"kept");
+        }
+        assert!(table.get(HANDLE_DYNAMIC_BASE).is_none());
+        assert!(table.get(HANDLE_STORAGE).is_none());
+    }
 
     // Both cases fail at the identity-root PEM step, before any keystore/HSM
     // access, so the keystore path need not exist.

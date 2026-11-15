@@ -105,6 +105,25 @@ impl HandleTable {
         Some(handle)
     }
 
+    /// Put back a dynamic handle a previous run persisted, under the number it
+    /// had, so a guest's persistent handle names the same key after a restart
+    /// ([`Self::allocate`] would number it afresh, and a backend that names keys
+    /// by handle would then find another key's material under it). Later
+    /// allocations start above every restored handle. Returns false, and changes
+    /// nothing, for a handle below the dynamic range, one already in the table,
+    /// or a full table.
+    pub fn restore(&mut self, entry: HandleEntry) -> bool {
+        if entry.handle < HANDLE_DYNAMIC_BASE
+            || self.entries.len() >= MAX_HANDLES
+            || self.get(entry.handle).is_some()
+        {
+            return false;
+        }
+        self.next_dynamic = self.next_dynamic.max(entry.handle.saturating_add(1));
+        self.entries.push(entry);
+        true
+    }
+
     /// Look up a handle. Returns None if not found.
     pub fn get(&self, handle: u32) -> Option<&HandleEntry> {
         self.entries.iter().find(|e| e.handle == handle)
@@ -187,6 +206,66 @@ mod tests {
         // Accessible from any VM
         assert!(table.resolve(HANDLE_JWT_SIGNING, "vm1").is_some());
         assert!(table.resolve(HANDLE_JWT_SIGNING, "vm2").is_some());
+    }
+
+    fn saved(handle: u32) -> HandleEntry {
+        HandleEntry {
+            handle,
+            key_id: format!("gen-vm1-{handle:x}"),
+            algorithm: ALG_AES_256,
+            permitted_ops: PERM_ENCRYPT | PERM_DECRYPT,
+            owner_vm_id: "vm1".to_string(),
+            persistent: true,
+            label: [0u8; LABEL_LEN],
+        }
+    }
+
+    /// A restored handle keeps its number, whatever the gaps before it, and new
+    /// allocations start above the highest one.
+    #[test]
+    fn restore_keeps_the_saved_number_and_allocates_above_it() {
+        let mut table = HandleTable::new();
+        assert!(table.restore(saved(HANDLE_DYNAMIC_BASE + 5)));
+        assert!(table.restore(saved(HANDLE_DYNAMIC_BASE + 1)));
+        assert_eq!(
+            table
+                .resolve(HANDLE_DYNAMIC_BASE + 5, "vm1")
+                .map(|e| e.handle),
+            Some(HANDLE_DYNAMIC_BASE + 5)
+        );
+        assert!(table.resolve(HANDLE_DYNAMIC_BASE + 5, "vm2").is_none());
+        let next = table
+            .allocate(
+                "new",
+                ALG_AES_256,
+                PERM_ENCRYPT,
+                "vm1",
+                false,
+                &[0u8; LABEL_LEN],
+            )
+            .expect("room");
+        assert_eq!(next, HANDLE_DYNAMIC_BASE + 6);
+    }
+
+    /// A saved entry below the dynamic range, or on a number already taken, is
+    /// refused and changes nothing.
+    #[test]
+    fn restore_refuses_a_well_known_number_and_a_duplicate() {
+        let mut table = HandleTable::new();
+        assert!(table.register_well_known(
+            HANDLE_STORAGE,
+            "storage-key",
+            ALG_AES_256,
+            PERM_ENCRYPT
+        ));
+        assert!(!table.restore(saved(HANDLE_STORAGE)));
+        assert!(table.restore(saved(HANDLE_DYNAMIC_BASE)));
+        assert!(!table.restore(saved(HANDLE_DYNAMIC_BASE)));
+        assert_eq!(table.len(), 2);
+        assert_eq!(
+            table.get(HANDLE_STORAGE).map(|e| e.owner_vm_id.as_str()),
+            Some("")
+        );
     }
 
     #[test]
