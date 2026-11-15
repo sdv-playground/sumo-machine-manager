@@ -51,13 +51,34 @@ use hsm::{
 pub struct SimHsm {
     /// Keystore directory (e.g. /tmp/vhsm-keys).
     keystore_path: PathBuf,
+    /// Refuse dynamic handles, as a hardware backend does. See
+    /// [`Self::with_hse_parity`].
+    hse_parity: bool,
 }
 
 impl SimHsm {
     /// Construct a SimHsm over `keystore_path`. No daemon, no port — crypto and
     /// keystore ops read/write the directory directly.
     pub fn new(keystore_path: PathBuf) -> Self {
-        Self { keystore_path }
+        Self {
+            keystore_path,
+            hse_parity: false,
+        }
+    }
+
+    /// Serve only what a hardware backend can. With `on`, every op on a dynamic
+    /// handle (0x0100 and up) is refused with `KeyNotFound`, the way a backend
+    /// that serves only its own slot map refuses it: an HSE, for one, generates
+    /// no persistent key at a guest's request. Off (the default), the sim makes
+    /// and serves dynamic keys as files.
+    pub fn with_hse_parity(mut self, on: bool) -> Self {
+        self.hse_parity = on;
+        self
+    }
+
+    /// Whether [`Self::with_hse_parity`] is on.
+    pub fn hse_parity(&self) -> bool {
+        self.hse_parity
     }
 
     /// Factory signing public key as COSE_Key CBOR — the built-in provisioning authority.

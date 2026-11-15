@@ -6,6 +6,15 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- hsm-sim-backend: an opt-in HSE parity mode. `SimHsm::with_hse_parity(true)`, or
+  `HSM_SIM_HSE_PARITY=1` in `hsm-sim-service`'s environment, refuses every op on a dynamic handle
+  (0x0100 and up) with `KeyNotFound`, as a hardware backend that serves only its own slot map
+  does. A guest's KEY_GENERATE then fails under the sim as it does on silicon. Off by default.
+  **Host-facing:** none; a host that wants the sim to promise no more than its hardware sets the
+  variable for the backend it spawns.
+
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
 Tag on `bb2ad95` (2026-11-04), PR #36, #37.
