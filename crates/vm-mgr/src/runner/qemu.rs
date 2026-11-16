@@ -287,6 +287,12 @@ impl QemuRunner {
                 qnx_disks.push((disk.path.clone(), disk.readonly));
             }
             if arch == Arch::X86_64 {
+                // SeaBIOS sets up every bootable virtio-blk disk in its <1 MiB
+                // low memory. From 12 disks on, QNX's startup then finds no
+                // room for the AP trampoline and hangs bringing up CPU 1 (13+:
+                // resets after the IPL). Only boot.img must be visible to the
+                // BIOS; QNX finds the rest itself with devb-virtio.
+                args.extend_from_slice(&["-boot".into(), "strict=on".into()]);
                 for (i, (path, read_only)) in qnx_disks.iter().enumerate() {
                     let id = format!("qnxd{i}");
                     let bootidx = if i == 0 { ",bootindex=0" } else { "" };
@@ -830,6 +836,29 @@ mod tests {
         assert_eq!(option_value(&args, "-cpu"), Some("host"));
         assert!(args.iter().any(|arg| arg == "-nographic"));
         assert!(!args.iter().any(|arg| arg == "-serial"));
+    }
+
+    #[test]
+    fn qnx_x86_boots_strictly_from_the_boot_disk() {
+        let def = qnx_x86_definition();
+
+        let args = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), true)
+            .unwrap();
+
+        assert_eq!(option_value(&args, "-boot"), Some("strict=on"));
+    }
+
+    #[test]
+    fn linux_guests_keep_the_default_boot_order() {
+        let mut def = qnx_x86_definition();
+        def.os_type = OsType::Linux;
+
+        let args = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), true)
+            .unwrap();
+
+        assert_eq!(option_value(&args, "-boot"), None);
     }
 
     #[test]
