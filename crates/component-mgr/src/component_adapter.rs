@@ -24,6 +24,7 @@ use machine_mgr::{
 
 use crate::backend::{ComponentBackend, DID_REGISTRY};
 use crate::did;
+use crate::sovd::identity::EcuId;
 
 pub struct ComponentAdapter<D: BlockDevice + Send + 'static> {
     inner: Arc<ComponentBackend<D>>,
@@ -37,6 +38,9 @@ pub struct ComponentAdapter<D: BlockDevice + Send + 'static> {
     /// over `csr_keystore`; when `None` the keystore-backed path runs exactly as
     /// before. Set via [`Self::with_csr_crypto`].
     csr_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
+    /// What `get_device_id` reports. Set via [`Self::with_ecu_id`]; the default
+    /// is the device-key thumbprint.
+    ecu_id: EcuId,
 }
 
 impl<D: BlockDevice + Send + Sync + 'static> ComponentAdapter<D> {
@@ -56,7 +60,17 @@ impl<D: BlockDevice + Send + Sync + 'static> ComponentAdapter<D> {
             capabilities,
             csr_keystore: None,
             csr_crypto: None,
+            ecu_id: EcuId::Thumbprint,
         }
+    }
+
+    /// Say where `get_device_id` takes this ECU's id from: an id the host
+    /// supplies, none ([`EcuId::Unavailable`]), or the device-key thumbprint (the
+    /// default). Give it the same [`EcuId`] as the authorizer's, so the id the
+    /// component reports is the `aud` tokens are checked against.
+    pub fn with_ecu_id(mut self, ecu_id: EcuId) -> Self {
+        self.ecu_id = ecu_id;
+        self
     }
 
     /// Configure HSM CSR signing. Sets `Capabilities.hsm.supports_csr = true`
@@ -485,11 +499,17 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
         Ok(KeyInventory { provisioned, keys })
     }
 
-    /// The ECU's self-sovereign id: a thumbprint of its HSM device key (the
-    /// token `aud`). Read-only identity, served whether or not the device is
-    /// provisioned — the device key exists from first boot, so no CSR-style gate.
+    /// The ECU's id (the token `aud`): the one the host injected
+    /// ([`Self::with_ecu_id`]), or by default a thumbprint of its HSM device key.
+    /// Read-only identity, served whether or not the device is provisioned — the
+    /// device key exists from first boot, so no CSR-style gate.
     async fn get_device_id(&self) -> MachineResult<Option<String>> {
         use hsm::HsmCryptoProvider;
+        match &self.ecu_id {
+            EcuId::Injected(id) => return Ok(Some(id.clone()).filter(|id| !id.is_empty())),
+            EcuId::Unavailable => return Ok(None),
+            EcuId::Thumbprint => {}
+        }
         let handle = hsm::KeyRole::DeviceDecryption.handle();
 
         // Prefer the injected crypto provider; else a transient SimHsm over the

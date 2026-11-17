@@ -458,6 +458,9 @@ async fn main() {
         hsm_crypto: client.clone().map(|c| c as Arc<dyn hsm::HsmCryptoProvider>),
         hsm_keystore: Some(hsm_keystore_path.clone()),
         hsm_port,
+        // The dev gateway has no platform id: its device id stays the device-key
+        // thumbprint.
+        ecu_id: component_mgr::sovd::identity::EcuId::Thumbprint,
         bank_activators,
         // No raw-partition banks in the dev vm-sovd binary (VMs stage to bank
         // dirs); the host OS bank's PartitionBankProvider is a host-mm concern.
