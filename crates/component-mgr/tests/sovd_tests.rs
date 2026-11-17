@@ -1463,6 +1463,30 @@ async fn x_update_commit_resolves_both_components_after_one_coalesced_reboot() {
     }
 }
 
+#[tokio::test]
+async fn node_verdict_ops_are_served_on_the_v1_tree_beside_sovdd() {
+    // Merged over SOVDd's own two-tree router (the vm-sovd composition): the
+    // `/v1` verbs resolve to the vendor ops and answer like the legacy twins.
+    let (router, _nv, _keys) = make_node_router();
+
+    for op in ["x-update-commit", "x-update-rollback"] {
+        let suffix = format!("/operations/{op}/executions");
+        let (v1_status, v1) =
+            post_json(&router, &format!("/v1{suffix}"), serde_json::json!({})).await;
+        let (legacy_status, legacy) = post_json(
+            &router,
+            &format!("/vehicle/v1{suffix}"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(v1_status, StatusCode::OK, "{op}: {v1}");
+        assert_eq!(v1_status, legacy_status, "{op}");
+        assert_eq!(v1["operation_id"], op);
+        assert_eq!(v1["status"], legacy["status"], "{op}");
+        assert_eq!(v1["result"], legacy["result"], "{op}");
+    }
+}
+
 // --- x-update-state `banks` member ---
 
 /// Write `files` (name, bytes) into `images/<id>/<bank_x>` and sign an IVD

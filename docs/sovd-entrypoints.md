@@ -6,7 +6,9 @@ diagnostics-and-OTA HTTP API the sumo stack exposes under `/vehicle/v1/...`
 wire). The wire is built from the **SOVDd library** (`sovd-core` traits +
 `sovd-api` router); sumo-mm adds the `x-*` vendor routes on top (the
 three-layer rule — SOVDd stays spec-pure, vendor extensions live here in
-`component_mgr::sovd::routes`). This doc inventories every place in the
+`component_mgr::sovd::routes`). Like SOVDd's own routes, every vendor route is
+served on both trees: the spec base `/v1/...` and the legacy `/vehicle/v1/...`
+(e.g. `POST /v1/operations/x-update-commit/executions`). This doc inventories every place in the
 workspace that **binds a port and serves** that API, so "which server is this?"
 has one answer.
 

@@ -17,6 +17,12 @@ what a consumer has to touch when it moves its pin.
 - component-mgr: components whose bank provider requires an ECU reset report
   `VerdictScope::Node`; SOVDd refuses per-update verdicts on them under /v1 (409 naming the node
   operations) and serves verdict_scope "node"; /vehicle/v1 unchanged.
+- component-mgr: every vendor route (`update_state_router`, `hsm_router`, `node_verdict_router`,
+  `pull_update_router`, `device_id_router`) is served under /v1 as well as /vehicle/v1, so the
+  node operations SOVDd's /v1 409 names (`POST /v1/operations/x-update-commit/executions`, …)
+  resolve. A /v1 pull-update POST answers with a /v1 `Location`; /vehicle/v1 unchanged.
+  `pull_update::PULL_OP_PATH` is replaced by `pull_update::pull_op_path(tree)`, and
+  `execute_pull_update` takes the request's op path (used as the authz `path`).
 
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 

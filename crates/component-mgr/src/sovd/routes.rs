@@ -13,13 +13,26 @@ use std::sync::Arc;
 
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{get, post, MethodRouter};
 use axum::{Json, Router};
 use machine_mgr::node_update::NodeCoordinator;
 use machine_mgr::system_bank_state::{Outcome, Reason, Resolution};
 use machine_mgr::{BankContents, Component, FlashId, FlashState, Machine, MachineError};
 use nv_store::types::Bank;
 use sovd_core::{OperationExecution, OperationStatus};
+
+/// Mount each `(suffix, method_router)` under every SOVDd tree
+/// (`sovd_api::Tree::ALL`: `/v1` and the legacy `/vehicle/v1`), so the vendor
+/// routes sit on the same two trees as the SOVDd routes they are merged with.
+fn both_trees<const N: usize>(routes: [(&str, MethodRouter); N]) -> Router {
+    let mut router = Router::new();
+    for (suffix, method_router) in routes {
+        for tree in sovd_api::Tree::ALL {
+            router = router.route(&format!("{}{suffix}", tree.base()), method_router.clone());
+        }
+    }
+    router
+}
 
 /// `GET /vehicle/v1/data/x-ota-update-state` — the node's update-transaction
 /// state (phase + the components involved), for the orchestrator to poll before
@@ -40,23 +53,24 @@ use sovd_core::{OperationExecution, OperationStatus};
 pub fn update_state_router(coord: Arc<NodeCoordinator>, machine: Arc<dyn Machine>) -> Router {
     let alias_coord = coord.clone();
     let alias_machine = machine.clone();
-    Router::new()
-        .route(
-            "/vehicle/v1/data/x-ota-update-state",
+    both_trees([
+        (
+            "/data/x-ota-update-state",
             get(move || {
                 let coord = coord.clone();
                 let machine = machine.clone();
                 async move { update_state(coord, machine).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/data/x-update-state",
+        ),
+        (
+            "/data/x-update-state",
             get(move || {
                 let coord = alias_coord.clone();
                 let machine = alias_machine.clone();
                 async move { x_update_state(coord, machine).await }
             }),
-        )
+        ),
+    ])
 }
 
 /// The `x-ota-update-state` resource body — the node's update-transaction
@@ -292,21 +306,22 @@ fn component_banks(machine: &dyn Machine) -> Vec<ComponentBanksResponse> {
 /// old `vm-mgr` name).
 pub fn hsm_router(machine: Arc<dyn Machine>) -> Router {
     let csr = machine.clone();
-    Router::new()
-        .route(
-            "/vehicle/v1/components/hsm/data/keys",
+    both_trees([
+        (
+            "/components/hsm/data/keys",
             get(move || {
                 let machine = machine.clone();
                 async move { hsm_keys_list(machine).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/components/hsm/operations/x-csr/executions",
+        ),
+        (
+            "/components/hsm/operations/x-csr/executions",
             post(move |Json(req): Json<CsrRequest>| {
                 let machine = csr.clone();
                 async move { hsm_csr_execute(machine, req).await }
             }),
-        )
+        ),
+    ])
 }
 
 /// One HSM key-slot entry in the [`HsmKeysResponse`] inventory — public
@@ -484,13 +499,13 @@ pub(crate) async fn hsm_csr_execute(
 /// this is read-only identity, served whether or not the device is provisioned.
 /// Vendor extension per ISO 17978-3 §5.3.6.
 pub fn device_id_router(machine: Arc<dyn Machine>) -> Router {
-    Router::new().route(
-        "/vehicle/v1/components/hsm/x-ecu-id",
+    both_trees([(
+        "/components/hsm/x-ecu-id",
         get(move || {
             let machine = machine.clone();
             async move { device_id(machine).await }
         }),
-    )
+    )])
 }
 
 /// `GET /vehicle/v1/components/hsm/x-ecu-id` — the ECU's id; see
@@ -941,47 +956,48 @@ pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
     let update_commit_lock = verdict_lock.clone();
     let update_rollback_machine = machine.clone();
     let update_rollback_lock = verdict_lock.clone();
-    Router::new()
-        .route(
-            "/vehicle/v1/operations/x-ota-commit-trials/executions",
+    both_trees([
+        (
+            "/operations/x-ota-commit-trials/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = commit_machine.clone();
                 let verdict_lock = commit_lock.clone();
                 async move { commit_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/operations/x-ota-rollback-trials/executions",
+        ),
+        (
+            "/operations/x-ota-rollback-trials/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = machine.clone();
                 let verdict_lock = verdict_lock.clone();
                 async move { rollback_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/operations/x-update-verdict/executions",
+        ),
+        (
+            "/operations/x-update-verdict/executions",
             post(move |Json(req): Json<NodeVerdictRequest>| {
                 let machine = alias_machine.clone();
                 let verdict_lock = alias_lock.clone();
                 async move { x_update_verdict(machine, req, verdict_lock).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/operations/x-update-commit/executions",
+        ),
+        (
+            "/operations/x-update-commit/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = update_commit_machine.clone();
                 let verdict_lock = update_commit_lock.clone();
                 async move { x_update_commit(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/operations/x-update-rollback/executions",
+        ),
+        (
+            "/operations/x-update-rollback/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = update_rollback_machine.clone();
                 let verdict_lock = update_rollback_lock.clone();
                 async move { x_update_rollback(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
-        )
+        ),
+    ])
 }
 
 // The onboard pull-update entry lives in its own module (async, multi-
@@ -1723,6 +1739,94 @@ mod tests {
             alias,
             get_json(&router, "/vehicle/v1/data/x-ota-update-state").await
         );
+    }
+
+    // Two-tree mount: every vendor route is served under `/v1` exactly as
+    // under the legacy `/vehicle/v1`.
+
+    #[tokio::test]
+    async fn x_update_state_is_served_on_the_v1_tree() {
+        let router = update_state_router(
+            coord_with(Some((true, false)), Some(true), Some("boot-b")),
+            machine_with(&[]),
+        );
+        for suffix in ["/data/x-update-state", "/data/x-ota-update-state"] {
+            assert_eq!(
+                get_json(&router, &format!("/v1{suffix}")).await,
+                get_json(&router, &format!("/vehicle/v1{suffix}")).await,
+                "{suffix}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn x_update_commit_and_rollback_are_served_on_the_v1_tree() {
+        for (suffix, op, acted) in [
+            (
+                "/operations/x-update-commit/executions",
+                "x-update-commit",
+                "committed",
+            ),
+            (
+                "/operations/x-update-rollback/executions",
+                "x-update-rollback",
+                "rolled_back",
+            ),
+        ] {
+            let mut bodies = Vec::new();
+            for base in ["/v1", "/vehicle/v1"] {
+                let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+                let resp = node_verdict_router(machine_with(std::slice::from_ref(&stub)))
+                    .oneshot(post(&format!("{base}{suffix}"), None))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{base}{suffix}");
+                assert_eq!(
+                    stub.commits.load(Ordering::SeqCst) + stub.rollbacks.load(Ordering::SeqCst),
+                    1,
+                    "{base}{suffix}"
+                );
+                bodies.push(body_json(resp).await);
+            }
+            let (v1, legacy) = (&bodies[0], &bodies[1]);
+            assert_eq!(v1["operation_id"], op);
+            assert_eq!(v1["operation_id"], legacy["operation_id"]);
+            assert_eq!(v1["status"], legacy["status"]);
+            assert_eq!(v1["result"], legacy["result"]);
+            assert_eq!(v1["result"][acted], serde_json::json!(["vm1"]));
+        }
+    }
+
+    /// Status + raw body of a `GET uri`.
+    async fn get_raw(router: &Router, uri: &str) -> (StatusCode, axum::body::Bytes) {
+        let resp = router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn hsm_and_device_id_routes_are_served_on_the_v1_tree() {
+        // No hsm component: the handlers answer 503, never the router's 404.
+        let routers = [
+            ("/components/hsm/data/keys", hsm_router(machine_with(&[]))),
+            (
+                "/components/hsm/x-ecu-id",
+                device_id_router(machine_with(&[])),
+            ),
+        ];
+        for (suffix, router) in routers {
+            let v1 = get_raw(&router, &format!("/v1{suffix}")).await;
+            let legacy = get_raw(&router, &format!("/vehicle/v1{suffix}")).await;
+            assert_ne!(v1.0, StatusCode::NOT_FOUND, "{suffix}");
+            assert_eq!(v1, legacy, "{suffix}");
+        }
     }
 
     // Shape-identity guards: the named response structs must serialize to the

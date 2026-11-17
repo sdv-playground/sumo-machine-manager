@@ -129,4 +129,36 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    /// The vendor verdict ops are merged on the `/v1` tree too: the commit the
+    /// SOVDd `/v1` refusal names is served, answering like its legacy twin.
+    #[tokio::test]
+    async fn gateway_serves_x_update_commit_on_the_v1_tree() {
+        let authorizer: Arc<dyn Authorizer> = Arc::new(TieredAuthorizer::new(Vec::new()));
+        let router = gateway_router(
+            test_machine(),
+            HashMap::new(),
+            authorizer,
+            b"anchor".to_vec(),
+        );
+
+        let mut statuses = Vec::new();
+        for base in ["/v1", "/vehicle/v1"] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("{base}/operations/x-update-commit/executions"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            statuses.push(resp.status());
+        }
+
+        assert_ne!(statuses[0], StatusCode::NOT_FOUND);
+        assert_eq!(statuses[0], statuses[1]);
+    }
 }
