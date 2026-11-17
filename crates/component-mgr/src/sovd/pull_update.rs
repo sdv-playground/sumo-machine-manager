@@ -34,7 +34,15 @@ use puller::Puller;
 use sovd_core::{OperationExecution, OperationStatus};
 
 pub const PULL_OP_ID: &str = "x-ota-pull-update";
-pub const PULL_OP_PATH: &str = "/vehicle/v1/operations/x-ota-pull-update/executions";
+/// The op's executions path below a tree base; see [`pull_op_path`].
+const PULL_OP_SUFFIX: &str = "/operations/x-ota-pull-update/executions";
+
+/// The op's executions path under `tree` — `/v1/...` or `/vehicle/v1/...`.
+/// The routes, the 202 `Location` and the authz `path` all use the tree the
+/// request came in on.
+pub fn pull_op_path(tree: sovd_api::Tree) -> String {
+    format!("{}{PULL_OP_SUFFIX}", tree.base())
+}
 
 /// Body of the `x-ota-pull-update` operation.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
@@ -110,7 +118,8 @@ impl Executions {
 }
 
 /// Build the onboard pull-update routes: the POST entry (202 + `Location`)
-/// and the per-execution GET status.
+/// and the per-execution GET status, mounted under both SOVDd trees
+/// (`/v1` and `/vehicle/v1`) over one shared execution table.
 ///
 /// Authorization is enforced **on this route** by the injected `authorizer`
 /// (route-scoped — independent of whether the host wires global enforcement):
@@ -122,31 +131,51 @@ pub fn pull_update_router(
     trust_anchor: TrustAnchorSource,
 ) -> Router {
     let execs: Arc<Executions> = Arc::default();
-    let post_execs = execs.clone();
-    Router::new()
-        .route(
-            PULL_OP_PATH,
-            post(
-                move |headers: axum::http::HeaderMap, Json(req): Json<PullUpdateRequest>| {
-                    let machine = machine.clone();
-                    let authorizer = authorizer.clone();
-                    let trust_anchor = trust_anchor.clone();
-                    let execs = post_execs.clone();
-                    async move {
-                        handle_post(machine, authorizer, trust_anchor, execs, headers, req).await
-                    }
-                },
-            ),
-        )
-        .route(
-            &format!("{PULL_OP_PATH}/{{execution_id}}"),
-            get(
-                move |axum::extract::Path(execution_id): axum::extract::Path<String>| {
-                    let execs = execs.clone();
-                    async move { get_pull_update_status(execs, execution_id).await }
-                },
-            ),
-        )
+    let mut router = Router::new();
+    for tree in sovd_api::Tree::ALL {
+        let op_path = pull_op_path(tree);
+        let machine = machine.clone();
+        let authorizer = authorizer.clone();
+        let trust_anchor = trust_anchor.clone();
+        let post_execs = execs.clone();
+        let post_path = op_path.clone();
+        let get_execs = execs.clone();
+        router = router
+            .route(
+                &op_path,
+                post(
+                    move |headers: axum::http::HeaderMap, Json(req): Json<PullUpdateRequest>| {
+                        let machine = machine.clone();
+                        let authorizer = authorizer.clone();
+                        let trust_anchor = trust_anchor.clone();
+                        let execs = post_execs.clone();
+                        let op_path = post_path.clone();
+                        async move {
+                            handle_post(
+                                machine,
+                                authorizer,
+                                trust_anchor,
+                                execs,
+                                op_path,
+                                headers,
+                                req,
+                            )
+                            .await
+                        }
+                    },
+                ),
+            )
+            .route(
+                &format!("{op_path}/{{execution_id}}"),
+                get(
+                    move |axum::extract::Path(execution_id): axum::extract::Path<String>| {
+                        let execs = get_execs.clone();
+                        async move { get_pull_update_status(execs, execution_id).await }
+                    },
+                ),
+            );
+    }
+    router
 }
 
 /// `GET /vehicle/v1/operations/x-ota-pull-update/executions/{execution_id}` —
@@ -197,6 +226,7 @@ pub(crate) async fn handle_post(
     authorizer: Arc<dyn sovd_api::Authorizer>,
     trust_anchor: TrustAnchorSource,
     execs: Arc<Executions>,
+    op_path: String,
     headers: axum::http::HeaderMap,
     req: PullUpdateRequest,
 ) -> axum::response::Response {
@@ -206,7 +236,7 @@ pub(crate) async fn handle_post(
     let access = sovd_api::AccessRequest {
         bearer: bearer.as_deref(),
         method: &axum::http::Method::POST,
-        path: PULL_OP_PATH,
+        path: &op_path,
         component: None,
         capability: sovd_api::Capability::UpdateExecute,
     };
@@ -301,12 +331,14 @@ pub(crate) async fn handle_post(
     execs.put(running.clone());
     {
         let execs = execs.clone();
+        let op_path = op_path.clone();
         tokio::spawn(async move {
             let done = execute_pull_update(
                 machine,
                 authorizer,
                 anchor,
                 bearer,
+                op_path,
                 req,
                 l1_bytes,
                 execution_id,
@@ -321,7 +353,7 @@ pub(crate) async fn handle_post(
         StatusCode::ACCEPTED,
         [(
             header::LOCATION,
-            format!("{PULL_OP_PATH}/{}", running.execution_id),
+            format!("{op_path}/{}", running.execution_id),
         )],
         Json(running),
     )
@@ -409,6 +441,7 @@ pub async fn execute_pull_update(
     authorizer: Arc<dyn sovd_api::Authorizer>,
     trust_anchor: Vec<u8>,
     bearer: Option<String>,
+    op_path: String,
     req: PullUpdateRequest,
     l1_bytes: Vec<u8>,
     execution_id: String,
@@ -420,6 +453,7 @@ pub async fn execute_pull_update(
         authorizer.as_ref(),
         &trust_anchor,
         bearer.as_deref(),
+        &op_path,
         &req,
         &l1_bytes,
         &mut steps,
@@ -495,11 +529,13 @@ fn l2_needs_fetch(l2_bytes: &[u8]) -> bool {
 /// install source, start, upload) → finalize all. On failure, abort every
 /// still-open session; already-finalized deps stay in trial and are reported
 /// honestly (the operator resolves them via the node verdict ops).
+#[allow(clippy::too_many_arguments)]
 async fn run_campaign(
     machine: &dyn Machine,
     authorizer: &dyn sovd_api::Authorizer,
     trust_anchor: &[u8],
     bearer: Option<&str>,
+    op_path: &str,
     req: &PullUpdateRequest,
     l1_bytes: &[u8],
     steps: &mut Vec<DepStep>,
@@ -537,7 +573,7 @@ async fn run_campaign(
         let access = sovd_api::AccessRequest {
             bearer,
             method: &axum::http::Method::POST,
-            path: PULL_OP_PATH,
+            path: op_path,
             component: Some(&target),
             capability: sovd_api::Capability::UpdateExecute,
         };
