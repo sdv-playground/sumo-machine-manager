@@ -27,6 +27,104 @@ fn virtio_net_compat_features(os_type: OsType, arch: Arch) -> &'static str {
     }
 }
 
+/// The `,prop=…` suffix for every NIC: the VM's `virtio_net_features`
+/// override when set, otherwise the built-in set (QNX x86_64 only).
+fn virtio_net_features(def: &VmDefinition) -> String {
+    match def.virtio_net_features.as_deref().map(str::trim) {
+        Some("") => String::new(),
+        Some(features) => format!(",{}", features.trim_matches(',')),
+        None => virtio_net_compat_features(def.os_type, def.arch()).to_string(),
+    }
+}
+
+/// Whether to run with KVM: `auto` follows the runner's `try_kvm` and the
+/// host; `kvm` insists (a config error when the host cannot); `tcg` never.
+/// An explicit per-VM `accel: kvm` wins over the runner's `try_kvm(false)`:
+/// the VM's config is the more specific choice.
+fn resolve_kvm(
+    vm: &str,
+    accel: Accel,
+    try_kvm: bool,
+    kvm_available: bool,
+) -> Result<bool, RunnerError> {
+    match accel {
+        Accel::Auto => Ok(try_kvm && kvm_available),
+        Accel::Tcg => Ok(false),
+        Accel::Kvm if kvm_available => Ok(true),
+        Accel::Kvm => Err(RunnerError::Config(format!(
+            "{vm}: accel: kvm, but KVM is not available for this guest arch on this host"
+        ))),
+    }
+}
+
+/// QEMU's `virt` machine has 32 virtio-mmio transports (buses 0–31).
+const VIRT_MMIO_SLOTS: u8 = 32;
+
+/// Whether an aarch64 VM places its devices on fixed virtio-mmio buses: as
+/// soon as one block device or NIC names a `slot` (or `images.rootfs_slot` is
+/// set), every one must. Mixing is refused because QEMU puts an unplaced device
+/// on the highest free bus, which a later fixed device may name.
+fn uses_mmio_slots(def: &VmDefinition) -> bool {
+    def.arch() == Arch::Aarch64
+        && (def.images.rootfs_slot.is_some()
+            || def.partitions.iter().any(|p| p.slot.is_some())
+            || def.disks.iter().any(|d| d.slot.is_some())
+            || def.devices.iter().any(|d| {
+                matches!(
+                    d,
+                    DeviceConfig::Network { slot: Some(_), .. }
+                        | DeviceConfig::Bridge { slot: Some(_), .. }
+                )
+            }))
+}
+
+/// Fixed virtio-mmio placement (see [`uses_mmio_slots`]): a missing,
+/// out-of-range or doubly used slot is a config error. A device on the wrong
+/// slot is not an error the guest reports; it just never finds that disk.
+struct MmioSlots<'a> {
+    vm: &'a str,
+    fixed: bool,
+    used: Vec<(u8, String)>,
+}
+
+impl<'a> MmioSlots<'a> {
+    fn new(vm: &'a str, fixed: bool) -> Self {
+        Self {
+            vm,
+            fixed,
+            used: Vec::new(),
+        }
+    }
+
+    /// The `,bus=virtio-mmio-bus.<slot>` suffix for a device, or `""` when
+    /// the VM does not use fixed slots.
+    fn bus(&mut self, slot: Option<u8>, what: &str) -> Result<String, RunnerError> {
+        if !self.fixed {
+            return Ok(String::new());
+        }
+        let vm = self.vm;
+        let slot = slot.ok_or_else(|| {
+            RunnerError::Config(format!(
+                "{vm}: {what} needs a `slot`: once one device of an aarch64 VM names \
+                 its virtio-mmio slot, all must"
+            ))
+        })?;
+        if slot >= VIRT_MMIO_SLOTS {
+            return Err(RunnerError::Config(format!(
+                "{vm}: {what} slot {slot} is out of range (0-{})",
+                VIRT_MMIO_SLOTS - 1
+            )));
+        }
+        if let Some((_, owner)) = self.used.iter().find(|(used, _)| *used == slot) {
+            return Err(RunnerError::Config(format!(
+                "{vm}: {what} and {owner} both use virtio-mmio slot {slot}"
+            )));
+        }
+        self.used.push((slot, what.to_string()));
+        Ok(format!(",bus=virtio-mmio-bus.{slot}"))
+    }
+}
+
 pub struct QemuRunner {
     /// Override QEMU binary path. If None, resolved from arch.
     qemu_bin: Option<PathBuf>,
@@ -168,7 +266,7 @@ impl QemuRunner {
         ivshmem_sockets: &IvshmemSockets,
     ) -> Result<Vec<String>, RunnerError> {
         let arch = def.arch();
-        let use_kvm = self.try_kvm && arch.kvm_available();
+        let use_kvm = resolve_kvm(name, def.accel, self.try_kvm, arch.kvm_available())?;
         self.build_qemu_args_with_kvm(name, def, ivshmem_sockets, use_kvm)
     }
 
@@ -180,7 +278,14 @@ impl QemuRunner {
         use_kvm: bool,
     ) -> Result<Vec<String>, RunnerError> {
         let arch = def.arch();
+        let is_qnx = def.os_type == crate::config::OsType::Qnx;
+        let qnx_aarch64 = is_qnx && arch == Arch::Aarch64;
+        let fixed_mmio = uses_mmio_slots(def);
+        let mut mmio_slots = MmioSlots::new(name, fixed_mmio);
         let mut args: Vec<String> = Vec::new();
+        // The Linux RNG has no slot: with fixed slots it is added after every
+        // placed device, so QEMU puts it on a bus nobody names.
+        let mut deferred_rng = false;
 
         // A configured model is an explicit compatibility choice and applies
         // with KVM as well as TCG. Keep host passthrough as the default when
@@ -246,23 +351,18 @@ impl QemuRunner {
         args.extend_from_slice(&["-qmp".into(), format!("unix:{qmp_sock},server,nowait")]);
 
         // Boot mode depends on OS type
-        let is_qnx = def.os_type == crate::config::OsType::Qnx;
-
-        if is_qnx {
-            // QNX (QEMU) boots a BIOS+IPL-wrapped disk (boot.img) and mounts its
-            // QNX6 rootfs (+ per-bank partitions + extra disks) as additional
-            // disks, laid out in order: boot(0), rootfs(1), partitions, disks.
+        if is_qnx && arch == Arch::X86_64 {
+            // QNX x86_64 (QEMU) boots a BIOS+IPL-wrapped disk (boot.img) and
+            // mounts its QNX6 rootfs (+ per-bank partitions + extra disks) as
+            // additional disks, laid out in order: boot(0), rootfs(1),
+            // partitions, disks.
             //
-            // x86_64: attach every disk as `virtio-blk-pci` — the guest IFS runs
+            // Every disk is a `virtio-blk-pci` — the guest IFS runs
             // `devb-virtio` (the same block stack as the rig), which has no port
             // ceiling, so all bank partitions + persistent disks fit. SeaBIOS
             // boots boot.img via `bootindex=0`; the guest enumerates the disks
             // /dev/hd0.. in attach order (boot=hd0, rootfs=hd1, partitions hd2..).
             //
-            // Non-x86 QNX/QEMU (currently unused — the arm64 QEMU guest boots via
-            // -kernel, not this disk path): keep the legacy bare-`-drive` path. It
-            // auto-targets q35's BUILT-IN AHCI (an explicit ich9-ahci controller
-            // makes devb-ahci miss the disks), whose 6 ports cap the disk count.
             // (path, read_only). Boot + rootfs are IVD-signed, immutable firmware,
             // so they are attached READ-ONLY — mirroring the rig, where the QNX6
             // rootfs mounts read-only. A writable rootfs lets the guest mutate the
@@ -286,42 +386,64 @@ impl QemuRunner {
             for disk in &def.disks {
                 qnx_disks.push((disk.path.clone(), disk.readonly));
             }
-            if arch == Arch::X86_64 {
-                // SeaBIOS sets up every bootable virtio-blk disk in its <1 MiB
-                // low memory. From 12 disks on, QNX's startup then finds no
-                // room for the AP trampoline and hangs bringing up CPU 1 (13+:
-                // resets after the IPL). Only boot.img must be visible to the
-                // BIOS; QNX finds the rest itself with devb-virtio.
-                args.extend_from_slice(&["-boot".into(), "strict=on".into()]);
-                for (i, (path, read_only)) in qnx_disks.iter().enumerate() {
-                    let id = format!("qnxd{i}");
-                    let bootidx = if i == 0 { ",bootindex=0" } else { "" };
-                    let ro = if *read_only { ",readonly=on" } else { "" };
-                    args.extend_from_slice(&[
-                        "-drive".into(),
-                        format!("file={},format=raw,if=none,id={id}{ro}", path.display()),
-                        "-device".into(),
-                        format!("virtio-blk-pci,drive={id}{bootidx}"),
-                    ]);
+            // SeaBIOS sets up every bootable virtio-blk disk in its <1 MiB
+            // low memory. From 12 disks on, QNX's startup then finds no
+            // room for the AP trampoline and hangs bringing up CPU 1 (13+:
+            // resets after the IPL). Only boot.img must be visible to the
+            // BIOS; QNX finds the rest itself with devb-virtio.
+            args.extend_from_slice(&["-boot".into(), "strict=on".into()]);
+            for (i, (path, read_only)) in qnx_disks.iter().enumerate() {
+                let id = format!("qnxd{i}");
+                let bootidx = if i == 0 { ",bootindex=0" } else { "" };
+                let ro = if *read_only { ",readonly=on" } else { "" };
+                args.extend_from_slice(&[
+                    "-drive".into(),
+                    format!("file={},format=raw,if=none,id={id}{ro}", path.display()),
+                    "-device".into(),
+                    format!("virtio-blk-pci,drive={id}{bootidx}"),
+                ]);
+            }
+        } else if qnx_aarch64 {
+            // QNX aarch64: the boot image is an ELF IFS loaded with -kernel
+            // (no BIOS, no kernel cmdline); rootfs, partitions and disks are
+            // virtio-blk devices, on fixed virtio-mmio slots when the config
+            // names them. Boot + rootfs are read-only as on x86_64; partitions
+            // and disks carry their own flag. A partition whose image is absent
+            // is not attached, leaving its slot empty, exactly like x86_64.
+            let boot = def.kernel_path().ok_or_else(|| {
+                RunnerError::Config(format!(
+                    "{name}: QNX aarch64 boots its IFS with -kernel; set images.kernel"
+                ))
+            })?;
+            args.extend_from_slice(&["-kernel".into(), boot.to_string_lossy().into_owned()]);
+
+            let mut qnx_disks: Vec<(PathBuf, bool, String)> = Vec::new();
+            if let Some(rootfs) = def.rootfs_path() {
+                let bus = mmio_slots.bus(def.images.rootfs_slot, "rootfs")?;
+                qnx_disks.push((rootfs, true, bus));
+            }
+            // Every partition claims its slot, flashed or not, so a bad slot
+            // fails on the first start rather than when the layer arrives.
+            for part in &def.partitions {
+                let bus = mmio_slots.bus(part.slot, &format!("partition '{}'", part.role))?;
+                let path = def.partition_path(part);
+                if path.exists() {
+                    qnx_disks.push((path, part.readonly, bus));
                 }
-            } else {
-                const MAX_QNX_DRIVES: usize = 6; // q35 built-in AHCI ports
-                if qnx_disks.len() > MAX_QNX_DRIVES {
-                    tracing::warn!(
-                        vm = name,
-                        drives = qnx_disks.len(),
-                        "QNX/QEMU (non-x86): q35's built-in AHCI has only \
-                         {MAX_QNX_DRIVES} ports; dropping the rest"
-                    );
-                    qnx_disks.truncate(MAX_QNX_DRIVES);
-                }
-                for (path, read_only) in &qnx_disks {
-                    let ro = if *read_only { ",readonly=on" } else { "" };
-                    args.extend_from_slice(&[
-                        "-drive".into(),
-                        format!("file={},format=raw{ro}", path.display()),
-                    ]);
-                }
+            }
+            for disk in &def.disks {
+                let bus = mmio_slots.bus(disk.slot, &format!("disk '{}'", disk.role))?;
+                qnx_disks.push((disk.path.clone(), disk.readonly, bus));
+            }
+            for (i, (path, read_only, bus)) in qnx_disks.iter().enumerate() {
+                let id = format!("qnxd{i}");
+                let ro = if *read_only { ",readonly=on" } else { "" };
+                args.extend_from_slice(&[
+                    "-drive".into(),
+                    format!("file={},format=raw,if=none,id={id}{ro}", path.display()),
+                    "-device".into(),
+                    format!("virtio-blk-device,drive={id}{bus}"),
+                ]);
             }
         } else {
             // Linux: kernel + rootfs + cmdline
@@ -376,6 +498,7 @@ impl QemuRunner {
             let mut disk_args: Vec<Vec<String>> = Vec::new();
 
             for disk in &def.disks {
+                let bus = mmio_slots.bus(disk.slot, &format!("disk '{}'", disk.role))?;
                 let drive_id = format!("hd_{}", disk.role);
                 let ro = if disk.readonly { ",readonly=on" } else { "" };
                 disk_args.push(vec![
@@ -385,7 +508,7 @@ impl QemuRunner {
                         disk.path.display()
                     ),
                     "-device".into(),
-                    format!("{blk_device},drive={drive_id}"),
+                    format!("{blk_device},drive={drive_id}{bus}"),
                 ]);
 
                 if disk.role == "swap" {
@@ -399,6 +522,7 @@ impl QemuRunner {
             // guest mounts each from whichever virtio-blk node it enumerates
             // as. A missing source is skipped.
             for part in &def.partitions {
+                let bus = mmio_slots.bus(part.slot, &format!("partition '{}'", part.role))?;
                 let path = def.partition_path(part);
                 if !path.exists() {
                     continue;
@@ -412,7 +536,7 @@ impl QemuRunner {
                         path.display()
                     ),
                     "-device".into(),
-                    format!("{blk_device},drive={drive_id}"),
+                    format!("{blk_device},drive={drive_id}{bus}"),
                 ]);
             }
 
@@ -421,24 +545,30 @@ impl QemuRunner {
                     "{name}: no rootfs image configured (set images.rootfs in config)"
                 ))
             })?;
+            let rootfs_bus = mmio_slots.bus(def.images.rootfs_slot, "rootfs")?;
             let rootfs_args = vec![
                 "-drive".into(),
                 format!("file={},format=raw,if=none,id=hd_rootfs", rootfs.display()),
                 "-device".into(),
-                format!("{blk_device},drive=hd_rootfs"),
+                format!("{blk_device},drive=hd_rootfs{rootfs_bus}"),
             ];
 
+            deferred_rng = fixed_mmio;
             if arch.reverse_disk_order() {
                 for disk in &disk_args {
                     args.extend_from_slice(disk);
                 }
-                args.push("-device".into());
-                args.push(arch.virtio_device("rng"));
+                if !fixed_mmio {
+                    args.push("-device".into());
+                    args.push(arch.virtio_device("rng"));
+                }
                 args.extend_from_slice(&rootfs_args);
             } else {
                 args.extend_from_slice(&rootfs_args);
-                args.push("-device".into());
-                args.push(arch.virtio_device("rng"));
+                if !fixed_mmio {
+                    args.push("-device".into());
+                    args.push(arch.virtio_device("rng"));
+                }
                 for disk in &disk_args {
                     args.extend_from_slice(disk);
                 }
@@ -456,7 +586,7 @@ impl QemuRunner {
             .filter(|d| matches!(d, DeviceConfig::Network { .. }))
             .collect();
         let net_device = arch.virtio_device("net");
-        let virtio_net_features = virtio_net_compat_features(def.os_type, arch);
+        let virtio_net_features = virtio_net_features(def);
 
         let net_iter: Box<dyn Iterator<Item = (usize, &&DeviceConfig)>> =
             if arch.reverse_disk_order() {
@@ -467,7 +597,12 @@ impl QemuRunner {
 
         let mut net_idx = 0;
         for (i, dev) in net_iter {
-            if let DeviceConfig::Network { mac, ssh_port } = dev {
+            if let DeviceConfig::Network {
+                mac,
+                ssh_port,
+                slot,
+            } = dev
+            {
                 let id = format!("net{net_idx}");
                 let mut netdev = format!("user,id={id}");
                 if let Some(port) = ssh_port {
@@ -484,6 +619,7 @@ impl QemuRunner {
                 if let Some(m) = mac {
                     dev_str.push_str(&format!(",mac={m}"));
                 }
+                dev_str.push_str(&mmio_slots.bus(*slot, &format!("network NIC {i}"))?);
                 args.extend_from_slice(&["-device".into(), dev_str]);
                 net_idx += 1;
             }
@@ -493,16 +629,21 @@ impl QemuRunner {
         // bridge is the host vHSM daemon's identity for that guest, so
         // the MAC is mandatory: dnsmasq pins MAC → IP via static lease.
         for dev in &def.devices {
-            if let DeviceConfig::Bridge { bridge, mac } = dev {
+            if let DeviceConfig::Bridge { bridge, mac, slot } = dev {
+                let bus = mmio_slots.bus(*slot, &format!("bridge NIC '{bridge}'"))?;
                 let id = format!("net{net_idx}");
                 args.extend_from_slice(&[
                     "-netdev".into(),
                     format!("bridge,id={id},br={bridge}"),
                     "-device".into(),
-                    format!("{net_device},netdev={id},mac={mac}{virtio_net_features}"),
+                    format!("{net_device},netdev={id},mac={mac}{virtio_net_features}{bus}"),
                 ]);
                 net_idx += 1;
             }
+        }
+
+        if deferred_rng {
+            args.extend_from_slice(&["-device".into(), arch.virtio_device("rng")]);
         }
 
         // ivshmem devices (time, health, CAN)
@@ -758,6 +899,7 @@ mod tests {
             arch: Some("x86_64".into()),
             machine: None,
             cpus: 2,
+            accel: Accel::Auto,
             ram_mb: 2048,
             cpu_model: None,
             serial_log: None,
@@ -766,6 +908,7 @@ mod tests {
             images: ImagePaths {
                 kernel: Some("kernel".into()),
                 rootfs: Some("rootfs.img".into()),
+                rootfs_slot: None,
             },
             devices: Vec::new(),
             disks: Vec::new(),
@@ -773,6 +916,7 @@ mod tests {
             health: None,
             shutdown: None,
             extra_cmdline: None,
+            virtio_net_features: None,
             sim_dir: None,
             process_command: None,
             process_args: Vec::new(),
@@ -799,7 +943,281 @@ mod tests {
     #[test]
     fn other_guest_profiles_keep_default_virtio_net_features() {
         assert_eq!(virtio_net_compat_features(OsType::Linux, Arch::X86_64), "");
+        assert_eq!(virtio_net_compat_features(OsType::Linux, Arch::Aarch64), "");
         assert_eq!(virtio_net_compat_features(OsType::Qnx, Arch::Aarch64), "");
+    }
+
+    #[test]
+    fn virtio_net_features_override_replaces_the_profile_set() {
+        let mut def = qnx_x86_definition();
+        def.virtio_net_features = Some("event_idx=off,guest_tso4=off".into());
+        assert_eq!(virtio_net_features(&def), ",event_idx=off,guest_tso4=off");
+        def.virtio_net_features = Some(",guest_tso4=off,".into());
+        assert_eq!(virtio_net_features(&def), ",guest_tso4=off");
+        def.virtio_net_features = Some(String::new());
+        assert_eq!(virtio_net_features(&def), "");
+    }
+
+    #[test]
+    fn linux_aarch64_keeps_kernel_boot_and_plain_virtio_devices() {
+        let def: VmDefinition = serde_yaml::from_str(
+            r#"
+backend: qemu
+os_type: linux
+arch: aarch64
+cpus: 2
+image_dir: /var/lib/vm2
+images: { kernel: arm64-Image, rootfs: rootfs.img }
+devices:
+  - { type: network, mac: "52:54:00:00:02:01" }
+"#,
+        )
+        .unwrap();
+
+        let args = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm2", &def, &IvshmemSockets::default(), false)
+            .unwrap();
+
+        assert_eq!(
+            option_value(&args, "-kernel"),
+            Some("/var/lib/vm2/arm64-Image")
+        );
+        assert_eq!(option_value(&args, "-cpu"), Some("cortex-a76"));
+        assert!(args.contains(&"virtio-blk-device,drive=hd_rootfs".to_string()));
+        assert!(args.contains(&"virtio-net-device,netdev=net0,mac=52:54:00:00:02:01".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("virtio-mmio-bus")));
+        assert!(
+            option_value(&args, "-append").is_some_and(|cmdline| cmdline.contains("root=/dev/vda"))
+        );
+    }
+
+    #[test]
+    fn qnx_x86_keeps_bios_boot_disk_on_pci() {
+        let def = qnx_x86_definition();
+
+        let args = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), true)
+            .unwrap();
+
+        assert!(args.contains(&"virtio-blk-pci,drive=qnxd0,bootindex=0".to_string()));
+        assert!(args.contains(&"virtio-blk-pci,drive=qnxd1".to_string()));
+        assert!(!args.iter().any(|arg| arg == "-kernel"));
+        assert!(!args.iter().any(|arg| arg.contains("virtio-mmio-bus")));
+    }
+
+    /// A fixed slot layout as a QNX aarch64 image might expect it: rootfs 31,
+    /// data 30, NIC 29, opt 27, partitions 20/19.
+    fn qnx_aarch64_definition(bank: &std::path::Path) -> VmDefinition {
+        std::fs::write(bank.join("sumo-config.qnx6"), b"").unwrap();
+        serde_yaml::from_str(&format!(
+            r#"
+backend: qemu
+os_type: qnx
+arch: aarch64
+image_dir: {bank}
+images: {{ kernel: boot.img, rootfs: rootfs.img, rootfs_slot: 31 }}
+partitions:
+  - {{ role: cfg, source: sumo-config.qnx6, slot: 20 }}
+  - {{ role: rtl, source: absent-layer.qnx6, slot: 19 }}
+disks:
+  - {{ role: data, path: /var/lib/vm1/data.img, slot: 30 }}
+  - {{ role: opt, path: /var/lib/vm1/opt.img, slot: 27 }}
+devices:
+  - {{ type: bridge, bridge: br0, mac: "52:54:00:00:01:02", slot: 29 }}
+"#,
+            bank = bank.display()
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn qnx_aarch64_boots_ifs_with_devices_on_fixed_mmio_slots() {
+        let bank = tempfile::tempdir().unwrap();
+        let def = qnx_aarch64_definition(bank.path());
+
+        let args = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), false)
+            .unwrap();
+
+        let boot = bank.path().join("boot.img");
+        assert_eq!(option_value(&args, "-kernel"), boot.to_str());
+        assert_eq!(option_value(&args, "-machine"), Some("virt,gic-version=3"));
+        assert_eq!(option_value(&args, "-cpu"), Some("cortex-a76"));
+        assert_eq!(option_value(&args, "-smp"), Some("4"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "-enable-kvm" || arg == "-append"));
+
+        let devices: Vec<&str> = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .filter(|(option, _)| *option == "-device")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(
+            devices[..4],
+            [
+                "virtio-blk-device,drive=qnxd0,bus=virtio-mmio-bus.31",
+                "virtio-blk-device,drive=qnxd1,bus=virtio-mmio-bus.20",
+                "virtio-blk-device,drive=qnxd2,bus=virtio-mmio-bus.30",
+                "virtio-blk-device,drive=qnxd3,bus=virtio-mmio-bus.27",
+            ]
+        );
+        assert_eq!(
+            devices[4],
+            "virtio-net-device,netdev=net0,mac=52:54:00:00:01:02,bus=virtio-mmio-bus.29"
+        );
+        let rootfs = bank.path().join("rootfs.img");
+        assert!(args.contains(&format!(
+            "file={},format=raw,if=none,id=qnxd0,readonly=on",
+            rootfs.display()
+        )));
+        assert!(
+            args.contains(&"file=/var/lib/vm1/data.img,format=raw,if=none,id=qnxd2".to_string())
+        );
+    }
+
+    #[test]
+    fn qnx_aarch64_without_slots_keeps_qemu_placement() {
+        let bank = tempfile::tempdir().unwrap();
+        let mut def = qnx_aarch64_definition(bank.path());
+        def.images.rootfs_slot = None;
+        def.partitions.iter_mut().for_each(|p| p.slot = None);
+        def.disks.iter_mut().for_each(|d| d.slot = None);
+        def.devices = vec![DeviceConfig::Network {
+            mac: None,
+            ssh_port: None,
+            slot: None,
+        }];
+
+        let args = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), false)
+            .unwrap();
+
+        assert!(args.iter().any(|arg| arg == "-kernel"));
+        assert!(args.contains(&"virtio-blk-device,drive=qnxd0".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("virtio-mmio-bus")));
+    }
+
+    #[test]
+    fn linux_aarch64_places_devices_on_named_slots_and_the_rng_last() {
+        let bank = tempfile::tempdir().unwrap();
+        std::fs::write(bank.path().join("ca-bundle"), b"").unwrap();
+        let mut def: VmDefinition = serde_yaml::from_str(&format!(
+            r#"
+backend: qemu
+os_type: linux
+arch: aarch64
+image_dir: {bank}
+images: {{ kernel: arm64-Image, rootfs: rootfs.img, rootfs_slot: 31 }}
+partitions:
+  - {{ role: cab, source: ca-bundle, slot: 25 }}
+disks:
+  - {{ role: data, path: /var/lib/vm2/data.img, slot: 30 }}
+devices:
+  - {{ type: network, mac: "52:54:00:00:02:01", slot: 29 }}
+"#,
+            bank = bank.path().display()
+        ))
+        .unwrap();
+
+        let args = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm2", &def, &IvshmemSockets::default(), false)
+            .unwrap();
+
+        let devices: Vec<&str> = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .filter(|(option, _)| *option == "-device")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(
+            devices,
+            [
+                "virtio-blk-device,drive=hd_data,bus=virtio-mmio-bus.30",
+                "virtio-blk-device,drive=hd_cab,bus=virtio-mmio-bus.25",
+                "virtio-blk-device,drive=hd_rootfs,bus=virtio-mmio-bus.31",
+                "virtio-net-device,netdev=net0,mac=52:54:00:00:02:01,bus=virtio-mmio-bus.29",
+                "virtio-rng-device",
+            ]
+        );
+
+        def.disks[0].slot = None;
+        let error = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm2", &def, &IvshmemSockets::default(), false)
+            .unwrap_err();
+        assert!(error.to_string().contains("disk 'data' needs a `slot`"));
+    }
+
+    #[test]
+    fn qnx_aarch64_keeps_the_configured_vcpus_under_kvm() {
+        let bank = tempfile::tempdir().unwrap();
+        let def = qnx_aarch64_definition(bank.path());
+
+        let args = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), true)
+            .unwrap();
+
+        assert_eq!(option_value(&args, "-smp"), Some("4"));
+        assert_eq!(option_value(&args, "-cpu"), Some("host"));
+        assert!(args.iter().any(|arg| arg == "-enable-kvm"));
+    }
+
+    #[test]
+    fn accel_selects_kvm_or_tcg() {
+        assert!(resolve_kvm("vm1", Accel::Auto, true, true).unwrap());
+        assert!(!resolve_kvm("vm1", Accel::Auto, false, true).unwrap());
+        assert!(!resolve_kvm("vm1", Accel::Auto, true, false).unwrap());
+        assert!(!resolve_kvm("vm1", Accel::Tcg, true, true).unwrap());
+        assert!(resolve_kvm("vm1", Accel::Kvm, false, true).unwrap());
+        let error = resolve_kvm("vm1", Accel::Kvm, true, false).unwrap_err();
+        assert!(error.to_string().contains("KVM is not available"));
+    }
+
+    #[test]
+    fn qnx_aarch64_rejects_a_device_without_a_slot() {
+        let bank = tempfile::tempdir().unwrap();
+        let mut def = qnx_aarch64_definition(bank.path());
+        def.disks[1].slot = None;
+
+        let error = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), false)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("disk 'opt' needs a `slot`"));
+    }
+
+    #[test]
+    fn qnx_aarch64_rejects_a_slot_used_twice_or_out_of_range() {
+        let bank = tempfile::tempdir().unwrap();
+        let mut def = qnx_aarch64_definition(bank.path());
+        def.partitions[0].slot = Some(31);
+
+        let error = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), false)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("partition 'cfg' and rootfs both use virtio-mmio slot 31"));
+
+        def.partitions[0].slot = Some(32);
+        let error = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), false)
+            .unwrap_err();
+        assert!(error.to_string().contains("slot 32 is out of range"));
+    }
+
+    #[test]
+    fn qnx_aarch64_checks_the_slot_of_a_partition_not_flashed_yet() {
+        let bank = tempfile::tempdir().unwrap();
+        let mut def = qnx_aarch64_definition(bank.path());
+        def.partitions[1].slot = None; // absent-layer.qnx6 is not on disk
+
+        let error = QemuRunner::new()
+            .build_qemu_args_with_kvm("vm1", &def, &IvshmemSockets::default(), false)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("partition 'rtl' needs a `slot`"));
     }
 
     #[test]
