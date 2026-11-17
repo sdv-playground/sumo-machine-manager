@@ -23,6 +23,17 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         }
     }
 
+    /// A component whose bank provider requires an ECU reset is activated by
+    /// the node restart together with its peers, so the node operation is its
+    /// only settle path: per-update verdicts are refused on it.
+    fn verdict_scope(&self) -> sovd_core::VerdictScope {
+        if self.reset_kind() == machine_mgr::ResetKind::RequiresEcuReset {
+            sovd_core::VerdictScope::Node
+        } else {
+            sovd_core::VerdictScope::Update
+        }
+    }
+
     // --- Data ---
 
     async fn list_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {

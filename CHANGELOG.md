@@ -10,6 +10,13 @@ what a consumer has to touch when it moves its pin.
 
 - vm-sovd: the plain (non-gateway) server mounts `node_verdict_router`, so `x-update-commit` /
   `x-update-rollback` (and the `x-ota-*-trials` aliases) are served there too, not only by `--gateway`.
+- deps: SOVDd v0.1.4 — entity API under /v1 beside /vehicle/v1, node-level /updates, root
+  capability document, x-update.verdict_scope. component-mgr authorizers return
+  `sovd_api::AuthError`; a valid token without rights for the entity answers 403
+  insufficient-access-rights on /v1 (401 on /vehicle/v1 as before).
+- component-mgr: components whose bank provider requires an ECU reset report
+  `VerdictScope::Node`; SOVDd refuses per-update verdicts on them under /v1 (409 naming the node
+  operations) and serves verdict_scope "node"; /vehicle/v1 unchanged.
 
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 

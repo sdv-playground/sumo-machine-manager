@@ -211,7 +211,8 @@ pub(crate) async fn handle_post(
         capability: sovd_api::Capability::UpdateExecute,
     };
     if let Err(e) = authorizer.authorize(&access).await {
-        return (StatusCode::UNAUTHORIZED, format!("unauthorized: {e}")).into_response();
+        let msg = auth_error_message(&e);
+        return (StatusCode::UNAUTHORIZED, format!("unauthorized: {msg}")).into_response();
     }
 
     // (2) The sw-authority anchor exists only once the device is provisioned.
@@ -541,6 +542,7 @@ async fn run_campaign(
             capability: sovd_api::Capability::UpdateExecute,
         };
         if let Err(e) = authorizer.authorize(&access).await {
+            let e = auth_error_message(&e);
             steps.push(DepStep {
                 component: target.clone(),
                 phase: "failed",
@@ -637,6 +639,14 @@ pub(crate) fn bearer_of(headers: &axum::http::HeaderMap) -> Option<String> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
+}
+
+/// The denial reason of either [`sovd_api::AuthError`] variant. This route lives
+/// on the `/vehicle/v1` tree only, so both answer 401 as before.
+fn auth_error_message(e: &sovd_api::AuthError) -> &str {
+    match e {
+        sovd_api::AuthError::Unauthenticated(m) | sovd_api::AuthError::Forbidden(m) => m,
+    }
 }
 
 /// One-shot [`machine_mgr::EnvelopeStream`] over `bytes`.

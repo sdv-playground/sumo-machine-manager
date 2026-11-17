@@ -89,6 +89,12 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.update_shape()
     }
 
+    /// The engine's answer: a node-reset component is settled by the node
+    /// operation whether or not its installs go through the router.
+    fn verdict_scope(&self) -> sovd_core::VerdictScope {
+        self.engine.verdict_scope()
+    }
+
     // -----------------------------------------------------------------
     // Data — delegated to the engine (the single authority that owns the
     // DID registry, identity overlay, and x-ota-installed-manifest).

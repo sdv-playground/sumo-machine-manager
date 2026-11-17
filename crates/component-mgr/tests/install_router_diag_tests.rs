@@ -426,3 +426,55 @@ async fn abort_flash_routes_through_router() {
         "abort_flash must route through the router's abort_install"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Verdict scope: the wrapper answers what the engine answers
+// ---------------------------------------------------------------------------
+
+/// Bank activator that needs a node reset to apply an activated bank.
+struct NodeResetActivator;
+impl machine_mgr::BankActivator for NodeResetActivator {
+    fn activate(&self, _dir: &std::path::Path) -> Result<(), machine_mgr::BankActivatorError> {
+        Ok(())
+    }
+    fn reset_kind(&self) -> ResetKind {
+        ResetKind::RequiresEcuReset
+    }
+}
+
+fn bare_router() -> Arc<dyn Component> {
+    Arc::new(BareComponent {
+        id: "vm2",
+        caps: Capabilities::default(),
+    })
+}
+
+/// An engine whose bank provider requires an ECU reset answers `Node`, and the
+/// wrapper forwards it rather than falling back to the trait default.
+#[test]
+fn verdict_scope_forwards_node_from_engine() {
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    nv.write_boot_state(&mut NvBootState::default()).unwrap();
+    let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(vec![0u8; 32]));
+    let engine: Arc<dyn DiagnosticBackend> = Arc::new(
+        ComponentBackend::new(
+            slots::VM2,
+            Arc::new(Mutex::new(nv)),
+            mp,
+            ComponentConfig::default(),
+        )
+        .with_bank_activator(Arc::new(NodeResetActivator)),
+    );
+    assert_eq!(engine.verdict_scope(), sovd_core::VerdictScope::Node);
+
+    let diag = InstallRouterDiag::new(bare_router(), engine);
+    assert_eq!(diag.verdict_scope(), sovd_core::VerdictScope::Node);
+}
+
+/// A local-reset engine answers `Update`, and so does the wrapper.
+#[test]
+fn verdict_scope_forwards_update_from_engine() {
+    let diag = InstallRouterDiag::new(bare_router(), engine_backend());
+    assert_eq!(diag.verdict_scope(), sovd_core::VerdictScope::Update);
+}

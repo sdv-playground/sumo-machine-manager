@@ -237,7 +237,7 @@ impl Authorizer for CachedHsmAuthorizer {
     async fn authorize(
         &self,
         req: &sovd_api::AccessRequest<'_>,
-    ) -> Result<sovd_api::ClientContext, String> {
+    ) -> Result<sovd_api::ClientContext, sovd_api::AuthError> {
         // "Did the HSM change?" = the keystore manifest's mtime; install-keystore
         // rewrites it on every (re)provision. A missing manifest (un-provisioned)
         // reads as None and rebuilds the same way.
