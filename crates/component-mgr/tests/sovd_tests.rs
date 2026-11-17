@@ -1973,3 +1973,153 @@ async fn rollback_verdict_after_bail_out_is_idempotent() {
         Reason::TrialBootLimit
     );
 }
+
+// --- verdict scope: node-reset members settle by the node operation (/v1) ---
+
+/// vm1 (local reset) + vm2 (node reset, `NodeResetActivator`) served through
+/// the SOVDd router on both trees.
+fn make_verdict_scope_router() -> (axum::Router, TestKeys) {
+    let keys = generate_test_keys();
+    let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
+    suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
+    let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
+
+    let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+    let mut boot_state = NvBootState::default();
+    nv.write_boot_state(&mut boot_state).unwrap();
+    let nv = Arc::new(Mutex::new(nv));
+
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    for (id, set) in [("vm1", slots::VM1), ("vm2", slots::VM2)] {
+        let mut backend = ComponentBackend::new(
+            set,
+            nv.clone(),
+            manifest_provider.clone(),
+            ComponentConfig::default(),
+        )
+        .with_id(id.to_string());
+        if id == "vm2" {
+            backend = backend.with_bank_activator(Arc::new(NodeResetActivator));
+        }
+        backends.insert(id.to_string(), Arc::new(backend));
+    }
+    let router = sovd_api::create_router(sovd_api::AppState::new(backends));
+    (router, keys)
+}
+
+/// `PUT uri` with no body; the status and the raw body text.
+async fn put_empty_text(router: &axum::Router, uri: &str) -> (StatusCode, String) {
+    let resp = router
+        .clone()
+        .oneshot(Request::put(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Register an update on `component` (no payload); its id.
+async fn register_update(router: &axum::Router, component: &str) -> String {
+    let (status, body) = post_json(
+        router,
+        &format!("/vehicle/v1/components/{component}/updates"),
+        serde_json::json!({"id": next_update_id()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
+    body["update_id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn v1_refuses_per_update_verdict_on_node_reset_member() {
+    let (router, keys) = make_verdict_scope_router();
+    let update_id = flash_to_awaiting_verdict(
+        &router,
+        "vm2",
+        make_test_suit_envelope(&keys, "vm2", 2, &vec![0xBB; 1024]),
+    )
+    .await;
+
+    for verb in ["x-update-commit", "x-update-rollback"] {
+        let (status, body) = put_empty_text(
+            &router,
+            &format!("/v1/components/vm2/updates/{update_id}/{verb}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{verb}: {body}");
+        assert!(
+            body.contains("operations/x-update-commit/executions"),
+            "{verb}: {body}"
+        );
+        assert!(!body.contains("trial mode"), "{verb}: {body}");
+    }
+
+    // Refused, not settled: the update still awaits its (node) verdict.
+    let (_, status) = get(
+        &router,
+        &format!("/vehicle/v1/components/vm2/updates/{update_id}/status"),
+    )
+    .await;
+    assert_eq!(status["x-ota-substate"], "awaiting-verdict", "{status}");
+}
+
+#[tokio::test]
+async fn vehicle_v1_per_update_verdict_on_node_reset_member_is_unchanged() {
+    let (router, keys) = make_verdict_scope_router();
+    let update_id = flash_to_awaiting_verdict(
+        &router,
+        "vm2",
+        make_test_suit_envelope(&keys, "vm2", 2, &vec![0xBB; 1024]),
+    )
+    .await;
+    activation_reset(&router, "vm2").await;
+
+    let (status, body) = put_empty_text(
+        &router,
+        &format!("/vehicle/v1/components/vm2/updates/{update_id}/x-update-commit"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let settled = poll_status_until_terminal(&router, "vm2", &update_id).await;
+    assert_eq!(settled["status"], "completed", "{settled}");
+}
+
+#[tokio::test]
+async fn v1_update_status_reports_verdict_scope() {
+    let (router, _keys) = make_verdict_scope_router();
+    for (component, scope) in [("vm1", "update"), ("vm2", "node")] {
+        let update_id = register_update(&router, component).await;
+        let (status, body) = get(
+            &router,
+            &format!("/v1/components/{component}/updates/{update_id}/status"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["x-update"]["verdict_scope"], scope, "{body}");
+
+        // The legacy tree keeps its body as it was.
+        let (_, legacy) = get(
+            &router,
+            &format!("/vehicle/v1/components/{component}/updates/{update_id}/status"),
+        )
+        .await;
+        assert!(
+            legacy["x-update"].get("verdict_scope").is_none(),
+            "{legacy}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn v1_component_capabilities_report_verdict_scope() {
+    let (router, _keys) = make_verdict_scope_router();
+    for (component, scope) in [("vm1", "update"), ("vm2", "node")] {
+        let (status, body) = get(&router, &format!("/v1/components/{component}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["capabilities"]["x-update"]["verdict_scope"], scope,
+            "{body}"
+        );
+    }
+}

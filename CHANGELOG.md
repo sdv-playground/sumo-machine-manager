@@ -14,6 +14,9 @@ what a consumer has to touch when it moves its pin.
   capability document, x-update.verdict_scope. component-mgr authorizers return
   `sovd_api::AuthError`; a valid token without rights for the entity answers 403
   insufficient-access-rights on /v1 (401 on /vehicle/v1 as before).
+- component-mgr: components whose bank provider requires an ECU reset report
+  `VerdictScope::Node`; SOVDd refuses per-update verdicts on them under /v1 (409 naming the node
+  operations) and serves verdict_scope "node"; /vehicle/v1 unchanged.
 
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
