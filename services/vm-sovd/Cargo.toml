@@ -55,3 +55,6 @@ sovd-docs-hook = ["component-mgr/sovd-docs-hook"]
 # component-mgr. NOT in `default`: the server only needs it where the target
 # actually runs a container runtime (`--features container`).
 container = ["component-factory/container"]
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

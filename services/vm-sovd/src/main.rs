@@ -540,18 +540,7 @@ async fn main() {
         )
         .await
     } else {
-        let state = sovd_api::AppState::new(backends);
-        // Advertise the vendor extension ops in the merged §7.5 capability
-        // description (feature off until the sovd-api hook is on the pinned dep).
-        #[cfg(feature = "sovd-docs-hook")]
-        let state =
-            state.with_capability_extensions(component_mgr::sovd::openapi::capability_extensions());
-        sovd_api::create_router(state)
-            .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
-            .merge(component_mgr::sovd::routes::update_state_router(
-                node_coordinator.clone(),
-                machine.clone(),
-            ))
+        plain_router(machine.clone(), backends, node_coordinator.clone())
     };
 
     // --tls: serve HTTPS with the HSM-held tls-identity (server-only TLS — the
@@ -682,6 +671,29 @@ async fn main() {
 /// only connects. Mirrors the connect-only retry budget vhsm-ssd uses
 /// (~5 s = 50 × 100 ms), so a just-spawned backend isn't missed on the first
 /// refused connect.
+/// The default (non-gateway) router: the standard SOVD surface plus the sumo
+/// vendor routes.
+fn plain_router(
+    machine: Arc<dyn Machine>,
+    backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
+    node_coordinator: Arc<machine_mgr::node_update::NodeCoordinator>,
+) -> axum::Router {
+    let state = sovd_api::AppState::new(backends);
+    // Advertise the vendor extension ops in the merged §7.5 capability
+    // description (feature off until the sovd-api hook is on the pinned dep).
+    #[cfg(feature = "sovd-docs-hook")]
+    let state =
+        state.with_capability_extensions(component_mgr::sovd::openapi::capability_extensions());
+    sovd_api::create_router(state)
+        .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
+        .merge(component_mgr::sovd::routes::update_state_router(
+            node_coordinator,
+            machine.clone(),
+        ))
+        // Keep the vendor routes in sync with component_mgr::sovd::gateway::gateway_router.
+        .merge(component_mgr::sovd::routes::node_verdict_router(machine))
+}
+
 fn connect_backend(socket: &std::path::Path) -> std::io::Result<LinkBClient> {
     const ATTEMPTS: u32 = 50;
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -791,4 +803,63 @@ async fn build_gateway_router(
         node_coordinator,
         machine,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_machine() -> Arc<dyn Machine> {
+        Arc::new(
+            MachineRegistry::builder(EntityInfo {
+                id: "vehicle".into(),
+                name: "vehicle".into(),
+                entity_type: "vehicle".into(),
+                description: None,
+                href: "/vehicle/v1".into(),
+                status: None,
+            })
+            .build()
+            .unwrap(),
+        )
+    }
+
+    async fn post_commit(router: axum::Router) -> StatusCode {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vehicle/v1/operations/x-update-commit/executions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The plain server serves the node verdict operations, as the gateway does.
+    /// The control (the composition without `node_verdict_router`) 404s, so the
+    /// assertion detects the route going missing.
+    #[tokio::test]
+    async fn plain_router_serves_node_verdict() {
+        let machine = test_machine();
+        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
+
+        let status =
+            post_commit(plain_router(machine.clone(), HashMap::new(), coord.clone())).await;
+        assert_ne!(status, StatusCode::NOT_FOUND);
+        assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED);
+
+        let without = sovd_api::create_router(sovd_api::AppState::new(HashMap::new()))
+            .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
+            .merge(component_mgr::sovd::routes::update_state_router(
+                coord, machine,
+            ));
+        assert_eq!(post_commit(without).await, StatusCode::NOT_FOUND);
+    }
 }

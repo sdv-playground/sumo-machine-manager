@@ -52,8 +52,10 @@ repo — that serve the **same** wire from the **same** route library.
 - **Serves:** the host-owned components `host-os`, `vm1`, `vm2`, `hsm` (built via
   `component_factory::build_component`), the standard SOVD surface from
   `sovd_api::create_router`, plus the sumo vendor routes —
-  `hsm_router` (HSM key inventory + `x-csr`) and `update_state_router`
-  (`x-ota-update-state`). See `services/vm-sovd/src/main.rs`.
+  `hsm_router` (HSM key inventory + `x-csr`), `update_state_router`
+  (`x-ota-update-state`) and `node_verdict_router` (node-level
+  `x-update-commit` / `x-update-rollback` operations, same set as the gateway).
+  See `plain_router` in `services/vm-sovd/src/main.rs`.
 - **Bind / port:** `0.0.0.0:4000` by default; override with `--bind <addr>` or a
   positional bind-addr (`services/vm-sovd/src/main.rs`).
 - **Launched by:** `example/run.sh` (alongside the `hsm-sim-service` link-B
