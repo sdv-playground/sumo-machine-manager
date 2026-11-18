@@ -69,6 +69,10 @@ Tag on `108b6e1` (2026-11-21), PR #59, #60.
 
 Tag on `d0f9740` (2026-11-17), PR #49, #50, #51, #52.
 
+- hsm-sim-backend: `reset_keystore(dir)`, an HSM-only factory reset of a SimHsm keystore: removes the
+  provisioning state, every provisioned key, root and certificate and the identity keys (device-decrypt,
+  tls-identity, iam-signing, jwt-signing), keeps ivd-signing, storage-key and the monotonic counters. The
+  next backend start regenerates the identity keys: a new ECU id, unprovisioned. Builds without `crypto`.
 - vm-sovd: the plain (non-gateway) server mounts `node_verdict_router`, so `x-update-commit` /
   `x-update-rollback` (and the `x-ota-*-trials` aliases) are served there too, not only by `--gateway`.
 - deps: SOVDd v0.1.4 — entity API under /v1 beside /vehicle/v1, node-level /updates, root
