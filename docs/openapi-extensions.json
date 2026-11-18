@@ -15,11 +15,11 @@
         "operationId": "hsm_keys_list",
         "responses": {
           "200": {
-            "description": "The HSM key-slot inventory (public metadata only; never key material).",
+            "description": "The HSM key-slot inventory as a data item (public metadata only; never key material).",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HsmKeysResponse"
+                  "$ref": "#/components/schemas/HsmKeysDataItem"
                 }
               }
             }
@@ -927,6 +927,22 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "HsmKeysDataItem": {
+        "type": "object",
+        "description": "`hsm/data/keys` as a SOVD data item, `{ \"id\": \"keys\", \"data\": <inventory> }`: the shape\ntraton-one-os's vehicle_os SOVD server serves and drive-twin reads `data.provisioned` from.",
+        "required": [
+          "id",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/HsmKeysResponse"
+          },
+          "id": {
+            "type": "string"
           }
         }
       },

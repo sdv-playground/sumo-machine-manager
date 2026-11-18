@@ -322,8 +322,9 @@ fn component_banks(machine: &dyn Machine) -> Vec<ComponentBanksResponse> {
 /// Wire:
 ///
 ///   `GET  /vehicle/v1/components/hsm/data/keys`
-///        → 200 JSON `{ "provisioned": bool, "items": [ { id, kind,
-///          has_certificate, allowed_ops, public_key_der_base64 } ] }` — ALWAYS
+///        → 200 JSON, a SOVD data item: `{ "id": "keys", "data": { "provisioned": bool,
+///          "items": [ { id, kind, has_certificate, allowed_ops, public_key_der_base64 } ] } }`
+///          (the shape traton-one-os's vehicle_os SOVD server and drive-twin use) — ALWAYS
 ///          served (device-generated keys exist from first boot); `provisioned`
 ///          is the device's own state, so callers read it instead of inferring
 ///          from a status code. Every slot is listed — key slots (`kind` =
@@ -385,13 +386,21 @@ pub(crate) struct HsmKeysResponse {
     pub items: Vec<HsmKeyEntry>,
 }
 
+/// `hsm/data/keys` as a SOVD data item, `{ "id": "keys", "data": <inventory> }`: the shape
+/// traton-one-os's vehicle_os SOVD server serves and drive-twin reads `data.provisioned` from.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct HsmKeysDataItem {
+    pub id: &'static str,
+    pub data: HsmKeysResponse,
+}
+
 /// `GET …/hsm/data/keys` — the key-slot inventory (public metadata only).
 #[utoipa::path(
     get,
     path = "/vehicle/v1/components/hsm/data/keys",
     tag = "x-extensions",
     responses(
-        (status = 200, description = "The HSM key-slot inventory (public metadata only; never key material).", body = HsmKeysResponse),
+        (status = 200, description = "The HSM key-slot inventory as a data item (public metadata only; never key material).", body = HsmKeysDataItem),
         (status = 503, description = "No HSM component, or the HSM keys are unavailable.", body = String),
     ),
 )]
@@ -423,9 +432,12 @@ pub(crate) async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::
                     }
                 })
                 .collect();
-            Json(HsmKeysResponse {
-                provisioned: inv.provisioned,
-                items,
+            Json(HsmKeysDataItem {
+                id: "keys",
+                data: HsmKeysResponse {
+                    provisioned: inv.provisioned,
+                    items,
+                },
             })
             .into_response()
         }
@@ -2086,28 +2098,31 @@ mod tests {
 
     #[test]
     fn hsm_keys_response_shape_is_stable() {
-        let resp = HsmKeysResponse {
-            provisioned: true,
-            items: vec![
-                HsmKeyEntry {
-                    id: "tls-identity".to_string(),
-                    kind: "EC-P256".to_string(),
-                    has_certificate: true,
-                    allowed_ops: Some(vec!["sign".to_string(), "verify".to_string()]),
-                    public_key_der_base64: Some("QUJD".to_string()),
-                },
-                HsmKeyEntry {
-                    id: "time-floor".to_string(),
-                    kind: "monotonic".to_string(),
-                    has_certificate: false,
-                    allowed_ops: None,
-                    public_key_der_base64: None,
-                },
-            ],
+        let resp = HsmKeysDataItem {
+            id: "keys",
+            data: HsmKeysResponse {
+                provisioned: true,
+                items: vec![
+                    HsmKeyEntry {
+                        id: "tls-identity".to_string(),
+                        kind: "EC-P256".to_string(),
+                        has_certificate: true,
+                        allowed_ops: Some(vec!["sign".to_string(), "verify".to_string()]),
+                        public_key_der_base64: Some("QUJD".to_string()),
+                    },
+                    HsmKeyEntry {
+                        id: "time-floor".to_string(),
+                        kind: "monotonic".to_string(),
+                        has_certificate: false,
+                        allowed_ops: None,
+                        public_key_der_base64: None,
+                    },
+                ],
+            },
         };
         assert_eq!(
             serde_json::to_value(&resp).unwrap(),
-            serde_json::json!({
+            serde_json::json!({ "id": "keys", "data": {
                 "provisioned": true,
                 "items": [
                     {
@@ -2125,7 +2140,7 @@ mod tests {
                         "public_key_der_base64": null,
                     },
                 ],
-            })
+            }})
         );
     }
 
