@@ -98,6 +98,61 @@ fn fw_meta_roundtrip() {
 }
 
 #[test]
+fn reset_fw_meta_zeroes_the_floor_and_keeps_the_generation() {
+    let mut store = make_store();
+    let mut meta = NvFwMeta {
+        fw_seq: 10,
+        fw_secver: 2,
+        fw_crc: 0xDEADBEEF,
+        image_sha256: [0xAA; 32],
+        min_security_ver: 2,
+        gen: 7,
+        ..NvFwMeta::default()
+    };
+    store.write_fw_meta(slots::HSM, Bank::A, &mut meta).unwrap();
+    let mut other = NvFwMeta {
+        min_security_ver: 5,
+        gen: 3,
+        ..NvFwMeta::default()
+    };
+    store
+        .write_fw_meta(slots::VM1, Bank::A, &mut other)
+        .unwrap();
+
+    assert_eq!(
+        store.reset_fw_meta(slots::HSM).unwrap(),
+        1,
+        "bank B has no record"
+    );
+
+    let read = store.read_fw_meta(slots::HSM, Bank::A).unwrap();
+    assert_eq!(read.min_security_ver, 0);
+    assert_eq!(read.fw_secver, 0);
+    assert_eq!(read.fw_seq, 0);
+    assert_eq!(read.fw_crc, 0);
+    assert_eq!(read.image_sha256, [0; 32]);
+    assert_eq!(read.gen, 7, "the generation keeps ratcheting");
+    assert!(
+        store.read_fw_meta(slots::HSM, Bank::B).is_none(),
+        "not written"
+    );
+    let untouched = store.read_fw_meta(slots::VM1, Bank::A).unwrap();
+    assert_eq!(
+        (untouched.min_security_ver, untouched.gen),
+        (5, 3),
+        "other sets untouched"
+    );
+}
+
+#[test]
+fn reset_fw_meta_of_an_unwritten_or_out_of_range_set() {
+    let mut store = make_store();
+    assert_eq!(store.reset_fw_meta(slots::HSM).unwrap(), 0);
+    let past = BankSet(store.slot_count() as u8);
+    assert!(store.reset_fw_meta(past).is_err());
+}
+
+#[test]
 fn runtime_roundtrip() {
     let mut store = make_store();
     let mut runtime = NvRuntime::default();
