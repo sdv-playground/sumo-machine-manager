@@ -155,6 +155,9 @@ Tag on `108b6e1` (2026-11-21), PR #59, #60.
 
 Tag on `d0f9740` (2026-11-17), PR #49, #50, #51, #52.
 
+- nv-store: `NvStore::reset_fw_meta(set)` zeroes a bank set's firmware fields and anti-rollback floor
+  (`min_security_ver`) on both banks and keeps `gen`, so a first factory-signed HSM keystore installs
+  again after an HSM-only factory reset.
 - hsm-sim-backend: `reset_keystore(dir)`, an HSM-only factory reset of a SimHsm keystore: removes the
   provisioning state, every provisioned key, root and certificate and the identity keys (device-decrypt,
   tls-identity, iam-signing, jwt-signing), keeps ivd-signing, storage-key and the monotonic counters. The
