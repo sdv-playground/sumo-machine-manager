@@ -8,6 +8,8 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- deps (temporary): SOVDd pinned to its `feat/node-resources-under-the-node` branch (the node-scope 409
+  names a node's own operations); back to a tag once SOVDd tags it.
 - component-mgr (host-facing): `update_state_router` and `node_verdict_router` take
   `&NodeResources`: `Root` serves them at the server root as before, `Host(id)` under the host component
   (`{base}/components/{id}/...`), which behind SOVDd's node topology is the node's own data and
