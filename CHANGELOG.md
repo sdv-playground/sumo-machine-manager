@@ -8,6 +8,10 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- component-mgr (host-facing): `update_state_router` and `node_verdict_router` take
+  `&NodeResources`: `Root` serves them at the server root as before, `Host(id)` under the host component
+  (`{base}/components/{id}/...`), which behind SOVDd's node topology is the node's own data and
+  operations, and not at the root. Hosts pass `&NodeResources::Root` to keep today's paths.
 - nv-store: `NvStore::reset_fw_meta(set)` zeroes a bank set's firmware fields and anti-rollback floor
   (`min_security_ver`) on both banks and keeps `gen`, so a first factory-signed HSM keystore installs
   again after an HSM-only factory reset.

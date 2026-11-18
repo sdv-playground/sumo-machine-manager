@@ -1225,7 +1225,10 @@ fn make_node_router_with(
     }
 
     let router = sovd_api::create_router(sovd_api::AppState::new(backends)).merge(
-        component_mgr::sovd::routes::node_verdict_router(Arc::new(machine.build().unwrap())),
+        component_mgr::sovd::routes::node_verdict_router(
+            Arc::new(machine.build().unwrap()),
+            &component_mgr::sovd::routes::NodeResources::Root,
+        ),
     );
     (router, nv, keys)
 }
@@ -1612,8 +1615,11 @@ fn make_banks_router(selector: Option<SharedSystemBankState>) -> (axum::Router, 
         machine = machine.with(ComponentAdapter::new(backend));
     }
 
-    let router =
-        component_mgr::sovd::routes::update_state_router(coord, Arc::new(machine.build().unwrap()));
+    let router = component_mgr::sovd::routes::update_state_router(
+        coord,
+        Arc::new(machine.build().unwrap()),
+        &component_mgr::sovd::routes::NodeResources::Root,
+    );
     (router, tmp)
 }
 
@@ -1831,9 +1837,15 @@ impl TrialNode {
     /// The update-state and node verdict routes over this node, reporting
     /// through `coord`.
     fn router(&self, coord: Arc<NodeCoordinator>) -> axum::Router {
-        component_mgr::sovd::routes::update_state_router(coord, self.machine.clone()).merge(
-            component_mgr::sovd::routes::node_verdict_router(self.machine.clone()),
+        component_mgr::sovd::routes::update_state_router(
+            coord,
+            self.machine.clone(),
+            &component_mgr::sovd::routes::NodeResources::Root,
         )
+        .merge(component_mgr::sovd::routes::node_verdict_router(
+            self.machine.clone(),
+            &component_mgr::sovd::routes::NodeResources::Root,
+        ))
     }
 
     fn store(&self) -> FileSelectorStore {

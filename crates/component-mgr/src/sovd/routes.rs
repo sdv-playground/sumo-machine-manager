@@ -25,10 +25,44 @@ use sovd_core::{OperationExecution, OperationStatus};
 /// (`sovd_api::Tree::ALL`: `/v1` and the legacy `/vehicle/v1`), so the vendor
 /// routes sit on the same two trees as the SOVDd routes they are merged with.
 fn both_trees<const N: usize>(routes: [(&str, MethodRouter); N]) -> Router {
+    node_trees(&NodeResources::Root, routes)
+}
+
+/// Where a host's node-level resources (the update state, the node verdict
+/// operations, and the host's own ones such as its boot id) are served.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeResources {
+    /// At the server root, `{base}/data/...` and `{base}/operations/...`: a
+    /// server that lists its components side by side (no SOVD node).
+    Root,
+    /// Under the host component, `{base}/components/{host}/...`. Behind SOVDd's
+    /// node topology (`sovd_api::with_node_topology` with this host) that is the
+    /// node's own resources, `{base}/components/{node}/...`, and the root paths
+    /// are not served.
+    Host(String),
+}
+
+impl NodeResources {
+    /// The path between a tree's base and a resource's suffix.
+    pub fn prefix(&self) -> String {
+        match self {
+            NodeResources::Root => String::new(),
+            NodeResources::Host(host) => format!("/components/{host}"),
+        }
+    }
+
+    /// `suffix` under `tree`, e.g. `/v1/components/host/data/x-update-state`.
+    pub fn path(&self, tree: sovd_api::Tree, suffix: &str) -> String {
+        format!("{}{}{suffix}", tree.base(), self.prefix())
+    }
+}
+
+/// [`both_trees`], each route under `at`'s prefix.
+fn node_trees<const N: usize>(at: &NodeResources, routes: [(&str, MethodRouter); N]) -> Router {
     let mut router = Router::new();
     for (suffix, method_router) in routes {
         for tree in sovd_api::Tree::ALL {
-            router = router.route(&format!("{}{suffix}", tree.base()), method_router.clone());
+            router = router.route(&at.path(tree, suffix), method_router.clone());
         }
     }
     router
@@ -43,34 +77,42 @@ fn both_trees<const N: usize>(routes: [(&str, MethodRouter); N]) -> Router {
 /// `x-ota` vendor route (sumo-mm, not SOVDd); see `docs/design/node-update-state.md`.
 ///
 /// Also serves `GET /vehicle/v1/data/x-update-state`, an alias with the same
-/// body (both carry `node_boot_id`).
+/// body (both carry `node_boot_id`). Both sit where `at` says: at the server
+/// root, or under the host component (the node's own data).
 ///
 /// `machine` supplies the per-component `banks` member (what each bank holds,
 /// from the installed manifests) and the boot vector's header. The router
 /// takes no NV store: nothing it reports is read from NV. A deliberate
 /// signature change; hosts that merge this router drop the argument when they
 /// bump the pin.
-pub fn update_state_router(coord: Arc<NodeCoordinator>, machine: Arc<dyn Machine>) -> Router {
+pub fn update_state_router(
+    coord: Arc<NodeCoordinator>,
+    machine: Arc<dyn Machine>,
+    at: &NodeResources,
+) -> Router {
     let alias_coord = coord.clone();
     let alias_machine = machine.clone();
-    both_trees([
-        (
-            "/data/x-ota-update-state",
-            get(move || {
-                let coord = coord.clone();
-                let machine = machine.clone();
-                async move { update_state(coord, machine).await }
-            }),
-        ),
-        (
-            "/data/x-update-state",
-            get(move || {
-                let coord = alias_coord.clone();
-                let machine = alias_machine.clone();
-                async move { x_update_state(coord, machine).await }
-            }),
-        ),
-    ])
+    node_trees(
+        at,
+        [
+            (
+                "/data/x-ota-update-state",
+                get(move || {
+                    let coord = coord.clone();
+                    let machine = machine.clone();
+                    async move { update_state(coord, machine).await }
+                }),
+            ),
+            (
+                "/data/x-update-state",
+                get(move || {
+                    let coord = alias_coord.clone();
+                    let machine = alias_machine.clone();
+                    async move { x_update_state(coord, machine).await }
+                }),
+            ),
+        ],
+    )
 }
 
 /// The `x-ota-update-state` resource body — the node's update-transaction
@@ -946,7 +988,9 @@ pub(crate) async fn x_update_rollback(
     .await
 }
 
-pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
+/// The node verdict operations, where `at` says: at the server root, or under
+/// the host component (the node's own operations).
+pub fn node_verdict_router(machine: Arc<dyn Machine>, at: &NodeResources) -> Router {
     let verdict_lock = Arc::new(tokio::sync::Mutex::new(()));
     let commit_machine = machine.clone();
     let commit_lock = verdict_lock.clone();
@@ -956,48 +1000,51 @@ pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
     let update_commit_lock = verdict_lock.clone();
     let update_rollback_machine = machine.clone();
     let update_rollback_lock = verdict_lock.clone();
-    both_trees([
-        (
-            "/operations/x-ota-commit-trials/executions",
-            post(move |req: Option<Json<VerdictRequest>>| {
-                let machine = commit_machine.clone();
-                let verdict_lock = commit_lock.clone();
-                async move { commit_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
-            }),
-        ),
-        (
-            "/operations/x-ota-rollback-trials/executions",
-            post(move |req: Option<Json<VerdictRequest>>| {
-                let machine = machine.clone();
-                let verdict_lock = verdict_lock.clone();
-                async move { rollback_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
-            }),
-        ),
-        (
-            "/operations/x-update-verdict/executions",
-            post(move |Json(req): Json<NodeVerdictRequest>| {
-                let machine = alias_machine.clone();
-                let verdict_lock = alias_lock.clone();
-                async move { x_update_verdict(machine, req, verdict_lock).await }
-            }),
-        ),
-        (
-            "/operations/x-update-commit/executions",
-            post(move |req: Option<Json<VerdictRequest>>| {
-                let machine = update_commit_machine.clone();
-                let verdict_lock = update_commit_lock.clone();
-                async move { x_update_commit(machine, req.map(|Json(r)| r), verdict_lock).await }
-            }),
-        ),
-        (
-            "/operations/x-update-rollback/executions",
-            post(move |req: Option<Json<VerdictRequest>>| {
-                let machine = update_rollback_machine.clone();
-                let verdict_lock = update_rollback_lock.clone();
-                async move { x_update_rollback(machine, req.map(|Json(r)| r), verdict_lock).await }
-            }),
-        ),
-    ])
+    node_trees(
+        at,
+        [
+            (
+                "/operations/x-ota-commit-trials/executions",
+                post(move |req: Option<Json<VerdictRequest>>| {
+                    let machine = commit_machine.clone();
+                    let verdict_lock = commit_lock.clone();
+                    async move { commit_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
+                }),
+            ),
+            (
+                "/operations/x-ota-rollback-trials/executions",
+                post(move |req: Option<Json<VerdictRequest>>| {
+                    let machine = machine.clone();
+                    let verdict_lock = verdict_lock.clone();
+                    async move { rollback_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
+                }),
+            ),
+            (
+                "/operations/x-update-verdict/executions",
+                post(move |Json(req): Json<NodeVerdictRequest>| {
+                    let machine = alias_machine.clone();
+                    let verdict_lock = alias_lock.clone();
+                    async move { x_update_verdict(machine, req, verdict_lock).await }
+                }),
+            ),
+            (
+                "/operations/x-update-commit/executions",
+                post(move |req: Option<Json<VerdictRequest>>| {
+                    let machine = update_commit_machine.clone();
+                    let verdict_lock = update_commit_lock.clone();
+                    async move { x_update_commit(machine, req.map(|Json(r)| r), verdict_lock).await }
+                }),
+            ),
+            (
+                "/operations/x-update-rollback/executions",
+                post(move |req: Option<Json<VerdictRequest>>| {
+                    let machine = update_rollback_machine.clone();
+                    let verdict_lock = update_rollback_lock.clone();
+                    async move { x_update_rollback(machine, req.map(|Json(r)| r), verdict_lock).await }
+                }),
+            ),
+        ],
+    )
 }
 
 // The onboard pull-update entry lives in its own module (async, multi-
@@ -1243,7 +1290,7 @@ mod tests {
     /// The `execution_id` from one commit POST against an idle node.
     async fn commit_execution_id() -> String {
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
-        let router = node_verdict_router(machine_with(&[stub]));
+        let router = node_verdict_router(machine_with(&[stub]), &NodeResources::Root);
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
         body_json(resp).await["execution_id"]
             .as_str()
@@ -1319,7 +1366,10 @@ mod tests {
         // An in-trial component is committed (there is no node-level gate;
         // components preflight themselves).
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&stub)),
+            &NodeResources::Root,
+        );
 
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
 
@@ -1332,7 +1382,10 @@ mod tests {
     async fn commit_preflights_all_candidates_before_mutating_any() {
         let first = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
         let refusing = Arc::new(VerdictStub::refusing_commit("vm2"));
-        let router = node_verdict_router(machine_with(&[first.clone(), refusing.clone()]));
+        let router = node_verdict_router(
+            machine_with(&[first.clone(), refusing.clone()]),
+            &NodeResources::Root,
+        );
 
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
 
@@ -1351,7 +1404,10 @@ mod tests {
     async fn mixed_preflight_failures_return_500_not_409() {
         let busy = Arc::new(VerdictStub::refusing_commit("vm1"));
         let internal = Arc::new(VerdictStub::failing_commit_preflight("vm2"));
-        let router = node_verdict_router(machine_with(&[busy.clone(), internal.clone()]));
+        let router = node_verdict_router(
+            machine_with(&[busy.clone(), internal.clone()]),
+            &NodeResources::Root,
+        );
 
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
 
@@ -1363,7 +1419,10 @@ mod tests {
     #[tokio::test]
     async fn rollback_busy_failure_returns_documented_409() {
         let refusing = Arc::new(VerdictStub::refusing_rollback("vm1"));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&refusing)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&refusing)),
+            &NodeResources::Root,
+        );
 
         let resp = router.oneshot(post(ROLLBACK_URI, None)).await.unwrap();
 
@@ -1378,7 +1437,10 @@ mod tests {
     #[tokio::test]
     async fn node_verdict_router_serializes_commit_and_rollback() {
         let component = Arc::new(VerdictStub::slow("vm1"));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&component)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&component)),
+            &NodeResources::Root,
+        );
 
         let (commit, rollback) = tokio::join!(
             router.clone().oneshot(post(COMMIT_URI, None)),
@@ -1395,7 +1457,7 @@ mod tests {
         // An idle node (nothing in trial) commits as a no-op success — there is
         // no node-level gate; components preflight themselves.
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
-        let router = node_verdict_router(machine_with(&[stub]));
+        let router = node_verdict_router(machine_with(&[stub]), &NodeResources::Root);
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -1405,7 +1467,10 @@ mod tests {
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
 
         // A supplied nonce is echoed verbatim in the execution record.
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&stub)),
+            &NodeResources::Root,
+        );
         let resp = router
             .oneshot(post(COMMIT_URI, Some("abc-123")))
             .await
@@ -1414,7 +1479,7 @@ mod tests {
         assert_eq!(body_json(resp).await["nonce"], "abc-123");
 
         // No body ⇒ old-client shape: no `nonce` field.
-        let router = node_verdict_router(machine_with(&[stub]));
+        let router = node_verdict_router(machine_with(&[stub]), &NodeResources::Root);
         let resp = router.oneshot(post(COMMIT_URI, None)).await.unwrap();
         assert!(body_json(resp).await.get("nonce").is_none());
     }
@@ -1443,7 +1508,10 @@ mod tests {
     #[tokio::test]
     async fn x_update_verdict_commit_matches_commit_trials() {
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&stub)),
+            &NodeResources::Root,
+        );
 
         let resp = router
             .oneshot(post_json(
@@ -1465,7 +1533,10 @@ mod tests {
     #[tokio::test]
     async fn x_update_verdict_rollback_reports_rolled_back_key() {
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&stub)),
+            &NodeResources::Root,
+        );
 
         let resp = router
             .oneshot(post_json(
@@ -1486,7 +1557,10 @@ mod tests {
     #[tokio::test]
     async fn x_update_verdict_rejects_missing_or_unknown_word() {
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&stub)),
+            &NodeResources::Root,
+        );
 
         for body in [
             serde_json::json!({}),
@@ -1506,7 +1580,10 @@ mod tests {
     #[tokio::test]
     async fn x_update_verdict_busy_failure_returns_409() {
         let refusing = Arc::new(VerdictStub::refusing_rollback("vm1"));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&refusing)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&refusing)),
+            &NodeResources::Root,
+        );
 
         let resp = router
             .oneshot(post_json(
@@ -1527,7 +1604,7 @@ mod tests {
     #[tokio::test]
     async fn x_update_verdict_echoes_nonce_and_mints_unique_execution_ids() {
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
-        let router = node_verdict_router(machine_with(&[stub]));
+        let router = node_verdict_router(machine_with(&[stub]), &NodeResources::Root);
 
         let with_nonce = body_json(
             router
@@ -1560,7 +1637,10 @@ mod tests {
     #[tokio::test]
     async fn x_update_verdict_shares_the_lock_with_x_ota_trials() {
         let component = Arc::new(VerdictStub::slow("vm1"));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&component)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&component)),
+            &NodeResources::Root,
+        );
 
         let (alias, ota) = tokio::join!(
             router.clone().oneshot(post_json(
@@ -1582,18 +1662,24 @@ mod tests {
     async fn x_update_commit_matches_commit_trials() {
         let ota_stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
         let ota = body_json(
-            node_verdict_router(machine_with(std::slice::from_ref(&ota_stub)))
-                .oneshot(post(COMMIT_URI, None))
-                .await
-                .unwrap(),
+            node_verdict_router(
+                machine_with(std::slice::from_ref(&ota_stub)),
+                &NodeResources::Root,
+            )
+            .oneshot(post(COMMIT_URI, None))
+            .await
+            .unwrap(),
         )
         .await;
 
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-        let resp = node_verdict_router(machine_with(std::slice::from_ref(&stub)))
-            .oneshot(post(X_UPDATE_COMMIT_URI, None))
-            .await
-            .unwrap();
+        let resp = node_verdict_router(
+            machine_with(std::slice::from_ref(&stub)),
+            &NodeResources::Root,
+        )
+        .oneshot(post(X_UPDATE_COMMIT_URI, None))
+        .await
+        .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(stub.commits.load(Ordering::SeqCst), 1);
@@ -1608,7 +1694,10 @@ mod tests {
     #[tokio::test]
     async fn x_update_rollback_reports_rolled_back_key() {
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&stub)),
+            &NodeResources::Root,
+        );
 
         let resp = router
             .oneshot(post(X_UPDATE_ROLLBACK_URI, None))
@@ -1631,7 +1720,7 @@ mod tests {
             (X_UPDATE_ROLLBACK_URI, "x-update-rollback"),
         ] {
             let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Committed)));
-            let router = node_verdict_router(machine_with(&[stub]));
+            let router = node_verdict_router(machine_with(&[stub]), &NodeResources::Root);
 
             let resp = router.clone().oneshot(post(uri, None)).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{op}");
@@ -1655,7 +1744,10 @@ mod tests {
     #[tokio::test]
     async fn x_update_commit_busy_failure_returns_409() {
         let refusing = Arc::new(VerdictStub::refusing_commit("vm1"));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&refusing)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&refusing)),
+            &NodeResources::Root,
+        );
 
         let resp = router
             .oneshot(post(X_UPDATE_COMMIT_URI, None))
@@ -1673,7 +1765,10 @@ mod tests {
     #[tokio::test]
     async fn x_update_verb_operations_share_the_lock_with_the_alias_and_x_ota_trials() {
         let component = Arc::new(VerdictStub::slow("vm1"));
-        let router = node_verdict_router(machine_with(std::slice::from_ref(&component)));
+        let router = node_verdict_router(
+            machine_with(std::slice::from_ref(&component)),
+            &NodeResources::Root,
+        );
 
         let (verb, alias, ota) = tokio::join!(
             router.clone().oneshot(post(X_UPDATE_COMMIT_URI, None)),
@@ -1693,7 +1788,7 @@ mod tests {
     #[tokio::test]
     async fn x_update_verdict_alias_still_served() {
         let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-        let router = node_verdict_router(machine_with(&[stub]));
+        let router = node_verdict_router(machine_with(&[stub]), &NodeResources::Root);
 
         let resp = router
             .oneshot(post_json(
@@ -1723,6 +1818,7 @@ mod tests {
         let router = update_state_router(
             coord_with(Some((true, false)), Some(true), Some("boot-b")),
             machine_with(&[]),
+            &NodeResources::Root,
         );
 
         let ota = get_json(&router, "/vehicle/v1/data/x-ota-update-state").await;
@@ -1732,7 +1828,11 @@ mod tests {
         assert_eq!(alias["rebooted_since_arming"], true);
 
         // No boot id configured: `node_boot_id` is an explicit null.
-        let router = update_state_router(coord_with(None, None, None), machine_with(&[]));
+        let router = update_state_router(
+            coord_with(None, None, None),
+            machine_with(&[]),
+            &NodeResources::Root,
+        );
         let alias = get_json(&router, "/vehicle/v1/data/x-update-state").await;
         assert_eq!(alias["node_boot_id"], serde_json::Value::Null);
         assert_eq!(
@@ -1749,6 +1849,7 @@ mod tests {
         let router = update_state_router(
             coord_with(Some((true, false)), Some(true), Some("boot-b")),
             machine_with(&[]),
+            &NodeResources::Root,
         );
         for suffix in ["/data/x-update-state", "/data/x-ota-update-state"] {
             assert_eq!(
@@ -1776,10 +1877,13 @@ mod tests {
             let mut bodies = Vec::new();
             for base in ["/v1", "/vehicle/v1"] {
                 let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-                let resp = node_verdict_router(machine_with(std::slice::from_ref(&stub)))
-                    .oneshot(post(&format!("{base}{suffix}"), None))
-                    .await
-                    .unwrap();
+                let resp = node_verdict_router(
+                    machine_with(std::slice::from_ref(&stub)),
+                    &NodeResources::Root,
+                )
+                .oneshot(post(&format!("{base}{suffix}"), None))
+                .await
+                .unwrap();
                 assert_eq!(resp.status(), StatusCode::OK, "{base}{suffix}");
                 assert_eq!(
                     stub.commits.load(Ordering::SeqCst) + stub.rollbacks.load(Ordering::SeqCst),
@@ -1795,6 +1899,55 @@ mod tests {
             assert_eq!(v1["result"], legacy["result"]);
             assert_eq!(v1["result"][acted], serde_json::json!(["vm1"]));
         }
+    }
+
+    /// Under a host, the node resources are the host component's: served at
+    /// `{base}/components/{host}/...` on both trees, and not at the root.
+    #[tokio::test]
+    async fn node_resources_under_the_host_are_not_served_at_the_root() {
+        let host = NodeResources::Host("host".into());
+        let router = update_state_router(
+            coord_with(Some((true, false)), Some(true), Some("boot-b")),
+            machine_with(&[]),
+            &host,
+        );
+        for base in ["/v1", "/vehicle/v1"] {
+            for suffix in ["/data/x-update-state", "/data/x-ota-update-state"] {
+                let under = get_raw(&router, &format!("{base}/components/host{suffix}")).await;
+                assert_eq!(under.0, StatusCode::OK, "{base}/components/host{suffix}");
+                let root = get_raw(&router, &format!("{base}{suffix}")).await;
+                assert_eq!(root.0, StatusCode::NOT_FOUND, "{base}{suffix}");
+            }
+        }
+
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let router = node_verdict_router(machine_with(std::slice::from_ref(&stub)), &host);
+        let resp = router
+            .clone()
+            .oneshot(post("/v1/operations/x-update-commit/executions", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "not at the root");
+        let resp = router
+            .oneshot(post(
+                "/v1/components/host/operations/x-update-commit/executions",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(stub.commits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn node_resource_paths() {
+        let root = NodeResources::Root;
+        let host = NodeResources::Host("host".into());
+        assert_eq!(root.path(sovd_api::Tree::V1, "/data/x"), "/v1/data/x");
+        assert_eq!(
+            host.path(sovd_api::Tree::Legacy, "/data/x"),
+            "/vehicle/v1/components/host/data/x"
+        );
     }
 
     /// Status + raw body of a `GET uri`.
