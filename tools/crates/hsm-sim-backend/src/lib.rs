@@ -24,6 +24,8 @@
 
 #[cfg(feature = "crypto")]
 pub mod crypto;
+pub mod reset;
 pub mod sim;
 
+pub use reset::reset_keystore;
 pub use sim::SimHsm;
