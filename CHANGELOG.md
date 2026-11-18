@@ -69,6 +69,15 @@ Tag on `108b6e1` (2026-11-21), PR #59, #60.
 
 Tag on `d0f9740` (2026-11-17), PR #49, #50, #51, #52.
 
+- component-mgr (wire): `GET {base}/components/hsm/data/keys` answers a SOVD data item,
+  `{"id": "keys", "data": {"provisioned", "items"}}`, the shape traton-one-os's vehicle_os SOVD server serves and
+  drive-twin reads; was the bare `{"provisioned", "items"}`. Readers take `data.provisioned` / `data.items`.
+- deps (temporary): SOVDd pinned to its `feat/node-resources-under-the-node` branch (the node-scope 409
+  names a node's own operations); back to a tag once SOVDd tags it.
+- component-mgr (host-facing): `update_state_router` and `node_verdict_router` take
+  `&NodeResources`: `Root` serves them at the server root as before, `Host(id)` under the host component
+  (`{base}/components/{id}/...`), which behind SOVDd's node topology is the node's own data and
+  operations, and not at the root. Hosts pass `&NodeResources::Root` to keep today's paths.
 - nv-store: `NvStore::reset_fw_meta(set)` zeroes a bank set's firmware fields and anti-rollback floor
   (`min_security_ver`) on both banks and keeps `gen`, so a first factory-signed HSM keystore installs
   again after an HSM-only factory reset.
