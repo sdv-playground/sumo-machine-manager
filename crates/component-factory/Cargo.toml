@@ -12,8 +12,9 @@ component-mgr = { path = "../component-mgr" }
 app-mgr = { path = "../app-mgr" }
 hsm = { path = "../hsm", features = ["crypto"] }
 # Inline (not a [dependencies.sovd-core] table) on purpose: the workspace
-# tag-consistency guard requires the git and tag keys on ONE line, so a
-# multi-line table is invisible to it and could drift off the pin unnoticed.
+# pin-consistency guard reads the git key and its pin (the tag, or the branch
+# until SOVDd tags the node topology) off ONE line, so a multi-line table is
+# invisible to it and could drift off the pin unnoticed.
 sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "feat/node-subcomponent-topology" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
