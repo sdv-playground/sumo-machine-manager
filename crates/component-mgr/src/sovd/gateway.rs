@@ -18,7 +18,7 @@ use machine_mgr::Machine;
 use sovd_api::{create_router, AppState, Authorizer};
 use sovd_core::DiagnosticBackend;
 
-use crate::sovd::routes::{hsm_router, node_verdict_router, pull_update_router};
+use crate::sovd::routes::{hsm_router, node_verdict_router, pull_update_router, NodeResources};
 
 /// Build the in-guest federating gateway router.
 ///
@@ -50,7 +50,7 @@ pub fn gateway_router(
     let state = state.with_capability_extensions(crate::sovd::openapi::capability_extensions());
     create_router(state)
         .merge(hsm_router(machine.clone()))
-        .merge(node_verdict_router(machine.clone()))
+        .merge(node_verdict_router(machine.clone(), &NodeResources::Root))
         .merge(pull_update_router(machine, authorizer, anchor))
 }
 

@@ -689,9 +689,13 @@ fn plain_router(
         .merge(component_mgr::sovd::routes::update_state_router(
             node_coordinator,
             machine.clone(),
+            &component_mgr::sovd::routes::NodeResources::Root,
         ))
         // Keep the vendor routes in sync with component_mgr::sovd::gateway::gateway_router.
-        .merge(component_mgr::sovd::routes::node_verdict_router(machine))
+        .merge(component_mgr::sovd::routes::node_verdict_router(
+            machine,
+            &component_mgr::sovd::routes::NodeResources::Root,
+        ))
 }
 
 fn connect_backend(socket: &std::path::Path) -> std::io::Result<LinkBClient> {
@@ -802,6 +806,7 @@ async fn build_gateway_router(
     .merge(component_mgr::sovd::routes::update_state_router(
         node_coordinator,
         machine,
+        &component_mgr::sovd::routes::NodeResources::Root,
     ))
 }
 
@@ -858,7 +863,9 @@ mod tests {
         let without = sovd_api::create_router(sovd_api::AppState::new(HashMap::new()))
             .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
             .merge(component_mgr::sovd::routes::update_state_router(
-                coord, machine,
+                coord,
+                machine,
+                &component_mgr::sovd::routes::NodeResources::Root,
             ));
         assert_eq!(post_commit(without).await, StatusCode::NOT_FOUND);
     }

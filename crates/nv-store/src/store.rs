@@ -432,6 +432,34 @@ impl<D: BlockDevice> NvStore<D> {
         write_record(&mut self.dev, offset, layout::FW_META_SECTORS, meta)
     }
 
+    /// Forget what was installed in bank set `set`, keeping its generation: on
+    /// both banks a written record gets its firmware fields (`fw_seq`,
+    /// `fw_secver`, `fw_crc`, `image_sha256`) and its anti-rollback floor
+    /// (`min_security_ver`) zeroed, while `gen` stays so the next install
+    /// still ratchets past every generation a bank's IVD manifest was sealed
+    /// at. A factory reset of one component (the HSM keystore) uses it: a
+    /// first, factory-signed install at security version 1 is accepted again
+    /// after a later one raised the floor. Banks with no record are left
+    /// unwritten. Returns how many records it rewrote.
+    pub fn reset_fw_meta(&mut self, set: BankSet) -> Result<usize, BlockError> {
+        if !self.slot_in_range(set) {
+            return Err(self.out_of_range(set));
+        }
+        let mut rewritten = 0;
+        for bank in [Bank::A, Bank::B] {
+            let Some(old) = self.read_fw_meta(set, bank) else {
+                continue;
+            };
+            let mut meta = NvFwMeta {
+                gen: old.gen,
+                ..NvFwMeta::default()
+            };
+            self.write_fw_meta(set, bank, &mut meta)?;
+            rewritten += 1;
+        }
+        Ok(rewritten)
+    }
+
     // --- Runtime (per bank set, per bank) ---
 
     /// `None` for a slot past [`NvStore::slot_count`] — see

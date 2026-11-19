@@ -15,7 +15,7 @@ hsm = { path = "../hsm", features = ["crypto"] }
 # pin-consistency guard reads the git key and its pin (the tag, or the branch
 # until SOVDd tags the node topology) off ONE line, so a multi-line table is
 # invisible to it and could drift off the pin unnoticed.
-sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "feat/node-subcomponent-topology" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "feat/node-resources-under-the-node" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 
