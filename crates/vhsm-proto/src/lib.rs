@@ -250,6 +250,14 @@ pub const ALG_ECC_P256: u32 = 0x0021;
 /// name every slot uniformly.
 pub const ALG_MONOTONIC: u32 = 0x0022;
 
+/// Sentinel "algorithm" for a **certificate-only** slot: a pinned trust-anchor
+/// CA certificate (e.g. `identity-root`) with NO key material and NO
+/// cryptographic operation behind it. Its one operation is `GetCert`, which
+/// returns the anchor's DER from the backend's trust-anchor store
+/// (`get_trust_anchor_der`, addressed by the slot's `key_id`). Kept in the
+/// `ALG_*` space only so `SlotEntry.alg` can name every slot uniformly.
+pub const ALG_X509_CERT: u32 = 0x0023;
+
 // ---- Permission bitmask (uint32) ----------------------------------------
 
 pub const PERM_ENCRYPT: u32 = 1 << 0;
@@ -302,6 +310,14 @@ pub const HANDLE_TLS_IDENTITY: u32 = 0x000C;
 /// handle-addressed slot access (like the host-in-process key slots above) and
 /// is never registered on the guest wire.
 pub const HANDLE_TIME_FLOOR: u32 = 0x000D;
+
+/// The fleet identity root — the CA the node's TLS leaves (its SOVD server's,
+/// its peers') chain to — as a guest-readable certificate slot: `GetCert`
+/// returns the keystore's pinned `identity-root` trust anchor, installed with
+/// the keystore at provisioning. NOT a key (`ALG_X509_CERT`, `GET_CERT` only):
+/// a guest reads it to verify the host and its peers, and it is registered on
+/// the guest wire only while the keystore holds the anchor.
+pub const HANDLE_IDENTITY_ROOT: u32 = 0x000E;
 
 /// Lower boundary of the project-extension well-known range. Sumo owns
 /// the slots strictly below this; downstream projects own
@@ -447,6 +463,16 @@ pub const SUMO_CORE_SLOTS: &[SlotEntry] = &[
         alg: ALG_MONOTONIC,
         default_perms: 0,
         guest_exposed: false,
+    },
+    // Certificate-only slot (NOT a key — ALG_X509_CERT sentinel): the pinned
+    // identity-root trust anchor, which guests read (GetCert) to verify TLS
+    // leaves the identity CA issued. `key_id` is the trust-anchor id.
+    SlotEntry {
+        handle: HANDLE_IDENTITY_ROOT,
+        key_id: "identity-root",
+        alg: ALG_X509_CERT,
+        default_perms: PERM_GET_CERT,
+        guest_exposed: true,
     },
 ];
 
@@ -715,6 +741,7 @@ mod tests {
             HANDLE_IVD_SIGNING,
             HANDLE_TLS_IDENTITY,
             HANDLE_TIME_FLOOR,
+            HANDLE_IDENTITY_ROOT,
         ];
         for (i, a) in hs.iter().enumerate() {
             for b in &hs[i + 1..] {

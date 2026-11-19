@@ -97,7 +97,7 @@ fn sim_hsm_conforms() {
     // loop and the anchors go untested — the section would pass vacuously.
     for slot in vhsm_proto::SUMO_CORE_SLOTS
         .iter()
-        .filter(|s| s.alg != vhsm_proto::ALG_MONOTONIC)
+        .filter(|s| s.alg != vhsm_proto::ALG_MONOTONIC && s.alg != vhsm_proto::ALG_X509_CERT)
     {
         hsm::HsmCryptoProvider::generate_key(&client, hsm::KeyHandle(slot.handle), slot.alg)
             .expect("generate mandatory sumo-core key");

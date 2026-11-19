@@ -533,7 +533,16 @@ fn handle_get_cert(
         return Response::err(req.op, req.session_id, StatusCode::PermissionDeny);
     }
 
-    match crypto.get_certificate_der(hsm::KeyHandle(handle)) {
+    // A certificate-only slot (the identity root) has no key of its own: its
+    // certificate is the trust anchor its key_id names.
+    let cert = if vhsm_proto::slot_for_handle(handle)
+        .is_some_and(|s| s.alg == vhsm_proto::ALG_X509_CERT)
+    {
+        crypto.get_trust_anchor_der(&entry.key_id)
+    } else {
+        crypto.get_certificate_der(hsm::KeyHandle(handle))
+    };
+    match cert {
         Ok(cert) => {
             let mut result = Vec::with_capacity(4 + cert.len());
             result.extend_from_slice(&(cert.len() as u32).to_le_bytes());
