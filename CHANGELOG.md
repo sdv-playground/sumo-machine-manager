@@ -8,6 +8,11 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- vhsm (wire): a guest-readable sumo-core certificate slot, `HANDLE_IDENTITY_ROOT` (`0x000E`, key id
+  `identity-root`, `ALG_X509_CERT`, `PERM_GET_CERT` only): `GetCert` returns the keystore's pinned
+  `identity-root` trust anchor (`get_trust_anchor_der`), so a guest verifies TLS leaves the identity CA issued,
+  the host SOVD server's among them. vhsm-ssd registers it only while the anchor is pinned; it holds no key, and
+  backends do not list it. Guests need an IAM statement granting `get-cert` on `identity-root`.
 - component-mgr (wire): `GET {base}/components/hsm/data/keys` answers a SOVD data item,
   `{"id": "keys", "data": {"provisioned", "items"}}`, the shape traton-one-os's vehicle_os SOVD server serves and
   drive-twin reads; was the bare `{"provisioned", "items"}`. Readers take `data.provisioned` / `data.items`.
