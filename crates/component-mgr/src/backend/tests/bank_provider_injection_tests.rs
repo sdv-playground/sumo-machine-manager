@@ -741,6 +741,24 @@ fn commit_and_rollback_share_one_resolve_hook() {
     );
 }
 
+/// Only a banked `RequiresEcuReset` component with no vm-service (the host)
+/// cannot restart itself; the same provider behind a vm-service (a guest) or
+/// on a single-bank component (rt) can, as can any `Local` component.
+#[test]
+fn restart_supported_is_false_only_for_the_host_shape() {
+    let host = backend_with_commit_provider(Arc::new(SentinelProvider::new(None)), false);
+    assert!(!host.restart_supported(), "host: node reset, no vm-service");
+
+    let mut guest = backend_with_commit_provider(Arc::new(SentinelProvider::new(None)), false);
+    guest.vm_service_addr = Some("127.0.0.1:1".into());
+    assert!(guest.restart_supported(), "vm-service guest");
+
+    let rt = backend_with_commit_provider(Arc::new(SentinelProvider::new(None)), true);
+    assert!(rt.restart_supported(), "single-bank rt");
+
+    assert!(backend().restart_supported(), "local-reset component");
+}
+
 #[tokio::test]
 async fn update_mode_param_banked_for_default_component() {
     // Default backend: dual-bank VM, NO firmware flashed. The vendor param

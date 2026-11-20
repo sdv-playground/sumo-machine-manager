@@ -2507,14 +2507,10 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // phantom probe timeout against a deliberately-stopped guest.)
         let admin_disabled = self.admin_disabled();
 
-        // A banked component that needs a node reset and has no vm-service to
-        // relaunch (the host bank) cannot restart itself: refuse rather than
-        // report a fake activation. The real reboot re-derives the running
-        // bank at startup (`ComponentBackend::new`).
-        if !self.config.single_bank
-            && self.vm_service_addr.is_none()
-            && self.reset_kind() == machine_mgr::ResetKind::RequiresEcuReset
-        {
+        // A component that cannot restart itself (the host bank) refuses
+        // rather than report a fake activation. The real reboot re-derives the
+        // running bank at startup (`ComponentBackend::new`).
+        if !self.restart_supported() {
             return Err(BackendError::NotSupported(ECU_RESET_NODE_ONLY.into()));
         }
 

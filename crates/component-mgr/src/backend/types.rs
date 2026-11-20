@@ -28,7 +28,7 @@ pub const ATTEST_TIME_OP_ID: &str = "x-attest-time";
 /// vm-service (the host bank): it cannot restart itself — its armed bank runs
 /// only after the node reboots — so a component-level reset is not supported.
 pub(crate) const ECU_RESET_NODE_ONLY: &str =
-    "ecu_reset: component is activated by a node reset (PUT /vehicle/v1/status/restart)";
+    "ecu_reset: this component is activated by the node-level status/restart, not by a component restart";
 
 /// Map a [`BankError`] raised by a bank-provider payload sink / readback onto
 /// the SOVD wire, prefixed with the call site's `context`.

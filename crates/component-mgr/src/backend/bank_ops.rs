@@ -122,6 +122,20 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         self.bank_provider.reset_kind()
     }
 
+    /// Whether a component-level restart (`ecu_reset`) can take effect: false
+    /// for a banked `RequiresEcuReset` component with no vm-service to relaunch
+    /// it (the host bank) — its armed bank runs only after the node reboots, so
+    /// it is activated by the node-level status/restart. Single-bank components
+    /// (rt) and vm-service guests restart. This is also the predicate for the
+    /// `DiagnosticBackend::supports_restart` override that lands when the SOVDd
+    /// pin moves to the tag carrying it (SOVDd #18), so the host stops
+    /// advertising a restart it refuses (ISO 17978-3 Table 280, C2).
+    pub(crate) fn restart_supported(&self) -> bool {
+        self.config.single_bank
+            || self.vm_service_addr.is_some()
+            || self.reset_kind() != machine_mgr::ResetKind::RequiresEcuReset
+    }
+
     /// Render this component's update-mode as the `x-ota-update-mode` JSON
     /// value: `banked` (A/B + trial + rollback) vs `singleshot` (single-bank,
     /// write-through, irreversible — the HSM keystore), plus the flash-cap
