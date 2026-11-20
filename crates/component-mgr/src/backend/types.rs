@@ -24,6 +24,12 @@ pub const UPDATE_MODE_PARAM_ID: &str = "x-ota-update-mode";
 /// on the host/device component (the floor + clock are shared singletons).
 pub const ATTEST_TIME_OP_ID: &str = "x-attest-time";
 
+/// `ecu_reset` refusal for a banked `RequiresEcuReset` component with no
+/// vm-service (the host bank): it cannot restart itself — its armed bank runs
+/// only after the node reboots — so a component-level reset is not supported.
+pub(crate) const ECU_RESET_NODE_ONLY: &str =
+    "ecu_reset: component is activated by a node reset (PUT /vehicle/v1/status/restart)";
+
 /// Map a [`BankError`] raised by a bank-provider payload sink / readback onto
 /// the SOVD wire, prefixed with the call site's `context`.
 ///
