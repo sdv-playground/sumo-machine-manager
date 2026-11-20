@@ -549,6 +549,12 @@ pub fn check_inventory(client: &LinkBClient) -> ConformanceReport {
 
         let mut missing: Vec<String> = Vec::new();
         for slot in vhsm_proto::SUMO_CORE_SLOTS {
+            // A certificate-only slot (the identity root) is a guest-wire view of
+            // a pinned trust anchor, not a slot of the backend's key store: the
+            // backend does not list it.
+            if slot.alg == vhsm_proto::ALG_X509_CERT {
+                continue;
+            }
             let listed = slots.iter().any(|s| s.handle.get() == slot.handle);
             if listed {
                 continue;

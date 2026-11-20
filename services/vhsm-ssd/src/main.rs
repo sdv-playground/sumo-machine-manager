@@ -1113,7 +1113,13 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     // registered only if its key actually exists in the keystore (soft-missing
     // keys are skipped).
     for slot in SUMO_CORE_SLOTS.iter().filter(|s| s.guest_exposed) {
-        if crypto.get_slot_info(hsm::KeyHandle(slot.handle)).is_ok() {
+        // A certificate-only slot (the identity root) is no key but a read-through
+        // to the trust anchor its key_id names, which enrollment pins while the
+        // daemon runs: it is always on the wire, and GET_CERT answers
+        // InvalidHandle while the anchor is absent.
+        let present = slot.alg == vhsm_proto::ALG_X509_CERT
+            || crypto.get_slot_info(hsm::KeyHandle(slot.handle)).is_ok();
+        if present {
             table.register_well_known(slot.handle, slot.key_id, slot.alg, slot.default_perms);
             tracing::debug!(
                 handle = slot.handle,
@@ -1227,6 +1233,24 @@ mod tests {
     // The startup path turns these Errs into a warn-and-disable (a fresh device
     // serves guests with cross-node off until its identity is provisioned),
     // rather than crashing the daemon — so they must be Errs, not panics.
+    /// The identity-root slot (a certificate-only guest slot) is on the guest
+    /// wire before the anchor is pinned: enrollment pins it while the daemon runs,
+    /// after the handle table is built.
+    #[test]
+    fn the_identity_root_slot_is_registered_before_the_anchor_is_pinned() {
+        let dir =
+            std::env::temp_dir().join(format!("vhsm-ssd-identity-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let crypto = SimHsm::new(dir.clone());
+        let table = init_handle_table(&crypto);
+        let entry = table
+            .resolve(vhsm_proto::HANDLE_IDENTITY_ROOT, "vm1")
+            .expect("the slot is registered without an anchor");
+        assert_eq!(entry.key_id, "identity-root");
+        assert_eq!(entry.permitted_ops, vhsm_proto::PERM_GET_CERT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cross_node_config_requires_identity_root() {
         let crypto = unprovisioned_crypto();

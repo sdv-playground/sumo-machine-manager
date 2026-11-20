@@ -547,3 +547,84 @@ fn unknown_op_rejected() {
     );
     assert_eq!(resp.status, StatusCode::InvalidParam as u32);
 }
+
+/// The keystore's identity-root trust anchor, as `roots/identity-root.cert`
+/// holds it after provisioning (the placeholder cert, standing in for the CA).
+fn install_identity_root(fix: &TestFixture) {
+    let roots = fix.keystore_path.join("keys/roots");
+    std::fs::create_dir_all(&roots).unwrap();
+    std::fs::copy(
+        fix.keystore_path.join("keys/iam-signing.cert"),
+        roots.join("identity-root.cert"),
+    )
+    .unwrap();
+}
+
+/// The identity-root slot registered as vhsm-ssd registers it, and vm1 granted
+/// get-cert on it, as the host policy grants it.
+fn with_identity_root_slot(fix: &mut TestFixture) {
+    let slot = slot_for_handle(HANDLE_IDENTITY_ROOT).expect("identity-root is a core slot");
+    assert_eq!(slot.alg, ALG_X509_CERT);
+    fix.handle_table
+        .register_well_known(slot.handle, slot.key_id, slot.alg, slot.default_perms);
+    fix.iam = IamPolicy::parse(
+        r#"
+version: 1
+statements:
+  - principals: [vm1]
+    handles: [identity-root]
+    ops: [get-cert, get-handle-info]
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn get_cert_on_the_identity_root_slot_returns_the_trust_anchor() {
+    let mut fix = TestFixture::new();
+    install_identity_root(&fix);
+    with_identity_root_slot(&mut fix);
+    let anchor = fix.crypto.get_trust_anchor_der("identity-root").unwrap();
+
+    let resp = fix.request(
+        &caller(TEST_IP, TEST_VM),
+        Op::GetCert,
+        HANDLE_IDENTITY_ROOT.to_le_bytes().to_vec(),
+    );
+    assert_eq!(
+        resp.status,
+        StatusCode::Ok as u32,
+        "get_cert on identity-root"
+    );
+    let len = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap()) as usize;
+    assert_eq!(
+        &resp.payload[4..4 + len],
+        &anchor[..],
+        "the keystore's anchor, as DER"
+    );
+
+    // A certificate-only slot carries no key: its public key is not served.
+    let resp = fix.request(
+        &caller(TEST_IP, TEST_VM),
+        Op::GetPubkey,
+        HANDLE_IDENTITY_ROOT.to_le_bytes().to_vec(),
+    );
+    assert_ne!(
+        resp.status,
+        StatusCode::Ok as u32,
+        "no key behind the identity root"
+    );
+}
+
+#[test]
+fn the_identity_root_slot_without_an_anchor_has_no_certificate() {
+    // Before provisioning (or after a factory reset) the keystore holds no root.
+    let mut fix = TestFixture::new();
+    with_identity_root_slot(&mut fix);
+    let resp = fix.request(
+        &caller(TEST_IP, TEST_VM),
+        Op::GetCert,
+        HANDLE_IDENTITY_ROOT.to_le_bytes().to_vec(),
+    );
+    assert_eq!(resp.status, StatusCode::InvalidHandle as u32);
+}
