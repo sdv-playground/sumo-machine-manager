@@ -11,7 +11,7 @@ what a consumer has to touch when it moves its pin.
 - component-mgr (wire): `GET {base}/components/hsm/data/keys` answers a SOVD data item,
   `{"id": "keys", "data": {"provisioned", "items"}}`, the shape traton-one-os's vehicle_os SOVD server serves and
   drive-twin reads; was the bare `{"provisioned", "items"}`. Readers take `data.provisioned` / `data.items`.
-- deps (temporary): SOVDd pinned to its `feat/node-resources-under-the-node` branch (the node-scope 409
+- deps (temporary): SOVDd pinned to its `feat/x-update-verdicts-after-restart` branch (stacked on `feat/mdns-every-interface` and `feat/node-resources-under-the-node`: x-update verdicts after a standard-mode execute, and a verdict adopting the update the executor held through a restart); before that, its `feat/node-resources-under-the-node` branch (the node-scope 409
   names a node's own operations); back to a tag once SOVDd tags it.
 - component-mgr (host-facing): `update_state_router` and `node_verdict_router` take
   `&NodeResources`: `Root` serves them at the server root as before, `Host(id)` under the host component
