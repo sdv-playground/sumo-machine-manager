@@ -2629,7 +2629,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// so its outcome is `Completed` too.
     async fn ecu_reset_outcome(&self, reset_type: u8) -> BackendResult<EcuResetOutcome> {
         let power_down_time = self.ecu_reset(reset_type).await?;
-        Ok(if self.vm_service_addr.is_some() && !self.admin_disabled() {
+        let relaunch_queued = self.vm_service_addr.is_some() && !self.admin_disabled();
+        Ok(if relaunch_queued {
             EcuResetOutcome::Initiated { power_down_time }
         } else {
             EcuResetOutcome::Completed { power_down_time }
