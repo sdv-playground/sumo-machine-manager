@@ -2622,6 +2622,26 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         Ok(None)
     }
 
+    /// A vm-service guest's reset only queues the relaunch (the component
+    /// stays Verifying until a fresh ready boot), so it is `Initiated`; every
+    /// other component has switched by the time `ecu_reset` returns. An
+    /// admin-disabled guest queues nothing (`ecu_reset` skips the relaunch),
+    /// so its outcome is `Completed` too.
+    async fn ecu_reset_outcome(&self, reset_type: u8) -> BackendResult<EcuResetOutcome> {
+        let power_down_time = self.ecu_reset(reset_type).await?;
+        Ok(if self.vm_service_addr.is_some() && !self.admin_disabled() {
+            EcuResetOutcome::Initiated { power_down_time }
+        } else {
+            EcuResetOutcome::Completed { power_down_time }
+        })
+    }
+
+    /// The host shape (node reset, no vm-service) is restarted only by the
+    /// node-level status/restart, so it advertises no `restart` of its own.
+    fn supports_restart(&self) -> bool {
+        self.restart_supported()
+    }
+
     async fn list_flash_transfers(&self) -> BackendResult<Vec<FlashStatus>> {
         let ft = self.flash_transfer.lock().unwrap();
         match ft.as_ref() {

@@ -136,6 +136,14 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.ecu_reset(reset_type).await
     }
 
+    async fn ecu_reset_outcome(&self, reset_type: u8) -> BackendResult<EcuResetOutcome> {
+        self.engine.ecu_reset_outcome(reset_type).await
+    }
+
+    fn supports_restart(&self) -> bool {
+        self.engine.supports_restart()
+    }
+
     // Entity status (§7.19.2: ready/notReady + x-runtime boot_count) —
     // delegated to the engine, which owns the heartbeat + NV boot counter.
     async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {

@@ -8,6 +8,21 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- component-mgr: a host component whose reset is the node's (`RequiresEcuReset`, no vm-service, not
+  single-bank) refuses `ecu_reset` with NotSupported (501, message pointing to the node-level
+  status/restart) instead of pretending; `restart_supported()` predicate (PR #59).
+- deps: SOVDd v0.1.5 — /v1 `status/restart` answers 202 with no body and `Location: {entity}/status`
+  (ISO 17978-3 §7.19.4); 405 precondition-not-fulfilled and no `restart` href when
+  `supports_restart()` is false; 501 → `vendor-specific`/`not-supported` on both trees.
+  component-mgr implements `supports_restart()` (= `restart_supported()`) and
+  `ecu_reset_outcome()` (`Initiated` for vm-service guests, `Completed` otherwise);
+  `InstallRouterDiag` delegates both. Host-facing: hosts that wrap the backend by hand must forward
+  the two new methods.
+
+## v0.1.23 — SOVDd v0.1.4: /v1 tree on the CVC, node-level verdict_scope; vendor routes on both trees
+
+Tag on `d0f9740` (2026-11-17), PR #49, #50, #51, #52.
+
 - vm-sovd: the plain (non-gateway) server mounts `node_verdict_router`, so `x-update-commit` /
   `x-update-rollback` (and the `x-ota-*-trials` aliases) are served there too, not only by `--gateway`.
 - deps: SOVDd v0.1.4 — entity API under /v1 beside /vehicle/v1, node-level /updates, root
