@@ -2507,6 +2507,13 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // phantom probe timeout against a deliberately-stopped guest.)
         let admin_disabled = self.admin_disabled();
 
+        // A component that cannot restart itself (the host bank) refuses
+        // rather than report a fake activation. The real reboot re-derives the
+        // running bank at startup (`ComponentBackend::new`).
+        if !self.restart_supported() {
+            return Err(BackendError::NotSupported(ECU_RESET_NODE_ONLY.into()));
+        }
+
         // Establish the pre-reset witness before issuing any runtime request.
         // A running guest supplies the boot-id baseline and uses "restart";
         // confirmed absence uses "start". Query failure must abort rather than

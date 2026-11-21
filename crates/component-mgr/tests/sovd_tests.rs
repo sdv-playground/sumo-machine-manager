@@ -2097,16 +2097,89 @@ async fn vehicle_v1_per_update_verdict_on_node_reset_member_is_unchanged() {
         make_test_suit_envelope(&keys, "vm2", 2, &vec![0xBB; 1024]),
     )
     .await;
-    activation_reset(&router, "vm2").await;
-
+    // No activation_reset: vm2 (node reset, no vm-service) cannot restart itself
+    // (501), so the legacy commit is not scope-refused but meets the
+    // pre-reboot activation precondition instead.
     let (status, body) = put_empty_text(
         &router,
         &format!("/vehicle/v1/components/vm2/updates/{update_id}/x-update-commit"),
     )
     .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-    let settled = poll_status_until_terminal(&router, "vm2", &update_id).await;
-    assert_eq!(settled["status"], "completed", "{settled}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("AwaitingReboot"), "{body}");
+    assert!(
+        !body.contains("operations/x-update-commit/executions"),
+        "{body}"
+    );
+}
+
+/// A vm-service stand-in on an ephemeral loopback port: `GET` (the health
+/// probe) reports a stopped guest, anything else (the start/restart notify)
+/// gets an empty `200 OK`.
+async fn stub_vm_service() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let size = stream.read(&mut buf).await.unwrap_or(0);
+                let body = if buf[..size].starts_with(b"GET ") {
+                    r#"{"status":"stopped","guest_state":null,"hb_seq":null,"boot_id":null}"#
+                } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn host_restart_is_not_supported_while_a_vm_service_guest_restarts() {
+    // Both node-reset banked components; only the guest has a vm-service to
+    // relaunch it. The host cannot restart itself: 501, not a fake activation.
+    let keys = generate_test_keys();
+    let manifests: Arc<dyn ManifestProvider> =
+        Arc::new(SuitProvider::new(keys.trust_anchor.clone()));
+    let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+    nv.write_boot_state(&mut NvBootState::default()).unwrap();
+    let nv = Arc::new(Mutex::new(nv));
+    let vm_service = stub_vm_service().await;
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    for (id, set, addr) in [
+        ("host", slots::OS, None),
+        ("vm1", slots::VM1, Some(vm_service)),
+    ] {
+        let backend = ComponentBackend::with_options(
+            set,
+            nv.clone(),
+            manifests.clone(),
+            ComponentConfig::default(),
+            addr,
+            None,
+            None,
+        )
+        .with_id(id.to_string())
+        .with_bank_activator(Arc::new(NodeResetActivator));
+        backends.insert(id.to_string(), Arc::new(backend));
+    }
+    let router = sovd_api::create_router(sovd_api::AppState::new(backends));
+
+    let (status, body) = put_json(
+        &router,
+        "/vehicle/v1/components/host/status/restart",
+        serde_json::json!({ "reset_type": "hard" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    activation_reset(&router, "vm1").await;
 }
 
 #[tokio::test]

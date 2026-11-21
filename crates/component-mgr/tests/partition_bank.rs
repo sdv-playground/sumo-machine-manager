@@ -29,7 +29,7 @@ use nv_store::store::{NvStore, MIN_NV_DEVICE_SIZE};
 use nv_store::types::{Bank, NvBootState};
 
 use machine_mgr::bank_provider::BankProvider;
-use sovd_core::{BackendError, DiagnosticBackend, PackageStream};
+use sovd_core::{BackendError, DiagnosticBackend, FlashState, PackageStream};
 
 use component_mgr::backend::{ComponentBackend, ComponentConfig};
 use component_mgr::bank_provider::{bank_dir_name, IvdBankProvider};
@@ -523,4 +523,53 @@ async fn an_unresolvable_part_id_falls_back_to_manifest_order() {
     upload_part(&backend, "manifest", signed_manifest(&key, &manifest_parts)).await;
     upload_part(&backend, "payload-1", parts[0].payload.clone()).await;
     assert_eq!(std::fs::read(&parts[0].dev_b).unwrap(), parts[0].payload);
+}
+
+/// The host bank (raw partitions, `RequiresEcuReset`, no vm-service) cannot
+/// restart itself: after an armed install, `ecu_reset` is `NotSupported` (SOVDd
+/// → 501) and neither the running bank nor the flash state moves — the armed
+/// bank runs only after the node reboot.
+#[tokio::test]
+async fn host_requires_ecu_reset_restart_is_not_supported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parts = make_parts(tmp.path());
+    let (provider, nv, crypto) = partition_provider(tmp.path(), &parts);
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let backend = host_backend(
+        provider.clone(),
+        nv,
+        crypto,
+        &["application.img", "ifs", "rootfs"],
+        key.public_key_bytes(),
+    );
+    let manifest_parts: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|p| (p.name, p.payload.as_slice()))
+        .collect();
+
+    backend.start_flash().await.unwrap();
+    backend
+        .receive_package_stream(stream_of(signed_manifest(&key, &manifest_parts)), None)
+        .await
+        .unwrap();
+    for part in &parts {
+        backend
+            .receive_package_stream(stream_of(part.payload.clone()), None)
+            .await
+            .unwrap();
+    }
+    backend.finalize_flash().await.expect("install armed");
+
+    let running_before = backend.running_bank().unwrap();
+    let state_before = backend.get_activation_state().await.unwrap().state;
+    assert_eq!(state_before, FlashState::AwaitingReboot);
+
+    let err = backend.ecu_reset(0x01).await.unwrap_err();
+
+    assert!(matches!(err, BackendError::NotSupported(_)), "{err:?}");
+    assert_eq!(backend.running_bank().unwrap(), running_before);
+    assert_eq!(
+        backend.get_activation_state().await.unwrap().state,
+        state_before
+    );
 }
