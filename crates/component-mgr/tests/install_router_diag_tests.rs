@@ -29,7 +29,11 @@ use machine_mgr::{
     MachineError, MachineResult, ResetKind,
 };
 
-use sovd_core::DiagnosticBackend;
+use sovd_core::error::BackendResult;
+use sovd_core::{
+    DataValue, DiagnosticBackend, EcuResetOutcome, EntityInfo, FaultFilter, FaultsResult,
+    OperationExecution, OperationInfo, ParameterInfo,
+};
 
 use nv_store::block::MemBlockDevice;
 use nv_store::slots;
@@ -477,4 +481,74 @@ fn verdict_scope_forwards_node_from_engine() {
 fn verdict_scope_forwards_update_from_engine() {
     let diag = InstallRouterDiag::new(bare_router(), engine_backend());
     assert_eq!(diag.verdict_scope(), sovd_core::VerdictScope::Update);
+}
+
+/// Engine whose restart hooks both differ from the trait defaults (`true`,
+/// `Completed`), so the wrapper's answers can only come from forwarding.
+struct AsyncRestartEngine {
+    info: EntityInfo,
+    caps: sovd_core::Capabilities,
+}
+
+#[async_trait]
+impl DiagnosticBackend for AsyncRestartEngine {
+    fn entity_info(&self) -> &EntityInfo {
+        &self.info
+    }
+    fn capabilities(&self) -> &sovd_core::Capabilities {
+        &self.caps
+    }
+    async fn list_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {
+        Ok(Vec::new())
+    }
+    async fn read_data(&self, _param_ids: &[String]) -> BackendResult<Vec<DataValue>> {
+        Ok(Vec::new())
+    }
+    async fn get_faults(&self, _filter: Option<&FaultFilter>) -> BackendResult<FaultsResult> {
+        unreachable!()
+    }
+    async fn list_operations(&self) -> BackendResult<Vec<OperationInfo>> {
+        unreachable!()
+    }
+    async fn start_operation(
+        &self,
+        _operation_id: &str,
+        _params: &[u8],
+    ) -> BackendResult<OperationExecution> {
+        unreachable!()
+    }
+    async fn ecu_reset_outcome(&self, _reset_type: u8) -> BackendResult<EcuResetOutcome> {
+        Ok(EcuResetOutcome::Initiated {
+            power_down_time: Some(3),
+        })
+    }
+    fn supports_restart(&self) -> bool {
+        false
+    }
+}
+
+/// The restart hooks are forwarded to the engine, not masked by the trait
+/// defaults.
+#[tokio::test]
+async fn restart_hooks_forward_from_engine() {
+    let engine = Arc::new(AsyncRestartEngine {
+        info: EntityInfo {
+            id: "vm2".into(),
+            name: "vm2".into(),
+            entity_type: "vm".into(),
+            description: None,
+            href: "/vm2".into(),
+            status: None,
+        },
+        caps: sovd_core::Capabilities::default(),
+    });
+    let diag = InstallRouterDiag::new(bare_router(), engine);
+
+    assert!(!diag.supports_restart());
+    assert_eq!(
+        diag.ecu_reset_outcome(0).await.unwrap(),
+        EcuResetOutcome::Initiated {
+            power_down_time: Some(3)
+        }
+    );
 }

@@ -759,6 +759,74 @@ fn restart_supported_is_false_only_for_the_host_shape() {
     assert!(backend().restart_supported(), "local-reset component");
 }
 
+/// The `supports_restart` hook answers exactly `restart_supported`: the host
+/// shape advertises no component restart, a guest / single-bank one does.
+#[test]
+fn supports_restart_matches_restart_supported() {
+    let host = backend_with_commit_provider(Arc::new(SentinelProvider::new(None)), false);
+    assert!(!host.supports_restart(), "host: node reset, no vm-service");
+
+    let mut guest = backend_with_commit_provider(Arc::new(SentinelProvider::new(None)), false);
+    guest.vm_service_addr = Some("127.0.0.1:1".into());
+    assert!(guest.supports_restart(), "vm-service guest");
+
+    let rt = backend_with_commit_provider(Arc::new(SentinelProvider::new(None)), true);
+    assert!(rt.supports_restart(), "single-bank rt");
+}
+
+/// A vm-service guest's reset only queues the relaunch, so it is `Initiated`
+/// (and the component is left Verifying).
+#[tokio::test]
+async fn ecu_reset_outcome_is_initiated_for_a_vm_service_guest() {
+    let (addr, server) = queued_restart_server(7);
+    let mut b = backend();
+    b.vm_service_addr = Some(addr);
+    arm_bank_b_trial(&b);
+
+    let outcome = b.ecu_reset_outcome(0).await.unwrap();
+
+    assert_eq!(
+        outcome,
+        EcuResetOutcome::Initiated {
+            power_down_time: None
+        }
+    );
+    assert_eq!(
+        b.get_activation_state().await.unwrap().state,
+        FlashState::Verifying
+    );
+    server.join().unwrap();
+}
+
+/// A single-bank component has restarted by the time the call returns.
+#[tokio::test]
+async fn ecu_reset_outcome_is_completed_for_a_single_bank_component() {
+    let rt = backend_with_commit_provider(Arc::new(SentinelProvider::new(None)), true);
+
+    let outcome = rt.ecu_reset_outcome(0).await.unwrap();
+
+    assert_eq!(
+        outcome,
+        EcuResetOutcome::Completed {
+            power_down_time: None
+        }
+    );
+}
+
+/// The host shape refuses `ecu_reset_outcome` with the same NotSupported as
+/// `ecu_reset`.
+#[tokio::test]
+async fn ecu_reset_outcome_refuses_the_host_shape() {
+    let host = backend_with_commit_provider(Arc::new(SentinelProvider::new(None)), false);
+
+    let err = host.ecu_reset_outcome(0).await.unwrap_err();
+
+    assert!(
+        matches!(&err, BackendError::NotSupported(m) if m == ECU_RESET_NODE_ONLY),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn update_mode_param_banked_for_default_component() {
     // Default backend: dual-bank VM, NO firmware flashed. The vendor param

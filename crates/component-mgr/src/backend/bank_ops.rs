@@ -126,10 +126,9 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// for a banked `RequiresEcuReset` component with no vm-service to relaunch
     /// it (the host bank) — its armed bank runs only after the node reboots, so
     /// it is activated by the node-level status/restart. Single-bank components
-    /// (rt) and vm-service guests restart. This is also the predicate for the
-    /// `DiagnosticBackend::supports_restart` override that lands when the SOVDd
-    /// pin moves to the tag carrying it (SOVDd #18), so the host stops
-    /// advertising a restart it refuses (ISO 17978-3 Table 280, C2).
+    /// (rt) and vm-service guests restart. This is also the predicate behind
+    /// the `DiagnosticBackend::supports_restart` override (SOVDd v0.1.5), so the
+    /// host does not advertise a restart it refuses (ISO 17978-3 Table 280, C2).
     pub(crate) fn restart_supported(&self) -> bool {
         self.config.single_bank
             || self.vm_service_addr.is_some()
