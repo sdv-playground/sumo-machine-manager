@@ -330,6 +330,23 @@ pub fn resolve_bank_set(spec: &ComponentSpec) -> Result<BankSet, String> {
     }
 }
 
+/// The parts a `PartitionBankProvider` streams into, in profile order, for
+/// [`FactoryDeps::partition_parts`]. `record: None` — no platform image record
+/// wired yet (the seam lands with the BMFT work).
+pub fn partition_parts(
+    spec: &ComponentSpec,
+) -> Vec<component_mgr::partition_bank_provider::PartitionPart> {
+    spec.parts
+        .iter()
+        .map(|p| component_mgr::partition_bank_provider::PartitionPart {
+            file: p.name.clone(),
+            partition_a: p.a.clone(),
+            partition_b: p.b.clone(),
+            record: None,
+        })
+        .collect()
+}
+
 /// Check a spec's raw-partition [`parts`](ComponentSpec::parts) list is
 /// well-formed: every `name` is non-empty and path-free (it is a payload's last
 /// id segment, not a path) and unique; every device path is non-empty; `a` and
@@ -1115,6 +1132,39 @@ mod tests {
         assert_eq!(
             serde_yaml::from_str::<Vec<PartSpec>>(&yaml).unwrap(),
             spec.parts
+        );
+    }
+
+    fn spec(parts: &str) -> ComponentSpec {
+        serde_yaml::from_str(&format!(
+            "id: host\ntype: hpc\nslot: 2\nactivator: host-bank\n{parts}"
+        ))
+        .unwrap()
+    }
+
+    const HOST_PARTS: &str = "\
+parts:
+  - { name: application.img, a: /dev/emmc4.lnxdata.host-appl, b: /dev/emmc5.lnxdata.host-appl }
+  - { name: ifs, a: /dev/emmc4.lnxdata.host-ifs, b: /dev/emmc5.lnxdata.host-ifs }
+  - { name: rootfs, a: /dev/emmc4.lnxdata.host-core, b: /dev/emmc5.lnxdata.host-core }
+";
+
+    #[test]
+    fn partition_parts_maps_name_a_b_in_order() {
+        let parts = partition_parts(&spec(HOST_PARTS));
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].file, "application.img");
+        assert_eq!(parts[0].partition_a, "/dev/emmc4.lnxdata.host-appl");
+        assert_eq!(parts[0].partition_b, "/dev/emmc5.lnxdata.host-appl");
+        assert_eq!(parts[1].file, "ifs");
+        assert_eq!(parts[1].partition_a, "/dev/emmc4.lnxdata.host-ifs");
+        assert_eq!(parts[1].partition_b, "/dev/emmc5.lnxdata.host-ifs");
+        assert_eq!(parts[2].file, "rootfs");
+        assert_eq!(parts[2].partition_a, "/dev/emmc4.lnxdata.host-core");
+        assert_eq!(parts[2].partition_b, "/dev/emmc5.lnxdata.host-core");
+        assert!(
+            parts.iter().all(|p| p.record.is_none()),
+            "no platform image record is wired yet"
         );
     }
 
