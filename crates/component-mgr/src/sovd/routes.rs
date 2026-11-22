@@ -1829,6 +1829,59 @@ mod tests {
         }
     }
 
+    /// `router` behind SOVDd's node topology (node `cvc`), as an embedder
+    /// that opts in serves it.
+    fn behind_node(router: Router) -> Router {
+        let state = sovd_api::AppState::new(std::collections::HashMap::new())
+            .with_node(sovd_api::NodeTopology::new("cvc", "CVC"))
+            .unwrap();
+        sovd_api::with_node_topology(router, &state)
+    }
+
+    // Node topology: the vendor bodies carry no URL, so the node form serves
+    // the root/flat form's body unchanged, and the legacy tree is untouched.
+    #[tokio::test]
+    async fn vendor_routes_serve_the_node_form_with_the_same_body() {
+        let mut bodies = Vec::new();
+        for uri in [
+            "/v1/components/cvc/operations/x-update-commit/executions",
+            "/v1/operations/x-update-commit/executions",
+            "/vehicle/v1/operations/x-update-commit/executions",
+        ] {
+            let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+            let router = behind_node(node_verdict_router(machine_with(std::slice::from_ref(
+                &stub,
+            ))));
+            let resp = router.oneshot(post(uri, None)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            assert_eq!(stub.commits.load(Ordering::SeqCst), 1, "{uri}");
+            bodies.push(body_json(resp).await);
+        }
+        // Everything but the per-execution id and times.
+        let stable = |b: &serde_json::Value| {
+            (
+                b["operation_id"].clone(),
+                b["status"].clone(),
+                b["result"].clone(),
+                b.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(stable(&bodies[0]), stable(&bodies[1]));
+        assert_eq!(stable(&bodies[0]), stable(&bodies[2]));
+
+        let router = behind_node(device_id_router(machine_with(&[])));
+        let member = get_raw(&router, "/v1/components/cvc/subcomponents/hsm/x-ecu-id").await;
+        assert_ne!(member.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            member,
+            get_raw(&router, "/v1/components/hsm/x-ecu-id").await
+        );
+        assert_eq!(
+            member,
+            get_raw(&router, "/vehicle/v1/components/hsm/x-ecu-id").await
+        );
+    }
+
     // Shape-identity guards: the named response structs must serialize to the
     // exact JSON the handlers emitted as ad-hoc `serde_json::json!` before the
     // utoipa refactor (the regen test only covers the doc, not the wire).
