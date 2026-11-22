@@ -61,12 +61,16 @@ repo — that serve the **same** wire from the **same** route library.
 - **Bind / port:** `0.0.0.0:4000` by default; override with `--bind <addr>` or a
   positional bind-addr (`services/vm-sovd/src/main.rs`).
 - **Node topology (opt-in, both modes):** `--node-id <id>` (`--node-name <name>`,
-  default the id) serves `/v1` as SOVDd node `<id>`: the components are its
-  subcomponents (`/v1/components/<id>/subcomponents/<component>/...`) and the
-  node-level resources (`updates`, `operations` — the node verdict ops among
-  them) sit under `/v1/components/<id>/...`; the flat and root forms keep
-  working, `/vehicle/v1` is untouched. A node id that is also a component's
-  id fails startup.
+  default the id) serves `/v1` as SOVDd node `<id>` only (SOVDd v0.1.10,
+  hierarchical-only): the components are its subcomponents
+  (`/v1/components/<id>/subcomponents/<component>/...`) and the node-level
+  resources (`status`, `updates`, `operations` — the node verdict ops among
+  them — and `data`, e.g. `x-update-state`) sit under `/v1/components/<id>/...`;
+  the node document carries the identification below as `x-identification`.
+  The flat member and root node-level forms answer 404 naming the node form
+  (`/v1`, `/v1/components`, `/v1/docs` stay); without a node, and on
+  `/vehicle/v1`, nothing changes. A node id that is also a component's id
+  fails startup.
 - **mDNS identification:** `--identification <id>` verbatim, or
   `--identification-prefix <prefix>` for `<prefix>-<first 16 hex of the ECU
   id>` (the hsm component's device id, what `x-ecu-id` serves; without an hsm

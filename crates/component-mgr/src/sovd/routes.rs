@@ -1829,34 +1829,66 @@ mod tests {
         }
     }
 
-    /// `router` behind SOVDd's node topology (node `cvc`), as an embedder
-    /// that opts in serves it.
-    fn behind_node(router: Router) -> Router {
-        let state = sovd_api::AppState::new(std::collections::HashMap::new())
-            .with_node(sovd_api::NodeTopology::new("cvc", "CVC"))
-            .unwrap();
+    /// `router` behind SOVDd's node topology, as an embedder serves it: with
+    /// `node`, configured as node `cvc`; without, node-less.
+    fn served(router: Router, node: bool) -> Router {
+        let state = sovd_api::AppState::new(std::collections::HashMap::new());
+        let state = if node {
+            state
+                .with_node(sovd_api::NodeTopology::new("cvc", "CVC"))
+                .unwrap()
+        } else {
+            state
+        };
         sovd_api::with_node_topology(router, &state)
     }
 
-    // Node topology: the vendor bodies carry no URL, so the node form serves
-    // the root/flat form's body unchanged, and the legacy tree is untouched.
+    // Node topology: the vendor bodies carry no URL, so the node form on a
+    // node server serves the body a node-less server serves at the root/flat
+    // form, and the legacy tree is untouched on both. On a node server the
+    // root/flat form answers 404, naming the node form.
     #[tokio::test]
     async fn vendor_routes_serve_the_node_form_with_the_same_body() {
         let mut bodies = Vec::new();
-        for uri in [
-            "/v1/components/cvc/operations/x-update-commit/executions",
-            "/v1/operations/x-update-commit/executions",
-            "/vehicle/v1/operations/x-update-commit/executions",
+        for (uri, node) in [
+            (
+                "/v1/components/cvc/operations/x-update-commit/executions",
+                true,
+            ),
+            ("/v1/operations/x-update-commit/executions", false),
+            ("/vehicle/v1/operations/x-update-commit/executions", true),
+            ("/vehicle/v1/operations/x-update-commit/executions", false),
         ] {
             let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
-            let router = behind_node(node_verdict_router(machine_with(std::slice::from_ref(
-                &stub,
-            ))));
+            let router = served(
+                node_verdict_router(machine_with(std::slice::from_ref(&stub))),
+                node,
+            );
             let resp = router.oneshot(post(uri, None)).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-            assert_eq!(stub.commits.load(Ordering::SeqCst), 1, "{uri}");
+            assert_eq!(resp.status(), StatusCode::OK, "{uri} node={node}");
+            assert_eq!(stub.commits.load(Ordering::SeqCst), 1, "{uri} node={node}");
             bodies.push(body_json(resp).await);
         }
+
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let router = served(
+            node_verdict_router(machine_with(std::slice::from_ref(&stub))),
+            true,
+        );
+        let resp = router
+            .oneshot(post("/v1/operations/x-update-commit/executions", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(stub.commits.load(Ordering::SeqCst), 0);
+        let body = body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("/v1/components/cvc/operations/x-update-commit/executions"),
+            "{body}"
+        );
         // Everything but the per-execution id and times.
         let stable = |b: &serde_json::Value| {
             (
@@ -1866,19 +1898,30 @@ mod tests {
                 b.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
             )
         };
-        assert_eq!(stable(&bodies[0]), stable(&bodies[1]));
-        assert_eq!(stable(&bodies[0]), stable(&bodies[2]));
+        for body in &bodies[1..] {
+            assert_eq!(stable(&bodies[0]), stable(body));
+        }
 
-        let router = behind_node(device_id_router(machine_with(&[])));
-        let member = get_raw(&router, "/v1/components/cvc/subcomponents/hsm/x-ecu-id").await;
+        let with = served(device_id_router(machine_with(&[])), true);
+        let without = served(device_id_router(machine_with(&[])), false);
+        let member = get_raw(&with, "/v1/components/cvc/subcomponents/hsm/x-ecu-id").await;
         assert_ne!(member.0, StatusCode::NOT_FOUND);
         assert_eq!(
             member,
-            get_raw(&router, "/v1/components/hsm/x-ecu-id").await
+            get_raw(&without, "/v1/components/hsm/x-ecu-id").await
         );
-        assert_eq!(
-            member,
-            get_raw(&router, "/vehicle/v1/components/hsm/x-ecu-id").await
+        for router in [&with, &without] {
+            assert_eq!(
+                member,
+                get_raw(router, "/vehicle/v1/components/hsm/x-ecu-id").await
+            );
+        }
+        let (status, body) = get_raw(&with, "/v1/components/hsm/x-ecu-id").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            String::from_utf8_lossy(&body)
+                .contains("/v1/components/cvc/subcomponents/hsm/x-ecu-id"),
+            "{body:?}"
         );
     }
 
