@@ -541,10 +541,7 @@ async fn main() {
             identification = ecu_identification(machine.as_ref(), prefix).await;
         }
     }
-    let node = node_id.map(|id| {
-        let name = node_name.unwrap_or_else(|| id.clone());
-        sovd_api::NodeTopology::new(id, name)
-    });
+    let node = node_topology(node_id, node_name, identification.as_deref());
 
     let router = if gateway_mode {
         // In-guest federating gateway: local onboard pull-update (route-scoped
@@ -827,6 +824,22 @@ fn sovd_state(
     }
 }
 
+/// The `/v1` node of `--node-id` (named `--node-name`, else its id), carrying
+/// the unit's `identification` on its document when one is known.
+fn node_topology(
+    id: Option<String>,
+    name: Option<String>,
+    identification: Option<&str>,
+) -> Option<sovd_api::NodeTopology> {
+    let id = id?;
+    let name = name.unwrap_or_else(|| id.clone());
+    let node = sovd_api::NodeTopology::new(id, name);
+    Some(match identification {
+        Some(identification) => node.with_identification(identification),
+        None => node,
+    })
+}
+
 /// `<prefix>-<first 16 characters of ecu_id>`; `None` when the id is shorter.
 fn prefixed_identification(prefix: &str, ecu_id: &str) -> Option<String> {
     ecu_id.get(..16).map(|ecu16| format!("{prefix}-{ecu16}"))
@@ -1066,6 +1079,67 @@ mod tests {
 
         let without = plain_router(machine, sovd_state(HashMap::new(), None).unwrap(), coord);
         assert_ne!(post_commit_at(without, node_form).await, StatusCode::OK);
+    }
+
+    /// `GET uri`: the status and the body text.
+    async fn get_text(router: axum::Router, uri: &str) -> (StatusCode, String) {
+        let resp = router
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// With --node-id, a known identification is carried on the node document
+    /// as `x-identification`; without one the member is absent.
+    #[tokio::test]
+    async fn the_node_document_carries_the_identification() {
+        let machine = test_machine();
+        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
+        let router = |identification| {
+            let node = node_topology(Some("cvc".into()), None, identification);
+            plain_router(
+                machine.clone(),
+                sovd_state(HashMap::new(), node).unwrap(),
+                coord.clone(),
+            )
+        };
+
+        let (status, body) = get_text(
+            router(Some("cvc-host-f88a13a329a72db1")),
+            "/v1/components/cvc",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(r#""x-identification":"cvc-host-f88a13a329a72db1""#),
+            "{body}"
+        );
+
+        let (status, body) = get_text(router(None), "/v1/components/cvc").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("x-identification"), "{body}");
+
+        assert!(node_topology(None, None, Some("cvc-host-f88a13a329a72db1")).is_none());
+    }
+
+    /// With --node-id the node form of `x-update-state` serves the root form's
+    /// body (SOVDd v0.1.9 maps node-level data under the node).
+    #[tokio::test]
+    async fn plain_router_serves_x_update_state_under_the_node() {
+        let machine = test_machine();
+        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
+        let node = node_topology(Some("cvc".into()), None, None);
+        let router = plain_router(machine, sovd_state(HashMap::new(), node).unwrap(), coord);
+
+        let root = get_text(router.clone(), "/v1/data/x-update-state").await;
+        assert_eq!(root.0, StatusCode::OK, "{}", root.1);
+        let node_form = get_text(router, "/v1/components/cvc/data/x-update-state").await;
+        assert_eq!(node_form, root);
     }
 
     /// A node id that is also a component's id is refused (startup fails).
