@@ -223,7 +223,7 @@ pub async fn process_envelope_stream(
         }
         drop(tx);
 
-        let (image_size, image_hash) = match process_handle.await {
+        let (image_size, image_hash, _) = match process_handle.await {
             Ok(Ok(result)) => {
                 if send_failed {
                     return Err(BackendError::Internal(format!(
@@ -572,7 +572,9 @@ fn rebuild_envelope_with_payload(
 /// Runs in a blocking thread. `writer` is the provider's payload sink (already
 /// opened by the caller, e.g. via `open_payload_writer`), or `None` for
 /// in-memory / no-images-dir paths that still verify the hash. Returns
-/// (total_image_size, image_sha256).
+/// (total_image_size, image_sha256, as_received): `as_received` when neither
+/// decryption nor decompression ran, so the bytes written are the bytes
+/// received.
 #[allow(clippy::too_many_arguments)]
 fn process_payload_sync(
     rx: tokio::sync::mpsc::Receiver<Bytes>,
@@ -583,7 +585,7 @@ fn process_payload_sync(
     key_unwrap: Option<&(dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync)>,
     expected_digest: Option<&[u8]>,
     writer: Option<Box<dyn IoWrite + Send>>,
-) -> Result<(usize, [u8; 32]), String> {
+) -> Result<(usize, [u8; 32], bool), String> {
     let crypto = RustCryptoBackend::new();
 
     let mut channel_reader = ChannelReader {
@@ -612,11 +614,11 @@ fn process_payload_sync(
         if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
             // Encrypted + compressed: chain through zstd (libzstd)
             let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
-            process_decompressed(prefixed, expected_digest, writer)
+            process_decompressed(prefixed, expected_digest, writer).map(|(n, h)| (n, h, false))
         } else {
             // Encrypted, not compressed: hash + write directly
             let prefixed = PrefixReader::new(&first_buf[..first_n], decrypt_reader);
-            process_plain(prefixed, expected_digest, writer)
+            process_plain(prefixed, expected_digest, writer).map(|(n, h)| (n, h, false))
         }
     } else {
         // Unencrypted — read first bytes to check for zstd
@@ -625,10 +627,10 @@ fn process_payload_sync(
 
         if first_n >= 4 && first_buf[..4] == ZSTD_MAGIC {
             let prefixed = PrefixReader::new(&first_buf[..first_n], channel_reader);
-            process_decompressed(prefixed, expected_digest, writer)
+            process_decompressed(prefixed, expected_digest, writer).map(|(n, h)| (n, h, false))
         } else {
             let prefixed = PrefixReader::new(&first_buf[..first_n], channel_reader);
-            process_plain(prefixed, expected_digest, writer)
+            process_plain(prefixed, expected_digest, writer).map(|(n, h)| (n, h, true))
         }
     }
 }
@@ -1382,7 +1384,7 @@ pub async fn resolve_campaign_dependencies(
 /// once as the unpacked final file — doubling the I/O cost on the
 /// device's flash storage for no benefit.
 ///
-/// Returns `(inbound_bytes, image_size, image_sha256)`:
+/// Returns `(inbound_bytes, image_size, image_sha256, as_received)`:
 /// - `inbound_bytes`: total ciphertext + zstd bytes read from the
 ///   stream (i.e. the "on-wire" size — useful for compression-ratio
 ///   logging).
@@ -1390,6 +1392,8 @@ pub async fn resolve_campaign_dependencies(
 /// - `image_sha256`: digest of the written bytes (matches
 ///   `expected_digest` when one is given; with `None` the caller names the
 ///   component by this digest).
+/// - `as_received`: neither decryption nor decompression ran — the bytes
+///   written are exactly the bytes received.
 ///
 /// `component_index` supplies the decryption context of an encrypted
 /// payload.
@@ -1400,7 +1404,7 @@ pub async fn process_payload_stream(
     key_unwrap: Option<Arc<dyn sumo_onboard::decryptor::KeyUnwrap + Send + Sync>>,
     expected_digest: Option<Vec<u8>>,
     writer: Box<dyn IoWrite + Send>,
-) -> Result<(u64, usize, [u8; 32]), BackendError> {
+) -> Result<(u64, usize, [u8; 32], bool), BackendError> {
     let envelope = sumo_codec::decode::decode_envelope(&manifest_bytes)
         .map_err(|e| BackendError::Internal(format!("decode manifest: {e:?}")))?;
     let has_encryption = sumo_onboard::manifest::Manifest { envelope }
@@ -1455,7 +1459,7 @@ pub async fn process_payload_stream(
     }
     drop(tx);
 
-    let (image_size, image_hash) = match process_handle.await {
+    let (image_size, image_hash, as_received) = match process_handle.await {
         Ok(Ok(result)) => {
             if send_failed {
                 return Err(BackendError::Internal("payload stream ended early".into()));
@@ -1474,7 +1478,32 @@ pub async fn process_payload_stream(
         }
     };
 
-    Ok((inbound, image_size, image_hash))
+    Ok((inbound, image_size, image_hash, as_received))
+}
+
+/// Stream `reader` out in 64 KiB chunks, read on a blocking thread — the
+/// read-back counterpart of the upload pipeline: never more than a few chunks
+/// resident, whatever the part's size. A read error ends the stream with it.
+pub(crate) fn read_stream(mut reader: Box<dyn Read + Send>) -> PackageStream {
+    let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(4);
+    tokio::task::spawn_blocking(move || {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let chunk = match reader.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => Ok(Bytes::copy_from_slice(&buf[..n])),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => Err(e),
+            };
+            let failed = chunk.is_err();
+            if tx.blocking_send(chunk).is_err() || failed {
+                return;
+            }
+        }
+    });
+    Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk.map_err(Into::into), rx))
+    }))
 }
 
 /// Stream a raw payload from an async stream to disk (no CBOR, no processing).

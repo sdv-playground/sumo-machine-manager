@@ -204,6 +204,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         self.manifests.lock().unwrap().clear();
         self.payloads.lock().unwrap().clear();
         self.manifest_describe.lock().unwrap().clear();
+        self.uploaded_parts.lock().unwrap().clear();
     }
 
     /// Terminal session teardown shared by every abort path: drop the staging
@@ -732,10 +733,13 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 );
             }
             let upload_sha256: [u8; 32] = hasher.clone().finalize().into();
-            self.uploaded_parts
-                .lock()
-                .unwrap()
-                .insert(id.clone(), UploadedPartLocation::Manifest { upload_sha256 });
+            self.uploaded_parts.lock().unwrap().insert(
+                id.clone(),
+                UploadedPartLocation::Manifest {
+                    upload_sha256,
+                    bytes: data.into(),
+                },
+            );
 
             // Session complete — no payload uploads needed
             {
@@ -793,10 +797,13 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 );
             }
             let upload_sha256: [u8; 32] = hasher.clone().finalize().into();
-            self.uploaded_parts
-                .lock()
-                .unwrap()
-                .insert(id.clone(), UploadedPartLocation::Manifest { upload_sha256 });
+            self.uploaded_parts.lock().unwrap().insert(
+                id.clone(),
+                UploadedPartLocation::Manifest {
+                    upload_sha256,
+                    bytes: data.clone().into(),
+                },
+            );
 
             // Set package_id on flash transfer. With no payload part owed there
             // is nothing left to transfer, so settle the transfer HERE:
@@ -893,8 +900,12 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         let target_bank = self.determine_target_bank()?;
 
         // A part the bank already holds, sent again: accepted as it stands,
-        // nothing written.
-        let already_staged = |i: usize, image_hash: [u8; 32]| -> BackendResult<String> {
+        // nothing written. `as_received`: this upload's bytes are the staged
+        // bytes.
+        let already_staged = |i: usize,
+                              image_hash: [u8; 32],
+                              as_received: bool|
+         -> BackendResult<String> {
             let name = crate::bank_spec::payload_target_name_for_id(manifest.component_id(i))?;
             tracing::info!(component = i, part = %name, "payload is a part already staged — accepted, discarded");
             let id = self.next_id();
@@ -904,19 +915,25 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     bank: target_bank,
                     name,
                     inner_sha256: image_hash,
+                    as_received,
                 },
             );
             Ok(id)
         };
         if let Some(i) = addressed.filter(|i| present.contains(i)) {
             use futures::StreamExt;
+            use sha2::Digest;
+            // Hashed only to tell whether the bytes received are the staged
+            // bytes (then `read_part` may serve them).
+            let mut hasher = sha2::Sha256::new();
             let mut stream = stream;
             while let Some(chunk) = stream.next().await {
-                chunk.map_err(|e| BackendError::Internal(format!("stream: {e}")))?;
+                hasher.update(chunk.map_err(|e| BackendError::Internal(format!("stream: {e}")))?);
             }
             let digest = <[u8; 32]>::try_from(digest_of(i)?.as_slice())
                 .map_err(|_| BackendError::Internal(format!("digest of component {i}")))?;
-            return already_staged(i, digest);
+            let received: [u8; 32] = hasher.finalize().into();
+            return already_staged(i, digest, received == digest);
         }
 
         // The part this upload streams as: the one named, else the next in
@@ -933,7 +950,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // is the dominant cost on the device and writing the payload
         // twice (once as .tmp, once unpacked) doubles it for nothing.
         let process_started = std::time::Instant::now();
-        let (comp_idx, target_name, inbound, image_size, image_hash) = match self
+        let (comp_idx, target_name, inbound, image_size, image_hash, as_received) = match self
             .bank_provider
             .open_staging_writer(target_bank)
         {
@@ -957,7 +974,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     writer,
                 )
                 .await;
-                let (inbound, image_size, image_hash) = match processed {
+                let (inbound, image_size, image_hash, as_received) = match processed {
                     Ok(x) => x,
                     Err(e) => {
                         let _ = self.bank_provider.discard_staged(target_bank, handle);
@@ -973,7 +990,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 let Some(comp_idx) = found else {
                     let _ = self.bank_provider.discard_staged(target_bank, handle);
                     if let Some(i) = parts.iter().copied().find(matches) {
-                        return already_staged(i, image_hash);
+                        return already_staged(i, image_hash, as_received);
                     }
                     return Err(BackendError::Internal(
                         "payload matches no component of the manifest".into(),
@@ -988,7 +1005,14 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     let _ = self.bank_provider.discard_staged(target_bank, handle);
                     return Err(sink_error(&format!("commit staged {target_name}"), e));
                 }
-                (comp_idx, target_name, inbound, image_size, image_hash)
+                (
+                    comp_idx,
+                    target_name,
+                    inbound,
+                    image_size,
+                    image_hash,
+                    as_received,
+                )
             }
             Err(BankError::Unsupported(_)) => {
                 let comp_idx = next;
@@ -1011,16 +1035,24 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     comp_idx + 1,
                     total,
                 );
-                let (inbound, image_size, image_hash) = crate::streaming::process_payload_stream(
-                    stream,
-                    manifest_bytes.clone(),
+                let (inbound, image_size, image_hash, as_received) =
+                    crate::streaming::process_payload_stream(
+                        stream,
+                        manifest_bytes.clone(),
+                        comp_idx,
+                        key_unwrap.clone(),
+                        Some(digest_of(comp_idx)?),
+                        writer,
+                    )
+                    .await?;
+                (
                     comp_idx,
-                    key_unwrap.clone(),
-                    Some(digest_of(comp_idx)?),
-                    writer,
+                    target_name,
+                    inbound,
+                    image_size,
+                    image_hash,
+                    as_received,
                 )
-                .await?;
-                (comp_idx, target_name, inbound, image_size, image_hash)
             }
             Err(e) => return Err(sink_error("open staging sink", e)),
         };
@@ -1129,6 +1161,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                 bank: target_bank,
                 name: target_name.clone(),
                 inner_sha256: image_hash,
+                as_received,
             },
         );
         Ok(id)

@@ -407,8 +407,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// Wipe the target bank dir + reclaim space — delegated to the provider's
     /// `prepare_target`. Called at flash-session start so the incoming payload
     /// lands in a clean, space-reclaimed location on the same filesystem as its
-    /// final home.
+    /// final home. The bank's parts go, so do the records `read_part` serves
+    /// them from.
     pub(super) fn prepare_target_bank_dir(&self, target: Bank) -> BackendResult<()> {
+        self.uploaded_parts.lock().unwrap().clear();
         self.bank_provider
             .prepare_target(target)
             .map_err(|e| BackendError::Internal(e.to_string()))
