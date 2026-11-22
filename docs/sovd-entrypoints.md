@@ -60,6 +60,17 @@ repo — that serve the **same** wire from the **same** route library.
   See `plain_router` in `services/vm-sovd/src/main.rs`.
 - **Bind / port:** `0.0.0.0:4000` by default; override with `--bind <addr>` or a
   positional bind-addr (`services/vm-sovd/src/main.rs`).
+- **Node topology (opt-in, both modes):** `--node-id <id>` (`--node-name <name>`,
+  default the id) serves `/v1` as SOVDd node `<id>`: the components are its
+  subcomponents (`/v1/components/<id>/subcomponents/<component>/...`) and the
+  node-level resources (`updates`, `operations` — the node verdict ops among
+  them) sit under `/v1/components/<id>/...`; the flat and root forms keep
+  working, `/vehicle/v1` is untouched. A node id that is also a component's
+  id fails startup.
+- **mDNS identification:** `--identification <id>` verbatim, or
+  `--identification-prefix <prefix>` for `<prefix>-<first 16 hex of the ECU
+  id>` (the hsm component's device id, what `x-ecu-id` serves; without an hsm
+  component or ECU id it warns and falls through). `--identification` wins.
 - **Launched by:** `example/run.sh` (alongside the `hsm-sim-service` link-B
   backend and `vhsm-ssd`). Connect-only to the
   pre-spawned link-B HSM backend via `--backend-socket`. Also run in host mode

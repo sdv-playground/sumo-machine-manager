@@ -789,6 +789,19 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         &self.entity_info
     }
 
+    /// Where the part `file_id` was placed (a copy, so no lock is held across
+    /// `.await`); `EntityNotFound` when no part of that id is recorded.
+    fn uploaded_part(&self, file_id: &str) -> BackendResult<UploadedPartLocation> {
+        self.uploaded_parts
+            .lock()
+            .unwrap()
+            .get(file_id)
+            .cloned()
+            .ok_or_else(|| {
+                BackendError::EntityNotFound(format!("no uploaded part with file_id {file_id}"))
+            })
+    }
+
     /// SUIT-derived Table-261 facts cached for the manifest uploaded under
     /// `file_id`, if any. Returns `(update_name, notes, component_paths)`:
     ///

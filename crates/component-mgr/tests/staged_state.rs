@@ -857,3 +857,148 @@ async fn a_committed_previous_bank_is_not_held() {
     assert_eq!(previous.update_id.as_deref(), Some("upd-6"));
     assert!(held(&backend).await.is_empty());
 }
+
+/// Every byte `read_part` streams for `file_id`.
+async fn read_back(
+    backend: &ComponentBackend<MemBlockDevice>,
+    file_id: &str,
+) -> Result<Vec<u8>, sovd_core::BackendError> {
+    use futures::StreamExt;
+    let mut stream = backend.read_part(file_id).await?;
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        out.extend_from_slice(&chunk.expect("read-back chunk"));
+    }
+    Ok(out)
+}
+
+/// `data` as a stream of `n`-byte chunks.
+fn chunked(data: &[u8], n: usize) -> PackageStream {
+    let chunks: Vec<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> = data
+        .chunks(n)
+        .map(|c| Ok(Bytes::copy_from_slice(c)))
+        .collect();
+    Box::pin(futures::stream::iter(chunks))
+}
+
+/// The manifest reads back as received while the update lasts — also once
+/// every part is in and the session is complete — and is gone after DELETE.
+#[tokio::test]
+async fn read_part_streams_the_manifest_back_until_the_update_is_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let parts = parts();
+    let manifest = signed_manifest(&key, "vm1", &parts);
+    let (backend, _) = file_backend(tmp.path(), &nv, &key);
+
+    let transfer = backend.start_flash().await.unwrap();
+    let file_id = backend
+        .receive_package_part("manifest", stream_of(manifest.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(read_back(&backend, &file_id).await.unwrap(), manifest);
+    for (name, payload) in &parts {
+        upload_part(&backend, name, payload.clone()).await;
+    }
+    assert_eq!(
+        read_back(&backend, &file_id).await.unwrap(),
+        manifest,
+        "still kept once the session is complete"
+    );
+
+    backend.abort_flash(&transfer).await.unwrap();
+    assert!(matches!(
+        read_back(&backend, &file_id).await,
+        Err(sovd_core::BackendError::EntityNotFound(_))
+    ));
+}
+
+/// A payload staged as received (no encryption, no compression) streams back
+/// byte for byte — a multi-chunk one too, and a re-sent copy.
+#[tokio::test]
+async fn read_part_streams_an_untransformed_payload_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    // 200 KiB: several of the read-back's 64 KiB chunks.
+    let rootfs: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+    let parts = vec![("kernel", vec![0x11; 3000]), ("rootfs.img", rootfs.clone())];
+    let (backend, _) = file_backend(tmp.path(), &nv, &key);
+
+    backend.start_flash().await.unwrap();
+    upload_part(&backend, "manifest", signed_manifest(&key, "vm1", &parts)).await;
+    let small = backend
+        .receive_package_part("kernel", stream_of(parts[0].1.clone()), None)
+        .await
+        .unwrap();
+    // Already staged: accepted, nothing written; its bytes are the staged ones.
+    let resent = backend
+        .receive_package_part("kernel", stream_of(parts[0].1.clone()), None)
+        .await
+        .unwrap();
+    let big = backend
+        .receive_package_part("rootfs.img", chunked(&rootfs, 50_000), None)
+        .await
+        .unwrap();
+
+    assert_eq!(read_back(&backend, &small).await.unwrap(), parts[0].1);
+    assert_eq!(read_back(&backend, &big).await.unwrap(), rootfs);
+    assert_eq!(read_back(&backend, &resent).await.unwrap(), parts[0].1);
+}
+
+/// A payload kept decoded (here: decompressed) exists but has no received
+/// form to stream: `NotSupported`, not `EntityNotFound`. So does a re-sent
+/// part whose received bytes are not the staged ones.
+#[tokio::test]
+async fn read_part_refuses_a_decoded_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let parts = vec![
+        ("kernel", vec![0x11; 3000]),
+        ("rootfs.img", vec![0x22; 9000]),
+    ];
+    let zstd_of = |i: usize| zstd::encode_all(parts[i].1.as_slice(), 3).unwrap();
+    let (backend, _) = file_backend(tmp.path(), &nv, &key);
+    let not_supported = |r: Result<Vec<u8>, sovd_core::BackendError>| match r {
+        Err(sovd_core::BackendError::NotSupported(m)) => {
+            assert!(m.contains("kept decoded"), "got {m}")
+        }
+        other => panic!("expected NotSupported, got {:?}", other.map(|b| b.len())),
+    };
+
+    backend.start_flash().await.unwrap();
+    upload_part(&backend, "manifest", signed_manifest(&key, "vm1", &parts)).await;
+    upload_part(&backend, "kernel", parts[0].1.clone()).await;
+    let resent = backend
+        .receive_package_part("kernel", stream_of(zstd_of(0)), None)
+        .await
+        .unwrap();
+    not_supported(read_back(&backend, &resent).await);
+
+    let file_id = backend
+        .receive_package_part("rootfs.img", stream_of(zstd_of(1)), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(tmp.path().join("images/vm1/bank_b/rootfs.img")).unwrap(),
+        parts[1].1,
+        "staged decompressed"
+    );
+    not_supported(read_back(&backend, &file_id).await);
+}
+
+/// A file_id this backend never issued is `EntityNotFound`.
+#[tokio::test]
+async fn read_part_of_an_unknown_file_id_is_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nv = fresh_nv();
+    let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let (backend, _) = file_backend(tmp.path(), &nv, &key);
+
+    assert!(matches!(
+        read_back(&backend, "no-such-file-id").await,
+        Err(sovd_core::BackendError::EntityNotFound(_))
+    ));
+}

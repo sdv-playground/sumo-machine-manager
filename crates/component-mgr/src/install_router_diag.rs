@@ -210,6 +210,10 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.verify_part(file_id, expected_sha256).await
     }
 
+    async fn read_part(&self, file_id: &str) -> BackendResult<PackageStream> {
+        self.engine.read_part(file_id).await
+    }
+
     async fn delete_package(&self, package_id: &str) -> BackendResult<()> {
         self.engine.delete_package(package_id).await
     }

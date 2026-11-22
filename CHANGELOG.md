@@ -15,6 +15,30 @@ what a consumer has to touch when it moves its pin.
   `--identification <id>` option; `--no-mdns` still opts out. SIGTERM / ctrl-c now shut the server
   down gracefully (5 s cap) on both transports, so the DNS-SD goodbye is sent before exit.
   Host-facing: none (all SOVDd pins move to v0.1.6; no API change consumed).
+- deps: SOVDd v0.1.8 (every pin: machine-mgr, component-mgr, component-factory, vm-sovd) — opt-in
+  node topology on /v1, `DiagnosticBackend::read_part` behind `GET /v1/…/updates/{id}/bulk-data/{part}`,
+  sovd-mdns leaf instance only from a plain `<label>.local` SAN. Host-facing: none by the bump itself.
+- component-mgr: `read_part` streams a part back exactly as received. The manifest is kept as
+  received and reads back while its update lasts. A payload reads back only when the bank holds it as
+  received (no decryption, no decompression ran, or a re-sent part whose bytes hash to the staged
+  digest); one kept decoded answers 501 (NotSupported: the part exists, its received form is not
+  kept). In practice fleet payloads are encrypted and compressed, so only the manifest reads back —
+  the intended use: a client checks that its manifest upload landed before uploading the payloads.
+  404 for an unknown file_id and once the part is no longer kept (update aborted / deleted, target
+  bank wiped, next update started, bank file gone). New `BankProvider::open_payload_reader` (default
+  Unsupported; file banks implement it); `InstallRouterDiag` forwards `read_part`. Host-facing: hosts
+  that wrap the backend by hand forward `read_part`; a custom `BankProvider` may implement
+  `open_payload_reader`.
+- component-mgr: no vendor route renders a URL in a JSON body, so node-form requests get the root/flat
+  form's body unchanged (pinned by a test); pull-update's root-form 202 `Location` is rewritten by
+  SOVDd. New `gateway::gateway_router_with_state(machine, state, authorizer, trust_anchor)` — the
+  gateway over a caller-built `AppState` (taken as is), so the same state can be handed to
+  `sovd_api::with_node_topology`; `gateway_router` is unchanged for its callers.
+- vm-sovd: `--node-id <id>` / `--node-name <name>` (default the id) serve /v1 as SOVDd node `<id>`
+  in both modes (the final router wrapped in `with_node_topology`; a bad or colliding id fails
+  startup). `--identification-prefix <prefix>`: identification `<prefix>-<first 16 hex of the ECU
+  id>` (the hsm device id `x-ecu-id` serves), warning and falling through when there is none;
+  `--identification` wins.
 
 ## v0.1.24 — SOVDd v0.1.5: restart outcome hooks; host ecu_reset refused as NotSupported
 

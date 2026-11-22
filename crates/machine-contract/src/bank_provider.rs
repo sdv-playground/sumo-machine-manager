@@ -343,6 +343,21 @@ pub trait BankProvider: Send + Sync {
         expected_sha256: &[u8; 32],
     ) -> Result<(), BankError>;
 
+    /// Open staged payload `name` in `bank` for reading back: exactly the
+    /// bytes its writer placed there, read as they stand on the medium. A part
+    /// that is not there is `Io` with `NotFound`. Default `Unsupported` (a
+    /// medium the provider does not read parts back from).
+    fn open_payload_reader(
+        &self,
+        bank: Bank,
+        name: &str,
+    ) -> Result<Box<dyn std::io::Read + Send>, BankError> {
+        let _ = (bank, name);
+        Err(BankError::Unsupported(
+            "reading a staged payload back".into(),
+        ))
+    }
+
     /// Make `bank` the active image (symlink flip / partition-selector write /
     /// loader exec). Returns the reset needed to bring it up.
     fn activate(&self, bank: Bank) -> Result<ResetKind, BankError>;

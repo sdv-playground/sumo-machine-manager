@@ -1596,32 +1596,8 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         //   captured at write time (already cross-checked against the
         //   manifest's image_digest).  The SOVD-passed
         //   `expected_sha256` (outer) is informational only here.
-        let location = {
-            let parts = self.uploaded_parts.lock().unwrap();
-            parts
-                .get(file_id)
-                .ok_or_else(|| {
-                    BackendError::EntityNotFound(format!("no uploaded part with file_id {file_id}"))
-                })
-                .map(|loc| match loc {
-                    UploadedPartLocation::Manifest { upload_sha256 } => {
-                        UploadedPartLocation::Manifest {
-                            upload_sha256: *upload_sha256,
-                        }
-                    }
-                    UploadedPartLocation::OnDisk {
-                        bank,
-                        name,
-                        inner_sha256,
-                    } => UploadedPartLocation::OnDisk {
-                        bank: *bank,
-                        name: name.clone(),
-                        inner_sha256: *inner_sha256,
-                    },
-                })?
-        };
-        match location {
-            UploadedPartLocation::Manifest { upload_sha256 } => {
+        match self.uploaded_part(file_id)? {
+            UploadedPartLocation::Manifest { upload_sha256, .. } => {
                 let stored = hex::encode(upload_sha256);
                 if stored.eq_ignore_ascii_case(expected_sha256) {
                     Ok(())
@@ -1636,6 +1612,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 bank,
                 name,
                 inner_sha256,
+                ..
             } => {
                 // Re-read the staged part through the provider (it owns the
                 // on-medium layout) and confirm the captured inner hash. Map
@@ -1645,6 +1622,47 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                 self.bank_provider
                     .verify_payload(bank, &name, &inner_sha256)
                     .map_err(|e| sink_error(&format!("verify_part {file_id}"), e))
+            }
+        }
+    }
+
+    /// The part as received, for `GET …/updates/{id}/bulk-data/{part}`.
+    ///
+    /// The manifest is kept as received and always reads back while its
+    /// record lasts. A payload reads back only when the bank holds it as
+    /// received (no decryption, no decompression ran); one kept decoded is
+    /// `NotSupported` (501): the part exists, its received form does not. In
+    /// practice fleet payloads are encrypted and compressed, so only the
+    /// manifest reads back — the intended use: a client checks that its
+    /// manifest upload landed before it uploads the payloads. A file_id never
+    /// issued, or one whose update was aborted / deleted, its staging wiped or
+    /// a later update started, is `EntityNotFound`.
+    async fn read_part(&self, file_id: &str) -> BackendResult<PackageStream> {
+        match self.uploaded_part(file_id)? {
+            UploadedPartLocation::Manifest { bytes, .. } => {
+                Ok(Box::pin(futures::stream::once(async move { Ok(bytes) })))
+            }
+            UploadedPartLocation::OnDisk {
+                as_received: false, ..
+            } => Err(BackendError::NotSupported(format!(
+                "read_part {file_id}: part is kept decoded; the received form is not kept"
+            ))),
+            UploadedPartLocation::OnDisk { bank, name, .. } => {
+                let reader = match self.bank_provider.open_payload_reader(bank, &name) {
+                    Ok(reader) => reader,
+                    Err(BankError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(BackendError::EntityNotFound(format!(
+                            "read_part {file_id}: part {name} is no longer kept"
+                        )))
+                    }
+                    Err(BankError::Unsupported(m)) => {
+                        return Err(BackendError::NotSupported(format!(
+                            "read_part {file_id}: {m}"
+                        )))
+                    }
+                    Err(e) => return Err(sink_error(&format!("read_part {file_id}"), e)),
+                };
+                Ok(crate::streaming::read_stream(reader))
             }
         }
     }

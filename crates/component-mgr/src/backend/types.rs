@@ -214,14 +214,14 @@ pub(super) fn resolve_part(
 }
 
 /// Where an uploaded file_id was placed, so `verify_part` can re-confirm
-/// the part's integrity post-upload.
+/// the part's integrity post-upload and `read_part` can stream it back.
 ///
 /// Two flavours:
 ///
 /// * `Manifest` — the SUIT envelope as it arrived on the wire.  Small
-///   (≤100 KB), kept whole in `packages[file_id]`.  We record the
-///   upload-time outer SHA-256 so verify_part can compare directly
-///   against what the SOVD wire recorded during `PUT /bulk-data`.
+///   (≤100 KB), kept whole here (`bytes`, what `read_part` streams back).
+///   We record the upload-time outer SHA-256 so verify_part can compare
+///   directly against what the SOVD wire recorded during `PUT /bulk-data`.
 ///
 /// * `OnDisk` — a detached payload.  We can't keep the raw wire bytes
 ///   (multi-MB; the streaming pipeline writes the decrypted +
@@ -233,15 +233,21 @@ pub(super) fn resolve_part(
 ///   against ciphertext during upload.  Catches on-disk corruption
 ///   between upload and finalize; doesn't and can't re-verify the
 ///   outer-on-the-wire hash post-stream.  Stored as `(bank, name)` (not
-///   a path) so the provider owns the on-medium layout.
+///   a path) so the provider owns the on-medium layout.  `as_received`:
+///   the staged bytes are provably the bytes this upload received (no
+///   decryption, no decompression; or a re-sent part whose received bytes
+///   hash to the staged digest) — only then does `read_part` serve them.
+#[derive(Clone)]
 pub(super) enum UploadedPartLocation {
     Manifest {
         upload_sha256: [u8; 32],
+        bytes: bytes::Bytes,
     },
     OnDisk {
         bank: Bank,
         name: String,
         inner_sha256: [u8; 32],
+        as_received: bool,
     },
 }
 

@@ -1080,6 +1080,17 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         }
     }
 
+    fn open_payload_reader(
+        &self,
+        bank: Bank,
+        name: &str,
+    ) -> Result<Box<dyn std::io::Read + Send>, BankError> {
+        let bank_dir = self
+            .target_bank_dir(bank)
+            .ok_or_else(|| BankError::Failed("no images_dir configured".into()))?;
+        Ok(Box::new(std::fs::File::open(bank_dir.join(name))?))
+    }
+
     fn activate(&self, bank: Bank) -> Result<ResetKind, BankError> {
         // Run the activator (IFS write, partition swap, RT launcher …) FIRST so
         // a failure short-circuits with `?` BEFORE the selector below is sealed:
