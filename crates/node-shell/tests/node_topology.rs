@@ -751,3 +751,57 @@ async fn the_restart_route_authorizes_then_resets() {
     assert_eq!(headers[header::LOCATION], body["href"].as_str().unwrap());
     assert_eq!(resets.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
+
+/// The node status and boot id are documented on `/v1` (in the node form on
+/// a node server) and the legacy capability description is what it is
+/// without the shell's rows.
+#[tokio::test]
+async fn the_v1_only_routes_are_documented_on_v1_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let router = |extra: &str, rows: bool| {
+        let cfg = config(extra);
+        let ext = sovd_api::CapabilityExtensions::default();
+        let ext = if rows {
+            node_shell::capability_extensions(ext)
+        } else {
+            ext
+        };
+        let state = sovd_state(backends(&dir), node_topology(&cfg, None))
+            .unwrap()
+            .with_capability_extensions(ext);
+        sovd_router(
+            &state,
+            axum::Router::new(),
+            BOOT_ID,
+            no_factory_reset(),
+            restart,
+        )
+    };
+    for (extra, status, boot_id) in [
+        ("", "/v1/status", "/v1/status/x-boot-id"),
+        (
+            "node: { id: cvc }\n",
+            "/v1/components/cvc/status",
+            "/v1/components/cvc/status/x-boot-id",
+        ),
+    ] {
+        let (_, docs) = get_json(&router(extra, true), "/v1/docs").await;
+        assert_eq!(
+            docs["paths"][status]["get"]["operationId"], "node_status",
+            "{extra}"
+        );
+        assert_eq!(
+            docs["paths"][boot_id]["get"]["operationId"], "node_boot_id",
+            "{extra}"
+        );
+        let (_, without) = get_json(&router(extra, false), "/v1/docs").await;
+        assert!(without["paths"].get(status).is_none(), "{extra}");
+
+        let legacy = send(&router(extra, true), "GET", "/vehicle/v1/docs").await;
+        assert_eq!(legacy.0, StatusCode::OK);
+        assert_eq!(
+            legacy,
+            send(&router(extra, false), "GET", "/vehicle/v1/docs").await
+        );
+    }
+}

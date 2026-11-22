@@ -17,7 +17,7 @@
 //!   node-level routes (`status/x-boot-id`, the node status, `status/restart`
 //!   with [`restart_route`] and the shape of its 202 in [`restart_response`],
 //!   the legacy restart-status stub, the factory-reset route), in the node
-//!   topology.
+//!   topology; [`capability_extensions`] documents the `/v1`-only ones.
 //! - [`SovdListener`] — HTTPS from the HSM-held tls-identity leaf (else HTTP),
 //!   the mDNS advertisement on either transport, and serving until the
 //!   binary's shutdown [`Notify`](tokio::sync::Notify) fires;
@@ -44,6 +44,10 @@
 //! let identification = node_shell::configured_identification(&cfg, ecu_id.as_deref());
 //! let node = node_shell::node_topology(&cfg, identification.as_deref());
 //! let state = node_shell::sovd_state(backends, node).expect("SOVD node refused");
+//! // The binary's own capability rows (here none) plus the shell's `/v1`-only ones.
+//! let state = state.with_capability_extensions(node_shell::capability_extensions(
+//!     sovd_api::CapabilityExtensions::default(),
+//! ));
 //!
 //! let shutdown = Arc::new(tokio::sync::Notify::new());
 //! node_shell::shutdown_on_signals(shutdown.clone());
@@ -73,5 +77,7 @@ pub use config::{NodeConfig, ShellConfig};
 pub use identity::{
     configured_identification, node_topology, prefixed_identification, read_ecu_id, sovd_state,
 };
-pub use router::{auth_error_message, restart_response, restart_route, sovd_router};
+pub use router::{
+    auth_error_message, capability_extensions, restart_response, restart_route, sovd_router,
+};
 pub use serve::{shutdown_on_signals, SovdListener};

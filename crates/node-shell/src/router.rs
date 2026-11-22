@@ -160,6 +160,38 @@ pub fn sovd_router(
     sovd_api::with_node_topology(router, state)
 }
 
+/// `extensions` plus the capability rows of the shell's `/v1`-only routes,
+/// for `AppState::with_capability_extensions`: `GET /v1/status` (the node
+/// status) and `GET /v1/status/x-boot-id`, so `/v1/docs` describes them (in
+/// the node form on a node server) while `/vehicle/v1/docs` stays what it was
+/// (`x-boot-id` is served there too, undocumented as before).
+pub fn capability_extensions(
+    mut extensions: sovd_api::CapabilityExtensions,
+) -> sovd_api::CapabilityExtensions {
+    let rows = serde_json::json!({
+        "/v1/status": { "get": {
+            "operationId": "node_status",
+            "summary": "The node's status (ISO 17978-3 §7.19.2): `notReady` once a restart was accepted, else `ready`; `restart` links the node's `status/restart`, `x-runtime.node_boot_id` is the boot id.",
+            "responses": { "200": {
+                "description": "The node's status.",
+                "content": { "application/json": { "schema": { "type": "object" } } },
+            } },
+        } },
+        "/v1/status/x-boot-id": { "get": {
+            "operationId": "node_boot_id",
+            "summary": "The node's per-boot nonce: a fresh value after every node reboot, the boot id a destructive token binds to.",
+            "responses": { "200": {
+                "description": "The boot id.",
+                "content": { "text/plain": { "schema": { "type": "string" } } },
+            } },
+        } },
+    });
+    if let serde_json::Value::Object(rows) = rows {
+        extensions.v1_paths.extend(rows);
+    }
+    extensions
+}
+
 /// The reason carried by an authorizer denial — `AuthError` has no `Display`.
 /// The 401/403 split is not used here: denials stay 403 as before.
 pub fn auth_error_message(e: &sovd_api::AuthError) -> &str {
