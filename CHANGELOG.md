@@ -8,7 +8,7 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
-- vm-sovd: SOVDd v0.1.6 — the SOVD server is advertised over mDNS / DNS-SD on both transports
+- vm-sovd: SOVDd v0.1.7 — the SOVD server is advertised over mDNS / DNS-SD on both transports
   (`accessurl` scheme `http` before enrolment, `https` once the tls-identity leaf is live), using the
   sovd-mdns v0.1.6 identity rule: hostname from the TLS leaf, else `--identification`, else the OS
   hostname; TXT `identification` is `--identification` verbatim when set. New
