@@ -19,9 +19,12 @@ nv-store = { path = "../nv-store" }
 # `bank_provider` / `bank_activator` / `deactivator` / `image_record` module
 # names, so this crate stays the single import surface for consumers.
 machine-contract = { path = "../machine-contract" }
+# The node's per-boot nonce (`node_update::read_or_create_boot_id`).
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"
 # Our own unit tests use the in-memory selector seams and the `slots` fixture
 # names; the re-declaration enables them for test builds only (cargo unifies
 # dev-features there).
