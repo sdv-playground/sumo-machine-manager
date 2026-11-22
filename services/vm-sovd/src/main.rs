@@ -48,7 +48,8 @@ async fn main() {
         eprintln!("  --guest-vhsm               [gateway] source HSM crypto from the guest vHSM (VhsmProvider); else the host link-B backend");
         eprintln!("  --bind <addr>              Listen address (alt to the positional; default 0.0.0.0:4000)");
         eprintln!("  --tls                      Serve HTTPS using the HSM-held tls-identity leaf (server-only TLS)");
-        eprintln!("  --no-mdns                  Disable mDNS/DNS-SD advertising of the SOVD endpoint (on by default once HTTPS is live)");
+        eprintln!("  --no-mdns                  Disable mDNS/DNS-SD advertising of the SOVD endpoint (on by default, http and https)");
+        eprintln!("  --identification <id>      SOVD server id for mDNS: TXT identification (verbatim) and, absent a TLS leaf, the hostname");
         eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
         eprintln!();
         eprintln!("Provisioning authority: built-in factory signing key (P-256 generator G).");
@@ -88,8 +89,13 @@ async fn main() {
     // server-only — the client still authenticates with an operator token).
     let mut tls_enabled = false;
     // mDNS/DNS-SD advertising of the SOVD endpoint (ISO 17978-3 §5.11) — on by
-    // default, only takes effect on the provisioned HTTPS path. --no-mdns opts out.
+    // default on both transports; the `accessurl` scheme tells the client which
+    // one to dial. --no-mdns opts out.
     let mut mdns_enabled = true;
+    // --identification: the SOVD server id — TXT `identification` (verbatim,
+    // stable across enrolment) and the `<id>.local` hostname until a TLS leaf
+    // supplies one. Unset: the leaf's id, else the OS hostname.
+    let mut identification: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--images-dir" && i + 1 < args.len() {
@@ -140,6 +146,9 @@ async fn main() {
         } else if args[i] == "--no-mdns" {
             mdns_enabled = false;
             i += 1;
+        } else if args[i] == "--identification" && i + 1 < args.len() {
+            identification = Some(args[i + 1].clone());
+            i += 2;
         } else if args[i] == "--bind" && i + 1 < args.len() {
             bind_addr = &args[i + 1];
             i += 2;
@@ -551,10 +560,17 @@ async fn main() {
     // leaf (CSR enrollment + keystore install) runs over this SOVD path, so it
     // can't require the cert it's about to deliver. A restart after provisioning
     // lights up HTTPS. Mirrors the cross-node listener's graceful degradation.
-    // mDNS/DNS-SD advertiser guard — held for the server's lifetime, unregisters
-    // on drop. Only started on the provisioned HTTPS path (below); an
-    // unprovisioned device is not a discoverable SOVD server.
+    // mDNS/DNS-SD advertiser guard — held until `serve` returns (graceful
+    // shutdown on SIGTERM / ctrl-c too), dropping it sends DNS-SD goodbye
+    // packets. Started on both transports: hostname from the TLS leaf (https
+    // only), else --identification, else the OS hostname; TXT identification is
+    // --identification when set. The rule lives in `SovdAdvertiser::new`.
     let mut _mdns_guard: Option<sovd_mdns::AdvertiserGuard> = None;
+    let identities: Vec<sovd_mdns::Identity<'_>> = identification
+        .as_deref()
+        .map(sovd_mdns::Identity::Configured)
+        .into_iter()
+        .collect();
     let tls_config: Option<axum_server::tls_rustls::RustlsConfig> = if tls_enabled {
         match client.as_ref() {
             None => {
@@ -575,15 +591,12 @@ async fn main() {
                     // instance/hostname come from this leaf's `<id>.local` SAN, so
                     // a discovery client dialing `<id>.local` verifies this cert.
                     if mdns_enabled {
-                        _mdns_guard =
-                            sovd_mdns::SovdAdvertiser::from_leaf_and_bind(&leaf, bind_addr)
-                                .and_then(|adv| match adv.start() {
-                                    Ok(g) => Some(g),
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "SOVD mDNS advertise failed");
-                                        None
-                                    }
-                                });
+                        let mut ids = identities.clone();
+                        ids.extend([
+                            sovd_mdns::Identity::Leaf(&leaf),
+                            sovd_mdns::Identity::Hostname,
+                        ]);
+                        _mdns_guard = start_mdns(&ids, sovd_mdns::Scheme::Https, bind_addr);
                     }
                     let signer = crypto.clone();
                     let sign_fn = move |msg: &[u8]| {
@@ -616,6 +629,11 @@ async fn main() {
     } else {
         None
     };
+    if listener.is_some() && mdns_enabled {
+        let mut ids = identities.clone();
+        ids.push(sovd_mdns::Identity::Hostname);
+        _mdns_guard = start_mdns(&ids, sovd_mdns::Scheme::Http, bind_addr);
+    }
 
     tracing::info!(
         "vm-sovd listening on {bind_addr}{}",
@@ -647,21 +665,105 @@ async fn main() {
         tracing::info!("  boot mount: {}", boot_mount.display());
     }
     tracing::info!("  components: hypervisor, vm1, vm2, hsm, boot");
-    tracing::info!("  try: curl http://{bind_addr}/vehicle/v1/components");
+    tracing::info!("  try: curl http://{bind_addr}/v1/components");
 
     match (listener, tls_config) {
-        (Some(listener), None) => axum::serve(listener, router).await.unwrap(),
+        (Some(listener), None) => {
+            // One signal task drives both the graceful shutdown and its 5 s cap,
+            // so a long-lived client can't hold SIGTERM open and block the goodbye.
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                let _ = stop_tx.send(());
+            });
+            let mut graceful_rx = stop_rx.clone();
+            let mut cap_rx = stop_rx;
+            let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
+                let _ = graceful_rx.changed().await;
+            });
+            tokio::select! {
+                result = serve => result.unwrap(),
+                _ = async {
+                    let _ = cap_rx.changed().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                } => tracing::warn!("graceful shutdown timed out after 5 s; closing"),
+            }
+        }
         (None, Some(tls_config)) => {
             let addr: std::net::SocketAddr = bind_addr.parse().unwrap_or_else(|e| {
                 eprintln!("--tls: --bind {bind_addr} must be ip:port: {e}");
                 std::process::exit(1);
             });
+            let handle = axum_server::Handle::new();
+            tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    shutdown_signal().await;
+                    handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+                }
+            });
             axum_server::bind_rustls(addr, tls_config)
+                .handle(handle)
                 .serve(router.into_make_service())
                 .await
                 .unwrap();
         }
         _ => unreachable!("listener and tls_config are set together"),
+    }
+}
+
+/// Resolves on ctrl-c or (on unix) SIGTERM — the trigger for graceful
+/// shutdown, so `serve` returns and the mDNS guard sends its goodbye.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("Shutdown signal received; stopping server");
+}
+
+/// Start the mDNS / DNS-SD advertiser. Best-effort: a failure to advertise
+/// must never stop serving, so it is logged and `None` returned.
+fn start_mdns(
+    identities: &[sovd_mdns::Identity<'_>],
+    scheme: sovd_mdns::Scheme,
+    bind_addr: &str,
+) -> Option<sovd_mdns::AdvertiserGuard> {
+    let Some(adv) = sovd_mdns::SovdAdvertiser::new(identities, scheme, bind_addr) else {
+        tracing::warn!(
+            "SOVD mDNS advertise skipped: no usable instance name (identification, TLS leaf or hostname)"
+        );
+        return None;
+    };
+    tracing::info!(
+        instance = %adv.instance,
+        identification = %adv.identification,
+        accessurl = %adv.accessurl,
+        "SOVD mDNS advertising"
+    );
+    match adv.start() {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            tracing::warn!(error = %e, "SOVD mDNS advertise failed; serving without discovery");
+            None
+        }
     }
 }
 

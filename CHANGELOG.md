@@ -8,6 +8,18 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- vm-sovd: SOVDd v0.1.6 — the SOVD server is advertised over mDNS / DNS-SD on both transports
+  (`accessurl` scheme `http` before enrolment, `https` once the tls-identity leaf is live), using the
+  sovd-mdns v0.1.6 identity rule: hostname from the TLS leaf, else `--identification`, else the OS
+  hostname; TXT `identification` is `--identification` verbatim when set. New
+  `--identification <id>` option; `--no-mdns` still opts out. SIGTERM / ctrl-c now shut the server
+  down gracefully (5 s cap) on both transports, so the DNS-SD goodbye is sent before exit.
+  Host-facing: none (all SOVDd pins move to v0.1.6; no API change consumed).
+
+## v0.1.24 — SOVDd v0.1.5: restart outcome hooks; host ecu_reset refused as NotSupported
+
+Tag on `108b6e1` (2026-11-21), PR #59, #60.
+
 - component-mgr: a host component whose reset is the node's (`RequiresEcuReset`, no vm-service, not
   single-bank) refuses `ecu_reset` with NotSupported (501, message pointing to the node-level
   status/restart) instead of pretending; `restart_supported()` predicate (PR #59).
