@@ -41,13 +41,27 @@ pub fn gateway_router(
     authorizer: Arc<dyn Authorizer>,
     trust_anchor: Vec<u8>,
 ) -> Router {
-    let anchor: crate::sovd::pull_update::TrustAnchorSource =
-        Arc::new(move || Some(trust_anchor.clone()));
     let state = AppState::new(backends);
     // Advertise the vendor extension ops in the merged §7.5 capability description
     // (feature off until the sovd-api hook is on the pinned git dep).
     #[cfg(feature = "sovd-docs-hook")]
     let state = state.with_capability_extensions(crate::sovd::openapi::capability_extensions());
+    gateway_router_with_state(machine, state, authorizer, trust_anchor)
+}
+
+/// [`gateway_router`] over a caller-built `state` (its `backends` the entity
+/// map, as there), taken as is — no capability extensions are added. For an
+/// embedder that must hand the SAME state to something else as well, e.g.
+/// `sovd_api::with_node_topology` around its final router when the state
+/// carries a node (`AppState::with_node`).
+pub fn gateway_router_with_state(
+    machine: Arc<dyn Machine>,
+    state: AppState,
+    authorizer: Arc<dyn Authorizer>,
+    trust_anchor: Vec<u8>,
+) -> Router {
+    let anchor: crate::sovd::pull_update::TrustAnchorSource =
+        Arc::new(move || Some(trust_anchor.clone()));
     create_router(state)
         .merge(hsm_router(machine.clone()))
         .merge(node_verdict_router(machine.clone()))

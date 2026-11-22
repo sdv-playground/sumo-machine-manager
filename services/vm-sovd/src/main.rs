@@ -50,6 +50,11 @@ async fn main() {
         eprintln!("  --tls                      Serve HTTPS using the HSM-held tls-identity leaf (server-only TLS)");
         eprintln!("  --no-mdns                  Disable mDNS/DNS-SD advertising of the SOVD endpoint (on by default, http and https)");
         eprintln!("  --identification <id>      SOVD server id for mDNS: TXT identification (verbatim) and, absent a TLS leaf, the hostname");
+        eprintln!("  --identification-prefix <p> Like --identification, as <p>-<first 16 hex of the ECU id> (the hsm x-ecu-id); --identification wins");
+        eprintln!("  --node-id <id>             Serve /v1 as node <id>: the components become /v1/components/<id>/subcomponents/...");
+        eprintln!(
+            "  --node-name <name>         [--node-id] the node's name (default: the node id)"
+        );
         eprintln!("  bind-addr                  Listen address (default: 0.0.0.0:4000)");
         eprintln!();
         eprintln!("Provisioning authority: built-in factory signing key (P-256 generator G).");
@@ -96,6 +101,12 @@ async fn main() {
     // stable across enrolment) and the `<id>.local` hostname until a TLS leaf
     // supplies one. Unset: the leaf's id, else the OS hostname.
     let mut identification: Option<String> = None;
+    // --identification-prefix: the identification derived from the ECU id
+    // (`<prefix>-<ecu16>`), when --identification is not given.
+    let mut identification_prefix: Option<String> = None;
+    // --node-id / --node-name: opt-in SOVDd node topology on `/v1`.
+    let mut node_id: Option<String> = None;
+    let mut node_name: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         if args[i] == "--images-dir" && i + 1 < args.len() {
@@ -148,6 +159,15 @@ async fn main() {
             i += 1;
         } else if args[i] == "--identification" && i + 1 < args.len() {
             identification = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--identification-prefix" && i + 1 < args.len() {
+            identification_prefix = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--node-id" && i + 1 < args.len() {
+            node_id = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--node-name" && i + 1 < args.len() {
+            node_name = Some(args[i + 1].clone());
             i += 2;
         } else if args[i] == "--bind" && i + 1 < args.len() {
             bind_addr = &args[i + 1];
@@ -516,6 +536,16 @@ async fn main() {
         }
     };
 
+    if identification.is_none() {
+        if let Some(prefix) = identification_prefix.as_deref() {
+            identification = ecu_identification(machine.as_ref(), prefix).await;
+        }
+    }
+    let node = node_id.map(|id| {
+        let name = node_name.unwrap_or_else(|| id.clone());
+        sovd_api::NodeTopology::new(id, name)
+    });
+
     let router = if gateway_mode {
         // In-guest federating gateway: local onboard pull-update (route-scoped
         // Operational authz) + host-owned components proxied to the host SOVD.
@@ -546,10 +576,15 @@ async fn main() {
             host_sovd_url,
             &proxy_components,
             node_coordinator.clone(),
+            node,
         )
         .await
     } else {
-        plain_router(machine.clone(), backends, node_coordinator.clone())
+        let state = sovd_state(backends, node).unwrap_or_else(|e| {
+            eprintln!("vm-sovd: --node-id: {e}");
+            std::process::exit(1);
+        });
+        plain_router(machine.clone(), state, node_coordinator.clone())
     };
 
     // --tls: serve HTTPS with the HSM-held tls-identity (server-only TLS — the
@@ -773,27 +808,72 @@ fn start_mdns(
 /// only connects. Mirrors the connect-only retry budget vhsm-ssd uses
 /// (~5 s = 50 × 100 ms), so a just-spawned backend isn't missed on the first
 /// refused connect.
-/// The default (non-gateway) router: the standard SOVD surface plus the sumo
-/// vendor routes.
-fn plain_router(
-    machine: Arc<dyn Machine>,
+/// The SOVD state over `backends`; with `node`, they are served on `/v1` as
+/// its subcomponents too (`Err` when the node id is unusable or collides with
+/// a component's).
+fn sovd_state(
     backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
-    node_coordinator: Arc<machine_mgr::node_update::NodeCoordinator>,
-) -> axum::Router {
+    node: Option<sovd_api::NodeTopology>,
+) -> Result<sovd_api::AppState, String> {
     let state = sovd_api::AppState::new(backends);
     // Advertise the vendor extension ops in the merged §7.5 capability
     // description (feature off until the sovd-api hook is on the pinned dep).
     #[cfg(feature = "sovd-docs-hook")]
     let state =
         state.with_capability_extensions(component_mgr::sovd::openapi::capability_extensions());
-    sovd_api::create_router(state)
+    match node {
+        Some(node) => state.with_node(node),
+        None => Ok(state),
+    }
+}
+
+/// `<prefix>-<first 16 characters of ecu_id>`; `None` when the id is shorter.
+fn prefixed_identification(prefix: &str, ecu_id: &str) -> Option<String> {
+    ecu_id.get(..16).map(|ecu16| format!("{prefix}-{ecu16}"))
+}
+
+/// The `--identification-prefix` identification, from the ECU id `x-ecu-id`
+/// serves (the hsm component's device id). `None`, with a warning, when there
+/// is none to derive it from.
+async fn ecu_identification(machine: &dyn Machine, prefix: &str) -> Option<String> {
+    let Some(hsm) = machine.component("hsm") else {
+        tracing::warn!("--identification-prefix: no hsm component, no ECU id — ignored");
+        return None;
+    };
+    let ecu_id = match hsm.get_device_id().await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            tracing::warn!("--identification-prefix: ECU id unavailable — ignored");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "--identification-prefix: ECU id read failed — ignored");
+            return None;
+        }
+    };
+    let identification = prefixed_identification(prefix, &ecu_id);
+    if identification.is_none() {
+        tracing::warn!(%ecu_id, "--identification-prefix: ECU id shorter than 16 — ignored");
+    }
+    identification
+}
+
+/// The default (non-gateway) router: the standard SOVD surface plus the sumo
+/// vendor routes, behind the node topology when `state` carries a node.
+fn plain_router(
+    machine: Arc<dyn Machine>,
+    state: sovd_api::AppState,
+    node_coordinator: Arc<machine_mgr::node_update::NodeCoordinator>,
+) -> axum::Router {
+    let router = sovd_api::create_router(state.clone())
         .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
         .merge(component_mgr::sovd::routes::update_state_router(
             node_coordinator,
             machine.clone(),
         ))
         // Keep the vendor routes in sync with component_mgr::sovd::gateway::gateway_router.
-        .merge(component_mgr::sovd::routes::node_verdict_router(machine))
+        .merge(component_mgr::sovd::routes::node_verdict_router(machine));
+    sovd_api::with_node_topology(router, &state)
 }
 
 fn connect_backend(socket: &std::path::Path) -> std::io::Result<LinkBClient> {
@@ -836,6 +916,7 @@ fn connect_backend(socket: &std::path::Path) -> std::io::Result<LinkBClient> {
 /// `HsmCryptoProvider`, so this code is
 /// backend-agnostic — the issuer pubkeys and the sw-authority trust anchor are
 /// read via `get_public_key_der`, needing no lifecycle (`HsmProvider`) trait.
+#[allow(clippy::too_many_arguments)]
 async fn build_gateway_router(
     machine: Arc<dyn Machine>,
     mut backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
@@ -844,6 +925,7 @@ async fn build_gateway_router(
     host_sovd_url: Option<String>,
     proxy_components: &[String],
     node_coordinator: Arc<machine_mgr::node_update::NodeCoordinator>,
+    node: Option<sovd_api::NodeTopology>,
 ) -> axum::Router {
     fn fail(msg: &str) -> ! {
         eprintln!("vm-sovd --gateway: {msg}");
@@ -895,16 +977,18 @@ async fn build_gateway_router(
     tracing::info!(
         "vm-sovd GATEWAY: device={device_id}, host={host_url}, proxied={proxy_components:?}"
     );
-    component_mgr::sovd::gateway::gateway_router(
+    let state = sovd_state(backends, node).unwrap_or_else(|e| fail(&format!("--node-id: {e}")));
+    let router = component_mgr::sovd::gateway::gateway_router_with_state(
         machine.clone(),
-        backends,
+        state.clone(),
         authorizer,
         trust_anchor,
     )
     .merge(component_mgr::sovd::routes::update_state_router(
         node_coordinator,
         machine,
-    ))
+    ));
+    sovd_api::with_node_topology(router, &state)
 }
 
 #[cfg(test)]
@@ -931,17 +1015,78 @@ mod tests {
     }
 
     async fn post_commit(router: axum::Router) -> StatusCode {
+        post_commit_at(router, "/vehicle/v1/operations/x-update-commit/executions").await
+    }
+
+    async fn post_commit_at(router: axum::Router, uri: &str) -> StatusCode {
         router
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/vehicle/v1/operations/x-update-commit/executions")
+                    .uri(uri)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap()
             .status()
+    }
+
+    #[test]
+    fn identification_prefix_takes_the_first_16_of_the_ecu_id() {
+        assert_eq!(
+            prefixed_identification("cvc-vm1", "f88a13a329a72db1c0ffee00c0ffee00").as_deref(),
+            Some("cvc-vm1-f88a13a329a72db1")
+        );
+        assert_eq!(
+            prefixed_identification("cvc-vm1", "f88a13a329a72db1").as_deref(),
+            Some("cvc-vm1-f88a13a329a72db1")
+        );
+        assert_eq!(prefixed_identification("cvc-vm1", "f88a13a329a72db"), None);
+    }
+
+    /// With --node-id the node form of a node-level route reaches the node
+    /// verdict handler, as the root form does; without it, it does not (it is
+    /// then a component path of an unknown component).
+    #[tokio::test]
+    async fn plain_router_serves_the_node_form_with_a_node() {
+        let machine = test_machine();
+        let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
+        let node_form = "/v1/components/cvc/operations/x-update-commit/executions";
+
+        let node = Some(sovd_api::NodeTopology::new("cvc", "cvc"));
+        let with = plain_router(
+            machine.clone(),
+            sovd_state(HashMap::new(), node).unwrap(),
+            coord.clone(),
+        );
+        let root = post_commit_at(with.clone(), "/v1/operations/x-update-commit/executions").await;
+        assert_eq!(root, StatusCode::OK);
+        assert_eq!(post_commit_at(with, node_form).await, root);
+
+        let without = plain_router(machine, sovd_state(HashMap::new(), None).unwrap(), coord);
+        assert_ne!(post_commit_at(without, node_form).await, StatusCode::OK);
+    }
+
+    /// A node id that is also a component's id is refused (startup fails).
+    #[test]
+    fn a_node_id_colliding_with_a_component_is_refused() {
+        let backend: Arc<dyn DiagnosticBackend> = Arc::new(
+            component_mgr::backend::ComponentBackend::new(
+                BankSet(1),
+                Arc::new(Mutex::new(NvStore::new(
+                    nv_store::block::MemBlockDevice::new(
+                        nv_store::store::MIN_NV_DEVICE_SIZE as usize,
+                    ),
+                ))),
+                Arc::new(SuitProvider::with_factory_authority()),
+                component_mgr::backend::ComponentConfig::default(),
+            )
+            .with_id("vm1".into()),
+        );
+        let backends = HashMap::from([("vm1".to_string(), backend)]);
+        let node = Some(sovd_api::NodeTopology::new("vm1", "vm1"));
+        assert!(sovd_state(backends, node).is_err());
     }
 
     /// The plain server serves the node verdict operations, as the gateway does.
@@ -952,8 +1097,8 @@ mod tests {
         let machine = test_machine();
         let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
 
-        let status =
-            post_commit(plain_router(machine.clone(), HashMap::new(), coord.clone())).await;
+        let state = sovd_state(HashMap::new(), None).unwrap();
+        let status = post_commit(plain_router(machine.clone(), state, coord.clone())).await;
         assert_ne!(status, StatusCode::NOT_FOUND);
         assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED);
 
