@@ -1,0 +1,20 @@
+[package]
+name = "node-shell"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "The SOVD node application shell: the generic server a machine manager wires around its device — its config keys, identification and node topology. Device facts stay in the binary that wires it."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+# `Machine` — the hsm component's device id is the ECU id the identification
+# prefix and `x-ecu-id` share.
+machine-mgr = { path = "../machine-mgr" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.11" }
+sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.11" }
+
+[dev-dependencies]
+serde_yaml = "0.9"
+# The prefixed name is the instance the advertiser announces.
+sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.11" }

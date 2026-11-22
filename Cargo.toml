@@ -27,6 +27,12 @@ members = [
     # supernova's main.rs — it is the same on every node family, and dep-light
     # (hsm + tracing + libc) so a node need not link SOVD to parent a daemon.
     "crates/hsm-supervisor",
+    # The SOVD node application shell: config keys, identification, node
+    # topology, router assembly with the node-level routes, TLS/mDNS serving and
+    # graceful shutdown. Extracted from supernova's main.rs — every node binary
+    # (supernova, mmgr-cvc, vm-sovd) hand-assembled the same server; the binary
+    # now keeps only its device facts and wires this.
+    "crates/node-shell",
     "crates/policy-eval",
     "crates/policy-partition",
     "crates/vm-wire",
