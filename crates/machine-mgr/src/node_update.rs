@@ -19,6 +19,7 @@
 //! ([`derive`], [`admit`]) is pure. [`NodeCoordinator`] holds the probes and the
 //! in-memory [`Staging`].
 
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::system_bank_state::SharedSystemBankState;
@@ -399,6 +400,44 @@ impl NodeCoordinator {
     }
 }
 
+/// Read-or-create the durable per-boot nonce (§7.1) at `path` — the value a node
+/// binary hands to [`NodeCoordinator::with_node_boot_id`] and its components.
+///
+/// The offboard flash engine treats a CHANGED `node_boot_id` as proof the node
+/// rebooted, so on hardware the witness must NOT rotate when the respawn wrapper
+/// re-execs the node binary after a SIGTERM — only a real kernel reboot (which
+/// clears `path`: the caller puts it on a RAM-backed fs such as `/tmp`) may rotate
+/// it. So: reuse a well-formed existing nonce; mint and persist one when the file
+/// is absent or malformed; on any IO error fall back to a fresh per-process uuid
+/// (the pre-fix behavior) so an unwritable `path` degrades safely instead of
+/// aborting startup.
+pub fn read_or_create_boot_id(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(existing) => {
+            let trimmed = existing.trim();
+            if uuid::Uuid::parse_str(trimmed).is_ok() {
+                return trimmed.to_string();
+            }
+            tracing::warn!(path = %path.display(), "node-boot-id malformed — regenerating");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "node-boot-id unreadable — per-process nonce");
+            return uuid::Uuid::new_v4().to_string();
+        }
+    }
+    // Absent or malformed: mint and persist atomically (write tmp + rename). A
+    // failed persist degrades to a per-process nonce — returned, but not durable.
+    let id = uuid::Uuid::new_v4().to_string();
+    let tmp = path.with_extension("tmp");
+    let persisted =
+        std::fs::write(&tmp, format!("{id}\n")).and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = persisted {
+        tracing::warn!(path = %path.display(), error = %e, "node-boot-id not persisted — per-process nonce");
+    }
+    id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,5 +713,77 @@ mod tests {
                 .trial_boot_limit(),
             Some(3)
         );
+    }
+}
+
+#[cfg(test)]
+mod boot_id_tests {
+    use super::read_or_create_boot_id;
+
+    fn is_uuid(s: &str) -> bool {
+        uuid::Uuid::parse_str(s).is_ok()
+    }
+
+    #[test]
+    fn creates_when_absent_and_reuses_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-boot-id");
+
+        let first = read_or_create_boot_id(&path);
+        assert!(is_uuid(&first), "minted a well-formed uuid");
+        assert!(path.exists(), "persisted the nonce file");
+
+        // A re-exec (second read) reuses the persisted nonce — the reboot witness
+        // must NOT rotate.
+        let second = read_or_create_boot_id(&path);
+        assert_eq!(first, second, "reused the persisted nonce across calls");
+    }
+
+    #[test]
+    fn reuses_existing_well_formed_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-boot-id");
+        let existing = uuid::Uuid::new_v4().to_string();
+        std::fs::write(&path, format!("{existing}\n")).unwrap();
+
+        let got = read_or_create_boot_id(&path);
+        assert_eq!(got, existing, "returned the existing nonce (trimmed)");
+    }
+
+    #[test]
+    fn rejects_malformed_and_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-boot-id");
+        std::fs::write(&path, "not-a-uuid\n").unwrap();
+
+        let minted = read_or_create_boot_id(&path);
+        assert!(
+            is_uuid(&minted),
+            "malformed content is replaced with a uuid"
+        );
+        // Overwritten on disk: the next read reuses the minted value, not the garbage.
+        assert_eq!(
+            read_or_create_boot_id(&path),
+            minted,
+            "overwrote the malformed file"
+        );
+    }
+
+    #[test]
+    fn io_error_falls_back_to_fresh_per_process() {
+        // Parent dir does not exist → both the read and the atomic write fail (uid-
+        // robust, unlike chmod which root bypasses). The nonce can't be persisted, so
+        // each call mints a fresh per-process uuid (the pre-fix behavior).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-subdir").join("node-boot-id");
+
+        let a = read_or_create_boot_id(&path);
+        let b = read_or_create_boot_id(&path);
+        assert!(
+            is_uuid(&a) && is_uuid(&b),
+            "still returns well-formed uuids"
+        );
+        assert_ne!(a, b, "un-persistable nonce is fresh per process");
+        assert!(!path.exists(), "nothing was written");
     }
 }

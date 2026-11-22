@@ -8,6 +8,25 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **app leaf items** moved from supernova-machine-manager, unchanged in behaviour (sumo is the pattern: a
+  device manager wires these, it does not carry its own copy):
+  - component-factory: `HsmKeystoreActivator` (the `hsm-keystore` marker: no-op activate,
+    `RequiresEcuReset`) and `builtin_activator(marker)` for the markers sumo implements;
+    `partition_parts(&ComponentSpec)` (the `parts:` list as `PartitionPart`s).
+  - component-mgr: `sovd::ident_data` (read-only `identData` entities over KEY=VALUE version records; the
+    `IdentDataSpec` serde shape is the `ident_data:` config entry) and `boot_selector_signer`
+    (`HsmSelectorSigner` / `make_selector_signer`).
+  - machine-mgr: `node_update::read_or_create_boot_id(path)` (the file-backed per-boot nonce that
+    survives a process re-exec); machine-mgr now depends on `uuid`.
+
+  Host-facing: none required. A node binary deletes its copies and calls these; activator markers,
+  config keys and wire responses are unchanged (verified on CVC .20: the served API of supernova built
+  on this is identical to the build before the move, 408 requests on both trees).
+
+## v0.1.25 — SOVDd v0.1.10: node topology, part read-back, orchestrated execute on /v1
+
+Tag on `852a261` (2026-11-22), PR #61, #62, #63, #64.
+
 - vm-sovd: SOVDd v0.1.7 — the SOVD server is advertised over mDNS / DNS-SD on both transports
   (`accessurl` scheme `http` before enrolment, `https` once the tls-identity leaf is live), using the
   sovd-mdns v0.1.6 identity rule: hostname from the TLS leaf, else `--identification`, else the OS

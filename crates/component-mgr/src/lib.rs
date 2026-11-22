@@ -53,6 +53,7 @@ pub mod backend;
 pub mod bank_provider;
 pub mod bank_seed;
 pub mod bank_spec;
+pub mod boot_selector_signer;
 pub mod component_adapter;
 pub mod did;
 pub mod dispatcher;
@@ -72,6 +73,7 @@ pub mod sovd {
     pub mod delegation;
     pub mod gateway;
     pub mod hsm_authorizer;
+    pub mod ident_data;
     pub mod identity;
     pub mod issuer_keys;
     pub mod openapi;

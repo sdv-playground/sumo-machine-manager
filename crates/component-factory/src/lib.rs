@@ -13,6 +13,9 @@ use component_mgr::backend::{ComponentBackend, ComponentConfig};
 use component_mgr::component_adapter::ComponentAdapter;
 use component_mgr::manifest_provider::ManifestProvider;
 
+mod activators;
+pub use activators::{builtin_activator, HsmKeystoreActivator};
+
 /// One raw A/B partition pair behind a bank part. `name` is the payload name as it
 /// arrives on the wire (the SUIT component-id's last segment); `a`/`b` are the
 /// device paths of the two banks. What a part MEANS is the platform's business;
@@ -77,7 +80,8 @@ pub struct ComponentSpec {
     pub parts: Vec<PartSpec>,
 
     /// Bank-activator marker. When set, the caller constructs the
-    /// appropriate activator and inserts it into `FactoryDeps::bank_activators`.
+    /// appropriate activator and inserts it into `FactoryDeps::bank_activators`
+    /// ([`builtin_activator`] answers the markers sumo implements itself).
     /// Also suppresses vm-service notifications for this component.
     #[serde(default)]
     pub activator: Option<String>,
@@ -324,6 +328,23 @@ pub fn resolve_bank_set(spec: &ComponentSpec) -> Result<BankSet, String> {
             spec.id,
         )),
     }
+}
+
+/// The parts a `PartitionBankProvider` streams into, in profile order, for
+/// [`FactoryDeps::partition_parts`]. `record: None` — no platform image record
+/// wired yet (the seam lands with the BMFT work).
+pub fn partition_parts(
+    spec: &ComponentSpec,
+) -> Vec<component_mgr::partition_bank_provider::PartitionPart> {
+    spec.parts
+        .iter()
+        .map(|p| component_mgr::partition_bank_provider::PartitionPart {
+            file: p.name.clone(),
+            partition_a: p.a.clone(),
+            partition_b: p.b.clone(),
+            record: None,
+        })
+        .collect()
 }
 
 /// Check a spec's raw-partition [`parts`](ComponentSpec::parts) list is
@@ -1111,6 +1132,39 @@ mod tests {
         assert_eq!(
             serde_yaml::from_str::<Vec<PartSpec>>(&yaml).unwrap(),
             spec.parts
+        );
+    }
+
+    fn spec(parts: &str) -> ComponentSpec {
+        serde_yaml::from_str(&format!(
+            "id: host\ntype: hpc\nslot: 2\nactivator: host-bank\n{parts}"
+        ))
+        .unwrap()
+    }
+
+    const HOST_PARTS: &str = "\
+parts:
+  - { name: application.img, a: /dev/emmc4.lnxdata.host-appl, b: /dev/emmc5.lnxdata.host-appl }
+  - { name: ifs, a: /dev/emmc4.lnxdata.host-ifs, b: /dev/emmc5.lnxdata.host-ifs }
+  - { name: rootfs, a: /dev/emmc4.lnxdata.host-core, b: /dev/emmc5.lnxdata.host-core }
+";
+
+    #[test]
+    fn partition_parts_maps_name_a_b_in_order() {
+        let parts = partition_parts(&spec(HOST_PARTS));
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].file, "application.img");
+        assert_eq!(parts[0].partition_a, "/dev/emmc4.lnxdata.host-appl");
+        assert_eq!(parts[0].partition_b, "/dev/emmc5.lnxdata.host-appl");
+        assert_eq!(parts[1].file, "ifs");
+        assert_eq!(parts[1].partition_a, "/dev/emmc4.lnxdata.host-ifs");
+        assert_eq!(parts[1].partition_b, "/dev/emmc5.lnxdata.host-ifs");
+        assert_eq!(parts[2].file, "rootfs");
+        assert_eq!(parts[2].partition_a, "/dev/emmc4.lnxdata.host-core");
+        assert_eq!(parts[2].partition_b, "/dev/emmc5.lnxdata.host-core");
+        assert!(
+            parts.iter().all(|p| p.record.is_none()),
+            "no platform image record is wired yet"
         );
     }
 
