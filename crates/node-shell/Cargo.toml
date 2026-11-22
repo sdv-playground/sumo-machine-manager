@@ -3,11 +3,15 @@ name = "node-shell"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
-description = "The SOVD node application shell: the generic server a machine manager wires around its device — its config keys, identification and node topology. Device facts stay in the binary that wires it."
+description = "The SOVD node application shell: the generic server a machine manager wires around its device — its config keys, identification, node topology and router with the node-level routes. Device facts stay in the binary that wires it."
 
 [dependencies]
+axum = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tracing = "0.1"
+# The restart's execution id (the legacy body's `exec_id`).
+uuid = { version = "1", features = ["v4"] }
 # `Machine` — the hsm component's device id is the ECU id the identification
 # prefix and `x-ecu-id` share.
 machine-mgr = { path = "../machine-mgr" }
@@ -15,6 +19,15 @@ sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.1
 sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.11" }
 
 [dev-dependencies]
+async-trait = "0.1"
 serde_yaml = "0.9"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
+# `oneshot` to drive the router in the router tests.
+tower = { version = "0.5", features = ["util"] }
+# The test node's members: components, ident_data entities and the vendor
+# routes a binary merges in.
+component-mgr = { path = "../component-mgr" }
+nv-store = { path = "../nv-store" }
 # The prefixed name is the instance the advertiser announces.
 sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.11" }
