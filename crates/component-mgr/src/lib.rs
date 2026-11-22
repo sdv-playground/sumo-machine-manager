@@ -53,6 +53,7 @@ pub mod backend;
 pub mod bank_provider;
 pub mod bank_seed;
 pub mod bank_spec;
+pub mod boot_selector_signer;
 pub mod component_adapter;
 pub mod did;
 pub mod dispatcher;
