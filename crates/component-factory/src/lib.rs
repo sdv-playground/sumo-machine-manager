@@ -13,6 +13,9 @@ use component_mgr::backend::{ComponentBackend, ComponentConfig};
 use component_mgr::component_adapter::ComponentAdapter;
 use component_mgr::manifest_provider::ManifestProvider;
 
+mod activators;
+pub use activators::{builtin_activator, HsmKeystoreActivator};
+
 /// One raw A/B partition pair behind a bank part. `name` is the payload name as it
 /// arrives on the wire (the SUIT component-id's last segment); `a`/`b` are the
 /// device paths of the two banks. What a part MEANS is the platform's business;
@@ -77,7 +80,8 @@ pub struct ComponentSpec {
     pub parts: Vec<PartSpec>,
 
     /// Bank-activator marker. When set, the caller constructs the
-    /// appropriate activator and inserts it into `FactoryDeps::bank_activators`.
+    /// appropriate activator and inserts it into `FactoryDeps::bank_activators`
+    /// ([`builtin_activator`] answers the markers sumo implements itself).
     /// Also suppresses vm-service notifications for this component.
     #[serde(default)]
     pub activator: Option<String>,
