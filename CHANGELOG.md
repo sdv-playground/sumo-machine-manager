@@ -18,13 +18,16 @@ what a consumer has to touch when it moves its pin.
 - deps: SOVDd v0.1.8 (every pin: machine-mgr, component-mgr, component-factory, vm-sovd) — opt-in
   node topology on /v1, `DiagnosticBackend::read_part` behind `GET /v1/…/updates/{id}/bulk-data/{part}`,
   sovd-mdns leaf instance only from a plain `<label>.local` SAN. Host-facing: none by the bump itself.
-- deps: SOVDd v0.1.9 (every pin) — on /v1, `PUT …/updates/{id}/execute` requires
+- deps: SOVDd v0.1.10 (every pin) — on /v1, `PUT …/updates/{id}/execute` requires
   `?x-ota-control=orchestrated` (400 `incomplete-request` without it; `automated` answers 409), and
   component capabilities carry `x-update.control`; node-level data is served under the node
-  (`/v1/components/{node}/data/x-update-state` is `/v1/data/x-update-state`). vm-sovd: with
-  `--node-id`, the node document carries the unit's identification (`--identification`, else the
-  `--identification-prefix` result) as `x-identification`. /vehicle/v1 unchanged. Host-facing:
-  /v1 clients send `x-ota-control=orchestrated` on execute.
+  (`/v1/components/{node}/data/x-update-state`). Hierarchical-only on /v1 for a node server:
+  `/v1/components` lists the node alone, and the flat member and root node-level forms answer 404
+  naming the node form (no more Deprecation/Link headers); node-less servers and the legacy tree
+  unchanged. vm-sovd: with `--node-id`, the node document carries the unit's identification
+  (`--identification`, else the `--identification-prefix` result) as `x-identification`.
+  Host-facing: /v1 clients send `x-ota-control=orchestrated` on execute, and address a node
+  server's members and node-level resources by the node form only.
 - component-mgr: `read_part` streams a part back exactly as received. The manifest is kept as
   received and reads back while its update lasts. A payload reads back only when the bank holds it as
   received (no decryption, no decompression ran, or a re-sent part whose bytes hash to the staged

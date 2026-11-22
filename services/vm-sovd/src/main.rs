@@ -1059,13 +1059,15 @@ mod tests {
     }
 
     /// With --node-id the node form of a node-level route reaches the node
-    /// verdict handler, as the root form does; without it, it does not (it is
-    /// then a component path of an unknown component).
+    /// verdict handler, as the root form does without it; with it the root
+    /// form answers 404 naming the node form, without it the node form is a
+    /// component path of an unknown component.
     #[tokio::test]
     async fn plain_router_serves_the_node_form_with_a_node() {
         let machine = test_machine();
         let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
         let node_form = "/v1/components/cvc/operations/x-update-commit/executions";
+        let root_form = "/v1/operations/x-update-commit/executions";
 
         let node = Some(sovd_api::NodeTopology::new("cvc", "cvc"));
         let with = plain_router(
@@ -1073,20 +1075,26 @@ mod tests {
             sovd_state(HashMap::new(), node).unwrap(),
             coord.clone(),
         );
-        let root = post_commit_at(with.clone(), "/v1/operations/x-update-commit/executions").await;
-        assert_eq!(root, StatusCode::OK);
-        assert_eq!(post_commit_at(with, node_form).await, root);
-
         let without = plain_router(machine, sovd_state(HashMap::new(), None).unwrap(), coord);
+        let root = post_commit_at(without.clone(), root_form).await;
+        assert_eq!(root, StatusCode::OK);
+        assert_eq!(post_commit_at(with.clone(), node_form).await, root);
+
+        let (status, body) =
+            send_text(with, Request::post(root_form).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains(node_form), "{body}");
         assert_ne!(post_commit_at(without, node_form).await, StatusCode::OK);
     }
 
     /// `GET uri`: the status and the body text.
     async fn get_text(router: axum::Router, uri: &str) -> (StatusCode, String) {
-        let resp = router
-            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        send_text(router, Request::get(uri).body(Body::empty()).unwrap()).await
+    }
+
+    /// Send `req`: the status and the body text.
+    async fn send_text(router: axum::Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = router.oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -1127,19 +1135,35 @@ mod tests {
         assert!(node_topology(None, None, Some("cvc-host-f88a13a329a72db1")).is_none());
     }
 
-    /// With --node-id the node form of `x-update-state` serves the root form's
-    /// body (SOVDd v0.1.9 maps node-level data under the node).
+    /// With --node-id the node form of `x-update-state` serves the body the
+    /// node-less server serves at the root form, and the root form answers 404
+    /// naming the node form; the legacy alias is unchanged on both.
     #[tokio::test]
     async fn plain_router_serves_x_update_state_under_the_node() {
         let machine = test_machine();
         let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
-        let node = node_topology(Some("cvc".into()), None, None);
-        let router = plain_router(machine, sovd_state(HashMap::new(), node).unwrap(), coord);
+        let router = |node| {
+            plain_router(
+                machine.clone(),
+                sovd_state(HashMap::new(), node).unwrap(),
+                coord.clone(),
+            )
+        };
+        let with = router(node_topology(Some("cvc".into()), None, None));
+        let without = router(None);
+        let node_form = "/v1/components/cvc/data/x-update-state";
 
-        let root = get_text(router.clone(), "/v1/data/x-update-state").await;
+        let root = get_text(without.clone(), "/v1/data/x-update-state").await;
         assert_eq!(root.0, StatusCode::OK, "{}", root.1);
-        let node_form = get_text(router, "/v1/components/cvc/data/x-update-state").await;
-        assert_eq!(node_form, root);
+        assert_eq!(get_text(with.clone(), node_form).await, root);
+        for router in [&with, &without] {
+            let legacy = get_text(router.clone(), "/vehicle/v1/data/x-update-state").await;
+            assert_eq!(legacy, root);
+        }
+
+        let (status, body) = get_text(with, "/v1/data/x-update-state").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains(node_form), "{body}");
     }
 
     /// A node id that is also a component's id is refused (startup fails).
