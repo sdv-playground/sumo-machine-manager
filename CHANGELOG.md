@@ -25,6 +25,10 @@ what a consumer has to touch when it moves its pin.
   copies, and supplies its backends, vendor routes, boot id, HSM, restart authorizer + reset action and
   factory-reset handler (verified: supernova's served API identical before/after the move, 504 probes
   on both trees).
+- node-shell: `SovdListener::serve` caps the graceful drain at 5 s on both transports (HTTP warns
+  `graceful shutdown timed out after 5 s; closing`) and sends the mDNS/DNS-SD goodbye before it returns
+  — as vm-sovd does. Host-facing: `serve` now returns `Result<(), String>` (it no longer hands back the
+  advertiser guard); drop the `_mdns` binding.
 
 ## v0.1.26 — app leaf items from supernova
 

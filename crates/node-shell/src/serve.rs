@@ -3,10 +3,16 @@
 //! binary's signal, restart or reset paths trigger.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Notify;
 
 use crate::ShellConfig;
+
+/// How long [`SovdListener::serve`] lets in-flight connections drain after the
+/// shutdown notify before it closes them, so a client holding one open cannot
+/// hold back the mDNS goodbye or the binary's cleanup.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Advertise the host SOVD endpoint over mDNS / DNS-SD (ISO 17978-3 §5.11) when
 /// `sovd_mdns` is on. The `configured` identification (see
@@ -177,24 +183,31 @@ impl SovdListener {
     }
 
     /// Serve `router` until `shutdown` is notified, then drain in-flight
-    /// requests and return. Hands back the mDNS advertisement: dropping it
-    /// sends the DNS-SD goodbye, so the binary holds it while it cleans up.
+    /// requests for at most 5 s (`SHUTDOWN_GRACE`) and withdraw the mDNS
+    /// advertisement (the DNS-SD goodbye is on the wire when this returns).
     /// `Err` is a TLS bind that is not `ip:port`; a server failure panics.
-    pub async fn serve(
-        self,
-        router: axum::Router,
-        shutdown: Arc<Notify>,
-    ) -> Result<Option<sovd_mdns::AdvertiserGuard>, String> {
-        let shutdown_signal = {
-            let s = shutdown.clone();
-            async move { s.notified().await }
-        };
+    pub async fn serve(self, router: axum::Router, shutdown: Arc<Notify>) -> Result<(), String> {
         match self.transport {
             Transport::Http(listener) => {
-                axum::serve(listener, router)
-                    .with_graceful_shutdown(shutdown_signal)
-                    .await
-                    .unwrap();
+                // One task turns the notify into a watch, so both the graceful
+                // shutdown and its cap see it (a Notify wakes one waiter).
+                let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+                tokio::spawn(async move {
+                    shutdown.notified().await;
+                    let _ = stop_tx.send(());
+                });
+                let mut graceful_rx = stop_rx.clone();
+                let mut cap_rx = stop_rx;
+                let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
+                    let _ = graceful_rx.changed().await;
+                });
+                tokio::select! {
+                    result = serve => result.unwrap(),
+                    _ = async {
+                        let _ = cap_rx.changed().await;
+                        tokio::time::sleep(SHUTDOWN_GRACE).await;
+                    } => tracing::warn!("graceful shutdown timed out after 5 s; closing"),
+                }
             }
             Transport::Https(tls_config) => {
                 let addr: std::net::SocketAddr = self
@@ -207,8 +220,8 @@ impl SovdListener {
                 let handle = axum_server::Handle::new();
                 let shutdown_handle = handle.clone();
                 tokio::spawn(async move {
-                    shutdown_signal.await;
-                    shutdown_handle.graceful_shutdown(None);
+                    shutdown.notified().await;
+                    shutdown_handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
                 });
                 axum_server::bind_rustls(addr, tls_config)
                     .handle(handle)
@@ -217,7 +230,11 @@ impl SovdListener {
                     .unwrap();
             }
         }
-        Ok(self.mdns)
+        // The goodbye: the guard's drop multicasts the TTL-0 records and blocks
+        // (bounded) until they are sent, so a process exiting right after this
+        // returns — `std::process::exit` runs no Drop — still withdraws it.
+        drop(self.mdns);
+        Ok(())
     }
 }
 
@@ -225,6 +242,8 @@ impl SovdListener {
 mod tests {
     use super::*;
     use hsm::{HsmError, KeyHandle, SlotInfo};
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// An HSM whose tls-identity leaf is not provisioned yet.
     struct NoLeaf;
@@ -270,7 +289,7 @@ mod tests {
     }
 
     /// `sovd_tls` is on by default; without a leaf the server is HTTP, and
-    /// a notified shutdown ends `serve`.
+    /// a notified shutdown with no open connection ends `serve` promptly.
     #[tokio::test]
     async fn no_leaf_serves_http_until_shutdown() {
         let crypto: Arc<dyn hsm::HsmCryptoProvider> = Arc::new(NoLeaf);
@@ -280,8 +299,126 @@ mod tests {
         assert!(!listener.is_tls());
         let shutdown = Arc::new(Notify::new());
         shutdown.notify_one();
-        let mdns = listener.serve(axum::Router::new(), shutdown).await.unwrap();
-        assert!(mdns.is_none(), "sovd_mdns is off");
+        let start = Instant::now();
+        listener.serve(axum::Router::new(), shutdown).await.unwrap();
+        let took = start.elapsed();
+        assert!(took < Duration::from_secs(1), "{took:?}");
+    }
+
+    /// Serve `router` over HTTP on a free port: its address, the shutdown
+    /// notify and the `serve` task.
+    async fn serve_http(
+        router: axum::Router,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<Notify>,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ) {
+        let crypto: Arc<dyn hsm::HsmCryptoProvider> = Arc::new(NoLeaf);
+        let listener = SovdListener::bind(&cfg("127.0.0.1:0"), &crypto, None)
+            .await
+            .unwrap();
+        let Transport::Http(l) = &listener.transport else {
+            panic!("no leaf, so HTTP");
+        };
+        let addr = l.local_addr().unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(listener.serve(router, shutdown.clone()));
+        (addr, shutdown, task)
+    }
+
+    /// Notify `shutdown` and time how long `serve` takes to return.
+    async fn shutdown_time(
+        shutdown: &Notify,
+        task: tokio::task::JoinHandle<Result<(), String>>,
+    ) -> Duration {
+        shutdown.notify_one();
+        let start = Instant::now();
+        tokio::time::timeout(SHUTDOWN_GRACE * 3, task)
+            .await
+            .expect("serve did not return")
+            .unwrap()
+            .unwrap();
+        start.elapsed()
+    }
+
+    /// A client idling on a keep-alive connection after its response does not
+    /// hold `serve` open.
+    #[tokio::test]
+    async fn an_idle_keep_alive_connection_does_not_hold_shutdown() {
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let (addr, shutdown, task) = serve_http(router).await;
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(b"GET / HTTP/1.1\r\nhost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "{:?}", &buf[..n]);
+        let took = shutdown_time(&shutdown, task).await;
+        assert!(took < SHUTDOWN_GRACE + Duration::from_secs(1), "{took:?}");
+        drop(conn);
+    }
+
+    /// A request that never completes holds the HTTP drain for 5 s, no longer.
+    #[tokio::test]
+    async fn a_held_http_request_is_cut_after_the_grace() {
+        let entered = Arc::new(Notify::new());
+        let router = axum::Router::new().route(
+            "/hang",
+            axum::routing::get({
+                let entered = entered.clone();
+                || async move {
+                    entered.notify_one();
+                    std::future::pending::<&str>().await
+                }
+            }),
+        );
+        let (addr, shutdown, task) = serve_http(router).await;
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(b"GET /hang HTTP/1.1\r\nhost: t\r\n\r\n")
+            .await
+            .unwrap();
+        entered.notified().await;
+        let took = shutdown_time(&shutdown, task).await;
+        assert!(took >= SHUTDOWN_GRACE, "{took:?}");
+        assert!(took < SHUTDOWN_GRACE + Duration::from_secs(1), "{took:?}");
+        drop(conn);
+    }
+
+    /// A TLS client that connected but never finishes its handshake (axum_server
+    /// would wait out its 10 s handshake timeout) holds the drain for 5 s, no
+    /// longer. The leaf is never read: no handshake gets that far.
+    #[tokio::test]
+    async fn a_held_tls_connection_is_cut_after_the_grace() {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let tls_cfg =
+            hsm_rustls::server_config_no_client_auth(Vec::new(), |_| Err("no key".to_string()));
+        let listener = SovdListener {
+            transport: Transport::Https(axum_server::tls_rustls::RustlsConfig::from_config(
+                Arc::new(tls_cfg),
+            )),
+            bind: addr.to_string(),
+            mdns: None,
+        };
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(listener.serve(axum::Router::new(), shutdown.clone()));
+        let conn = loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        // Let the accept loop take the connection and park again: axum_server's
+        // graceful shutdown only wakes a loop that is waiting.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let took = shutdown_time(&shutdown, task).await;
+        assert!(took >= SHUTDOWN_GRACE, "{took:?}");
+        assert!(took < SHUTDOWN_GRACE + Duration::from_secs(1), "{took:?}");
+        drop(conn);
     }
 
     #[tokio::test]
