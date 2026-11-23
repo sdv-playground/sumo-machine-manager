@@ -121,8 +121,12 @@ impl SimHsm {
         let current = self.read_monotonic_at(handle)?;
         let raised = current.max(new_value);
         if raised != current {
-            std::fs::write(self.monotonic_path(handle), raised.to_string().as_bytes())
-                .map_err(|e| HsmError::KeystoreError(format!("write monotonic counter: {e}")))?;
+            write_atomic(
+                &self.monotonic_path(handle),
+                raised.to_string().as_bytes(),
+                false,
+            )
+            .map_err(|e| HsmError::KeystoreError(format!("write monotonic counter: {e}")))?;
         }
         Ok(raised)
     }
@@ -163,7 +167,7 @@ impl SimHsm {
                 let mut bytes = vec![0u8; 32];
                 use rand::RngCore;
                 rand::rngs::OsRng.fill_bytes(&mut bytes);
-                std::fs::write(&bin_path, &bytes)
+                write_atomic(&bin_path, &bytes, false)
                     .map_err(|e| HsmError::KeystoreError(format!("write {key_id} key: {e}")))?;
                 tracing::info!(key_id = %key_id, "device-side AES-256 key generated (first boot)");
                 continue;
@@ -178,12 +182,15 @@ impl SimHsm {
             let scalar = sk.to_bytes();
             let pk = sk.verifying_key().to_encoded_point(false);
 
-            write_pem_ec_private(&priv_path, &scalar)
-                .map_err(|e| HsmError::KeystoreError(format!("write {key_id} priv: {e}")))?;
-
+            // Public half first: `.priv` is what marks the pair present, so a
+            // crash between the two writes regenerates the pair rather than
+            // leaving a private key with no public half.
             let pub_path = self.keys_dir().join(format!("{key_id}.pub"));
             write_pem_ec_public(&pub_path, pk.as_bytes())
                 .map_err(|e| HsmError::KeystoreError(format!("write {key_id} pub: {e}")))?;
+
+            write_pem_ec_private(&priv_path, &scalar)
+                .map_err(|e| HsmError::KeystoreError(format!("write {key_id} priv: {e}")))?;
 
             tracing::info!(key_id = %key_id, "device-side key pair generated (first boot)");
         }
@@ -207,8 +214,12 @@ impl SimHsm {
     }
 
     fn save_state(&self, security_version: u64) -> Result<(), HsmError> {
-        std::fs::write(self.state_path(), security_version.to_string().as_bytes())
-            .map_err(|e| HsmError::KeystoreError(format!("write provision_state: {e}")))?;
+        write_atomic(
+            &self.state_path(),
+            security_version.to_string().as_bytes(),
+            false,
+        )
+        .map_err(|e| HsmError::KeystoreError(format!("write provision_state: {e}")))?;
         Ok(())
     }
 
@@ -244,9 +255,12 @@ impl SimHsm {
         // root). Public trust material, not a device key.
         self.write_trust_anchors(&ks.trust_anchors, &keys_dir)?;
 
-        self.write_manifest(&ks.slots)?;
         self.write_identities(ks)?;
         self.save_state(ks.security_version)?;
+        // The manifest last: its presence is what reads as provisioned, so a
+        // keystore interrupted before this point is still unprovisioned and the
+        // same envelope can simply be applied again.
+        self.write_manifest(&ks.slots)?;
 
         Ok(())
     }
@@ -370,12 +384,14 @@ impl SimHsm {
                     let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
                     let scalar = sk.to_bytes();
                     let pk = sk.verifying_key().to_encoded_point(false);
-                    write_pem_ec_private(&priv_path, &scalar).map_err(|e| {
-                        HsmError::KeystoreError(format!("generate {} priv: {e}", slot.key_id,))
-                    })?;
+                    // Public half first, as in `ensure_device_keys`: `.priv`
+                    // marks the pair present.
                     let pub_path = keys_dir.join(format!("{}.pub", slot.key_id));
                     write_pem_ec_public(&pub_path, pk.as_bytes()).map_err(|e| {
                         HsmError::KeystoreError(format!("generate {} pub: {e}", slot.key_id,))
+                    })?;
+                    write_pem_ec_private(&priv_path, &scalar).map_err(|e| {
+                        HsmError::KeystoreError(format!("generate {} priv: {e}", slot.key_id,))
                     })?;
                     tracing::info!(key_id = %slot.key_id, "generated EC-P256 keypair locally");
                 }
@@ -387,7 +403,7 @@ impl SimHsm {
                     let mut bytes = vec![0u8; 32];
                     use rand::RngCore;
                     rand::rngs::OsRng.fill_bytes(&mut bytes);
-                    std::fs::write(&path, &bytes).map_err(|e| {
+                    write_atomic(&path, &bytes, false).map_err(|e| {
                         HsmError::KeystoreError(format!("write generated {}: {e}", path.display(),))
                     })?;
                     tracing::info!(key_id = %slot.key_id, "generated AES-256 key locally");
@@ -416,8 +432,7 @@ impl SimHsm {
     ///
     /// Format: `key_id type key_path cert_path [allowed_guests=...] [allowed_ops=...]`
     fn write_manifest(&self, slots: &[KeySlot]) -> Result<(), HsmError> {
-        let mut f = std::fs::File::create(self.manifest_path())
-            .map_err(|e| HsmError::KeystoreError(format!("create manifest: {e}")))?;
+        let mut f = Vec::new();
 
         for slot in slots {
             let type_str = match slot.key_kind {
@@ -458,14 +473,14 @@ impl SimHsm {
             writeln!(f).map_err(|e| HsmError::KeystoreError(format!("write manifest: {e}")))?;
         }
 
-        Ok(())
+        write_atomic(&self.manifest_path(), &f, false)
+            .map_err(|e| HsmError::KeystoreError(format!("write manifest: {e}")))
     }
 
     /// Write the identities file for guest registration.
     fn write_identities(&self, ks: &HsmKeystore) -> Result<(), HsmError> {
         let path = self.keystore_path.join("identities");
-        let mut f = std::fs::File::create(&path)
-            .map_err(|e| HsmError::KeystoreError(format!("create identities: {e}")))?;
+        let mut f = Vec::new();
 
         for id in &ks.identities {
             // Write identity public key as PEM file
@@ -476,7 +491,8 @@ impl SimHsm {
                 .map_err(|e| HsmError::KeystoreError(format!("write identities: {e}")))?;
         }
 
-        Ok(())
+        write_atomic(&path, &f, false)
+            .map_err(|e| HsmError::KeystoreError(format!("write identities: {e}")))
     }
 
     /// Parse the manifest file to extract key-slot information.
@@ -815,23 +831,8 @@ impl HsmProvider for SimHsm {
             std::fs::create_dir_all(parent)
                 .map_err(|e| HsmError::ProcessError(format!("mkdir {}: {e}", parent.display())))?;
         }
-        let tmp = path.with_extension("yaml.tmp");
-        {
-            use std::io::Write as _;
-            let mut f = std::fs::File::create(&tmp)
-                .map_err(|e| HsmError::ProcessError(format!("create {}: {e}", tmp.display())))?;
-            f.write_all(yaml.as_bytes())
-                .map_err(|e| HsmError::ProcessError(format!("write {}: {e}", tmp.display())))?;
-            f.sync_data()
-                .map_err(|e| HsmError::ProcessError(format!("sync {}: {e}", tmp.display())))?;
-        }
-        std::fs::rename(&tmp, &path).map_err(|e| {
-            HsmError::ProcessError(format!(
-                "rename {} → {}: {e}",
-                tmp.display(),
-                path.display()
-            ))
-        })?;
+        write_atomic(&path, yaml.as_bytes(), false)
+            .map_err(|e| HsmError::ProcessError(format!("write {}: {e}", path.display())))?;
 
         tracing::info!(
             vm_id = %vm_id,
@@ -875,19 +876,8 @@ impl HsmProvider for SimHsm {
         if removed {
             let yaml = serde_yaml::to_string(&doc)
                 .map_err(|e| HsmError::ProcessError(format!("serialise: {e}")))?;
-            let tmp = path.with_extension("yaml.tmp");
-            {
-                use std::io::Write as _;
-                let mut f = std::fs::File::create(&tmp).map_err(|e| {
-                    HsmError::ProcessError(format!("create {}: {e}", tmp.display()))
-                })?;
-                f.write_all(yaml.as_bytes())
-                    .map_err(|e| HsmError::ProcessError(format!("write {}: {e}", tmp.display())))?;
-                f.sync_data()
-                    .map_err(|e| HsmError::ProcessError(format!("sync {}: {e}", tmp.display())))?;
-            }
-            std::fs::rename(&tmp, &path)
-                .map_err(|e| HsmError::ProcessError(format!("rename: {e}")))?;
+            write_atomic(&path, yaml.as_bytes(), false)
+                .map_err(|e| HsmError::ProcessError(format!("write {}: {e}", path.display())))?;
             tracing::info!(vm_id, "cleared enrolled record");
         }
         Ok(removed)
@@ -1235,13 +1225,42 @@ fn write_pem_file(path: &Path, label: &str, der: &[u8]) -> Result<(), HsmError> 
     }
     writeln!(pem, "-----END {label}-----").unwrap();
 
-    std::fs::write(path, pem.as_bytes())
-        .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))?;
     // Private key material → owner-only (0600). Public keys / certs stay readable.
-    if label.contains("PRIVATE") {
-        restrict_file_600(path);
+    write_atomic(path, pem.as_bytes(), label.contains("PRIVATE"))
+        .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))
+}
+
+/// Replace `path` with `data` so that a crash leaves either the old content or
+/// the new, never a torn file: write a sibling `{name}.tmp`, fsync it, rename it
+/// over `path`, fsync the directory. `private` restricts the file to 0600
+/// (`restrict_file_600`) before it becomes visible under `path`; otherwise it
+/// keeps the mode a plain create gives it.
+pub(crate) fn write_atomic(path: &Path, data: &[u8], private: bool) -> std::io::Result<()> {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        if private {
+            restrict_file_600(&tmp);
+        }
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        sync_dir(dir);
     }
     Ok(())
+}
+
+/// Best-effort fsync of a directory, so the renames in it are durable. Not every
+/// filesystem accepts an fsync on a directory handle; the file data itself is
+/// already synced by the caller.
+fn sync_dir(dir: &Path) {
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
 }
 
 /// Best-effort: restrict a keystore directory to the owner (0700) so other local
@@ -1758,6 +1777,66 @@ mod tests {
         let yaml = std::fs::read_to_string(keystore.join("bootstrap.yaml")).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed["pending"]["vm9"]["ttl_secs"].as_u64(), Some(9999));
+    }
+
+    /// What a crash between writing a counter's temp file and renaming it
+    /// leaves on disk: the counter file untouched and a (possibly torn)
+    /// `{name}.tmp` beside it. The counter reads its old value, and the next
+    /// ratchet replaces the leftover.
+    #[test]
+    fn torn_counter_write_is_never_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hsm = SimHsm::new(dir.path().to_path_buf());
+        let floor = KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR);
+        hsm.raise_monotonic(floor, 10).unwrap();
+        let file = hsm.monotonic_path(floor.get());
+        let mut tmp = file.file_name().unwrap().to_os_string();
+        tmp.push(".tmp");
+        let tmp = file.with_file_name(tmp);
+        for torn in [&b""[..], b"2", b"20"] {
+            std::fs::write(&tmp, torn).unwrap();
+            assert_eq!(hsm.read_monotonic(floor).unwrap(), 10);
+        }
+        assert_eq!(hsm.raise_monotonic(floor, 15).unwrap(), 15);
+        assert_eq!(
+            SimHsm::new(dir.path().into())
+                .read_monotonic(floor)
+                .unwrap(),
+            15
+        );
+        assert!(
+            !tmp.exists(),
+            "the ratchet's own temp file was renamed away"
+        );
+    }
+
+    /// `write_atomic` keeps today's modes: a private file is 0600, any other
+    /// gets the plain-create mode, and no temp file is left behind.
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_keeps_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        let create_mode = std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777;
+
+        let public = dir.path().join("a.pub");
+        write_atomic(&public, b"pub", false).unwrap();
+        let private = dir.path().join("a.priv");
+        write_atomic(&private, b"priv", true).unwrap();
+        write_atomic(&private, b"priv2", true).unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&public), create_mode);
+        assert_eq!(mode(&private), 0o600);
+        assert_eq!(std::fs::read(&private).unwrap(), b"priv2");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "temp files left: {left:?}");
     }
 
     /// Provisioning through the real `HsmProvider::provision`: signed +
