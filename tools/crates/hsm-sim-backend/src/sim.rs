@@ -363,10 +363,55 @@ impl SimHsm {
         Ok(())
     }
 
+    /// `Ok` when every leaf in `certs` parses as an X.509 certificate whose
+    /// subject public key is the key this device holds for the leaf's slot:
+    /// the live `{key_id}.pub`, what `get_public_key_der` returns and what the
+    /// CA signed the leaf for. `PayloadInvalid` for a leaf that does not
+    /// parse, names a slot with no key here, or certifies another key — a
+    /// leaf installed for another key would make every verifying TLS client
+    /// fail. Reads only.
+    #[cfg(feature = "crypto")]
+    fn check_leaf_certs(&self, certs: &[hsm::payload::LeafCert]) -> Result<(), HsmError> {
+        use p256::pkcs8::DecodePublicKey;
+        use x509_cert::der::{Decode, Encode};
+        for c in certs {
+            let refuse = |why: String| {
+                HsmError::PayloadInvalid(format!("leaf cert for '{}' {why}", c.key_id))
+            };
+            let leaf_spki = x509_cert::Certificate::from_der(&c.certificate)
+                .and_then(|cert| cert.tbs_certificate.subject_public_key_info.to_der())
+                .map_err(|e| refuse(format!("does not parse as an X.509 certificate: {e}")))?;
+            let pub_path = self.keys_dir().join(format!("{}.pub", c.key_id));
+            let pem = match std::fs::read_to_string(&pub_path) {
+                Ok(pem) => pem,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(refuse("names a slot with no key on this device".into()))
+                }
+                Err(e) => {
+                    return Err(HsmError::KeystoreError(format!(
+                        "read {}: {e}",
+                        pub_path.display()
+                    )))
+                }
+            };
+            let device = decode_pem(&pem, "PUBLIC KEY").and_then(|der| {
+                p256::PublicKey::from_public_key_der(&der).map_err(|e| {
+                    HsmError::KeystoreError(format!("parse {}: {e}", pub_path.display()))
+                })
+            })?;
+            if p256::PublicKey::from_public_key_der(&leaf_spki).ok() != Some(device) {
+                return Err(refuse("does not match the on-disk public key".into()));
+            }
+        }
+        Ok(())
+    }
+
     /// Write each delivered leaf certificate to `{key_id}.cert` (PEM). The
     /// cert is a public artifact bound to a device-generated key whose
     /// private half never left the HSM; `payload::decode` has already
-    /// checked each names an EC-P256 slot in this keystore.
+    /// checked each names an EC-P256 slot in this keystore, and `provision`
+    /// that each certifies the key the device holds for it
+    /// ([`Self::check_leaf_certs`]).
     fn write_leaf_certs(
         &self,
         certs: &[hsm::payload::LeafCert],
@@ -836,6 +881,12 @@ impl HsmProvider for SimHsm {
             factory = is_factory,
             "provisioning HSM keystore"
         );
+
+        // Every delivered leaf must certify the key this device holds for its
+        // slot; one that does not refuses the whole envelope, before anything
+        // is written.
+        #[cfg(feature = "crypto")]
+        self.check_leaf_certs(&keystore.certificates)?;
 
         // Re-provision: build the new keystore beside the live one, starting
         // from everything the envelope does not own (the device's keys, its
@@ -2273,11 +2324,15 @@ mod tests {
         /// A CA-issued leaf for the device's current `role` key (what the CA
         /// returns for that key's CSR).
         pub(super) fn leaf_for(hsm: &SimHsm, role: KeyRole) -> Vec<u8> {
+            leaf_over(&hsm.get_public_key_der(role.handle()).unwrap())
+        }
+
+        /// A CA-issued leaf certifying the key `spki_der`.
+        pub(super) fn leaf_over(spki_der: &[u8]) -> Vec<u8> {
             use std::str::FromStr;
             use x509_cert::builder::{Builder, CertificateBuilder, Profile};
             use x509_cert::der::{Decode, Encode};
-            let spki_der = hsm.get_public_key_der(role.handle()).unwrap();
-            let spki = x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(&spki_der).unwrap();
+            let spki = x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(spki_der).unwrap();
             let ca = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
             let builder = CertificateBuilder::new(
                 Profile::Root,
@@ -2621,6 +2676,175 @@ mod tests {
             assert!(device_material(&live) == keys);
             assert_eq!(hsm.load_security_version().unwrap(), 1);
             std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        /// Every file under `dir` (recursively), by relative path, with its
+        /// bytes.
+        fn tree(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            fn walk(
+                root: &Path,
+                dir: &Path,
+                out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+            ) {
+                for e in std::fs::read_dir(dir).unwrap() {
+                    let p = e.unwrap().path();
+                    if p.is_dir() {
+                        walk(root, &p, out);
+                    } else {
+                        let bytes = std::fs::read(&p).unwrap();
+                        out.insert(p.strip_prefix(root).unwrap().into(), bytes);
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeMap::new();
+            walk(dir, dir, &mut out);
+            out
+        }
+
+        /// A started keystore that was never provisioned: the device keys
+        /// only.
+        fn unprovisioned() -> (tempfile::TempDir, SimHsm) {
+            let dir = tempfile::tempdir().unwrap();
+            let hsm = SimHsm::new(dir.path().join("keystore"));
+            hsm.ensure_device_keys().unwrap();
+            (dir, hsm)
+        }
+
+        /// A leaf certifying a key this device does not hold.
+        fn foreign_leaf() -> Vec<u8> {
+            use p256::pkcs8::EncodePublicKey;
+            let other = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+            leaf_over(
+                other
+                    .verifying_key()
+                    .to_public_key_der()
+                    .unwrap()
+                    .as_bytes(),
+            )
+        }
+
+        /// The leaves no envelope may install, each named: for `tls-identity`
+        /// a leaf for another key, garbage, and one good leaf beside a bad
+        /// one; a valid leaf for a slot with no key on the device; a leaf for
+        /// the key-authority anchor slot that certifies another key.
+        fn bad_leaves(hsm: &SimHsm) -> Vec<(&'static str, Vec<LeafCert>)> {
+            let tls = KeyRole::TlsIdentity.key_id();
+            let leaf = |key_id: &str, certificate: Vec<u8>| LeafCert {
+                key_id: key_id.into(),
+                certificate,
+            };
+            let good = leaf_for(hsm, KeyRole::TlsIdentity);
+            vec![
+                ("another key", vec![leaf(tls, foreign_leaf())]),
+                (
+                    "garbage",
+                    vec![leaf(tls, vec![0x30, 0x82, 0x01, 0x00, 0xDE, 0xAD])],
+                ),
+                (
+                    "one good, one bad",
+                    vec![
+                        leaf(tls, good.clone()),
+                        leaf(KeyRole::JwtSigning.key_id(), foreign_leaf()),
+                    ],
+                ),
+                ("a slot without a key", vec![leaf("extra-identity", good)]),
+                (
+                    "the anchor slot",
+                    vec![leaf(KeyRole::KeyAuthority.key_id(), foreign_leaf())],
+                ),
+            ]
+        }
+
+        /// `ks` with `leaves`, and with an EC slot `extra-identity` the
+        /// device has no key for yet.
+        fn with_leaves(mut ks: HsmKeystore, leaves: Vec<LeafCert>) -> HsmKeystore {
+            ks.slots.push(KeySlot {
+                key_id: "extra-identity".into(),
+                key_kind: KEY_TYPE_EC_P256,
+                anchor_public_key: None,
+                allowed_guests: None,
+                allowed_ops: None,
+            });
+            ks.certificates = leaves;
+            ks
+        }
+
+        /// A first provision carrying a leaf for the device's own key
+        /// installs it, as a re-provision does.
+        #[test]
+        fn first_provision_installs_a_leaf_for_the_device_key() {
+            let (_dir, mut hsm) = unprovisioned();
+            let leaf = leaf_for(&hsm, KeyRole::TlsIdentity);
+            let ka = key_authority();
+            let mut ks = keystore(1, &ka.1);
+            ks.certificates.push(LeafCert {
+                key_id: KeyRole::TlsIdentity.key_id().into(),
+                certificate: leaf.clone(),
+            });
+            hsm.provision(&envelope(
+                &hsm,
+                &ks,
+                &FACTORY_SIGNING_SCALAR,
+                &FACTORY_SIGNING_PUBLIC,
+            ))
+            .unwrap();
+            assert!(hsm.is_provisioned().unwrap());
+            assert!(
+                hsm.get_certificate_der(KeyRole::TlsIdentity.handle())
+                    .unwrap()
+                    == leaf
+            );
+        }
+
+        /// A first provision whose leaf does not certify the device's key is
+        /// refused whole: the keystore stays unprovisioned, byte for byte.
+        #[test]
+        fn first_provision_with_a_bad_leaf_is_refused_and_writes_nothing() {
+            let ka = key_authority();
+            let (_dir, probe) = unprovisioned();
+            for (case, _) in bad_leaves(&probe) {
+                let (dir, mut hsm) = unprovisioned();
+                let leaves = bad_leaves(&hsm)
+                    .into_iter()
+                    .find(|(c, _)| *c == case)
+                    .unwrap()
+                    .1;
+                let ks = with_leaves(keystore(1, &ka.1), leaves);
+                let update = envelope(&hsm, &ks, &FACTORY_SIGNING_SCALAR, &FACTORY_SIGNING_PUBLIC);
+                let before = tree(dir.path());
+
+                let err = hsm.provision(&update).expect_err(case);
+                assert!(matches!(err, HsmError::PayloadInvalid(_)), "{case}: {err}");
+                assert!(tree(dir.path()) == before, "{case}: the keystore changed");
+                assert!(!hsm.is_provisioned().unwrap(), "{case}");
+            }
+        }
+
+        /// A re-provision whose leaf does not certify the device's key is
+        /// refused whole, before any staging: the keystore stays as it was,
+        /// byte for byte, and the same envelope without the leaf applies.
+        #[test]
+        fn reprovision_with_a_bad_leaf_is_refused_and_writes_nothing() {
+            let (_probe_dir, probe, _) = provisioned();
+            for (case, _) in bad_leaves(&probe) {
+                let (dir, mut hsm, ka) = provisioned();
+                let leaves = bad_leaves(&hsm)
+                    .into_iter()
+                    .find(|(c, _)| *c == case)
+                    .unwrap()
+                    .1;
+                let update = envelope(&hsm, &with_leaves(keystore(2, &ka.1), leaves), &ka.0, &ka.1);
+                let before = tree(dir.path());
+
+                let err = hsm.provision(&update).expect_err(case);
+                assert!(matches!(err, HsmError::PayloadInvalid(_)), "{case}: {err}");
+                assert!(tree(dir.path()) == before, "{case}: the keystore changed");
+                assert_eq!(hsm.load_security_version().unwrap(), 1, "{case}");
+
+                let retry = envelope(&hsm, &keystore(2, &ka.1), &ka.0, &ka.1);
+                hsm.provision(&retry).expect(case);
+                assert_eq!(hsm.load_security_version().unwrap(), 2, "{case}");
+            }
         }
     }
 }
