@@ -67,9 +67,10 @@ pub trait BootRecord: Send + Sync {
     /// gates on the secondary's generation.
     fn rollback(&self) -> Result<u64, SelectorError>;
     /// Migration hook: a header the record itself still carries from an older
-    /// layout.
-    fn legacy_transaction(&self) -> Option<(u64, Transaction)> {
-        None
+    /// layout. `Err` when the record could not be read — never read as no
+    /// header.
+    fn legacy_transaction(&self) -> Result<Option<(u64, Transaction)>, SelectorError> {
+        Ok(None)
     }
 }
 
@@ -98,14 +99,19 @@ impl SignedFiles {
         Self { dir, signer }
     }
 
-    /// Sign `entries` (and `transaction`) at `generation`.
+    /// Sign `entries` (and `transaction`) at `generation`; `Err` when the
+    /// signer could not sign — then there is nothing to write.
     fn sign(
         &self,
         generation: u64,
         entries: BTreeMap<String, ComponentEntry>,
         transaction: Option<Transaction>,
-    ) -> SelectorBlob {
-        SelectorBlob::signed(generation, entries, transaction, &*self.signer)
+    ) -> Result<SelectorBlob, SelectorError> {
+        SelectorBlob::signed(generation, entries, transaction, &*self.signer).map_err(|e| {
+            SelectorError::Unsignable(format!(
+                "boot selector at generation {generation} could not be signed: {e}"
+            ))
+        })
     }
 
     /// Read + parse a file: `Ok(None)` if it doesn't exist, `Err` if it
@@ -132,18 +138,26 @@ impl SignedFiles {
     /// [`Self::read_blob`], keeping only a blob that verifies. A PRESENT blob
     /// that fails verification warns rather than vanishing silently: it reads
     /// as absent (an absent primary is the host's reseed-from-NV trigger), and
-    /// this line is the only record of why.
+    /// this line is the only record of why. A present blob the signer could
+    /// not verify is `Err(Unreadable)` — never absent, so nothing is reseeded
+    /// or written over it.
     fn read_verified(&self, name: &str) -> Result<Option<SelectorBlob>, SelectorError> {
-        Ok(self.read_blob(name)?.filter(|b| {
-            let valid = b.is_valid(&*self.signer);
-            if !valid {
+        let Some(b) = self.read_blob(name)? else {
+            return Ok(None);
+        };
+        match b.is_valid(&*self.signer) {
+            Ok(true) => Ok(Some(b)),
+            Ok(false) => {
                 tracing::warn!(
                     generation = b.generation,
                     "boot selector {name} failed verification — treated as absent (will be reseeded)"
                 );
+                Ok(None)
             }
-            valid
-        }))
+            Err(e) => Err(SelectorError::Unreadable(format!(
+                "boot selector {name} could not be verified: {e}"
+            ))),
+        }
     }
 
     /// Atomically + durably write a file: serialize into `<name>.tmp`, **fsync
@@ -198,9 +212,11 @@ impl SignedFiles {
 /// Failure rules, beyond the [`SelectorStore`] write order:
 /// - a record or a side file that could not be read is `Err` from every verb
 ///   that reads it — never read as absent, so `commit` over an unreadable
-///   primary is `Err` (`read_transaction`, which has no error channel, logs it
-///   and reads no header); a side file that does not parse or verify is
-///   absent, as a missing one is;
+///   primary is `Err`; a side file that does not parse or verify is absent, as
+///   a missing one is, while one the signer could not verify is `Err`;
+/// - every verb signs its side files before its first write, so a signer that
+///   cannot sign fails the verb with nothing written (they are re-signed after
+///   the record only when it issues a generation other than the one expected);
 /// - `activate`: a failed `rows` write rolls the record back when it was not
 ///   in trial before, and is `Err` (with a standing trial the record is left
 ///   alone — a rollback would discard the trial; a retry heals);
@@ -325,14 +341,20 @@ impl<R: BootRecord + Clone> RecordSelectorStore<R> {
         }
     }
 
-    fn write_rows(
-        &self,
-        name: &str,
-        generation: u64,
-        rows: BTreeMap<String, ComponentEntry>,
-    ) -> Result<(), SelectorError> {
-        self.files
-            .write_blob(name, &self.files.sign(generation, rows, None))
+    /// What [`SelectorStore::commit`] writes beside the record, prepared
+    /// without writing: `None` without a primary, else the primary generation
+    /// and the `committed` rows signed at it (`None` when there are no manager
+    /// rows to commit — the commit then fails after the record committed).
+    fn prepare_commit(&self) -> Result<Option<(u64, Option<SelectorBlob>)>, SelectorError> {
+        let Some(generation) = self.generation(RecordCopy::Primary)? else {
+            return Ok(None);
+        };
+        let rows = self.first_rows_at([ROWS, COMMITTED], generation)?;
+        let committed = match self.required(rows, generation) {
+            Ok(rows) => Some(self.files.sign(generation, rows, None)?),
+            Err(_) => None,
+        };
+        Ok(Some((generation, committed)))
     }
 
     /// The header and its generation, under the attribution rule of
@@ -343,7 +365,11 @@ impl<R: BootRecord + Clone> RecordSelectorStore<R> {
             Some(b) => b.transaction.map(|t| (b.generation, t)),
             None => None,
         };
-        let Some((generation, header)) = header.or_else(|| self.record.legacy_transaction()) else {
+        let header = match header {
+            Some(header) => Some(header),
+            None => self.record.legacy_transaction()?,
+        };
+        let Some((generation, header)) = header else {
             return Ok(None);
         };
         if !self.record.routes_everything() {
@@ -362,12 +388,14 @@ impl<R: BootRecord + Clone> RecordSelectorStore<R> {
         Ok(Some((generation, header)))
     }
 
-    /// Sign + write the header for `generation` (empty entries).
-    fn write_header(&self, generation: u64, header: &Transaction) -> Result<(), SelectorError> {
-        let blob = self
-            .files
-            .sign(generation, BTreeMap::new(), Some(header.clone()));
-        self.files.write_blob(TRANSACTION, &blob)
+    /// Sign the header for `generation` (empty entries).
+    fn sign_header(
+        &self,
+        generation: u64,
+        header: &Transaction,
+    ) -> Result<SelectorBlob, SelectorError> {
+        self.files
+            .sign(generation, BTreeMap::new(), Some(header.clone()))
     }
 }
 
@@ -413,10 +441,27 @@ impl<R: BootRecord + Clone> SelectorStore for RecordSelectorStore<R> {
             .iter()
             .map(|(id, e)| (id.clone(), e.clone()))
             .partition(|(id, _)| self.record.routes(id));
-        let was_trial = self.generation(RecordCopy::Primary)?.unwrap_or(0)
-            != self.generation(RecordCopy::Secondary)?.unwrap_or(0);
+        let (primary, secondary) = (
+            self.generation(RecordCopy::Primary)?.unwrap_or(0),
+            self.generation(RecordCopy::Secondary)?.unwrap_or(0),
+        );
+        let was_trial = primary != secondary;
+        // Sign the side files before the record moves, at the generation it
+        // is expected to issue: a signer that cannot sign fails the
+        // activation with nothing written.
+        let expected = primary.max(secondary) + 1;
+        let rows = self.files.sign(expected, manager_rows.clone(), None)?;
+        let tx = self.sign_header(expected, header)?;
         let generation = self.record.activate(&record_rows)?;
-        if let Err(e) = self.write_rows(ROWS, generation, manager_rows) {
+        let (rows, tx) = if generation == expected {
+            (Ok(rows), Ok(tx))
+        } else {
+            (
+                self.files.sign(generation, manager_rows, None),
+                self.sign_header(generation, header),
+            )
+        };
+        if let Err(e) = rows.and_then(|rows| self.files.write_blob(ROWS, &rows)) {
             if was_trial {
                 tracing::warn!(
                     generation,
@@ -439,7 +484,7 @@ impl<R: BootRecord + Clone> SelectorStore for RecordSelectorStore<R> {
             }
             return Err(e);
         }
-        if let Err(e) = self.write_header(generation, header) {
+        if let Err(e) = tx.and_then(|tx| self.files.write_blob(TRANSACTION, &tx)) {
             tracing::warn!(
                 generation,
                 error = %e,
@@ -450,13 +495,20 @@ impl<R: BootRecord + Clone> SelectorStore for RecordSelectorStore<R> {
     }
 
     fn commit(&self) -> Result<(), SelectorError> {
-        let Some(generation) = self.generation(RecordCopy::Primary)? else {
+        // Read and sign before the record commits: a signer that cannot sign
+        // or verify fails the commit with nothing written.
+        let Some((generation, committed)) = self.prepare_commit()? else {
             return Ok(());
         };
         self.record.commit()?;
-        let rows = self.first_rows_at([ROWS, COMMITTED], generation)?;
-        let rows = self.required(rows, generation)?;
-        self.write_rows(COMMITTED, generation, rows)
+        match committed {
+            Some(committed) => self.files.write_blob(COMMITTED, &committed),
+            None => self.required(None, generation).map(|_| ()),
+        }
+    }
+
+    fn check_commit(&self) -> Result<(), SelectorError> {
+        self.prepare_commit().map(|_| ())
     }
 
     fn rollback(&self, header: &Transaction) -> Result<u64, SelectorError> {
@@ -467,9 +519,18 @@ impl<R: BootRecord + Clone> SelectorStore for RecordSelectorStore<R> {
             .ok_or(SelectorError::NoTrial)?;
         let rows = self.first_rows_at([COMMITTED, ROWS], floor)?;
         let rows = self.required(rows, floor)?;
-        self.write_header(floor, header)?;
+        // Sign before the first write: a signer that cannot sign fails the
+        // rollback with nothing written.
+        let signed_rows = self.files.sign(floor, rows.clone(), None)?;
+        self.files
+            .write_blob(TRANSACTION, &self.sign_header(floor, header)?)?;
         let generation = self.record.rollback()?;
-        if let Err(e) = self.write_rows(ROWS, generation, rows) {
+        let signed_rows = if generation == floor {
+            Ok(signed_rows)
+        } else {
+            self.files.sign(generation, rows, None)
+        };
+        if let Err(e) = signed_rows.and_then(|rows| self.files.write_blob(ROWS, &rows)) {
             tracing::warn!(
                 generation,
                 error = %e,
@@ -479,14 +540,8 @@ impl<R: BootRecord + Clone> SelectorStore for RecordSelectorStore<R> {
         Ok(generation)
     }
 
-    fn read_transaction(&self) -> Option<(u64, Transaction)> {
-        self.attributed_transaction().unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                "boot-vector: transaction header could not be attributed — read as none"
-            );
-            None
-        })
+    fn read_transaction(&self) -> Result<Option<(u64, Transaction)>, SelectorError> {
+        self.attributed_transaction()
     }
 
     fn write_transaction(
@@ -494,7 +549,8 @@ impl<R: BootRecord + Clone> SelectorStore for RecordSelectorStore<R> {
         generation: u64,
         header: &Transaction,
     ) -> Result<(), SelectorError> {
-        self.write_header(generation, header)
+        self.files
+            .write_blob(TRANSACTION, &self.sign_header(generation, header)?)
     }
 }
 
@@ -543,7 +599,7 @@ impl FileBootRecord {
         generation: u64,
         entries: BTreeMap<String, ComponentEntry>,
     ) -> Result<(), SelectorError> {
-        let mut blob = self.files.sign(generation, entries, None);
+        let mut blob = self.files.sign(generation, entries, None)?;
         blob.selectors = self.legacy_slot_map.as_ref().map(|map| {
             blob.entries
                 .iter()
@@ -593,10 +649,11 @@ impl BootRecord for FileBootRecord {
         self.write_copy(RecordCopy::Primary, secondary.generation, secondary.entries)?;
         Ok(secondary.generation)
     }
-    fn legacy_transaction(&self) -> Option<(u64, Transaction)> {
-        // An unreadable primary fails `read`; here it carries no header.
-        let blob = self.files.read_verified(PRIMARY).ok().flatten()?;
-        Some((blob.generation, blob.transaction?))
+    fn legacy_transaction(&self) -> Result<Option<(u64, Transaction)>, SelectorError> {
+        Ok(self
+            .files
+            .read_verified(PRIMARY)?
+            .and_then(|blob| Some((blob.generation, blob.transaction?))))
     }
 }
 
@@ -899,13 +956,13 @@ mod tests {
         assert_eq!(raw(&legacy_dir, "secondary").selectors, want);
         assert_eq!(raw(&legacy_dir, "transaction").selectors, None);
         assert_eq!(read.entries, written);
-        assert!(read.is_valid(&StubSigner));
+        assert!(read.is_valid(&StubSigner).unwrap());
 
         // A modified legacy map does not affect validity (the digest is
         // recomputed over the entries alone).
         let mut tampered = read;
         tampered.selectors = Some(BTreeMap::from([(BankSet(0), SlotSelect::new(Bank::A))]));
-        assert!(tampered.is_valid(&StubSigner));
+        assert!(tampered.is_valid(&StubSigner).unwrap());
 
         std::fs::remove_dir_all(&plain_dir).unwrap();
         std::fs::remove_dir_all(&legacy_dir).unwrap();
@@ -977,7 +1034,7 @@ mod tests {
             entries,
             transaction: None,
             sha256: [0u8; 32], // doesn't match contents
-            signature: TestSigner.sign(&[0u8; 32]),
+            signature: TestSigner.sign(&[0u8; 32]).unwrap(),
             selectors: None,
         };
         plant(&dir, PRIMARY, &tampered);
@@ -1010,11 +1067,11 @@ mod tests {
             entries: BTreeMap::new(),
             transaction: None,
             sha256,
-            signature: TestSigner.sign(&sha256),
+            signature: TestSigner.sign(&sha256).unwrap(),
             selectors: Some(selectors),
         };
         assert!(
-            TestSigner.verify(&blob.sha256, &blob.signature),
+            TestSigner.verify(&blob.sha256, &blob.signature).unwrap(),
             "the signature itself is good — only the digest is stale"
         );
 
@@ -1063,7 +1120,7 @@ mod tests {
             "the primary moved"
         );
         assert_eq!(
-            store.read_transaction(),
+            store.read_transaction().unwrap(),
             Some((1, header())),
             "the previous header is left, below the primary"
         );
@@ -1110,7 +1167,7 @@ mod tests {
             "primary bytes unchanged"
         );
         assert_eq!(
-            store.read_transaction(),
+            store.read_transaction().unwrap(),
             Some((1, resolved)),
             "the rollback header sits at the committed generation, below the primary"
         );
@@ -1126,7 +1183,7 @@ mod tests {
         let e = entries("os", Bank::B);
         let mut embedded = header();
         embedded.trial_boots = 3;
-        let blob = SelectorBlob::signed(7, e.clone(), Some(embedded.clone()), &TestSigner);
+        let blob = SelectorBlob::signed(7, e.clone(), Some(embedded.clone()), &TestSigner).unwrap();
         plant(&dir, PRIMARY, &blob);
 
         let vector = BootVector {
@@ -1134,13 +1191,13 @@ mod tests {
             entries: e.clone(),
         };
         assert_eq!(store.read_primary().unwrap(), Some(vector.clone()));
-        assert_eq!(store.read_transaction(), Some((7, embedded)));
+        assert_eq!(store.read_transaction().unwrap(), Some((7, embedded)));
 
         // A transaction file, once written, wins over the embedded header.
         let mut other = header();
         other.trial_boots = 9;
         store.write_transaction(7, &other).unwrap();
-        assert_eq!(store.read_transaction(), Some((7, other)));
+        assert_eq!(store.read_transaction().unwrap(), Some((7, other)));
         assert_eq!(store.read_primary().unwrap(), Some(vector));
 
         // A tampered signature: neither the vector nor the header is trusted.
@@ -1150,7 +1207,7 @@ mod tests {
         bad.signature = vec![0xFF; 32];
         plant(&dir2, PRIMARY, &bad);
         assert_eq!(store2.read_primary().unwrap(), None);
-        assert_eq!(store2.read_transaction(), None);
+        assert_eq!(store2.read_transaction().unwrap(), None);
 
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&dir2).unwrap();
@@ -1229,12 +1286,12 @@ mod tests {
         assert_eq!(primary.entries, entries("os", Bank::A), "record: os only");
 
         let rows = raw(&dir, ROWS);
-        assert!(rows.is_valid(&TestSigner));
+        assert!(rows.is_valid(&TestSigner).unwrap());
         assert_eq!(rows.generation, g);
         assert_eq!(rows.entries, entries("vm1", Bank::A), "rows: vm1 only");
 
         let tx = raw(&dir, TRANSACTION);
-        assert!(tx.is_valid(&TestSigner));
+        assert!(tx.is_valid(&TestSigner).unwrap());
         assert_eq!(tx.generation, g);
         assert!(tx.entries.is_empty());
         assert_eq!(tx.transaction, Some(armed));
@@ -1307,7 +1364,7 @@ mod tests {
         );
         assert_eq!(record.read(RecordCopy::Secondary).unwrap(), committed);
         assert_eq!(
-            store.read_transaction(),
+            store.read_transaction().unwrap(),
             Some((t, armed)),
             "the trial header is still readable"
         );
@@ -1366,7 +1423,10 @@ mod tests {
 
         record.set_fail_writes(true);
         assert!(store.rollback(&resolved).is_err());
-        assert_eq!(store.read_transaction(), Some((f, resolved.clone())));
+        assert_eq!(
+            store.read_transaction().unwrap(),
+            Some((f, resolved.clone()))
+        );
         assert_eq!(store.read_primary().unwrap().as_ref(), Some(&trial));
         assert_eq!(trial.entries["vm1"].bank, Bank::B, "the trial row stands");
 
@@ -1390,7 +1450,7 @@ mod tests {
         store.write_transaction(g, &other).unwrap();
 
         assert_eq!(std::fs::read(dir.join(ROWS)).unwrap(), rows_bytes);
-        assert_eq!(store.read_transaction(), Some((g, other)));
+        assert_eq!(store.read_transaction().unwrap(), Some((g, other)));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1407,7 +1467,7 @@ mod tests {
 
         for name in [ROWS, COMMITTED] {
             let blob = raw(&dir, name);
-            assert!(blob.is_valid(&TestSigner), "{name}");
+            assert!(blob.is_valid(&TestSigner).unwrap(), "{name}");
             assert_eq!(blob.generation, g, "{name}");
             assert!(blob.entries.is_empty(), "{name} carries no entries");
         }
@@ -1488,6 +1548,270 @@ mod tests {
         let primary = store.read_primary().unwrap();
         assert_eq!(primary.as_ref().unwrap().entries, vector(Bank::B, Bank::B));
         assert_eq!(store.read_secondary().unwrap(), primary);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- a signer that could not decide is not a verdict ---
+
+    /// Every file in `dir`, by name, with its bytes.
+    #[cfg(feature = "test-seams")]
+    fn snapshot(dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().into_string().unwrap(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// A file store under `signer`, committed at A and in trial on B (all
+    /// five files written), with the signer working.
+    #[cfg(feature = "test-seams")]
+    fn store_in_trial(tag: &str, signer: &SwitchableSigner) -> (PathBuf, FileSelectorStore) {
+        let dir = temp_path(tag);
+        let store = FileSelectorStore::new(&dir, Box::new(signer.clone()));
+        store.activate(&entries("os", Bank::A), &header()).unwrap();
+        store.commit().unwrap();
+        let mut armed = header();
+        armed.trial_boots = 1;
+        assert_eq!(store.activate(&entries("os", Bank::B), &armed).unwrap(), 2);
+        (dir, store)
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn signer_unavailable_reads_are_err_never_absent() {
+        let signer = SwitchableSigner::new();
+        let (dir, store) = store_in_trial("unavailable-reads", &signer);
+        let before = snapshot(&dir);
+
+        signer.set(SignerMode::Unavailable);
+        assert!(matches!(
+            store.read_primary(),
+            Err(SelectorError::Unreadable(_))
+        ));
+        assert!(matches!(
+            store.read_secondary(),
+            Err(SelectorError::Unreadable(_))
+        ));
+        assert!(matches!(
+            store.read_transaction(),
+            Err(SelectorError::Unreadable(_))
+        ));
+        assert_eq!(snapshot(&dir), before, "a read writes nothing");
+
+        signer.set(SignerMode::Ok);
+        assert_eq!(store.read_primary().unwrap().unwrap().generation, 2);
+        assert_eq!(store.read_secondary().unwrap().unwrap().generation, 1);
+        assert_eq!(store.read_transaction().unwrap().unwrap().1.trial_boots, 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn signer_invalid_still_reads_as_absent() {
+        let signer = SwitchableSigner::new();
+        let (dir, store) = store_in_trial("invalid-reads", &signer);
+
+        signer.set(SignerMode::Invalid);
+        assert_eq!(store.read_primary().unwrap(), None);
+        assert_eq!(store.read_secondary().unwrap(), None);
+        assert_eq!(store.read_transaction().unwrap(), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn signer_unavailable_at_any_call_of_activate_writes_nothing() {
+        let signer = SwitchableSigner::new();
+        let (dir, store) = store_in_trial("unavailable-activate", &signer);
+        let before = snapshot(&dir);
+
+        // Verify works, sign does not.
+        signer.set_sign(SignerMode::Unavailable);
+        assert!(store.activate(&entries("os", Bank::A), &header()).is_err());
+        assert_eq!(snapshot(&dir), before);
+
+        // The signer goes away after `n` calls, for every `n` short of the
+        // activation's own: each attempt fails and leaves every file as it was.
+        let mut n = 0;
+        loop {
+            signer.set(SignerMode::Ok);
+            signer.unavailable_after(n);
+            match store.activate(&entries("os", Bank::A), &header()) {
+                Err(_) => assert_eq!(snapshot(&dir), before, "unavailable after {n} calls"),
+                Ok(generation) => {
+                    assert!(n > 0);
+                    assert_eq!(generation, 3, "the failed attempts issued nothing");
+                    break;
+                }
+            }
+            n += 1;
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn signer_unavailable_at_any_call_of_commit_writes_nothing_and_is_never_a_no_op() {
+        let signer = SwitchableSigner::new();
+        let (dir, store) = store_in_trial("unavailable-commit", &signer);
+        let before = snapshot(&dir);
+
+        signer.set(SignerMode::Unavailable);
+        assert!(
+            matches!(store.commit(), Err(SelectorError::Unreadable(_))),
+            "a primary that could not be verified is not an absent one"
+        );
+        assert!(store.check_commit().is_err());
+        assert_eq!(snapshot(&dir), before);
+
+        signer.set_verify(SignerMode::Ok);
+        assert!(store.commit().is_err(), "verify works, sign does not");
+        assert!(store.check_commit().is_err());
+        assert_eq!(snapshot(&dir), before);
+
+        let mut n = 0;
+        loop {
+            signer.set(SignerMode::Ok);
+            signer.unavailable_after(n);
+            match store.commit() {
+                Err(_) => assert_eq!(snapshot(&dir), before, "unavailable after {n} calls"),
+                Ok(()) => break,
+            }
+            n += 1;
+        }
+        signer.set(SignerMode::Ok);
+        assert_eq!(store.read_secondary().unwrap().unwrap().generation, 2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn check_commit_writes_nothing_and_commit_without_a_primary_stays_ok() {
+        let signer = SwitchableSigner::new();
+        let (dir, store) = store_in_trial("check-commit", &signer);
+        let before = snapshot(&dir);
+        store.check_commit().expect("a store that can commit");
+        assert_eq!(snapshot(&dir), before);
+
+        // No selector yet: nothing to verify or sign, so the commit is the
+        // documented no-op even with the signer gone.
+        let empty = temp_path("check-commit-empty");
+        let fresh = FileSelectorStore::new(&empty, Box::new(signer.clone()));
+        signer.set(SignerMode::Unavailable);
+        fresh.check_commit().expect("no primary");
+        fresh.commit().expect("no primary");
+        assert!(!empty.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn signer_unavailable_during_rollback_changes_no_copy() {
+        let signer = SwitchableSigner::new();
+        let (dir, store) = store_in_trial("unavailable-rollback", &signer);
+        let before = snapshot(&dir);
+        let mut resolved = header();
+        resolved.resolution = Some(Resolution {
+            outcome: Outcome::RolledBack,
+            reason: Reason::Verdict,
+        });
+
+        signer.set(SignerMode::Unavailable);
+        assert!(
+            matches!(store.rollback(&resolved), Err(SelectorError::Unreadable(_))),
+            "not NoTrial: the copies could not be verified"
+        );
+        assert_eq!(snapshot(&dir), before);
+        signer.set_verify(SignerMode::Ok);
+        assert!(store.rollback(&resolved).is_err());
+        assert_eq!(snapshot(&dir), before);
+
+        // Taken away later, the copies and rows never change; the header is
+        // written first, so a failure after it leaves the rollback header at
+        // the committed generation, below the primary — stale, as the
+        // contract has it.
+        let mut n = 0;
+        loop {
+            signer.set(SignerMode::Ok);
+            signer.unavailable_after(n);
+            let result = store.rollback(&resolved);
+            let now = snapshot(&dir);
+            if result.is_ok() {
+                break;
+            }
+            for name in [PRIMARY, SECONDARY, ROWS, COMMITTED] {
+                assert_eq!(
+                    now[name], before[name],
+                    "{name}, unavailable after {n} calls"
+                );
+            }
+            if now[TRANSACTION] != before[TRANSACTION] {
+                let tx = raw(&dir, TRANSACTION);
+                assert_eq!((tx.generation, tx.transaction), (1, Some(resolved.clone())));
+            }
+            n += 1;
+        }
+        signer.set(SignerMode::Ok);
+        assert_eq!(store.read_primary().unwrap().unwrap().generation, 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn signer_unavailable_header_write_is_err_and_leaves_the_header() {
+        let signer = SwitchableSigner::new();
+        let (dir, store) = store_in_trial("unavailable-header", &signer);
+        let before = snapshot(&dir);
+        let mut counted = header();
+        counted.trial_boots = 2;
+
+        signer.set(SignerMode::Unavailable);
+        assert!(store.write_transaction(2, &counted).is_err());
+        assert_eq!(snapshot(&dir), before);
+
+        signer.set(SignerMode::Ok);
+        assert_eq!(store.read_transaction().unwrap().unwrap().1.trial_boots, 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn signer_unavailable_over_a_partial_record_writes_no_side_file() {
+        let (dir, record) = (
+            temp_path("unavailable-partial"),
+            InMemoryBootRecord::routing(["os"]),
+        );
+        let signer = SwitchableSigner::new();
+        let store = RecordSelectorStore::over(record.clone(), &dir, Box::new(signer.clone()));
+        store
+            .activate(&vector(Bank::A, Bank::A), &header())
+            .unwrap();
+        store.commit().unwrap();
+        let before = (snapshot(&dir), record.read(RecordCopy::Primary).unwrap());
+
+        signer.set_sign(SignerMode::Unavailable);
+        assert!(store
+            .activate(&vector(Bank::B, Bank::B), &header())
+            .is_err());
+        assert_eq!(
+            (snapshot(&dir), record.read(RecordCopy::Primary).unwrap()),
+            before,
+            "the record did not move: the side files are signed first"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

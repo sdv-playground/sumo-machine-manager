@@ -176,6 +176,12 @@ impl MachineRegistry {
     /// or missing ids) is no longer needed, and hid the same hole whenever an id
     /// was missing.
     ///
+    /// A vector in trial whose every trial row NV has already committed at
+    /// that bank, with nothing in trial in NV, is committed: the verdict's NV
+    /// commit landed and its vector commit did not (the signer went away in
+    /// between). Left in trial, a trial boot limit would roll the vector back
+    /// below a committed update.
+    ///
     /// A failed selector write is returned as `Err`; the in-memory selector
     /// then holds whatever the last successful write left.
     pub fn seed_selector<'a>(
@@ -218,6 +224,18 @@ impl MachineRegistry {
                 .iter()
                 .all(|(id, nv)| sb.active_bank(id) == Some(nv.active_bank))
         {
+            // NV committed the trial the vector still holds: a commit whose
+            // NV step landed and whose vector step did not. Complete it, so no
+            // trial boot limit rolls a committed update back.
+            let ids: Vec<&str> = entries.iter().map(|(id, _)| *id).collect();
+            if sb.is_trial() && entries.iter().all(|(_, nv)| nv.committed) && sb.trial_only_in(&ids)
+            {
+                tracing::warn!(
+                    generation = sb.generation(),
+                    "boot-vector: NV committed the trial the vector still holds — completing the commit"
+                );
+                sb.commit()?;
+            }
             return Ok(());
         }
         let all = entries.clone();
@@ -309,7 +327,7 @@ impl MachineRegistry {
                 | BootObservation::Counted { trial_boots },
             ) => trial_boots,
             Err(e) => {
-                tracing::warn!(error = %e, "trial boot not counted — retried next boot");
+                tracing::error!(error = %e, "trial boot not counted — retried next boot");
                 return out;
             }
         };
