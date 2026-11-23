@@ -40,7 +40,7 @@ pub struct ShellConfig {
 
     /// Role prefix of the SOVD server identification; with it the server is
     /// identified as `<prefix>-<first 16 hex of the ECU id>` — the Tower roster
-    /// id, e.g. `cvc-host-…` — from first boot, before a TLS leaf exists. An
+    /// id, e.g. `hpc-host-…` — from first boot, before a TLS leaf exists. An
     /// explicit `identification` wins.
     #[serde(default)]
     pub identification_prefix: Option<String>,
@@ -67,8 +67,8 @@ pub struct NodeConfig {
 impl ShellConfig {
     /// The node this server is on `/v1`, as `(id, name)`: an explicit `node`
     /// (name defaulting to the id); else derived from `identification_prefix`,
-    /// whose first `-`-separated label is the node (`cvc-host` → `cvc`, named
-    /// `cvc`; a prefix without `-` is the node itself); else `None`, and `/v1`
+    /// whose first `-`-separated label is the node (`hpc-host` → `hpc`, named
+    /// `hpc`; a prefix without `-` is the node itself); else `None`, and `/v1`
     /// is served flat as before. A prefix with an empty first label (`""`,
     /// `-x`) derives no node.
     pub fn effective_node(&self) -> Option<(String, String)> {
@@ -116,28 +116,28 @@ mod node_tests {
     #[test]
     fn an_explicit_node_wins_over_the_prefix() {
         assert_eq!(
-            node("node: { id: hpc, name: HPC }\nidentification_prefix: cvc-host"),
+            node("node: { id: hpc, name: HPC }\nidentification_prefix: zone-host"),
             some("hpc", "HPC")
         );
         // The name defaults to the id.
         assert_eq!(
-            node("node: { id: hpc }\nidentification_prefix: cvc-host"),
+            node("node: { id: hpc }\nidentification_prefix: zone-host"),
             some("hpc", "hpc")
         );
     }
 
     #[test]
     fn the_prefix_first_label_is_the_node() {
-        assert_eq!(node("identification_prefix: cvc-host"), some("cvc", "cvc"));
-        assert_eq!(node("identification_prefix: cvc-vm1-x"), some("cvc", "cvc"));
+        assert_eq!(node("identification_prefix: hpc-host"), some("hpc", "hpc"));
+        assert_eq!(node("identification_prefix: hpc-vm1-x"), some("hpc", "hpc"));
         // No `-`: the prefix is the node itself.
-        assert_eq!(node("identification_prefix: cvc"), some("cvc", "cvc"));
+        assert_eq!(node("identification_prefix: hpc"), some("hpc", "hpc"));
     }
 
     #[test]
     fn no_node_without_a_usable_prefix() {
         assert_eq!(node(""), None);
-        assert_eq!(node("identification: cvc-host-f88a13a329a72db1"), None);
+        assert_eq!(node("identification: hpc-host-f88a13a329a72db1"), None);
         // An empty first label derives nothing.
         assert_eq!(node("identification_prefix: \"-x\""), None);
         assert_eq!(node("identification_prefix: \"\""), None);

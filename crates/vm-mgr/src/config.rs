@@ -358,7 +358,7 @@ pub struct ShutdownConfig {
 }
 
 // 60s — Linux (autosd / debian) systemd shutdown takes 5-30s on
-// managed-cvc; QNX is faster but the orchestrator amortises the
+// a managed host; QNX is faster but the orchestrator amortises the
 // extra ceiling. Was 10s, which always force-killed before linux
 // finished, leaving fsck-on-next-mount as the cleanup path.
 fn default_shutdown_timeout() -> u64 {

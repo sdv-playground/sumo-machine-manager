@@ -291,7 +291,7 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    const PLATFORM: &str = "component=supernova-platform\n\
+    const PLATFORM: &str = "component=host-platform\n\
         image=nor_ifs\n\
         version=PSW_ONLY_20_1.10-0-gb862638\n\
         tag=PSW_ONLY_20_1.10\n\
@@ -303,7 +303,7 @@ mod tests {
         manifest_coo11_m7_release_tgz=1.7.0\n\
         manifest_hse_fw_pink_g3_rev1_1=0.2.64.0\n";
 
-    const OLD_BOOT: &str = "component=supernova-boot\n\
+    const OLD_BOOT: &str = "component=host-boot\n\
         status=no version record in /dev/fs0p0 0x00000000..0x00800000 (boot older than the record)\n";
 
     fn write(dir: &tempfile::TempDir, name: &str, text: &str) -> PathBuf {
@@ -318,7 +318,7 @@ mod tests {
     fn platform_spec(file: PathBuf) -> IdentDataSpec {
         IdentDataSpec {
             entity: "platform".into(),
-            name: Some("Supernova platform".into()),
+            name: Some("Host platform".into()),
             file,
             sw_version: Some(SwVersionSpec {
                 key: "version".into(),

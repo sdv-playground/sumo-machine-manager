@@ -66,7 +66,7 @@ The load-bearing ones, bottom-up:
   on shared memory (ivshmem vs QNX native shm).
 - **vm-mgr** (lib, was `vm-service`): QEMU / `qvm` lifecycle, per-bank VM config,
   ivshmem-server management, QMP integration, IPC to the diagnostics daemon.
-  On a device supernova embeds `VmManager` in-process; the standalone `vm-service`
+  On a device the node manager embeds `VmManager` in-process; the standalone `vm-service`
   binary is the dev/Linux path and lives in `tools/crates/vm-service` — the
   PROCESS owns that name, the library is `vm-mgr`.
 - **machine-contract** (lib): the out-of-tree implementer's surface — the four

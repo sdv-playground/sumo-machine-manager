@@ -81,7 +81,7 @@ pub struct WipeTargets {
     /// partition head makes host-boot's mount of THAT bank fail → it falls back to
     /// the resident Tier-1 MM (mmgr/bank_a). Same mechanism as prepare-device.sh's
     /// SOVD-down break-glass wipe. Best-effort per device: the RUNNING bank's
-    /// device is loopback-mounted by the live supernova and refuses the write with
+    /// device is loopback-mounted by the running node manager and refuses the write with
     /// EBUSY (benign — see the step-7b note for the residual and why we don't tear
     /// the loopback down from inside the running process), so only the inactive
     /// SIBLING zeroes here. Empty when no component declares parts (an
@@ -367,7 +367,7 @@ pub fn execute_wipe(targets: &WipeTargets) -> WipeOutcome {
     //     re-runs host-boot.sh to re-select the tier; an exit-respawn re-execs the
     //     same mounted bank).
     //
-    //     SCOPE (deliberate — see tasks): this runs INSIDE the live supernova, which
+    //     SCOPE (deliberate — see tasks): this runs INSIDE the running node manager, which
     //     is itself executing from the CURRENTLY-RUNNING bank's loopback
     //     (/dev/hostbank0 on /tmp/host-app). We therefore do NOT tear that loopback
     //     down here (unmount + slay devb-loopback would pull the fs out from under
@@ -376,7 +376,7 @@ pub fn execute_wipe(targets: &WipeTargets) -> WipeOutcome {
     //     the INACTIVE SIBLING bank zeroes now. RESIDUAL: if the post-reset host-boot
     //     re-selects the still-intact running bank, it could still mount Tier-2 —
     //     verify on-device. If insufficient, the both-banks teardown belongs in a
-    //     reset-specific reboot path (after supernova commits to dying), NOT here.
+    //     reset-specific reboot path (after the node manager commits to dying), NOT here.
     //     `zero_partition_head` skips an absent device (emulated/container: no raw
     //     host bank).
     for dev in &targets.host_bank_partitions {
@@ -435,7 +435,7 @@ fn zero_partition_head(dev: &str, out: &mut WipeOutcome) {
             }
         }
         // EBUSY is EXPECTED + BENIGN for the CURRENTLY-RUNNING host-appl bank: it's
-        // loopback-mounted by the live supernova, so it can't be opened for write —
+        // loopback-mounted by the running node manager, so it can't be opened for write —
         // and it doesn't need zeroing here (the forced reboot + the sibling-bank
         // zero drop the node to Tier-1; a guest RW partition is released by
         // stop_guests before this runs). Treat it as a best-effort SKIP (log,
@@ -522,7 +522,7 @@ fn wipe_dir_contents(root: &Path, dir: &Path, label: &str, out: &mut WipeOutcome
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownKind {
-    /// Clean exit — start-managed.sh's respawn loop brings supernova
+    /// Clean exit — start-managed.sh's respawn loop brings the node manager
     /// back up with the wiped state. Fast path, ~5 s round-trip.
     Exit,
     /// Full host reboot via `sync && reboot` (QNX) / `shutdown -r now`
@@ -882,7 +882,7 @@ mod tests {
     ///   vm2/{bank_a/boot.img, bank_b/boot.img, current → bank_b}
     ///   hsm/{bank_a/blob.bin, bank_b/blob.bin}
     ///   {vm1,vm2,hsm}/{staging-bank_a.cbor, staging/bank_a/x.part}
-    ///   log/supernova.log
+    ///   log/node.log
     fn make_layout() -> (tempfile::TempDir, Layout) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -893,8 +893,8 @@ mod tests {
         std::fs::create_dir_all(mmgr.join("B")).unwrap();
         std::fs::write(mmgr.join("nv-store.bin"), b"nv-data").unwrap();
         std::fs::write(mmgr.join("images").join("IMAGE.suit"), b"img").unwrap();
-        std::fs::write(mmgr.join("A").join("keep.bin"), b"supernova-bin-A").unwrap();
-        std::fs::write(mmgr.join("B").join("keep.bin"), b"supernova-bin-B").unwrap();
+        std::fs::write(mmgr.join("A").join("keep.bin"), b"node-bin-A").unwrap();
+        std::fs::write(mmgr.join("B").join("keep.bin"), b"node-bin-B").unwrap();
         std::fs::write(mmgr.join("start.sh"), b"#!/bin/sh\n").unwrap();
         std::os::unix::fs::symlink("A", mmgr.join("current")).unwrap();
 
@@ -930,7 +930,7 @@ mod tests {
         }
 
         std::fs::create_dir_all(root.join("log")).unwrap();
-        std::fs::write(root.join("log").join("supernova.log"), b"prior boot").unwrap();
+        std::fs::write(root.join("log").join("node.log"), b"prior boot").unwrap();
 
         std::fs::create_dir_all(mmgr.join("boot-selector")).unwrap();
         std::fs::write(mmgr.join("boot-selector").join("primary"), b"{}").unwrap();
@@ -950,7 +950,7 @@ mod tests {
                     "{{id: hsm, type: hsm, rollback: false, single_bank: true, slot: 3, storage_path: {storage}}}"
                 )),
                 spec(&format!(
-                    "{{id: supernova, type: app, slot: 4, base_path: {}}}",
+                    "{{id: host-app, type: app, slot: 4, base_path: {}}}",
                     mmgr.display()
                 )),
             ],
@@ -1084,7 +1084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn happy_path_wipes_targets_preserves_supernova_install() {
+    async fn happy_path_wipes_targets_preserves_app_install() {
         let (tmp, layout) = make_layout();
         let root = tmp.path().to_path_buf();
         let (state, scheduled) = make_state(layout);
@@ -1105,7 +1105,7 @@ mod tests {
         assert!(!root.join("vm2").join("bank_b").join("boot.img").exists());
         assert!(!root.join("hsm").join("bank_a").join("blob.bin").exists());
         assert!(!root.join("hsm").join("bank_b").join("blob.bin").exists());
-        assert!(!root.join("log").join("supernova.log").exists());
+        assert!(!root.join("log").join("node.log").exists());
         assert!(!root
             .join("mmgr")
             .join("boot-selector")

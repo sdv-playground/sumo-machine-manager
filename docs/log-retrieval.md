@@ -70,12 +70,12 @@ Per-variant detail:
   correct across the non-monotonic wall-clock jump). A persist POLICY (severity
   floor + emitter denylist) keeps the `devb_*` firehose off flash. TWO PLANES,
   same bus: `slog2-ring` = raw volatile live tail (all emitters, cursor:false);
-  `slog2` = the durable, cursor-pageable, resumable timeline (oldest→now). supernova
+  `slog2` = the durable, cursor-pageable, resumable timeline (oldest→now). The node manager
   is the READER half only (`LogSource::Slog2Segments`).
-  LAUNCH: the drainer is an OS-level daemon that must OUTLIVE supernova (else it
-  can't capture supernova's own crash + dies on every re-exec), so it is started
-  by `runtime/start-managed.sh` ONCE before the supernova respawn loop — NOT by
-  supernova. Tier gate = binary presence: it ships only in the Tier-2 (`full`)
+  LAUNCH: the drainer is an OS-level daemon that must OUTLIVE the node manager (else
+  it can't capture the node manager's own crash + dies on every re-exec), so it is started
+  by `runtime/start-managed.sh` ONCE before the node-manager respawn loop — NOT
+  by the node manager. Tier gate = binary presence: it ships only in the Tier-2 (`full`)
   bundle, so Tier-1 (provisioning MM, no drainer bin) stays ring-only.
   FUTURE: it belongs in the host OS IFS boot beside `Start slogger2` (a true OS
   service, independent of the app bank); start-managed.sh is the interim home.

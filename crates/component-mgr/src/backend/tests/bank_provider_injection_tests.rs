@@ -613,7 +613,7 @@ async fn queued_vm_restart_without_fresh_boot_stays_verifying_and_unwitnessed() 
 /// goes through — with the NV boot counter still 0. The promotion no longer
 /// writes one (it was a process-lifetime fact dressed up as durable), and the
 /// commit gate no longer asks for one on a vm-service-backed guest: the only
-/// durable writer there is supernova's heartbeat-confirmed witness, so gating
+/// durable writer there is the node manager's heartbeat-confirmed witness, so gating
 /// on it made a guest with a broken heartbeat chain permanently uncommittable
 /// ("no durable boot witness" on the rig). The reboot evidence is the guest's
 /// fresh heartbeat `boot_id` versus the pre-reset baseline — checked in the
@@ -1023,7 +1023,7 @@ async fn multi_source_file_read_pages_via_cursor() {
     }
     // A file source with several lines so one page leaves more to read.
     std::fs::write(
-        dir.join("supernova.log"),
+        dir.join("node.log"),
         "line-a\nline-b\nline-c\nline-d\nline-e\n",
     )
     .unwrap();
@@ -1061,7 +1061,7 @@ async fn multi_source_file_read_pages_via_cursor() {
     // sets it): must return a cursor despite the mixed source set.
     let page = b
         .get_logs_paged(&LogFilter {
-            source: Some("supernova".into()),
+            source: Some("node".into()),
             limit: Some(2),
             ..Default::default()
         })
@@ -1228,7 +1228,7 @@ fn backend_with_logs(source: LogSource) -> ComponentBackend<MemBlockDevice> {
 }
 
 /// §7.9 HOST diagnostics: a `host_diagnostics: true` backend gathers probes
-/// IN-PROCESS (no guest agent) — this is how supernova's own disk/RAM become
+/// IN-PROCESS (no guest agent) — this is how the node manager's own disk/RAM become
 /// visible over SOVD (the gap a flash `No space left on device` exposed).
 #[tokio::test]
 async fn host_diagnostics_gathers_in_process() {
@@ -1532,7 +1532,7 @@ async fn scripts_execute_proxies_run_and_stores_execution() {
 async fn logs_host_files_globs_and_filters() {
     let dir = std::env::temp_dir().join(format!("cm-logs-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("supernova.log"), "one\ntwo\nthree\n").unwrap();
+    std::fs::write(dir.join("node.log"), "one\ntwo\nthree\n").unwrap();
     std::fs::write(dir.join("other.log"), "alpha\nbeta\n").unwrap();
     std::fs::write(dir.join("skip.txt"), "not a log\n").unwrap();
 
@@ -1547,7 +1547,7 @@ async fn logs_host_files_globs_and_filters() {
 
     let filtered = b
         .get_logs(&LogFilter {
-            source: Some("supernova".into()),
+            source: Some("node".into()),
             pattern: Some("t".into()),
             tail: Some(1),
             ..LogFilter::default()
@@ -1556,7 +1556,7 @@ async fn logs_host_files_globs_and_filters() {
         .unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].message, "three");
-    assert_eq!(filtered[0].source.as_deref(), Some("supernova"));
+    assert_eq!(filtered[0].source.as_deref(), Some("node"));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2311,7 +2311,7 @@ async fn bulk_data_logs_category_list_and_download() {
     use sovd_core::DiagnosticBackend;
     let dir = std::env::temp_dir().join(format!("cm-bulk-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let f1 = dir.join("supernova.log");
+    let f1 = dir.join("node.log");
     let f2 = dir.join("other.log");
     std::fs::write(&f1, "one\ntwo\nthree\n").unwrap();
     std::fs::write(&f2, "alpha\nbeta\n").unwrap();
@@ -2489,12 +2489,12 @@ fn guest_bulk_id_round_trips_and_is_distinct() {
 
     // A host-file id (bare base64url path — the unchanged scheme) is NOT
     // parsed as a guest id, so get_bulk_data routes it to the host path.
-    let host_id = b64url(b"/var/log/supernova.log");
+    let host_id = b64url(b"/var/log/node.log");
     assert!(parse_guest_bulk_id(&host_id).is_none());
     // And the host id still round-trips to its path (scheme unchanged).
     assert_eq!(
         String::from_utf8(b64url_decode(&host_id).unwrap()).unwrap(),
-        "/var/log/supernova.log"
+        "/var/log/node.log"
     );
 
     // Malformed guest ids are rejected (no panic).

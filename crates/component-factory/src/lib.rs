@@ -108,7 +108,7 @@ pub struct ComponentSpec {
     pub log_agent_url: Option<String>,
 
     /// §7.21 log reads — host-local file globs (`dir/prefix*suffix`)
-    /// for components whose logs live on THIS node (e.g. the supernova
+    /// for components whose logs live on THIS node (e.g. the node manager
     /// component: `["/var/log/*.log"]`). STANDARD (line) logs.
     #[serde(default)]
     pub host_log_globs: Option<Vec<String>>,
@@ -120,10 +120,10 @@ pub struct ComponentSpec {
 
     /// §7.21 log reads — the QNX `slogger2` ring (the host system log), read via
     /// `platform_log::read_slog2`. `true` for the host component on QNX: it serves
-    /// supernova's own records (emitted through score-log-slog2) AND the OS
+    /// the node manager's own records (emitted through score-log-slog2) AND the OS
     /// driver/eMMC telemetry, decoupled from the producer via the kernel-owned
-    /// ring — replacing the `host_log_globs` tail of supernova.log. Additive with
-    /// the above; a no-op read off QNX. STANDARD (line) logs.
+    /// ring — replacing the `host_log_globs` tail of the node manager's log
+    /// file. Additive with the above; a no-op read off QNX. STANDARD (line) logs.
     #[serde(default)]
     pub host_slog2: bool,
 
@@ -162,7 +162,7 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub diag_agent_url: Option<String>,
     /// §7.9 diagnostics gathered IN-PROCESS (no guest agent) — set `true` for
-    /// the HOST itself (supernova) / on-box components, so its disk/RAM
+    /// the HOST itself (the node manager) / on-box components, so its disk/RAM
     /// (`/mnt/common-rw`, `/proc/meminfo`) are visible over SOVD. Default false.
     #[serde(default)]
     pub host_diagnostics: bool,
@@ -175,7 +175,7 @@ pub struct ComponentSpec {
 
     /// This component is a vHSM principal: after a bank commit the host arms
     /// enrollment so the guest can enroll on its next boot. The platform fills
-    /// it — supernova derives it from its `hsm.allow` list.
+    /// it — the node manager derives it from its `hsm.allow` list.
     #[serde(default)]
     pub vm_principal: bool,
 }

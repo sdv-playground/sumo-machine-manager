@@ -98,8 +98,8 @@ fn serve(listener: UnixListener, hsm: Arc<Mutex<SimHsm>>) {
 
 fn main() {
     // Fleet logging: install the env-selected recorder + tracing→score_log bridge
-    // (slog2 on QNX). hsm-sim-service is a supernova companion whose stdout would
-    // otherwise funnel ANSI fmt into supernova.log; route it to the bus like the
+    // (slog2 on QNX). hsm-sim-service is a node-manager companion whose stdout would
+    // otherwise funnel ANSI fmt into the node manager's log; route it to the bus like the
     // other host binaries. Context "hsms".
     sumo_log::init_tracing("hsms");
 

@@ -2,9 +2,9 @@
 //! resolution rules that fill in what a node leaves unset.
 //!
 //! [`HsmSupervisorConfig`] is deliberately **not** a serde type. The node's
-//! deployment config (supernova's `HsmConfig`, and whatever the CM5 and DDU
-//! managers grow) owns the YAML surface and the defaults, because the useful
-//! defaults are board-specific: supernova's `bind` defaults to the vp2
+//! deployment config (the node manager's `HsmConfig`, and whatever other
+//! boards' managers grow) owns the YAML surface and the defaults, because the
+//! useful defaults are board-specific: one node manager's `bind` defaults to the vp2
 //! vdevpeer address and its `policy_dir` to a bank-relative path under
 //! `/mnt/common-rw`. Neither is a fact about HSM supervision. So the node maps
 //! its own config into this struct, and this crate holds only the rules that
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(resolve_backend_socket(&cfg), PathBuf::from("/run/hsm.sock"));
     }
 
-    /// `resolve_daemon_bin` was untested in supernova — the arg-mapping tests
+    /// `resolve_daemon_bin` was untested in the node binary it came from — the arg-mapping tests
     /// covered it only incidentally, through `vhsm_spawn_spec`'s `daemon_bin`
     /// assertion on the `None` case.
     #[test]

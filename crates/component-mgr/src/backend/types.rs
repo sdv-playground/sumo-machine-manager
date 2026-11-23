@@ -325,7 +325,7 @@ pub enum LogSource {
     /// `{timestamp, priority, message, source}` (mirror-by-convention;
     /// the guest tree is a different repo).
     GuestAgent { url: String },
-    /// Host-local plain files (the supernova/host component): bounded
+    /// Host-local plain files (the node manager/host component): bounded
     /// tails of every file matching the globs (only `dir/prefix*suffix`
     /// patterns — no full glob engine). Lines carry the file's mtime.
     /// These produce STANDARD (line) log entries.
@@ -339,7 +339,7 @@ pub enum LogSource {
     /// discrete downloadable entries — the message-passing pattern.
     HostDumps { dir: String },
     /// The QNX `slogger2` ring — the host system log, and the sink for everything
-    /// that CAN emit to it: supernova + vhsm-ssd (via score-log-slog2) plus the OS
+    /// that CAN emit to it: the node manager + vhsm-ssd (via score-log-slog2) plus the OS
     /// driver/eMMC telemetry (devb_sdmmc, CAM). Read through `platform_log::read_slog2`,
     /// decoupled from the producer via the kernel-owned ring. It is ONE physical
     /// `source` (`"slog2"`); the per-buffer name is the EMITTER, surfaced in
@@ -396,7 +396,7 @@ pub struct ComponentConfig {
     /// `tasks/diag-agent-design.md`.
     pub diag_agent_url: Option<String>,
     /// §7.9 diagnostics gathered IN-PROCESS (no guest agent) — for the HOST
-    /// itself (supernova) and any component that runs ON this box. `true` → the
+    /// itself (the node manager) and any component that runs ON this box. `true` → the
     /// same built-in probes the guest diag-agent serves (mem/df/du:<dir>/ps/…)
     /// are gathered locally. The host has no diag-agent to proxy, so this is how
     /// its `/mnt/common-rw` disk, RAM, etc. become visible over SOVD — the gap a

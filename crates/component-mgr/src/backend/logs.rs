@@ -424,7 +424,7 @@ pub(super) fn file_mtime(path: &std::path::Path) -> chrono::DateTime<Utc> {
 /// real PER-LINE time. When that leading stamp parses, use it (and drop it from
 /// the message — the SOVD `timestamp` field carries it instead).
 ///
-/// When a line has NO self-timestamp (e.g. supernova's own un-piped stderr) we do
+/// When a line has NO self-timestamp (e.g. the node manager's own un-piped stderr) we do
 /// NOT substitute the file `mtime`: mtime is when the file was last written, not
 /// when the line was logged, so it's worthless as a line time and — being shared
 /// by every mtime-stamped line — reproduces the "all timestamps identical" bug.
@@ -510,7 +510,7 @@ pub(super) fn read_lines_from(
 /// journald source instead).
 pub(super) fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
     // The slog2 ring is ONE physical `source` ("slog2"); the per-buffer name is the
-    // EMITTER (supernova, vhsm-ssd, devb_sdmmc, …), carried in `fields.emitter` —
+    // EMITTER (the node manager, vhsm-ssd, devb_sdmmc, …), carried in `fields.emitter` —
     // not the source. So a `filter.source` naming a specific slog2 buffer would NOT
     // match here (source is always "slog2"); to narrow to one emitter a client
     // filters on the emitter field / message, not `source`. A `filter.source` set
@@ -587,7 +587,7 @@ pub(super) fn slog2_logs(filter: &LogFilter) -> Vec<LogEntry> {
 /// resume API, so this source is `cursor:false` — good for "last N raw records /
 /// sub-policy noise", but a client wanting the resumable slog2 log uses `slog2`
 /// (the drained segments plane) instead. The per-buffer emitter
-/// (supernova/vhsm-ssd/devb_sdmmc/…) is carried in `LogEntry.fields.emitter`, NOT
+/// (node manager/vhsm-ssd/devb_sdmmc/…) is carried in `LogEntry.fields.emitter`, NOT
 /// the source — slog2 is one bus, many emitters.
 pub(super) const SLOG2_SOURCE: &str = "slog2-ring";
 

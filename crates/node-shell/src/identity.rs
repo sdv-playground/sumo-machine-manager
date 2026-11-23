@@ -92,19 +92,19 @@ mod mdns_identification_tests {
     #[test]
     fn prefix_takes_the_first_16_hex_of_the_ecu_id() {
         assert_eq!(
-            prefixed_identification("cvc-host", ECU_ID).as_deref(),
-            Some("cvc-host-f88a13a329a72db1")
+            prefixed_identification("hpc-host", ECU_ID).as_deref(),
+            Some("hpc-host-f88a13a329a72db1")
         );
     }
 
     #[test]
     fn an_ecu_id_shorter_than_16_hex_yields_none() {
-        assert_eq!(prefixed_identification("cvc-host", "f88a13a329a72db"), None);
+        assert_eq!(prefixed_identification("hpc-host", "f88a13a329a72db"), None);
     }
 
     #[test]
     fn explicit_identification_wins_over_the_prefix() {
-        let c = cfg("identification: rig1\nidentification_prefix: cvc-host");
+        let c = cfg("identification: rig1\nidentification_prefix: hpc-host");
         assert_eq!(
             configured_identification(&c, Some(ECU_ID)).as_deref(),
             Some("rig1")
@@ -113,18 +113,18 @@ mod mdns_identification_tests {
 
     #[test]
     fn prefix_without_an_ecu_id_falls_through() {
-        let c = cfg("identification_prefix: cvc-host");
+        let c = cfg("identification_prefix: hpc-host");
         assert_eq!(configured_identification(&c, None), None);
         assert_eq!(
             configured_identification(&c, Some(ECU_ID)).as_deref(),
-            Some("cvc-host-f88a13a329a72db1")
+            Some("hpc-host-f88a13a329a72db1")
         );
         assert_eq!(configured_identification(&cfg(""), Some(ECU_ID)), None);
     }
 
     #[test]
     fn the_prefixed_name_is_the_advertised_instance() {
-        let name = prefixed_identification("cvc-host", ECU_ID).unwrap();
+        let name = prefixed_identification("hpc-host", ECU_ID).unwrap();
         let adv = sovd_mdns::SovdAdvertiser::new(
             &[
                 sovd_mdns::Identity::Configured(&name),
@@ -138,7 +138,7 @@ mod mdns_identification_tests {
         assert_eq!(adv.identification, name);
         assert_eq!(
             adv.accessurl,
-            "http://cvc-host-f88a13a329a72db1.local:4000/v1"
+            "http://hpc-host-f88a13a329a72db1.local:4000/v1"
         );
     }
 }

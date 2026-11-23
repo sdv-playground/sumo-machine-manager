@@ -1059,7 +1059,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // Stream the hash in 64 KiB chunks — NEVER `std::fs::read` the whole
         // image into a Vec. A rootfs is hundreds of MB; the one-shot read
         // pre-sizes a contiguous Vec to the file length and OOMs a
-        // memory-pressured CVC (`verify_payload read …: out of memory`), which
+        // memory-pressured ECU (`verify_payload read …: out of memory`), which
         // then surfaces as a bank/verify failure. `hash_reader` is O(64 KiB)
         // resident — same idiom as the upload pipeline's `process_plain`.
         let file = std::fs::File::open(&path).map_err(|e| {

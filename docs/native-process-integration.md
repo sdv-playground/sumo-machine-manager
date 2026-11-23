@@ -30,7 +30,7 @@ exit-immediately
 
 `cargo test -p vm-shim` starts the real child with `VmManager` and an HTTP
 device transport, and checks all four health modes. The host composition's
-opt-in test runs from `supernova-machine-manager` with:
+opt-in test runs from the consuming node-manager repo with:
 
 ```bash
 cargo test --features native-process-tests --test native_process

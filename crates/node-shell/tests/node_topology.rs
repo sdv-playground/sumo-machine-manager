@@ -1,5 +1,5 @@
 //! The SOVD node topology on the shell's router: what is served where with a
-//! node (`identification_prefix: cvc-host` → node `cvc`) and without one.
+//! node (`identification_prefix: hpc-host` → node `hpc`) and without one.
 //! A small node binary built through `read_ecu_id`, `configured_identification`,
 //! `node_topology`, `sovd_state` and `sovd_router` as a binary's `main` builds
 //! it; the restart and factory-reset handlers are stand-ins (the real ones
@@ -26,8 +26,8 @@ use tower::ServiceExt;
 
 const ECU_ID: &str = "f88a13a329a72db168066272a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 const BOOT_ID: &str = "6f1b6a52-3f0e-4c64-9d2b-2b8f7a0e9c11";
-const IDENTIFICATION: &str = "cvc-host-f88a13a329a72db1";
-const NODE: &str = "identification_prefix: cvc-host\n";
+const IDENTIFICATION: &str = "hpc-host-f88a13a329a72db1";
+const NODE: &str = "identification_prefix: hpc-host\n";
 
 /// The hsm component as far as `x-ecu-id` and `read_ecu_id` read it.
 struct Hsm(machine_mgr::Capabilities);
@@ -112,7 +112,7 @@ fn backends(dir: &tempfile::TempDir) -> HashMap<String, Arc<dyn DiagnosticBacken
     ))
     .unwrap();
     let mut backends = HashMap::from([
-        ("supernova".to_string(), component("supernova", 1)),
+        ("host-app".to_string(), component("host-app", 1)),
         ("vm1".to_string(), component("vm1", 2)),
     ]);
     for spec in ident_data {
@@ -179,7 +179,7 @@ async fn server(extra: &str, backends: HashMap<String, Arc<dyn DiagnosticBackend
     }
 }
 
-/// The node server (`cvc`) and the node-less one, over the same members.
+/// The node server (`hpc`) and the node-less one, over the same members.
 async fn servers(dir: &tempfile::TempDir) -> (Server, Server) {
     let members = backends(dir);
     // One map cloned for both, so both list the members in one order.
@@ -231,7 +231,7 @@ fn ids_and_hrefs(listing: &serde_json::Value) -> Vec<(String, String)> {
     items
 }
 
-const MEMBERS: [&str; 4] = ["boot", "platform", "supernova", "vm1"];
+const MEMBERS: [&str; 4] = ["boot", "host-app", "platform", "vm1"];
 
 #[tokio::test]
 async fn the_node_server_lists_the_node_alone_on_v1() {
@@ -242,7 +242,7 @@ async fn the_node_server_lists_the_node_alone_on_v1() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         ids_and_hrefs(&body),
-        [("cvc".to_string(), "/v1/components/cvc".to_string())]
+        [("hpc".to_string(), "/v1/components/hpc".to_string())]
     );
     assert_eq!(body["items"][0]["type"], "node", "{body}");
 
@@ -260,16 +260,16 @@ async fn the_node_document_carries_the_mdns_identification() {
     assert_eq!(node.identification.as_deref(), Some(IDENTIFICATION));
     assert_eq!(flat.identification, None);
 
-    let (status, body) = get_json(&node.router, "/v1/components/cvc").await;
+    let (status, body) = get_json(&node.router, "/v1/components/hpc").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["id"], "cvc");
-    assert_eq!(body["name"], "cvc");
+    assert_eq!(body["id"], "hpc");
+    assert_eq!(body["name"], "hpc");
     assert_eq!(body["type"], "node");
     assert_eq!(body["x-identification"], IDENTIFICATION);
-    assert_eq!(body["status"], "/v1/components/cvc/status");
-    assert_eq!(body["operations"], "/v1/components/cvc/operations");
-    assert_eq!(body["data"], "/v1/components/cvc/data");
-    assert_eq!(body["subcomponents"], "/v1/components/cvc/subcomponents");
+    assert_eq!(body["status"], "/v1/components/hpc/status");
+    assert_eq!(body["operations"], "/v1/components/hpc/operations");
+    assert_eq!(body["data"], "/v1/components/hpc/data");
+    assert_eq!(body["subcomponents"], "/v1/components/hpc/subcomponents");
 }
 
 #[tokio::test]
@@ -277,14 +277,14 @@ async fn the_subcomponents_are_the_components_and_ident_entities() {
     let dir = tempfile::tempdir().unwrap();
     let (node, _) = servers(&dir).await;
 
-    let (status, body) = get_json(&node.router, "/v1/components/cvc/subcomponents").await;
+    let (status, body) = get_json(&node.router, "/v1/components/hpc/subcomponents").await;
     assert_eq!(status, StatusCode::OK);
     let expected: Vec<(String, String)> = MEMBERS
         .iter()
         .map(|id| {
             (
                 id.to_string(),
-                format!("/v1/components/cvc/subcomponents/{id}"),
+                format!("/v1/components/hpc/subcomponents/{id}"),
             )
         })
         .collect();
@@ -300,12 +300,12 @@ async fn a_member_through_the_node_is_the_flat_member_without_one() {
 
     for id in MEMBERS {
         for rest in ["", "/data", "/status", "/updates", "/operations"] {
-            let nested = format!("/v1/components/cvc/subcomponents/{id}{rest}");
+            let nested = format!("/v1/components/hpc/subcomponents/{id}{rest}");
             let (status, _, body) = send(&node.router, "GET", &nested).await;
             let expected = send(&flat.router, "GET", &format!("/v1/components/{id}{rest}")).await;
             assert_eq!(status, expected.0, "{nested}: {body}");
             assert_eq!(
-                body.replace("/v1/components/cvc/subcomponents/", "/v1/components/"),
+                body.replace("/v1/components/hpc/subcomponents/", "/v1/components/"),
                 expected.2,
                 "{nested}"
             );
@@ -313,7 +313,7 @@ async fn a_member_through_the_node_is_the_flat_member_without_one() {
     }
     let (status, body) = get_json(
         &node.router,
-        "/v1/components/cvc/subcomponents/platform/data/sw-version",
+        "/v1/components/hpc/subcomponents/platform/data/sw-version",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -330,7 +330,7 @@ async fn a_flat_member_path_on_the_node_server_names_the_node_form() {
             send(&node.router, "GET", &format!("/v1/components/{id}/data")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert!(
-            body.contains(&format!("/v1/components/cvc/subcomponents/{id}/data")),
+            body.contains(&format!("/v1/components/hpc/subcomponents/{id}/data")),
             "{body}"
         );
     }
@@ -342,15 +342,15 @@ async fn the_node_restart_is_202_location_node_status_no_body() {
     let (node, flat) = servers(&dir).await;
 
     let (status, headers, body) =
-        send(&node.router, "PUT", "/v1/components/cvc/status/restart").await;
+        send(&node.router, "PUT", "/v1/components/hpc/status/restart").await;
     assert_eq!(status, StatusCode::ACCEPTED);
-    assert_eq!(headers[header::LOCATION], "/v1/components/cvc/status");
+    assert_eq!(headers[header::LOCATION], "/v1/components/hpc/status");
     assert_eq!(body, "");
 
     // The root form is the node's: 404 naming the node form.
     let (status, _, body) = send(&node.router, "PUT", "/v1/status/restart").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(body.contains("/v1/components/cvc/status/restart"), "{body}");
+    assert!(body.contains("/v1/components/hpc/status/restart"), "{body}");
 
     // Without a node: as before.
     let (status, headers, body) = send(&flat.router, "PUT", "/v1/status/restart").await;
@@ -377,7 +377,7 @@ async fn the_factory_reset_is_reached_under_the_node() {
     let (status, _, body) = send(
         &node.router,
         "POST",
-        "/v1/components/cvc/operations/factory-reset/executions",
+        "/v1/components/hpc/operations/factory-reset/executions",
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -418,7 +418,7 @@ async fn the_hsm_ecu_id_is_served_under_the_node() {
     let (status, _, body) = send(
         &node.router,
         "GET",
-        "/v1/components/cvc/subcomponents/hsm/x-ecu-id",
+        "/v1/components/hpc/subcomponents/hsm/x-ecu-id",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -441,7 +441,7 @@ async fn the_update_state_is_node_level_data() {
     let (status, _, body) = send(
         &node.router,
         "GET",
-        "/v1/components/cvc/data/x-update-state",
+        "/v1/components/hpc/data/x-update-state",
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -466,17 +466,17 @@ async fn the_node_status_is_where_the_restart_points() {
         })
     };
 
-    let (status, body) = get_json(&node.router, "/v1/components/cvc/status").await;
+    let (status, body) = get_json(&node.router, "/v1/components/hpc/status").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, ready("/v1/components/cvc"));
+    assert_eq!(body, ready("/v1/components/hpc"));
     // The node document links it.
-    let (_, doc) = get_json(&node.router, "/v1/components/cvc").await;
-    assert_eq!(doc["status"], "/v1/components/cvc/status");
+    let (_, doc) = get_json(&node.router, "/v1/components/hpc").await;
+    assert_eq!(doc["status"], "/v1/components/hpc/status");
 
     // The root form is the node's: 404 naming the node form.
     let (status, _, body) = send(&node.router, "GET", "/v1/status").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(body.contains("/v1/components/cvc/status"), "{body}");
+    assert!(body.contains("/v1/components/hpc/status"), "{body}");
 
     // Without a node: the root form.
     let (status, body) = get_json(&flat.router, "/v1/status").await;
@@ -492,7 +492,7 @@ async fn an_accepted_restart_makes_the_node_not_ready() {
     let (node, flat) = servers(&dir).await;
 
     for (server, restart) in [
-        (&node, "/v1/components/cvc/status/restart"),
+        (&node, "/v1/components/hpc/status/restart"),
         (&flat, "/v1/status/restart"),
     ] {
         let (status, headers, _) = send(&server.router, "PUT", restart).await;
@@ -572,7 +572,7 @@ async fn x_boot_id_is_served_under_the_node() {
     for (server, uri, status) in [
         (&node, "/v1/status/x-boot-id", StatusCode::NOT_FOUND),
         (&node, "/vehicle/v1/status/x-boot-id", StatusCode::OK),
-        (&node, "/v1/components/cvc/status/x-boot-id", StatusCode::OK),
+        (&node, "/v1/components/hpc/status/x-boot-id", StatusCode::OK),
         (&flat, "/v1/status/x-boot-id", StatusCode::OK),
         (&flat, "/vehicle/v1/status/x-boot-id", StatusCode::OK),
     ] {
@@ -644,7 +644,7 @@ async fn ident_entities_render_no_legacy_urls_on_v1() {
                 (&flat, format!("/v1/components/{id}{rest}")),
                 (
                     &node,
-                    format!("/v1/components/cvc/subcomponents/{id}{rest}"),
+                    format!("/v1/components/hpc/subcomponents/{id}{rest}"),
                 ),
             ] {
                 let (_, headers, body) = send(&server.router, "GET", &uri).await;
@@ -663,12 +663,12 @@ async fn ident_entities_render_no_legacy_urls_on_v1() {
 fn a_node_id_colliding_with_a_component_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut members = backends(&dir);
-    members.insert("cvc".into(), component("cvc", 3));
+    members.insert("hpc".into(), component("hpc", 3));
     let cfg = config(NODE);
     let Err(err) = sovd_state(members, node_topology(&cfg, None)) else {
         panic!("a colliding node id was accepted");
     };
-    assert!(err.contains("'cvc'"), "{err}");
+    assert!(err.contains("'hpc'"), "{err}");
 
     // An explicit node colliding with an ident entity alike.
     let cfg = config("node: { id: platform }\n");
@@ -683,7 +683,7 @@ async fn the_ecu_id_is_read_for_a_node_or_a_prefix_only() {
         async move { read_ecu_id(&config(extra), machine.as_ref()).await }
     };
     assert_eq!(read(NODE).await.as_deref(), Some(ECU_ID));
-    assert_eq!(read("node: { id: cvc }\n").await.as_deref(), Some(ECU_ID));
+    assert_eq!(read("node: { id: hpc }\n").await.as_deref(), Some(ECU_ID));
     assert_eq!(read("").await, None);
 }
 
@@ -780,9 +780,9 @@ async fn the_v1_only_routes_are_documented_on_v1_only() {
     for (extra, status, boot_id) in [
         ("", "/v1/status", "/v1/status/x-boot-id"),
         (
-            "node: { id: cvc }\n",
-            "/v1/components/cvc/status",
-            "/v1/components/cvc/status/x-boot-id",
+            "node: { id: hpc }\n",
+            "/v1/components/hpc/status",
+            "/v1/components/hpc/status/x-boot-id",
         ),
     ] {
         let (_, docs) = get_json(&router(extra, true), "/v1/docs").await;

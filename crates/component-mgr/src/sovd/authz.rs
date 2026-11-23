@@ -486,7 +486,7 @@ impl TieredAuthorizer {
 
         // (b) Delegation is the *cable-connected workshop* path. We verify the
         // chain's validity window against `max(wall_clock_now, safe-time floor)`
-        // (`effective_now`) — NOT raw wall clock. A CVC has no RTC and boots at
+        // (`effective_now`) — NOT raw wall clock. An ECU without an RTC boots at
         // the Unix epoch, so raw `now` would reject a workshop delegate leaf
         // whose `not_before` is a real-world date ("certificate not valid yet").
         // The floor, seeded from our own CA-signed material at provisioning and

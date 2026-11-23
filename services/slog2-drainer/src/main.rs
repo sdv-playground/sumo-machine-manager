@@ -14,7 +14,7 @@
 //! adds the durable, cursor-pageable history plane (`LogSource::Slog2Segments`).
 //!
 //! Persist policy (what's WORTH keeping on flash — live appends are free in RAM):
-//! a severity FLOOR (default `info`+, so supernova's operational trail persists —
+//! a severity FLOOR (default `info`+, so the node manager's operational trail persists —
 //! it emits at `info`, never `notice`) and an emitter DENYLIST (default
 //! `devb_,CAM` — the eMMC/CAM driver firehose). Both env-tunable. Everything is
 //! still live-tailable via the ring regardless; the policy only bounds what
@@ -45,16 +45,16 @@ const DEFAULT_SEALED_DIR: &str = "/mnt/common-rw/log/segments";
 /// slog2 severity below which a packet isn't persisted (still ring-tailable).
 /// Names→rank via [`severity_rank`]; default keeps `info` and more-severe.
 ///
-/// `info`, NOT `notice`: supernova (via score-log-slog2) maps its `Info` level to
+/// `info`, NOT `notice`: the node manager (via score-log-slog2) maps its `Info` level to
 /// SLOG2_INFO and NEVER emits at `notice` (score-log-slog2: "SLOG2_NOTICE exists
-/// but nothing maps to it"). A `notice+` floor therefore dropped supernova's ENTIRE
+/// but nothing maps to it"). A `notice+` floor therefore dropped the node manager's ENTIRE
 /// operational trail (ivd-route, vhsm handshakes, bank serving) — the durable
 /// `slog2` timeline captured only boot-time OS lines + the rare WARNING, so it read
 /// nearly empty on a healthy device while all real content lived only in the
-/// volatile ring. `info` makes the persisted timeline actually mirror supernova.
+/// volatile ring. `info` makes the persisted timeline actually mirror the node manager.
 /// Flash wear stays bounded by the emitter denylist (kills the `devb_`/CAM driver
 /// firehose — the real volume) + the cull budget (SVCLOG_KEEP_BYTES); info-level
-/// supernova traffic itself is light. Override with SLOG2_DRAINER_SEVERITY_FLOOR.
+/// node-manager traffic itself is light. Override with SLOG2_DRAINER_SEVERITY_FLOOR.
 const DEFAULT_SEVERITY_FLOOR: &str = "info";
 /// Emitter prefixes never persisted (comma-separated, prefix-matched).
 const DEFAULT_EMITTER_DENYLIST: &str = "devb_,CAM";
@@ -328,7 +328,7 @@ fn main() {
     // SEAL-ON-SHUTDOWN. The live file lives in /dev/shmem (RAM) — a reboot wipes it,
     // and hop-2 sealing only fires at the size ceiling, so a small pre-reboot burst
     // (e.g. an OTA flash's finalize/`boot-vector write` lines) is normally LOST on
-    // reboot. supernova's reboot path SIGTERMs us (with a bounded grace) BEFORE the
+    // reboot. The node manager's reboot path SIGTERMs us (with a bounded grace) BEFORE the
     // kernel reset so we can flush the live file to a durable disk segment first.
     //
     // Pattern (mirrors vhsm-ssd's signal path): BLOCK SIGTERM/SIGINT in the main

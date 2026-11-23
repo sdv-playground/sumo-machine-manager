@@ -497,7 +497,7 @@ pub(super) async fn read_diag_probe(url: &str, probe_id: &str) -> Option<Diagnos
 }
 
 // ---------------------------------------------------------------------------
-// Host in-process diagnostics (host_diagnostics=true — supernova / on-box).
+// Host in-process diagnostics (host_diagnostics=true — the node manager / on-box).
 // The host has no guest diag-agent to proxy, so it gathers READ-ONLY probes
 // locally. Scoped to storage/memory triage — the class the flash
 // `No space left on device` exposed. Mirrors the guest diag-agent's source

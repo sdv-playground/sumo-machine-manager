@@ -41,10 +41,10 @@ is the size a fresh store is created with when the platform does not say otherwi
 `MIN_NV_DEVICE_SIZE = nv_device_size(DEFAULT_SLOTS) = 0x190000` (1600 KB). A 1 MB device
 is therefore a 10-slot store. Growing a store means recreating the device — qnx6
 `ftruncate(grow)` is a silent no-op — and the "too small, recreate" guard lives in the
-supernova host binary, not in this library.
+host's node manager, not in this library.
 
 Slots are numbers here and nothing else: what a slot holds is declared by the platform
-profile (supernova's `id` + `slot`); the library names no slot. A component's storage
+profile (the node manager's `id` + `slot`); the library names no slot. A component's storage
 directory is its `storage_subdir` when the profile sets one, else its component id. A
 single-bank component (the HSM keystore) is always bank A, always committed.
 

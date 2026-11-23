@@ -83,7 +83,7 @@ impl HealthStatus {
 ///
 /// Derived from the **actions actually taken**, never from config. `auto_start`
 /// is only a trigger, and it is acted on outside this crate (the standalone
-/// `vm-service` binary, supernova's own `auto_start_vms` toggle) — a host
+/// `vm-service` binary, the node manager's own `auto_start_vms` toggle) — a host
 /// configured not to start anything would make a config-derived intent lie on
 /// its very first read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]

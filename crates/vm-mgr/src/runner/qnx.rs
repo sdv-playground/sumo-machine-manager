@@ -279,7 +279,7 @@ fn wait_for_device(path: &str, timeout: Duration) -> Result<(), RunnerError> {
 }
 
 /// The per-VM qvm console file: the VM's `serial_log` when it is an absolute
-/// path, else `/mnt/common-rw/log/<name>-console.log` (the managed-cvc host-bank
+/// path, else `/mnt/common-rw/log/<name>-console.log` (the managed host-bank
 /// layout this runner was written for). A host without `/mnt/common-rw` sets
 /// `serial_log` in vm-service.yaml; a relative one is ignored with a warning,
 /// since it would resolve against whatever the service's cwd happens to be.
@@ -535,7 +535,7 @@ impl VmRunner for QnxRunner {
         // qvm's stdout carries the guest's serial/virtio console (kernel + any
         // service that writes to /dev/console, e.g. an `autostart.sh` layer that
         // bypasses svclog). Inheriting our fds funnels that guest console into the
-        // MM's own stdout, which start-managed.sh redirects to supernova.log — so
+        // MM's own stdout, which start-managed.sh redirects to the node manager's log — so
         // guest heartbeats like "[teesa-vf] alive (tick N)" pollute the HOST log
         // and wreck its per-line timestamps. The guest's REAL logs go via svclog →
         // the in-guest log-agent (surfaced over SOVD §7.21); this console file is a

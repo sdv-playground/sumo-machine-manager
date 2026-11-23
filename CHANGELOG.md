@@ -9,7 +9,7 @@ what a consumer has to touch when it moves its pin.
 ## Unreleased
 
 - **node-shell `reset`** (feature `factory-reset`, on by default): the factory-reset engine, moved from
-  supernova-machine-manager unchanged in behaviour — `WipeTargets`, `component_dirs`,
+  a node manager unchanged in behaviour — `WipeTargets`, `component_dirs`,
   `write_provisioned_banks`, `ensure_under_root`, `execute_wipe` (same order, log dir last),
   `ShutdownKind`, `FactoryResetState`, `handle` (precheck, authorize, clear flash sessions, resolve,
   before-wipe, stop guests, synchronous wipe, schedule shutdown; `{ok, wiped, errors}` with 200/500;
@@ -23,7 +23,7 @@ what a consumer has to touch when it moves its pin.
   `extra_anchor`. Host-facing: delete your copy; enable the feature only where that anchor is meant to
   be compiled in.
 
-  Verified: supernova's served API (540 probes) and a real wipe of a fixture tree are identical before
+  Verified: the node manager's served API (540 probes) and a real wipe of a fixture tree are identical before
   and after the move.
 
 ## v0.1.29 — SOVDd v0.1.12: /v1 execute is orchestrated without x-ota-control
@@ -57,7 +57,7 @@ Tag on `b532cb7` (2026-11-23), PR #66.
   `/v1/status/x-boot-id` is served at `/v1/components/{node}/status/x-boot-id`; its root form is 404),
   node-level data/operations collections, `CapabilityExtensions::with_v1_paths`. Host-facing: move SOVDd
   pins together; a test reading root-form status paths on a node server must use the node form.
-- **node-shell** (new crate): the SOVD node application shell, moved from supernova-machine-manager
+- **node-shell** (new crate): the SOVD node application shell, moved from a node manager
   unchanged in behaviour — `ShellConfig` (the `bind`, `sovd_tls`, `sovd_mdns`, `identification`,
   `identification_prefix`, `node` keys, for `#[serde(flatten)]`), `read_ecu_id` /
   `configured_identification` / `node_topology` / `sovd_state`, `sovd_router` (SOVDd's router + vendor
@@ -68,14 +68,14 @@ Tag on `b532cb7` (2026-11-23), PR #66.
 
   Host-facing: a node binary flattens `ShellConfig` into its config (keys unchanged), deletes its
   copies, and supplies its backends, vendor routes, boot id, HSM, restart authorizer + reset action and
-  factory-reset handler (verified: supernova's served API identical before/after the move, 504 probes
-  on both trees).
+  factory-reset handler (verified: the node manager's served API identical before/after the move, 504
+  probes on both trees).
 
-## v0.1.26 — app leaf items from supernova
+## v0.1.26 — app leaf items from the node manager
 
 Tag on `e1c84e3` (2026-11-23), PR #65.
 
-- **app leaf items** moved from supernova-machine-manager, unchanged in behaviour (sumo is the pattern: a
+- **app leaf items** moved from a node manager, unchanged in behaviour (sumo is the pattern: a
   device manager wires these, it does not carry its own copy):
   - component-factory: `HsmKeystoreActivator` (the `hsm-keystore` marker: no-op activate,
     `RequiresEcuReset`) and `builtin_activator(marker)` for the markers sumo implements;
@@ -87,8 +87,8 @@ Tag on `e1c84e3` (2026-11-23), PR #65.
     survives a process re-exec); machine-mgr now depends on `uuid`.
 
   Host-facing: none required. A node binary deletes its copies and calls these; activator markers,
-  config keys and wire responses are unchanged (verified on CVC .20: the served API of supernova built
-  on this is identical to the build before the move, 408 requests on both trees).
+  config keys and wire responses are unchanged (verified on target hardware: the served API of the node manager
+  built on this is identical to the build before the move, 408 requests on both trees).
 
 ## v0.1.25 — SOVDd v0.1.10: node topology, part read-back, orchestrated execute on /v1
 
@@ -151,7 +151,7 @@ Tag on `108b6e1` (2026-11-21), PR #59, #60.
   `InstallRouterDiag` delegates both. Host-facing: hosts that wrap the backend by hand must forward
   the two new methods.
 
-## v0.1.23 — SOVDd v0.1.4: /v1 tree on the CVC, node-level verdict_scope; vendor routes on both trees
+## v0.1.23 — SOVDd v0.1.4: /v1 tree on the node, node-level verdict_scope; vendor routes on both trees
 
 Tag on `d0f9740` (2026-11-17), PR #49, #50, #51, #52.
 
@@ -181,13 +181,13 @@ Tag on `bb2ad95` (2026-11-04), PR #36, #37.
   (relative to the bank dir) gets no loopback and logs `… not wired as /dev/… in qvm.conf —
   file-backed, no loopback`, so it stays openable by the pre-launch verify and the bank seeder
   instead of `EBUSY`. A conf that wires `/dev` nodes, and an unreadable conf, keep the old behaviour
-  (PR #36, LYNXION-9004).
+  (PR #36).
 - vm-mgr (QNX runner): the per-VM qvm console file follows the VM's `serial_log` in
   vm-service.yaml when it is an absolute path; a relative one is ignored with a warning; without
-  one it stays `/mnt/common-rw/log/<name>-console.log` (PR #37, LYNXION-9028).
+  one it stays `/mnt/common-rw/log/<name>-console.log` (PR #37).
 
 Host-facing: no config change needed on a host that has `/mnt/common-rw`. A host without it (e.g.
-the CVC 21-layout secure-boot host) sets `serial_log: /var/log/mmgr/<vm>-console.log` per VM. A
+a secure-boot host) sets `serial_log: /var/log/mmgr/<vm>-console.log` per VM. A
 bank whose `qvm.conf` uses `hostdev <file` for its rootfs and declares `partitions: []` needs a host
 with this version; an older host still holds the file behind its loopback and qvm fails with
 `EBUSY`.

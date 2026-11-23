@@ -1,7 +1,7 @@
 //! Core types for the NV store bank management system.
 //!
 //! Independent A/B bank sets addressed by a numeric slot index. What a slot
-//! HOLDS is declared by the platform profile (supernova's `id` + `slot` per
+//! HOLDS is declared by the platform profile (the node manager's `id` + `slot` per
 //! component) and handed to every consumer at construction; this library
 //! names no slot. The `slots` module at the bottom carries a reference layout
 //! for tests only (`test-seams`).
@@ -56,7 +56,7 @@ impl BankSet {
 }
 
 /// Reference slot layout used by tests and examples ONLY. Production code
-/// receives a component's slot from the platform profile (supernova's
+/// receives a component's slot from the platform profile (the node manager's
 /// `id` + `slot`) and never names one; this module exists so tests read
 /// as prose. Enabled by the `test-seams` feature (dev-dependency re-declaration).
 #[cfg(any(test, feature = "test-seams"))]
@@ -80,7 +80,7 @@ pub const MAX_SLOTS: usize = 64;
 const _: () = assert!(MAX_SLOTS <= u64::BITS as usize); // the mask is the cap
 
 /// Slot count a fresh store is created with when the platform doesn't
-/// say otherwise — the CVC contract's image count. An existing store
+/// say otherwise — the reference ECU contract's image count. An existing store
 /// keeps whatever its device size gives it; only the create path
 /// (`nv_device_size(DEFAULT_SLOTS)`) uses this.
 pub const DEFAULT_SLOTS: usize = 16;

@@ -9,8 +9,8 @@
 //! them and this test executes. Under a bare `cargo test -p hsm-supervisor` they
 //! are absent and the test skips with a note.
 //!
-//! In supernova this test located those binaries by walking to a *sibling*
-//! `sumo-machine-manager` checkout's `target/` — which supernova's own
+//! In the node manager it came from, this test located those binaries by walking
+//! to a *sibling* `sumo-machine-manager` checkout's `target/` — which that repo's own
 //! `cargo test` never populates, so it skipped essentially always. Probing from
 //! `current_exe()` instead is profile-correct and `CARGO_TARGET_DIR`-agnostic.
 

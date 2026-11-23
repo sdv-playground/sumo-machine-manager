@@ -58,7 +58,7 @@ run "tests (default features)" \
 
 # Slot-vocabulary guard (v0.1.2). A bank slot is a number a component is
 # constructed with; which slot means what lives in the platform profile
-# (supernova), never here. The named constants, the name parser and the
+# (the node manager), never here. The named constants, the name parser and the
 # id/name/dir tables were retired in v0.1.2 — this keeps them from creeping
 # back. The `nv_store::slots` test fixtures (HSM/OS/…, `test-seams` only) are
 # deliberately outside the pattern.
@@ -81,7 +81,7 @@ run "machine-contract stays dep-light" \
 # only needs to PARENT the two HSM daemons must not have to link a SOVD server to
 # do it. Allowlist: the crate itself, hsm, libc, tracing. Anything else printed
 # fails the run — in particular sovd-core / tokio / axum creeping in would mean
-# the extraction from supernova's main.rs had quietly re-coupled.
+# the extraction from a node manager's main.rs had quietly re-coupled.
 run "hsm-supervisor stays dep-light" \
     bash -c 'out=$(cargo tree -p hsm-supervisor -e normal --depth 1 --prefix none) && ! printf "%s\n" "$out" | grep -v -E "^(hsm-supervisor|hsm|libc|tracing) "'
 

@@ -8,12 +8,12 @@ members = [
     # Resetting the node this process runs on: QNX per-thread privity, the
     # kernel-direct `sysmgr_reboot` that avoids `shutdown`'s deadlock on a dead
     # loopback pager, and the once-guarded deadman that resets anyway when
-    # teardown wedges. Extracted from supernova's main.rs; QNX-specific but not
+    # teardown wedges. Extracted from a node manager's main.rs; QNX-specific but not
     # board-specific, and dep-light (libc + tracing).
     "crates/host-reboot",
     # The platform side of machine-contract's two floor seams: step CLOCK_REALTIME
-    # forward to a proven safe-time floor, forward-only and best-effort. Also from
-    # supernova's main.rs; POSIX only, so Linux and QNX alike.
+    # forward to a proven safe-time floor, forward-only and best-effort. Also from a
+    # node manager's main.rs; POSIX only, so Linux and QNX alike.
     "crates/host-clock",
     "crates/app-mgr",
     "crates/machine-mgr",
@@ -24,13 +24,13 @@ members = [
     "crates/hsm-link-b",
     # Parenting the two HSM daemons (link-B backend + the vhsm-ssd proxy): spawn,
     # stale-orphan reclaim, respawn-on-provision, reap. Extracted from
-    # supernova's main.rs — it is the same on every node family, and dep-light
+    # a node manager's main.rs — it is the same on every node family, and dep-light
     # (hsm + tracing + libc) so a node need not link SOVD to parent a daemon.
     "crates/hsm-supervisor",
     # The SOVD node application shell: config keys, identification, node
     # topology, router assembly with the node-level routes, TLS/mDNS serving and
-    # graceful shutdown. Extracted from supernova's main.rs — every node binary
-    # (supernova, mmgr-cvc, vm-sovd) hand-assembled the same server; the binary
+    # graceful shutdown. Extracted from a node manager's main.rs — every node
+    # binary (the device managers, vm-sovd) hand-assembled the same server; the binary
     # now keeps only its device facts and wires this.
     "crates/node-shell",
     "crates/policy-eval",
@@ -42,7 +42,7 @@ members = [
     "crates/host-metrics",
     "crates/log-rotate",
     # --- platform-integration tier (NOT machine-manager internals) -----------
-    # Shared logging glue used by BOTH the host (supernova + host binaries) and
+    # Shared logging glue used by BOTH the host (the node manager + host binaries) and
     # the guest (services via sumo-log; the log-agent over platform-log). Lives
     # here because sumo-mm is the only upstream both host and guest already
     # git-dep (like vm-wire / hsm-contract). Candidate to extract into a
@@ -71,14 +71,14 @@ members = [
     # nv-store and machine-mgr — and a `[[bin]]` sharing its crate's
     # [dependencies] is how library consumers silently inherit binary deps.
     #
-    # slog2-drainer was the PILOT that proved the premise: supernova installs it
+    # slog2-drainer was the PILOT that proved the premise: a consumer installs it
     # BY PACKAGE NAME over git (`cargo install --git … slog2-drainer`), so cargo
     # resolves against the workspace, not the directory — the move is invisible
     # to consumers, and Cargo.lock is byte-unchanged by it. Every move below
     # rides on that proof (docs/componentization.md, item 3d Feasibility).
     "services/slog2-drainer",                        # Tier-2 host: drain slog2 ring → sealed disk segments
     "services/sumo-verify",                          # launch gate: external secure boot / start script runs it per component
-    "services/vhsm-ssd",                             # the vHSM daemon guests reach over /dev/vhsm (supernova installs it BY NAME)
+    "services/vhsm-ssd",                             # the vHSM daemon guests reach over /dev/vhsm (consumers install it BY NAME)
     "services/vm-sovd",                              # the SOVD/OTA HTTP server (3c splits it into its two halves)
     # -------------------------------------------------------------------------
 
@@ -92,12 +92,12 @@ members = [
     "tools/crates/ca-bundle-build",
     "tools/crates/hsm-conformance",
     # Prometheus EXPORTER over the host-metrics library (dev/standalone only — in
-    # production supernova embeds the library and serves on its own bind). Split
+    # production the node manager embeds the library and serves on its own bind). Split
     # out by item 3d: the runner owns the tokio runtime + signal handling +
     # sumo-log init, none of which a library consumer should inherit.
     "tools/crates/host-metrics-exporter",
     # The `vm-service` PROCESS — runner over the vm-mgr library, the dev/Linux
-    # path (example/dummy-vm/run-vm.sh). On a device supernova embeds VmManager
+    # path (example/dummy-vm/run-vm.sh). On a device the node manager embeds VmManager
     # in-process, so this binary is not deployed. Split out by item 3d (the old
     # bin re-declared every library module, compiling the crate twice); the
     # follow-up rename gave the process the name and the library `vm-mgr`, so
