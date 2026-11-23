@@ -20,8 +20,10 @@
 //!   topology; [`capability_extensions`] documents the `/v1`-only ones.
 //! - [`SovdListener`] — HTTPS from the HSM-held tls-identity leaf (else HTTP),
 //!   the mDNS advertisement on either transport, and serving until the
-//!   binary's shutdown [`Notify`](tokio::sync::Notify) fires;
-//!   [`shutdown_on_signals`] fires it on SIGTERM / SIGINT.
+//!   binary's shutdown [`Notify`](tokio::sync::Notify) fires, then a drain
+//!   capped at 5 s and the DNS-SD goodbye; [`shutdown_on_signals`] fires it on
+//!   SIGTERM / SIGINT. A reset that ends the process without that notify sends
+//!   the goodbye itself, through [`SovdListener::advertisement`].
 //!
 //! Nothing here knows a device: no paths, no reset primitive, no board. What a
 //! binary supplies is its device: the backends, the vendor routes it merges,
@@ -63,8 +65,10 @@
 //!     .await
 //!     .unwrap_or_else(|e| panic!("{e}"));
 //! tracing::info!("listening on {} (tls: {})", cfg.bind, listener.is_tls());
-//! let _mdns = listener.serve(router, shutdown).await.unwrap();
-//! // ... the binary's cleanup; dropping `_mdns` sends the DNS-SD goodbye.
+//! // A reset path that never returns from serve calls `withdraw()` before it fires.
+//! let _advertisement = listener.advertisement();
+//! listener.serve(router, shutdown).await.unwrap();
+//! // ... the binary's cleanup; the DNS-SD goodbye has already been sent.
 //! # }
 //! ```
 
@@ -80,4 +84,4 @@ pub use identity::{
 pub use router::{
     auth_error_message, capability_extensions, restart_response, restart_route, sovd_router,
 };
-pub use serve::{shutdown_on_signals, SovdListener};
+pub use serve::{shutdown_on_signals, Advertisement, SovdListener};
