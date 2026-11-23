@@ -40,7 +40,7 @@ use rand::RngCore as _;
 use sha2::{Digest, Sha256};
 
 use crate::bootstrap::{BootstrapState, ConsumeOutcome, PendingConsumeOutcome};
-use crate::cert::{mint_cwt, validate as validate_cert, EcuSigner, ParsedCert};
+use crate::cert::{mint_cwt, validate as validate_cert, EcuSigner, MintError, ParsedCert};
 use crate::iam::IamPolicy;
 use crate::proto::{AuthFailReason, Op, Request, Response, StatusCode};
 
@@ -339,9 +339,12 @@ fn handle_enroll(
 
     // Mint first; we need the thumbprint to call consume(). If
     // bootstrap.consume fails afterwards, we throw the minted CWT
-    // away — burning CPU but never leaking it to the client.
+    // away — burning CPU but never leaking it to the client. Minting
+    // first also means a signer outage fails here, before the token
+    // is consumed: the guest retries with the same token.
     let cwt_bytes = match mint_cwt(ctx.signer, vm_id, ctx.issuer, csr_x, csr_y, iat, exp) {
         Ok(b) => b,
+        Err(MintError::Sign) => return signer_unavailable(state, req, vm_id),
         Err(_) => return reject(state, req, AuthFailReason::InvalidParam),
     };
     let thumbprint = sha256(&cwt_bytes);
@@ -476,9 +479,11 @@ fn handle_enroll_assisted(
     let exp = iat.saturating_add(ctx.cert_lifetime_secs);
 
     // Mint first; thumbprint is derived from the CWT bytes and
-    // recorded in the pending-consume audit trail.
+    // recorded in the pending-consume audit trail. A signer outage
+    // fails here, before the pending flag is consumed.
     let cwt_bytes = match mint_cwt(ctx.signer, &vm_id, ctx.issuer, csr_x, csr_y, iat, exp) {
         Ok(b) => b,
+        Err(MintError::Sign) => return signer_unavailable(state, req, &vm_id),
         Err(_) => return reject(state, req, AuthFailReason::InvalidParam),
     };
     let thumbprint = sha256(&cwt_bytes);
@@ -611,6 +616,21 @@ fn reject(state: &mut HandshakeState, req: &Request, reason: AuthFailReason) -> 
     *state = HandshakeState::Failed(reason);
     Response::err(req.op, req.session_id, StatusCode::PolicyReject)
         .with_payload((reason as u16).to_le_bytes().to_vec())
+}
+
+/// An enrolment the signer could not sign. Nothing was consumed or
+/// persisted, so the guest retries the same enrolment later. On the
+/// wire this is `Internal` with no `AuthFailReason` payload — a server
+/// fault, not a verdict on the request (no `AuthFailReason` means "try
+/// again"). The connection still closes: `Failed` needs a reason, and
+/// `InvalidParam` stands in for it in the daemon's log only.
+fn signer_unavailable(state: &mut HandshakeState, req: &Request, vm_id: &str) -> Response {
+    tracing::error!(
+        vm_id = %vm_id,
+        "enrolment not signed (signer unavailable); token left unconsumed for a retry"
+    );
+    *state = HandshakeState::Failed(AuthFailReason::InvalidParam);
+    Response::err(req.op, req.session_id, StatusCode::Internal)
 }
 
 // ---- small Response extension trait -------------------------------
@@ -1793,6 +1813,139 @@ statements:
             resp.status,
             StatusCode::Ok as u32,
             "reload should have surfaced the entry"
+        );
+    }
+
+    // ---- signer outage --------------------------------------------
+
+    /// An `EcuSigner` whose HSM does not answer.
+    struct UnavailableSigner;
+
+    impl EcuSigner for UnavailableSigner {
+        fn sign(&self, _data: &[u8]) -> Result<Vec<u8>, crate::cert::SignError> {
+            Err(crate::cert::SignError("HSM unreachable".into()))
+        }
+    }
+
+    /// One ENROLL step on a fresh connection with `signer`.
+    fn enroll_once(
+        bootstrap: &mut BootstrapState,
+        signer: &dyn EcuSigner,
+        token: &[u8],
+        csr_pub: &[u8],
+    ) -> (Response, HandshakeState) {
+        let (_signer, signer_pub, _principal, _principal_pub) = fixture();
+        let policy = sample_policy();
+        let now = fixed_time(1_500_000);
+        let mut ctx = EnrollContext {
+            bootstrap,
+            signer,
+            issuer: "device-test",
+            cert_lifetime_secs: 86_400,
+            peer_ip: None,
+            ip_resolver: None,
+        };
+        let mut state = HandshakeState::new();
+        drive_hello(&mut state, &signer_pub, &policy, now);
+        let resp = step(
+            &mut state,
+            &Request {
+                op: Op::Enroll as u32,
+                session_id: 1,
+                payload: encode_enroll_payload("vm9", token, csr_pub),
+            },
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            now,
+        );
+        (resp, state)
+    }
+
+    /// The signer is down while a guest enrols: the enrolment fails as a
+    /// server fault, the one-shot token is NOT consumed (in memory or on
+    /// disk), and a retry once the signer answers succeeds with a cert that
+    /// validates.
+    #[test]
+    fn enroll_with_the_signer_down_keeps_the_token_for_a_retry() {
+        let (signer, signer_pub, _principal, principal_pub) = fixture();
+        let token = [0xABu8; 32];
+        let (mut bootstrap, tmp) = fresh_bootstrap();
+        bootstrap.add("vm9", &token);
+        bootstrap.save().unwrap();
+
+        let (resp, state) = enroll_once(&mut bootstrap, &UnavailableSigner, &token, &principal_pub);
+        assert_eq!(resp.status, StatusCode::Internal as u32);
+        assert!(resp.payload.is_empty(), "no AuthFailReason: not a verdict");
+        assert!(matches!(state, HandshakeState::Failed(_)));
+        assert!(!bootstrap.get("vm9").unwrap().consumed);
+        let on_disk = BootstrapState::load(tmp.path().join("bootstrap.yaml")).unwrap();
+        assert!(!on_disk.get("vm9").unwrap().consumed, "nothing persisted");
+
+        // The HSM answers again: the same token enrols.
+        let healthy = LocalEcuSigner::new(signer.clone());
+        let (resp, state) = enroll_once(&mut bootstrap, &healthy, &token, &principal_pub);
+        assert_eq!(resp.status, StatusCode::Ok as u32);
+        assert!(matches!(state, HandshakeState::Enrolled { ref vm_id, .. } if vm_id == "vm9"));
+        let parsed = validate_cert(&resp.payload, &signer_pub, fixed_time(1_500_100)).unwrap();
+        assert_eq!(parsed.subject, "vm9");
+        assert_eq!(parsed.cnf_pubkey, principal_pub);
+        assert!(bootstrap.get("vm9").unwrap().consumed);
+    }
+
+    /// One ENROLL_ASSISTED step from the guest's IP on a fresh connection.
+    fn enroll_assisted_once(bootstrap: &mut BootstrapState, signer: &dyn EcuSigner) -> Response {
+        let (_signer, signer_pub, _principal, principal_pub) = fixture();
+        let policy = sample_policy();
+        let now = fixed_time(1_500_000);
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 201, 2));
+        let resolver = TestResolver(vec![(ip, "vm9".to_string())]);
+        let mut ctx = EnrollContext {
+            bootstrap,
+            signer,
+            issuer: "device-test",
+            cert_lifetime_secs: 86_400,
+            peer_ip: Some(ip),
+            ip_resolver: Some(&resolver),
+        };
+        let mut state = HandshakeState::new();
+        drive_hello(&mut state, &signer_pub, &policy, now);
+        step(
+            &mut state,
+            &Request {
+                op: Op::EnrollAssisted as u32,
+                session_id: 1,
+                payload: encode_enroll_assisted_payload(&principal_pub),
+            },
+            &signer_pub,
+            &policy,
+            Some(&mut ctx),
+            now,
+        )
+    }
+
+    /// Same for ENROLL_ASSISTED: the pending flag survives a signer outage
+    /// (in memory and on disk) and the retry enrols.
+    #[test]
+    fn enroll_assisted_with_the_signer_down_keeps_the_pending_flag() {
+        let (signer, signer_pub, _principal, _principal_pub) = fixture();
+        let (mut bootstrap, tmp) = fresh_bootstrap();
+        bootstrap.arm_pending("vm9", Some(3600));
+        bootstrap.save().unwrap();
+
+        let resp = enroll_assisted_once(&mut bootstrap, &UnavailableSigner);
+        assert_eq!(resp.status, StatusCode::Internal as u32);
+        assert!(bootstrap.get_pending("vm9").is_some());
+        let on_disk = BootstrapState::load(tmp.path().join("bootstrap.yaml")).unwrap();
+        assert!(on_disk.get_pending("vm9").is_some(), "nothing persisted");
+
+        let resp = enroll_assisted_once(&mut bootstrap, &LocalEcuSigner::new(signer.clone()));
+        assert_eq!(resp.status, StatusCode::Ok as u32, "retry enrols");
+        let parsed = validate_cert(&resp.payload, &signer_pub, fixed_time(1_500_100)).unwrap();
+        assert_eq!(parsed.subject, "vm9");
+        assert!(
+            bootstrap.get_pending("vm9").is_none(),
+            "consumed by the retry"
         );
     }
 }
