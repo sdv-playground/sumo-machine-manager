@@ -242,7 +242,7 @@ The core update/diagnostics path:
 Support crates: **policy-eval** /
 **policy-partition** / **policy-build** (guest IAM policy), **ca-bundle-build**,
 **vm-wire**, **host-metrics** (OpenTelemetry/Prometheus host sensors — the library
-supernova embeds; the Prometheus exporter process is
+the node manager embeds; the Prometheus exporter process is
 `tools/crates/host-metrics-exporter`),
 **log-rotate**, **puller**.
 

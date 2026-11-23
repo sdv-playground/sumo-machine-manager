@@ -98,10 +98,9 @@ repo — that serve the **same** wire from the **same** route library.
   proxying). Secure-by-default authorizer is always wired (`src/main.rs`).
 - **Bind / port:** `cfg.bind`, default `0.0.0.0:4000` (`src/config.rs`);
   `axum::serve` in `src/main.rs`.
-- **Launched by:** a respawn loop with a TOML config — the `qemu-cvc` Docker
-  entrypoint (`examples/qemu-cvc/entrypoint.sh`) for the emulated device, and
-  the host runtime bundle's `start.sh` → `bank_a/start.sh` on the rig
-  (deployed by the `tower-provision` example).
+- **Launched by:** a respawn loop with a TOML config — a QEMU Docker
+  entrypoint for the emulated device, and the host runtime bundle's
+  `start.sh` → `bank_a/start.sh` on target hardware.
 
 ---
 

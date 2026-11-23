@@ -26,7 +26,7 @@ Then connect [SOVD Explorer](https://github.com/sdv-playground/SOVD-explorer) to
 - **[vHSM integration path](docs/vhsm-integration-path.md)** — the end-to-end guest → host → device crypto path + how to verify a backend.
 - **[Simulation stepping](docs/simulation-stepping.md)** — deterministic VM time / sim clock control.
 - **[Reusable-component convention](docs/reusable-component-convention.md)** — what goes in `machine-contract` and what stays here, the `ResetKind` decision, and the checklist for adding a contract trait. **Read before adding a trait an out-of-tree board manager will implement.**
-- **[SOVD server entrypoints](docs/sovd-entrypoints.md)** — every SOVD server in the workspace, classified: the host machine-manager (`vm-sovd`), the in-VM/on-host vehicle gateway (`vm-sovd --gateway`), the production `supernova` server, the SOVDd reference servers, and the library-vs-clients distinction.
+- **[SOVD server entrypoints](docs/sovd-entrypoints.md)** — every SOVD server in the workspace, classified: the host machine-manager (`vm-sovd`), the in-VM/on-host vehicle gateway (`vm-sovd --gateway`), the production node-manager server, the SOVDd reference servers, and the library-vs-clients distinction.
 - **Link-B contract** — `crates/hsm-link-b/` (frozen wire + C header) with the C vendor skeleton at [`crates/hsm-link-b/reference/`](crates/hsm-link-b/reference/) — the hardware-HSM integration example.
 - **HSM tooling** — `tools/crates/hsm-conformance` (the suite a vendor backend must pass) · `tools/crates/hsm-sim-backend` (the non-production reference backend).
 - **Deeper** — [CLAUDE.md](CLAUDE.md) · [ARCHITECTURE.md](ARCHITECTURE.md) · [AGENTS.md](AGENTS.md)
