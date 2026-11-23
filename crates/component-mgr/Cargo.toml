@@ -79,6 +79,12 @@ sovd-docs-hook = []
 # container-image manifest is refused by name instead of being routed. OFF by
 # default — see app-mgr's `container` comment for why.
 container = ["app-mgr/container"]
+# The dev recovery anchor: `sovd::hsm_authorizer::dev_recovery_anchor`, the
+# SPKI-DER of the well-known factory bootstrap key, for a deployment that hands
+# it to the authorizer as its `extra_anchor` so a dev unit with an empty keystore
+# stays factory-resettable. OFF by default: without it the function does not
+# exist. Which builds turn it on is the deployment's decision.
+dev-recovery-anchor = []
 
 [dev-dependencies]
 # host-os-mgr left even the dev-dependencies in v0.1.2: its only user here was
