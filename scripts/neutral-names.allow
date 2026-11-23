@@ -1,0 +1,4 @@
+# Functional identifiers that still carry a downstream name — see
+# scripts/check-neutral-names.sh. One `path:literal  # reason` per line.
+crates/app-mgr/src/install.rs:"$SCRIPT_DIR/supernova"  # the generated default start.sh execs the app binary by this file name
+crates/component-factory/src/lib.rs:"/data/supernova"  # default base_path of an `app` component whose config sets none
