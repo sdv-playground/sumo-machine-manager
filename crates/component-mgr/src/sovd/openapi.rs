@@ -13,6 +13,11 @@
 //!   * the live `GET /vehicle/v1/docs` capability description — the vendor
 //!     paths + schemas are contributed to SOVDd's §7.5 document via its neutral
 //!     `CapabilityExtensions` hook (see [`capability_extensions`]).
+//!
+//! SOVDd merges one schema set into the documents of both trees, so the
+//! schemas are the frozen legacy tree's: `UpdateStateResponse` still lists
+//! the optional `trial_boot_limit`, which only `/vehicle/v1` serves (always
+//! null) and `/v1` omits.
 
 /// The bearer security scheme (`x-ota-pull-update` is the only op that
 /// requires it; the dev/sim binary defaults to open auth).

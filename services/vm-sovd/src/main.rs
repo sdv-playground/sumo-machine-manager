@@ -1156,9 +1156,14 @@ mod tests {
         let root = get_text(without.clone(), "/v1/data/x-update-state").await;
         assert_eq!(root.0, StatusCode::OK, "{}", root.1);
         assert_eq!(get_text(with.clone(), node_form).await, root);
+        // The frozen legacy alias keeps its `trial_boot_limit`, always null.
+        let legacy_body = root.1.replace(
+            r#""resolution":"#,
+            r#""trial_boot_limit":null,"resolution":"#,
+        );
         for router in [&with, &without] {
             let legacy = get_text(router.clone(), "/vehicle/v1/data/x-update-state").await;
-            assert_eq!(legacy, root);
+            assert_eq!(legacy, (StatusCode::OK, legacy_body.clone()));
         }
 
         let (status, body) = get_text(with, "/v1/data/x-update-state").await;

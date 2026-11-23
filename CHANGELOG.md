@@ -44,8 +44,9 @@ what a consumer has to touch when it moves its pin.
   `NodeBootOutcome` keeps only `trial_boots` (`limit`, `bailed_out` and `errors` are gone). An
   embedder deletes its `with_trial_boot_limit(..)` call, its own config key for the limit (a config
   file that still carries the key keeps loading as long as the config struct does not deny unknown
-  fields), and any use of the removed `NodeBootOutcome` fields. The update-state body no longer
-  carries `trial_boot_limit`.
+  fields), and any use of the removed `NodeBootOutcome` fields. The update-state body on `/v1`
+  (`x-ota-update-state`, `x-update-state`) no longer carries `trial_boot_limit`; the frozen legacy
+  `/vehicle/v1` tree keeps it, always `null`, and its `/docs` are unchanged.
 
 - **Software HSM (`hsm-sim-backend`): a re-provision keeps the device's own keys and state.** A
   second keystore envelope on a provisioned unit (a keystore update, a certificate renewal) built the

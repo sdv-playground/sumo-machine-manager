@@ -1891,16 +1891,21 @@ async fn trial_boots_are_counted_and_never_roll_the_node_back() {
         Bank::B
     );
 
-    let (status, body) = get(
-        &node.router(coord_at("boot-f")),
-        "/vehicle/v1/data/x-update-state",
-    )
-    .await;
+    let router = node.router(coord_at("boot-f"));
+    let (status, body) = get(&router, "/v1/data/x-update-state").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["banks"][0]["in_trial"], true);
     assert_eq!(body["trial_boots"], 5);
     assert_eq!(body["resolution"], serde_json::Value::Null);
     assert!(body.get("trial_boot_limit").is_none(), "{body}");
+    // The frozen legacy tree keeps the member, always null.
+    let (status, legacy) = get(&router, "/vehicle/v1/data/x-update-state").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(legacy["trial_boot_limit"], serde_json::Value::Null);
+    assert_eq!(
+        legacy.as_object().unwrap().len(),
+        body.as_object().unwrap().len() + 1
+    );
 }
 
 #[tokio::test]
