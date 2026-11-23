@@ -61,7 +61,7 @@ repo — that serve the **same** wire from the **same** route library.
 - **Bind / port:** `0.0.0.0:4000` by default; override with `--bind <addr>` or a
   positional bind-addr (`services/vm-sovd/src/main.rs`).
 - **Node topology (opt-in, both modes):** `--node-id <id>` (`--node-name <name>`,
-  default the id) serves `/v1` as SOVDd node `<id>` only (SOVDd v0.1.11,
+  default the id) serves `/v1` as SOVDd node `<id>` only (SOVDd v0.1.12,
   hierarchical-only): the components are its subcomponents
   (`/v1/components/<id>/subcomponents/<component>/...`) and the node-level
   resources (`status`, `updates`, `operations` — the node verdict ops among

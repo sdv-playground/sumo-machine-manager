@@ -6,6 +6,16 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
+## Unreleased
+
+- deps: SOVDd v0.1.12 (every pin) — on `/v1`, `PUT …/updates/{id}/execute` without `x-ota-control` runs
+  orchestrated (was 400 `incomplete-request`); `x-ota-control=orchestrated` stays accepted, any other
+  value still answers 400 before anything runs; the component capabilities drop `x-update.control`,
+  `/v1/docs` lists execute without parameters, `/.well-known/sovd-extensions` marks `x-ota-control`
+  `implied_on: ["/v1"]`. `/vehicle/v1` unchanged. Host-facing: move SOVDd pins together; a `/v1` client
+  may omit `x-ota-control`; a test pinning the 400 on a missing parameter, or reading
+  `x-update.control`, must change.
+
 ## v0.1.28 — node-shell: mDNS goodbye on shutdown and before a reset
 
 Tag on `bbccd45` (2026-11-23), PR #67.
