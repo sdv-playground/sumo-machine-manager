@@ -57,8 +57,10 @@
 //!
 //! # No ECU id
 //!
-//! The ECU id is every token's expected `aud`. When it cannot be had (no device
-//! key, or it could not be read) no keystore issuer and no delegate is trusted:
+//! The ECU id is every token's expected `aud`: the device-key thumbprint, or the
+//! host's injected id ([`identity::EcuId`]). When it cannot be had (no device
+//! key, a device key that could not be read, or [`identity::EcuId::Unavailable`])
+//! no keystore issuer and no delegate is trusted:
 //! there is no audience to match them to. A build with an [`ExtraAnchor`] keeps
 //! the unit resettable: the issuer ids that anchor answers for (resolved as
 //! usual, keystore first) are trusted with the audience `""` — the one audience
@@ -143,6 +145,12 @@ pub struct HsmAuthorizerDeps {
     pub floor_sink: Arc<dyn FloorSink>,
     /// Optional out-of-keystore anchor lookup. See [`ExtraAnchor`].
     pub extra_anchor: Option<ExtraAnchor>,
+    /// Where this ECU's id (every token's `aud`) comes from. It must be the id
+    /// the HSM component serves as `x-ecu-id`: a host with a component factory
+    /// takes these deps from `component_factory::FactoryDeps::hsm_authorizer_deps`,
+    /// which fills this field from `FactoryDeps::ecu_id`, rather than stating it
+    /// a second time here.
+    pub ecu_id: identity::EcuId,
 }
 
 impl HsmAuthorizerDeps {
@@ -220,7 +228,8 @@ struct Built {
 ///
 /// Fails closed: a build error yields an authorizer trusting no issuer, and an
 /// anchor the HSM could not read is trusted only where `extra_anchor` answers
-/// for it. See the module docs for the no-ECU-id rule.
+/// for it. `ecu_id` says where the expected `aud` comes from; see the module
+/// docs for the no-ECU-id rule.
 pub fn build_authorizer_now(
     crypto: &dyn HsmCryptoProvider,
     boot_id: Option<&str>,
@@ -228,6 +237,7 @@ pub fn build_authorizer_now(
     time_floor_secs: Arc<AtomicU64>,
     floor_sink: Arc<dyn FloorSink>,
     extra_anchor: Option<&ExtraAnchor>,
+    ecu_id: &identity::EcuId,
 ) -> Arc<dyn Authorizer> {
     build(
         crypto,
@@ -236,6 +246,7 @@ pub fn build_authorizer_now(
         time_floor_secs,
         floor_sink,
         extra_anchor,
+        ecu_id,
     )
     .authorizer
 }
@@ -247,6 +258,7 @@ fn build(
     time_floor_secs: Arc<AtomicU64>,
     floor_sink: Arc<dyn FloorSink>,
     extra_anchor: Option<&ExtraAnchor>,
+    ecu_id: &identity::EcuId,
 ) -> Built {
     let unreadable = RefCell::new(Vec::new());
     // A read error is recorded (the build is then degraded) and contributes
@@ -282,9 +294,10 @@ fn build(
         Err(HsmError::NotSupported(_)) => None,
         read => or_note(id, keystore_read(read)),
     };
-    // `audience` = this ECU's own id (its device-key thumbprint), the cross-ECU
-    // replay guard.
-    let audience = identity::ecu_id(der_for);
+    // `audience` = this ECU's own id (its device-key thumbprint, or the host's
+    // injected id), the cross-ECU replay guard. An injected id reads nothing
+    // from the HSM; `Unavailable` is no id.
+    let audience = ecu_id.resolve(der_for);
     let recovery_only = audience.is_none() && extra_anchor.is_some();
     let built = match (audience.as_deref(), extra_anchor) {
         (Some(aud), _) => issuer_keys::authorizer_from_anchors(der_for, anchor_for, aud),
@@ -434,6 +447,7 @@ impl Authorizer for CachedHsmAuthorizer {
                         self.deps.time_floor_secs.clone(),
                         self.deps.floor_sink.clone(),
                         self.deps.extra_anchor.as_ref(),
+                        &self.deps.ecu_id,
                     );
                     self.log_state_change(&mut cell, &built.unreadable);
                     // Cache only a complete build. A degraded one serves this
@@ -543,6 +557,7 @@ mod tests {
     use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 
     use super::super::authz::NoopFloorSink;
+    use super::super::identity::EcuId;
 
     const FRI: &str = "factory-reset-issuer";
 
@@ -687,6 +702,14 @@ mod tests {
     }
 
     fn build_for(hsm: &FakeHsm, extra: Option<&ExtraAnchor>) -> Arc<dyn Authorizer> {
+        build_with_id(hsm, extra, &EcuId::Thumbprint)
+    }
+
+    fn build_with_id(
+        hsm: &FakeHsm,
+        extra: Option<&ExtraAnchor>,
+        ecu_id: &EcuId,
+    ) -> Arc<dyn Authorizer> {
         build_authorizer_now(
             hsm,
             None,
@@ -694,6 +717,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(NoopFloorSink),
             extra,
+            ecu_id,
         )
     }
 
@@ -765,6 +789,7 @@ mod tests {
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(NoopFloorSink),
                 Some(&extra),
+                &EcuId::Thumbprint,
             );
             let all = token(&rec, "", "factory-reset reset:execute data:write");
             assert!(accepts(authz.as_ref(), &all, Capability::FactoryReset).await);
@@ -783,7 +808,100 @@ mod tests {
         }
     }
 
+    fn injected_id() -> EcuId {
+        EcuId::injected("4b334ebada044b608d8d8d8d8d8d8d8d").unwrap()
+    }
+
+    /// An injected id is the audience: a token for it passes, a token for the
+    /// device-key thumbprint it replaces does not. It reads nothing from the
+    /// HSM, so a device key that cannot be read neither takes the id away nor
+    /// degrades the build.
+    #[tokio::test]
+    async fn an_injected_id_is_the_audience_whatever_the_device_key() {
+        let ks = keystore_issuer();
+        let injected = injected_id();
+        let aud = injected.resolve(|_| None).unwrap();
+        for device in [Slot::Has, Slot::Absent, Slot::Unreadable] {
+            let hsm = FakeHsm::new(device, Slot::Has);
+            let authz = build_with_id(&hsm, None, &injected);
+            for (bearer, want) in [
+                (token(&ks, &aud, "factory-reset reset:execute"), true),
+                (token(&ks, &ecu_id(), "factory-reset"), false),
+                (token(&ks, "", "factory-reset"), false),
+            ] {
+                assert_eq!(
+                    accepts(authz.as_ref(), &bearer, Capability::FactoryReset).await,
+                    want,
+                    "device key {device:?}"
+                );
+            }
+            let restart = token(&ks, &aud, "reset:execute");
+            assert!(accepts(authz.as_ref(), &restart, Capability::ResetExecute).await);
+        }
+
+        let hsm = FakeHsm::new(Slot::Unreadable, Slot::Has);
+        let authz = cached_with_id(&hsm, None, injected, "component-mgr-authz-cache-injected");
+        let ok = token(&ks, &aud, "factory-reset");
+        assert!(accepts(authz.as_ref(), &ok, Capability::FactoryReset).await);
+        let reads = hsm.reads();
+        assert!(accepts(authz.as_ref(), &ok, Capability::FactoryReset).await);
+        assert_eq!(
+            hsm.reads(),
+            reads,
+            "cached: the device key was never needed"
+        );
+    }
+
+    /// `Unavailable` is the no-id unit, the same rule as a device key that is
+    /// absent or unreadable: with a recovery anchor, the reset issuer (keystore
+    /// first, then the anchor) is trusted with the empty audience, for the
+    /// factory reset and nothing else, and a token for the thumbprint is refused
+    /// (the thumbprint does not stand in). Without a recovery anchor nothing is
+    /// accepted.
+    #[tokio::test]
+    async fn an_unavailable_id_takes_the_no_id_rule() {
+        let extra = recovery_extra();
+        let (ks, rec) = (keystore_issuer(), recovery_issuer());
+        for (issuer_slot, clears) in [(Slot::Absent, &rec), (Slot::Has, &ks)] {
+            let hsm = FakeHsm::new(Slot::Has, issuer_slot);
+            let authz = build_with_id(&hsm, Some(&extra), &EcuId::Unavailable);
+            let reset = token(clears, "", "factory-reset reset:execute");
+            assert!(
+                accepts(authz.as_ref(), &reset, Capability::FactoryReset).await,
+                "keystore issuer {issuer_slot:?}"
+            );
+            assert!(!accepts(authz.as_ref(), &reset, Capability::ResetExecute).await);
+            for bearer in [
+                token(&ks, &ecu_id(), "factory-reset"),
+                token(&rec, &ecu_id(), "factory-reset"),
+            ] {
+                assert!(!accepts(authz.as_ref(), &bearer, Capability::FactoryReset).await);
+            }
+
+            let authz = build_with_id(&hsm, None, &EcuId::Unavailable);
+            for bearer in [
+                token(&ks, &ecu_id(), "factory-reset"),
+                token(&ks, "", "factory-reset"),
+                token(&rec, "", "factory-reset"),
+            ] {
+                assert!(
+                    !accepts(authz.as_ref(), &bearer, Capability::FactoryReset).await,
+                    "no recovery anchor, keystore issuer {issuer_slot:?}"
+                );
+            }
+        }
+    }
+
     fn cached(hsm: &Arc<FakeHsm>, extra: Option<ExtraAnchor>, dir: &str) -> Arc<dyn Authorizer> {
+        cached_with_id(hsm, extra, EcuId::Thumbprint, dir)
+    }
+
+    fn cached_with_id(
+        hsm: &Arc<FakeHsm>,
+        extra: Option<ExtraAnchor>,
+        ecu_id: EcuId,
+        dir: &str,
+    ) -> Arc<dyn Authorizer> {
         let keystore = std::env::temp_dir().join(dir);
         let _ = std::fs::remove_dir_all(&keystore);
         std::fs::create_dir_all(&keystore).unwrap();
@@ -794,6 +912,7 @@ mod tests {
             time_floor_secs: Arc::new(AtomicU64::new(0)),
             floor_sink: Arc::new(NoopFloorSink),
             extra_anchor: extra,
+            ecu_id,
         }
         .destructive("boot-1")
     }
