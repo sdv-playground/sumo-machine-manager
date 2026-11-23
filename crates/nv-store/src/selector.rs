@@ -364,6 +364,9 @@ pub enum SelectorError {
     /// not run (or another failure that is not a filesystem error). Transient
     /// as far as the store knows: retry or fail, never read it as absent.
     Unreadable(String),
+    /// A copy could not be signed: the signer could not sign. Nothing was
+    /// written. Transient as far as the store knows: retry or fail.
+    Unsignable(String),
     /// A rollback found nothing to restore: no committed copy, or the primary
     /// already is the committed copy.
     NoTrial,
@@ -381,6 +384,7 @@ impl std::fmt::Display for SelectorError {
             SelectorError::Io(e) => write!(f, "boot vector store I/O error: {e}"),
             SelectorError::Serialize(e) => write!(f, "boot vector serialize error: {e}"),
             SelectorError::Unreadable(e) => write!(f, "boot vector record unreadable: {e}"),
+            SelectorError::Unsignable(e) => write!(f, "boot vector record unsignable: {e}"),
             SelectorError::NoTrial => write!(
                 f,
                 "nothing to roll back: the primary already is the committed copy"

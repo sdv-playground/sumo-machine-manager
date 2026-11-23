@@ -42,6 +42,9 @@ what a consumer has to touch when it moves its pin.
   boot count or boot-stage rollback record that cannot be written is logged at error level and leaves
   the previous header. With a working signer every file written and every decision is unchanged.
 
+  A copy that could not be verified is `SelectorError::Unreadable`; one that could not be signed is
+  the new `SelectorError::Unsignable`. A node binary can tell both from a filesystem error.
+
   Host-facing: `Signer::sign` returns `Result<Vec<u8>, SignerError>` and `Signer::verify`
   `Result<bool, SignerError>` (`SignerError::new` / `with_source`, exported next to `Signer`): an
   implementor returns `Ok(false)` only for a signature that does not verify and `Err` whenever it could

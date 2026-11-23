@@ -108,9 +108,9 @@ impl SignedFiles {
         transaction: Option<Transaction>,
     ) -> Result<SelectorBlob, SelectorError> {
         SelectorBlob::signed(generation, entries, transaction, &*self.signer).map_err(|e| {
-            SelectorError::Io(std::io::Error::other(format!(
+            SelectorError::Unsignable(format!(
                 "boot selector at generation {generation} could not be signed: {e}"
-            )))
+            ))
         })
     }
 
