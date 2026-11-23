@@ -165,6 +165,33 @@ what a consumer has to touch when it moves its pin.
   Verified: a scripted sequence (seed, activate, trial boots, commit, activate, rollback, reseed after
   deleting the primary) with the deterministic test signer writes byte-identical files and returns
   identical values before and after.
+- **hsm, hsm-link-b: a backend can say what holds each slot, and `hsm/data/keys` says it.** A slot
+  inventory listed a software key exactly like a key that never leaves the HSM, so it promised
+  protection the device may not have. The frozen `SlotInfo` record cannot carry more, so the
+  question is its own op:
+  - `SlotBacking` (`Hardware`, `SoftwareSealed`, `Software`), `HsmProvider::slot_backing` (default
+    `NotSupported`), and the additive link-B op `GET_SLOT_BACKING` (`0x2A`, handle → `BACKING_*` =
+    1 / 2 / 3) in the Rust contract, the C header and the reference skeleton; `LinkBClient` and
+    `LinkBProvider` ask it, `serve` routes it to the provider half, and `SimHsm` answers `Software`;
+  - a backend that predates the op answers `ST_NOT_SUPPORTED` (the Rust `serve`) or
+    `ST_PROTOCOL_ERROR` (the C skeleton's dispatch default, and every copy of it). The client reads
+    both as `NotSupported`, i.e. unknown; for any other op `ST_PROTOCOL_ERROR` stays an error;
+  - the C skeleton's slot map gains a `backing` column, and every row says `BACKING_SOFTWARE`, the
+    weakest claim, for the vendor to raise per slot. A copy no longer reports hardware protection
+    for keys its silicon may keep in software;
+  - the first consumer: every `hsm/data/keys` item gains `backing`, one of `hardware`,
+    `software-sealed`, `software` and `unknown`. `unknown` is where the backend did not say (it
+    predates the op, the question failed, or no HSM provider is wired); it is no claim, never read
+    as `hardware`. The component asks its HSM provider, the same link-B backend as its crypto
+    handle on a host.
+  - The `link_b` docs also name the monotonic-counter ops `0x28` / `0x29`, which `serve` routes to
+    the provider half beside the provisioning ops `0x20..=0x27`.
+
+  Host-facing: `machine_mgr::KeyDescriptor` gains a required field, `backing: KeyBacking` (a code
+  that builds one sets it; `KeyBacking::Unknown` claims nothing). A backend that keeps some keys in
+  software overrides `HsmProvider::slot_backing`. A C backend copied from the skeleton answers
+  unknown until it adds the op; one that adds it sets its rows' `backing` to what its silicon gives.
+  A `data/keys` reader sees a new `backing` field on every item.
 
 ## v0.1.29 — SOVDd v0.1.12: /v1 execute is orchestrated without x-ota-control
 

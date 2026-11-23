@@ -63,6 +63,9 @@
  * holds no key material — a u64 that only ever ratchets upward). */
 #define OP_READ_MONOTONIC       0x28u
 #define OP_RAISE_MONOTONIC      0x29u
+#define OP_GET_SLOT_BACKING     0x2Au /* handle -> backing:u32 (BACKING_*); an
+                                         older backend answers ST_NOT_SUPPORTED
+                                         or ST_PROTOCOL_ERROR: unknown */
 
 /* Status codes (mirror the Rust HsmError categories). */
 #define ST_OK                   0u
@@ -92,6 +95,11 @@
 #define KEYTYPE_AES256      4u
 #define KEYTYPE_HMAC_SHA256 5u
 #define KEYTYPE_MONOTONIC   0xFFu
+
+/* Slot-backing wire constants — GET_SLOT_BACKING result backing:u32. */
+#define BACKING_HARDWARE         1u /* in the HSM; the key never leaves it */
+#define BACKING_SOFTWARE_SEALED  2u /* software key sealed under an HSM key */
+#define BACKING_SOFTWARE         3u /* software key, no hardware protection */
 
 /* ProvisioningState wire constants — PROVISIONING_STATE result state:u32. */
 #define PROV_STATE_UNPROVISIONED 0u

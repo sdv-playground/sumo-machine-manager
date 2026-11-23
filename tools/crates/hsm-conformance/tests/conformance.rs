@@ -283,6 +283,26 @@ fn stub_example_does_not_conform() {
         "I4 (counter present) must pass — the stub now lists the time-floor:\n{inv}"
     );
 
+    // GET_SLOT_BACKING answers from the slot map's `backing` column, which in
+    // the skeleton is the weakest claim for every slot: a copy of it must not
+    // report hardware protection its silicon may not give. Every listed slot
+    // answers Software, and an unknown handle has no slot.
+    use hsm::{HsmError, KeyHandle, SlotBacking};
+    let slots = client.list_slots().expect("list_slots");
+    assert!(!slots.is_empty());
+    for slot in &slots {
+        assert_eq!(
+            client.slot_backing(slot.handle).unwrap(),
+            SlotBacking::Software,
+            "the skeleton claims no more than software for '{}'",
+            slot.key_id
+        );
+    }
+    assert!(matches!(
+        client.slot_backing(KeyHandle(0x000B)),
+        Err(HsmError::KeyNotFound(_))
+    ));
+
     drop(client);
     let _ = child.kill();
     let _ = child.wait();

@@ -144,6 +144,31 @@ pub enum SlotKind {
     Monotonic,
 }
 
+/// What holds a slot's material. A [`SlotInfo`] does not say, and its wire record
+/// is frozen, so a backend reports it per slot on request (link-B
+/// `GET_SLOT_BACKING`). A slot inventory that lists a software key as if it were
+/// in hardware promises protection the device does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotBacking {
+    /// In the HSM; the key never leaves it.
+    Hardware,
+    /// A software key kept sealed under a key in the HSM, and opened into host
+    /// memory for each use. Protected at rest, and bound to this device.
+    SoftwareSealed,
+    /// A software key with no hardware protection (e.g. a simulator's files).
+    Software,
+}
+
+impl std::fmt::Display for SlotBacking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SlotBacking::Hardware => "hardware",
+            SlotBacking::SoftwareSealed => "software-sealed",
+            SlotBacking::Software => "software",
+        })
+    }
+}
+
 impl std::fmt::Display for SlotKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

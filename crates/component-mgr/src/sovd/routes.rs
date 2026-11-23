@@ -303,13 +303,16 @@ fn component_banks(machine: &dyn Machine) -> Vec<ComponentBanksResponse> {
 ///
 ///   `GET  /vehicle/v1/components/hsm/data/keys`
 ///        → 200 JSON `{ "provisioned": bool, "items": [ { id, kind,
-///          has_certificate, allowed_ops, public_key_der_base64 } ] }` — ALWAYS
+///          has_certificate, allowed_ops, public_key_der_base64, backing } ] }` — ALWAYS
 ///          served (device-generated keys exist from first boot); `provisioned`
 ///          is the device's own state, so callers read it instead of inferring
 ///          from a status code. Every slot is listed — key slots (`kind` =
 ///          `EC-P256`/`AES-256`/…) AND the monotonic counter (`kind` =
 ///          `monotonic`). Public-only; `public_key_der_base64` is the SPKI for
 ///          asymmetric key slots, `null` for symmetric keys and the counter.
+///          `backing` is what holds the slot (`hardware`, `software-sealed`,
+///          `software`), or `unknown` where the backend did not say; `unknown`
+///          is no claim, never read as `hardware`.
 ///   `POST /vehicle/v1/components/hsm/operations/x-csr/executions`
 ///        body `{ "key_id": "<slot>" }` → 200 ISO 17978-3 §7.14 operation
 ///        execution; `result.csr_der_base64` is the PKCS#10 CSR.
@@ -355,6 +358,9 @@ pub(crate) struct HsmKeyEntry {
     pub has_certificate: bool,
     pub allowed_ops: Option<Vec<String>>,
     pub public_key_der_base64: Option<String>,
+    /// What holds the slot: `hardware`, `software-sealed`, `software`, or
+    /// `unknown` where the backend did not say (no claim, never `hardware`).
+    pub backing: String,
 }
 
 /// The `hsm/data/keys` inventory: the device's provisioning state plus every
@@ -400,6 +406,7 @@ pub(crate) async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::
                         has_certificate: k.has_certificate,
                         allowed_ops: k.allowed_ops,
                         public_key_der_base64,
+                        backing: k.backing.label().to_string(),
                     }
                 })
                 .collect();
@@ -2099,6 +2106,7 @@ mod tests {
                     has_certificate: true,
                     allowed_ops: Some(vec!["sign".to_string(), "verify".to_string()]),
                     public_key_der_base64: Some("QUJD".to_string()),
+                    backing: "hardware".to_string(),
                 },
                 HsmKeyEntry {
                     id: "time-floor".to_string(),
@@ -2106,6 +2114,7 @@ mod tests {
                     has_certificate: false,
                     allowed_ops: None,
                     public_key_der_base64: None,
+                    backing: "unknown".to_string(),
                 },
             ],
         };
@@ -2120,6 +2129,7 @@ mod tests {
                         "has_certificate": true,
                         "allowed_ops": ["sign", "verify"],
                         "public_key_der_base64": "QUJD",
+                        "backing": "hardware",
                     },
                     {
                         "id": "time-floor",
@@ -2127,6 +2137,7 @@ mod tests {
                         "has_certificate": false,
                         "allowed_ops": null,
                         "public_key_der_base64": null,
+                        "backing": "unknown",
                     },
                 ],
             })

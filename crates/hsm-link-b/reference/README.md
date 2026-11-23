@@ -68,6 +68,13 @@ Handle handling, already wired:
   handle return `ST_KEY_NOT_FOUND`. It holds no key, so a **crypto** op on it is
   rejected — but it DOES appear in the slot inventory (`LIST_SLOTS` /
   `GET_SLOT_INFO`) with kind `KEYTYPE_MONOTONIC`, alongside the key slots.
+- `GET_SLOT_BACKING` says what holds each slot: the slot map's `backing` column.
+  The skeleton's rows all say `BACKING_SOFTWARE`, the weakest claim, so a copy
+  never reports protection its silicon may not give. Raise a row to
+  `BACKING_HARDWARE` only for a key you know never leaves the HSM (or a counter
+  the HSM keeps), or to `BACKING_SOFTWARE_SEALED` for a software key sealed under
+  an HSM key. A virtual anchor (a public key the service keeps itself) stays
+  `BACKING_SOFTWARE`.
 
 ## What you replace: the slot map (the per-silicon part)
 
@@ -86,4 +93,5 @@ gap (was `freshness-signing`).
 
 This is the **one table a real integrator replaces** for their silicon: keep the
 logical handles identical, substitute your own physical slot numbers / key
-banks. Nothing above Link B (the proxy, the transport, the op contract) changes.
+banks, and set each row's `backing` to what your silicon actually gives (the
+sample says `BACKING_SOFTWARE` throughout). Nothing above Link B (the proxy, the transport, the op contract) changes.
