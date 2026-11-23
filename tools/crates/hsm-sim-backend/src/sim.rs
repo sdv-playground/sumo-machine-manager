@@ -209,6 +209,20 @@ impl SimHsm {
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
         restrict_dir_700(&self.keys_dir());
 
+        // A keystore that is provisioned or already holds a device key belongs
+        // to an established device: a key created in it now is not first boot.
+        let material = |role: &KeyRole| {
+            let ext = match role.key_type() {
+                KeyType::Aes256 => "bin",
+                _ => "priv",
+            };
+            self.keys_dir().join(format!("{}.{ext}", role.key_id()))
+        };
+        let established = self.manifest_path().exists()
+            || KeyRole::mandatory_roles()
+                .iter()
+                .any(|r| r.is_device_generated() && material(r).exists());
+
         for role in KeyRole::mandatory_roles() {
             if !role.is_device_generated() {
                 continue;
@@ -227,7 +241,11 @@ impl SimHsm {
                 rand::rngs::OsRng.fill_bytes(&mut bytes);
                 write_atomic(&bin_path, &bytes, false)
                     .map_err(|e| HsmError::KeystoreError(format!("write {key_id} key: {e}")))?;
-                tracing::info!(key_id = %key_id, "device-side AES-256 key generated (first boot)");
+                if established {
+                    log_device_key_replaced(*role);
+                } else {
+                    tracing::info!(key_id = %key_id, "device-side AES-256 key generated (first boot)");
+                }
                 continue;
             }
 
@@ -250,7 +268,11 @@ impl SimHsm {
             write_pem_ec_private(&priv_path, &scalar)
                 .map_err(|e| HsmError::KeystoreError(format!("write {key_id} priv: {e}")))?;
 
-            tracing::info!(key_id = %key_id, "device-side key pair generated (first boot)");
+            if established {
+                log_device_key_replaced(*role);
+            } else {
+                tracing::info!(key_id = %key_id, "device-side key pair generated (first boot)");
+            }
         }
         Ok(())
     }
@@ -1330,6 +1352,30 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8], private: bool) -> std::io::
     Ok(())
 }
 
+/// Report a device-generated key that `ensure_device_keys` had to create in an
+/// established keystore: the device's identity or attestation for `role` is now
+/// a different key, and whatever trusted the old one stops verifying.
+#[cfg(feature = "crypto")]
+fn log_device_key_replaced(role: KeyRole) {
+    let breaks = match role {
+        KeyRole::DeviceDecryption => {
+            "the ECU id (the digest of this key) changed and envelopes encrypted to the old key can no longer be decrypted"
+        }
+        KeyRole::IvdSigning => {
+            "existing bank IVD manifests and the boot selector, signed with the old key, no longer verify"
+        }
+        KeyRole::TlsIdentity => "the installed TLS leaf certificate no longer matches the key",
+        KeyRole::Storage => "data encrypted under the old storage key can no longer be decrypted",
+        _ => "anything signed with the old key no longer verifies",
+    };
+    tracing::error!(
+        key_id = %role.key_id(),
+        "device key {} was missing from a keystore that is provisioned or holds other device keys, \
+         and has been created anew: the device's identity/attestation for this role changed; {breaks}",
+        role.key_id(),
+    );
+}
+
 /// Where [`carry_over`] is in the keystore tree; what a re-provision owns
 /// differs per level.
 #[derive(Clone, Copy)]
@@ -1947,6 +1993,93 @@ mod tests {
         let yaml = std::fs::read_to_string(keystore.join("bootstrap.yaml")).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed["pending"]["vm9"]["ttl_secs"].as_u64(), Some(9999));
+    }
+
+    /// Run `f` and return the events it logged on this thread (level, fields).
+    /// One process-wide subscriber records into a per-thread buffer, so tests
+    /// running in parallel neither see each other's events nor race on
+    /// callsite interest the way a scoped subscriber per test does.
+    #[cfg(feature = "crypto")]
+    fn capture_logs(f: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        use std::cell::RefCell;
+        type Events = Vec<(tracing::Level, String)>;
+        thread_local!(static CAPTURED: RefCell<Option<Events>> = const { RefCell::new(None) });
+        struct Capture;
+        struct Fields<'a>(&'a mut String);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={v:?} ", f.name()));
+            }
+        }
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                CAPTURED.with(|c| {
+                    if let Some(events) = c.borrow_mut().as_mut() {
+                        let mut fields = String::new();
+                        event.record(&mut Fields(&mut fields));
+                        events.push((*event.metadata().level(), fields));
+                    }
+                });
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| tracing::subscriber::set_global_default(Capture).unwrap());
+        CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        f();
+        CAPTURED.with(|c| c.borrow_mut().take().unwrap())
+    }
+
+    /// A fresh keystore's device keys are first boot: info, no error.
+    #[test]
+    #[cfg(feature = "crypto")]
+    fn first_boot_device_keys_log_info_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hsm = SimHsm::new(tmp.path().to_path_buf());
+        let logs = capture_logs(|| hsm.ensure_device_keys().unwrap());
+        assert!(
+            logs.iter().all(|(l, _)| *l != tracing::Level::ERROR),
+            "{logs:?}"
+        );
+        assert!(logs
+            .iter()
+            .any(|(l, m)| *l == tracing::Level::INFO && m.contains("(first boot)")));
+    }
+
+    /// A device key missing from a keystore that holds other device keys (or is
+    /// provisioned) is created, as before, and reported at ERROR naming the
+    /// role and what stops verifying.
+    #[test]
+    #[cfg(feature = "crypto")]
+    fn device_key_created_in_an_established_keystore_logs_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hsm = SimHsm::new(tmp.path().to_path_buf());
+        hsm.ensure_device_keys().unwrap();
+        std::fs::remove_file(tmp.path().join("keys/ivd-signing.priv")).unwrap();
+        std::fs::remove_file(tmp.path().join("keys/storage-key.bin")).unwrap();
+
+        let logs = capture_logs(|| hsm.ensure_device_keys().unwrap());
+
+        assert!(tmp.path().join("keys/ivd-signing.priv").exists());
+        assert!(tmp.path().join("keys/storage-key.bin").exists());
+        let errors: Vec<_> = logs
+            .iter()
+            .filter(|(l, _)| *l == tracing::Level::ERROR)
+            .map(|(_, m)| m)
+            .collect();
+        assert_eq!(errors.len(), 2, "{logs:?}");
+        assert!(errors[0].contains("ivd-signing") && errors[0].contains("boot selector"));
+        assert!(errors[1].contains("storage-key") && errors[1].contains("identity/attestation"));
+        assert!(!logs.iter().any(|(_, m)| m.contains("first boot")));
     }
 
     /// What a crash between writing a counter's temp file and renaming it
