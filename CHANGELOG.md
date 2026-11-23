@@ -8,6 +8,29 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- deps: SOVDd v0.1.12 (every pin) — on `/v1`, `PUT …/updates/{id}/execute` without `x-ota-control` runs
+  orchestrated (was 400 `incomplete-request`); `x-ota-control=orchestrated` stays accepted, any other
+  value still answers 400 before anything runs; the component capabilities drop `x-update.control`,
+  `/v1/docs` lists execute without parameters, `/.well-known/sovd-extensions` marks `x-ota-control`
+  `implied_on: ["/v1"]`. `/vehicle/v1` unchanged. Host-facing: move SOVDd pins together; a `/v1` client
+  may omit `x-ota-control`; a test pinning the 400 on a missing parameter, or reading
+  `x-update.control`, must change.
+
+## v0.1.28 — node-shell: mDNS goodbye on shutdown and before a reset
+
+Tag on `bbccd45` (2026-11-23), PR #67.
+
+- node-shell: `SovdListener::serve` caps the graceful drain at 5 s on both transports (HTTP warns
+  `graceful shutdown timed out after 5 s; closing`) and sends the mDNS/DNS-SD goodbye before it returns
+  — as vm-sovd does. Host-facing: `serve` now returns `Result<(), String>` (it no longer hands back the
+  advertiser guard); drop the `_mdns` binding. `SovdListener::advertisement()` hands out an
+  `Advertisement` whose `withdraw()` sends the goodbye now (idempotent, blocking ~1 s, shared with
+  `serve`), for a reset path that ends the process without the shutdown notify.
+
+## v0.1.27 — node-shell: the SOVD node application shell; SOVDd v0.1.11
+
+Tag on `b532cb7` (2026-11-23), PR #66.
+
 - deps: SOVDd v0.1.11 (every pin) — the whole status family of a node server is node-level (an embedder's
   `/v1/status/x-boot-id` is served at `/v1/components/{node}/status/x-boot-id`; its root form is 404),
   node-level data/operations collections, `CapabilityExtensions::with_v1_paths`. Host-facing: move SOVDd
@@ -25,12 +48,6 @@ what a consumer has to touch when it moves its pin.
   copies, and supplies its backends, vendor routes, boot id, HSM, restart authorizer + reset action and
   factory-reset handler (verified: supernova's served API identical before/after the move, 504 probes
   on both trees).
-- node-shell: `SovdListener::serve` caps the graceful drain at 5 s on both transports (HTTP warns
-  `graceful shutdown timed out after 5 s; closing`) and sends the mDNS/DNS-SD goodbye before it returns
-  — as vm-sovd does. Host-facing: `serve` now returns `Result<(), String>` (it no longer hands back the
-  advertiser guard); drop the `_mdns` binding. `SovdListener::advertisement()` hands out an
-  `Advertisement` whose `withdraw()` sends the goodbye now (idempotent, blocking ~1 s, shared with
-  `serve`), for a reset path that ends the process without the shutdown notify.
 
 ## v0.1.26 — app leaf items from supernova
 

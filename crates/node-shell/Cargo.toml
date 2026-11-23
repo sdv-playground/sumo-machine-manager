@@ -23,11 +23,11 @@ tokio = { version = "1", features = ["net", "signal", "sync", "rt", "macros", "t
 # `Machine` — the hsm component's device id is the ECU id the identification
 # prefix and `x-ecu-id` share.
 machine-mgr = { path = "../machine-mgr" }
-sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.11" }
-sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.11" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.12" }
+sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.12" }
 # mDNS / DNS-SD advertiser for the SOVD endpoint (ISO 17978-3 §5.11), on both
 # transports; QNX-safe (a pure-Rust responder on `nto`).
-sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.11" }
+sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.12" }
 
 [dev-dependencies]
 async-trait = "0.1"

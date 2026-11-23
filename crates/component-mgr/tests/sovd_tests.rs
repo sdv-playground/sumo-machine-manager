@@ -2218,10 +2218,9 @@ async fn v1_component_capabilities_report_verdict_scope() {
             body["capabilities"]["x-update"]["verdict_scope"], scope,
             "{body}"
         );
-        // Execute requires the orchestrated control mode on /v1.
-        assert_eq!(
-            body["capabilities"]["x-update"]["control"],
-            serde_json::json!(["orchestrated"]),
+        // Every /v1 execute is orchestrated: no control mode to advertise.
+        assert!(
+            body["capabilities"]["x-update"].get("control").is_none(),
             "{body}"
         );
 
