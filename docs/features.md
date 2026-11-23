@@ -44,6 +44,7 @@ doesn't have to guess.
 | `app-mgr` | `container` | off | `docker_image::ContainerImageComponent` — detached `#container-image` payload validation + import into Docker / Podman / containerd |
 | `component-mgr` | `container` | off | forwards `app-mgr/container`; the container-image route in `app_install_router` |
 | `component-mgr` | `sovd-docs-hook` | **on** | vendor OpenAPI paths/schemas into SOVDd's §7.5 capability description |
+| `component-mgr` | `dev-recovery-anchor` | off | `sovd::hsm_authorizer::dev_recovery_anchor` — the SPKI of the well-known factory key, a deployment's dev `extra_anchor` for the factory-reset issuer |
 | `component-factory` | `container` | off | forwards `component-mgr/container` + `app-mgr/container` (nothing in the factory itself is gated) |
 | `vm-sovd` | `container` | off | forwards `component-factory/container` |
 | `vm-sovd` | `sovd-docs-hook` | **on** | forwards `component-mgr/sovd-docs-hook` |

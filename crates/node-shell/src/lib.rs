@@ -24,11 +24,16 @@
 //!   capped at 5 s and the DNS-SD goodbye; [`shutdown_on_signals`] fires it on
 //!   SIGTERM / SIGINT. A reset that ends the process without that notify sends
 //!   the goodbye itself, through [`SovdListener::advertisement`].
+//! - `reset` (feature `factory-reset`, on by default) — the factory-reset
+//!   engine: the authorized, ordered wipe, its response and the handler for
+//!   the router's factory-reset slot; the node's device comes in through
+//!   `reset::ResetHooks`.
 //!
 //! Nothing here knows a device: no paths, no reset primitive, no board. What a
 //! binary supplies is its device: the backends, the vendor routes it merges,
 //! the boot id, the HSM, the authorizer and action of its restart, its
-//! factory-reset handler, and the shutdown it cleans up after.
+//! factory-reset hooks (what to wipe, its before-wipe work, how its guests stop
+//! and how it shuts down), and the shutdown it cleans up after.
 //!
 //! ```no_run
 //! # use std::{collections::HashMap, sync::Arc};
@@ -74,6 +79,8 @@
 
 mod config;
 mod identity;
+#[cfg(feature = "factory-reset")]
+pub mod reset;
 mod router;
 mod serve;
 

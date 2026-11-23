@@ -73,6 +73,22 @@ use super::{identity, issuer_keys};
 /// itself has no key for that id. See the module docs.
 pub type ExtraAnchor = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
 
+/// SPKI-DER of the well-known factory bootstrap key (`FACTORY_SIGNING_PUBLIC`,
+/// P-256 `scalar=1` public). In dev builds it backs the factory-reset issuer
+/// so a rig with no provisioned keystore is still factory-resettable — the same
+/// public key the HSM already trusts to verify the first keystore install. A
+/// deployment feeds it to the authorizer as its [`ExtraAnchor`]; whether and
+/// under which condition is the deployment's (see the module docs).
+#[cfg(feature = "dev-recovery-anchor")]
+pub fn dev_recovery_anchor() -> Option<Vec<u8>> {
+    use p256::pkcs8::EncodePublicKey;
+    p256::ecdsa::VerifyingKey::from_sec1_bytes(&hsm::payload::FACTORY_SIGNING_PUBLIC)
+        .ok()?
+        .to_public_key_der()
+        .ok()
+        .map(|doc| doc.into_vec())
+}
+
 /// The cache cell: the keystore-manifest mtime the cached authorizer was built
 /// from (`None` = no manifest, i.e. unprovisioned), and the authorizer.
 type CacheCell = Option<(Option<std::time::SystemTime>, Arc<dyn Authorizer>)>;
@@ -325,6 +341,19 @@ mod tests {
     /// No fallback wired (the production shape) → the keystore is the only source,
     /// and a missing anchor stays missing. `authorizer_from_anchors` then skips
     /// that issuer, which is the fail-closed direction.
+    #[cfg(feature = "dev-recovery-anchor")]
+    #[test]
+    fn dev_recovery_anchor_round_trips_to_the_factory_key() {
+        use p256::pkcs8::DecodePublicKey;
+        let spki = dev_recovery_anchor().expect("recovery spki present");
+        let vk = p256::ecdsa::VerifyingKey::from_public_key_der(&spki).expect("valid P-256 SPKI");
+        assert_eq!(
+            vk.to_encoded_point(false).as_bytes(),
+            &hsm::payload::FACTORY_SIGNING_PUBLIC[..],
+            "the dev recovery anchor must be the well-known factory key"
+        );
+    }
+
     #[test]
     fn without_a_fallback_a_missing_anchor_stays_missing() {
         assert_eq!(anchor_der(|_| None, None, "factory-reset-issuer"), None);

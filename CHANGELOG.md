@@ -8,6 +8,28 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **node-shell `reset`** (feature `factory-reset`, on by default): the factory-reset engine, moved from
+  supernova-machine-manager unchanged in behaviour — `WipeTargets`, `component_dirs`,
+  `write_provisioned_banks`, `ensure_under_root`, `execute_wipe` (same order, log dir last),
+  `ShutdownKind`, `FactoryResetState`, `handle` (precheck, authorize, clear flash sessions, resolve,
+  before-wipe, stop guests, synchronous wipe, schedule shutdown; `{ok, wiped, errors}` with 200/500;
+  403 `factory-reset denied: …`) and `route` for `sovd_router`'s slot. The node supplies `ResetHooks`
+  (`resolve`, `precheck`, `before_wipe`, `stop_guests`, `schedule_shutdown`).
+
+  Host-facing: delete your engine copy, implement the hooks, mount `route(..)`. The moved lines now log
+  with the `node_shell::reset` target (texts unchanged).
+- **component-mgr** feature `dev-recovery-anchor` (off by default):
+  `sovd::hsm_authorizer::dev_recovery_anchor()`, the factory-key SPKI for a deployment's development
+  `extra_anchor`. Host-facing: delete your copy; enable the feature only where that anchor is meant to
+  be compiled in.
+
+  Verified: supernova's served API (540 probes) and a real wipe of a fixture tree are identical before
+  and after the move.
+
+## v0.1.29 — SOVDd v0.1.12: /v1 execute is orchestrated without x-ota-control
+
+Tag on `b6d65fb` (2026-11-23), PR #68.
+
 - deps: SOVDd v0.1.12 (every pin) — on `/v1`, `PUT …/updates/{id}/execute` without `x-ota-control` runs
   orchestrated (was 400 `incomplete-request`); `x-ota-control=orchestrated` stays accepted, any other
   value still answers 400 before anything runs; the component capabilities drop `x-update.control`,
