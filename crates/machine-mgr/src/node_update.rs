@@ -240,10 +240,6 @@ pub struct NodeCoordinator {
     /// The node's current boot id (the components record it into the installs
     /// they seal, which is how `pending_reset` is observed). `None` = unknown.
     node_boot_id: Option<String>,
-    /// Node boots while armed without a verdict after which the node rolls
-    /// itself back (see `MachineRegistry::observe_node_boot`). `None` =
-    /// disabled. Set by the host; there is no default.
-    trial_boot_limit: Option<u8>,
 }
 
 impl NodeCoordinator {
@@ -261,18 +257,6 @@ impl NodeCoordinator {
     /// The node's current boot id, if known.
     pub fn node_boot_id(&self) -> Option<&str> {
         self.node_boot_id.as_deref()
-    }
-
-    /// Set the trial boot limit (`None` = disabled). The host sets it below
-    /// its boot stage's own bound.
-    pub fn with_trial_boot_limit(mut self, limit: Option<u8>) -> Self {
-        self.trial_boot_limit = limit;
-        self
-    }
-
-    /// The trial boot limit, if one is set.
-    pub fn trial_boot_limit(&self) -> Option<u8> {
-        self.trial_boot_limit
     }
 
     /// Answer "rebooted since arming" from the boot vector's transaction
@@ -701,17 +685,6 @@ mod tests {
                 .with_node_boot_id("abc")
                 .node_boot_id(),
             Some("abc")
-        );
-    }
-
-    #[test]
-    fn trial_boot_limit_defaults_to_none_and_is_settable() {
-        assert_eq!(NodeCoordinator::new().trial_boot_limit(), None);
-        assert_eq!(
-            NodeCoordinator::new()
-                .with_trial_boot_limit(Some(3))
-                .trial_boot_limit(),
-            Some(3)
         );
     }
 }

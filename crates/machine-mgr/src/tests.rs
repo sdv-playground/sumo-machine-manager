@@ -1328,24 +1328,20 @@ async fn trial_boot_count_with_the_signer_unavailable_is_err_and_leaves_the_head
     assert_eq!(m.transaction().unwrap().trial_boots, 1, "not counted");
     assert_eq!(snapshot(tmp.path()), files);
 
-    // Through the registry: nothing counted, nothing rolled back.
+    // Through the registry: nothing counted, still in trial.
     let registry = MachineRegistry::builder(entity("veh"))
         .with_shared_selector(Arc::new(std::sync::RwLock::new(m)))
         .build()
         .unwrap();
-    let coord = NodeCoordinator::new()
-        .with_node_boot_id("boot-c")
-        .with_trial_boot_limit(Some(1));
+    let coord = NodeCoordinator::new().with_node_boot_id("boot-c");
     let out = registry.observe_node_boot(&coord).await;
     assert_eq!(out.trial_boots, None);
-    assert!(!out.bailed_out);
     assert!(registry.boot_selector().is_trial());
     assert_eq!(snapshot(tmp.path()), files);
 }
 
-#[tokio::test]
-async fn seed_completes_a_commit_nv_took_and_the_trial_limit_never_rolls_it_back() {
-    use crate::node_update::NodeCoordinator;
+#[test]
+fn seed_completes_a_commit_nv_took() {
     use crate::system_bank_state::{SignerMode, SwitchableSigner};
     use nv_store::types::Bank;
 
@@ -1374,14 +1370,6 @@ async fn seed_completes_a_commit_nv_took_and_the_trial_limit_never_rolls_it_back
         assert_eq!(sb.committed_generation(), trial_generation);
         assert_eq!(sb.active_bank("vm1"), Some(Bank::B));
     }
-
-    // The trial boot limit has nothing left to roll back.
-    let coord = NodeCoordinator::new()
-        .with_node_boot_id("boot-c")
-        .with_trial_boot_limit(Some(1));
-    let out = registry.observe_node_boot(&coord).await;
-    assert!(!out.bailed_out);
-    assert_eq!(registry.boot_selector().active_bank("vm1"), Some(Bank::B));
 }
 
 #[test]
@@ -1411,4 +1399,88 @@ fn seed_leaves_a_trial_nv_holds_or_does_not_describe() {
         .unwrap();
     assert!(registry.boot_selector().is_trial());
     assert_eq!(snapshot(tmp.path()), files);
+}
+
+/// A header an older build wrote when its trial boot limit rolled the node
+/// back — these bytes, produced by that build with the deterministic test
+/// signer — still parses, verifies and reads back as recorded.
+#[test]
+fn a_header_an_older_build_resolved_at_the_trial_boot_limit_still_verifies() {
+    use crate::system_bank_state::{Outcome, Reason, Resolution, SelectorBlob, TestSigner};
+
+    let written_by_an_older_build = r#"{
+  "generation": 3,
+  "entries": {},
+  "transaction": {
+    "armed_boot_id": "3224e44221a77f6e58a8ce398e189920",
+    "trial_boots": 2,
+    "counted_boot_id": "dd8922d45b6934130a24691b324c239e",
+    "resolution": {
+      "outcome": "rolled_back",
+      "reason": "trial_boot_limit"
+    }
+  },
+  "sha256": "9302bfc2e5157d50965059e61952565c343f315cd380d91c1665bf1dcaea7f01",
+  "signature": "36a71a6740b0d8f533f5fc43bcf7f3f9919a94f976257cb9b3c01ab86f4fdaa4"
+}"#;
+    let blob: SelectorBlob = serde_json::from_str(written_by_an_older_build).unwrap();
+    assert!(blob.is_valid(&TestSigner).unwrap());
+    let t = blob.transaction.unwrap();
+    assert_eq!(t.trial_boots, 2);
+    assert_eq!(
+        t.resolution,
+        Some(Resolution {
+            outcome: Outcome::RolledBack,
+            reason: Reason::TrialBootLimit,
+        })
+    );
+}
+
+/// A vector an older build rolled back at its trial boot limit loads: the
+/// resolution stays as recorded, the node is out of trial, and the next
+/// update arms and commits as usual.
+#[test]
+fn a_vector_an_older_build_rolled_back_at_the_trial_boot_limit_loads() {
+    use crate::system_bank_state::{
+        FileSelectorStore, Outcome, Reason, Resolution, SelectorStore, SwitchableSigner,
+        SystemBankManager,
+    };
+    use nv_store::types::Bank;
+    use std::collections::BTreeMap;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let signer = SwitchableSigner::new();
+    let m = file_vector_in_trial(tmp.path(), &signer);
+    let floor = m.committed_generation();
+    // The older build's bail-out: the store's rollback, the header resolved
+    // with the limit as its reason, boot ids and count kept.
+    let resolved = Resolution {
+        outcome: Outcome::RolledBack,
+        reason: Reason::TrialBootLimit,
+    };
+    let header = crate::system_bank_state::Transaction {
+        resolution: Some(resolved),
+        ..m.transaction().unwrap().clone()
+    };
+    drop(m);
+    let store = FileSelectorStore::new(tmp.path(), Box::new(signer.clone()));
+    assert_eq!(store.rollback(&header).unwrap(), floor);
+
+    let mut m = SystemBankManager::load(Box::new(FileSelectorStore::new(
+        tmp.path(),
+        Box::new(signer.clone()),
+    )))
+    .unwrap();
+    assert!(!m.is_trial());
+    assert_eq!(m.generation(), floor);
+    assert_eq!(m.active_bank("vm1"), Some(Bank::A));
+    assert_eq!(m.transaction().unwrap().resolution, Some(resolved));
+    assert_eq!(m.transaction().unwrap().trial_boots, 1);
+
+    m.stage("vm1", Bank::B, BTreeMap::new());
+    assert!(m.seal(Some("boot-d")).unwrap());
+    assert!(m.is_trial());
+    m.commit().unwrap();
+    assert!(!m.is_trial());
+    assert_eq!(m.active_bank("vm1"), Some(Bank::B));
 }

@@ -106,8 +106,11 @@ pub enum Outcome {
 pub enum Reason {
     /// A verdict from the caller.
     Verdict,
-    /// The node rolled itself back after the host-configured number of boots
-    /// while armed without a verdict.
+    /// The node rolled itself back after a host-configured number of boots
+    /// while armed without a verdict. Recorded only by older builds: a trial
+    /// now has no boot limit and nothing records this reason. Kept so a
+    /// header such a build wrote still verifies (the reason is inside the
+    /// signed digest) and loads as it was recorded.
     TrialBootLimit,
     /// The primary was restored to the committed copy outside the node's
     /// verdict path — the boot stage's rollback. Recorded by the manager at
@@ -177,7 +180,8 @@ pub struct Transaction {
 /// only when a transaction header is present:
 ///     u8 0x01, 16 bytes armed_boot_id, u8 trial_boots, 16 bytes counted_boot_id,
 ///     u8 resolution (0 none, 1 committed, 2 rolled_back),
-///     u8 reason (0 verdict, 1 trial_boot_limit, 2 boot_stage; 0 when no resolution)
+///     u8 reason (0 verdict, 1 trial_boot_limit [older builds only], 2 boot_stage;
+///         0 when no resolution)
 /// ```
 ///
 /// A blob without a header digests exactly as before the header existed.

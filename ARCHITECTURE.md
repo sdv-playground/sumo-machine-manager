@@ -307,8 +307,8 @@ one responsibility each:
 Two counters, by design, with distinct roles. The boot stage's own boot counter is the
 **safeguard** against bricking: it fires only when sumo never ran to settle the trial.
 The header's `trial_boots` is **information**: how many trial boots the node actually
-executed. A host-set trial boot limit is optional policy on top of that count and must sit
-strictly below the boot stage's bound.
+executed. It decides nothing: a trial has no boot limit and no time limit in sumo; it ends
+by the tester's verdict, or by the boot stage's own rollback when the node cannot start.
 
 The store never leaves a header recorded above the primary generation (write order,
 below). So a header above the primary on a committed vector can mean only one thing — the
@@ -407,8 +407,8 @@ per-component NV boot state as the authority for "which bank each set boots from
   `u64 size`, 32 bytes sha256; then, only when a transaction header is present (the
   `transaction` file, or a v0.1.14 primary), `u8 0x01`,
   16 bytes `armed_boot_id`, `u8 trial_boots`, 16 bytes `counted_boot_id`, `u8 resolution`
-  (0 none, 1 committed, 2 rolled_back), `u8 reason` (0 verdict, 1 trial_boot_limit,
-  2 boot_stage; 0 with no resolution). A blob without a header digests exactly as before.
+  (0 none, 1 committed, 2 rolled_back), `u8 reason` (0 verdict, 1 trial_boot_limit — written
+  only by older builds, read as recorded — 2 boot_stage; 0 with no resolution). A blob without a header digests exactly as before.
   The signature is over `sha256`.
 
   The **transaction header** (`Transaction`) is kept apart from both copies, recorded for
@@ -416,7 +416,7 @@ per-component NV boot state as the authority for "which bank each set boots from
   reduced to the first 16 bytes of its SHA-256; zero = unknown), `trial_boots` (distinct
   node boots counted while armed without a verdict), `counted_boot_id` (the last boot
   counted; zero = none) and `resolution` (`{outcome: committed|rolled_back, reason:
-  verdict|trial_boot_limit|boot_stage}`). It is meaningful only while the node is in trial
+  verdict|boot_stage}`, or `trial_boot_limit` in a header an older build wrote). It is meaningful only while the node is in trial
   (PRIMARY entries differ from the backup's) or when it records a resolution; readers gate
   on that.
   `seal` activates with a fresh header; `commit` moves the backup only, so the header
@@ -431,20 +431,13 @@ per-component NV boot state as the authority for "which bank each set boots from
   back, and goes away when no deployed boot stage needs it.
 - **Two counters.** The node counts trial boots in the header per distinct boot id (the
   arming boot and an already-counted boot count nothing), so a process restart within one
-  boot counts nothing. On top of that count a host may set
-  `NodeCoordinator::with_trial_boot_limit(Some(n))` (`None`, the default, disables it;
-  sumo has no default value): after `n` counted boots without a verdict the node rolls the
-  whole node back by itself — the same path a rollback verdict takes, differing only in the
-  recorded reason (`trial_boot_limit`): the boot vector first (the authority), then each
-  component that was in trial rolls back its own NV. The node never commits by itself. The
-  host sets `n` below its boot stage's own bound, so the node, not the boot stage, settles
-  the trial; the boot stage's counter stays the safeguard for when sumo never runs.
+  boot counts nothing. The count is reported and decides nothing: the node never commits
+  or rolls back by itself; the boot stage's counter stays the safeguard for when sumo never
+  runs.
 
   Host contract: call `MachineRegistry::observe_node_boot(&coord)` once after the store is
   loaded and before serving, with the coordinator carrying the current node boot id. A
-  failed count or a failed boot-vector rollback is logged and retried on the next boot;
-  per-component rollback failures after the vector moved are returned in
-  `NodeBootOutcome::errors`.
+  failed count is logged and retried on the next boot.
 
   Seed: call `MachineRegistry::seed_selector` when `SystemBankManager::is_empty()` or
   `!missing_entries(ids).is_empty()`. A vector holding record rows but no manager rows (the
@@ -488,11 +481,8 @@ per-component NV boot state as the authority for "which bank each set boots from
   which leaves NV unarmed. A failed commit or rollback verdict is reported to the orchestrator;
   NV is written before the boot vector, so NV is then one step ahead. A commit is safe to
   retry (NV folds an already-committed set into success); a rollback verdict retry is
-  still refused by NV as not-in-trial (the provider still writes NV first). With a trial
-  boot limit set, the gap closes on its own: the vector is still in trial, so later boots
-  count and the bail-out rolls the vector back (the per-component NV rollback then reports
-  not-in-trial in `NodeBootOutcome::errors`). Without a limit it closes only once the write
-  order changes.
+  still refused by NV as not-in-trial (the provider still writes NV first). The gap closes
+  only once the write order changes.
 
   The record adapter adds its own rules, record first throughout. `activate`: a failed
   `rows` write rolls the record back when it was not in trial before and returns `Err`; with
