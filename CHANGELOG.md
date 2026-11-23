@@ -26,6 +26,29 @@ what a consumer has to touch when it moves its pin.
   Verified: supernova's served API (540 probes) and a real wipe of a fixture tree are identical before
   and after the move.
 
+- **node-shell `reset`: the HSM-only factory reset** — `handle_hsm`, `reset_hsm` and `hsm_route`, for
+  `POST {base}/components/{hsm}/operations/factory-reset/executions` (on a node server
+  `/v1/components/{node}/subcomponents/{hsm}/...`). The same HighConsequence `FactoryReset` token as the
+  whole-device reset, bound to the ECU, not a component. It resets the keystore through the node's
+  hook, forgets the hsm bank set's install in NV (`NvStore::reset_fw_meta`, generation kept, so the first
+  factory-signed keystore installs again) and wipes the hsm bank dirs and staging, then exits (no
+  reboot): the HSM backend comes back with new identity keys, a new ECU id, ready to enroll. Every other
+  bank, the NV boot state, the boot selector, the guests and the logs stay. `ResetHooks` gains
+  `reset_keystore(dir)` and `hsm_bank_set()`, both defaulted (no keystore reset / no set: the HSM reset
+  answers 500 naming them). Host-facing: none unless the node mounts `hsm_route(..)` and implements the
+  two hooks.
+- nv-store: `NvStore::reset_fw_meta(set)` zeroes a bank set's firmware fields and anti-rollback floor
+  (`min_security_ver`) on both banks and keeps `gen`, so a first factory-signed HSM keystore installs
+  again after an HSM-only factory reset.
+- hsm-sim-backend: `reset_keystore(dir)`, an HSM-only factory reset of a SimHsm keystore: removes the
+  provisioning state, every provisioned key, root and certificate and the identity keys (device-decrypt,
+  tls-identity, iam-signing, jwt-signing), keeps ivd-signing, storage-key and the monotonic counters. The
+  next backend start regenerates the identity keys: a new ECU id, unprovisioned. Builds without `crypto`.
+- component-mgr (wire): `GET {base}/components/hsm/data/keys` answers a SOVD data item,
+  `{"id": "keys", "data": {"provisioned", "items"}}`, the shape traton-one-os's vehicle_os SOVD server
+  serves and drive-twin reads; was the bare `{"provisioned", "items"}`. Host-facing: readers take
+  `data.provisioned` / `data.items`.
+
 ## v0.1.29 — SOVDd v0.1.12: /v1 execute is orchestrated without x-ota-control
 
 Tag on `b6d65fb` (2026-11-23), PR #68.
@@ -155,22 +178,6 @@ Tag on `108b6e1` (2026-11-21), PR #59, #60.
 
 Tag on `d0f9740` (2026-11-17), PR #49, #50, #51, #52.
 
-- component-mgr (wire): `GET {base}/components/hsm/data/keys` answers a SOVD data item,
-  `{"id": "keys", "data": {"provisioned", "items"}}`, the shape traton-one-os's vehicle_os SOVD server serves and
-  drive-twin reads; was the bare `{"provisioned", "items"}`. Readers take `data.provisioned` / `data.items`.
-- deps (temporary): SOVDd pinned to its `feat/node-resources-under-the-node` branch (the node-scope 409
-  names a node's own operations); back to a tag once SOVDd tags it.
-- component-mgr (host-facing): `update_state_router` and `node_verdict_router` take
-  `&NodeResources`: `Root` serves them at the server root as before, `Host(id)` under the host component
-  (`{base}/components/{id}/...`), which behind SOVDd's node topology is the node's own data and
-  operations, and not at the root. Hosts pass `&NodeResources::Root` to keep today's paths.
-- nv-store: `NvStore::reset_fw_meta(set)` zeroes a bank set's firmware fields and anti-rollback floor
-  (`min_security_ver`) on both banks and keeps `gen`, so a first factory-signed HSM keystore installs
-  again after an HSM-only factory reset.
-- hsm-sim-backend: `reset_keystore(dir)`, an HSM-only factory reset of a SimHsm keystore: removes the
-  provisioning state, every provisioned key, root and certificate and the identity keys (device-decrypt,
-  tls-identity, iam-signing, jwt-signing), keeps ivd-signing, storage-key and the monotonic counters. The
-  next backend start regenerates the identity keys: a new ECU id, unprovisioned. Builds without `crypto`.
 - vm-sovd: the plain (non-gateway) server mounts `node_verdict_router`, so `x-update-commit` /
   `x-update-rollback` (and the `x-ota-*-trials` aliases) are served there too, not only by `--gateway`.
 - deps: SOVDd v0.1.4 — entity API under /v1 beside /vehicle/v1, node-level /updates, root

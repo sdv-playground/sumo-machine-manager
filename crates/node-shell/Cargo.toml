@@ -11,7 +11,7 @@ default = ["factory-reset"]
 # response and the route builder for `sovd_router`'s factory-reset slot. The
 # node supplies its device through `reset::ResetHooks`. ON by default; a node
 # without a factory reset builds with `--no-default-features`.
-factory-reset = ["dep:async-trait", "dep:component-factory", "dep:component-mgr", "dep:libc"]
+factory-reset = ["dep:async-trait", "dep:component-factory", "dep:component-mgr", "dep:libc", "dep:nv-store"]
 
 [dependencies]
 axum = "0.8"
@@ -42,6 +42,7 @@ sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.1
 component-factory = { path = "../component-factory", optional = true }
 component-mgr = { path = "../component-mgr", optional = true }
 libc = { version = "0.2", optional = true }
+nv-store = { path = "../nv-store", optional = true }
 async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]

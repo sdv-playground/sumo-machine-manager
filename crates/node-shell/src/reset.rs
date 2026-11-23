@@ -570,6 +570,27 @@ pub trait ResetHooks: Send + Sync {
     /// returned, so it must not block: arm the reset and fire it from a
     /// detached task after a short flush delay, so the response leaves first.
     fn schedule_shutdown(&self, kind: ShutdownKind);
+
+    /// [`handle_hsm`]'s keystore reset: return the keystore at `keystore` to
+    /// its unprovisioned floor (the provisioning state, every provisioned key,
+    /// root and certificate and the identity keys go; what keeps the banks'
+    /// signatures valid and the time floor stays) and list what it removed.
+    /// The HSM backend's own operation (the sim backend's
+    /// `hsm_sim_backend::reset_keystore`). Default: no keystore reset, so the
+    /// HSM-only reset answers 500 naming it.
+    fn reset_keystore(&self, keystore: &Path) -> Result<Vec<PathBuf>, String> {
+        Err(format!(
+            "{}: no keystore reset for this HSM backend",
+            keystore.display()
+        ))
+    }
+
+    /// The NV bank set of the node's `hsm` component (its profile `slot`), whose
+    /// install record [`handle_hsm`] forgets. Default: none, and the reset
+    /// answers 500 naming it.
+    fn hsm_bank_set(&self) -> Option<u8> {
+        None
+    }
 }
 
 pub struct FactoryResetState {
@@ -709,6 +730,149 @@ pub fn route(fr_state: Arc<FactoryResetState>) -> impl Fn(&str) -> axum::routing
             let st = fr_state.clone();
             let path = path.clone();
             async move { handle(st, headers, &path).await }
+        })
+    }
+}
+
+/// The factory reset of the node's `hsm` subcomponent alone: its keystore, its
+/// NV install record and its bank dirs. `POST
+/// {base}/components/{hsm}/operations/factory-reset/executions`, which a node
+/// server serves as `/v1/components/{node}/subcomponents/{hsm}/...`; the node
+/// mounts it with [`hsm_route`]. The same HighConsequence `FactoryReset` token as
+/// [`handle`], bound to the ECU (`aud` = its id, and the boot), not to a
+/// component: the keystore is the ECU's.
+///
+/// After [`ResetHooks::precheck`], the token and the flash sessions as in
+/// [`handle`], [`reset_hsm`] runs on the [`ResetHooks::resolve`] targets, and
+/// the node exits ([`ShutdownKind::Exit`], never a reboot): the respawn brings
+/// the HSM backend up with new identity keys, a new ECU id, ready to enroll
+/// again. The banks of every other component, the NV boot state, the boot
+/// selector, the guests and the logs are untouched. Answers like [`handle`]:
+/// 200 `{ok, wiped, errors}`, 500 if anything failed, 403 when the token is
+/// refused.
+pub async fn handle_hsm(
+    state: Arc<FactoryResetState>,
+    headers: HeaderMap,
+    path: &str,
+) -> axum::response::Response {
+    if let Err(status) = state.hooks.precheck() {
+        return status.into_response();
+    }
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let req = AccessRequest {
+        bearer,
+        method: &axum::http::Method::POST,
+        path,
+        // The token names the ECU, as the whole-device reset's does; a
+        // component-scoped check would refuse the issuer's factory-reset token.
+        component: None,
+        capability: Capability::FactoryReset,
+    };
+    if let Err(e) = state.authorizer.authorize(&req).await {
+        let e = crate::auth_error_message(&e);
+        tracing::warn!("hsm factory-reset denied: {e}");
+        return (StatusCode::FORBIDDEN, format!("factory-reset denied: {e}")).into_response();
+    }
+    if (state.flash_in_progress)() {
+        tracing::warn!("hsm factory_reset: clearing in-flight flash session(s) before the reset");
+    }
+    (state.clear_flash_sessions)();
+
+    let out = match state.hooks.resolve() {
+        Ok(targets) => reset_hsm(&targets, state.hooks.as_ref()),
+        Err(e) => WipeOutcome {
+            wiped: Vec::new(),
+            errors: vec![format!("resolve targets: {e}")],
+        },
+    };
+    tracing::warn!(
+        wiped = out.wiped.len(),
+        errors = out.errors.len(),
+        "hsm factory_reset: the HSM keystore is back to the unprovisioned floor"
+    );
+    let ok = out.errors.is_empty();
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let body = Response {
+        ok,
+        wiped: out.wiped.iter().map(|p| p.display().to_string()).collect(),
+        errors: out.errors,
+    };
+    // A restart, never a reboot: only the HSM backend has to come back up.
+    state.hooks.schedule_shutdown(ShutdownKind::Exit);
+    (status, axum::Json(body)).into_response()
+}
+
+/// The wipe of [`handle_hsm`] on `targets`: the keystore through
+/// [`ResetHooks::reset_keystore`], the hsm bank set's install record in NV
+/// (`NvStore::reset_fw_meta`, firmware fields and floor zeroed, generation kept,
+/// so the first, factory-signed keystore installs again and the next install
+/// still ratchets past every sealed generation), and the hsm bank dirs and
+/// staging.
+pub fn reset_hsm(targets: &WipeTargets, hooks: &dyn ResetHooks) -> WipeOutcome {
+    let mut out = WipeOutcome::default();
+    let root = &targets.root;
+
+    // 1. The keystore, to the unprovisioned floor.
+    match ensure_under_root(root, &targets.hsm_keystore) {
+        Err(e) => out.errors.push(format!("hsm_keystore: {e}")),
+        Ok(()) => match hooks.reset_keystore(&targets.hsm_keystore) {
+            Ok(removed) => out.wiped.extend(removed),
+            Err(e) => out.errors.push(format!("hsm_keystore: {e}")),
+        },
+    }
+
+    // 2. The hsm bank set's install record.
+    match hooks.hsm_bank_set() {
+        None => out
+            .errors
+            .push("nv_store: the node names no hsm bank set".into()),
+        Some(slot) => {
+            let set = nv_store::types::BankSet(slot);
+            match nv_store::block::FileBlockDevice::open(&targets.nv_store)
+                .map(nv_store::store::NvStore::new)
+                .map_err(|e| e.to_string())
+                .and_then(|mut nv| nv.reset_fw_meta(set).map_err(|e| e.to_string()))
+            {
+                Ok(n) => tracing::info!(
+                    slot,
+                    records = n,
+                    "hsm factory_reset: NV install record reset"
+                ),
+                Err(e) => out.errors.push(format!(
+                    "nv_store: reset_fw_meta(slot {slot}) in {}: {e}",
+                    targets.nv_store.display()
+                )),
+            }
+        }
+    }
+
+    // 3. The hsm bank dirs and staging (its installed manifest and IVD).
+    if let Some(dir) = &targets.hsm_state_dir {
+        for bank in ["bank_a", "bank_b"] {
+            wipe_dir_contents(root, &dir.join(bank), &format!("hsm/{bank}"), &mut out);
+        }
+        wipe_staging_under(root, dir, "hsm", &mut out);
+    }
+    out
+}
+
+/// The handler builder for [`handle_hsm`]: a `POST` handler for the executions
+/// path it is mounted at, `{tree}/components/{hsm}/operations/factory-reset/executions`
+/// on each tree (a node server maps the member form under the node).
+pub fn hsm_route(fr_state: Arc<FactoryResetState>) -> impl Fn(&str) -> axum::routing::MethodRouter {
+    move |path: &str| {
+        let fr_state = fr_state.clone();
+        let path = path.to_string();
+        axum::routing::post(move |headers: axum::http::HeaderMap| {
+            let st = fr_state.clone();
+            let path = path.clone();
+            async move { handle_hsm(st, headers, &path).await }
         })
     }
 }
@@ -1374,5 +1538,168 @@ mod tests {
             "mmgr never listed"
         );
         let _ = tmp;
+    }
+
+    /// The node side of an HSM-only reset: the fixture's targets, a keystore reset that removes
+    /// what a provisioning wrote, and the hsm component's bank set (3 in the fixture).
+    struct HsmHooks {
+        layout: Layout,
+        scheduled: Arc<Mutex<Vec<ShutdownKind>>>,
+        keystores: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    #[async_trait]
+    impl ResetHooks for HsmHooks {
+        fn resolve(&self) -> Result<WipeTargets, String> {
+            self.layout.targets()
+        }
+        fn before_wipe(&self, _errors: &mut Vec<String>) -> bool {
+            panic!("an HSM-only reset runs no whole-device work")
+        }
+        fn schedule_shutdown(&self, kind: ShutdownKind) {
+            self.scheduled.lock().unwrap().push(kind);
+        }
+        fn reset_keystore(&self, keystore: &Path) -> Result<Vec<PathBuf>, String> {
+            self.keystores.lock().unwrap().push(keystore.to_path_buf());
+            let key = keystore.join("device.key");
+            std::fs::remove_file(&key).map_err(|e| e.to_string())?;
+            Ok(vec![key])
+        }
+        fn hsm_bank_set(&self) -> Option<u8> {
+            Some(3)
+        }
+    }
+
+    /// An HSM reset fixture: its tree, the handler state, the shutdowns and keystore resets asked.
+    type HsmFixture = (
+        tempfile::TempDir,
+        Arc<FactoryResetState>,
+        Arc<Mutex<Vec<ShutdownKind>>>,
+        Arc<Mutex<Vec<PathBuf>>>,
+    );
+
+    /// The make_layout device with a real NV store: the hsm set (slot 3) and vm1 (slot 1) installed.
+    fn hsm_state(authorizer: Arc<dyn Authorizer>) -> HsmFixture {
+        let (tmp, layout) = make_layout();
+        std::fs::remove_file(&layout.nv_store).unwrap();
+        let dev = nv_store::block::FileBlockDevice::create(
+            &layout.nv_store,
+            nv_store::store::nv_device_size(8),
+        )
+        .unwrap();
+        let mut nv = nv_store::store::NvStore::new(dev);
+        for (slot, secver, gen) in [(3u8, 2u32, 4u64), (1, 5, 9)] {
+            let mut meta = nv_store::types::NvFwMeta {
+                fw_secver: secver,
+                min_security_ver: secver,
+                gen,
+                ..Default::default()
+            };
+            nv.write_fw_meta(
+                nv_store::types::BankSet(slot),
+                nv_store::types::Bank::A,
+                &mut meta,
+            )
+            .unwrap();
+        }
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let keystores = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(FactoryResetState {
+            flash_in_progress: Arc::new(|| false),
+            clear_flash_sessions: Arc::new(|| {}),
+            authorizer,
+            hooks: Arc::new(HsmHooks {
+                layout,
+                scheduled: scheduled.clone(),
+                keystores: keystores.clone(),
+            }),
+        });
+        (tmp, state, scheduled, keystores)
+    }
+
+    const HSM_PATH: &str = "/v1/components/hsm/operations/factory-reset/executions";
+
+    #[tokio::test]
+    async fn the_hsm_reset_resets_the_keystore_and_the_hsm_set_only() {
+        let (tmp, state, scheduled, keystores) = hsm_state(Arc::new(AllowAuth));
+        let root = tmp.path().to_path_buf();
+
+        let resp = handle_hsm(state, HeaderMap::new(), HSM_PATH).await;
+        let status = resp.status();
+        let body = body_string(resp).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            *scheduled.lock().unwrap(),
+            vec![ShutdownKind::Exit],
+            "a restart, no reboot"
+        );
+        assert_eq!(
+            *keystores.lock().unwrap(),
+            vec![root.join("vhsm").join("keys")]
+        );
+        assert!(!root.join("vhsm").join("keys").join("device.key").exists());
+
+        // The hsm set's install is forgotten (floor 0, generation kept); vm1's is not.
+        let nv = nv_store::store::NvStore::new(
+            nv_store::block::FileBlockDevice::open(&root.join("mmgr").join("nv-store.bin"))
+                .unwrap(),
+        );
+        let hsm = nv
+            .read_fw_meta(nv_store::types::BankSet(3), nv_store::types::Bank::A)
+            .unwrap();
+        assert_eq!((hsm.min_security_ver, hsm.fw_secver, hsm.gen), (0, 0, 4));
+        let vm1 = nv
+            .read_fw_meta(nv_store::types::BankSet(1), nv_store::types::Bank::A)
+            .unwrap();
+        assert_eq!((vm1.min_security_ver, vm1.gen), (5, 9));
+
+        // The hsm bank dirs and staging are wiped; everything else stays.
+        assert!(!root.join("hsm").join("bank_a").join("blob.bin").exists());
+        assert!(!root.join("hsm").join("staging-bank_a.cbor").exists());
+        assert!(root.join("vm1").join("bank_a").join("boot.img").exists());
+        assert!(root.join("vm1").join("staging-bank_a.cbor").exists());
+        assert!(root.join("mmgr").join("images").join("IMAGE.suit").exists());
+        assert!(root
+            .join("mmgr")
+            .join("boot-selector")
+            .join("primary")
+            .exists());
+        assert!(root.join("log").join("supernova.log").exists());
+    }
+
+    /// The issuer's factory-reset token names the ECU, not a component: the HSM reset checks it
+    /// as the whole-device reset does, on the path it came in on; refused, nothing runs.
+    #[tokio::test]
+    async fn the_hsm_reset_checks_the_ecus_token_and_does_nothing_when_refused() {
+        let auth = Arc::new(RecordingDenyAuth(Mutex::new(None)));
+        let (tmp, state, scheduled, keystores) = hsm_state(auth.clone());
+        let resp = handle_hsm(state, HeaderMap::new(), HSM_PATH).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(auth.0.lock().unwrap().as_deref(), Some(HSM_PATH));
+        assert!(scheduled.lock().unwrap().is_empty());
+        assert!(keystores.lock().unwrap().is_empty());
+        assert!(tmp
+            .path()
+            .join("hsm")
+            .join("bank_a")
+            .join("blob.bin")
+            .exists());
+    }
+
+    /// A node that supplies neither a keystore reset nor its hsm bank set gets 500 naming both,
+    /// and still restarts.
+    #[tokio::test]
+    async fn the_hsm_reset_without_the_nodes_hooks_answers_500() {
+        let (_tmp, layout) = make_layout();
+        let (state, scheduled) = make_state(layout);
+        let resp = handle_hsm(state, HeaderMap::new(), HSM_PATH).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("no keystore reset for this HSM backend"),
+            "{body}"
+        );
+        assert!(body.contains("names no hsm bank set"), "{body}");
+        assert_eq!(*scheduled.lock().unwrap(), vec![ShutdownKind::Exit]);
     }
 }
