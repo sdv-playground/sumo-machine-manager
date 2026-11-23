@@ -5,6 +5,14 @@ edition = "2021"
 license.workspace = true
 description = "The SOVD node application shell: the generic server a machine manager wires around its device — its config keys, identification, node topology, router with the node-level routes, and TLS/mDNS serving with graceful shutdown. Device facts stay in the binary that wires it."
 
+[features]
+default = ["factory-reset"]
+# The factory-reset engine (`reset`): the authorized wipe, its order, the
+# response and the route builder for `sovd_router`'s factory-reset slot. The
+# node supplies its device through `reset::ResetHooks`. ON by default; a node
+# without a factory reset builds with `--no-default-features`.
+factory-reset = ["dep:async-trait", "dep:component-factory", "dep:component-mgr", "dep:libc"]
+
 [dependencies]
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +36,13 @@ sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.12
 # mDNS / DNS-SD advertiser for the SOVD endpoint (ISO 17978-3 §5.11), on both
 # transports; QNX-safe (a pure-Rust responder on `nto`).
 sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.12" }
+# factory-reset: the component specs a reset resolves its bank dirs from, the
+# bank staging wipe, the `EBUSY` errno of a mounted partition, and the
+# `ResetHooks` async trait.
+component-factory = { path = "../component-factory", optional = true }
+component-mgr = { path = "../component-mgr", optional = true }
+libc = { version = "0.2", optional = true }
+async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]
 async-trait = "0.1"
