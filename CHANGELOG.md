@@ -37,8 +37,9 @@ what a consumer has to touch when it moves its pin.
     when they start or change and at info when they end, not per request;
   - no ECU id (device key absent or unreadable): no keystore issuer and no delegate is trusted. On a
     build with an `extra_anchor`, the issuer ids it answers (resolved keystore first, as everywhere)
-    are trusted with audience `""` for ECU restart and factory reset only; any other request that
-    carries a token is refused. Before, every trusted issuer was accepted with `aud: ""` for every
+    are trusted with audience `""` for the factory reset only (such a unit is badly provisioned and
+    the factory reset clears it); any other request that carries a token, an ECU restart included,
+    is refused. Before, every trusted issuer was accepted with `aud: ""` for every
     capability.
 
   A healthy unit accepts and rejects the same tokens as before and caches as before.

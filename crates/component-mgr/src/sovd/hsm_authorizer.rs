@@ -291,7 +291,7 @@ fn build(
         // No id: no audience to match a keystore issuer or a delegate to. Only
         // the ids the recovery anchor answers for stay trusted (keystore first,
         // as everywhere), with the no-id audience; `RecoveryOnly` below limits
-        // them to restart and factory reset.
+        // them to the factory reset.
         (None, Some(extra)) => issuer_keys::authorizer_from_anchors(
             |id| extra(id).and_then(|_| der_for(id)),
             |_| None,
@@ -334,22 +334,18 @@ fn build(
 }
 
 /// The authorizer of a unit with no ECU id on a build with a recovery anchor:
-/// a token may only restart the ECU or factory-reset it. Anything else that
-/// carries a token is refused before the issuer check; tokenless reads still
+/// a token may only factory-reset it: such a unit is badly provisioned, and the
+/// factory reset is what clears it. Anything else that carries a token, an ECU
+/// restart included, is refused before the issuer check; tokenless reads still
 /// reach the inner authorizer's read-open rule.
 struct RecoveryOnly(TieredAuthorizer);
 
 #[async_trait::async_trait]
 impl Authorizer for RecoveryOnly {
     async fn authorize(&self, req: &AccessRequest<'_>) -> Result<ClientContext, AuthError> {
-        if req.bearer.is_some()
-            && !matches!(
-                req.capability,
-                Capability::ResetExecute | Capability::FactoryReset
-            )
-        {
+        if req.bearer.is_some() && !matches!(req.capability, Capability::FactoryReset) {
             return Err(AuthError::Forbidden(
-                "no ECU id: only ECU restart and factory reset are authorised".into(),
+                "no ECU id: only the factory reset is authorised".into(),
             ));
         }
         self.0.authorize(req).await
@@ -753,11 +749,11 @@ mod tests {
         }
     }
 
-    /// With no ECU id, the recovery-anchor token restarts and factory-resets
-    /// the unit and does nothing else; tokenless reads stay read-open. A
+    /// With no ECU id, the recovery-anchor token factory-resets the unit and
+    /// does nothing else, not even a restart; tokenless reads stay read-open. A
     /// device key that is absent (not unreadable) gets the same rule.
     #[tokio::test]
-    async fn without_an_ecu_id_the_recovery_anchor_only_restarts_and_resets() {
+    async fn without_an_ecu_id_the_recovery_anchor_only_factory_resets() {
         let extra = recovery_extra();
         let rec = recovery_issuer();
         for device in [Slot::Unreadable, Slot::Absent] {
@@ -772,7 +768,7 @@ mod tests {
             );
             let all = token(&rec, "", "factory-reset reset:execute data:write");
             assert!(accepts(authz.as_ref(), &all, Capability::FactoryReset).await);
-            assert!(accepts(authz.as_ref(), &all, Capability::ResetExecute).await);
+            assert!(!accepts(authz.as_ref(), &all, Capability::ResetExecute).await);
             assert!(!accepts(authz.as_ref(), &all, Capability::DataWrite).await);
             let read = authz
                 .authorize(&AccessRequest {
