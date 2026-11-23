@@ -1153,3 +1153,262 @@ fn duplicate_component_id_error_display() {
     let e = DuplicateComponentId("host".into());
     assert!(e.to_string().contains("host"));
 }
+
+// ---------------------------------------------------------------------------
+// A signer that could not decide: never a verdict on the boot vector
+// ---------------------------------------------------------------------------
+
+/// Every file in `dir`, by name, with its bytes.
+fn snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().into_string().unwrap(),
+                std::fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// A file store in `dir` under `signer`: os and vm1 committed on A, vm1 with
+/// a sealed image, then vm1 in trial on B armed at node boot `boot-a`, one
+/// trial boot (`boot-b`) counted.
+fn file_vector_in_trial(
+    dir: &std::path::Path,
+    signer: &crate::system_bank_state::SwitchableSigner,
+) -> crate::system_bank_state::SystemBankManager {
+    use crate::system_bank_state::{FileSelectorStore, ImageEntry, SystemBankManager};
+    use nv_store::types::Bank;
+    use std::collections::BTreeMap;
+
+    let mut m = SystemBankManager::load(Box::new(FileSelectorStore::new(
+        dir,
+        Box::new(signer.clone()),
+    )))
+    .unwrap();
+    let image = ImageEntry {
+        size: 4096,
+        sha256: [0xAB; 32],
+    };
+    m.stage("os", Bank::A, BTreeMap::new());
+    m.stage(
+        "vm1",
+        Bank::A,
+        BTreeMap::from([("kernel".to_string(), image)]),
+    );
+    m.seal(None).unwrap();
+    m.commit().unwrap();
+    m.stage(
+        "vm1",
+        Bank::B,
+        BTreeMap::from([("kernel".to_string(), image)]),
+    );
+    m.seal(Some("boot-a")).unwrap();
+    m.observe_node_boot("boot-b").unwrap();
+    m
+}
+
+#[test]
+fn load_with_the_signer_unavailable_is_err_and_never_reseeded_then_loads_unchanged() {
+    use crate::system_bank_state::{
+        FileSelectorStore, LoadRetry, SignerMode, SwitchableSigner, SystemBankManager,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let signer = SwitchableSigner::new();
+    let before = file_vector_in_trial(tmp.path(), &signer);
+    let files = snapshot(tmp.path());
+    let store = || -> Box<dyn crate::system_bank_state::SelectorStore> {
+        Box::new(FileSelectorStore::new(tmp.path(), Box::new(signer.clone())))
+    };
+
+    signer.set(SignerMode::Unavailable);
+    assert!(SystemBankManager::load(store()).is_err());
+    let build = MachineRegistry::builder(entity("veh"))
+        .with_selector_store(store())
+        .build();
+    assert!(build.is_err(), "no registry, so nothing to seed over");
+    let retry = LoadRetry {
+        attempts: 3,
+        delay: std::time::Duration::ZERO,
+    };
+    assert!(SystemBankManager::load_retrying(store, retry).is_err());
+    assert_eq!(snapshot(tmp.path()), files, "nothing written");
+
+    // Back: the same vector, header and count.
+    signer.set(SignerMode::Ok);
+    let after = SystemBankManager::load(store()).unwrap();
+    assert_eq!(after.generation(), before.generation());
+    assert_eq!(after.committed_generation(), before.committed_generation());
+    assert_eq!(after.entry("vm1"), before.entry("vm1"));
+    assert_eq!(after.committed_entry("vm1"), before.committed_entry("vm1"));
+    assert_eq!(after.transaction(), before.transaction());
+    assert_eq!(after.transaction().unwrap().trial_boots, 1);
+    assert_eq!(snapshot(tmp.path()), files);
+}
+
+#[test]
+fn load_retrying_loads_once_the_signer_is_back_within_the_attempts() {
+    use crate::system_bank_state::{
+        FileSelectorStore, LoadRetry, SelectorStore, SignerMode, SwitchableSigner,
+        SystemBankManager,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let signer = SwitchableSigner::new();
+    let before = file_vector_in_trial(tmp.path(), &signer);
+    signer.set(SignerMode::Unavailable);
+
+    // The signer comes back for the third store built.
+    let built = std::cell::Cell::new(0);
+    let store = || -> Box<dyn SelectorStore> {
+        built.set(built.get() + 1);
+        if built.get() == 3 {
+            signer.set(SignerMode::Ok);
+        }
+        Box::new(FileSelectorStore::new(tmp.path(), Box::new(signer.clone())))
+    };
+    let retry = LoadRetry {
+        attempts: 3,
+        delay: std::time::Duration::ZERO,
+    };
+    let m = SystemBankManager::load_retrying(store, retry).expect("third attempt loads");
+    assert_eq!(built.get(), 3);
+    assert_eq!(m.generation(), before.generation());
+    assert_eq!(m.transaction(), before.transaction());
+}
+
+#[test]
+fn seal_with_the_signer_unavailable_is_err_writes_nothing_and_a_retry_seals() {
+    use crate::system_bank_state::{SignerMode, SwitchableSigner};
+    use nv_store::types::Bank;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let signer = SwitchableSigner::new();
+    let mut m = file_vector_in_trial(tmp.path(), &signer);
+    let (files, generation) = (snapshot(tmp.path()), m.generation());
+
+    m.stage("vm2", Bank::A, Default::default());
+    signer.set(SignerMode::Unavailable);
+    assert!(m.seal(Some("boot-c")).is_err());
+    signer.set(SignerMode::Ok);
+    signer.set_sign(SignerMode::Unavailable);
+    assert!(
+        m.seal(Some("boot-c")).is_err(),
+        "verify works, sign does not"
+    );
+    assert_eq!(snapshot(tmp.path()), files);
+    assert_eq!(m.generation(), generation);
+    assert_eq!(
+        m.active_bank("vm2"),
+        None,
+        "the staged selection is not adopted"
+    );
+
+    signer.set(SignerMode::Ok);
+    assert!(m.seal(Some("boot-c")).unwrap());
+    assert_eq!(m.generation(), generation + 1);
+    assert_eq!(m.active_bank("vm2"), Some(Bank::A));
+}
+
+#[tokio::test]
+async fn trial_boot_count_with_the_signer_unavailable_is_err_and_leaves_the_header() {
+    use crate::node_update::NodeCoordinator;
+    use crate::system_bank_state::{SignerMode, SwitchableSigner};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let signer = SwitchableSigner::new();
+    let mut m = file_vector_in_trial(tmp.path(), &signer);
+    let files = snapshot(tmp.path());
+
+    signer.set(SignerMode::Unavailable);
+    assert!(m.observe_node_boot("boot-c").is_err());
+    assert_eq!(m.transaction().unwrap().trial_boots, 1, "not counted");
+    assert_eq!(snapshot(tmp.path()), files);
+
+    // Through the registry: nothing counted, nothing rolled back.
+    let registry = MachineRegistry::builder(entity("veh"))
+        .with_shared_selector(Arc::new(std::sync::RwLock::new(m)))
+        .build()
+        .unwrap();
+    let coord = NodeCoordinator::new()
+        .with_node_boot_id("boot-c")
+        .with_trial_boot_limit(Some(1));
+    let out = registry.observe_node_boot(&coord).await;
+    assert_eq!(out.trial_boots, None);
+    assert!(!out.bailed_out);
+    assert!(registry.boot_selector().is_trial());
+    assert_eq!(snapshot(tmp.path()), files);
+}
+
+#[tokio::test]
+async fn seed_completes_a_commit_nv_took_and_the_trial_limit_never_rolls_it_back() {
+    use crate::node_update::NodeCoordinator;
+    use crate::system_bank_state::{SignerMode, SwitchableSigner};
+    use nv_store::types::Bank;
+
+    // The verdict's NV commit landed and its vector commit did not: NV has vm1
+    // committed on B, the vector still holds vm1 in trial on B over A.
+    let tmp = tempfile::tempdir().unwrap();
+    let signer = SwitchableSigner::new();
+    let m = file_vector_in_trial(tmp.path(), &signer);
+    let trial_generation = m.generation();
+    let mut registry = MachineRegistry::builder(entity("veh"))
+        .with_shared_selector(Arc::new(std::sync::RwLock::new(m)))
+        .build()
+        .unwrap();
+    let vm1 = nv_boot(Bank::B, true);
+
+    // The seed itself cannot complete it while the signer is gone.
+    signer.set(SignerMode::Unavailable);
+    assert!(registry.seed_selector([("vm1", &vm1)]).is_err());
+    assert!(registry.boot_selector().is_trial());
+
+    signer.set(SignerMode::Ok);
+    registry.seed_selector([("vm1", &vm1)]).unwrap();
+    {
+        let sb = registry.system_bank().read().unwrap();
+        assert!(!sb.is_trial(), "the commit is completed");
+        assert_eq!(sb.committed_generation(), trial_generation);
+        assert_eq!(sb.active_bank("vm1"), Some(Bank::B));
+    }
+
+    // The trial boot limit has nothing left to roll back.
+    let coord = NodeCoordinator::new()
+        .with_node_boot_id("boot-c")
+        .with_trial_boot_limit(Some(1));
+    let out = registry.observe_node_boot(&coord).await;
+    assert!(!out.bailed_out);
+    assert_eq!(registry.boot_selector().active_bank("vm1"), Some(Bank::B));
+}
+
+#[test]
+fn seed_leaves_a_trial_nv_holds_or_does_not_describe() {
+    use crate::system_bank_state::SwitchableSigner;
+    use nv_store::types::Bank;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let signer = SwitchableSigner::new();
+    let mut registry = MachineRegistry::builder(entity("veh"))
+        .with_shared_selector(Arc::new(std::sync::RwLock::new(file_vector_in_trial(
+            tmp.path(),
+            &signer,
+        ))))
+        .build()
+        .unwrap();
+    let files = snapshot(tmp.path());
+
+    // NV holds the trial too: the verdict's to settle.
+    registry
+        .seed_selector([("vm1", &nv_boot(Bank::B, false))])
+        .unwrap();
+    assert!(registry.boot_selector().is_trial());
+    // NV has no view of the component in trial: not the seed's to commit.
+    registry
+        .seed_selector([("os", &nv_boot(Bank::A, true))])
+        .unwrap();
+    assert!(registry.boot_selector().is_trial());
+    assert_eq!(snapshot(tmp.path()), files);
+}

@@ -90,7 +90,7 @@ pub use image_record::ImageRecord;
 pub use machine::{Machine, MachineRegistry, NodeBootOutcome};
 pub use system_bank_state::{
     BootRecord, BootSelector, BootVector, ComponentEntry, FileBootRecord, FileSelectorStore,
-    ImageEntry, Reason, RecordCopy, RecordSelectorStore, SelectorBlob, SelectorError,
+    ImageEntry, LoadRetry, Reason, RecordCopy, RecordSelectorStore, SelectorBlob, SelectorError,
     SelectorStore, SharedSystemBankState, Signer, SignerError, StubSelectorStore, StubSigner,
     SystemBankManager, Transaction,
 };

@@ -95,6 +95,25 @@ fn render_slots(m: &BTreeMap<String, ComponentEntry>) -> String {
 // The manager
 // ---------------------------------------------------------------------------
 
+/// How [`SystemBankManager::load_retrying`] retries a load that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadRetry {
+    /// Loads attempted in all, at least one.
+    pub attempts: u32,
+    /// Wait between two attempts.
+    pub delay: std::time::Duration,
+}
+
+impl Default for LoadRetry {
+    /// Five attempts one second apart.
+    fn default() -> Self {
+        Self {
+            attempts: 5,
+            delay: std::time::Duration::from_secs(1),
+        }
+    }
+}
+
 /// What [`SystemBankManager::observe_node_boot`] saw. It counts; it never
 /// decides on a limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +173,7 @@ impl SystemBankManager {
     /// generation 0. A copy or header the store could not read — including one
     /// its signer could not verify — is `Err`: nothing is loaded, so an
     /// unreadable record is never taken for an empty vector (and never
-    /// reseeded).
+    /// reseeded). See [`Self::load_retrying`].
     ///
     /// A header recorded above the primary generation, on a committed vector
     /// and with no resolution, can only mean the boot stage restored the
@@ -197,7 +216,7 @@ impl SystemBankManager {
                         Some(header)
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::error!(
                             trial_generation = gen,
                             generation,
                             error = %e,
@@ -227,6 +246,36 @@ impl SystemBankManager {
             transaction,
             pending: None,
         })
+    }
+
+    /// [`Self::load`] over a store from `make_store`, retried up to
+    /// `retry.attempts` times `retry.delay` apart while it fails — a store
+    /// whose signer is still coming up reads as unreadable, never as empty.
+    /// Returns the last error once the attempts are spent: the caller then
+    /// fails closed (exits non-zero) instead of serving or seeding over a
+    /// vector it could not read. Blocks the calling thread while it waits.
+    pub fn load_retrying(
+        make_store: impl Fn() -> Box<dyn SelectorStore>,
+        retry: LoadRetry,
+    ) -> Result<Self, SelectorError> {
+        let attempts = retry.attempts.max(1);
+        let mut attempt = 1;
+        loop {
+            match Self::load(make_store()) {
+                Ok(manager) => return Ok(manager),
+                Err(e) if attempt < attempts => {
+                    tracing::error!(
+                        attempt,
+                        attempts,
+                        error = %e,
+                        "boot-vector: the boot vector could not be read — retrying; nothing is seeded over it"
+                    );
+                    std::thread::sleep(retry.delay);
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Stage `bank` (with the `images` sealed into it, by part name) for
@@ -293,6 +342,13 @@ impl SystemBankManager {
             "boot-selector COMMIT → SECONDARY (PRIMARY copied to rollback floor)"
         );
         Ok(())
+    }
+
+    /// Whether [`commit`](Self::commit) can run now (see
+    /// [`SelectorStore::check_commit`]). Writes nothing; run it before a step
+    /// the commit must follow and that cannot be undone.
+    pub fn check_commit(&self) -> Result<(), SelectorError> {
+        self.store.check_commit()
     }
 
     /// Roll the booted (PRIMARY) selection back to the committed floor
@@ -428,6 +484,16 @@ impl SystemBankManager {
     /// from the committed floor (SECONDARY).
     pub fn is_trial(&self) -> bool {
         self.current != self.committed
+    }
+
+    /// Whether every component whose booted entry differs from its committed
+    /// one (either side absent counts) is among `ids`.
+    pub(crate) fn trial_only_in(&self, ids: &[&str]) -> bool {
+        self.current
+            .keys()
+            .chain(self.committed.keys())
+            .filter(|id| self.current.get(*id) != self.committed.get(*id))
+            .all(|id| ids.contains(&id.as_str()))
     }
 
     /// The generation of the currently-booted (PRIMARY) selection.
