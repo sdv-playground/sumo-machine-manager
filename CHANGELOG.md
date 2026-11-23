@@ -8,6 +8,43 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **vhsm-ssd guest enrolment: an HSM sign error no longer burns the enrolment token.** The
+  enrolment signer returned an empty signature when the HSM could not sign; the CWT minted from it
+  was handed to the guest and the one-shot bootstrap token (or the ENROLL_ASSISTED pending flag) was
+  consumed and saved, so a guest that enrolled during an HSM outage held a certificate that never
+  validates and had to be re-armed. Now the signer reports the error and ENROLL / ENROLL_ASSISTED
+  fail before anything is consumed or saved; the guest gets status `Internal` with no
+  `AuthFailReason` payload (a server fault, not a verdict) and retries the same enrolment once the
+  HSM answers. No wire format change.
+  Host-facing: `vhsm_server::cert::EcuSigner::sign` now returns `Result<Vec<u8>, SignError>` (new
+  `vhsm_server::cert::SignError`; `MintError` gains `Sign`). An out-of-tree `EcuSigner` returns
+  `Err(SignError(..))` where it cannot sign, never a placeholder signature. Hosts that run the
+  `vhsm-ssd` binary change nothing.
+- **component-mgr HSM authorizer: an HSM read error is no longer "no key", and a degraded authorizer
+  is no longer cached.** `build_authorizer_now` read the issuer anchors and the delegation root with
+  `.ok()` and the ECU id with `unwrap_or_default()`, and `CachedHsmAuthorizer` cached the result
+  keyed only on the keystore manifest mtime. An HSM read error therefore fell through to the build's
+  `extra_anchor` (the development recovery key) as if the keystore had no key, made the expected
+  audience `""` (accepted from every trusted issuer and on the delegated path), and was cached: a
+  build made during an outage kept restart and factory reset locked until a keystore push or a
+  process restart. Now a keystore read is present, absent (`KeyNotFound` / `NotProvisioned`, and
+  `NotSupported` for a provider without a trust-anchor store) or unreadable, and:
+  - an unreadable anchor is not trusted; on a build with an `extra_anchor` that anchor still stands
+    in for the ids it answers, now as a logged decision, so a development unit with an unreadable
+    HSM stays factory-resettable;
+  - a build that saw any read error serves that request only and is never cached: the next request
+    rebuilds, so the unit heals by itself once the HSM answers. Degraded states are logged at error
+    when they start or change and at info when they end, not per request;
+  - no ECU id (device key absent or unreadable): no keystore issuer and no delegate is trusted. On a
+    build with an `extra_anchor`, the issuer ids it answers (resolved keystore first, as everywhere)
+    are trusted with audience `""` for ECU restart and factory reset only; any other request that
+    carries a token is refused. Before, every trusted issuer was accepted with `aud: ""` for every
+    capability.
+
+  A healthy unit accepts and rejects the same tokens as before and caches as before.
+  Host-facing: no API change (`HsmAuthorizerDeps`, `ExtraAnchor`, `build_authorizer_now` keep their
+  signatures). To reset a development unit whose ECU id cannot be read, mint the recovery token with
+  `aud` = `""` (`x-ecu-id` cannot answer in that state).
 - **Software HSM (`hsm-sim-backend`): a re-provision keeps the device's own keys and state.** A
   second keystore envelope on a provisioned unit (a keystore update, a certificate renewal) built the
   new keystore in an empty directory, so every device-generated key was created anew — a new
