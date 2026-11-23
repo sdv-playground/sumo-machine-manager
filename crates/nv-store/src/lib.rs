@@ -30,11 +30,11 @@ pub use boot_record::{
 };
 pub use selector::{
     boot_id_digest, BootVector, ComponentEntry, ImageEntry, Outcome, Reason, Resolution,
-    SelectorBlob, SelectorError, SelectorStore, Signer, SlotSelect, StubSelectorStore, StubSigner,
-    Transaction,
+    SelectorBlob, SelectorError, SelectorStore, Signer, SignerError, SlotSelect, StubSelectorStore,
+    StubSigner, Transaction,
 };
 #[cfg(feature = "test-seams")]
-pub use selector::{InMemorySelectorStore, TestSigner};
+pub use selector::{InMemorySelectorStore, SignerMode, SwitchableSigner, TestSigner};
 /// The named reference slot layout — a test fixture, not a production API.
 #[cfg(any(test, feature = "test-seams"))]
 pub use types::slots;

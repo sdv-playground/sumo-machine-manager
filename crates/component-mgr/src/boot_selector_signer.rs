@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use hsm::{HsmCryptoProvider, KeyRole};
-use machine_mgr::system_bank_state::{Signer, StubSigner};
+use machine_mgr::system_bank_state::{Signer, SignerError, StubSigner};
 
 /// [`Signer`] that signs/verifies the boot-selector digest with the device
 /// HSM's `ivd-signing` key (ECDSA-P256, DER — same key + algorithm as
@@ -31,12 +31,12 @@ impl HsmSelectorSigner {
 }
 
 impl Signer for HsmSelectorSigner {
-    fn sign(&self, sha: &[u8; 32]) -> Vec<u8> {
+    fn sign(&self, sha: &[u8; 32]) -> Result<Vec<u8>, SignerError> {
         // The `Signer` trait is infallible. On any HSM error we log loudly and
         // return an empty signature: the resulting blob fails `is_valid` at the
         // next load, so it is rejected and the node falls back to the NV floor —
         // fail-safe rather than persisting an unverifiable boot selection.
-        match self.crypto.sign(KeyRole::IvdSigning.handle(), sha) {
+        Ok(match self.crypto.sign(KeyRole::IvdSigning.handle(), sha) {
             Ok(sig) => sig,
             Err(e) => {
                 tracing::error!(
@@ -46,21 +46,23 @@ impl Signer for HsmSelectorSigner {
                 );
                 Vec::new()
             }
-        }
+        })
     }
 
-    fn verify(&self, sha: &[u8; 32], sig: &[u8]) -> bool {
-        match self.crypto.verify(KeyRole::IvdSigning.handle(), sha, sig) {
-            Ok(ok) => ok,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    key = KeyRole::IvdSigning.key_id(),
-                    "boot-selector verify failed — rejecting selector"
-                );
-                false
-            }
-        }
+    fn verify(&self, sha: &[u8; 32], sig: &[u8]) -> Result<bool, SignerError> {
+        Ok(
+            match self.crypto.verify(KeyRole::IvdSigning.handle(), sha, sig) {
+                Ok(ok) => ok,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        key = KeyRole::IvdSigning.key_id(),
+                        "boot-selector verify failed — rejecting selector"
+                    );
+                    false
+                }
+            },
+        )
     }
 }
 
@@ -100,10 +102,10 @@ mod tests {
         let signer = HsmSelectorSigner::new(hsm);
         let sha = [0x11u8; 32];
 
-        let sig = signer.sign(&sha);
+        let sig = signer.sign(&sha).unwrap();
         assert!(!sig.is_empty(), "HSM sign must produce a real signature");
         assert!(
-            signer.verify(&sha, &sig),
+            signer.verify(&sha, &sig).unwrap(),
             "freshly-signed digest must verify"
         );
     }
@@ -113,20 +115,20 @@ mod tests {
         let (hsm, _tmp) = hsm_with_ivd_key();
         let signer = HsmSelectorSigner::new(hsm);
         let sha = [0x22u8; 32];
-        let sig = signer.sign(&sha);
+        let sig = signer.sign(&sha).unwrap();
 
         // Tampered signature → reject.
         let mut bad_sig = sig.clone();
         *bad_sig.last_mut().unwrap() ^= 0x01;
-        assert!(!signer.verify(&sha, &bad_sig));
+        assert!(!signer.verify(&sha, &bad_sig).unwrap());
 
         // Same signature, different digest → reject.
         let mut other = sha;
         other[0] ^= 0x01;
-        assert!(!signer.verify(&other, &sig));
+        assert!(!signer.verify(&other, &sig).unwrap());
 
         // Empty signature (what a failed sign yields) → reject.
-        assert!(!signer.verify(&sha, &[]));
+        assert!(!signer.verify(&sha, &[]).unwrap());
     }
 
     #[test]
@@ -134,9 +136,9 @@ mod tests {
         let (hsm, _tmp) = hsm_with_ivd_key();
         let signer = make_selector_signer(&Some(hsm));
         let sha = [0x33u8; 32];
-        let sig = signer.sign(&sha);
+        let sig = signer.sign(&sha).unwrap();
         assert!(!sig.is_empty(), "Some(hsm) → real signature");
-        assert!(signer.verify(&sha, &sig));
+        assert!(signer.verify(&sha, &sig).unwrap());
     }
 
     #[test]
@@ -145,11 +147,11 @@ mod tests {
         let signer = make_selector_signer(&None);
         let sha = [0x44u8; 32];
         assert!(
-            signer.sign(&sha).is_empty(),
+            signer.sign(&sha).unwrap().is_empty(),
             "None → StubSigner returns empty signature"
         );
         assert!(
-            signer.verify(&sha, &[]),
+            signer.verify(&sha, &[]).unwrap(),
             "StubSigner accepts (no-op verify)"
         );
     }

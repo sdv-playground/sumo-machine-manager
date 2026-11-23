@@ -374,7 +374,7 @@ fn seed_selector_reseeds_after_rejected_legacy_blob() {
         entries: BTreeMap::new(),
         transaction: None,
         sha256,
-        signature: TestSigner.sign(&sha256),
+        signature: TestSigner.sign(&sha256).unwrap(),
         selectors: Some(selectors),
     };
     let dir = std::env::temp_dir().join(format!(

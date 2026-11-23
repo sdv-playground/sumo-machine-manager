@@ -1856,6 +1856,7 @@ async fn activate_arms_the_primary_transaction_header() {
     let (gen, t) = node
         .store()
         .read_transaction()
+        .unwrap()
         .expect("the header is recorded");
     assert_eq!(
         gen, primary.generation,
@@ -1919,7 +1920,12 @@ async fn trial_boot_limit_rolls_the_node_back() {
     let primary = node.store().read_primary().unwrap().unwrap();
     assert_eq!(primary.entries["vm1"].bank, Bank::A);
     assert_eq!(
-        node.store().read_transaction().unwrap().1.resolution,
+        node.store()
+            .read_transaction()
+            .unwrap()
+            .unwrap()
+            .1
+            .resolution,
         Some(Resolution {
             outcome: Outcome::RolledBack,
             reason: Reason::TrialBootLimit,
@@ -1989,6 +1995,7 @@ async fn rollback_verdict_after_bail_out_is_idempotent() {
     assert_eq!(
         node.store()
             .read_transaction()
+            .unwrap()
             .unwrap()
             .1
             .resolution

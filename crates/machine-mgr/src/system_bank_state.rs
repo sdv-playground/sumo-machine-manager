@@ -63,13 +63,13 @@ use nv_store::types::Bank;
 // so existing `machine_mgr::system_bank_state::*` paths still resolve.
 pub use nv_store::selector::{
     boot_id_digest, BootVector, ComponentEntry, FileSelectorStore, ImageEntry, Outcome, Reason,
-    Resolution, SelectorBlob, SelectorError, SelectorStore, Signer, SlotSelect, StubSelectorStore,
-    StubSigner, Transaction,
+    Resolution, SelectorBlob, SelectorError, SelectorStore, Signer, SignerError, SlotSelect,
+    StubSelectorStore, StubSigner, Transaction,
 };
 // In-memory test seams: only for test builds (this crate's own unit tests, or
 // downstream cfg(test) users via the forwarding `test-seams` feature).
 #[cfg(any(test, feature = "test-seams"))]
-pub use nv_store::selector::{InMemorySelectorStore, TestSigner};
+pub use nv_store::selector::{InMemorySelectorStore, SignerMode, SwitchableSigner, TestSigner};
 // The boot-stage record seam and the one store over it.
 #[cfg(any(test, feature = "test-seams"))]
 pub use nv_store::boot_record::InMemoryBootRecord;
@@ -151,8 +151,10 @@ impl SystemBankManager {
     /// The store authenticates its contents: a copy that fails its check reads
     /// as absent. An absent PRIMARY (the stub case) yields empty maps at
     /// generation 0; an absent SECONDARY, an empty committed copy at
-    /// generation 0. A copy the store could not read is `Err`: nothing is
-    /// loaded, so an unreadable record is never taken for an empty vector.
+    /// generation 0. A copy or header the store could not read — including one
+    /// its signer could not verify — is `Err`: nothing is loaded, so an
+    /// unreadable record is never taken for an empty vector (and never
+    /// reseeded).
     ///
     /// A header recorded above the primary generation, on a committed vector
     /// and with no resolution, can only mean the boot stage restored the
@@ -172,7 +174,7 @@ impl SystemBankManager {
             Some(v) => (v.entries, v.generation),
             None => (BTreeMap::new(), 0),
         };
-        let transaction = match store.read_transaction() {
+        let transaction = match store.read_transaction()? {
             Some((gen, header)) if gen == generation => Some(header),
             Some((gen, header))
                 if gen > generation && current == committed && header.resolution.is_none() =>
@@ -811,7 +813,7 @@ mod tests {
         };
         assert_eq!(m.transaction(), Some(&want));
         assert_eq!(
-            store.read_transaction(),
+            store.read_transaction().unwrap(),
             Some((m.generation(), want.clone())),
             "the header is recorded for the primary generation"
         );
@@ -823,7 +825,7 @@ mod tests {
             "the backup is a plain vector"
         );
         assert_eq!(
-            store.read_transaction(),
+            store.read_transaction().unwrap(),
             Some((m.generation(), want)),
             "header untouched by commit"
         );
@@ -843,7 +845,7 @@ mod tests {
         });
         let primary = store.read_primary().unwrap().unwrap();
         assert_eq!(primary.entries["vm1"].bank, Bank::A);
-        let (gen, t) = store.read_transaction().unwrap();
+        let (gen, t) = store.read_transaction().unwrap().unwrap();
         assert_eq!(gen, primary.generation);
         assert_eq!(t.resolution, resolved);
         assert_eq!(t.armed_boot_id, boot_id_digest("boot-a"), "ids kept");
@@ -855,7 +857,10 @@ mod tests {
         m.rollback(Reason::Verdict).unwrap();
         assert_eq!(store.write_count(), writes);
         assert_eq!(m.transaction().unwrap().resolution, resolved);
-        assert_eq!(store.read_transaction().unwrap().1.resolution, resolved);
+        assert_eq!(
+            store.read_transaction().unwrap().unwrap().1.resolution,
+            resolved
+        );
     }
 
     #[test]
@@ -914,7 +919,7 @@ mod tests {
         let primary = store.read_primary().unwrap().unwrap();
         assert_eq!(primary.generation, gen, "same generation");
         assert_eq!(primary.entries["vm1"].bank, Bank::B, "same entries");
-        let (header_gen, t) = store.read_transaction().unwrap();
+        let (header_gen, t) = store.read_transaction().unwrap().unwrap();
         assert_eq!(header_gen, gen, "header recorded for the same generation");
         assert_eq!(t.trial_boots, 2);
         assert_eq!(t.counted_boot_id, boot_id_digest("boot-c"));
@@ -949,7 +954,7 @@ mod tests {
         m.stage("vm1", Bank::B, BTreeMap::new());
         m.seal(None).unwrap();
         assert_eq!(m.generation(), 43);
-        assert_eq!(store.read_transaction().unwrap().0, 43);
+        assert_eq!(store.read_transaction().unwrap().unwrap().0, 43);
     }
 
     #[test]
@@ -1033,7 +1038,7 @@ mod tests {
         assert!(!m.is_trial());
         assert_eq!(m.transaction(), Some(&recorded));
         assert_eq!(
-            store.read_transaction(),
+            store.read_transaction().unwrap(),
             Some((1, recorded.clone())),
             "persisted for the restored generation"
         );
@@ -1076,7 +1081,7 @@ mod tests {
             secondary,
             "secondary untouched"
         );
-        let (gen, t) = store.read_transaction().unwrap();
+        let (gen, t) = store.read_transaction().unwrap().unwrap();
         assert_eq!(gen, m.generation());
         assert_eq!(t.trial_boots, 1);
         assert_eq!(t.counted_boot_id, boot_id_digest("boot-b"));
@@ -1109,7 +1114,7 @@ mod tests {
             store.read_primary().unwrap(),
             store.read_secondary().unwrap()
         );
-        assert_eq!(store.read_transaction().unwrap().0, 1);
+        assert_eq!(store.read_transaction().unwrap().unwrap().0, 1);
     }
 
     // --- over a boot stage record that routes part of the vector ---
@@ -1234,7 +1239,8 @@ mod tests {
                 resolution: None,
             }),
             &TestSigner,
-        );
+        )
+        .unwrap();
         std::fs::write(
             dir.join("transaction"),
             serde_json::to_vec_pretty(&blob).unwrap(),
@@ -1243,7 +1249,7 @@ mod tests {
         let file = std::fs::read(dir.join("transaction")).unwrap();
         let writes = record.write_count();
 
-        assert_eq!(store.read_transaction(), None);
+        assert_eq!(store.read_transaction().unwrap(), None);
         let m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert!(m.transaction().is_none());
         assert_eq!(record.write_count(), writes);
@@ -1325,7 +1331,7 @@ mod tests {
             reader.read_secondary().unwrap(),
             vector(1, entries("vm2", Bank::A))
         );
-        assert_eq!(reader.read_transaction(), Some((2, header)));
+        assert_eq!(reader.read_transaction().unwrap(), Some((2, header)));
 
         // The slots are the named files, not the .tmp staging files.
         assert!(dir.join("primary").exists());
