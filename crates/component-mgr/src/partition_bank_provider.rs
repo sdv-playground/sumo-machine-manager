@@ -242,7 +242,11 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         self.inner.read_installed(bank)
     }
     fn activate(&self, bank: Bank) -> Result<ResetKind, BankError> {
-        // Route FIRST: every attached record points at `bank` BEFORE the inner
+        // The routing is not undone when the seal fails, so the boot vector
+        // proves first that its seal can run: a vector that cannot seal fails
+        // the activation with no record routed.
+        self.inner.check_activate(bank)?;
+        // Route next: every attached record points at `bank` BEFORE the inner
         // switches the boot selector to it, so the platform is never asked to
         // boot a bank it has not been pointed at. A route error returns here,
         // with the selector still on the old bank.
@@ -1303,6 +1307,64 @@ mod tests {
             Some(Bank::A),
             "a refused route aborts with the selector still on the old bank"
         );
+    }
+
+    #[test]
+    fn activate_with_the_signer_unavailable_routes_nothing_and_writes_nothing() {
+        use machine_mgr::system_bank_state::{FileSelectorStore, SignerMode, SwitchableSigner};
+        let base = tmp("rec-activate-signer");
+        let vector = base.join("vector");
+        let signer = SwitchableSigner::new();
+        let mut m = SystemBankManager::load(Box::new(FileSelectorStore::new(
+            &vector,
+            Box::new(signer.clone()),
+        )))
+        .unwrap();
+        m.stage("os", Bank::A, Default::default());
+        m.seal(None).unwrap();
+        m.commit().unwrap();
+        let selector: SharedSystemBankState = Arc::new(RwLock::new(m));
+        let nv = nv_armed(Bank::B);
+        let rec = Arc::new(Rec::default());
+        let parts = vec![
+            part("application.img", &base.join("a.img"), &base.join("b.img"))
+                .with_record(rec.clone()),
+        ];
+        let p = build_with(
+            base.join("images"),
+            parts,
+            "rec-activate-signer",
+            Arc::clone(&nv),
+            Some(Arc::clone(&selector)),
+        );
+        let (files, before) = (snapshot(&vector), nv_os(&nv));
+
+        signer.set(SignerMode::Unavailable);
+        let err = p.activate(Bank::B).expect_err("the vector cannot seal");
+        assert!(err.to_string().contains("nothing activated"), "{err}");
+        assert!(rec.routes().is_empty(), "no record routed");
+        assert_eq!(snapshot(&vector), files, "every boot-vector file unchanged");
+        assert_eq!(nv_os(&nv), before, "NV untouched");
+        assert_eq!(p.selected_bank(), Some(Bank::A));
+
+        signer.set(SignerMode::Ok);
+        p.activate(Bank::B).expect("activate");
+        assert_eq!(rec.routes(), [Bank::B]);
+        assert_eq!(p.selected_bank(), Some(Bank::B));
+    }
+
+    /// Every file in `dir`, by name, with its bytes.
+    fn snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().into_string().unwrap(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect()
     }
 
     #[test]

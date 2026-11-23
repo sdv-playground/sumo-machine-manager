@@ -220,6 +220,31 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         self.read_bank(bank).images
     }
 
+    /// Whether [`activate`](BankProvider::activate) of `bank` can seal the
+    /// boot vector now (see [`SystemBankManager::check_activate`]). Writes
+    /// nothing; `Ok` without a selector. Run before any step the seal must
+    /// follow and that cannot be undone.
+    ///
+    /// [`SystemBankManager::check_activate`]: machine_mgr::system_bank_state::SystemBankManager::check_activate
+    pub(crate) fn check_activate(&self, bank: Bank) -> Result<(), BankError> {
+        let Some(sel) = &self.selector else {
+            return Ok(());
+        };
+        sel.read()
+            .expect("selector poisoned")
+            .check_activate(
+                &self.component_id,
+                bank,
+                self.sealed_images(bank),
+                self.node_boot_id.as_deref(),
+            )
+            .map_err(|e| {
+                BankError::Failed(format!(
+                    "boot-vector activate cannot run — nothing activated: {e}"
+                ))
+            })
+    }
+
     /// What `bank`'s signed manifest records, for its boot-vector entry and
     /// the [`banks`](BankProvider::banks) status report: each image's size +
     /// SHA-256 and the node boot id the bank was sealed in (read without an
@@ -1092,10 +1117,15 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
     }
 
     fn activate(&self, bank: Bank) -> Result<ResetKind, BankError> {
-        // Run the activator (IFS write, partition swap, RT launcher …) FIRST so
-        // a failure short-circuits with `?` BEFORE the selector below is sealed:
-        // the engine can then roll NV back without the boot selector pointing at
-        // a half-activated bank.
+        // The activator below cannot be undone, and the seal must follow it,
+        // so the boot vector proves first that its seal can run (its copies
+        // read and verify, what it writes can be signed): a vector that
+        // cannot seal fails the activation with nothing activated.
+        self.check_activate(bank)?;
+        // Run the activator (IFS write, partition swap, RT launcher …) before
+        // the seal so a failure short-circuits with `?` BEFORE the selector
+        // below is sealed: the engine can then roll NV back without the boot
+        // selector pointing at a half-activated bank.
         //
         // For VMs (`bank_activator == None`) the block is skipped — VMs have no
         // activator; their qvm/process cycle is the activation. This matches the
@@ -2339,6 +2369,120 @@ mod tests {
         assert_eq!(snapshot(tmp.path()), files);
         assert_eq!(nv.lock().unwrap().read_boot_state(), before);
         assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::B));
+    }
+
+    /// An activator that counts its calls.
+    #[derive(Default)]
+    struct CountingActivator(std::sync::atomic::AtomicUsize);
+    impl CountingActivator {
+        fn calls(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl machine_mgr::BankActivator for CountingActivator {
+        fn activate(&self, _dir: &Path) -> Result<(), machine_mgr::BankActivatorError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn reset_kind(&self) -> ResetKind {
+            ResetKind::RequiresEcuReset
+        }
+    }
+
+    /// A committed file-backed vector (vm1 on B) under `signer`, and a
+    /// provider over it running `activator`.
+    fn activator_provider(
+        vector: &Path,
+        images_dir: &Path,
+        signer: &machine_mgr::system_bank_state::SwitchableSigner,
+        activator: &Arc<CountingActivator>,
+    ) -> (
+        IvdBankProvider<MemBlockDevice>,
+        SharedSystemBankState,
+        Arc<Mutex<NvStore<MemBlockDevice>>>,
+    ) {
+        let set = slots::VM1;
+        let (selector, nv) = file_trial(vector, signer, set);
+        selector.write().unwrap().commit().unwrap();
+        let p = IvdBankProvider::new(
+            Arc::clone(&nv),
+            set,
+            false,
+            Some(images_dir.to_path_buf()),
+            "vm1".into(),
+            None,
+            Some(Arc::clone(activator) as Arc<dyn machine_mgr::BankActivator>),
+            Some(Arc::clone(&selector)),
+        );
+        (p, selector, nv)
+    }
+
+    #[test]
+    fn activate_with_the_signer_unavailable_runs_no_activator_and_writes_nothing() {
+        use machine_mgr::system_bank_state::{SignerMode, SwitchableSigner};
+        let (vector, images) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let signer = SwitchableSigner::new();
+        let activator = Arc::new(CountingActivator::default());
+        let (p, selector, nv) =
+            activator_provider(vector.path(), images.path(), &signer, &activator);
+        let (files, before) = (
+            snapshot(vector.path()),
+            nv.lock().unwrap().read_boot_state(),
+        );
+
+        for (sign, verify) in [
+            (SignerMode::Unavailable, SignerMode::Unavailable),
+            (SignerMode::Unavailable, SignerMode::Ok),
+        ] {
+            signer.set_sign(sign);
+            signer.set_verify(verify);
+            let err = p.activate(Bank::A).expect_err("the vector cannot seal");
+            assert!(err.to_string().contains("nothing activated"), "{err}");
+            assert_eq!(activator.calls(), 0, "the activator did not run");
+            assert_eq!(
+                snapshot(vector.path()),
+                files,
+                "every boot-vector file unchanged"
+            );
+            assert_eq!(nv.lock().unwrap().read_boot_state(), before, "NV untouched");
+            assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::B));
+        }
+
+        signer.set(SignerMode::Ok);
+        p.activate(Bank::A).expect("activate");
+        assert_eq!(activator.calls(), 1);
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::A));
+    }
+
+    /// What the pre-flight cannot cover: a signer that answers it and goes
+    /// away before the seal. The activation fails as before the pre-flight
+    /// existed — the activator has run, the vector is unchanged — and a
+    /// retry completes it.
+    #[test]
+    fn activate_whose_signer_goes_away_after_the_pre_flight_fails_after_the_activator() {
+        use machine_mgr::system_bank_state::{SignerMode, SwitchableSigner};
+        let (vector, images) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let signer = SwitchableSigner::new();
+        let activator = Arc::new(CountingActivator::default());
+        let (p, selector, _nv) =
+            activator_provider(vector.path(), images.path(), &signer, &activator);
+        let files = snapshot(vector.path());
+
+        let calls = signer.calls();
+        p.check_activate(Bank::A).unwrap();
+        signer.unavailable_after(signer.calls() - calls);
+        let err = p.activate(Bank::A).expect_err("the seal fails");
+        assert!(
+            err.to_string().contains("boot-vector write failed"),
+            "{err}"
+        );
+        assert_eq!(activator.calls(), 1, "the activator ran before the seal");
+        assert_eq!(snapshot(vector.path()), files, "the vector is unchanged");
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::B));
+
+        signer.set(SignerMode::Ok);
+        p.activate(Bank::A).expect("retry");
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::A));
     }
 
     #[test]

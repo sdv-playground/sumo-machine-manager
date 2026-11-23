@@ -82,9 +82,8 @@ pub fn update_state_router(coord: Arc<NodeCoordinator>, machine: Arc<dyn Machine
 /// id (null = unknown); `banks`: what each component's banks hold, per the
 /// installed manifests (not a verification); `trial_boots`: node boots counted
 /// while armed without a verdict (null = no boot-vector trial open or
-/// resolved); `trial_boot_limit`: the count at which the node rolls itself
-/// back (null = disabled); `resolution`: how the last node transaction ended,
-/// per the boot vector (null = none recorded, or a trial is open).
+/// resolved); `resolution`: how the last node transaction ended, per the boot
+/// vector (null = none recorded, or a trial is open).
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct UpdateStateResponse {
     pub phase: String,
@@ -94,13 +93,13 @@ pub(crate) struct UpdateStateResponse {
     pub(crate) node_boot_id: Option<String>,
     pub banks: Vec<ComponentBanksResponse>,
     pub trial_boots: Option<u8>,
-    pub trial_boot_limit: Option<u8>,
     pub resolution: Option<ResolutionResponse>,
 }
 
 /// How a node transaction ended: `outcome` is `committed` or `rolled_back`,
-/// `reason` is `verdict`, `trial_boot_limit` or `boot_stage` (the boot stage
-/// restored the committed copy; recorded by the node at its next start).
+/// `reason` is `verdict` or `boot_stage` (the boot stage restored the
+/// committed copy; recorded by the node at its next start), or
+/// `trial_boot_limit` in a record an older build wrote.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct ResolutionResponse {
     pub outcome: String,
@@ -250,7 +249,6 @@ fn update_state_body(coord: &NodeCoordinator, machine: &dyn Machine) -> Json<Upd
         node_boot_id: coord.node_boot_id().map(str::to_string),
         banks: component_banks(machine),
         trial_boots,
-        trial_boot_limit: coord.trial_boot_limit(),
         resolution,
     })
 }
@@ -1957,7 +1955,6 @@ mod tests {
                 "node_boot_id": "boot-a",
                 "banks": [],
                 "trial_boots": null,
-                "trial_boot_limit": null,
                 "resolution": null,
             })
         );
@@ -1973,7 +1970,6 @@ mod tests {
                 "node_boot_id": "boot-a",
                 "banks": [],
                 "trial_boots": null,
-                "trial_boot_limit": null,
                 "resolution": null,
             })
         );
@@ -1989,7 +1985,6 @@ mod tests {
                 "node_boot_id": "boot-a",
                 "banks": [],
                 "trial_boots": null,
-                "trial_boot_limit": null,
                 "resolution": null,
             })
         );
@@ -2005,7 +2000,6 @@ mod tests {
                 "node_boot_id": "boot-b",
                 "banks": [],
                 "trial_boots": null,
-                "trial_boot_limit": null,
                 "resolution": null,
             })
         );
@@ -2021,7 +2015,6 @@ mod tests {
                 "node_boot_id": "boot-a",
                 "banks": [],
                 "trial_boots": null,
-                "trial_boot_limit": null,
                 "resolution": null,
             })
         );
