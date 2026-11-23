@@ -23,7 +23,10 @@
 //!   binary's shutdown [`Notify`](tokio::sync::Notify) fires, then a drain
 //!   capped at 5 s and the DNS-SD goodbye; [`shutdown_on_signals`] fires it on
 //!   SIGTERM / SIGINT. A reset that ends the process without that notify sends
-//!   the goodbye itself, through [`SovdListener::advertisement`].
+//!   the goodbye itself, through [`SovdListener::advertisement`]. A server that
+//!   starts on HTTP switches to HTTPS on the same port, without a restart, once
+//!   the leaf is provisioned and the binary's [`SovdListener::switch_when`] gate
+//!   allows it; [`SovdListener::tls_live`] tells the binary when it did.
 //! - `reset` (feature `factory-reset`, on by default) — the factory-reset
 //!   engine: the authorized, ordered wipe, its response and the handler for
 //!   the router's factory-reset slot; the node's device comes in through
@@ -91,4 +94,4 @@ pub use identity::{
 pub use router::{
     auth_error_message, capability_extensions, restart_response, restart_route, sovd_router,
 };
-pub use serve::{shutdown_on_signals, Advertisement, SovdListener};
+pub use serve::{shutdown_on_signals, Advertisement, SovdListener, SwitchGate};

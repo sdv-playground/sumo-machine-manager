@@ -23,10 +23,9 @@ pub fn builtin_activator(marker: &str) -> Option<Arc<dyn BankActivator>> {
 ///
 /// A keystore update is live the moment it is installed (the HSM provision
 /// path writes it and reloads the vhsm-ssd proxy), so `activate` has nothing
-/// left to do. What it does declare is that activation needs an ECU reset: a
-/// new `tls-identity` leaf switches the SOVD server from HTTP to HTTPS, and
-/// that transport choice is made once at startup. The server never restarts
-/// itself — the tester issues the node restart (`ResetKind::RequiresEcuReset`).
+/// left to do, and activation needs no reset (`ResetKind::None`): a new
+/// `tls-identity` leaf switches the SOVD server from HTTP to HTTPS on its own,
+/// without a restart (`node_shell::SovdListener::serve`).
 pub struct HsmKeystoreActivator;
 
 impl BankActivator for HsmKeystoreActivator {
@@ -36,7 +35,7 @@ impl BankActivator for HsmKeystoreActivator {
     }
 
     fn reset_kind(&self) -> ResetKind {
-        ResetKind::RequiresEcuReset
+        ResetKind::None
     }
 }
 
@@ -109,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn hsm_keystore_activation_requires_ecu_reset() {
+    fn hsm_keystore_activation_needs_no_reset() {
         let built = built_hsm();
         let flash = built
             .component
@@ -117,16 +116,14 @@ mod tests {
             .flash
             .clone()
             .expect("hsm is flashable");
-        assert_eq!(flash.reset_kind, ResetKind::RequiresEcuReset);
+        assert_eq!(flash.reset_kind, ResetKind::None);
     }
 
     /// `restart_supported` is `single_bank || vm_service || reset_kind !=
-    /// RequiresEcuReset` in component-mgr v0.1.24, so the single-bank hsm still
-    /// advertises a component restart — true ONLY because of the `single_bank`
-    /// term. The planned sumo-mm v0.1.25 predicate change drops that term and
-    /// flips this (and rt) to false; update the assertion with that pin.
+    /// RequiresEcuReset`, so the single-bank hsm, whose keystore needs no
+    /// reset, advertises a component restart.
     #[test]
-    fn hsm_restart_supported_true_only_via_single_bank_in_component_mgr_v0_1_24() {
+    fn hsm_advertises_a_component_restart() {
         let built = built_hsm();
         let diag = built.diag_backend.expect("hsm has a SOVD backend");
         assert!(diag.supports_restart());
@@ -135,7 +132,7 @@ mod tests {
     #[test]
     fn builtin_activator_knows_hsm_keystore_and_nothing_else() {
         let hsm = builtin_activator("hsm-keystore").expect("hsm-keystore is built in");
-        assert_eq!(hsm.reset_kind(), ResetKind::RequiresEcuReset);
+        assert_eq!(hsm.reset_kind(), ResetKind::None);
         // Device markers stay the node binary's to wire.
         for marker in ["host-bank", "some-device-loader", "HSM-KEYSTORE", ""] {
             assert!(builtin_activator(marker).is_none(), "{marker}");

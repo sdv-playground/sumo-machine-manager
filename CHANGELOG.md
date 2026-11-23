@@ -8,6 +8,23 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **node-shell `SovdListener`: HTTPS without a restart.** A server bound on HTTP with `sovd_tls` on (the
+  tls-identity leaf not provisioned yet) looks every 2 s whether the leaf is there and the binary's gate
+  allows the switch (`switch_when(SwitchGate)`, default: always). Then it drains its HTTP connections
+  (5 s cap), withdraws the HTTP advertisement, announces HTTPS and serves it on the same port, in the same
+  process, so every update session carries on. `tls_live()` is set while HTTPS is served, from the bind
+  or the switch. A keystore install brings the leaf in the middle of its update, and a client whose
+  server changes transport mid-session loses the session: gate the switch on that update being over
+  (its DELETE).
+
+  Host-facing: drop a restart that existed only to switch to HTTPS; pass `switch_when` with the end of
+  the keystore update; a run that keeps its authorization open while it provisions the device can close
+  it on `tls_live()`, so token checks and TLS come together.
+- **component-factory `HsmKeystoreActivator`:** `reset_kind` is `ResetKind::None` (was
+  `RequiresEcuReset`). The keystore is live once installed, and the SOVD server switches to HTTPS
+  without a restart, so nobody needs to restart the node for it. The hsm's x-update `reset_kind` reads
+  `none`.
+
 - **node-shell `reset`** (feature `factory-reset`, on by default): the factory-reset engine, moved from
   supernova-machine-manager unchanged in behaviour — `WipeTargets`, `component_dirs`,
   `write_provisioned_banks`, `ensure_under_root`, `execute_wipe` (same order, log dir last),

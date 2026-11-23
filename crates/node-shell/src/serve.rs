@@ -11,8 +11,18 @@ use crate::ShellConfig;
 
 /// How long [`SovdListener::serve`] lets in-flight connections drain after the
 /// shutdown notify before it closes them, so a client holding one open cannot
-/// hold back the mDNS goodbye or the binary's cleanup.
+/// hold back the mDNS goodbye or the binary's cleanup. The switch from HTTP to
+/// HTTPS drains the HTTP connections for as long.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a server on HTTP with `sovd_tls` on looks whether it may switch to
+/// HTTPS: the tls-identity leaf is provisioned and the binary's gate
+/// ([`SovdListener::switch_when`]) allows it (see [`SovdListener::serve`]).
+const SWITCH_POLL: Duration = Duration::from_secs(2);
+
+/// When a server may switch to HTTPS once the leaf is there; see
+/// [`SovdListener::switch_when`].
+pub type SwitchGate = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Advertise the host SOVD endpoint over mDNS / DNS-SD (ISO 17978-3 §5.11) when
 /// `sovd_mdns` is on. The `configured` identification (see
@@ -83,6 +93,71 @@ pub struct SovdListener {
     transport: Transport,
     bind: String,
     mdns: Advertisement,
+    /// For a server on HTTP with `sovd_tls` on: what it needs to switch to
+    /// HTTPS once the tls-identity leaf is provisioned.
+    upgrade: Option<Upgrade>,
+    /// Whether HTTPS is being served; see [`SovdListener::tls_live`].
+    tls_live: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What a [`SovdListener`] on HTTP switches to HTTPS with.
+struct Upgrade {
+    cfg: ShellConfig,
+    crypto: Arc<dyn hsm::HsmCryptoProvider>,
+    identification: Option<String>,
+    poll: Duration,
+    gate: SwitchGate,
+}
+
+/// The HTTPS transport for the tls-identity leaf, or `None` while it is not
+/// provisioned. The link-B backend signs the handshake (through `crypto`); the
+/// private key never leaves the HSM.
+fn tls_config(
+    crypto: &Arc<dyn hsm::HsmCryptoProvider>,
+) -> Option<(Vec<u8>, axum_server::tls_rustls::RustlsConfig)> {
+    let leaf = crypto
+        .get_certificate_der(hsm::KeyRole::TlsIdentity.handle())
+        .ok()?;
+    let signer = crypto.clone();
+    let sign_fn = move |msg: &[u8]| {
+        signer
+            .sign(hsm::KeyRole::TlsIdentity.handle(), msg)
+            .map_err(|e| e.to_string())
+    };
+    let tls_cfg = hsm_rustls::server_config_no_client_auth(leaf.clone(), sign_fn);
+    Some((
+        leaf,
+        axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls_cfg)),
+    ))
+}
+
+/// The HTTPS advertisement: instance and hostname from the leaf's `<id>.local`
+/// SAN, so a discovery client dialing `<id>.local` verifies this cert.
+fn https_mdns(
+    cfg: &ShellConfig,
+    identification: Option<&str>,
+    leaf: &[u8],
+) -> Option<sovd_mdns::AdvertiserGuard> {
+    start_mdns(
+        cfg,
+        identification,
+        &[
+            sovd_mdns::Identity::Leaf(leaf),
+            sovd_mdns::Identity::Hostname,
+        ],
+        sovd_mdns::Scheme::Https,
+    )
+}
+
+/// How the HTTP phase of [`SovdListener::serve`] ended.
+enum HttpEnd {
+    Shutdown,
+    /// The leaf appeared: serve HTTPS with it on the same address.
+    Upgrade(
+        Vec<u8>,
+        axum_server::tls_rustls::RustlsConfig,
+        std::net::SocketAddr,
+    ),
 }
 
 /// A [`SovdListener`]'s mDNS advertisement, shared between its `serve` and the
@@ -114,10 +189,11 @@ impl SovdListener {
     /// never leaves the HSM. Best-effort: HTTPS only once the tls-identity leaf
     /// is provisioned. Until then (first-boot provisioning) HTTP — the very flow
     /// that installs the leaf (CSR enrollment + keystore install) runs over this
-    /// SOVD path, so it can't require the cert it's about to deliver. The server
-    /// never restarts itself: the transport switch is an activation effect of
-    /// the hsm keystore update (`ResetKind::RequiresEcuReset`), and the tester
-    /// issues the node restart that lights up HTTPS.
+    /// SOVD path, so it can't require the cert it's about to deliver. Once the
+    /// keystore install brings the leaf and the binary's gate allows it
+    /// ([`switch_when`](Self::switch_when): the update that brought it is over),
+    /// [`serve`](Self::serve) switches to HTTPS on the same port by itself,
+    /// without a restart: the hsm keystore update needs no reset (`ResetKind::None`).
     ///
     /// Every server advertises over mDNS (when `sovd_mdns`): HTTPS with the leaf
     /// identity, or HTTP with the configured `identification` / OS hostname.
@@ -131,38 +207,18 @@ impl SovdListener {
         // unregisters on drop.
         let mut mdns: Option<sovd_mdns::AdvertiserGuard> = None;
         let tls_config: Option<axum_server::tls_rustls::RustlsConfig> = if cfg.sovd_tls {
-            match crypto.get_certificate_der(hsm::KeyRole::TlsIdentity.handle()) {
-                Err(e) => {
+            match tls_config(crypto) {
+                None => {
                     tracing::warn!(
-                        error = %e,
                         "sovd_tls set but the tls-identity leaf isn't provisioned yet — serving HTTP \
-                         (provisioning runs over the SOVD path)"
+                         until it is (provisioning runs over the SOVD path)"
                     );
                     None
                 }
-                Ok(leaf) => {
-                    // Advertise the SOVD endpoint over mDNS (ISO 17978-3 §5.11):
-                    // instance/hostname come from this leaf's `<id>.local` SAN, so a
-                    // discovery client dialing `<id>.local` verifies this cert.
-                    mdns = start_mdns(
-                        cfg,
-                        identification,
-                        &[
-                            sovd_mdns::Identity::Leaf(&leaf),
-                            sovd_mdns::Identity::Hostname,
-                        ],
-                        sovd_mdns::Scheme::Https,
-                    );
-                    let signer = crypto.clone();
-                    let sign_fn = move |msg: &[u8]| {
-                        signer
-                            .sign(hsm::KeyRole::TlsIdentity.handle(), msg)
-                            .map_err(|e| e.to_string())
-                    };
-                    let tls_cfg = hsm_rustls::server_config_no_client_auth(leaf, sign_fn);
-                    Some(axum_server::tls_rustls::RustlsConfig::from_config(
-                        Arc::new(tls_cfg),
-                    ))
+                Some((leaf, config)) => {
+                    // Advertise the SOVD endpoint over mDNS (ISO 17978-3 §5.11).
+                    mdns = https_mdns(cfg, identification, &leaf);
+                    Some(config)
                 }
             }
         } else {
@@ -179,6 +235,14 @@ impl SovdListener {
 
         // Plain-HTTP listener only when TLS is off — axum_server binds the TLS
         // socket itself, so a pre-bound TcpListener would collide on the port.
+        let upgrade = (cfg.sovd_tls && tls_config.is_none()).then(|| Upgrade {
+            cfg: cfg.clone(),
+            crypto: crypto.clone(),
+            identification: identification.map(str::to_owned),
+            poll: SWITCH_POLL,
+            gate: Arc::new(|| true),
+        });
+        let tls_live = Arc::new(std::sync::atomic::AtomicBool::new(tls_config.is_some()));
         let transport = match tls_config {
             Some(tls_config) => Transport::Https(tls_config),
             None => Transport::Http(
@@ -191,7 +255,30 @@ impl SovdListener {
             transport,
             bind: cfg.bind.clone(),
             mdns: Advertisement(Arc::new(Mutex::new(mdns))),
+            upgrade,
+            tls_live,
         })
+    }
+
+    /// Switch to HTTPS only while `gate` says so, besides the leaf being there:
+    /// the binary's say on when the switch may come. A keystore install brings
+    /// the leaf in the middle of its update, and a client whose server changes
+    /// transport mid-session loses it, so a node gates the switch on that
+    /// update being over (its DELETE, the last call of an x-update). Without a
+    /// gate the switch comes as soon as the leaf is there.
+    pub fn switch_when(mut self, gate: SwitchGate) -> Self {
+        if let Some(upgrade) = self.upgrade.as_mut() {
+            upgrade.gate = gate;
+        }
+        self
+    }
+
+    /// Set while HTTPS is served: from the bind, or from the switch. A binary
+    /// that keeps its authorization open for the run that provisions the device
+    /// (no token can come over plain HTTP) closes it with this, so token checks
+    /// and TLS come together.
+    pub fn tls_live(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.tls_live.clone()
     }
 
     /// The handle that withdraws this server's mDNS advertisement — for a
@@ -210,28 +297,57 @@ impl SovdListener {
     /// requests for at most 5 s (`SHUTDOWN_GRACE`) and withdraw the mDNS
     /// advertisement (the DNS-SD goodbye is on the wire when this returns,
     /// unless an [`Advertisement::withdraw`] already sent it).
-    /// `Err` is a TLS bind that is not `ip:port`; a server failure panics.
+    ///
+    /// A server on HTTP with `sovd_tls` on looks every 2 s (`SWITCH_POLL`)
+    /// whether the tls-identity leaf is provisioned and the gate
+    /// ([`switch_when`](Self::switch_when)) allows the switch. Then it drains its
+    /// HTTP connections as for a shutdown, withdraws the HTTP advertisement,
+    /// announces HTTPS, serves it on the same port and sets
+    /// [`tls_live`](Self::tls_live): the process, and every update session it
+    /// holds, carries on.
+    /// `Err` is a TLS bind that is not `ip:port`, or a failed rebind for HTTPS;
+    /// a server failure panics.
     pub async fn serve(self, router: axum::Router, shutdown: Arc<Notify>) -> Result<(), String> {
-        match self.transport {
+        // One task turns the notify into a watch, so every phase, its graceful
+        // shutdown and its cap see it (a Notify wakes one waiter).
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            shutdown.notified().await;
+            let _ = stop_tx.send(true);
+        });
+        let result = match self.transport {
             Transport::Http(listener) => {
-                // One task turns the notify into a watch, so both the graceful
-                // shutdown and its cap see it (a Notify wakes one waiter).
-                let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
-                tokio::spawn(async move {
-                    shutdown.notified().await;
-                    let _ = stop_tx.send(());
-                });
-                let mut graceful_rx = stop_rx.clone();
-                let mut cap_rx = stop_rx;
-                let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
-                    let _ = graceful_rx.changed().await;
-                });
-                tokio::select! {
-                    result = serve => result.unwrap(),
-                    _ = async {
-                        let _ = cap_rx.changed().await;
-                        tokio::time::sleep(SHUTDOWN_GRACE).await;
-                    } => tracing::warn!("graceful shutdown timed out after 5 s; closing"),
+                match serve_http(
+                    listener,
+                    router.clone(),
+                    stop_rx.clone(),
+                    self.upgrade.as_ref(),
+                )
+                .await
+                {
+                    HttpEnd::Shutdown => Ok(()),
+                    HttpEnd::Upgrade(leaf, config, addr) => {
+                        let upgrade = self
+                            .upgrade
+                            .as_ref()
+                            .expect("an upgrade comes from its settings");
+                        // The HTTP goodbye first, then the HTTPS announcement.
+                        self.mdns.withdraw();
+                        let guard =
+                            https_mdns(&upgrade.cfg, upgrade.identification.as_deref(), &leaf);
+                        *self.mdns.0.lock().unwrap_or_else(PoisonError::into_inner) = guard;
+                        tracing::info!(%addr, "the tls-identity leaf is provisioned — serving HTTPS");
+                        let listener = rebind(addr)?;
+                        self.tls_live
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        serve_https(
+                            axum_server::from_tcp_rustls(listener, config),
+                            router,
+                            stop_rx,
+                        )
+                        .await;
+                        Ok(())
+                    }
                 }
             }
             Transport::Https(tls_config) => {
@@ -239,27 +355,120 @@ impl SovdListener {
                     .bind
                     .parse()
                     .map_err(|e| format!("sovd_tls: bind {} must be ip:port: {e}", self.bind))?;
-                // axum_server has no `.with_graceful_shutdown(future)`; drive its
-                // Handle from the same shutdown Notify so the binary's post-serve
-                // cleanup still runs on SIGTERM / SIGINT / its own shutdowns.
-                let handle = axum_server::Handle::new();
-                let shutdown_handle = handle.clone();
-                tokio::spawn(async move {
-                    shutdown.notified().await;
-                    shutdown_handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
-                });
-                axum_server::bind_rustls(addr, tls_config)
-                    .handle(handle)
-                    .serve(router.into_make_service())
-                    .await
-                    .unwrap();
+                serve_https(axum_server::bind_rustls(addr, tls_config), router, stop_rx).await;
+                Ok(())
             }
-        }
+        };
         // The goodbye: sent (bounded) before this returns, so a process exiting
         // right after — `std::process::exit` runs no Drop — still withdraws it.
         self.mdns.withdraw();
-        Ok(())
+        result
     }
+}
+
+/// Serve HTTP on `listener` until the shutdown, or, with an `upgrade`, until the
+/// tls-identity leaf is provisioned; then drain for at most `SHUTDOWN_GRACE`.
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+    upgrade: Option<&Upgrade>,
+) -> HttpEnd {
+    let addr = listener.local_addr().ok();
+    let (switch_tx, switch_rx) = tokio::sync::watch::channel(None);
+    if let (Some(upgrade), Some(addr)) = (upgrade, addr) {
+        let crypto = upgrade.crypto.clone();
+        let poll = upgrade.poll;
+        let gate = upgrade.gate.clone();
+        let mut stopped = stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stopped.changed() => return,
+                    _ = tokio::time::sleep(poll) => {}
+                }
+                // The gate first: while it holds the switch back the leaf is not
+                // read, so a gated node asks its HSM nothing.
+                if !gate() {
+                    continue;
+                }
+                if let Some((leaf, config)) = tls_config(&crypto) {
+                    let _ = switch_tx.send(Some((leaf, config, addr)));
+                    return;
+                }
+            }
+        });
+    }
+    // Ends the HTTP phase: the shutdown, or the leaf.
+    let ended = |mut stop: tokio::sync::watch::Receiver<bool>,
+                 mut switch: tokio::sync::watch::Receiver<Option<_>>| async move {
+        tokio::select! {
+            _ = stop.wait_for(|stopped| *stopped) => {}
+            _ = switch.wait_for(|leaf: &Option<_>| leaf.is_some()) => {}
+        }
+    };
+    let serve = axum::serve(listener, router)
+        .with_graceful_shutdown(ended(stop_rx.clone(), switch_rx.clone()));
+    tokio::select! {
+        result = serve => result.unwrap(),
+        _ = async {
+            ended(stop_rx.clone(), switch_rx.clone()).await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } => tracing::warn!("HTTP drain timed out after 5 s; closing"),
+    }
+    if *stop_rx.borrow() {
+        return HttpEnd::Shutdown;
+    }
+    let leaf = switch_rx.borrow().clone();
+    match leaf {
+        Some((leaf, config, addr)) => HttpEnd::Upgrade(leaf, config, addr),
+        None => HttpEnd::Shutdown,
+    }
+}
+
+/// The HTTPS socket on the address the HTTP server just released, with
+/// `SO_REUSEADDR`, as tokio binds the HTTP one.
+fn rebind(addr: std::net::SocketAddr) -> Result<std::net::TcpListener, String> {
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()
+    } else {
+        tokio::net::TcpSocket::new_v6()
+    }
+    .map_err(|e| format!("HTTPS socket for {addr}: {e}"))?;
+    socket
+        .set_reuseaddr(true)
+        .map_err(|e| format!("HTTPS socket for {addr}: {e}"))?;
+    socket
+        .bind(addr)
+        .map_err(|e| format!("failed to bind HTTPS to {addr}: {e}"))?;
+    let listener = socket
+        .listen(1024)
+        .map_err(|e| format!("failed to listen for HTTPS on {addr}: {e}"))?;
+    listener
+        .into_std()
+        .map_err(|e| format!("HTTPS listener on {addr}: {e}"))
+}
+
+/// Serve HTTPS with `server` until the shutdown, then drain for at most
+/// `SHUTDOWN_GRACE`. axum_server has no `.with_graceful_shutdown(future)`;
+/// its Handle is driven from the shutdown watch, so the binary's post-serve
+/// cleanup still runs on SIGTERM / SIGINT / its own shutdowns.
+async fn serve_https(
+    server: axum_server::Server<axum_server::tls_rustls::RustlsAcceptor>,
+    router: axum::Router,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        let _ = stop_rx.wait_for(|stopped| *stopped).await;
+        shutdown_handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
+    });
+    server
+        .handle(handle)
+        .serve(router.into_make_service())
+        .await
+        .unwrap();
 }
 
 #[cfg(test)]
@@ -427,6 +636,8 @@ mod tests {
             )),
             bind: addr.to_string(),
             mdns: Advertisement(Arc::new(Mutex::new(None))),
+            upgrade: None,
+            tls_live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let shutdown = Arc::new(Notify::new());
         let task = tokio::spawn(listener.serve(axum::Router::new(), shutdown.clone()));
@@ -467,6 +678,171 @@ mod tests {
         let took = shutdown_time(&shutdown, task).await;
         assert!(took < Duration::from_secs(1), "{took:?}");
         advertisement.withdraw();
+    }
+
+    /// An HSM whose tls-identity leaf appears when `provisioned` is set, as a
+    /// keystore install brings it. The leaf is empty: no handshake gets far
+    /// enough to need it.
+    struct LeafLater(Arc<std::sync::atomic::AtomicBool>);
+
+    impl hsm::HsmCryptoProvider for LeafLater {
+        fn sign(&self, h: KeyHandle, m: &[u8]) -> Result<Vec<u8>, HsmError> {
+            NoLeaf.sign(h, m)
+        }
+        fn verify(&self, h: KeyHandle, m: &[u8], s: &[u8]) -> Result<bool, HsmError> {
+            NoLeaf.verify(h, m, s)
+        }
+        fn encrypt(&self, h: KeyHandle, m: &[u8]) -> Result<Vec<u8>, HsmError> {
+            NoLeaf.encrypt(h, m)
+        }
+        fn decrypt(&self, h: KeyHandle, m: &[u8]) -> Result<Vec<u8>, HsmError> {
+            NoLeaf.decrypt(h, m)
+        }
+        fn mac_generate(&self, h: KeyHandle, m: &[u8]) -> Result<Vec<u8>, HsmError> {
+            NoLeaf.mac_generate(h, m)
+        }
+        fn mac_verify(&self, h: KeyHandle, m: &[u8], t: &[u8]) -> Result<bool, HsmError> {
+            NoLeaf.mac_verify(h, m, t)
+        }
+        fn derive(&self, h: KeyHandle, c: &[u8], n: usize) -> Result<Vec<u8>, HsmError> {
+            NoLeaf.derive(h, c, n)
+        }
+        fn random(&self, n: usize) -> Result<Vec<u8>, HsmError> {
+            NoLeaf.random(n)
+        }
+        fn get_certificate_der(&self, h: KeyHandle) -> Result<Vec<u8>, HsmError> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(Vec::new())
+            } else {
+                NoLeaf.get_certificate_der(h)
+            }
+        }
+        fn get_public_key_der(&self, h: KeyHandle) -> Result<Vec<u8>, HsmError> {
+            NoLeaf.get_public_key_der(h)
+        }
+        fn get_slot_info(&self, h: KeyHandle) -> Result<SlotInfo, HsmError> {
+            NoLeaf.get_slot_info(h)
+        }
+    }
+
+    /// What a plain HTTP `GET /` on a fresh connection to `addr` gets back,
+    /// empty when the server closes it without an HTTP answer.
+    async fn plain_get(addr: std::net::SocketAddr) -> Vec<u8> {
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(b"GET / HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), conn.read_to_end(&mut buf)).await;
+        buf
+    }
+
+    /// Without the leaf the server is HTTP, and with it too while the gate holds
+    /// the switch back; once the gate allows it the server stops answering plain
+    /// HTTP on that port, serves TLS there instead and reports HTTPS live,
+    /// without `serve` returning; the shutdown still ends it.
+    #[tokio::test]
+    async fn switches_to_https_on_the_same_port_once_the_leaf_is_provisioned() {
+        let provisioned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let crypto: Arc<dyn hsm::HsmCryptoProvider> = Arc::new(LeafLater(provisioned.clone()));
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = open.clone();
+        let mut listener = SovdListener::bind(&cfg("127.0.0.1:0"), &crypto, None)
+            .await
+            .unwrap()
+            .switch_when(Arc::new(move || {
+                gate.load(std::sync::atomic::Ordering::SeqCst)
+            }));
+        assert!(!listener.is_tls());
+        listener
+            .upgrade
+            .as_mut()
+            .expect("sovd_tls on, so it may switch")
+            .poll = Duration::from_millis(50);
+        let tls_live = listener.tls_live();
+        let Transport::Http(l) = &listener.transport else {
+            panic!("no leaf, so HTTP");
+        };
+        let addr = l.local_addr().unwrap();
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(listener.serve(router, shutdown.clone()));
+
+        assert!(plain_get(addr).await.starts_with(b"HTTP/1.1 200"));
+
+        // The leaf alone does not switch while the gate holds it back (its
+        // update is still open).
+        provisioned.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            plain_get(addr).await.starts_with(b"HTTP/1.1 200"),
+            "gated: still HTTP"
+        );
+        assert!(!tls_live.load(std::sync::atomic::Ordering::SeqCst));
+
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let answer = match tokio::net::TcpStream::connect(addr).await {
+                Ok(_) => plain_get(addr).await,
+                Err(_) => b"HTTP/1.1 200".to_vec(), // between the two binds
+            };
+            if !answer.starts_with(b"HTTP/1.1 200") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "still plain HTTP after the leaf");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // A TLS ClientHello gets a TLS record back: the HTTPS server is there.
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(&tls_client_hello()).await.unwrap();
+        let mut head = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), conn.read_exact(&mut head))
+            .await
+            .expect("an answer to the ClientHello")
+            .unwrap();
+        assert!(
+            head[0] == 0x16 || head[0] == 0x15,
+            "TLS handshake or alert record, got {head:?}"
+        );
+        assert!(!task.is_finished(), "the switch does not end serve");
+        assert!(
+            tls_live.load(std::sync::atomic::Ordering::SeqCst),
+            "HTTPS is live"
+        );
+
+        let took = shutdown_time(&shutdown, task).await;
+        assert!(took < SHUTDOWN_GRACE + Duration::from_secs(1), "{took:?}");
+    }
+
+    /// A minimal TLS 1.2 ClientHello record (no extensions, two suites).
+    fn tls_client_hello() -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0); // session id
+        body.extend_from_slice(&[0x00, 0x04, 0xc0, 0x2b, 0xc0, 0x2f]); // suites
+        body.extend_from_slice(&[0x01, 0x00]); // compression: null
+        let mut handshake = vec![0x01];
+        handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&body);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    /// With `sovd_tls` off the server stays HTTP whatever the HSM holds.
+    #[tokio::test]
+    async fn with_sovd_tls_off_it_never_switches() {
+        let crypto: Arc<dyn hsm::HsmCryptoProvider> = Arc::new(LeafLater(Arc::new(
+            std::sync::atomic::AtomicBool::new(true),
+        )));
+        let off: ShellConfig =
+            serde_yaml::from_str("bind: \"127.0.0.1:0\"\nsovd_mdns: false\nsovd_tls: false\n")
+                .unwrap();
+        let listener = SovdListener::bind(&off, &crypto, None).await.unwrap();
+        assert!(!listener.is_tls());
+        assert!(listener.upgrade.is_none());
     }
 
     #[tokio::test]
