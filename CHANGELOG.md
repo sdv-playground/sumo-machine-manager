@@ -8,6 +8,18 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- component-mgr: `SuitProvider::with_first_provision_gate(gate)` asks the host before an HSM-keys
+  envelope is checked against the factory authority, which happens only while no key authority
+  is installed. While the gate answers `false` such an envelope is refused (`SignatureInvalid`),
+  so an empty keystore cannot be first-provisioned with the factory key outside the host's
+  provisioning window. An installed key authority is never gated; without a gate nothing
+  changes. **Host-facing:** none; a host with a provisioning window (a lifecycle read, say)
+  passes it as the gate.
+
+- hsm-sim-backend: `SimHsm`'s PROVISION checks a re-provision against the installed key authority
+  alone. One that is installed but cannot be read, or whose presence cannot be checked (an I/O
+  or permission error), refuses the envelope; it used to fall back to the factory key. A keystore provisioned without a key authority keeps the factory key, as
+  before. **Host-facing:** none.
 - **Bank activation pre-flights the boot-vector seal.** `activate` ran the bank's activator (the
   physical switch: a raw-partition write, a firmware load, record routing) and then sealed the boot
   vector; a seal that failed — a signer that is unavailable — left the new content physically in
