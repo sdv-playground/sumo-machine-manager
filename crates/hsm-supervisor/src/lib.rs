@@ -50,6 +50,17 @@
 //! exactly when it mattered, leaving both daemons orphaned with the port and
 //! socket still bound. The stale-orphan reclaim in [`standup`] exists because
 //! that case is real; explicit shutdown is what keeps it rare.
+//!
+//! # The backend watchdog
+//!
+//! A backend that exits is respawned only once the node has called
+//! [`HsmDaemons::watch_backend`], at the end of its own start-up. A node that
+//! reads its provisioning state and keys from the HSM once and keeps them would
+//! otherwise run on with what a backend dying in that window failed to answer.
+//! A respawn restores the link, not what the node cached. A node that keeps HSM
+//! state past its start-up reads it again, or restarts, after a respawn.
+//! [`HsmDaemons::backend_health`] reports the backend's state and
+//! [`BackendHealth::crash_looping`], which the host surfaces.
 
 mod config;
 mod daemons;
@@ -60,5 +71,5 @@ pub use config::{
 };
 pub use daemons::{
     kill_stale_backend_if_socket_live, kill_stale_daemon_if_port_busy, respawn_vhsm, standup,
-    terminate_child, vhsm_spawn_spec, HsmDaemons, VhsmSpawnSpec,
+    terminate_child, vhsm_spawn_spec, BackendHealth, HsmDaemons, VhsmSpawnSpec, CRASH_LOOP_EXITS,
 };
