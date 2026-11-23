@@ -357,11 +357,11 @@ per-component NV boot state as the authority for "which bank each set boots from
 
   | Verb | Contract | Record adapter (`RecordSelectorStore`) | File record |
   |---|---|---|---|
-  | `read_primary` / `read_secondary` | `Ok(Some)` the authenticated copy; `Ok(None)` absent (or a failed authenticity check); `Err` the copy could not be read — never treated as absent (`SystemBankManager::load` and `MachineRegistryBuilder::build` fail) | the record's `Err` propagates; otherwise the record's copy ∪ the manager rows at its generation (primary: `rows`, else `committed`; secondary: `committed`, else `rows` when the record is committed at that generation; else the newest, with a warning); the record wins a key collision | parse the file, `None` unless `is_valid` under its `Signer`; a missing file is `None`, one that cannot be read is `Err` |
+  | `read_primary` / `read_secondary` | `Ok(Some)` the authenticated copy; `Ok(None)` absent (or a failed authenticity check); `Err` the copy could not be read — never treated as absent (`SystemBankManager::load` and `MachineRegistryBuilder::build` fail) | the record's `Err` propagates; otherwise the record's copy ∪ the manager rows at its generation (primary: `rows`, else `committed`; secondary: `committed`, else `rows` when the record is committed at that generation; else the newest, with a warning); the record wins a key collision | parse the file, `None` when `is_valid` under its `Signer` is `Ok(false)`, `Err(Unreadable)` when the signer could not decide; a missing file is `None`, one that cannot be read is `Err` |
   | `activate(entries, header)` | primary := entries at a generation the store issues, strictly above both copies; header recorded for it; returns the generation. A header write that fails after the primary landed is logged as header loss and still `Ok` | splits by `routes`; record first, then `rows` and `transaction` at the generation it returned | `max(primary, secondary) + 1`; writes `primary` |
-  | `commit()` | secondary := primary (same generation); idempotent; no-op without a primary, `Err` over an unreadable one | record, then `committed` from `rows` | rewrites `secondary` from `primary` |
+  | `commit()` | secondary := primary (same generation); idempotent; no-op without a primary, `Err` over an unreadable one. `check_commit()` proves it can run now (reads succeed, writes can be signed) and writes nothing | `committed` signed first, then the record, then `committed` written | rewrites `secondary` from `primary` |
   | `rollback(header)` | primary := secondary; header recorded for the restored generation; returns it; `Err(NoTrial)` when there is nothing to restore | `NoTrial` checked first; `transaction`, then the record, then `rows` from `committed` | `primary` from `secondary` |
-  | `read_transaction()` | the header and the generation it was recorded for | the `transaction` file, else the record's legacy header | the header embedded in a v0.1.14 primary |
+  | `read_transaction()` | the header and the generation it was recorded for; `Err` when it could not be read | the `transaction` file, else the record's legacy header | the header embedded in a v0.1.14 primary |
   | `write_transaction(gen, header)` | rewrite the header for `gen`, neither copy touched | rewrites `transaction`; rows untouched | — |
 
   Two durability classes: the copies are **what boots** and sit under anti-rollback (only
@@ -460,6 +460,9 @@ per-component NV boot state as the authority for "which bank each set boots from
 - **Signed by the HSM** with `ivd-signing` (a `Signer` impl the host-manager process,
   where the HSM is reachable, passes to `FileSelectorStore::new`; the store verifies every
   blob it reads). Previously a `StubSigner` (empty signature) — now real ECDSA-P256. The
+  signer has three answers: valid, invalid (`Ok(false)`: the copy reads as absent and the
+  host reseeds it from NV) and could not decide (`Err`: the read fails, nothing is reseeded
+  or written; a write verb signs before its first write and fails with nothing written). The
   store is the file-backed JSON `FileSelectorStore` (pretty, one key per line) until a host
   plugs its record in with `RecordSelectorStore::over`; the record authenticates by its own
   means, the side files with the signer passed to `over`.

@@ -25,6 +25,42 @@ what a consumer has to touch when it moves its pin.
 
   Verified: the node manager's served API (540 probes) and a real wipe of a fixture tree are identical before
   and after the move.
+- **Boot vector: a signer that could not decide is an error, never a verdict.** Before, an HSM error
+  while signing wrote an empty signature and reported success, and an HSM error while verifying read the
+  copy as absent: `commit` returned `Ok` without committing the boot vector (after NV had already
+  committed and raised the security floor), `activate` overwrote the primary at generation 1, and a
+  start with the HSM not answering reseeded a good boot vector from NV (generation, sealed images,
+  transaction header and trial count lost). Now `Ok(false)` (invalid) and `Err` (could not decide)
+  stay apart everywhere: an invalid copy still reads as absent and is reseeded, as before; one that
+  could not be verified fails the read and every verb that reads it; every write verb signs before its
+  first write and fails with nothing written; `IvdBankProvider::commit` checks the boot vector can
+  commit (`SystemBankManager::check_commit`) before the NV commit, so an HSM that is down fails the
+  verdict with NV untouched. If the HSM goes away between the NV commit and the boot-vector commit the
+  error says NV is committed and the vector still in trial; a retry completes it, and so does
+  `seed_selector` at the next start (it commits a vector whose every trial row NV has committed at that
+  bank, with nothing in trial in NV), so a trial boot limit cannot roll a committed update back. A trial
+  boot count or boot-stage rollback record that cannot be written is logged at error level and leaves
+  the previous header. With a working signer every file written and every decision is unchanged.
+
+  Host-facing: `Signer::sign` returns `Result<Vec<u8>, SignerError>` and `Signer::verify`
+  `Result<bool, SignerError>` (`SignerError::new` / `with_source`, exported next to `Signer`): an
+  implementor returns `Ok(false)` only for a signature that does not verify and `Err` whenever it could
+  not decide or sign — never an empty signature or `false` for an error. `HsmSelectorSigner` does this
+  (an empty or non-DER signature is `Ok(false)` without asking the HSM; every HSM error is `Err`); a
+  node carrying its own copy of it must make the same change or switch to
+  `component_mgr::boot_selector_signer`. `SelectorBlob::signed` / `is_valid` return `Result`.
+  `SelectorStore::read_transaction` and `BootRecord::legacy_transaction` return
+  `Result<Option<_>, SelectorError>`; `SelectorStore::check_commit` is new (default `Ok`). Test seams:
+  `SwitchableSigner` / `SignerMode`. `SystemBankManager::load` (and `MachineRegistryBuilder::build`)
+  now also fails while the signer cannot verify: a node binary must fail closed — retry with
+  `SystemBankManager::load_retrying(make_store, LoadRetry { attempts, delay })` (default 5 x 1 s, blocks
+  the thread) for every store, not only a record store, then exit non-zero; never seed or serve over a
+  vector it could not load. The boot stage has already chosen the bank, so a manager that does not
+  start changes nothing on disk.
+
+  Verified: a scripted sequence (seed, activate, trial boots, commit, activate, rollback, reseed after
+  deleting the primary) with the deterministic test signer writes byte-identical files and returns
+  identical values before and after.
 
 ## v0.1.29 — SOVDd v0.1.12: /v1 execute is orchestrated without x-ota-control
 
