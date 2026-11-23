@@ -8,6 +8,28 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- deps: SOVDd v0.1.11 (every pin) — the whole status family of a node server is node-level (an embedder's
+  `/v1/status/x-boot-id` is served at `/v1/components/{node}/status/x-boot-id`; its root form is 404),
+  node-level data/operations collections, `CapabilityExtensions::with_v1_paths`. Host-facing: move SOVDd
+  pins together; a test reading root-form status paths on a node server must use the node form.
+- **node-shell** (new crate): the SOVD node application shell, moved from supernova-machine-manager
+  unchanged in behaviour — `ShellConfig` (the `bind`, `sovd_tls`, `sovd_mdns`, `identification`,
+  `identification_prefix`, `node` keys, for `#[serde(flatten)]`), `read_ecu_id` /
+  `configured_identification` / `node_topology` / `sovd_state`, `sovd_router` (SOVDd's router + vendor
+  routes + `status/x-boot-id`, node status, `status/restart`, legacy restart stub, factory-reset route,
+  node topology outermost), `restart_route` / `restart_response`, `SovdListener` (HTTPS from the HSM
+  tls-identity leaf else HTTP, mDNS on both, graceful serve), `shutdown_on_signals`, and
+  `capability_extensions` (`/v1`-only docs rows for the node status and boot id).
+
+  Host-facing: a node binary flattens `ShellConfig` into its config (keys unchanged), deletes its
+  copies, and supplies its backends, vendor routes, boot id, HSM, restart authorizer + reset action and
+  factory-reset handler (verified: supernova's served API identical before/after the move, 504 probes
+  on both trees).
+
+## v0.1.26 — app leaf items from supernova
+
+Tag on `e1c84e3` (2026-11-23), PR #65.
+
 - **app leaf items** moved from supernova-machine-manager, unchanged in behaviour (sumo is the pattern: a
   device manager wires these, it does not carry its own copy):
   - component-factory: `HsmKeystoreActivator` (the `hsm-keystore` marker: no-op activate,
