@@ -17,8 +17,8 @@ what a consumer has to touch when it moves its pin.
   passes it as the gate.
 
 - hsm-sim-backend: `SimHsm`'s PROVISION checks a re-provision against the installed key authority
-  alone. One that is installed but cannot be read refuses the envelope; it used to fall back to
-  the factory key. A keystore provisioned without a key authority keeps the factory key, as
+  alone. One that is installed but cannot be read, or whose presence cannot be checked (an I/O
+  or permission error), refuses the envelope; it used to fall back to the factory key. A keystore provisioned without a key authority keeps the factory key, as
   before. **Host-facing:** none.
 
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log

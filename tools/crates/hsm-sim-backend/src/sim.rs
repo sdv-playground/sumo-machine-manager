@@ -573,14 +573,24 @@ impl SimHsm {
     /// signing key for a first provision, then the installed key authority. A
     /// keystore provisioned without a key authority keeps the factory key. One
     /// that is installed but cannot be read is an error, never a fallback to the
-    /// publicly known factory key.
+    /// publicly known factory key, and so is a keystore where it can't be told
+    /// whether one is installed: `try_exists`, not `exists`, which answers false
+    /// on any error.
     #[cfg(feature = "suit")]
     fn provisioning_anchor(&self, is_factory: bool) -> Result<Vec<u8>, HsmError> {
-        let installed = self
+        if is_factory {
+            return Ok(Self::factory_provisioning_authority());
+        }
+        let path = self
             .keys_dir()
-            .join(format!("{}.pub", KeyRole::KeyAuthority.key_id()))
-            .exists();
-        if is_factory || !installed {
+            .join(format!("{}.pub", KeyRole::KeyAuthority.key_id()));
+        let installed = path.try_exists().map_err(|e| {
+            HsmError::KeystoreError(format!(
+                "cannot tell whether a key authority is installed at {}: {e}",
+                path.display()
+            ))
+        })?;
+        if !installed {
             return Ok(Self::factory_provisioning_authority());
         }
         self.get_public_key(KeyRole::KeyAuthority)
@@ -1440,6 +1450,57 @@ mod tests {
         std::fs::write(&key_authority, "not a PEM public key").unwrap();
         assert!(hsm.provisioning_anchor(false).is_err());
         assert_eq!(hsm.provisioning_anchor(true).unwrap(), factory);
+    }
+
+    /// A key authority whose presence or contents can't be read refuses too:
+    /// a file the process may not read, and a keys directory it may not
+    /// search, where `Path::exists` would have answered false and brought the
+    /// factory key back. Root reads through both, so the cases are skipped as
+    /// root.
+    #[test]
+    #[cfg(all(unix, feature = "suit", feature = "crypto"))]
+    fn a_key_authority_that_cannot_be_read_or_checked_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let hsm = SimHsm::new(tmp.path().to_path_buf());
+        hsm.write_keystore(&sample_keystore()).unwrap();
+        let keys_dir = hsm.keys_dir();
+        let key_authority = keys_dir.join("key-authority.pub");
+        let signer = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let point = signer.verifying_key().to_encoded_point(false);
+        write_pem_ec_public(&key_authority, point.as_bytes()).unwrap();
+        let mode = |path: &std::path::Path, bits: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap()
+        };
+
+        // The file is there and can't be read.
+        mode(&key_authority, 0o000);
+        let as_root = std::fs::read(&key_authority).is_ok();
+        if !as_root {
+            assert!(hsm.provisioning_anchor(false).is_err());
+        }
+        mode(&key_authority, 0o644);
+
+        // The keys directory can't be searched: whether the file is there
+        // can't be told.
+        mode(&keys_dir, 0o000);
+        let unknown = key_authority.try_exists().is_err();
+        let anchor = hsm.provisioning_anchor(false);
+        let first = hsm.provisioning_anchor(true);
+        mode(&keys_dir, 0o755);
+        if !as_root {
+            assert!(
+                unknown,
+                "a directory without search permission must make try_exists fail"
+            );
+            let err = anchor.unwrap_err().to_string();
+            assert!(
+                err.contains("cannot tell whether a key authority is installed"),
+                "{err}"
+            );
+        }
+        assert_eq!(first.unwrap(), SimHsm::factory_provisioning_authority());
     }
 
     #[test]
