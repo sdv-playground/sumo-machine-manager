@@ -901,7 +901,8 @@
         "required": [
           "id",
           "kind",
-          "has_certificate"
+          "has_certificate",
+          "backing"
         ],
         "properties": {
           "allowed_ops": {
@@ -912,6 +913,10 @@
             "items": {
               "type": "string"
             }
+          },
+          "backing": {
+            "type": "string",
+            "description": "What holds the slot: `hardware`, `software-sealed`, `software`, or\n`unknown` where the backend did not say (no claim, never `hardware`)."
           },
           "has_certificate": {
             "type": "boolean"

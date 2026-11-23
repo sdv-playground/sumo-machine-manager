@@ -467,3 +467,118 @@ async fn machine_registry_holds_multiple_components() {
     let vm1_caps = machine.component("vm1").unwrap().capabilities();
     assert!(vm1_caps.flash.as_ref().unwrap().dual_bank);
 }
+
+/// An HSM provider that answers only `slot_backing`: `Hardware` for one handle,
+/// `NotSupported` (a backend that predates the op) for every other.
+struct BackingOnly {
+    hardware: hsm::KeyHandle,
+}
+
+impl hsm::HsmProvider for BackingOnly {
+    fn is_provisioned(&self) -> Result<bool, hsm::HsmError> {
+        Ok(true)
+    }
+    fn provision(&mut self, _: &[u8]) -> Result<(), hsm::HsmError> {
+        Err(hsm::HsmError::NotSupported("test".into()))
+    }
+    fn list_slots(&self) -> Result<Vec<hsm::SlotInfo>, hsm::HsmError> {
+        Err(hsm::HsmError::NotSupported("test".into()))
+    }
+    fn get_public_key(&self, _: hsm::KeyRole) -> Result<Vec<u8>, hsm::HsmError> {
+        Err(hsm::HsmError::NotSupported("test".into()))
+    }
+    fn provisioning_state(&self) -> Result<hsm::ProvisioningState, hsm::HsmError> {
+        Ok(hsm::ProvisioningState::Provisioned)
+    }
+    fn slot_backing(&self, handle: hsm::KeyHandle) -> Result<hsm::SlotBacking, hsm::HsmError> {
+        if handle == self.hardware {
+            Ok(hsm::SlotBacking::Hardware)
+        } else {
+            Err(hsm::HsmError::NotSupported(
+                "predates GET_SLOT_BACKING".into(),
+            ))
+        }
+    }
+}
+
+/// The key inventory says what holds each slot. The software sim's keystore is
+/// software throughout. Over a crypto handle the backing comes from the HSM
+/// provider: its answer where it gives one, `Unknown` where it predates the
+/// question or no provider is wired. Never a guess.
+#[tokio::test]
+async fn list_keys_reports_each_slots_backing_and_unknown_where_unanswered() {
+    use machine_mgr::KeyBacking;
+    use std::path::PathBuf;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let keystore = PathBuf::from(tmp.path());
+    let sim = hsm_sim_backend::SimHsm::new(keystore.clone());
+    sim.ensure_device_keys().expect("device keys created");
+    let cfg = || ComponentConfig {
+        supports_rollback: false,
+        single_bank: true,
+        entity_type: "hsm".into(),
+        log_sources: Vec::new(),
+        test_agent_url: None,
+        diag_agent_url: None,
+        host_diagnostics: false,
+    };
+    let backing_of = |inv: &machine_mgr::KeyInventory| -> Vec<(String, KeyBacking)> {
+        inv.keys
+            .iter()
+            .map(|k| (k.key_id.clone(), k.backing))
+            .collect()
+    };
+
+    // The keystore path: the sim answers for itself.
+    let comp = ComponentAdapter::new(vm_backend("hsm", make_nv(), slots::HSM, cfg()))
+        .with_csr_keystore(keystore.clone());
+    let inv = comp.list_keys().await.expect("inventory");
+    assert!(!inv.keys.is_empty());
+    for (id, backing) in backing_of(&inv) {
+        assert_eq!(backing, KeyBacking::Software, "{id}");
+    }
+
+    // A crypto handle and no HSM provider: nobody to ask.
+    let crypto: Arc<dyn hsm::HsmCryptoProvider> =
+        Arc::new(hsm_sim_backend::SimHsm::new(keystore.clone()));
+    let comp = ComponentAdapter::new(vm_backend("hsm", make_nv(), slots::HSM, cfg()))
+        .with_csr_crypto(crypto.clone());
+    let inv = comp.list_keys().await.expect("inventory");
+    assert!(!inv.keys.is_empty());
+    for (id, backing) in backing_of(&inv) {
+        assert_eq!(backing, KeyBacking::Unknown, "{id}");
+    }
+
+    // A crypto handle and a provider that answers for one slot only.
+    let device_decrypt = hsm::KeyRole::DeviceDecryption.handle();
+    let provider: Arc<Mutex<dyn hsm::HsmProvider>> = Arc::new(Mutex::new(BackingOnly {
+        hardware: device_decrypt,
+    }));
+    let trust_anchor = vec![0u8; 32];
+    let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(trust_anchor));
+    let backend = Arc::new(
+        ComponentBackend::with_options(
+            slots::HSM,
+            make_nv(),
+            mp,
+            cfg(),
+            None,
+            None,
+            Some(provider),
+        )
+        .with_id("hsm".to_string()),
+    );
+    let comp = ComponentAdapter::new(backend).with_csr_crypto(crypto);
+    let inv = comp.list_keys().await.expect("inventory");
+    let got = backing_of(&inv);
+    assert!(got.len() > 1);
+    for (id, backing) in got {
+        let want = if id == hsm::KeyRole::DeviceDecryption.key_id() {
+            KeyBacking::Hardware
+        } else {
+            KeyBacking::Unknown
+        };
+        assert_eq!(backing, want, "{id}");
+    }
+}

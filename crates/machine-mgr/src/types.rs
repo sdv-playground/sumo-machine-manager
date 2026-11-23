@@ -273,6 +273,35 @@ impl SlotKind {
     }
 }
 
+/// What holds a key slot's material, as the HSM backend reports it (link-B
+/// `GET_SLOT_BACKING`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyBacking {
+    /// In the HSM; the key never leaves it.
+    Hardware,
+    /// A software key sealed under a key in the HSM, opened into host memory
+    /// for each use.
+    SoftwareSealed,
+    /// A software key with no hardware protection.
+    Software,
+    /// The backend did not say: it predates the question, or the question
+    /// failed. No claim either way, so a reader treats it like `Software`
+    /// when deciding what a key may protect, and never as `Hardware`.
+    Unknown,
+}
+
+impl KeyBacking {
+    /// The wire label: `hardware`, `software-sealed`, `software` or `unknown`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            KeyBacking::Hardware => "hardware",
+            KeyBacking::SoftwareSealed => "software-sealed",
+            KeyBacking::Software => "software",
+            KeyBacking::Unknown => "unknown",
+        }
+    }
+}
+
 /// A slot surfaced by an HSM component's `data/keys` SOVD resource — the public,
 /// SOVD-facing view of one keystore slot (never any key material). Returned by
 /// [`Component::list_keys`](crate::Component::list_keys); the inventory reports
@@ -293,6 +322,8 @@ pub struct KeyDescriptor {
     /// safe to return (e.g. the device-decryption pubkey a Tower encrypts to);
     /// `None` for symmetric keys and the counter. Never any private material.
     pub public_key: Option<Vec<u8>>,
+    /// What holds the slot's material; see [`KeyBacking`].
+    pub backing: KeyBacking,
 }
 
 /// The HSM key inventory returned by [`Component::list_keys`](crate::Component::list_keys)

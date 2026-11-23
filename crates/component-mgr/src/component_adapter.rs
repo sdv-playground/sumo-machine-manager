@@ -18,8 +18,8 @@ use machine_mgr::component::DidEntry;
 use machine_mgr::{
     ActivationState, Capabilities, ClearFaultsResult, Component, ComponentBanks, Csr, DidFilter,
     DidKind, DtcFilter, EnvelopeStream, Fault, FlashCaps, FlashId, FlashSession, FlashStatus,
-    HsmCaps, KeyDescriptor, KeyInventory, LifecycleCaps, MachineError, MachineResult, RuntimeState,
-    SlotKind,
+    HsmCaps, KeyBacking, KeyDescriptor, KeyInventory, LifecycleCaps, MachineError, MachineResult,
+    RuntimeState, SlotKind,
 };
 
 use crate::backend::{ComponentBackend, DID_REGISTRY};
@@ -426,16 +426,22 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
         // expose: structure, not the counter value); it is NOT filtered out.
         // `public_key` is the already-resolved SPKI for asymmetric key slots
         // (safe to return), never any private bytes; the counter has none.
-        let to_descriptor = |s: hsm::SlotInfo, public_key: Option<Vec<u8>>| KeyDescriptor {
-            key_id: s.key_id,
-            kind: match s.kind {
-                hsm::SlotKind::Key(kt) => SlotKind::Key(key_type_label(kt).to_string()),
-                hsm::SlotKind::Monotonic => SlotKind::Monotonic,
-            },
-            has_certificate: s.has_certificate,
-            allowed_ops: s.allowed_ops,
-            public_key,
-        };
+        let to_descriptor =
+            |s: hsm::SlotInfo,
+             public_key: Option<Vec<u8>>,
+             backing: Option<Result<hsm::SlotBacking, hsm::HsmError>>| {
+                KeyDescriptor {
+                    backing: key_backing(&s.key_id, backing),
+                    key_id: s.key_id,
+                    kind: match s.kind {
+                        hsm::SlotKind::Key(kt) => SlotKind::Key(key_type_label(kt).to_string()),
+                        hsm::SlotKind::Monotonic => SlotKind::Monotonic,
+                    },
+                    has_certificate: s.has_certificate,
+                    allowed_ops: s.allowed_ops,
+                    public_key,
+                }
+            };
         // Asymmetric KEY slots have a public half worth returning; symmetric keys
         // and the monotonic counter do not.
         let wants_pubkey = |kind: &hsm::SlotKind| {
@@ -460,7 +466,11 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                     let public_key = wants_pubkey(&info.kind)
                         .then(|| crypto.get_public_key_der(handle).ok())
                         .flatten();
-                    Some(to_descriptor(info, public_key))
+                    // The backing is a provider-half question; the crypto
+                    // handle has no op for it. On a host both halves are the
+                    // same link-B backend.
+                    let backing = self.inner.hsm_slot_backing(handle);
+                    Some(to_descriptor(info, public_key, backing))
                 })
                 .collect()
         } else {
@@ -478,7 +488,8 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
                     let public_key = wants_pubkey(&k.kind)
                         .then(|| tmp.get_public_key_der(k.handle).ok())
                         .flatten();
-                    to_descriptor(k, public_key)
+                    let backing = Some(tmp.slot_backing(k.handle));
+                    to_descriptor(k, public_key, backing)
                 })
                 .collect()
         };
@@ -513,6 +524,25 @@ impl<D: BlockDevice + Send + Sync + 'static> Component for ComponentAdapter<D> {
     // HSM key install today goes through the standard SOVD package flow
     // (receive_package -> upload_envelope), so install_keys is reserved for
     // future direct-install use cases.
+}
+
+/// A slot's backing as the inventory reports it. Anything but an answer is
+/// `Unknown`: no provider, a backend that predates the question
+/// (`NotSupported`), or a failed question (logged). Never a guess.
+fn key_backing(
+    key_id: &str,
+    backing: Option<Result<hsm::SlotBacking, hsm::HsmError>>,
+) -> KeyBacking {
+    match backing {
+        Some(Ok(hsm::SlotBacking::Hardware)) => KeyBacking::Hardware,
+        Some(Ok(hsm::SlotBacking::SoftwareSealed)) => KeyBacking::SoftwareSealed,
+        Some(Ok(hsm::SlotBacking::Software)) => KeyBacking::Software,
+        None | Some(Err(hsm::HsmError::NotSupported(_))) => KeyBacking::Unknown,
+        Some(Err(e)) => {
+            tracing::warn!(key_id, error = %e, "slot backing unreadable: reported as unknown");
+            KeyBacking::Unknown
+        }
+    }
 }
 
 fn map_backend_error(e: BackendError) -> MachineError {

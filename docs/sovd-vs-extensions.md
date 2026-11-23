@@ -73,7 +73,7 @@ spec; all are `x-`-namespaced.
 |---|---|---|
 | `/data/x-ota-update-state` | GET | node update-transaction state: `phase` ∈ Idle/Staging/RebootPending/Trial, `components`, `reboot_owed`, `rebooted_since_arming` — polled between campaign steps |
 | `/data/x-update-state` | GET | alias of `x-ota-update-state` plus `node_boot_id` (the node's current boot id, `null` when unknown) |
-| `/components/hsm/data/keys` | GET | HSM key-slot inventory (public metadata only) |
+| `/components/hsm/data/keys` | GET | HSM key-slot inventory (public metadata only); each slot's `backing` is `hardware`, `software-sealed`, `software` or `unknown` (no claim) |
 | `/components/hsm/operations/x-csr/executions` | POST | generate a PKCS#10 CSR for a key slot |
 | `/components/hsm/x-ecu-id` | GET | ECU id = HSM device-key thumbprint (the token `aud`); `text/plain` |
 | `/operations/x-ota-commit-trials/executions` | POST | node-level commit of all in-trial banked components |

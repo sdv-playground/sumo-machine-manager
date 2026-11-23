@@ -259,24 +259,35 @@ typedef struct {
     uint32_t    slot;       /* physical slot id (valid only when !is_virtual)    */
     uint32_t    key_type;   /* SlotInfo.kind: KEYTYPE_* or KEYTYPE_MONOTONIC     */
     int         has_cert;   /* 1 = an X.509 cert is stored alongside this key     */
+    uint32_t    backing;    /* GET_SLOT_BACKING: BACKING_*, see below             */
     const char *key_id;     /* stable key_id (GET_SLOT_INFO / LIST_SLOTS)         */
 } binding_t;
 
+/*
+ * `backing` is what GET_SLOT_BACKING claims for the slot. Every row below says
+ * BACKING_SOFTWARE, the weakest claim, because a copy of this map must not
+ * report protection its silicon may not give. TODO(vendor): per row, claim
+ * BACKING_HARDWARE only for a key you know never leaves the HSM (or a counter
+ * the HSM keeps), and BACKING_SOFTWARE_SEALED for a software key sealed under
+ * an HSM key. A virtual anchor is a public key this service keeps itself:
+ * BACKING_SOFTWARE.
+ */
+
 static const binding_t SLOT_MAP[] = {
-    /* handle  virt  physical slot     key_type         cert  key_id */
-    { 0x0002,  1, 0,               KEYTYPE_EC_P256,  0, "sw-authority"         }, /* VIRTUAL anchor */
-    { 0x0003,  0, HSM_ECC_SLOT(0), KEYTYPE_EC_P256,  0, "device-decrypt"       },
-    { 0x0004,  0, HSM_ECC_SLOT(1), KEYTYPE_EC_P256,  0, "iam-signing"          },
-    { 0x0005,  1, 0,               KEYTYPE_EC_P256,  0, "key-authority"        }, /* VIRTUAL anchor */
-    { 0x0006,  0, HSM_ECC_SLOT(2), KEYTYPE_EC_P256,  0, "jwt-signing"          },
-    { 0x0007,  0, HSM_SYM_SLOT(0), KEYTYPE_AES256,   0, "storage-key"          },
-    { 0x0008,  1, 0,               KEYTYPE_EC_P256,  0, "operational-issuer"   }, /* VIRTUAL anchor */
-    { 0x0009,  1, 0,               KEYTYPE_EC_P256,  0, "factory-reset-issuer" }, /* VIRTUAL anchor */
-    { 0x000A,  0, HSM_ECC_SLOT(3), KEYTYPE_EC_P256,  0, "ivd-signing"          },
+    /* handle  virt  physical slot     key_type         cert  backing           key_id */
+    { 0x0002,  1, 0,               KEYTYPE_EC_P256,  0, BACKING_SOFTWARE, "sw-authority"         }, /* VIRTUAL anchor */
+    { 0x0003,  0, HSM_ECC_SLOT(0), KEYTYPE_EC_P256,  0, BACKING_SOFTWARE, "device-decrypt"       },
+    { 0x0004,  0, HSM_ECC_SLOT(1), KEYTYPE_EC_P256,  0, BACKING_SOFTWARE, "iam-signing"          },
+    { 0x0005,  1, 0,               KEYTYPE_EC_P256,  0, BACKING_SOFTWARE, "key-authority"        }, /* VIRTUAL anchor */
+    { 0x0006,  0, HSM_ECC_SLOT(2), KEYTYPE_EC_P256,  0, BACKING_SOFTWARE, "jwt-signing"          },
+    { 0x0007,  0, HSM_SYM_SLOT(0), KEYTYPE_AES256,   0, BACKING_SOFTWARE, "storage-key"          },
+    { 0x0008,  1, 0,               KEYTYPE_EC_P256,  0, BACKING_SOFTWARE, "operational-issuer"   }, /* VIRTUAL anchor */
+    { 0x0009,  1, 0,               KEYTYPE_EC_P256,  0, BACKING_SOFTWARE, "factory-reset-issuer" }, /* VIRTUAL anchor */
+    { 0x000A,  0, HSM_ECC_SLOT(3), KEYTYPE_EC_P256,  0, BACKING_SOFTWARE, "ivd-signing"          },
     /* 0x000B RETIRED (was "freshness-signing") — do NOT reuse this handle. */
-    { 0x000C,  0, HSM_ECC_SLOT(5), KEYTYPE_EC_P256,  1, "tls-identity"         }, /* mTLS leaf: has a cert */
+    { 0x000C,  0, HSM_ECC_SLOT(5), KEYTYPE_EC_P256,  1, BACKING_SOFTWARE, "tls-identity"         }, /* mTLS leaf: has a cert */
     /* Not a key: a rollback-proof monotonic COUNTER (host-only time-floor). */
-    { 0x000D,  0, HSM_MONOTONIC_SLOT(0), KEYTYPE_MONOTONIC, 0, "time-floor"   },
+    { 0x000D,  0, HSM_MONOTONIC_SLOT(0), KEYTYPE_MONOTONIC, 0, BACKING_SOFTWARE, "time-floor"   },
 };
 static const size_t SLOT_MAP_LEN = sizeof(SLOT_MAP) / sizeof(SLOT_MAP[0]);
 
@@ -347,7 +358,8 @@ static void wr_slot_info(wtr_t *w, const binding_t *b) {
 
 /* ===================================================================== */
 /* Link-B dispatch — every op: crypto (0x01..0x11), provisioning         */
-/* (0x20..0x27), and the monotonic-counter ops (0x28..0x29).             */
+/* (0x20..0x27), the monotonic-counter ops (0x28..0x29) and               */
+/* GET_SLOT_BACKING (0x2A).                                               */
 /*                                                                       */
 /* Pattern per handle-addressed op: decode the request fields per the     */
 /* frozen table, resolve the logical handle through the slot map (unknown */
@@ -722,6 +734,18 @@ static uint32_t handle_op(uint32_t op, const uint8_t *payload, uint32_t plen,
          * NV counter for b->slot instead of this RAM cell. */
         if (new_value > c->value) c->value = new_value;
         wr_u64(&w, c->value);
+        *out_len = w.len;
+        return ST_OK;
+    }
+
+    case OP_GET_SLOT_BACKING: {
+        uint32_t handle = rd_u32(&r);
+        const binding_t *b;
+        if (!r.ok) return ST_PROTOCOL_ERROR;
+        b = resolve(handle);
+        if (!b) return ST_KEY_NOT_FOUND;
+        /* What holds the slot: the slot map's claim (see `backing` there). */
+        wr_u32(&w, b->backing);
         *out_len = w.len;
         return ST_OK;
     }

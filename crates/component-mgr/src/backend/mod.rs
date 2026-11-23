@@ -912,6 +912,17 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .map(|p| p.lock().unwrap().provisioning_state())
     }
 
+    /// What holds slot `handle`'s material, if an HSM provider is wired up.
+    /// `None` if no provider configured.
+    pub fn hsm_slot_backing(
+        &self,
+        handle: hsm::KeyHandle,
+    ) -> Option<Result<hsm::SlotBacking, hsm::HsmError>> {
+        self.hsm_provider
+            .as_ref()
+            .map(|p| p.lock().unwrap().slot_backing(handle))
+    }
+
     pub(crate) fn nv_bytes_to_string(data: &[u8]) -> String {
         let end = data.iter().position(|&c| c == 0).unwrap_or(data.len());
         String::from_utf8_lossy(&data[..end]).to_string()
