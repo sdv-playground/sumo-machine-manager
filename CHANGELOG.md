@@ -8,6 +8,29 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **Software HSM (`hsm-sim-backend`): a re-provision keeps the device's own keys and state.** A
+  second keystore envelope on a provisioned unit (a keystore update, a certificate renewal) built the
+  new keystore in an empty directory, so every device-generated key was created anew — a new
+  `device-decrypt` key (new ECU id), a new `ivd-signing` key (existing bank IVD manifests and the boot
+  selector stopped verifying), a new `tls-identity` (the leaf delivered in that envelope certified the
+  old key), new `iam-signing` / `jwt-signing` keys and a new `storage-key` — and the monotonic
+  counters (the time floor among them), `bootstrap.yaml` and every other file the envelope does not
+  write were dropped. Now the new keystore starts as a copy of everything the envelope does not own,
+  modes kept, and the envelope is applied on top: the manifest, identities, security version,
+  trust-anchor and guest-identity public keys and pinned roots are rewritten (one the new envelope no
+  longer carries is gone); device keys are never regenerated when they exist; a leaf for a kept key
+  stays until a new one is delivered. The keystore swap is still two renames; a start now resolves
+  whatever an interrupted swap left (`SimHsm::recover_interrupted_reprovision`, run first by
+  `ensure_device_keys`), to the complete old or the complete new keystore, instead of generating a
+  new identity into the gap.
+  The monotonic counters, `provision_state`, the manifest, the identities file, every key and
+  certificate file and `bootstrap.yaml` are written atomically (temp file, fsync, rename, directory
+  fsync), so a crash can no longer leave a torn counter that reads as corrupt. A device key created
+  in a keystore that is already provisioned or holds other device keys is logged at ERROR, naming the
+  role and what stops verifying; a fresh keystore keeps its first-boot info line.
+
+  No on-disk format change: an existing keystore reads as before, and a first provision on a fresh
+  keystore writes the same files with the same modes. Host-facing: none required.
 - **node-shell `reset`** (feature `factory-reset`, on by default): the factory-reset engine, moved from
   a node manager unchanged in behaviour — `WipeTargets`, `component_dirs`,
   `write_provisioned_banks`, `ensure_under_root`, `execute_wipe` (same order, log dir last),
