@@ -1759,4 +1759,281 @@ mod tests {
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed["pending"]["vm9"]["ttl_secs"].as_u64(), Some(9999));
     }
+
+    /// Provisioning through the real `HsmProvider::provision`: signed +
+    /// encrypted SUIT envelopes, the factory anchor for the first one and the
+    /// key authority for the next. Key material is compared for equality only
+    /// and never printed.
+    #[cfg(all(feature = "crypto", feature = "suit"))]
+    mod through_provision {
+        use super::*;
+        use coset::CborSerializable;
+        use sumo_offboard::cose_key::CoseKey;
+        use sumo_offboard::recipient::Recipient;
+        use sumo_offboard::{encryptor, keygen, ImageManifestBuilder};
+
+        /// A time-floor value far above any leaf `notBefore` a test issues, so a
+        /// re-provision's legitimate ratchet is a no-op and "unchanged" is exact.
+        pub(super) const FLOOR: u64 = 4_000_000_000;
+
+        fn signer(scalar: &[u8], public: &[u8]) -> CoseKey {
+            let key = coset::CoseKeyBuilder::new_ec2_priv_key(
+                coset::iana::EllipticCurve::P_256,
+                public[1..33].to_vec(),
+                public[33..65].to_vec(),
+                scalar.to_vec(),
+            )
+            .algorithm(coset::iana::Algorithm::ES256)
+            .build();
+            CoseKey::from_cose_key_bytes(&key.to_vec().unwrap()).unwrap()
+        }
+
+        /// The off-device key authority: (scalar, uncompressed public).
+        pub(super) fn key_authority() -> (Vec<u8>, Vec<u8>) {
+            let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+            let public = sk
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes()
+                .to_vec();
+            (sk.to_bytes().to_vec(), public)
+        }
+
+        /// The keystore a factory tool sends: the key-authority anchor, every
+        /// device-generated role enumerated (no material), one guest identity
+        /// and one pinned trust anchor.
+        pub(super) fn keystore(security_version: u64, ka_public: &[u8]) -> HsmKeystore {
+            let mut slots = vec![KeySlot {
+                key_id: KeyRole::KeyAuthority.key_id().into(),
+                key_kind: KEY_TYPE_EC_P256,
+                anchor_public_key: Some(ka_public.to_vec()),
+                allowed_guests: None,
+                allowed_ops: Some(vec![OP_VERIFY]),
+            }];
+            for role in KeyRole::mandatory_roles() {
+                if !role.is_device_generated() {
+                    continue;
+                }
+                slots.push(KeySlot {
+                    key_id: role.key_id().into(),
+                    key_kind: match role.key_type() {
+                        KeyType::Aes256 => KEY_TYPE_AES_256,
+                        _ => KEY_TYPE_EC_P256,
+                    },
+                    anchor_public_key: None,
+                    allowed_guests: None,
+                    allowed_ops: None,
+                });
+            }
+            let mut guest = vec![0x04];
+            guest.extend_from_slice(&[0x11; 32]);
+            guest.extend_from_slice(&[0x22; 32]);
+            HsmKeystore {
+                schema_version: SCHEMA_VERSION,
+                security_version,
+                identities: vec![IdentityDef {
+                    identity_id: "vm-a".into(),
+                    public_key: guest,
+                }],
+                slots,
+                certificates: Vec::new(),
+                trust_anchors: vec![TrustAnchorCert {
+                    anchor_id: DELEGATION_ROOT_ANCHOR_ID.into(),
+                    certificate: vec![0x30, 0x82, 0x01, 0x00, 0xAB, 0xCD],
+                }],
+            }
+        }
+
+        /// Seal `ks` the way the factory tooling does: CBOR → zstd → ECDH-ES to
+        /// the device's own `device-decrypt` public key → SUIT, signed by
+        /// `(scalar, public)`.
+        pub(super) fn envelope(
+            hsm: &SimHsm,
+            ks: &HsmKeystore,
+            scalar: &[u8],
+            public: &[u8],
+        ) -> Vec<u8> {
+            use sha2::Digest;
+            let pem = std::fs::read_to_string(hsm.keys_dir().join("device-decrypt.pub")).unwrap();
+            let (x, y) = extract_ec_public_from_pem(&pem).unwrap();
+            let mut device =
+                coset::CoseKeyBuilder::new_ec2_pub_key(coset::iana::EllipticCurve::P_256, x, y)
+                    .build();
+            device.alg = None;
+            let recipient = CoseKey::from_cose_key_bytes(&device.to_vec().unwrap()).unwrap();
+
+            let cbor = payload::encode(ks).unwrap();
+            let digest: [u8; 32] = sha2::Sha256::digest(&cbor).into();
+            let compressed = encryptor::compress_firmware(&cbor, 3, None).unwrap();
+            let ephemeral = keygen::generate_device_key(keygen::ES256).unwrap();
+            let encrypted = encryptor::encrypt_firmware_ecdh(
+                &compressed,
+                &ephemeral,
+                &[Recipient {
+                    public_key: recipient,
+                    kid: b"device-decrypt".to_vec(),
+                }],
+            )
+            .unwrap();
+            ImageManifestBuilder::new()
+                .signing_time(1_700_000_000)
+                .component_id(vec!["hsm".to_string(), "keys".to_string()])
+                .sequence_number(ks.security_version)
+                .security_version(ks.security_version)
+                .payload_digest(&digest, cbor.len() as u64)
+                .payload_uri("#hsm-keys".to_string())
+                .encryption_info(&encrypted.encryption_info)
+                .integrated_payload("#hsm-keys".to_string(), encrypted.ciphertext)
+                .build(&signer(scalar, public))
+                .unwrap()
+        }
+
+        /// A CA-issued leaf for the device's current `role` key (what the CA
+        /// returns for that key's CSR).
+        pub(super) fn leaf_for(hsm: &SimHsm, role: KeyRole) -> Vec<u8> {
+            use std::str::FromStr;
+            use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+            use x509_cert::der::{Decode, Encode};
+            let spki_der = hsm.get_public_key_der(role.handle()).unwrap();
+            let spki = x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(&spki_der).unwrap();
+            let ca = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+            let builder = CertificateBuilder::new(
+                Profile::Root,
+                x509_cert::serial_number::SerialNumber::from(7u32),
+                x509_cert::time::Validity::from_now(std::time::Duration::from_secs(3600)).unwrap(),
+                x509_cert::name::Name::from_str("CN=leaf").unwrap(),
+                spki,
+                &ca,
+            )
+            .unwrap();
+            builder
+                .build::<p256::ecdsa::DerSignature>()
+                .unwrap()
+                .to_der()
+                .unwrap()
+        }
+
+        /// The SPKI DER a leaf certifies.
+        pub(super) fn leaf_spki(der: &[u8]) -> Vec<u8> {
+            use x509_cert::der::{Decode, Encode};
+            x509_cert::Certificate::from_der(der)
+                .unwrap()
+                .tbs_certificate
+                .subject_public_key_info
+                .to_der()
+                .unwrap()
+        }
+
+        /// Every device-generated role's material: the public half for EC roles,
+        /// the key bytes for the AES storage key.
+        pub(super) fn device_material(keystore: &Path) -> Vec<(KeyRole, Vec<u8>)> {
+            KeyRole::mandatory_roles()
+                .iter()
+                .filter(|r| r.is_device_generated())
+                .map(|r| {
+                    let file = match r.key_type() {
+                        KeyType::Aes256 => format!("{}.bin", r.key_id()),
+                        _ => format!("{}.pub", r.key_id()),
+                    };
+                    (*r, std::fs::read(keystore.join("keys").join(file)).unwrap())
+                })
+                .collect()
+        }
+
+        /// A started, factory-provisioned keystore with a raised time floor, a
+        /// second counter, an armed enrolment, and the key authority that
+        /// signs its re-provisions.
+        pub(super) fn provisioned() -> (tempfile::TempDir, SimHsm, (Vec<u8>, Vec<u8>)) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut hsm = SimHsm::new(dir.path().join("keystore"));
+            hsm.ensure_device_keys().unwrap();
+            let ka = key_authority();
+            let factory = envelope(
+                &hsm,
+                &keystore(1, &ka.1),
+                &FACTORY_SIGNING_SCALAR,
+                &FACTORY_SIGNING_PUBLIC,
+            );
+            hsm.provision(&factory).unwrap();
+            hsm.raise_monotonic(KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR), FLOOR)
+                .unwrap();
+            hsm.raise_monotonic(KeyHandle(vhsm_proto::HANDLE_IVD_SIGNING), 7)
+                .unwrap();
+            hsm.arm_enrollment("vm9", Some(600)).unwrap();
+            (dir, hsm, ka)
+        }
+
+        /// A re-provision (higher security version, signed by the key
+        /// authority, carrying the CA-issued `tls-identity` leaf) keeps every
+        /// key the device generated, its counters and its enrolment state.
+        #[test]
+        fn reprovision_keeps_device_keys_counters_and_bootstrap() {
+            let (dir, mut hsm, ka) = provisioned();
+            let live = dir.path().join("keystore");
+            let floor = KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR);
+            let other = KeyHandle(vhsm_proto::HANDLE_IVD_SIGNING);
+
+            let keys_before = device_material(&live);
+            let ecu_id_before = hsm
+                .get_public_key_der(KeyRole::DeviceDecryption.handle())
+                .unwrap();
+            let bootstrap_before = std::fs::read(live.join("bootstrap.yaml")).unwrap();
+            let leaf = leaf_for(&hsm, KeyRole::TlsIdentity);
+
+            let mut ks2 = keystore(2, &ka.1);
+            ks2.certificates.push(LeafCert {
+                key_id: KeyRole::TlsIdentity.key_id().into(),
+                certificate: leaf.clone(),
+            });
+            let update = envelope(&hsm, &ks2, &ka.0, &ka.1);
+            hsm.provision(&update).unwrap();
+
+            // Every check is collected so one run names every broken property.
+            let mut broken = Vec::new();
+            let mut check = |ok: bool, what: String| {
+                if !ok {
+                    broken.push(what);
+                }
+            };
+            let keys_after = device_material(&live);
+            for ((role, before), (_, after)) in keys_before.iter().zip(keys_after.iter()) {
+                check(
+                    before == after,
+                    format!("device-generated {role:?} key replaced"),
+                );
+            }
+            let ecu_id_after = hsm
+                .get_public_key_der(KeyRole::DeviceDecryption.handle())
+                .unwrap();
+            check(ecu_id_before == ecu_id_after, "ECU id changed".into());
+            check(
+                hsm.read_monotonic(floor).ok() == Some(FLOOR),
+                format!("time floor now {:?}", hsm.read_monotonic(floor)),
+            );
+            check(
+                hsm.read_monotonic(other).ok() == Some(7),
+                format!("second counter now {:?}", hsm.read_monotonic(other)),
+            );
+            check(
+                std::fs::read(live.join("bootstrap.yaml")).ok() == Some(bootstrap_before),
+                "bootstrap.yaml lost or changed".into(),
+            );
+            let installed = hsm
+                .get_certificate_der(KeyRole::TlsIdentity.handle())
+                .unwrap();
+            check(installed == leaf, "delivered leaf not installed".into());
+            check(
+                leaf_spki(&installed)
+                    == hsm
+                        .get_public_key_der(KeyRole::TlsIdentity.handle())
+                        .unwrap(),
+                "installed tls-identity leaf certifies a key the device no longer has".into(),
+            );
+            check(
+                hsm.load_security_version().ok() == Some(2),
+                "security version not advanced".into(),
+            );
+            assert!(broken.is_empty(), "re-provision broke: {broken:#?}");
+        }
+    }
 }
