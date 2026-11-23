@@ -2,7 +2,7 @@
 //! HTTP), the mDNS advertisement, the bind, and the graceful shutdown the
 //! binary's signal, restart or reset paths trigger.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -82,7 +82,24 @@ pub fn shutdown_on_signals(shutdown: Arc<Notify>) {
 pub struct SovdListener {
     transport: Transport,
     bind: String,
-    mdns: Option<sovd_mdns::AdvertiserGuard>,
+    mdns: Advertisement,
+}
+
+/// A [`SovdListener`]'s mDNS advertisement, shared between its `serve` and the
+/// binary (see [`SovdListener::advertisement`]): whichever withdraws it first
+/// sends the DNS-SD goodbye.
+#[derive(Clone)]
+pub struct Advertisement(Arc<Mutex<Option<sovd_mdns::AdvertiserGuard>>>);
+
+impl Advertisement {
+    /// Withdraw the advertisement now: the guard's drop multicasts the TTL-0
+    /// records and blocks (bounded, about 1 s) until they are sent. Idempotent;
+    /// a no-op when mDNS is off. The guard is dropped under the lock, so a
+    /// concurrent call returns only once the goodbye is on the wire.
+    pub fn withdraw(&self) {
+        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *guard = None;
+    }
 }
 
 enum Transport {
@@ -173,8 +190,15 @@ impl SovdListener {
         Ok(Self {
             transport,
             bind: cfg.bind.clone(),
-            mdns,
+            mdns: Advertisement(Arc::new(Mutex::new(mdns))),
         })
+    }
+
+    /// The handle that withdraws this server's mDNS advertisement — for a
+    /// reset path that ends the process without the shutdown notify, so
+    /// `serve` never returns: call [`Advertisement::withdraw`] just before it.
+    pub fn advertisement(&self) -> Advertisement {
+        self.mdns.clone()
     }
 
     /// Serving HTTPS (the tls-identity leaf is provisioned and `sovd_tls` on).
@@ -184,7 +208,8 @@ impl SovdListener {
 
     /// Serve `router` until `shutdown` is notified, then drain in-flight
     /// requests for at most 5 s (`SHUTDOWN_GRACE`) and withdraw the mDNS
-    /// advertisement (the DNS-SD goodbye is on the wire when this returns).
+    /// advertisement (the DNS-SD goodbye is on the wire when this returns,
+    /// unless an [`Advertisement::withdraw`] already sent it).
     /// `Err` is a TLS bind that is not `ip:port`; a server failure panics.
     pub async fn serve(self, router: axum::Router, shutdown: Arc<Notify>) -> Result<(), String> {
         match self.transport {
@@ -230,10 +255,9 @@ impl SovdListener {
                     .unwrap();
             }
         }
-        // The goodbye: the guard's drop multicasts the TTL-0 records and blocks
-        // (bounded) until they are sent, so a process exiting right after this
-        // returns — `std::process::exit` runs no Drop — still withdraws it.
-        drop(self.mdns);
+        // The goodbye: sent (bounded) before this returns, so a process exiting
+        // right after — `std::process::exit` runs no Drop — still withdraws it.
+        self.mdns.withdraw();
         Ok(())
     }
 }
@@ -402,7 +426,7 @@ mod tests {
                 Arc::new(tls_cfg),
             )),
             bind: addr.to_string(),
-            mdns: None,
+            mdns: Advertisement(Arc::new(Mutex::new(None))),
         };
         let shutdown = Arc::new(Notify::new());
         let task = tokio::spawn(listener.serve(axum::Router::new(), shutdown.clone()));
@@ -419,6 +443,30 @@ mod tests {
         assert!(took >= SHUTDOWN_GRACE, "{took:?}");
         assert!(took < SHUTDOWN_GRACE + Duration::from_secs(1), "{took:?}");
         drop(conn);
+    }
+
+    /// An explicit withdraw — twice, from another thread while `serve` runs,
+    /// with mDNS off — is a no-op for `serve`: its shutdown still returns
+    /// promptly, and withdrawing after it is harmless.
+    #[tokio::test]
+    async fn withdrawing_while_serving_leaves_the_shutdown_intact() {
+        let crypto: Arc<dyn hsm::HsmCryptoProvider> = Arc::new(NoLeaf);
+        let listener = SovdListener::bind(&cfg("127.0.0.1:0"), &crypto, None)
+            .await
+            .unwrap();
+        let advertisement = listener.advertisement();
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(listener.serve(axum::Router::new(), shutdown.clone()));
+        let other = advertisement.clone();
+        std::thread::spawn(move || {
+            other.withdraw();
+            other.withdraw();
+        })
+        .join()
+        .unwrap();
+        let took = shutdown_time(&shutdown, task).await;
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        advertisement.withdraw();
     }
 
     #[tokio::test]

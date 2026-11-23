@@ -28,7 +28,9 @@ what a consumer has to touch when it moves its pin.
 - node-shell: `SovdListener::serve` caps the graceful drain at 5 s on both transports (HTTP warns
   `graceful shutdown timed out after 5 s; closing`) and sends the mDNS/DNS-SD goodbye before it returns
   — as vm-sovd does. Host-facing: `serve` now returns `Result<(), String>` (it no longer hands back the
-  advertiser guard); drop the `_mdns` binding.
+  advertiser guard); drop the `_mdns` binding. `SovdListener::advertisement()` hands out an
+  `Advertisement` whose `withdraw()` sends the goodbye now (idempotent, blocking ~1 s, shared with
+  `serve`), for a reset path that ends the process without the shutdown notify.
 
 ## v0.1.26 — app leaf items from supernova
 
