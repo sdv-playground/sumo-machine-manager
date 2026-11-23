@@ -6,7 +6,20 @@ pull request; cutting the tag renames the heading. Tags are immutable: a mistake
 never a moved one. Consumers pin crates by `tag = "vX.Y.Z"`; the host-facing lines of each entry are
 what a consumer has to touch when it moves its pin.
 
-## Unreleased
+## v0.1.28 — node-shell: mDNS goodbye on shutdown and before a reset
+
+Tag on `bbccd45` (2026-11-23), PR #67.
+
+- node-shell: `SovdListener::serve` caps the graceful drain at 5 s on both transports (HTTP warns
+  `graceful shutdown timed out after 5 s; closing`) and sends the mDNS/DNS-SD goodbye before it returns
+  — as vm-sovd does. Host-facing: `serve` now returns `Result<(), String>` (it no longer hands back the
+  advertiser guard); drop the `_mdns` binding. `SovdListener::advertisement()` hands out an
+  `Advertisement` whose `withdraw()` sends the goodbye now (idempotent, blocking ~1 s, shared with
+  `serve`), for a reset path that ends the process without the shutdown notify.
+
+## v0.1.27 — node-shell: the SOVD node application shell; SOVDd v0.1.11
+
+Tag on `b532cb7` (2026-11-23), PR #66.
 
 - deps: SOVDd v0.1.11 (every pin) — the whole status family of a node server is node-level (an embedder's
   `/v1/status/x-boot-id` is served at `/v1/components/{node}/status/x-boot-id`; its root form is 404),
@@ -25,12 +38,6 @@ what a consumer has to touch when it moves its pin.
   copies, and supplies its backends, vendor routes, boot id, HSM, restart authorizer + reset action and
   factory-reset handler (verified: supernova's served API identical before/after the move, 504 probes
   on both trees).
-- node-shell: `SovdListener::serve` caps the graceful drain at 5 s on both transports (HTTP warns
-  `graceful shutdown timed out after 5 s; closing`) and sends the mDNS/DNS-SD goodbye before it returns
-  — as vm-sovd does. Host-facing: `serve` now returns `Result<(), String>` (it no longer hands back the
-  advertiser guard); drop the `_mdns` binding. `SovdListener::advertisement()` hands out an
-  `Advertisement` whose `withdraw()` sends the goodbye now (idempotent, blocking ~1 s, shared with
-  `serve`), for a reset path that ends the process without the shutdown notify.
 
 ## v0.1.26 — app leaf items from supernova
 
