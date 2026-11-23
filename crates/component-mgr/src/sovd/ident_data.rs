@@ -6,7 +6,7 @@
 //! of such a record as read-only SOVD `identData` on an entity of its own. The
 //! entity ids, record paths and items are the node's configuration.
 //!
-//! The model is the DDU node SOVD server's `ident_data`
+//! The model is another node SOVD server's `ident_data`
 //! (`IdentFileDataProvider`):
 //! - configured `{entity, file, items: [{id, name, key}]}`;
 //! - every item is `identData`, its value the file's string;
@@ -293,15 +293,15 @@ mod tests {
 
     const PLATFORM: &str = "component=host-platform\n\
         image=nor_ifs\n\
-        version=PSW_ONLY_20_1.10-0-gb862638\n\
-        tag=PSW_ONLY_20_1.10\n\
-        branch=psthyv/psw_only_20\n\
+        version=PLATFORM_1.10-0-g1a2b3c4\n\
+        tag=PLATFORM_1.10\n\
+        branch=release/platform\n\
         commit=b8626380060cc0ad1c83cf1d350459a7406bcc97\n\
         dirty=no\n\
         ci_job_url=\n\
         manifest_version=1.0\n\
-        manifest_coo11_m7_release_tgz=1.7.0\n\
-        manifest_hse_fw_pink_g3_rev1_1=0.2.64.0\n";
+        manifest_aux_firmware_tgz=1.7.0\n\
+        manifest_hsm_firmware_rev1=0.2.64.0\n";
 
     const OLD_BOOT: &str = "component=host-boot\n\
         status=no version record in /dev/fs0p0 0x00000000..0x00800000 (boot older than the record)\n";
@@ -339,7 +339,7 @@ mod tests {
                 IdentItemSpec {
                     id: "m7-firmware-version".into(),
                     name: "M7 firmware version".into(),
-                    key: "manifest_coo11_m7_release_tgz".into(),
+                    key: "manifest_aux_firmware_tgz".into(),
                 },
             ],
         }
@@ -411,14 +411,14 @@ mod tests {
             .read_data(&["platform-version".into(), "sw-version".into()])
             .await
             .unwrap();
-        assert_eq!(v[0].value, "PSW_ONLY_20_1.10-0-gb862638");
+        assert_eq!(v[0].value, "PLATFORM_1.10-0-g1a2b3c4");
         assert_eq!(
             v[1].value,
             serde_json::json!({
-                "version": "PSW_ONLY_20_1.10-0-gb862638",
+                "version": "PLATFORM_1.10-0-g1a2b3c4",
                 "items": [
-                    {"name": "coo11_m7_release_tgz", "version": "1.7.0"},
-                    {"name": "hse_fw_pink_g3_rev1_1", "version": "0.2.64.0"},
+                    {"name": "aux_firmware_tgz", "version": "1.7.0"},
+                    {"name": "hsm_firmware_rev1", "version": "0.2.64.0"},
                 ]
             })
         );
@@ -506,7 +506,7 @@ mod tests {
 
         let (s, body) = get("/vehicle/v1/components/platform/data/platform-version").await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(body["value"], "PSW_ONLY_20_1.10-0-gb862638", "{body}");
+        assert_eq!(body["value"], "PLATFORM_1.10-0-g1a2b3c4", "{body}");
 
         let (s, _) = get("/vehicle/v1/components/platform/data/platform-ci-job-url").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
