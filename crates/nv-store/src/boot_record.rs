@@ -239,6 +239,16 @@ pub struct RecordSelectorStore<R: BootRecord + Clone> {
     files: SignedFiles,
 }
 
+/// What [`RecordSelectorStore::prepare_activate`] returns.
+struct PreparedActivation {
+    record_rows: BTreeMap<String, ComponentEntry>,
+    manager_rows: BTreeMap<String, ComponentEntry>,
+    was_trial: bool,
+    expected: u64,
+    rows: SelectorBlob,
+    tx: SelectorBlob,
+}
+
 impl<R: BootRecord + Clone> RecordSelectorStore<R> {
     /// The host entry point: a store over `record`, its side files in `dir`,
     /// signed and verified with `signer`.
@@ -357,6 +367,36 @@ impl<R: BootRecord + Clone> RecordSelectorStore<R> {
         Ok(Some((generation, committed)))
     }
 
+    /// What [`SelectorStore::activate`] reads and signs before the record
+    /// moves, prepared without writing: the rows split between the record and
+    /// the manager, whether a trial stands, the generation the record is
+    /// expected to issue, and the manager rows and header signed at it.
+    fn prepare_activate(
+        &self,
+        entries: &BTreeMap<String, ComponentEntry>,
+        header: &Transaction,
+    ) -> Result<PreparedActivation, SelectorError> {
+        let (record_rows, manager_rows): (BTreeMap<_, _>, BTreeMap<_, _>) = entries
+            .iter()
+            .map(|(id, e)| (id.clone(), e.clone()))
+            .partition(|(id, _)| self.record.routes(id));
+        let (primary, secondary) = (
+            self.generation(RecordCopy::Primary)?.unwrap_or(0),
+            self.generation(RecordCopy::Secondary)?.unwrap_or(0),
+        );
+        let expected = primary.max(secondary) + 1;
+        let rows = self.files.sign(expected, manager_rows.clone(), None)?;
+        let tx = self.sign_header(expected, header)?;
+        Ok(PreparedActivation {
+            record_rows,
+            manager_rows,
+            was_trial: primary != secondary,
+            expected,
+            rows,
+            tx,
+        })
+    }
+
     /// The header and its generation, under the attribution rule of
     /// [`SelectorStore::read_transaction`] here; `Err` when the header, the
     /// record or a side file could not be read.
@@ -437,21 +477,17 @@ impl<R: BootRecord + Clone> SelectorStore for RecordSelectorStore<R> {
         entries: &BTreeMap<String, ComponentEntry>,
         header: &Transaction,
     ) -> Result<u64, SelectorError> {
-        let (record_rows, manager_rows): (BTreeMap<_, _>, BTreeMap<_, _>) = entries
-            .iter()
-            .map(|(id, e)| (id.clone(), e.clone()))
-            .partition(|(id, _)| self.record.routes(id));
-        let (primary, secondary) = (
-            self.generation(RecordCopy::Primary)?.unwrap_or(0),
-            self.generation(RecordCopy::Secondary)?.unwrap_or(0),
-        );
-        let was_trial = primary != secondary;
         // Sign the side files before the record moves, at the generation it
         // is expected to issue: a signer that cannot sign fails the
         // activation with nothing written.
-        let expected = primary.max(secondary) + 1;
-        let rows = self.files.sign(expected, manager_rows.clone(), None)?;
-        let tx = self.sign_header(expected, header)?;
+        let PreparedActivation {
+            record_rows,
+            manager_rows,
+            was_trial,
+            expected,
+            rows,
+            tx,
+        } = self.prepare_activate(entries, header)?;
         let generation = self.record.activate(&record_rows)?;
         let (rows, tx) = if generation == expected {
             (Ok(rows), Ok(tx))
@@ -492,6 +528,14 @@ impl<R: BootRecord + Clone> SelectorStore for RecordSelectorStore<R> {
             );
         }
         Ok(generation)
+    }
+
+    fn check_activate(
+        &self,
+        entries: &BTreeMap<String, ComponentEntry>,
+        header: &Transaction,
+    ) -> Result<(), SelectorError> {
+        self.prepare_activate(entries, header).map(|_| ())
     }
 
     fn commit(&self) -> Result<(), SelectorError> {
@@ -1691,6 +1735,55 @@ mod tests {
         }
         signer.set(SignerMode::Ok);
         assert_eq!(store.read_secondary().unwrap().unwrap().generation, 2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(feature = "test-seams")]
+    #[test]
+    fn check_activate_writes_nothing_and_fails_where_activate_fails_before_its_first_write() {
+        let signer = SwitchableSigner::new();
+        let (dir, store) = store_in_trial("check-activate", &signer);
+        let before = snapshot(&dir);
+        let calls = signer.calls();
+        store
+            .check_activate(&entries("os", Bank::A), &header())
+            .expect("a store that can activate");
+        let check_calls = signer.calls() - calls;
+        assert!(check_calls > 0, "the pre-flight reads and signs");
+        assert_eq!(snapshot(&dir), before);
+
+        // Verify works, sign does not.
+        signer.set_sign(SignerMode::Unavailable);
+        assert!(matches!(
+            store.check_activate(&entries("os", Bank::A), &header()),
+            Err(SelectorError::Unsignable(_))
+        ));
+        assert_eq!(snapshot(&dir), before);
+
+        // The signer goes away after `n` of the pre-flight's own calls (a
+        // read, the rows, the header): the pre-flight fails, and so does an
+        // activation in its place, both with nothing written.
+        for n in 0..check_calls {
+            signer.set(SignerMode::Ok);
+            signer.unavailable_after(n);
+            assert!(
+                store
+                    .check_activate(&entries("os", Bank::A), &header())
+                    .is_err(),
+                "unavailable after {n} calls"
+            );
+            signer.set(SignerMode::Ok);
+            signer.unavailable_after(n);
+            assert!(store.activate(&entries("os", Bank::A), &header()).is_err());
+            assert_eq!(snapshot(&dir), before, "unavailable after {n} calls");
+        }
+
+        signer.set(SignerMode::Ok);
+        assert_eq!(
+            store.activate(&entries("os", Bank::A), &header()).unwrap(),
+            3
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

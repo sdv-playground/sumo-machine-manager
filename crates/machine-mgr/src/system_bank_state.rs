@@ -286,9 +286,48 @@ impl SystemBankManager {
     /// **Nothing is written** — neither PRIMARY nor SECONDARY changes. This is
     /// exactly why a reboot here boots the old selection.
     pub fn stage(&mut self, component_id: &str, bank: Bank, images: BTreeMap<String, ImageEntry>) {
-        let mut pending = self.pending.take().unwrap_or_else(|| self.current.clone());
+        self.pending = Some(self.staged(component_id, bank, images));
+    }
+
+    /// The pending selection a [`stage`](Self::stage) of these arguments
+    /// leaves.
+    fn staged(
+        &self,
+        component_id: &str,
+        bank: Bank,
+        images: BTreeMap<String, ImageEntry>,
+    ) -> BTreeMap<String, ComponentEntry> {
+        let mut pending = self.pending.clone().unwrap_or_else(|| self.current.clone());
         pending.insert(component_id.to_string(), ComponentEntry::new(bank, images));
-        self.pending = Some(pending);
+        pending
+    }
+
+    /// The header [`seal`](Self::seal) arms: armed at `armed_boot_id` (`None`
+    /// ⇒ unknown, stored as zero), no boots counted, no resolution.
+    fn armed_header(armed_boot_id: Option<&str>) -> Transaction {
+        Transaction {
+            armed_boot_id: armed_boot_id.map_or([0; 16], boot_id_digest),
+            trial_boots: 0,
+            counted_boot_id: [0; 16],
+            resolution: None,
+        }
+    }
+
+    /// Whether a [`stage`](Self::stage) of these arguments followed by a
+    /// [`seal`](Self::seal) at `armed_boot_id` can write now (see
+    /// [`SelectorStore::check_activate`]). Writes nothing and stages nothing;
+    /// run it before a step the seal must follow and that cannot be undone.
+    pub fn check_activate(
+        &self,
+        component_id: &str,
+        bank: Bank,
+        images: BTreeMap<String, ImageEntry>,
+        armed_boot_id: Option<&str>,
+    ) -> Result<(), SelectorError> {
+        self.store.check_activate(
+            &self.staged(component_id, bank, images),
+            &Self::armed_header(armed_boot_id),
+        )
     }
 
     /// Atomically promote the staged selection to PRIMARY (booted).
@@ -307,12 +346,7 @@ impl SystemBankManager {
         let Some(pending) = self.pending.clone() else {
             return Ok(false);
         };
-        let header = Transaction {
-            armed_boot_id: armed_boot_id.map_or([0; 16], boot_id_digest),
-            trial_boots: 0,
-            counted_boot_id: [0; 16],
-            resolution: None,
-        };
+        let header = Self::armed_header(armed_boot_id);
         let gen = self.store.activate(&pending, &header)?;
         self.pending = None;
         self.current = pending;

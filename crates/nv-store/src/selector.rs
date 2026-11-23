@@ -451,6 +451,20 @@ pub trait SelectorStore: Send + Sync {
         entries: &BTreeMap<String, ComponentEntry>,
         header: &Transaction,
     ) -> Result<u64, SelectorError>;
+    /// Whether [`activate`](Self::activate) with these arguments can run now:
+    /// every read it makes before its first write succeeds and what it signs
+    /// can be signed, at the generation it would issue. Writes nothing. A
+    /// caller runs it before a step it cannot undo that the activation must
+    /// follow (a bank activator's physical switch), so a store that could not
+    /// activate fails the activation before that step. `Ok` by default, for a
+    /// store with nothing to check ahead.
+    fn check_activate(
+        &self,
+        _entries: &BTreeMap<String, ComponentEntry>,
+        _header: &Transaction,
+    ) -> Result<(), SelectorError> {
+        Ok(())
+    }
     /// secondary := primary (same generation) — "the trial is over, this is
     /// now the floor". Idempotent; `Ok` and a no-op without a primary, `Err`
     /// when the primary could not be read.
