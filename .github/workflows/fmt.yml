@@ -20,3 +20,11 @@ jobs:
       # those deps — format the tracked .rs files directly. rustfmt.toml (edition
       # 2021) is auto-discovered from the repo root.
       - run: git ls-files '*.rs' | xargs -r rustfmt --edition 2021 --check
+  neutral-names:
+    name: neutral names
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No downstream product/organisation names in the tree; the denylist and
+      # its allow-list live in the script.
+      - run: bash scripts/check-neutral-names.sh

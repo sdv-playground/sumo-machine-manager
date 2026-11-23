@@ -16,7 +16,7 @@ use tower::ServiceExt;
 
 use machine_mgr::bank_provider::BankProvider;
 use machine_mgr::node_update::NodeCoordinator;
-use machine_mgr::system_bank_state::{boot_id_digest, Outcome, Reason, Resolution, SelectorStore};
+use machine_mgr::system_bank_state::{boot_id_digest, SelectorStore};
 use machine_mgr::{
     DeactivateError, DeactivateOutcome, Deactivator, EntityInfo, FileSelectorStore, ImageEntry,
     InMemorySelectorStore, MachineRegistry, SharedSystemBankState, SystemBankManager, TestSigner,
@@ -1463,6 +1463,30 @@ async fn x_update_commit_resolves_both_components_after_one_coalesced_reboot() {
     }
 }
 
+#[tokio::test]
+async fn node_verdict_ops_are_served_on_the_v1_tree_beside_sovdd() {
+    // Merged over SOVDd's own two-tree router (the vm-sovd composition): the
+    // `/v1` verbs resolve to the vendor ops and answer like the legacy twins.
+    let (router, _nv, _keys) = make_node_router();
+
+    for op in ["x-update-commit", "x-update-rollback"] {
+        let suffix = format!("/operations/{op}/executions");
+        let (v1_status, v1) =
+            post_json(&router, &format!("/v1{suffix}"), serde_json::json!({})).await;
+        let (legacy_status, legacy) = post_json(
+            &router,
+            &format!("/vehicle/v1{suffix}"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(v1_status, StatusCode::OK, "{op}: {v1}");
+        assert_eq!(v1_status, legacy_status, "{op}");
+        assert_eq!(v1["operation_id"], op);
+        assert_eq!(v1["status"], legacy["status"], "{op}");
+        assert_eq!(v1["result"], legacy["result"], "{op}");
+    }
+}
+
 // --- x-update-state `banks` member ---
 
 /// Write `files` (name, bytes) into `images/<id>/<bank_x>` and sign an IVD
@@ -1694,7 +1718,7 @@ async fn update_state_in_trial_follows_boot_vector() {
     assert_eq!(vm2["in_trial"], false);
 }
 
-// --- boot-vector transaction header + trial boot limit ---
+// --- boot-vector transaction header + trial boot count ---
 
 /// vm1 + vm2 over on-disk `IvdBankProvider`s sharing one file-backed boot
 /// vector (floor: both on A). vm1 is then activated onto B at node boot
@@ -1817,12 +1841,8 @@ impl TrialNode {
     }
 }
 
-fn coord_at(boot_id: &str, limit: Option<u8>) -> Arc<NodeCoordinator> {
-    Arc::new(
-        NodeCoordinator::new()
-            .with_node_boot_id(boot_id)
-            .with_trial_boot_limit(limit),
-    )
+fn coord_at(boot_id: &str) -> Arc<NodeCoordinator> {
+    Arc::new(NodeCoordinator::new().with_node_boot_id(boot_id))
 }
 
 #[tokio::test]
@@ -1832,6 +1852,7 @@ async fn activate_arms_the_primary_transaction_header() {
     let (gen, t) = node
         .store()
         .read_transaction()
+        .unwrap()
         .expect("the header is recorded");
     assert_eq!(
         gen, primary.generation,
@@ -1846,73 +1867,20 @@ async fn activate_arms_the_primary_transaction_header() {
     assert_eq!(t.resolution, None);
 }
 
+/// A trial has no boot limit: every boot is counted and reported, and
+/// however many there are, the node stays in trial until a verdict.
 #[tokio::test]
-async fn trial_boot_limit_rolls_the_node_back() {
-    let node = TrialNode::new(false);
-
-    let out = node
-        .machine
-        .observe_node_boot(&coord_at("boot-b", Some(2)))
-        .await;
-    assert_eq!(out.trial_boots, Some(1));
-    assert!(!out.bailed_out);
-    // A process restart within the same boot counts nothing.
-    let out = node
-        .machine
-        .observe_node_boot(&coord_at("boot-b", Some(2)))
-        .await;
-    assert_eq!(
-        out.trial_boots,
-        Some(1),
-        "same boot id is not counted twice"
-    );
-    assert!(!out.bailed_out);
-
-    let coord = coord_at("boot-c", Some(2));
-    let out = node.machine.observe_node_boot(&coord).await;
-    assert_eq!(out.trial_boots, Some(2));
-    assert_eq!(out.limit, Some(2));
-    assert!(out.bailed_out, "{out:?}");
-    assert!(out.errors.is_empty(), "{out:?}");
-
-    let (status, body) = get(&node.router(coord), "/vehicle/v1/data/x-update-state").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["banks"][0]["id"], "vm1");
-    assert_eq!(body["banks"][0]["in_trial"], false);
-    assert_eq!(body["banks"][0]["active"]["bank"], "A");
-    assert_eq!(
-        body["resolution"],
-        serde_json::json!({"outcome": "rolled_back", "reason": "trial_boot_limit"})
-    );
-    assert_eq!(body["trial_boots"], 2);
-    assert_eq!(body["trial_boot_limit"], 2);
-
-    let vm1 = bank_state(&node.nv, slots::VM1);
-    assert!(vm1.committed, "vm1 NV rolled back: {vm1:?}");
-    assert_eq!(vm1.active_bank, Bank::A);
-    // The per-component rollback found the vector already settled: its
-    // verdict-reason rollback was the no-op, so the limit reason survives.
-    let primary = node.store().read_primary().unwrap().unwrap();
-    assert_eq!(primary.entries["vm1"].bank, Bank::A);
-    assert_eq!(
-        node.store().read_transaction().unwrap().1.resolution,
-        Some(Resolution {
-            outcome: Outcome::RolledBack,
-            reason: Reason::TrialBootLimit,
-        })
-    );
-}
-
-#[tokio::test]
-async fn no_trial_boot_limit_never_bails_out() {
+async fn trial_boots_are_counted_and_never_roll_the_node_back() {
     let node = TrialNode::new(false);
     for (i, id) in ["boot-b", "boot-c", "boot-d", "boot-e", "boot-f"]
         .iter()
         .enumerate()
     {
-        let out = node.machine.observe_node_boot(&coord_at(id, None)).await;
+        let out = node.machine.observe_node_boot(&coord_at(id)).await;
         assert_eq!(out.trial_boots, Some(i as u8 + 1));
-        assert!(!out.bailed_out);
+        // A process restart within the same boot counts nothing.
+        let out = node.machine.observe_node_boot(&coord_at(id)).await;
+        assert_eq!(out.trial_boots, Some(i as u8 + 1));
     }
     assert!(
         !bank_state(&node.nv, slots::VM1).committed,
@@ -1922,13 +1890,29 @@ async fn no_trial_boot_limit_never_bails_out() {
         node.store().read_primary().unwrap().unwrap().entries["vm1"].bank,
         Bank::B
     );
+
+    let router = node.router(coord_at("boot-f"));
+    let (status, body) = get(&router, "/v1/data/x-update-state").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["banks"][0]["in_trial"], true);
+    assert_eq!(body["trial_boots"], 5);
+    assert_eq!(body["resolution"], serde_json::Value::Null);
+    assert!(body.get("trial_boot_limit").is_none(), "{body}");
+    // The frozen legacy tree keeps the member, always null.
+    let (status, legacy) = get(&router, "/vehicle/v1/data/x-update-state").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(legacy["trial_boot_limit"], serde_json::Value::Null);
+    assert_eq!(
+        legacy.as_object().unwrap().len(),
+        body.as_object().unwrap().len() + 1
+    );
 }
 
 #[tokio::test]
 async fn verdict_skips_a_component_the_boot_vector_says_is_not_in_trial() {
     // NV holds vm2 in trial, the boot vector does not: vm2 is not a member.
     let node = TrialNode::new(true);
-    let router = node.router(coord_at("boot-b", None));
+    let router = node.router(coord_at("boot-b"));
     let (status, body) = post_json(
         &router,
         "/vehicle/v1/operations/x-update-verdict/executions",
@@ -1945,31 +1929,237 @@ async fn verdict_skips_a_component_the_boot_vector_says_is_not_in_trial() {
     );
 }
 
-#[tokio::test]
-async fn rollback_verdict_after_bail_out_is_idempotent() {
-    let node = TrialNode::new(false);
-    node.machine
-        .observe_node_boot(&coord_at("boot-b", Some(1)))
-        .await;
-    let router = node.router(coord_at("boot-b", Some(1)));
+// --- verdict scope: node-reset members settle by the node operation (/v1) ---
+
+/// vm1 (local reset) + vm2 (node reset, `NodeResetActivator`) served through
+/// the SOVDd router on both trees.
+fn make_verdict_scope_router() -> (axum::Router, TestKeys) {
+    let keys = generate_test_keys();
+    let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
+    suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
+    let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
+
+    let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+    let mut boot_state = NvBootState::default();
+    nv.write_boot_state(&mut boot_state).unwrap();
+    let nv = Arc::new(Mutex::new(nv));
+
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    for (id, set) in [("vm1", slots::VM1), ("vm2", slots::VM2)] {
+        let mut backend = ComponentBackend::new(
+            set,
+            nv.clone(),
+            manifest_provider.clone(),
+            ComponentConfig::default(),
+        )
+        .with_id(id.to_string());
+        if id == "vm2" {
+            backend = backend.with_bank_activator(Arc::new(NodeResetActivator));
+        }
+        backends.insert(id.to_string(), Arc::new(backend));
+    }
+    let router = sovd_api::create_router(sovd_api::AppState::new(backends));
+    (router, keys)
+}
+
+/// `PUT uri` with no body; the status and the raw body text.
+async fn put_empty_text(router: &axum::Router, uri: &str) -> (StatusCode, String) {
+    let resp = router
+        .clone()
+        .oneshot(Request::put(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Register an update on `component` (no payload); its id.
+async fn register_update(router: &axum::Router, component: &str) -> String {
     let (status, body) = post_json(
-        &router,
-        "/vehicle/v1/operations/x-update-verdict/executions",
-        serde_json::json!({"verdict": "rollback"}),
+        router,
+        &format!("/vehicle/v1/components/{component}/updates"),
+        serde_json::json!({"id": next_update_id()}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let skipped = body["result"]["skipped"].as_array().unwrap();
-    assert!(skipped.contains(&serde_json::json!("vm1")), "{body}");
-    assert_eq!(body["result"]["rolled_back"], serde_json::json!([]));
-    assert_eq!(
-        node.store()
-            .read_transaction()
-            .unwrap()
-            .1
-            .resolution
-            .unwrap()
-            .reason,
-        Reason::TrialBootLimit
+    assert_eq!(status, StatusCode::CREATED, "register_update: {body}");
+    body["update_id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn v1_refuses_per_update_verdict_on_node_reset_member() {
+    let (router, keys) = make_verdict_scope_router();
+    let update_id = flash_to_awaiting_verdict(
+        &router,
+        "vm2",
+        make_test_suit_envelope(&keys, "vm2", 2, &vec![0xBB; 1024]),
+    )
+    .await;
+
+    for verb in ["x-update-commit", "x-update-rollback"] {
+        let (status, body) = put_empty_text(
+            &router,
+            &format!("/v1/components/vm2/updates/{update_id}/{verb}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{verb}: {body}");
+        assert!(
+            body.contains("operations/x-update-commit/executions"),
+            "{verb}: {body}"
+        );
+        assert!(!body.contains("trial mode"), "{verb}: {body}");
+    }
+
+    // Refused, not settled: the update still awaits its (node) verdict.
+    let (_, status) = get(
+        &router,
+        &format!("/vehicle/v1/components/vm2/updates/{update_id}/status"),
+    )
+    .await;
+    assert_eq!(status["x-ota-substate"], "awaiting-verdict", "{status}");
+}
+
+#[tokio::test]
+async fn vehicle_v1_per_update_verdict_on_node_reset_member_is_unchanged() {
+    let (router, keys) = make_verdict_scope_router();
+    let update_id = flash_to_awaiting_verdict(
+        &router,
+        "vm2",
+        make_test_suit_envelope(&keys, "vm2", 2, &vec![0xBB; 1024]),
+    )
+    .await;
+    // No activation_reset: vm2 (node reset, no vm-service) cannot restart itself
+    // (501), so the legacy commit is not scope-refused but meets the
+    // pre-reboot activation precondition instead.
+    let (status, body) = put_empty_text(
+        &router,
+        &format!("/vehicle/v1/components/vm2/updates/{update_id}/x-update-commit"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("AwaitingReboot"), "{body}");
+    assert!(
+        !body.contains("operations/x-update-commit/executions"),
+        "{body}"
     );
+}
+
+/// A vm-service stand-in on an ephemeral loopback port: `GET` (the health
+/// probe) reports a stopped guest, anything else (the start/restart notify)
+/// gets an empty `200 OK`.
+async fn stub_vm_service() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let size = stream.read(&mut buf).await.unwrap_or(0);
+                let body = if buf[..size].starts_with(b"GET ") {
+                    r#"{"status":"stopped","guest_state":null,"hb_seq":null,"boot_id":null}"#
+                } else {
+                    ""
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn host_restart_is_not_supported_while_a_vm_service_guest_restarts() {
+    // Both node-reset banked components; only the guest has a vm-service to
+    // relaunch it. The host cannot restart itself: 501, not a fake activation.
+    let keys = generate_test_keys();
+    let manifests: Arc<dyn ManifestProvider> =
+        Arc::new(SuitProvider::new(keys.trust_anchor.clone()));
+    let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+    nv.write_boot_state(&mut NvBootState::default()).unwrap();
+    let nv = Arc::new(Mutex::new(nv));
+    let vm_service = stub_vm_service().await;
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    for (id, set, addr) in [
+        ("host", slots::OS, None),
+        ("vm1", slots::VM1, Some(vm_service)),
+    ] {
+        let backend = ComponentBackend::with_options(
+            set,
+            nv.clone(),
+            manifests.clone(),
+            ComponentConfig::default(),
+            addr,
+            None,
+            None,
+        )
+        .with_id(id.to_string())
+        .with_bank_activator(Arc::new(NodeResetActivator));
+        backends.insert(id.to_string(), Arc::new(backend));
+    }
+    let router = sovd_api::create_router(sovd_api::AppState::new(backends));
+
+    let (status, body) = put_json(
+        &router,
+        "/vehicle/v1/components/host/status/restart",
+        serde_json::json!({ "reset_type": "hard" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    activation_reset(&router, "vm1").await;
+}
+
+#[tokio::test]
+async fn v1_update_status_reports_verdict_scope() {
+    let (router, _keys) = make_verdict_scope_router();
+    for (component, scope) in [("vm1", "update"), ("vm2", "node")] {
+        let update_id = register_update(&router, component).await;
+        let (status, body) = get(
+            &router,
+            &format!("/v1/components/{component}/updates/{update_id}/status"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["x-update"]["verdict_scope"], scope, "{body}");
+
+        // The legacy tree keeps its body as it was.
+        let (_, legacy) = get(
+            &router,
+            &format!("/vehicle/v1/components/{component}/updates/{update_id}/status"),
+        )
+        .await;
+        assert!(
+            legacy["x-update"].get("verdict_scope").is_none(),
+            "{legacy}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn v1_component_capabilities_report_verdict_scope() {
+    let (router, _keys) = make_verdict_scope_router();
+    for (component, scope) in [("vm1", "update"), ("vm2", "node")] {
+        let (status, body) = get(&router, &format!("/v1/components/{component}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["capabilities"]["x-update"]["verdict_scope"], scope,
+            "{body}"
+        );
+        // Every /v1 execute is orchestrated: no control mode to advertise.
+        assert!(
+            body["capabilities"]["x-update"].get("control").is_none(),
+            "{body}"
+        );
+
+        // The legacy tree keeps its body as it was.
+        let (_, legacy) = get(&router, &format!("/vehicle/v1/components/{component}")).await;
+        assert!(
+            legacy["capabilities"]["x-update"].get("control").is_none(),
+            "{legacy}"
+        );
+    }
 }

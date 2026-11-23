@@ -124,11 +124,12 @@ orchestrator's.
 
 They also carry the boot vector's transaction state. `trial_boots`: distinct node boots
 counted while armed without a verdict (`null` when the boot vector has no header, or the
-node is not in trial and has no recorded resolution). `trial_boot_limit`: the count
-at which the node rolls itself back (`null` = disabled; set by the host). `resolution`: how
-the last node transaction ended, `{"outcome": "committed"|"rolled_back", "reason":
-"verdict"|"trial_boot_limit"|"boot_stage"}`, `null` while a trial is open or when none is
-recorded. `boot_stage` means the boot stage restored the committed copy while the node was
+node is not in trial and has no recorded resolution); the count is information, a trial
+has no boot limit. The frozen legacy `/vehicle/v1` tree still serves `"trial_boot_limit":
+null` (always null) and documents it; `/v1` bodies do not carry it. `resolution`: how the
+last node transaction ended, `{"outcome":
+"committed"|"rolled_back", "reason": "verdict"|"boot_stage"}` (`"trial_boot_limit"` in a
+record an older build wrote), `null` while a trial is open or when none is recorded. `boot_stage` means the boot stage restored the committed copy while the node was
 down (recorded at the next start); `trial_boots` then is the count sumo observed before the
 boot stage gave up (0 when the node never came up).
 

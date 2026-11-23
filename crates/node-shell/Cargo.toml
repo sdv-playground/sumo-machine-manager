@@ -1,0 +1,58 @@
+[package]
+name = "node-shell"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "The SOVD node application shell: the generic server a machine manager wires around its device — its config keys, identification, node topology, router with the node-level routes, and TLS/mDNS serving with graceful shutdown. Device facts stay in the binary that wires it."
+
+[features]
+default = ["factory-reset"]
+# The factory-reset engine (`reset`): the authorized wipe, its order, the
+# response and the route builder for `sovd_router`'s factory-reset slot. The
+# node supplies its device through `reset::ResetHooks`. ON by default; a node
+# without a factory reset builds with `--no-default-features`.
+factory-reset = ["dep:async-trait", "dep:component-factory", "dep:component-mgr", "dep:libc"]
+
+[dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+# The restart's execution id (the legacy body's `exec_id`).
+uuid = { version = "1", features = ["v4"] }
+# HTTPS from the HSM-held tls-identity leaf: the HSM signs the handshake (its
+# private key never leaves it). `tls-rustls-no-provider`, not `tls-rustls`: the
+# latter pulls rustls's aws-lc-rs default → aws-lc-sys (C/asm), which doesn't
+# cross-build to QNX — hsm-rustls installs the ring provider.
+hsm = { path = "../hsm" }
+hsm-rustls = { path = "../hsm-rustls" }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+tokio = { version = "1", features = ["net", "signal", "sync", "rt", "macros", "time"] }
+# `Machine` — the hsm component's device id is the ECU id the identification
+# prefix and `x-ecu-id` share.
+machine-mgr = { path = "../machine-mgr" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.12" }
+sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.12" }
+# mDNS / DNS-SD advertiser for the SOVD endpoint (ISO 17978-3 §5.11), on both
+# transports; QNX-safe (a pure-Rust responder on `nto`).
+sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.12" }
+# factory-reset: the component specs a reset resolves its bank dirs from, the
+# bank staging wipe, the `EBUSY` errno of a mounted partition, and the
+# `ResetHooks` async trait.
+component-factory = { path = "../component-factory", optional = true }
+component-mgr = { path = "../component-mgr", optional = true }
+libc = { version = "0.2", optional = true }
+async-trait = { version = "0.1", optional = true }
+
+[dev-dependencies]
+async-trait = "0.1"
+# The shutdown tests' client connections.
+tokio = { version = "1", features = ["io-util"] }
+serde_yaml = "0.9"
+tempfile = "3"
+# `oneshot` to drive the router in the router tests.
+tower = { version = "0.5", features = ["util"] }
+# The test node's members: components, ident_data entities and the vendor
+# routes a binary merges in.
+component-mgr = { path = "../component-mgr" }
+nv-store = { path = "../nv-store" }

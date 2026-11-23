@@ -13,6 +13,9 @@ use component_mgr::backend::{ComponentBackend, ComponentConfig};
 use component_mgr::component_adapter::ComponentAdapter;
 use component_mgr::manifest_provider::ManifestProvider;
 
+mod activators;
+pub use activators::{builtin_activator, HsmKeystoreActivator};
+
 /// One raw A/B partition pair behind a bank part. `name` is the payload name as it
 /// arrives on the wire (the SUIT component-id's last segment); `a`/`b` are the
 /// device paths of the two banks. What a part MEANS is the platform's business;
@@ -77,7 +80,8 @@ pub struct ComponentSpec {
     pub parts: Vec<PartSpec>,
 
     /// Bank-activator marker. When set, the caller constructs the
-    /// appropriate activator and inserts it into `FactoryDeps::bank_activators`.
+    /// appropriate activator and inserts it into `FactoryDeps::bank_activators`
+    /// ([`builtin_activator`] answers the markers sumo implements itself).
     /// Also suppresses vm-service notifications for this component.
     #[serde(default)]
     pub activator: Option<String>,
@@ -104,7 +108,7 @@ pub struct ComponentSpec {
     pub log_agent_url: Option<String>,
 
     /// §7.21 log reads — host-local file globs (`dir/prefix*suffix`)
-    /// for components whose logs live on THIS node (e.g. the supernova
+    /// for components whose logs live on THIS node (e.g. the node manager
     /// component: `["/var/log/*.log"]`). STANDARD (line) logs.
     #[serde(default)]
     pub host_log_globs: Option<Vec<String>>,
@@ -116,10 +120,10 @@ pub struct ComponentSpec {
 
     /// §7.21 log reads — the QNX `slogger2` ring (the host system log), read via
     /// `platform_log::read_slog2`. `true` for the host component on QNX: it serves
-    /// supernova's own records (emitted through score-log-slog2) AND the OS
+    /// the node manager's own records (emitted through score-log-slog2) AND the OS
     /// driver/eMMC telemetry, decoupled from the producer via the kernel-owned
-    /// ring — replacing the `host_log_globs` tail of supernova.log. Additive with
-    /// the above; a no-op read off QNX. STANDARD (line) logs.
+    /// ring — replacing the `host_log_globs` tail of the node manager's log
+    /// file. Additive with the above; a no-op read off QNX. STANDARD (line) logs.
     #[serde(default)]
     pub host_slog2: bool,
 
@@ -158,7 +162,7 @@ pub struct ComponentSpec {
     #[serde(default)]
     pub diag_agent_url: Option<String>,
     /// §7.9 diagnostics gathered IN-PROCESS (no guest agent) — set `true` for
-    /// the HOST itself (supernova) / on-box components, so its disk/RAM
+    /// the HOST itself (the node manager) / on-box components, so its disk/RAM
     /// (`/mnt/common-rw`, `/proc/meminfo`) are visible over SOVD. Default false.
     #[serde(default)]
     pub host_diagnostics: bool,
@@ -171,7 +175,7 @@ pub struct ComponentSpec {
 
     /// This component is a vHSM principal: after a bank commit the host arms
     /// enrollment so the guest can enroll on its next boot. The platform fills
-    /// it — supernova derives it from its `hsm.allow` list.
+    /// it — the node manager derives it from its `hsm.allow` list.
     #[serde(default)]
     pub vm_principal: bool,
 }
@@ -324,6 +328,23 @@ pub fn resolve_bank_set(spec: &ComponentSpec) -> Result<BankSet, String> {
             spec.id,
         )),
     }
+}
+
+/// The parts a `PartitionBankProvider` streams into, in profile order, for
+/// [`FactoryDeps::partition_parts`]. `record: None` — no platform image record
+/// wired yet (the seam lands with the BMFT work).
+pub fn partition_parts(
+    spec: &ComponentSpec,
+) -> Vec<component_mgr::partition_bank_provider::PartitionPart> {
+    spec.parts
+        .iter()
+        .map(|p| component_mgr::partition_bank_provider::PartitionPart {
+            file: p.name.clone(),
+            partition_a: p.a.clone(),
+            partition_b: p.b.clone(),
+            record: None,
+        })
+        .collect()
 }
 
 /// Check a spec's raw-partition [`parts`](ComponentSpec::parts) list is
@@ -1111,6 +1132,39 @@ mod tests {
         assert_eq!(
             serde_yaml::from_str::<Vec<PartSpec>>(&yaml).unwrap(),
             spec.parts
+        );
+    }
+
+    fn spec(parts: &str) -> ComponentSpec {
+        serde_yaml::from_str(&format!(
+            "id: host\ntype: hpc\nslot: 2\nactivator: host-bank\n{parts}"
+        ))
+        .unwrap()
+    }
+
+    const HOST_PARTS: &str = "\
+parts:
+  - { name: application.img, a: /dev/emmc4.lnxdata.host-appl, b: /dev/emmc5.lnxdata.host-appl }
+  - { name: ifs, a: /dev/emmc4.lnxdata.host-ifs, b: /dev/emmc5.lnxdata.host-ifs }
+  - { name: rootfs, a: /dev/emmc4.lnxdata.host-core, b: /dev/emmc5.lnxdata.host-core }
+";
+
+    #[test]
+    fn partition_parts_maps_name_a_b_in_order() {
+        let parts = partition_parts(&spec(HOST_PARTS));
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].file, "application.img");
+        assert_eq!(parts[0].partition_a, "/dev/emmc4.lnxdata.host-appl");
+        assert_eq!(parts[0].partition_b, "/dev/emmc5.lnxdata.host-appl");
+        assert_eq!(parts[1].file, "ifs");
+        assert_eq!(parts[1].partition_a, "/dev/emmc4.lnxdata.host-ifs");
+        assert_eq!(parts[1].partition_b, "/dev/emmc5.lnxdata.host-ifs");
+        assert_eq!(parts[2].file, "rootfs");
+        assert_eq!(parts[2].partition_a, "/dev/emmc4.lnxdata.host-core");
+        assert_eq!(parts[2].partition_b, "/dev/emmc5.lnxdata.host-core");
+        assert!(
+            parts.iter().all(|p| p.record.is_none()),
+            "no platform image record is wired yet"
         );
     }
 

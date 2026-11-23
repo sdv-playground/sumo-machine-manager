@@ -220,6 +220,31 @@ impl<D: BlockDevice + Send + 'static> IvdBankProvider<D> {
         self.read_bank(bank).images
     }
 
+    /// Whether [`activate`](BankProvider::activate) of `bank` can seal the
+    /// boot vector now (see [`SystemBankManager::check_activate`]). Writes
+    /// nothing; `Ok` without a selector. Run before any step the seal must
+    /// follow and that cannot be undone.
+    ///
+    /// [`SystemBankManager::check_activate`]: machine_mgr::system_bank_state::SystemBankManager::check_activate
+    pub(crate) fn check_activate(&self, bank: Bank) -> Result<(), BankError> {
+        let Some(sel) = &self.selector else {
+            return Ok(());
+        };
+        sel.read()
+            .expect("selector poisoned")
+            .check_activate(
+                &self.component_id,
+                bank,
+                self.sealed_images(bank),
+                self.node_boot_id.as_deref(),
+            )
+            .map_err(|e| {
+                BankError::Failed(format!(
+                    "boot-vector activate cannot run — nothing activated: {e}"
+                ))
+            })
+    }
+
     /// What `bank`'s signed manifest records, for its boot-vector entry and
     /// the [`banks`](BankProvider::banks) status report: each image's size +
     /// SHA-256 and the node boot id the bank was sealed in (read without an
@@ -1059,7 +1084,7 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // Stream the hash in 64 KiB chunks — NEVER `std::fs::read` the whole
         // image into a Vec. A rootfs is hundreds of MB; the one-shot read
         // pre-sizes a contiguous Vec to the file length and OOMs a
-        // memory-pressured CVC (`verify_payload read …: out of memory`), which
+        // memory-pressured ECU (`verify_payload read …: out of memory`), which
         // then surfaces as a bank/verify failure. `hash_reader` is O(64 KiB)
         // resident — same idiom as the upload pipeline's `process_plain`.
         let file = std::fs::File::open(&path).map_err(|e| {
@@ -1080,11 +1105,27 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         }
     }
 
+    fn open_payload_reader(
+        &self,
+        bank: Bank,
+        name: &str,
+    ) -> Result<Box<dyn std::io::Read + Send>, BankError> {
+        let bank_dir = self
+            .target_bank_dir(bank)
+            .ok_or_else(|| BankError::Failed("no images_dir configured".into()))?;
+        Ok(Box::new(std::fs::File::open(bank_dir.join(name))?))
+    }
+
     fn activate(&self, bank: Bank) -> Result<ResetKind, BankError> {
-        // Run the activator (IFS write, partition swap, RT launcher …) FIRST so
-        // a failure short-circuits with `?` BEFORE the selector below is sealed:
-        // the engine can then roll NV back without the boot selector pointing at
-        // a half-activated bank.
+        // The activator below cannot be undone, and the seal must follow it,
+        // so the boot vector proves first that its seal can run (its copies
+        // read and verify, what it writes can be signed): a vector that
+        // cannot seal fails the activation with nothing activated.
+        self.check_activate(bank)?;
+        // Run the activator (IFS write, partition swap, RT launcher …) before
+        // the seal so a failure short-circuits with `?` BEFORE the selector
+        // below is sealed: the engine can then roll NV back without the boot
+        // selector pointing at a half-activated bank.
         //
         // For VMs (`bank_activator == None`) the block is skipped — VMs have no
         // activator; their qvm/process cycle is the activation. This matches the
@@ -1172,6 +1213,21 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             .nv
             .lock()
             .map_err(|_| BankError::Failed("nv lock poisoned".into()))?;
+        // The NV commit raises the security floor and cannot be undone, so the
+        // boot vector proves first that its commit can follow (its copies
+        // read and verify, its write can be signed): a vector that cannot
+        // commit fails the verdict with NV untouched.
+        let mut selector = self
+            .selector
+            .as_ref()
+            .map(|sel| sel.write().expect("selector poisoned"));
+        if let Some(sel) = &selector {
+            sel.check_commit().map_err(|e| {
+                BankError::Failed(format!(
+                    "boot-vector commit cannot run — nothing committed: {e}"
+                ))
+            })?;
+        }
         match ota::commit(&mut nv, self.bank_set) {
             Ok(()) => {}
             // CRL / idempotent commit — already committed is fine.
@@ -1179,12 +1235,16 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             Err(e) => return Err(BankError::Failed(e.to_string())),
         }
         // Dual-write: promote the selector's PRIMARY to SECONDARY (rollback
-        // floor) — see the GLOBAL-op caveat on `activate`.
-        if let Some(sel) = &self.selector {
-            sel.write()
-                .expect("selector poisoned")
-                .commit()
-                .map_err(|e| BankError::Failed(format!("boot-vector commit failed: {e}")))?;
+        // floor) — see the GLOBAL-op caveat on `activate`. A failure here
+        // leaves NV committed and the vector in trial: a retry completes it
+        // (the NV step is idempotent), and so does the next start's seed.
+        if let Some(sel) = &mut selector {
+            sel.commit().map_err(|e| {
+                BankError::Failed(format!(
+                    "boot-vector commit failed after NV committed — NV is committed, the boot vector \
+                     is still in trial; retry the commit (the next start completes it): {e}"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -2173,5 +2233,277 @@ mod tests {
         }
 
         wipe_staging(&set).unwrap();
+    }
+
+    // --- a boot-vector signer that could not decide ---
+
+    /// Every file in `dir`, by name, with its bytes.
+    fn snapshot(dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().into_string().unwrap(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// A file-backed boot vector under `signer`: vm1 committed on A, in trial
+    /// on B. NV in trial on B for `set`, with a security version above the
+    /// floor for bank B so a commit would raise the floor.
+    fn file_trial(
+        dir: &std::path::Path,
+        signer: &machine_mgr::system_bank_state::SwitchableSigner,
+        set: BankSet,
+    ) -> (SharedSystemBankState, Arc<Mutex<NvStore<MemBlockDevice>>>) {
+        use machine_mgr::system_bank_state::FileSelectorStore;
+        let mut m = SystemBankManager::load(Box::new(FileSelectorStore::new(
+            dir,
+            Box::new(signer.clone()),
+        )))
+        .unwrap();
+        m.stage("vm1", Bank::A, BTreeMap::new());
+        m.seal(None).unwrap();
+        m.commit().unwrap();
+        m.stage("vm1", Bank::B, BTreeMap::new());
+        m.seal(None).unwrap();
+        let nv = nv_with_active(set, Bank::B);
+        nv_enter_trial(&nv, set, Bank::B);
+        let mut meta = nv_store::types::NvFwMeta {
+            fw_secver: 7,
+            min_security_ver: 3,
+            ..Default::default()
+        };
+        nv.lock()
+            .unwrap()
+            .write_fw_meta(set, Bank::B, &mut meta)
+            .unwrap();
+        (Arc::new(RwLock::new(m)), nv)
+    }
+
+    /// The security floor NV records for `set`'s bank B.
+    fn floor(nv: &Arc<Mutex<NvStore<MemBlockDevice>>>, set: BankSet) -> u32 {
+        nv.lock()
+            .unwrap()
+            .read_fw_meta(set, Bank::B)
+            .unwrap()
+            .min_security_ver
+    }
+
+    #[test]
+    fn commit_with_the_signer_unavailable_errs_before_nv_commits() {
+        use machine_mgr::system_bank_state::{SignerMode, SwitchableSigner};
+        let set = slots::VM1;
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = SwitchableSigner::new();
+        let (selector, nv) = file_trial(tmp.path(), &signer, set);
+        let files = snapshot(tmp.path());
+        let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
+
+        for (sign, verify) in [
+            (SignerMode::Unavailable, SignerMode::Unavailable),
+            (SignerMode::Unavailable, SignerMode::Ok),
+        ] {
+            signer.set_sign(sign);
+            signer.set_verify(verify);
+            let err = p.commit().expect_err("the vector cannot commit");
+            assert!(err.to_string().contains("nothing committed"), "{err}");
+            assert_eq!(
+                nv_bank_state(&nv, set),
+                (Bank::B, false),
+                "NV not committed"
+            );
+            assert_eq!(floor(&nv, set), 3, "the security floor is not raised");
+            assert_eq!(snapshot(tmp.path()), files);
+            assert!(selector.read().unwrap().is_trial());
+        }
+
+        signer.set(SignerMode::Ok);
+        p.commit().expect("commit");
+        assert_eq!(nv_bank_state(&nv, set), (Bank::B, true));
+        assert_eq!(floor(&nv, set), 7);
+        assert!(!selector.read().unwrap().is_trial());
+    }
+
+    #[test]
+    fn commit_whose_signer_goes_away_after_nv_committed_says_so_and_a_retry_completes_it() {
+        use machine_mgr::system_bank_state::{SignerMode, SwitchableSigner};
+        let set = slots::VM1;
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = SwitchableSigner::new();
+        let (selector, nv) = file_trial(tmp.path(), &signer, set);
+        let files = snapshot(tmp.path());
+        let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
+
+        // The signer answers the pre-flight, then goes away.
+        let calls = signer.calls();
+        selector.read().unwrap().check_commit().unwrap();
+        signer.unavailable_after(signer.calls() - calls);
+        let err = p.commit().expect_err("the vector commit fails");
+        assert!(err.to_string().contains("NV is committed"), "{err}");
+        assert_eq!(nv_bank_state(&nv, set), (Bank::B, true));
+        assert_eq!(snapshot(tmp.path()), files, "the vector is unchanged");
+        assert!(selector.read().unwrap().is_trial());
+
+        signer.set(SignerMode::Ok);
+        p.commit().expect("retry");
+        assert!(!selector.read().unwrap().is_trial());
+    }
+
+    #[test]
+    fn activate_with_the_signer_unavailable_errs_and_writes_nothing() {
+        use machine_mgr::system_bank_state::{SignerMode, SwitchableSigner};
+        let set = slots::VM1;
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = SwitchableSigner::new();
+        let (selector, nv) = file_trial(tmp.path(), &signer, set);
+        selector.write().unwrap().commit().unwrap();
+        let (files, before) = (snapshot(tmp.path()), nv.lock().unwrap().read_boot_state());
+        let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
+
+        signer.set(SignerMode::Unavailable);
+        assert!(p.activate(Bank::A).is_err());
+        assert_eq!(snapshot(tmp.path()), files);
+        assert_eq!(nv.lock().unwrap().read_boot_state(), before);
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::B));
+    }
+
+    /// An activator that counts its calls.
+    #[derive(Default)]
+    struct CountingActivator(std::sync::atomic::AtomicUsize);
+    impl CountingActivator {
+        fn calls(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl machine_mgr::BankActivator for CountingActivator {
+        fn activate(&self, _dir: &Path) -> Result<(), machine_mgr::BankActivatorError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn reset_kind(&self) -> ResetKind {
+            ResetKind::RequiresEcuReset
+        }
+    }
+
+    /// A committed file-backed vector (vm1 on B) under `signer`, and a
+    /// provider over it running `activator`.
+    fn activator_provider(
+        vector: &Path,
+        images_dir: &Path,
+        signer: &machine_mgr::system_bank_state::SwitchableSigner,
+        activator: &Arc<CountingActivator>,
+    ) -> (
+        IvdBankProvider<MemBlockDevice>,
+        SharedSystemBankState,
+        Arc<Mutex<NvStore<MemBlockDevice>>>,
+    ) {
+        let set = slots::VM1;
+        let (selector, nv) = file_trial(vector, signer, set);
+        selector.write().unwrap().commit().unwrap();
+        let p = IvdBankProvider::new(
+            Arc::clone(&nv),
+            set,
+            false,
+            Some(images_dir.to_path_buf()),
+            "vm1".into(),
+            None,
+            Some(Arc::clone(activator) as Arc<dyn machine_mgr::BankActivator>),
+            Some(Arc::clone(&selector)),
+        );
+        (p, selector, nv)
+    }
+
+    #[test]
+    fn activate_with_the_signer_unavailable_runs_no_activator_and_writes_nothing() {
+        use machine_mgr::system_bank_state::{SignerMode, SwitchableSigner};
+        let (vector, images) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let signer = SwitchableSigner::new();
+        let activator = Arc::new(CountingActivator::default());
+        let (p, selector, nv) =
+            activator_provider(vector.path(), images.path(), &signer, &activator);
+        let (files, before) = (
+            snapshot(vector.path()),
+            nv.lock().unwrap().read_boot_state(),
+        );
+
+        for (sign, verify) in [
+            (SignerMode::Unavailable, SignerMode::Unavailable),
+            (SignerMode::Unavailable, SignerMode::Ok),
+        ] {
+            signer.set_sign(sign);
+            signer.set_verify(verify);
+            let err = p.activate(Bank::A).expect_err("the vector cannot seal");
+            assert!(err.to_string().contains("nothing activated"), "{err}");
+            assert_eq!(activator.calls(), 0, "the activator did not run");
+            assert_eq!(
+                snapshot(vector.path()),
+                files,
+                "every boot-vector file unchanged"
+            );
+            assert_eq!(nv.lock().unwrap().read_boot_state(), before, "NV untouched");
+            assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::B));
+        }
+
+        signer.set(SignerMode::Ok);
+        p.activate(Bank::A).expect("activate");
+        assert_eq!(activator.calls(), 1);
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::A));
+    }
+
+    /// What the pre-flight cannot cover: a signer that answers it and goes
+    /// away before the seal. The activation fails as before the pre-flight
+    /// existed — the activator has run, the vector is unchanged — and a
+    /// retry completes it.
+    #[test]
+    fn activate_whose_signer_goes_away_after_the_pre_flight_fails_after_the_activator() {
+        use machine_mgr::system_bank_state::{SignerMode, SwitchableSigner};
+        let (vector, images) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let signer = SwitchableSigner::new();
+        let activator = Arc::new(CountingActivator::default());
+        let (p, selector, _nv) =
+            activator_provider(vector.path(), images.path(), &signer, &activator);
+        let files = snapshot(vector.path());
+
+        let calls = signer.calls();
+        p.check_activate(Bank::A).unwrap();
+        signer.unavailable_after(signer.calls() - calls);
+        let err = p.activate(Bank::A).expect_err("the seal fails");
+        assert!(
+            err.to_string().contains("boot-vector write failed"),
+            "{err}"
+        );
+        assert_eq!(activator.calls(), 1, "the activator ran before the seal");
+        assert_eq!(snapshot(vector.path()), files, "the vector is unchanged");
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::B));
+
+        signer.set(SignerMode::Ok);
+        p.activate(Bank::A).expect("retry");
+        assert_eq!(selector.read().unwrap().active_bank("vm1"), Some(Bank::A));
+    }
+
+    #[test]
+    fn rollback_with_the_signer_unavailable_errs_and_changes_nothing() {
+        use machine_mgr::system_bank_state::{SignerMode, SwitchableSigner};
+        let set = slots::VM1;
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = SwitchableSigner::new();
+        let (selector, nv) = file_trial(tmp.path(), &signer, set);
+        let files = snapshot(tmp.path());
+        let p = provider(Arc::clone(&nv), set, Some(Arc::clone(&selector)));
+
+        signer.set(SignerMode::Unavailable);
+        let err = p.rollback().expect_err("the vector cannot roll back");
+        assert!(!err.to_string().contains("nothing to roll back"), "{err}");
+        assert_eq!(snapshot(tmp.path()), files);
+        assert_eq!(nv_bank_state(&nv, set), (Bank::B, false));
+        assert!(selector.read().unwrap().is_trial());
+
+        signer.set(SignerMode::Ok);
+        p.rollback().expect("rollback");
+        assert_eq!(nv_bank_state(&nv, set), (Bank::A, true));
     }
 }

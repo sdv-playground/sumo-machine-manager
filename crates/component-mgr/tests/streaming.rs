@@ -1364,6 +1364,64 @@ async fn pull_update_installs_campaign_under_operational_token() {
 }
 
 #[tokio::test]
+async fn pull_update_location_follows_the_request_tree() {
+    let (signing, _) = test_keys();
+    let l1 = campaign_integrated(&signing, &["vm1"]);
+    let (enc, dec) = issuer_keys();
+    let bearer = format!(
+        "Bearer {}",
+        mint_token(&enc, "onboard", "rig-1", "component:vm1 update:execute")
+    );
+    let stub = Arc::new(PullStub::new("vm1"));
+    let router = pull_router(
+        vec![stub.clone()],
+        operational_authorizer(dec),
+        signing.public_key_bytes(),
+    );
+
+    // `/v1` POST → `/v1` Location, pollable on that tree.
+    use tower::ServiceExt;
+    let resp = router
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/operations/x-ota-pull-update/executions")
+                .header("content-type", "application/json")
+                .header("authorization", &bearer)
+                .body(axum::body::Body::from(pull_body(None, &l1, DEAD_CAS)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
+    let location = resp.headers()[axum::http::header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with("/v1/operations/x-ota-pull-update/executions/"),
+        "{location}"
+    );
+    let exec = poll_execution(&router, &location).await;
+    assert!(
+        matches!(exec.status, sovd_core::OperationStatus::Completed),
+        "status = {:?}, error = {:?}",
+        exec.status,
+        exec.error
+    );
+
+    // Legacy POST keeps the legacy Location.
+    let (status, location, _) =
+        post_pull(&router, Some(&bearer), pull_body(None, &l1, DEAD_CAS)).await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let location = location.expect("Location header");
+    assert!(location.starts_with(&format!("{PULL_PATH}/")), "{location}");
+    let exec = poll_execution(&router, &location).await;
+    assert!(matches!(exec.status, sovd_core::OperationStatus::Completed));
+}
+
+#[tokio::test]
 async fn pull_update_rejects_without_token() {
     let (l1, base, trust_anchor) = campaign_fixture().await;
     let (_enc, dec) = issuer_keys();

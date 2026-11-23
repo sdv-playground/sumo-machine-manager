@@ -42,7 +42,7 @@ use vhsm_server::audit::AuditLogger;
 use vhsm_server::auth::{self, EnrollContext, HandshakeState, IpResolver, Principal};
 use vhsm_server::backend;
 use vhsm_server::bootstrap::BootstrapState;
-use vhsm_server::cert::EcuSigner;
+use vhsm_server::cert::{EcuSigner, SignError};
 use vhsm_server::codec;
 use vhsm_server::crossnode;
 use vhsm_server::handle_table::HandleTable;
@@ -74,21 +74,16 @@ struct HsmIamSigner {
 }
 
 impl EcuSigner for HsmIamSigner {
-    fn sign(&self, data: &[u8]) -> Vec<u8> {
-        match self
-            .crypto
+    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, SignError> {
+        // An HSM error is reported, never replaced by a placeholder
+        // signature: the enrolment then fails before the guest's token
+        // is consumed, and the guest can retry once the HSM answers.
+        self.crypto
             .sign_raw_p256(KeyRole::IamSigning.handle(), data)
-        {
-            Ok(sig) => sig,
-            Err(e) => {
-                // Return an empty sig so the resulting CWT will fail
-                // validation on the next AUTH attempt. The client
-                // surface this as BadCertSignature; operators see this
-                // tracing error in the daemon log.
-                tracing::error!(error = %e, "iam-signing HSM sign failed; minted CWT will be unusable");
-                Vec::new()
-            }
-        }
+            .map_err(|e| {
+                tracing::error!(error = %e, "iam-signing HSM sign failed");
+                SignError(e.to_string())
+            })
     }
 }
 
@@ -262,7 +257,7 @@ fn main() {
     // Policy source is the in-bank policy directory at /etc/sumo/policy
     // (AUTH-ARCH-001 §4). Required — there is no fallback. The legacy
     // single-file `--iam-policy` switch was retired once the partition
-    // path was proven on the managed-cvc; operators must now ship a
+    // path was proven on a managed host; operators must now ship a
     // policy.yaml (and roots/, crl.yaml) under --policy-dir.
     let policy_dir = policy_dir.unwrap_or_else(|| {
         eprintln!("error: --policy-dir is required");
@@ -1227,6 +1222,16 @@ mod tests {
     // The startup path turns these Errs into a warn-and-disable (a fresh device
     // serves guests with cross-node off until its identity is provisioned),
     // rather than crashing the daemon — so they must be Errs, not panics.
+    /// An HSM that cannot sign must surface as an error, not as an empty
+    /// signature that would be minted into an unusable enrolment cert.
+    #[test]
+    fn hsm_iam_signer_reports_an_hsm_error() {
+        let signer = HsmIamSigner {
+            crypto: unprovisioned_crypto(),
+        };
+        assert!(signer.sign(b"payload").is_err());
+    }
+
     #[test]
     fn cross_node_config_requires_identity_root() {
         let crypto = unprovisioned_crypto();

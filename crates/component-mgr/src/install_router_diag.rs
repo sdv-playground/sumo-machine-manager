@@ -89,6 +89,12 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.update_shape()
     }
 
+    /// The engine's answer: a node-reset component is settled by the node
+    /// operation whether or not its installs go through the router.
+    fn verdict_scope(&self) -> sovd_core::VerdictScope {
+        self.engine.verdict_scope()
+    }
+
     // -----------------------------------------------------------------
     // Data — delegated to the engine (the single authority that owns the
     // DID registry, identity overlay, and x-ota-installed-manifest).
@@ -128,6 +134,14 @@ impl DiagnosticBackend for InstallRouterDiag {
 
     async fn ecu_reset(&self, reset_type: u8) -> BackendResult<Option<u8>> {
         self.engine.ecu_reset(reset_type).await
+    }
+
+    async fn ecu_reset_outcome(&self, reset_type: u8) -> BackendResult<EcuResetOutcome> {
+        self.engine.ecu_reset_outcome(reset_type).await
+    }
+
+    fn supports_restart(&self) -> bool {
+        self.engine.supports_restart()
     }
 
     // Entity status (§7.19.2: ready/notReady + x-runtime boot_count) —
@@ -194,6 +208,10 @@ impl DiagnosticBackend for InstallRouterDiag {
 
     async fn verify_part(&self, file_id: &str, expected_sha256: &str) -> BackendResult<()> {
         self.engine.verify_part(file_id, expected_sha256).await
+    }
+
+    async fn read_part(&self, file_id: &str) -> BackendResult<PackageStream> {
+        self.engine.read_part(file_id).await
     }
 
     async fn delete_package(&self, package_id: &str) -> BackendResult<()> {
@@ -368,7 +386,7 @@ impl DiagnosticBackend for InstallRouterDiag {
 
     // Cursor paging + §7.20 bulk-data — delegated to the engine like the other
     // log reads. Without these forwarders an `app`-type component (which is wired
-    // through this router, e.g. the host-os `supernova`) would silently fall back
+    // through this router, e.g. the host-os node manager) would silently fall back
     // to the trait defaults: empty bulk-data categories + a cursor-less /logs.
     async fn get_logs_paged(&self, filter: &LogFilter) -> BackendResult<LogPage> {
         self.engine.get_logs_paged(filter).await

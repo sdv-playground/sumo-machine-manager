@@ -10,7 +10,7 @@
 
 The deferral was explicit: *extract the traits IF and WHEN an out-of-tree
 implementer appears.* Planning the split of the vendor's host machine manager
-into per-board managers (`mmgr-cvc` / `mmgr-cm5` / `mmgr-ddu`) fired it. After that split
+into per-board managers (one per board) fired it. After that split
 **every** implementer of a bank trait is out-of-tree, and there is no longer a
 single place to add one — each board would grow its own shape of "the same"
 trait, and the first cross-board campaign would discover three incompatible
@@ -115,7 +115,7 @@ There is deliberately **no** generic runtime check of the form "declares
 accessor to check against, and the app-mgr shape would legitimately fail such a
 check. The real guard belongs on the platform side instead: **a config that
 names a capability the binary was not built with must fail at startup.** That
-lands with the RT feature gating below, at `mmgr-cvc` creation.
+lands with the RT feature gating below, at the first per-board manager's creation.
 
 Not covered by the model today: there is no `VmCaps` and no RT capability. VM
 and RT are gated by cargo features (`vm-runtime = ["dep:vm-mgr"]` in the host machine manager)

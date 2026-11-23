@@ -8,7 +8,7 @@
 //! along with the bank, and a trial flip just exposes the staged
 //! bank with its existing signature intact.
 //!
-//! External secure boot (or the `sumo-verify` CLI for managed-cvc
+//! External secure boot (or the `sumo-verify` CLI for managed-host
 //! deployments without one) reads the manifest + signature before
 //! launching the component:
 //!
@@ -378,7 +378,7 @@ pub fn build_manifest(
 /// writes it (and verifies against the OEM-signed SUIT digest); the
 /// resulting `(path, size, hash)` triples are exactly what the IVD
 /// manifest needs. Skipping the re-walk + re-hash here saves the full
-/// rootfs SHA pass — ~2.5 s for an 80 MB rootfs on the CVC.
+/// rootfs SHA pass — ~2.5 s for an 80 MB rootfs on the target ECU.
 ///
 /// The function sorts the input by `relative_path` so the signed CBOR
 /// is deterministic regardless of payload-arrival order.
@@ -565,7 +565,7 @@ fn collect_with_timing(bank_dir: &Path) -> Result<(Vec<IvdFile>, u64), IvdError>
 /// SUIT manifest. Those `(relative_path, size, sha256)` triples are
 /// exactly what the IVD manifest needs — re-walking the bank dir and
 /// re-hashing is duplicate work (~2.5 s for the 80 MB rootfs on the
-/// CVC).
+/// target ECU).
 ///
 /// Trust chain: SUIT envelope (OEM-signed) authenticates the
 /// `image_digest` of each payload. The streaming pipeline computes

@@ -30,7 +30,7 @@
 //!         Prints `disabled gen=<N>` on stdout. A state the device was
 //!         told to be in, not a fault — but still DO NOT launch.
 //!
-//! On managed-cvc (no real secure boot), `start-managed.sh` runs this
+//! On a managed host (no real secure boot), `start-managed.sh` runs this
 //! after the host comes up, once per VM bank; only the banks that
 //! exit 0 get a corresponding `POST /vm/<id>/start`. See
 //! `tasks/qnx-sumo-ctl-resmgr-backend.md` follow-up for the integration.

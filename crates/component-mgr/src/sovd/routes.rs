@@ -13,13 +13,32 @@ use std::sync::Arc;
 
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::routing::{get, post, MethodRouter};
+use axum::{Extension, Json, Router};
 use machine_mgr::node_update::NodeCoordinator;
 use machine_mgr::system_bank_state::{Outcome, Reason, Resolution};
 use machine_mgr::{BankContents, Component, FlashId, FlashState, Machine, MachineError};
 use nv_store::types::Bank;
+use sovd_api::Tree;
 use sovd_core::{OperationExecution, OperationStatus};
+
+/// Mount each `(suffix, method_router)` under every SOVDd tree
+/// (`sovd_api::Tree::ALL`: `/v1` and the legacy `/vehicle/v1`), so the vendor
+/// routes sit on the same two trees as the SOVDd routes they are merged with.
+/// Each request is tagged with its `sovd_api::Tree` as an `axum::Extension`,
+/// as SOVDd tags its own, for a handler whose body differs per tree.
+fn both_trees<const N: usize>(routes: [(&str, MethodRouter); N]) -> Router {
+    let mut router = Router::new();
+    for (suffix, method_router) in routes {
+        for tree in sovd_api::Tree::ALL {
+            router = router.route(
+                &format!("{}{suffix}", tree.base()),
+                method_router.clone().layer(Extension(tree)),
+            );
+        }
+    }
+    router
+}
 
 /// `GET /vehicle/v1/data/x-ota-update-state` — the node's update-transaction
 /// state (phase + the components involved), for the orchestrator to poll before
@@ -30,7 +49,8 @@ use sovd_core::{OperationExecution, OperationStatus};
 /// `x-ota` vendor route (sumo-mm, not SOVDd); see `docs/design/node-update-state.md`.
 ///
 /// Also serves `GET /vehicle/v1/data/x-update-state`, an alias with the same
-/// body (both carry `node_boot_id`).
+/// body (both carry `node_boot_id`). The frozen legacy tree keeps the
+/// `trial_boot_limit` member, always null; `/v1` does not carry it.
 ///
 /// `machine` supplies the per-component `banks` member (what each bank holds,
 /// from the installed manifests) and the boot vector's header. The router
@@ -40,23 +60,24 @@ use sovd_core::{OperationExecution, OperationStatus};
 pub fn update_state_router(coord: Arc<NodeCoordinator>, machine: Arc<dyn Machine>) -> Router {
     let alias_coord = coord.clone();
     let alias_machine = machine.clone();
-    Router::new()
-        .route(
-            "/vehicle/v1/data/x-ota-update-state",
-            get(move || {
+    both_trees([
+        (
+            "/data/x-ota-update-state",
+            get(move |Extension(tree): Extension<Tree>| {
                 let coord = coord.clone();
                 let machine = machine.clone();
-                async move { update_state(coord, machine).await }
+                async move { update_state(tree, coord, machine).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/data/x-update-state",
-            get(move || {
+        ),
+        (
+            "/data/x-update-state",
+            get(move |Extension(tree): Extension<Tree>| {
                 let coord = alias_coord.clone();
                 let machine = alias_machine.clone();
-                async move { x_update_state(coord, machine).await }
+                async move { x_update_state(tree, coord, machine).await }
             }),
-        )
+        ),
+    ])
 }
 
 /// The `x-ota-update-state` resource body — the node's update-transaction
@@ -71,6 +92,9 @@ pub fn update_state_router(coord: Arc<NodeCoordinator>, machine: Arc<dyn Machine
 /// resolved); `trial_boot_limit`: the count at which the node rolls itself
 /// back (null = disabled); `resolution`: how the last node transaction ended,
 /// per the boot vector (null = none recorded, or a trial is open).
+// The text above is the frozen legacy tree's schema description, served as is
+// in its `/docs`. A trial has no boot limit: `trial_boot_limit` is always null
+// on the legacy tree and absent on `/v1`.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct UpdateStateResponse {
     pub phase: String,
@@ -80,13 +104,18 @@ pub(crate) struct UpdateStateResponse {
     pub(crate) node_boot_id: Option<String>,
     pub banks: Vec<ComponentBanksResponse>,
     pub trial_boots: Option<u8>,
-    pub trial_boot_limit: Option<u8>,
+    // `Some(None)` (null) on the legacy tree, `None` (absent) on `/v1`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<u8>)]
+    pub trial_boot_limit: Option<Option<u8>>,
     pub resolution: Option<ResolutionResponse>,
 }
 
 /// How a node transaction ended: `outcome` is `committed` or `rolled_back`,
 /// `reason` is `verdict`, `trial_boot_limit` or `boot_stage` (the boot stage
 /// restored the committed copy; recorded by the node at its next start).
+// The text above is the frozen legacy tree's schema description. Nothing
+// writes `trial_boot_limit` any more; a record an older build wrote carries it.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct ResolutionResponse {
     pub outcome: String,
@@ -190,10 +219,11 @@ impl From<BankContents> for BankContentsResponse {
     ),
 )]
 pub(crate) async fn update_state(
+    tree: Tree,
     coord: Arc<NodeCoordinator>,
     machine: Arc<dyn Machine>,
 ) -> Json<UpdateStateResponse> {
-    update_state_body(&coord, machine.as_ref())
+    update_state_body(tree, &coord, machine.as_ref())
 }
 
 /// `GET /vehicle/v1/data/x-update-state` — alias of
@@ -207,14 +237,20 @@ pub(crate) async fn update_state(
     ),
 )]
 pub(crate) async fn x_update_state(
+    tree: Tree,
     coord: Arc<NodeCoordinator>,
     machine: Arc<dyn Machine>,
 ) -> Json<UpdateStateResponse> {
-    update_state_body(&coord, machine.as_ref())
+    update_state_body(tree, &coord, machine.as_ref())
 }
 
-/// The shared body of [`update_state`] and [`x_update_state`].
-fn update_state_body(coord: &NodeCoordinator, machine: &dyn Machine) -> Json<UpdateStateResponse> {
+/// The shared body of [`update_state`] and [`x_update_state`], as served on
+/// `tree`.
+fn update_state_body(
+    tree: Tree,
+    coord: &NodeCoordinator,
+    machine: &dyn Machine,
+) -> Json<UpdateStateResponse> {
     let st = coord.node_update_state();
     // The boot vector's header is meaningful only while in trial or when it
     // records a resolution; a committed node's leftover header reports nothing.
@@ -236,7 +272,7 @@ fn update_state_body(coord: &NodeCoordinator, machine: &dyn Machine) -> Json<Upd
         node_boot_id: coord.node_boot_id().map(str::to_string),
         banks: component_banks(machine),
         trial_boots,
-        trial_boot_limit: coord.trial_boot_limit(),
+        trial_boot_limit: (tree == Tree::Legacy).then_some(None),
         resolution,
     })
 }
@@ -292,21 +328,22 @@ fn component_banks(machine: &dyn Machine) -> Vec<ComponentBanksResponse> {
 /// old `vm-mgr` name).
 pub fn hsm_router(machine: Arc<dyn Machine>) -> Router {
     let csr = machine.clone();
-    Router::new()
-        .route(
-            "/vehicle/v1/components/hsm/data/keys",
+    both_trees([
+        (
+            "/components/hsm/data/keys",
             get(move || {
                 let machine = machine.clone();
                 async move { hsm_keys_list(machine).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/components/hsm/operations/x-csr/executions",
+        ),
+        (
+            "/components/hsm/operations/x-csr/executions",
             post(move |Json(req): Json<CsrRequest>| {
                 let machine = csr.clone();
                 async move { hsm_csr_execute(machine, req).await }
             }),
-        )
+        ),
+    ])
 }
 
 /// One HSM key-slot entry in the [`HsmKeysResponse`] inventory — public
@@ -484,13 +521,13 @@ pub(crate) async fn hsm_csr_execute(
 /// this is read-only identity, served whether or not the device is provisioned.
 /// Vendor extension per ISO 17978-3 §5.3.6.
 pub fn device_id_router(machine: Arc<dyn Machine>) -> Router {
-    Router::new().route(
-        "/vehicle/v1/components/hsm/x-ecu-id",
+    both_trees([(
+        "/components/hsm/x-ecu-id",
         get(move || {
             let machine = machine.clone();
             async move { device_id(machine).await }
         }),
-    )
+    )])
 }
 
 /// `GET /vehicle/v1/components/hsm/x-ecu-id` — the ECU's id; see
@@ -941,47 +978,48 @@ pub fn node_verdict_router(machine: Arc<dyn Machine>) -> Router {
     let update_commit_lock = verdict_lock.clone();
     let update_rollback_machine = machine.clone();
     let update_rollback_lock = verdict_lock.clone();
-    Router::new()
-        .route(
-            "/vehicle/v1/operations/x-ota-commit-trials/executions",
+    both_trees([
+        (
+            "/operations/x-ota-commit-trials/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = commit_machine.clone();
                 let verdict_lock = commit_lock.clone();
                 async move { commit_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/operations/x-ota-rollback-trials/executions",
+        ),
+        (
+            "/operations/x-ota-rollback-trials/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = machine.clone();
                 let verdict_lock = verdict_lock.clone();
                 async move { rollback_trials(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/operations/x-update-verdict/executions",
+        ),
+        (
+            "/operations/x-update-verdict/executions",
             post(move |Json(req): Json<NodeVerdictRequest>| {
                 let machine = alias_machine.clone();
                 let verdict_lock = alias_lock.clone();
                 async move { x_update_verdict(machine, req, verdict_lock).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/operations/x-update-commit/executions",
+        ),
+        (
+            "/operations/x-update-commit/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = update_commit_machine.clone();
                 let verdict_lock = update_commit_lock.clone();
                 async move { x_update_commit(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
-        )
-        .route(
-            "/vehicle/v1/operations/x-update-rollback/executions",
+        ),
+        (
+            "/operations/x-update-rollback/executions",
             post(move |req: Option<Json<VerdictRequest>>| {
                 let machine = update_rollback_machine.clone();
                 let verdict_lock = update_rollback_lock.clone();
                 async move { x_update_rollback(machine, req.map(|Json(r)| r), verdict_lock).await }
             }),
-        )
+        ),
+    ])
 }
 
 // The onboard pull-update entry lives in its own module (async, multi-
@@ -1725,10 +1763,234 @@ mod tests {
         );
     }
 
+    // Two-tree mount: every vendor route is served under `/v1` exactly as
+    // under the legacy `/vehicle/v1`, but for the update-state body's
+    // `trial_boot_limit`, which the frozen legacy tree keeps.
+
+    /// The legacy update-state body for the fixture below, byte for byte as
+    /// v0.1.32 served it (its `trial_boot_limit` then null = disabled).
+    const LEGACY_UPDATE_STATE: &str = r#"{"phase":"Trial","components":["vm1"],"reboot_owed":[],"rebooted_since_arming":true,"node_boot_id":"boot-b","banks":[],"trial_boots":null,"trial_boot_limit":null,"resolution":null}"#;
+
+    #[tokio::test]
+    async fn x_update_state_is_served_on_the_v1_tree_without_trial_boot_limit() {
+        let router = update_state_router(
+            coord_with(Some((true, false)), Some(true), Some("boot-b")),
+            machine_with(&[]),
+        );
+        let v1_body = LEGACY_UPDATE_STATE.replace(r#""trial_boot_limit":null,"#, "");
+        for suffix in ["/data/x-update-state", "/data/x-ota-update-state"] {
+            for node in [false, true] {
+                let served = served(router.clone(), node);
+                let legacy = get_raw(&served, &format!("/vehicle/v1{suffix}")).await;
+                assert_eq!(legacy.0, StatusCode::OK, "{suffix} node={node}");
+                assert_eq!(legacy.1, LEGACY_UPDATE_STATE, "{suffix} node={node}");
+
+                let v1_uri = if node {
+                    format!("/v1/components/hpc{suffix}")
+                } else {
+                    format!("/v1{suffix}")
+                };
+                let v1 = get_raw(&served, &v1_uri).await;
+                assert_eq!(v1.0, StatusCode::OK, "{v1_uri}");
+                assert_eq!(v1.1, v1_body, "{v1_uri}");
+            }
+        }
+    }
+
+    /// The legacy capability description keeps the update-state schemas as
+    /// v0.1.32 served them; `/v1` lists the same schema set (SOVDd merges the
+    /// contributed schemas into both trees' documents).
+    #[cfg(feature = "sovd-docs-hook")]
+    #[tokio::test]
+    async fn legacy_docs_keep_the_update_state_schemas() {
+        const UPDATE_STATE_SCHEMA: &str = r##"{"description":"The `x-ota-update-state` resource body — the node's update-transaction\nphase plus the component ids the transaction covers. `reboot_owed`:\ncomponents pending a node reset (their install needs a node reset that has\nnot happened yet); `rebooted_since_arming`: whether the node has rebooted\nsince the open trial was armed, from the boot vector's transaction header\n(null = unknown); `node_boot_id`: the node's current boot\nid (null = unknown); `banks`: what each component's banks hold, per the\ninstalled manifests (not a verification); `trial_boots`: node boots counted\nwhile armed without a verdict (null = no boot-vector trial open or\nresolved); `trial_boot_limit`: the count at which the node rolls itself\nback (null = disabled); `resolution`: how the last node transaction ended,\nper the boot vector (null = none recorded, or a trial is open).","properties":{"banks":{"items":{"$ref":"#/components/schemas/ComponentBanksResponse"},"type":"array"},"components":{"items":{"type":"string"},"type":"array"},"node_boot_id":{"type":["string","null"]},"phase":{"type":"string"},"reboot_owed":{"items":{"type":"string"},"type":"array"},"rebooted_since_arming":{"type":["boolean","null"]},"resolution":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/ResolutionResponse"}]},"trial_boot_limit":{"format":"int32","minimum":0,"type":["integer","null"]},"trial_boots":{"format":"int32","minimum":0,"type":["integer","null"]}},"required":["phase","components","reboot_owed","banks"],"type":"object"}"##;
+        const RESOLUTION_SCHEMA: &str = r##"{"description":"How a node transaction ended: `outcome` is `committed` or `rolled_back`,\n`reason` is `verdict`, `trial_boot_limit` or `boot_stage` (the boot stage\nrestored the committed copy; recorded by the node at its next start).","properties":{"outcome":{"type":"string"},"reason":{"type":"string"}},"required":["outcome","reason"],"type":"object"}"##;
+        let state = sovd_api::AppState::new(std::collections::HashMap::new())
+            .with_capability_extensions(crate::sovd::openapi::capability_extensions());
+        let router = sovd_api::create_router(state);
+        for uri in ["/vehicle/v1/docs", "/vehicle/v1/components/vm1/docs"] {
+            let docs = get_json(&router, uri).await;
+            let schemas = &docs["components"]["schemas"];
+            for (name, pinned) in [
+                ("UpdateStateResponse", UPDATE_STATE_SCHEMA),
+                ("ResolutionResponse", RESOLUTION_SCHEMA),
+            ] {
+                let pinned: serde_json::Value = serde_json::from_str(pinned).unwrap();
+                assert_eq!(schemas[name], pinned, "{uri} {name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn x_update_commit_and_rollback_are_served_on_the_v1_tree() {
+        for (suffix, op, acted) in [
+            (
+                "/operations/x-update-commit/executions",
+                "x-update-commit",
+                "committed",
+            ),
+            (
+                "/operations/x-update-rollback/executions",
+                "x-update-rollback",
+                "rolled_back",
+            ),
+        ] {
+            let mut bodies = Vec::new();
+            for base in ["/v1", "/vehicle/v1"] {
+                let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+                let resp = node_verdict_router(machine_with(std::slice::from_ref(&stub)))
+                    .oneshot(post(&format!("{base}{suffix}"), None))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{base}{suffix}");
+                assert_eq!(
+                    stub.commits.load(Ordering::SeqCst) + stub.rollbacks.load(Ordering::SeqCst),
+                    1,
+                    "{base}{suffix}"
+                );
+                bodies.push(body_json(resp).await);
+            }
+            let (v1, legacy) = (&bodies[0], &bodies[1]);
+            assert_eq!(v1["operation_id"], op);
+            assert_eq!(v1["operation_id"], legacy["operation_id"]);
+            assert_eq!(v1["status"], legacy["status"]);
+            assert_eq!(v1["result"], legacy["result"]);
+            assert_eq!(v1["result"][acted], serde_json::json!(["vm1"]));
+        }
+    }
+
+    /// Status + raw body of a `GET uri`.
+    async fn get_raw(router: &Router, uri: &str) -> (StatusCode, axum::body::Bytes) {
+        let resp = router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn hsm_and_device_id_routes_are_served_on_the_v1_tree() {
+        // No hsm component: the handlers answer 503, never the router's 404.
+        let routers = [
+            ("/components/hsm/data/keys", hsm_router(machine_with(&[]))),
+            (
+                "/components/hsm/x-ecu-id",
+                device_id_router(machine_with(&[])),
+            ),
+        ];
+        for (suffix, router) in routers {
+            let v1 = get_raw(&router, &format!("/v1{suffix}")).await;
+            let legacy = get_raw(&router, &format!("/vehicle/v1{suffix}")).await;
+            assert_ne!(v1.0, StatusCode::NOT_FOUND, "{suffix}");
+            assert_eq!(v1, legacy, "{suffix}");
+        }
+    }
+
+    /// `router` behind SOVDd's node topology, as an embedder serves it: with
+    /// `node`, configured as node `hpc`; without, node-less.
+    fn served(router: Router, node: bool) -> Router {
+        let state = sovd_api::AppState::new(std::collections::HashMap::new());
+        let state = if node {
+            state
+                .with_node(sovd_api::NodeTopology::new("hpc", "HPC"))
+                .unwrap()
+        } else {
+            state
+        };
+        sovd_api::with_node_topology(router, &state)
+    }
+
+    // Node topology: the vendor bodies carry no URL, so the node form on a
+    // node server serves the body a node-less server serves at the root/flat
+    // form, and the legacy tree is untouched on both. On a node server the
+    // root/flat form answers 404, naming the node form.
+    #[tokio::test]
+    async fn vendor_routes_serve_the_node_form_with_the_same_body() {
+        let mut bodies = Vec::new();
+        for (uri, node) in [
+            (
+                "/v1/components/hpc/operations/x-update-commit/executions",
+                true,
+            ),
+            ("/v1/operations/x-update-commit/executions", false),
+            ("/vehicle/v1/operations/x-update-commit/executions", true),
+            ("/vehicle/v1/operations/x-update-commit/executions", false),
+        ] {
+            let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+            let router = served(
+                node_verdict_router(machine_with(std::slice::from_ref(&stub))),
+                node,
+            );
+            let resp = router.oneshot(post(uri, None)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri} node={node}");
+            assert_eq!(stub.commits.load(Ordering::SeqCst), 1, "{uri} node={node}");
+            bodies.push(body_json(resp).await);
+        }
+
+        let stub = Arc::new(VerdictStub::new("vm1", true, Some(FlashState::Activated)));
+        let router = served(
+            node_verdict_router(machine_with(std::slice::from_ref(&stub))),
+            true,
+        );
+        let resp = router
+            .oneshot(post("/v1/operations/x-update-commit/executions", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(stub.commits.load(Ordering::SeqCst), 0);
+        let body = body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("/v1/components/hpc/operations/x-update-commit/executions"),
+            "{body}"
+        );
+        // Everything but the per-execution id and times.
+        let stable = |b: &serde_json::Value| {
+            (
+                b["operation_id"].clone(),
+                b["status"].clone(),
+                b["result"].clone(),
+                b.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        for body in &bodies[1..] {
+            assert_eq!(stable(&bodies[0]), stable(body));
+        }
+
+        let with = served(device_id_router(machine_with(&[])), true);
+        let without = served(device_id_router(machine_with(&[])), false);
+        let member = get_raw(&with, "/v1/components/hpc/subcomponents/hsm/x-ecu-id").await;
+        assert_ne!(member.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            member,
+            get_raw(&without, "/v1/components/hsm/x-ecu-id").await
+        );
+        for router in [&with, &without] {
+            assert_eq!(
+                member,
+                get_raw(router, "/vehicle/v1/components/hsm/x-ecu-id").await
+            );
+        }
+        let (status, body) = get_raw(&with, "/v1/components/hsm/x-ecu-id").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            String::from_utf8_lossy(&body)
+                .contains("/v1/components/hpc/subcomponents/hsm/x-ecu-id"),
+            "{body:?}"
+        );
+    }
+
     // Shape-identity guards: the named response structs must serialize to the
     // exact JSON the handlers emitted as ad-hoc `serde_json::json!` before the
     // utoipa refactor (the regen test only covers the doc, not the wire).
-    /// The `x-ota-update-state` body with vm1 reporting `vm1`, the node
+    /// The `/v1` `x-ota-update-state` body with vm1 reporting `vm1`, the node
     /// reporting `rebooted` (see [`coord_with`]) and currently booted as
     /// `boot_id`.
     async fn update_state_json(
@@ -1737,9 +1999,13 @@ mod tests {
         boot_id: &str,
     ) -> serde_json::Value {
         serde_json::to_value(
-            update_state(coord_with(vm1, rebooted, Some(boot_id)), machine_with(&[]))
-                .await
-                .0,
+            update_state(
+                Tree::V1,
+                coord_with(vm1, rebooted, Some(boot_id)),
+                machine_with(&[]),
+            )
+            .await
+            .0,
         )
         .unwrap()
     }
@@ -1757,7 +2023,6 @@ mod tests {
                 "node_boot_id": "boot-a",
                 "banks": [],
                 "trial_boots": null,
-                "trial_boot_limit": null,
                 "resolution": null,
             })
         );
@@ -1773,7 +2038,6 @@ mod tests {
                 "node_boot_id": "boot-a",
                 "banks": [],
                 "trial_boots": null,
-                "trial_boot_limit": null,
                 "resolution": null,
             })
         );
@@ -1789,7 +2053,6 @@ mod tests {
                 "node_boot_id": "boot-a",
                 "banks": [],
                 "trial_boots": null,
-                "trial_boot_limit": null,
                 "resolution": null,
             })
         );
@@ -1805,7 +2068,6 @@ mod tests {
                 "node_boot_id": "boot-b",
                 "banks": [],
                 "trial_boots": null,
-                "trial_boot_limit": null,
                 "resolution": null,
             })
         );
@@ -1821,7 +2083,6 @@ mod tests {
                 "node_boot_id": "boot-a",
                 "banks": [],
                 "trial_boots": null,
-                "trial_boot_limit": null,
                 "resolution": null,
             })
         );

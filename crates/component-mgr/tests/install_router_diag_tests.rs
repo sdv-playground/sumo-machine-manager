@@ -29,7 +29,11 @@ use machine_mgr::{
     MachineError, MachineResult, ResetKind,
 };
 
-use sovd_core::DiagnosticBackend;
+use sovd_core::error::BackendResult;
+use sovd_core::{
+    DataValue, DiagnosticBackend, EcuResetOutcome, EntityInfo, FaultFilter, FaultsResult,
+    OperationExecution, OperationInfo, ParameterInfo,
+};
 
 use nv_store::block::MemBlockDevice;
 use nv_store::slots;
@@ -424,5 +428,127 @@ async fn abort_flash_routes_through_router() {
         aborted.load(Ordering::SeqCst),
         1,
         "abort_flash must route through the router's abort_install"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Verdict scope: the wrapper answers what the engine answers
+// ---------------------------------------------------------------------------
+
+/// Bank activator that needs a node reset to apply an activated bank.
+struct NodeResetActivator;
+impl machine_mgr::BankActivator for NodeResetActivator {
+    fn activate(&self, _dir: &std::path::Path) -> Result<(), machine_mgr::BankActivatorError> {
+        Ok(())
+    }
+    fn reset_kind(&self) -> ResetKind {
+        ResetKind::RequiresEcuReset
+    }
+}
+
+fn bare_router() -> Arc<dyn Component> {
+    Arc::new(BareComponent {
+        id: "vm2",
+        caps: Capabilities::default(),
+    })
+}
+
+/// An engine whose bank provider requires an ECU reset answers `Node`, and the
+/// wrapper forwards it rather than falling back to the trait default.
+#[test]
+fn verdict_scope_forwards_node_from_engine() {
+    let dev = MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize);
+    let mut nv = NvStore::new(dev);
+    nv.write_boot_state(&mut NvBootState::default()).unwrap();
+    let mp: Arc<dyn ManifestProvider> = Arc::new(SuitProvider::new(vec![0u8; 32]));
+    let engine: Arc<dyn DiagnosticBackend> = Arc::new(
+        ComponentBackend::new(
+            slots::VM2,
+            Arc::new(Mutex::new(nv)),
+            mp,
+            ComponentConfig::default(),
+        )
+        .with_bank_activator(Arc::new(NodeResetActivator)),
+    );
+    assert_eq!(engine.verdict_scope(), sovd_core::VerdictScope::Node);
+
+    let diag = InstallRouterDiag::new(bare_router(), engine);
+    assert_eq!(diag.verdict_scope(), sovd_core::VerdictScope::Node);
+}
+
+/// A local-reset engine answers `Update`, and so does the wrapper.
+#[test]
+fn verdict_scope_forwards_update_from_engine() {
+    let diag = InstallRouterDiag::new(bare_router(), engine_backend());
+    assert_eq!(diag.verdict_scope(), sovd_core::VerdictScope::Update);
+}
+
+/// Engine whose restart hooks both differ from the trait defaults (`true`,
+/// `Completed`), so the wrapper's answers can only come from forwarding.
+struct AsyncRestartEngine {
+    info: EntityInfo,
+    caps: sovd_core::Capabilities,
+}
+
+#[async_trait]
+impl DiagnosticBackend for AsyncRestartEngine {
+    fn entity_info(&self) -> &EntityInfo {
+        &self.info
+    }
+    fn capabilities(&self) -> &sovd_core::Capabilities {
+        &self.caps
+    }
+    async fn list_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {
+        Ok(Vec::new())
+    }
+    async fn read_data(&self, _param_ids: &[String]) -> BackendResult<Vec<DataValue>> {
+        Ok(Vec::new())
+    }
+    async fn get_faults(&self, _filter: Option<&FaultFilter>) -> BackendResult<FaultsResult> {
+        unreachable!()
+    }
+    async fn list_operations(&self) -> BackendResult<Vec<OperationInfo>> {
+        unreachable!()
+    }
+    async fn start_operation(
+        &self,
+        _operation_id: &str,
+        _params: &[u8],
+    ) -> BackendResult<OperationExecution> {
+        unreachable!()
+    }
+    async fn ecu_reset_outcome(&self, _reset_type: u8) -> BackendResult<EcuResetOutcome> {
+        Ok(EcuResetOutcome::Initiated {
+            power_down_time: Some(3),
+        })
+    }
+    fn supports_restart(&self) -> bool {
+        false
+    }
+}
+
+/// The restart hooks are forwarded to the engine, not masked by the trait
+/// defaults.
+#[tokio::test]
+async fn restart_hooks_forward_from_engine() {
+    let engine = Arc::new(AsyncRestartEngine {
+        info: EntityInfo {
+            id: "vm2".into(),
+            name: "vm2".into(),
+            entity_type: "vm".into(),
+            description: None,
+            href: "/vm2".into(),
+            status: None,
+        },
+        caps: sovd_core::Capabilities::default(),
+    });
+    let diag = InstallRouterDiag::new(bare_router(), engine);
+
+    assert!(!diag.supports_restart());
+    assert_eq!(
+        diag.ecu_reset_outcome(0).await.unwrap(),
+        EcuResetOutcome::Initiated {
+            power_down_time: Some(3)
+        }
     );
 }

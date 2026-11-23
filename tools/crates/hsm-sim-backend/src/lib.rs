@@ -5,7 +5,7 @@
 //! contract, paired with the `hsm-sim-service` bin that serves it over link-B.
 //!
 //! This is the software-HSM link-B backend for **sim / dev deployments** — on
-//! sim devices (e.g. the QEMU-emulated CVC) the host machine manager spawns and
+//! sim devices (e.g. a QEMU-emulated ECU) the host machine manager spawns and
 //! owns it as the node's HSM, and it stays the dev-mode backend until real-HSM
 //! integration lands. It is **just another link-B implementation**, not
 //! privileged: hardware production runs a vendor C HSE service implementing the

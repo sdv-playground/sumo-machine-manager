@@ -358,7 +358,7 @@ fn writer_loop(
 ) {
     // Wrap the iteration loop in catch_unwind so a panic inside the
     // body (channel.write, clock.now_mono_ns, …) doesn't silently
-    // kill the writer with no diagnostic. On the CVC we hit a freeze
+    // kill the writer with no diagnostic. On target hardware we hit a freeze
     // where mono_ns stopped advancing with zero host-side
     // evidence; this surfaces the cause next time. Thread still
     // exits on panic — vm-service has to rebuild the TimeDevice
@@ -444,7 +444,7 @@ fn writer_loop_inner(
 
         // 1b. Host self-election. Without this step the publisher
         //     refuses to advertise SYNC_VALID until a guest issues a
-        //     TIME_ADJUST — but on managed-cvc the host already gets
+        //     TIME_ADJUST — but on a managed host the host itself gets
         //     its wall time from sntp at boot and is the most natural
         //     authority. The QNX guest gets the host clock via qvm's
         //     kernel pass-through and ignores the regs flag entirely;

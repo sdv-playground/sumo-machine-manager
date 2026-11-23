@@ -13,7 +13,7 @@ machine-mgr = { path = "../machine-mgr" }
 # No new graph edge — machine-mgr already depends on machine-contract.
 machine-contract = { path = "../machine-contract" }
 # Shared log readers (platform-integration). Provides read_slog2 for the host's
-# LogSource::Slog2 — the QNX slogger2 ring reader (supernova + driver telemetry).
+# LogSource::Slog2 — the QNX slogger2 ring reader (the node manager + driver telemetry).
 platform-log = { path = "../platform-integration/platform-log" }
 sha2 = "0.10"
 crc32fast = "1"
@@ -36,8 +36,8 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 # `openapi` = the feature-gated utoipa::ToSchema derives on OperationExecution /
 # OperationStatus, so sovd::openapi references the real wire types (no mirror).
-sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.3", features = ["openapi"] }
-sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.3" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.12", features = ["openapi"] }
+sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.12" }
 sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
 sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.3" }
@@ -79,6 +79,12 @@ sovd-docs-hook = []
 # container-image manifest is refused by name instead of being routed. OFF by
 # default — see app-mgr's `container` comment for why.
 container = ["app-mgr/container"]
+# The dev recovery anchor: `sovd::hsm_authorizer::dev_recovery_anchor`, the
+# SPKI-DER of the well-known factory bootstrap key, for a deployment that hands
+# it to the authorizer as its `extra_anchor` so a dev unit with an empty keystore
+# stays factory-resettable. OFF by default: without it the function does not
+# exist. Which builds turn it on is the deployment's decision.
+dev-recovery-anchor = []
 
 [dev-dependencies]
 # host-os-mgr left even the dev-dependencies in v0.1.2: its only user here was

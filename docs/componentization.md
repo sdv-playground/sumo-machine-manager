@@ -67,7 +67,7 @@ workspace tree, not from memory:
 
 | Consumer | smm crates | Owns one of the six defaults? | Lock |
 |---|---|---|---|
-| `supernova-machine-manager` | 17 | **5** — `component-mgr`, `vm-devices`, `hsm`, `hsm-sim-backend`, `sumo-log` | tracked |
+| the host node manager (downstream) | 17 | **5** — `component-mgr`, `vm-devices`, `hsm`, `hsm-sim-backend`, `sumo-log` | tracked |
 | `sumo-provision` | 2 — `hsm`, `vhsm-proto` | 1 — `hsm`, already `default-features = false` | tracked |
 | `guest-vm-sdk` | 5 — `vm-wire`, `vhsm-proto`, `hsm-contract`, `vhsm-client`, `vhsm-provider` | **0** | **untracked** |
 
@@ -78,11 +78,11 @@ depended on sumo-machine-manager.)
 Two consequences that shrink the work dramatically:
 
 - **The blast radius of the default flips is one repo**,
-  `supernova-machine-manager`. `guest-vm-sdk` touches none of the six
+  the host node manager. `guest-vm-sdk` touches none of the six
   default-owning crates, and already names `guest-auth` explicitly on
   `vhsm-client` in `vhsm-daemon-qnx` and `vhsm-daemon-linux` — it is already a
   good citizen under the new rule.
-- **`hsm` is free.** `supernova-machine-manager` already writes
+- **`hsm` is free.** The host node manager already writes
   `features = ["crypto", "suit"]` and `sumo-provision` already writes
   `default-features = false`. Flipping `hsm`'s default to `[]` changes nothing
   for either. It is the zero-risk first flip.
@@ -195,7 +195,7 @@ This is the whole reason the script switches to `--package` for the powerset.
 
 **This moved to the front.** An earlier draft defined the profiles last, after
 telling every consumer to write an explicit feature list — which migrates
-`supernova-machine-manager` twice, once to a hand-written list and again onto a
+the host node manager twice, once to a hand-written list and again onto a
 profile. Profiles are pure additive feature bundles: no code changes, no
 behaviour change, just `[features]` entries. Land them first and every later
 flip moves a consumer onto a profile in one edit.
@@ -210,7 +210,7 @@ hypervisor" is the absence of `vm-*`, not a `no-vm`.
       - `soft-node` is the rp5 case above: `container` + a software HSM, no
         hypervisor, no banks, no QNX. It is the **fifth** profile — an earlier
         draft had four and none of them describes it. `emulated` is the closest
-        and is still not it: `emulated` is about supernova-mm's runtime
+        and is still not it: `emulated` is about the node manager's runtime
         "no activator / no raw host bank" branches on an otherwise full build,
         whereas `soft-node` wants those crates *absent*.
       - `soft-node` is also the profile that work item 3b unblocks; until then
@@ -221,7 +221,7 @@ hypervisor" is the absence of `vm-*`, not a `no-vm`.
       same commit.
 - [ ] `feature-matrix.sh` grows a profile section building each one.
 - [ ] Record which repo/binary claims each profile —
-      `supernova-machine-manager` is `rig-qnx`, `guest-vm-sdk` is `guest-sdk`.
+      the host node manager is `rig-qnx`, `guest-vm-sdk` is `guest-sdk`.
       A profile no binary claims is dead weight; a binary with no profile is the
       gap this whole document is about.
 
@@ -284,15 +284,15 @@ So there are two different things, and only one is a defect:
 **Deployment reality, verified 2026-09-08 — the soft HSM is the production HSM.**
 Not a dev convenience that leaked; the only HSM the fleet has:
 
-- `hsm-sim-service` ships in **both** supernova packages (provisioning *and*
-  full) — `assemble-package.sh:71, 89` — reaches the device in the deploy tar
-  (`provisioned-cvc/prepare-device.sh:80`), and is spawned by `vhsm-ssd` via
+- `hsm-sim-service` ships in **both** of the node manager's packages
+  (provisioning *and* full), reaches the device in the deploy tar, and is
+  spawned by `vhsm-ssd` via
   `--backend-cmd`, whose default is the sibling binary. **No vendor bridge
   exists yet**; `hsm.backend_cmd` is the config seam that will select one.
 - The device's real private keys are **generated on the device at first boot**
   by `SimHsm::ensure_device_keys()` (`sim.rs:136+`) with
   `p256::ecdsa::SigningKey::random(OsRng)`, written as PEM under
-  `/mnt/common-rw/vhsm/keys` (`managed-qnx71/config.yaml:40`, mode 700). That
+  `/mnt/common-rw/vhsm/keys` (mode 700). That
   covers every device-generated role — `DeviceDecryption`, `IamSigning`,
   `IvdSigning`, `JwtSigning`, `TlsIdentity`, `Storage` (`hsm/types.rs:184-193`).
 
@@ -311,18 +311,16 @@ Two consequences for this work item:
    qualified away. It needs gating at **two layers**, because the soft HSM
    exists at two:
    - *linked code* — `component-mgr`'s in-process `SimHsm` (the defect below).
-     Already clean in `supernova`: `hsm-sim-backend` sits in
-     `[dev-dependencies]` (`Cargo.toml:110`), its only use is under
-     `#[cfg(test)] mod tests` (`boot_selector_signer.rs:79-81`), and production
-     crypto is `Arc<hsm::link_b::LinkBClient>` (`main.rs:819, 1878`) —
+     Already clean in the node manager: `hsm-sim-backend` sits in
+     `[dev-dependencies]`, its only use is under `#[cfg(test)] mod tests`, and
+     production crypto is `Arc<hsm::link_b::LinkBClient>` —
      `LinkBClient` implements `HsmCryptoProvider` (`hsm/src/link_b.rs:436`).
    - *packaged binary* — `hsm-sim-service`, copied into every package
-     unconditionally (`assemble-package.sh:71` **dies** if it is absent, `:89`
-     copies it), installed unconditionally by CI (`.gitlab-ci.yml:208, 232`),
-     and reached by `backend_cmd`'s silent sibling-binary default
-     (`main.rs:1264`).
+     unconditionally (the package script **dies** if it is absent), installed
+     unconditionally by the consumer's CI, and reached by `backend_cmd`'s
+     silent sibling-binary default.
 
-   Gate only the first and the flag becomes theatre: a supernova with no soft
+   Gate only the first and the flag becomes theatre: a node manager with no soft
    crypto compiled in still ships the soft HSM beside it and spawns it by
    default. **Layer 2 is the actual work of this item, and the line to delete
    when the vendor bridge lands.**
@@ -346,11 +344,11 @@ not the same for both servers:**
 
 | Server | `FactoryDeps.hsm_crypto` | So `get_csr` uses | Soft HSM reached |
 |---|---|---|---|
-| `supernova` (deployed host MM) | `Some(LinkBClient)` — `main.rs:2367`, built at `main.rs:1881` | the injected link-B handle | **out of process only**, over link-B |
+| the node manager (deployed host MM) | `Some(LinkBClient)` | the injected link-B handle | **out of process only**, over link-B |
 | `vm-sovd` (dev / sim / the rp5 server) | **`None`** — `main.rs:445`, with `hsm_keystore: Some(..)` | `SimHsm::new(keystore)`, transient, per call | **in process, directly** |
 
 So the earlier claim that "a build that intended hardware silently signs with a
-software key" is **wrong for supernova**: it injects the link-B client, the
+software key" is **wrong for the node manager**: it injects the link-B client, the
 `if let Some(ref crypto)` arm always wins, and the fallback is unreachable in the
 deployed artifact. There the defect is *build surface* — a non-optional
 dependency and a code path no deployment takes — not a live crypto substitution.
@@ -374,15 +372,15 @@ is a hard dependency of the production component.
       explicit; an un-injected `csr_crypto` must fail naming what is missing
       (rule 6), never substitute software crypto. This is the security-relevant
       half and it is independent of any feature flag.
-- [ ] **The flag already exists in `supernova` — finish it, don't invent it.**
-      `supernova`'s `hsm-sim` feature gates 5 sites, and flag-off already fails
+- [ ] **The flag already exists in the node manager — finish it, don't invent it.**
+      The node manager's `hsm-sim` feature gates 5 sites, and flag-off already fails
       loudly instead of degrading: `#[cfg(not(feature = "hsm-sim"))]` on
       `HsmBackend::Sim` logs "HSM backend 'sim' not compiled in" and
-      `exit(1)` (`main.rs:1869-1873`) — rule 6, already implemented. It is also
+      `exit(1)` — rule 6, already implemented. It is also
       already named explicitly in every build line
-      (`.gitlab-ci.yml:193, 196, 230`, `build-qemu.sh`, `build-target.sh`), so
+      (its CI and its QEMU and target build scripts), so
       it is already the visible, removable statement of deployment intent.
-      **Decision (2026-09-08): keep it declared in supernova today; the point is
+      **Decision (2026-09-08): keep it declared in the node manager today; the point is
       that removing it later is a small, reviewable diff.** Three gaps remain:
       - [ ] It is in `default` (`default = ["hsm-sim", "ifs-dev", "vm-runtime"]`),
             so it is not yet a gate that must be turned *on*. Removing it from
@@ -391,14 +389,14 @@ is a hard dependency of the production component.
             that claim against all three CI build lines before flipping; if it
             holds, this is the cheapest of the six default flips in work item 4.
       - [ ] Gate layer 2 from the same decision: make the `hsm-sim-service`
-            build/copy/`die` in `assemble-package.sh` and the CI `cargo install`
+            build/copy/`die` in the package script and the CI `cargo install`
             conditional, and make `backend_cmd` require explicit config instead
             of silently resolving a sibling binary — so a hardware node fails
             loudly rather than quietly spawning a soft HSM.
       - [ ] Build the flag-off variant in CI (work item 0's matrix) or
             "removable later" rots into "unbuildable later".
 - [ ] **Split the factory-reset dev backdoor off this flag.** `hsm-sim` also
-      gates `factory_recovery_issuer_spki()` (`main.rs:579-585`, used at `:532`),
+      gates `factory_recovery_issuer_spki()`,
       which returns the hardcoded `hsm::payload::FACTORY_SIGNING_PUBLIC` —
       P-256 `scalar = 1` — as the factory-reset issuer anchor when the device has
       no provisioned keystore. That is a well-known-key recovery path riding the
@@ -419,12 +417,10 @@ is a hard dependency of the production component.
 - [ ] **`sumo-verify` — free to fix, because it is not deployed.** An earlier
       draft of this bullet claimed its runtime dependency on `hsm-sim-backend`
       was legitimate and load-bearing in production. It is not: `sumo-verify` is
-      **deliberately excluded** from both supernova packages
-      (`assemble-package.sh:69` — "sumo-verify is NOT shipped") and absent from
-      the device tar (`prepare-device.sh:80`). The verify-then-start orchestrator
-      that invoked it was removed and "verification will move to the RT side"
-      (`start-managed.sh:257-262`). It survives only in the `managed-qnx71` dev
-      example. So changing it carries no deployment risk.
+      **deliberately excluded** from both of the node manager's packages and
+      absent from the device tar. The verify-then-start orchestrator that
+      invoked it was removed and "verification will move to the RT side". It
+      survives only in a dev example. So changing it carries no deployment risk.
       What it actually needs is **not an HSM backend**: verification uses the
       *public* half only — `SimHsm::verify` → `load_ec_verifying_key` reads
       `keys/{key_id}.pub` and never opens `.priv`
@@ -442,8 +438,8 @@ is a hard dependency of the production component.
       returns host-side, the anchor must be HSM-held or in signed read-only
       storage. (Not a componentization item; it belongs to whoever owns the RT
       verify design, and this note exists so the constraint travels with it.)
-- [ ] `supernova-machine-manager` declares `hsm-sim-backend` directly too
-      (`Cargo.toml:110`) — decide in the same wave whether the rig runs
+- [ ] The host node manager declares `hsm-sim-backend` directly too —
+      decide in the same wave whether the rig runs
       `hsm-sim-service` deliberately or must inject a real `csr_crypto`. With
       the implicit fallback gone, that becomes a visible choice instead of a
       default.
@@ -610,10 +606,10 @@ there. Three buckets:
       `component-mgr` carried `sumo-processor` and `tracing-subscriber`
       referenced by **no** target, and `host-os-mgr` referenced **only** by
       `tests/component_adapter_tests.rs` (now a `[dev-dependency]`). Every
-      consumer of `component-mgr`, supernova included, had been linking the
+      consumer of `component-mgr`, the node manager included, had been linking the
       host OS manager and a SUIT interpreter for nothing. `vm-service` likewise
       carried `hyper` + `hyper-util` unused. **`sumo-processor` is now gone from
-      the resolved graph entirely** — this workspace's *and* supernova's, which
+      the resolved graph entirely** — this workspace's *and* the node manager's, which
       reached it only through `component-mgr` (see the Feasibility block). Three
       dead deps on the repo's most widely consumed library dwarf the
       `sumo-log`-per-bin finding, and this one is genuinely rp5-class: a whole
@@ -628,12 +624,12 @@ there. Three buckets:
       argument for 3d than the dep-closure one: a `[[bin]]` inside a lib crate
       invites exactly this, and nothing warns you.
 - [x] **`vhsm-ssd` shows how to extract a bin whose *package name* is
-      load-bearing, with zero cross-repo churn.** supernova installs the
+      load-bearing, with zero cross-repo churn.** The node manager installs the
       *binary* by package name (`cargo install … vhsm-ssd`), the device process
       is called `vhsm-ssd`, and `vhsm-proto`'s CWT `aud` claim is the string
       `"vhsm-ssd"` — so the deployable is what owns that name. The naive
       extraction (lib keeps the name, bin gets a new one) would have needed
-      edits in supernova's CI plus two example build scripts. Inverting it
+      edits in the consumer's CI plus two example build scripts. Inverting it
       costs nothing: **the bin keeps the package name and moves to
       `services/vhsm-ssd`; the library is renamed `vhsm-server`** — safe
       precisely because the lib's consumers are all in-repo (`vhsm-client`,
@@ -643,14 +639,13 @@ there. Three buckets:
       `env!("CARGO_BIN_EXE_vhsm-ssd")` move with the bin; the rest stay with the
       lib.
 - [ ] **The one case that cannot land mechanically — deferred, needs a paired
-      supernova edit.** `hsm-sim-service` is a *deployed production service* —
-      it ships in both supernova packages (`assemble-package.sh:71, 89`) and
+      consumer edit.** `hsm-sim-service` is a *deployed production service* —
+      it ships in both of the node manager's packages and
       lands on the device — but lives under `tools/crates/hsm-sim-backend`. Same
       category error as the rest, opposite direction. It is nonetheless **not**
-      mechanical, and the `vhsm-ssd` trick does not rescue it: supernova needs
-      the **lib** by name (`[dev-dependencies]`, `Cargo.toml:110`) *and*
-      installs the **bin** by that same name (`.gitlab-ci.yml:208`, `:232`, plus
-      two example `build.sh`), so whichever half is renamed, a consumer edit is
+      mechanical, and the `vhsm-ssd` trick does not rescue it: the node manager needs
+      the **lib** by name (`[dev-dependencies]`) *and* installs the **bin** by
+      that same name (its CI, plus two example `build.sh`), so whichever half is renamed, a consumer edit is
       owed. That makes it 3c-shaped — a coordinated cross-repo bump with the
       full artifact cascade behind it — and it must not be filed under this
       item's "mechanical" heading.
@@ -662,27 +657,27 @@ thin bin, so the rule above already decides them: the lib stays in `crates/`,
 the bin moves. No new judgement needed. What the check *did* surface is that
 each has a different reason, and two of those reasons are findings in their own
 right. *Amended after execution:* the rule decides them, but only `host-metrics`
-was **actionable** — `hsm-sim-service` turned out to need a paired supernova
+was **actionable** — `hsm-sim-service` turned out to need a paired consumer
 edit, and `vm-boot` has no consumer to make honest, so for it the rule decides a
 move that buys nothing:
 
-- **`host-metrics` — the clean case, and the model for the others.** supernova
-  takes the lib as a plain `[dependencies]` entry (`Cargo.toml:65`) and embeds
+- **`host-metrics` — the clean case, and the model for the others.** The node manager
+  takes the lib as a plain `[dependencies]` entry and embeds
   it; the bin is documented as "For dev / standalone deployments. In production,
   the host machine manager embeds the same library" and is in **neither**
-  supernova package. Real consumer for the lib, dev convenience for the bin, and
+  of its packages. Real consumer for the lib, dev convenience for the bin, and
   a 5-dep closure (axum, tokio, tracing, sumo-log, libc) that already honours
   its own header: "Lives at the workspace root so any host … can embed it
   without dragging vm-\* dependencies." Lib stays, bin → `tools/`.
-- **`hsm-sim-service` — the split is the whole point.** supernova has
-  `hsm-sim-backend` in **`[dev-dependencies]`** (`Cargo.toml:110`) yet
-  **packages its bin** (`assemble-package.sh:71, 89`). Both are right: the
-  `SimHsm` library genuinely is dev-only *to supernova*, and the binary
+- **`hsm-sim-service` — the split is the whole point.** The node manager has
+  `hsm-sim-backend` in **`[dev-dependencies]`** yet
+  **packages its bin**. Both are right: the
+  `SimHsm` library genuinely is dev-only *to the node manager*, and the binary
   genuinely is production. One crate cannot be in two dependency sections, so
   today the packaging line silently contradicts the manifest. Extracting the bin
   is what makes the manifest tell the truth — `services/hsm-sim-service`
-  depending on `crates/hsm-sim-backend`, which supernova then keeps as a
-  dev-dependency without also shipping it. **But not in this wave** — supernova
+  depending on `crates/hsm-sim-backend`, which the node manager then keeps as a
+  dev-dependency without also shipping it. **But not in this wave** — the node manager
   addresses `hsm-sim-backend` by that name in *both* roles at once
   (`[dev-dependencies]` for the lib, `cargo install` for the bin), so the split
   cannot be zero-churn in either direction; see the deferred bullet above.
@@ -699,8 +694,8 @@ move that buys nothing:
   `MAX_TRIAL_BOOTS`, verifies SHA-256 image hashes from FW Meta, and returns one
   `BootAction` per bank set **for the caller to execute**. On the device that
   decision is actually taken by
-  `host-platforms/provisioned-cvc/config/host-boot.sh` ("Interim host bootloader
-  stand-in — A/B selection for the supernova OS bank"), reading the same signed
+  the host image's `host-boot.sh` (an interim host bootloader stand-in doing
+  the A/B selection for the host OS bank), reading the same signed
   selector. So `vm-boot` is the Rust reference implementation of a contract
   currently implemented in bash. **Left whole in this wave** (user: "leave
   vm-boot for now") — and the zero-consumer finding is why that is the right
@@ -718,10 +713,10 @@ move that buys nothing:
 (`b4c8df7`, branch `chore/3d-pilot-slog2-drainer`):**
 
 - **External consumers are unaffected — executed, not reasoned about.**
-  `supernova-machine-manager` (16 deps), `sumo-provision` and `guest-vm-sdk` all
+  The host node manager (16 deps), `sumo-provision` and `guest-vm-sdk` all
   depend by `git = "…sumo-machine-manager.git"` + *package name*, so cargo
   resolves against the repo's workspace, not by directory. `slog2-drainer` was
-  moved to `services/` and supernova's own CI line was then run verbatim from
+  moved to `services/` and the node manager's own CI line was then run verbatim from
   outside the repo against the pilot branch:
 
   ```
@@ -743,7 +738,7 @@ move that buys nothing:
   for every change.* The real reason is structural: a lock entry for a
   workspace-local package is `name` + `version` + `dependencies` with **no
   `source` and no path**, so there is nothing in it for a directory move to
-  perturb. And a *consumer's* lock (supernova's, which **is** tracked) records
+  perturb. And a *consumer's* lock (the node manager's, which **is** tracked) records
   `git+…?branch=main#<sha>` keyed by package name — so a move changes nothing
   there either beyond the sha that every commit changes anyway.
 - **The rename case was then proven the same way, on `main` after the merge.**
@@ -771,19 +766,19 @@ move that buys nothing:
   wave added four package names (`vhsm-server`, `vm-diagctl`, `vm-service`,
   `host-metrics-exporter`) and renamed two libraries. It is
   still zero-churn for consumers, but by *verification*, not by the move
-  argument: `vhsm-ssd` appears **nowhere** in supernova's `Cargo.lock` (it was
+  argument: `vhsm-ssd` appears **nowhere** in the node manager's `Cargo.lock` (it was
   only ever `cargo install`ed as a binary), and the three new `tools/` packages
   are workspace-local with no external consumer. Do that check per rename; do
   not inherit the move proof.
 - **The wave's real de-linking win is in a consumer's graph, and it is one whole
   crate.** Removing the unreferenced `sumo-processor` from `component-mgr`
   removes it from **this** workspace's resolved graph entirely (`Cargo.lock`:
-  0 entries) *and* from supernova's — supernova has it in its lock with no
+  0 entries) *and* from the node manager's — which has it in its lock with no
   direct dependency and no `sumo_processor` reference in its sources, reached
   **only** via `component-mgr`. So a whole SUIT command-sequence interpreter was
   linked into the host machine manager and unusable from it: precisely the rp5
   pattern this document set out to measure, found in the repo's most widely
-  consumed library rather than in a feature flag. It materialises in supernova
+  consumed library rather than in a feature flag. It materialises in the node manager
   on its next `cargo update -p component-mgr` wave, not on this merge.
 - **Pilot design note, for the moves still to come.** The pilot was chosen to be
   falsifiable: a *pure* executable (nothing to untangle, so a failure could only
@@ -806,13 +801,13 @@ move that buys nothing:
   consumers, and it is worth asking per bin rather than adopting a blanket
   rule.** The extraction wave kept every binary name, and for two of them that
   is *mandatory*: `vhsm-ssd` and `hsm-sim-service` are installed by name and
-  packaged (`assemble-package.sh`), so their artifacts are an external contract.
+  packaged by a consumer, so their artifacts are an external contract.
   For the other three it turned out to be optional — priced by grep, the
   artifact consumers are `target/debug/vm-service` (2 sites:
   `example/dummy-vm/run-vm.sh:27`, `build-all.sh:208`),
   `target/debug/vm-diagserver` (2 sites: `example/run.sh:110`,
-  `build-all.sh:210`) and `host-metrics` (**zero** — in neither supernova
-  package, built by no script). So the naming follow-up below could rename two
+  `build-all.sh:210`) and `host-metrics` (**zero** — in neither of the node
+  manager's packages, built by no script). So the naming follow-up below could rename two
   of them for four lines total. **Rule: price the artifact's consumers, then
   rename; a bin name is only frozen when something outside the repo installs,
   packages or execs it.**
@@ -842,15 +837,15 @@ when the library is already holding a name that belongs to the process.
 Two notes worth carrying:
 
 - **`vm-runtime` was the first candidate for the library and is wrong**, because
-  `supernova-machine-manager` already uses `vm-runtime` as a *feature* name
-  (`Cargo.toml:27`, `vm-runtime = ["dep:vm-service"]`). A crate name that
+  the host node manager already uses `vm-runtime` as a *feature* name
+  (`vm-runtime = ["dep:vm-service"]`). A crate name that
   collides with a consumer's feature name is a trap; check the consumer's
   `[features]` table, not just its `[dependencies]`.
 - **Renaming a library is a cross-repo edit; renaming an identifier that merely
-  *contains* the old name usually is not.** In supernova the string `vm_service`
+  *contains* the old name usually is not.** In the node manager the string `vm_service`
   appears 41 times, but only **15** are crate paths. The other 26 are the config
-  key `vm_service:` (a device-config contract — `provisioned-cvc/config/config.yaml`,
-  `qnx-host-app-bank/.gitlab-ci.yml` read it) and `vm_service_addr` fields naming
+  key `vm_service:` (a device-config contract — the device config and the host
+  image build read it) and `vm_service_addr` fields naming
   the *process's* address. Those stay correct precisely *because* the process
   kept the name. A blind `sed s/vm_service/vm_mgr/` would have broken the device
   config contract.
@@ -917,7 +912,7 @@ What is **already** generic, and needs nothing:
 - [ ] **Consequence for the rename**: the generic/specific boundary is the thing
       the names must express. `hsm::link_b` = the service; `SimHsm` = one
       backend; the binary = that backend's `main()`. "sim" is the wrong word at
-      every level for something that ships in both supernova packages today.
+      every level for something that ships in both of the node manager's packages today.
 
 ---
 
@@ -925,7 +920,7 @@ What is **already** generic, and needs nothing:
 
 Ordered free → loud → silent, so the mechanism is proven before it can hurt.
 
-| Order | Crate | Current default | Consequence for `supernova-machine-manager` |
+| Order | Crate | Current default | Consequence for the host node manager |
 |---|---|---|---|
 | 1 | `hsm` | `suit` | **none** — already names `["crypto", "suit"]`. Free. |
 | 2 | `hsm-sim-backend` | `crypto`, `suit` | **compile error** at call sites — loud, good |
@@ -939,7 +934,7 @@ turn each of those three from a judgement call into a diff — do not start this
 item before that one lands.
 
 - [ ] Per crate, in the order above: flip to `default = []`, then move
-      `supernova-machine-manager` onto its `rig-qnx` profile in the same wave.
+      the host node manager onto its `rig-qnx` profile in the same wave.
 - [ ] Follow the workspace producer→consumer order (workspace `CLAUDE.md`
       §"Build & Artifact Order"): producers first, then `./prepare-push.sh` →
       `./push-all.sh`. `prepare-push` builds each consumer whose lock would
@@ -964,7 +959,7 @@ Facts to build on:
 - `vm-service/qnx` gates nothing (0 cfg sites) — delete it, or make it real if
   the QNX/`qvm` vs QEMU split should be a compile-time choice rather than the
   runtime branch it is today.
-- An emulated/container deployment has no VMs at all. `supernova-mm`'s code is
+- An emulated/container deployment has no VMs at all. The node manager's code is
   full of "emulated/container has no activator / no raw host bank" branches —
   that is a deployment shape being handled at runtime that could be a profile,
   and `emulated` from work item 1 is where it belongs.
@@ -1073,7 +1068,7 @@ Full powerset does not survive this change. A top binary with ~8 features is
       `feature = "` finds no cfg naming a feature no `Cargo.toml` declares
       (the `vm-service/qnx` class of rot).
 - [ ] Every consumer has an explicit feature list or profile; none relies on a
-      default. Consumers are `supernova-machine-manager`, `sumo-provision`,
+      default. Consumers are the host node manager, `sumo-provision`,
       `guest-vm-sdk` — and that list is checked, not assumed.
 - [ ] Each capability that can be absent fails loudly, naming its feature.
 - [ ] A golden capability description exists per profile, and CI diffs it.

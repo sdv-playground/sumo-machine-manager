@@ -21,7 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Header, Validation};
 use serde::Deserialize;
-use sovd_api::{AccessRequest, Authorizer, Capability, ClientContext};
+use sovd_api::{AccessRequest, AuthError, Authorizer, Capability, ClientContext};
 
 // Delegated (`x5c`) path: chain verification lives in `delegation`; deriving the
 // JWT verifying key from the verified leaf needs the x509/p256 SPKI surface.
@@ -346,7 +346,7 @@ fn strip_bearer(header: Option<&str>) -> Result<&str, String> {
 
 #[async_trait]
 impl Authorizer for TieredAuthorizer {
-    async fn authorize(&self, req: &AccessRequest<'_>) -> Result<ClientContext, String> {
+    async fn authorize(&self, req: &AccessRequest<'_>) -> Result<ClientContext, AuthError> {
         // Read-open (general path): a low-consequence read with NO token is
         // served anonymously — reads don't mutate, so the general path enforces
         // writes + destructive ops only. A read that DOES present a token still
@@ -382,7 +382,7 @@ impl Authorizer for TieredAuthorizer {
         // which would just fail with "untrusted issuer" anyway.)
         if header.x5c.is_some() {
             let Some(pinned_root) = self.pinned_root_pem.as_deref() else {
-                return Err("delegation not configured".to_string());
+                return Err("delegation not configured".into());
             };
             return self.authorize_delegated(token, &header, pinned_root, req);
         }
@@ -414,10 +414,10 @@ impl Authorizer for TieredAuthorizer {
         // this token must be trusted for at least the capability's tier.
         let needed = capability_tier(req.capability);
         if issuer.ceiling < needed {
-            return Err(format!(
+            return Err(AuthError::Forbidden(format!(
                 "issuer '{}' (ceiling {:?}) may not grant a {:?} capability",
                 issuer.id, issuer.ceiling, needed
-            ));
+            )));
         }
 
         // Freshness (§7.1 boot_id / §7.3 vehicle-epoch) — shared with the
@@ -432,13 +432,17 @@ impl Authorizer for TieredAuthorizer {
         // Component scope (C-031).
         if let Some(component) = req.component {
             if !ctx.can_access_component(component) {
-                return Err(format!("token has no scope for component '{component}'"));
+                return Err(AuthError::Forbidden(format!(
+                    "token has no scope for component '{component}'"
+                )));
             }
         }
         // Capability (verb) scope.
         if let Some(scope) = capability_scope(req.capability) {
             if !ctx.scopes.iter().any(|s| s == scope) {
-                return Err(format!("token lacks the '{scope}' capability"));
+                return Err(AuthError::Forbidden(format!(
+                    "token lacks the '{scope}' capability"
+                )));
             }
         }
         Ok(ctx)
@@ -463,7 +467,7 @@ impl TieredAuthorizer {
         header: &Header,
         pinned_root: &[u8],
         req: &AccessRequest<'_>,
-    ) -> Result<ClientContext, String> {
+    ) -> Result<ClientContext, AuthError> {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
         use p256::pkcs8::{DecodePublicKey, EncodePublicKey, LineEnding};
@@ -482,7 +486,7 @@ impl TieredAuthorizer {
 
         // (b) Delegation is the *cable-connected workshop* path. We verify the
         // chain's validity window against `max(wall_clock_now, safe-time floor)`
-        // (`effective_now`) — NOT raw wall clock. A CVC has no RTC and boots at
+        // (`effective_now`) — NOT raw wall clock. An ECU without an RTC boots at
         // the Unix epoch, so raw `now` would reject a workshop delegate leaf
         // whose `not_before` is a real-world date ("certificate not valid yet").
         // The floor, seeded from our own CA-signed material at provisioning and
@@ -557,12 +561,16 @@ impl TieredAuthorizer {
         // the pinned-issuer path.
         if let Some(component) = req.component {
             if !ctx.can_access_component(component) {
-                return Err(format!("token has no scope for component '{component}'"));
+                return Err(AuthError::Forbidden(format!(
+                    "token has no scope for component '{component}'"
+                )));
             }
         }
         if let Some(scope) = capability_scope(req.capability) {
             if !ctx.scopes.iter().any(|s| s == scope) {
-                return Err(format!("token lacks the '{scope}' capability"));
+                return Err(AuthError::Forbidden(format!(
+                    "token lacks the '{scope}' capability"
+                )));
             }
 
             // (i) THE escalation ceiling — the crux of delegation. The token may
@@ -572,9 +580,9 @@ impl TieredAuthorizer {
             // token it signs perform `reset:execute`, even if the operator asks.
             // The cert's granted scopes ARE the ceiling (no issuer-tier here).
             if !granted_scopes.iter().any(|g| g == scope) {
-                return Err(format!(
+                return Err(AuthError::Forbidden(format!(
                     "delegate's certificate does not authorise granting '{scope}'"
-                ));
+                )));
             }
         }
         Ok(ctx)
@@ -819,7 +827,10 @@ mod tests {
             .authorize(&access(&bearer, None, Capability::FactoryReset))
             .await
             .unwrap_err();
-        assert!(err.contains("may not grant"), "{err}");
+        assert!(
+            matches!(&err, AuthError::Forbidden(m) if m.contains("may not grant")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -862,7 +873,10 @@ mod tests {
             .authorize(&access(&bearer, None, Capability::FactoryReset))
             .await
             .unwrap_err();
-        assert!(err.contains("verification failed"), "{err}");
+        assert!(
+            matches!(&err, AuthError::Unauthenticated(m) if m.contains("verification failed")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -874,7 +888,10 @@ mod tests {
             .authorize(&access(&bearer, None, Capability::DataRead))
             .await
             .unwrap_err();
-        assert!(err.contains("untrusted issuer"), "{err}");
+        assert!(
+            matches!(&err, AuthError::Unauthenticated(m) if m.contains("untrusted issuer")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -886,7 +903,10 @@ mod tests {
             .authorize(&access(&bearer, Some("vm1"), Capability::DataRead))
             .await
             .unwrap_err();
-        assert!(err.contains("lacks the 'data:read'"), "{err}");
+        assert!(
+            matches!(&err, AuthError::Forbidden(m) if m.contains("lacks the 'data:read'")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -903,7 +923,10 @@ mod tests {
             .authorize(&access(&bearer, Some("vm1"), Capability::DataRead))
             .await
             .unwrap_err();
-        assert!(err.contains("no scope for component 'vm1'"), "{err}");
+        assert!(
+            matches!(&err, AuthError::Forbidden(m) if m.contains("no scope for component 'vm1'")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -921,7 +944,10 @@ mod tests {
             .authorize(&access(&bearer, Some("vm1"), Capability::DataRead))
             .await
             .unwrap_err();
-        assert!(err.contains("verification failed"), "{err}");
+        assert!(
+            matches!(&err, AuthError::Unauthenticated(m) if m.contains("verification failed")),
+            "{err:?}"
+        );
     }
 
     // A bad token must never crash the server — every malformed / garbage input
@@ -1003,13 +1029,13 @@ mod tests {
         assert!(authz
             .authorize(&access(&stale, None, Capability::FactoryReset))
             .await
-            .is_err());
+            .is_err_and(|e| matches!(e, AuthError::Unauthenticated(_))));
         // Missing boot_id while the device pins one → rejected.
         let none = token(None);
         assert!(authz
             .authorize(&access(&none, None, Capability::FactoryReset))
             .await
-            .is_err());
+            .is_err_and(|e| matches!(e, AuthError::Unauthenticated(_))));
     }
 
     #[tokio::test]
@@ -1053,13 +1079,13 @@ mod tests {
         assert!(authz
             .authorize(&access(&stale, None, Capability::FactoryReset))
             .await
-            .is_err());
+            .is_err_and(|e| matches!(e, AuthError::Unauthenticated(_))));
         // Missing epoch while the device pins one → rejected.
         let none = token(None);
         assert!(authz
             .authorize(&access(&none, None, Capability::FactoryReset))
             .await
-            .is_err());
+            .is_err_and(|e| matches!(e, AuthError::Unauthenticated(_))));
     }
 
     // -----------------------------------------------------------------------
@@ -1218,8 +1244,8 @@ mod tests {
             // NOT the chain (it verified) and NOT the verb-scope check (the token
             // DOES carry reset:execute).
             assert!(
-                err.contains("does not authorise granting 'reset:execute'"),
-                "must reject at the granted-scopes ceiling, got: {err}"
+                matches!(&err, AuthError::Forbidden(m) if m.contains("does not authorise granting 'reset:execute'")),
+                "must reject at the granted-scopes ceiling, got: {err:?}"
             );
         }
 
@@ -1273,8 +1299,8 @@ mod tests {
                 .await
                 .expect_err("a delegate under root A must not verify against pinned root B");
             assert!(
-                err.contains("pinned root"),
-                "wrong-root rejection must come from the chain check, got: {err}"
+                matches!(&err, AuthError::Unauthenticated(m) if m.contains("pinned root")),
+                "wrong-root rejection must come from the chain check, got: {err:?}"
             );
         }
 
@@ -1305,8 +1331,8 @@ mod tests {
                 .await
                 .expect_err("a JWT not signed by the leaf key must be rejected");
             assert!(
-                err.contains("token verification failed"),
-                "must reject at JWT signature verification against the leaf key, got: {err}"
+                matches!(&err, AuthError::Unauthenticated(m) if m.contains("token verification failed")),
+                "must reject at JWT signature verification against the leaf key, got: {err:?}"
             );
         }
 

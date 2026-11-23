@@ -5,8 +5,8 @@ edition = "2021"
 description = "vHSM Secure Storage Daemon — the host-side crypto service guest VMs reach over /dev/vhsm. Terminates the v3 handle-based wire protocol on the private vbr-vhsm bridge, establishes guest identity by CWT/IAM handshake, and delegates crypto to an HsmCryptoProvider (a link-B vendor service, or the software HSM). The reusable server half is the vhsm-server library; this package is the process that wires it to a backend, a secstore, TLS and the signal reaper."
 license.workspace = true
 
-# PACKAGE NAME IS LOAD-BEARING: supernova-machine-manager installs this by name
-# (`cargo install --git … vhsm-ssd`, .gitlab-ci.yml) and builds it by name
+# PACKAGE NAME IS LOAD-BEARING: a consumer node binary installs this by name
+# (`cargo install --git … vhsm-ssd` in its CI) and builds it by name
 # (`cargo build -p vhsm-ssd --target aarch64-unknown-nto-qnx710`). The pilot
 # proved directory moves are invisible to that; a package RENAME would not be.
 # So the daemon kept the name and the library became vhsm-server.

@@ -63,13 +63,13 @@ use nv_store::types::Bank;
 // so existing `machine_mgr::system_bank_state::*` paths still resolve.
 pub use nv_store::selector::{
     boot_id_digest, BootVector, ComponentEntry, FileSelectorStore, ImageEntry, Outcome, Reason,
-    Resolution, SelectorBlob, SelectorError, SelectorStore, Signer, SlotSelect, StubSelectorStore,
-    StubSigner, Transaction,
+    Resolution, SelectorBlob, SelectorError, SelectorStore, Signer, SignerError, SlotSelect,
+    StubSelectorStore, StubSigner, Transaction,
 };
 // In-memory test seams: only for test builds (this crate's own unit tests, or
 // downstream cfg(test) users via the forwarding `test-seams` feature).
 #[cfg(any(test, feature = "test-seams"))]
-pub use nv_store::selector::{InMemorySelectorStore, TestSigner};
+pub use nv_store::selector::{InMemorySelectorStore, SignerMode, SwitchableSigner, TestSigner};
 // The boot-stage record seam and the one store over it.
 #[cfg(any(test, feature = "test-seams"))]
 pub use nv_store::boot_record::InMemoryBootRecord;
@@ -94,6 +94,25 @@ fn render_slots(m: &BTreeMap<String, ComponentEntry>) -> String {
 // ---------------------------------------------------------------------------
 // The manager
 // ---------------------------------------------------------------------------
+
+/// How [`SystemBankManager::load_retrying`] retries a load that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadRetry {
+    /// Loads attempted in all, at least one.
+    pub attempts: u32,
+    /// Wait between two attempts.
+    pub delay: std::time::Duration,
+}
+
+impl Default for LoadRetry {
+    /// Five attempts one second apart.
+    fn default() -> Self {
+        Self {
+            attempts: 5,
+            delay: std::time::Duration::from_secs(1),
+        }
+    }
+}
 
 /// What [`SystemBankManager::observe_node_boot`] saw. It counts; it never
 /// decides on a limit.
@@ -151,8 +170,10 @@ impl SystemBankManager {
     /// The store authenticates its contents: a copy that fails its check reads
     /// as absent. An absent PRIMARY (the stub case) yields empty maps at
     /// generation 0; an absent SECONDARY, an empty committed copy at
-    /// generation 0. A copy the store could not read is `Err`: nothing is
-    /// loaded, so an unreadable record is never taken for an empty vector.
+    /// generation 0. A copy or header the store could not read — including one
+    /// its signer could not verify — is `Err`: nothing is loaded, so an
+    /// unreadable record is never taken for an empty vector (and never
+    /// reseeded). See [`Self::load_retrying`].
     ///
     /// A header recorded above the primary generation, on a committed vector
     /// and with no resolution, can only mean the boot stage restored the
@@ -172,7 +193,7 @@ impl SystemBankManager {
             Some(v) => (v.entries, v.generation),
             None => (BTreeMap::new(), 0),
         };
-        let transaction = match store.read_transaction() {
+        let transaction = match store.read_transaction()? {
             Some((gen, header)) if gen == generation => Some(header),
             Some((gen, header))
                 if gen > generation && current == committed && header.resolution.is_none() =>
@@ -195,7 +216,7 @@ impl SystemBankManager {
                         Some(header)
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::error!(
                             trial_generation = gen,
                             generation,
                             error = %e,
@@ -227,6 +248,36 @@ impl SystemBankManager {
         })
     }
 
+    /// [`Self::load`] over a store from `make_store`, retried up to
+    /// `retry.attempts` times `retry.delay` apart while it fails — a store
+    /// whose signer is still coming up reads as unreadable, never as empty.
+    /// Returns the last error once the attempts are spent: the caller then
+    /// fails closed (exits non-zero) instead of serving or seeding over a
+    /// vector it could not read. Blocks the calling thread while it waits.
+    pub fn load_retrying(
+        make_store: impl Fn() -> Box<dyn SelectorStore>,
+        retry: LoadRetry,
+    ) -> Result<Self, SelectorError> {
+        let attempts = retry.attempts.max(1);
+        let mut attempt = 1;
+        loop {
+            match Self::load(make_store()) {
+                Ok(manager) => return Ok(manager),
+                Err(e) if attempt < attempts => {
+                    tracing::error!(
+                        attempt,
+                        attempts,
+                        error = %e,
+                        "boot-vector: the boot vector could not be read — retrying; nothing is seeded over it"
+                    );
+                    std::thread::sleep(retry.delay);
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Stage `bank` (with the `images` sealed into it, by part name) for
     /// `component_id` in the **in-memory** pending selection. The first
     /// `stage` since the last `seal`/`rollback` clones `current` as the base so
@@ -235,9 +286,48 @@ impl SystemBankManager {
     /// **Nothing is written** — neither PRIMARY nor SECONDARY changes. This is
     /// exactly why a reboot here boots the old selection.
     pub fn stage(&mut self, component_id: &str, bank: Bank, images: BTreeMap<String, ImageEntry>) {
-        let mut pending = self.pending.take().unwrap_or_else(|| self.current.clone());
+        self.pending = Some(self.staged(component_id, bank, images));
+    }
+
+    /// The pending selection a [`stage`](Self::stage) of these arguments
+    /// leaves.
+    fn staged(
+        &self,
+        component_id: &str,
+        bank: Bank,
+        images: BTreeMap<String, ImageEntry>,
+    ) -> BTreeMap<String, ComponentEntry> {
+        let mut pending = self.pending.clone().unwrap_or_else(|| self.current.clone());
         pending.insert(component_id.to_string(), ComponentEntry::new(bank, images));
-        self.pending = Some(pending);
+        pending
+    }
+
+    /// The header [`seal`](Self::seal) arms: armed at `armed_boot_id` (`None`
+    /// ⇒ unknown, stored as zero), no boots counted, no resolution.
+    fn armed_header(armed_boot_id: Option<&str>) -> Transaction {
+        Transaction {
+            armed_boot_id: armed_boot_id.map_or([0; 16], boot_id_digest),
+            trial_boots: 0,
+            counted_boot_id: [0; 16],
+            resolution: None,
+        }
+    }
+
+    /// Whether a [`stage`](Self::stage) of these arguments followed by a
+    /// [`seal`](Self::seal) at `armed_boot_id` can write now (see
+    /// [`SelectorStore::check_activate`]). Writes nothing and stages nothing;
+    /// run it before a step the seal must follow and that cannot be undone.
+    pub fn check_activate(
+        &self,
+        component_id: &str,
+        bank: Bank,
+        images: BTreeMap<String, ImageEntry>,
+        armed_boot_id: Option<&str>,
+    ) -> Result<(), SelectorError> {
+        self.store.check_activate(
+            &self.staged(component_id, bank, images),
+            &Self::armed_header(armed_boot_id),
+        )
     }
 
     /// Atomically promote the staged selection to PRIMARY (booted).
@@ -256,12 +346,7 @@ impl SystemBankManager {
         let Some(pending) = self.pending.clone() else {
             return Ok(false);
         };
-        let header = Transaction {
-            armed_boot_id: armed_boot_id.map_or([0; 16], boot_id_digest),
-            trial_boots: 0,
-            counted_boot_id: [0; 16],
-            resolution: None,
-        };
+        let header = Self::armed_header(armed_boot_id);
         let gen = self.store.activate(&pending, &header)?;
         self.pending = None;
         self.current = pending;
@@ -291,6 +376,13 @@ impl SystemBankManager {
             "boot-selector COMMIT → SECONDARY (PRIMARY copied to rollback floor)"
         );
         Ok(())
+    }
+
+    /// Whether [`commit`](Self::commit) can run now (see
+    /// [`SelectorStore::check_commit`]). Writes nothing; run it before a step
+    /// the commit must follow and that cannot be undone.
+    pub fn check_commit(&self) -> Result<(), SelectorError> {
+        self.store.check_commit()
     }
 
     /// Roll the booted (PRIMARY) selection back to the committed floor
@@ -426,6 +518,16 @@ impl SystemBankManager {
     /// from the committed floor (SECONDARY).
     pub fn is_trial(&self) -> bool {
         self.current != self.committed
+    }
+
+    /// Whether every component whose booted entry differs from its committed
+    /// one (either side absent counts) is among `ids`.
+    pub(crate) fn trial_only_in(&self, ids: &[&str]) -> bool {
+        self.current
+            .keys()
+            .chain(self.committed.keys())
+            .filter(|id| self.current.get(*id) != self.committed.get(*id))
+            .all(|id| ids.contains(&id.as_str()))
     }
 
     /// The generation of the currently-booted (PRIMARY) selection.
@@ -811,7 +913,7 @@ mod tests {
         };
         assert_eq!(m.transaction(), Some(&want));
         assert_eq!(
-            store.read_transaction(),
+            store.read_transaction().unwrap(),
             Some((m.generation(), want.clone())),
             "the header is recorded for the primary generation"
         );
@@ -823,7 +925,7 @@ mod tests {
             "the backup is a plain vector"
         );
         assert_eq!(
-            store.read_transaction(),
+            store.read_transaction().unwrap(),
             Some((m.generation(), want)),
             "header untouched by commit"
         );
@@ -843,7 +945,7 @@ mod tests {
         });
         let primary = store.read_primary().unwrap().unwrap();
         assert_eq!(primary.entries["vm1"].bank, Bank::A);
-        let (gen, t) = store.read_transaction().unwrap();
+        let (gen, t) = store.read_transaction().unwrap().unwrap();
         assert_eq!(gen, primary.generation);
         assert_eq!(t.resolution, resolved);
         assert_eq!(t.armed_boot_id, boot_id_digest("boot-a"), "ids kept");
@@ -855,7 +957,10 @@ mod tests {
         m.rollback(Reason::Verdict).unwrap();
         assert_eq!(store.write_count(), writes);
         assert_eq!(m.transaction().unwrap().resolution, resolved);
-        assert_eq!(store.read_transaction().unwrap().1.resolution, resolved);
+        assert_eq!(
+            store.read_transaction().unwrap().unwrap().1.resolution,
+            resolved
+        );
     }
 
     #[test]
@@ -914,7 +1019,7 @@ mod tests {
         let primary = store.read_primary().unwrap().unwrap();
         assert_eq!(primary.generation, gen, "same generation");
         assert_eq!(primary.entries["vm1"].bank, Bank::B, "same entries");
-        let (header_gen, t) = store.read_transaction().unwrap();
+        let (header_gen, t) = store.read_transaction().unwrap().unwrap();
         assert_eq!(header_gen, gen, "header recorded for the same generation");
         assert_eq!(t.trial_boots, 2);
         assert_eq!(t.counted_boot_id, boot_id_digest("boot-c"));
@@ -949,7 +1054,7 @@ mod tests {
         m.stage("vm1", Bank::B, BTreeMap::new());
         m.seal(None).unwrap();
         assert_eq!(m.generation(), 43);
-        assert_eq!(store.read_transaction().unwrap().0, 43);
+        assert_eq!(store.read_transaction().unwrap().unwrap().0, 43);
     }
 
     #[test]
@@ -1033,7 +1138,7 @@ mod tests {
         assert!(!m.is_trial());
         assert_eq!(m.transaction(), Some(&recorded));
         assert_eq!(
-            store.read_transaction(),
+            store.read_transaction().unwrap(),
             Some((1, recorded.clone())),
             "persisted for the restored generation"
         );
@@ -1076,7 +1181,7 @@ mod tests {
             secondary,
             "secondary untouched"
         );
-        let (gen, t) = store.read_transaction().unwrap();
+        let (gen, t) = store.read_transaction().unwrap().unwrap();
         assert_eq!(gen, m.generation());
         assert_eq!(t.trial_boots, 1);
         assert_eq!(t.counted_boot_id, boot_id_digest("boot-b"));
@@ -1109,7 +1214,7 @@ mod tests {
             store.read_primary().unwrap(),
             store.read_secondary().unwrap()
         );
-        assert_eq!(store.read_transaction().unwrap().0, 1);
+        assert_eq!(store.read_transaction().unwrap().unwrap().0, 1);
     }
 
     // --- over a boot stage record that routes part of the vector ---
@@ -1234,7 +1339,8 @@ mod tests {
                 resolution: None,
             }),
             &TestSigner,
-        );
+        )
+        .unwrap();
         std::fs::write(
             dir.join("transaction"),
             serde_json::to_vec_pretty(&blob).unwrap(),
@@ -1243,7 +1349,7 @@ mod tests {
         let file = std::fs::read(dir.join("transaction")).unwrap();
         let writes = record.write_count();
 
-        assert_eq!(store.read_transaction(), None);
+        assert_eq!(store.read_transaction().unwrap(), None);
         let m = SystemBankManager::load(Box::new(store.clone())).unwrap();
         assert!(m.transaction().is_none());
         assert_eq!(record.write_count(), writes);
@@ -1325,7 +1431,7 @@ mod tests {
             reader.read_secondary().unwrap(),
             vector(1, entries("vm2", Bank::A))
         );
-        assert_eq!(reader.read_transaction(), Some((2, header)));
+        assert_eq!(reader.read_transaction().unwrap(), Some((2, header)));
 
         // The slots are the named files, not the .tmp staging files.
         assert!(dir.join("primary").exists());

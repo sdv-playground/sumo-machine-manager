@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::types::{Bank, BankSet};
+#[cfg(feature = "test-seams")]
+use std::sync::{Arc, Mutex};
 
 /// The reference store, defined with the record adapter it is built from.
 pub use crate::boot_record::FileSelectorStore;
@@ -104,8 +106,11 @@ pub enum Outcome {
 pub enum Reason {
     /// A verdict from the caller.
     Verdict,
-    /// The node rolled itself back after the host-configured number of boots
-    /// while armed without a verdict.
+    /// The node rolled itself back after a host-configured number of boots
+    /// while armed without a verdict. Recorded only by older builds: a trial
+    /// now has no boot limit and nothing records this reason. Kept so a
+    /// header such a build wrote still verifies (the reason is inside the
+    /// signed digest) and loads as it was recorded.
     TrialBootLimit,
     /// The primary was restored to the committed copy outside the node's
     /// verdict path — the boot stage's rollback. Recorded by the manager at
@@ -175,7 +180,8 @@ pub struct Transaction {
 /// only when a transaction header is present:
 ///     u8 0x01, 16 bytes armed_boot_id, u8 trial_boots, 16 bytes counted_boot_id,
 ///     u8 resolution (0 none, 1 committed, 2 rolled_back),
-///     u8 reason (0 verdict, 1 trial_boot_limit, 2 boot_stage; 0 when no resolution)
+///     u8 reason (0 verdict, 1 trial_boot_limit [older builds only], 2 boot_stage;
+///         0 when no resolution)
 /// ```
 ///
 /// A blob without a header digests exactly as before the header existed.
@@ -268,33 +274,37 @@ impl SelectorBlob {
     }
 
     /// Build + sign a blob for `entries` (and `transaction`) at `generation`
-    /// using `signer`.
+    /// using `signer`. `Err` when the signer could not sign: there is no blob.
     pub fn signed(
         generation: u64,
         entries: BTreeMap<String, ComponentEntry>,
         transaction: Option<Transaction>,
         signer: &dyn Signer,
-    ) -> SelectorBlob {
+    ) -> Result<SelectorBlob, SignerError> {
         let sha256 = Self::compute_sha256(generation, &entries, transaction.as_ref());
-        let signature = signer.sign(&sha256);
-        SelectorBlob {
+        let signature = signer.sign(&sha256)?;
+        Ok(SelectorBlob {
             generation,
             entries,
             transaction,
             sha256,
             signature,
             selectors: None,
-        }
+        })
     }
 
     /// Verify both the embedded digest (recompute over the contents) and the
     /// signature over that digest. A blob whose `sha256` doesn't match its own
-    /// contents, or whose signature doesn't verify, is rejected. The legacy
+    /// contents, or whose signature doesn't verify, is `Ok(false)`; `Err` when
+    /// the signer could not decide — not a verdict on the blob. The legacy
     /// slot map plays no part.
-    pub fn is_valid(&self, signer: &dyn Signer) -> bool {
+    pub fn is_valid(&self, signer: &dyn Signer) -> Result<bool, SignerError> {
         let recomputed =
             Self::compute_sha256(self.generation, &self.entries, self.transaction.as_ref());
-        recomputed == self.sha256 && signer.verify(&self.sha256, &self.signature)
+        if recomputed != self.sha256 {
+            return Ok(false);
+        }
+        signer.verify(&self.sha256, &self.signature)
     }
 }
 
@@ -358,6 +368,9 @@ pub enum SelectorError {
     /// not run (or another failure that is not a filesystem error). Transient
     /// as far as the store knows: retry or fail, never read it as absent.
     Unreadable(String),
+    /// A copy could not be signed: the signer could not sign. Nothing was
+    /// written. Transient as far as the store knows: retry or fail.
+    Unsignable(String),
     /// A rollback found nothing to restore: no committed copy, or the primary
     /// already is the committed copy.
     NoTrial,
@@ -375,6 +388,7 @@ impl std::fmt::Display for SelectorError {
             SelectorError::Io(e) => write!(f, "boot vector store I/O error: {e}"),
             SelectorError::Serialize(e) => write!(f, "boot vector serialize error: {e}"),
             SelectorError::Unreadable(e) => write!(f, "boot vector record unreadable: {e}"),
+            SelectorError::Unsignable(e) => write!(f, "boot vector record unsignable: {e}"),
             SelectorError::NoTrial => write!(
                 f,
                 "nothing to roll back: the primary already is the committed copy"
@@ -441,10 +455,33 @@ pub trait SelectorStore: Send + Sync {
         entries: &BTreeMap<String, ComponentEntry>,
         header: &Transaction,
     ) -> Result<u64, SelectorError>;
+    /// Whether [`activate`](Self::activate) with these arguments can run now:
+    /// every read it makes before its first write succeeds and what it signs
+    /// can be signed, at the generation it would issue. Writes nothing. A
+    /// caller runs it before a step it cannot undo that the activation must
+    /// follow (a bank activator's physical switch), so a store that could not
+    /// activate fails the activation before that step. `Ok` by default, for a
+    /// store with nothing to check ahead.
+    fn check_activate(
+        &self,
+        _entries: &BTreeMap<String, ComponentEntry>,
+        _header: &Transaction,
+    ) -> Result<(), SelectorError> {
+        Ok(())
+    }
     /// secondary := primary (same generation) — "the trial is over, this is
     /// now the floor". Idempotent; `Ok` and a no-op without a primary, `Err`
     /// when the primary could not be read.
     fn commit(&self) -> Result<(), SelectorError>;
+    /// Whether [`commit`](Self::commit) can run now: every read it makes
+    /// succeeds and what it writes can be signed. Writes nothing. A caller
+    /// runs it before a step it cannot undo that the commit must follow (the
+    /// NV commit raises the security floor), so a store that could not commit
+    /// fails the verdict before that step. `Ok` by default, for a store with
+    /// nothing to check ahead.
+    fn check_commit(&self) -> Result<(), SelectorError> {
+        Ok(())
+    }
     /// primary := secondary, record `header` against the restored generation,
     /// and return that generation. The header is written before the primary.
     ///
@@ -457,8 +494,9 @@ pub trait SelectorStore: Send + Sync {
     /// generation, not on the primary's being monotonic.
     fn rollback(&self, header: &Transaction) -> Result<u64, SelectorError>;
     /// The transaction header and the generation it was recorded for, or
-    /// `None` when there is none (or it fails the store's check).
-    fn read_transaction(&self) -> Option<(u64, Transaction)>;
+    /// `None` when there is none (or it fails the store's check); `Err` when
+    /// the store could not read it — never to be treated as absent.
+    fn read_transaction(&self) -> Result<Option<(u64, Transaction)>, SelectorError>;
     /// Rewrite the header for `generation` without touching either copy.
     fn write_transaction(&self, generation: u64, header: &Transaction)
         -> Result<(), SelectorError>;
@@ -474,9 +512,65 @@ pub(crate) fn next_generation(primary: Option<&BootVector>, secondary: Option<&B
 /// The attestation seam: sign / verify the selector digest. The production impl
 /// is the HSM's selector-signing key; the test impl is a trivial deterministic
 /// transform.
+///
+/// Three outcomes, never folded into one another: a verdict on the signature
+/// (`Ok(true)` / `Ok(false)`), or `Err` — the signer could not decide or could
+/// not sign (unavailable, I/O, backend fault). A store reads a copy whose
+/// signature is `Ok(false)` as absent (and the host reseeds it); a copy it
+/// could not verify is an error, never absent, and nothing is written with a
+/// signature the signer did not produce.
 pub trait Signer: Send + Sync {
-    fn sign(&self, sha: &[u8; 32]) -> Vec<u8>;
-    fn verify(&self, sha: &[u8; 32], sig: &[u8]) -> bool;
+    /// The signature over `sha`, or `Err` when it could not be produced.
+    fn sign(&self, sha: &[u8; 32]) -> Result<Vec<u8>, SignerError>;
+    /// `Ok(true)`: `sig` is a valid signature over `sha`. `Ok(false)`: it is
+    /// not (malformed, empty, or for another digest or key). `Err`: the signer
+    /// could not decide.
+    fn verify(&self, sha: &[u8; 32], sig: &[u8]) -> Result<bool, SignerError>;
+}
+
+/// A [`Signer`] that could not sign or could not decide a verification.
+#[derive(Debug)]
+pub struct SignerError {
+    message: String,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl SignerError {
+    /// An error described by `message`.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// An error described by `message`, caused by `source`.
+    pub fn with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+impl std::fmt::Display for SignerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            Some(source) => write!(f, "{}: {source}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+impl std::error::Error for SignerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -519,9 +613,9 @@ impl SelectorStore for StubSelectorStore {
         tracing::warn!("{STUB_STORE_WARNING}");
         Ok(0)
     }
-    fn read_transaction(&self) -> Option<(u64, Transaction)> {
+    fn read_transaction(&self) -> Result<Option<(u64, Transaction)>, SelectorError> {
         tracing::warn!("{STUB_STORE_WARNING}");
-        None
+        Ok(None)
     }
     fn write_transaction(
         &self,
@@ -540,17 +634,17 @@ impl SelectorStore for StubSelectorStore {
 pub struct StubSigner;
 
 impl Signer for StubSigner {
-    fn sign(&self, _sha: &[u8; 32]) -> Vec<u8> {
+    fn sign(&self, _sha: &[u8; 32]) -> Result<Vec<u8>, SignerError> {
         tracing::warn!(
             "TODO(hsm): SystemBankState selector signing unimplemented — returning empty signature"
         );
-        Vec::new()
+        Ok(Vec::new())
     }
-    fn verify(&self, _sha: &[u8; 32], _sig: &[u8]) -> bool {
+    fn verify(&self, _sha: &[u8; 32], _sig: &[u8]) -> Result<bool, SignerError> {
         tracing::warn!(
             "TODO(hsm): SystemBankState selector verification unimplemented — accepting signature"
         );
-        true
+        Ok(true)
     }
 }
 
@@ -679,11 +773,12 @@ impl SelectorStore for InMemorySelectorStore {
         self.count_write();
         Ok(generation)
     }
-    fn read_transaction(&self) -> Option<(u64, Transaction)> {
-        self.transaction
+    fn read_transaction(&self) -> Result<Option<(u64, Transaction)>, SelectorError> {
+        Ok(self
+            .transaction
             .lock()
             .expect("transaction poisoned")
-            .clone()
+            .clone())
     }
     fn write_transaction(
         &self,
@@ -715,11 +810,104 @@ impl TestSigner {
 
 #[cfg(feature = "test-seams")]
 impl Signer for TestSigner {
-    fn sign(&self, sha: &[u8; 32]) -> Vec<u8> {
-        Self::transform(sha)
+    fn sign(&self, sha: &[u8; 32]) -> Result<Vec<u8>, SignerError> {
+        Ok(Self::transform(sha))
     }
-    fn verify(&self, sha: &[u8; 32], sig: &[u8]) -> bool {
-        sig == Self::transform(sha).as_slice()
+    fn verify(&self, sha: &[u8; 32], sig: &[u8]) -> Result<bool, SignerError> {
+        Ok(sig == Self::transform(sha).as_slice())
+    }
+}
+
+/// What a [`SwitchableSigner`] answers.
+#[cfg(feature = "test-seams")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SignerMode {
+    /// As [`TestSigner`].
+    #[default]
+    Ok,
+    /// `sign` returns a signature that does not verify; `verify` is `Ok(false)`.
+    Invalid,
+    /// Every call is `Err`: the signer could not sign or decide.
+    Unavailable,
+}
+
+/// [`TestSigner`] whose answers are switched at run time — separately for
+/// `sign` and `verify`, and optionally to [`SignerMode::Unavailable`] after a
+/// number of calls — so a test can take the signer away at any call inside a
+/// verb. Clones share the switches.
+#[cfg(feature = "test-seams")]
+#[derive(Debug, Default, Clone)]
+pub struct SwitchableSigner {
+    sign: Arc<Mutex<SignerMode>>,
+    verify: Arc<Mutex<SignerMode>>,
+    /// Calls left before every call is unavailable; `None` = no limit.
+    calls_left: Arc<Mutex<Option<usize>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "test-seams")]
+impl SwitchableSigner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set both `sign` and `verify` to `mode`, and clear any call limit.
+    pub fn set(&self, mode: SignerMode) {
+        self.set_sign(mode);
+        self.set_verify(mode);
+        *self.calls_left.lock().expect("signer poisoned") = None;
+    }
+
+    /// Set what `sign` answers.
+    pub fn set_sign(&self, mode: SignerMode) {
+        *self.sign.lock().expect("signer poisoned") = mode;
+    }
+
+    /// Set what `verify` answers.
+    pub fn set_verify(&self, mode: SignerMode) {
+        *self.verify.lock().expect("signer poisoned") = mode;
+    }
+
+    /// Answer the next `calls` calls (sign or verify) as set, then every call
+    /// as [`SignerMode::Unavailable`] until [`Self::set`].
+    pub fn unavailable_after(&self, calls: usize) {
+        *self.calls_left.lock().expect("signer poisoned") = Some(calls);
+    }
+
+    /// Calls made so far (sign and verify).
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn mode(&self, set: &Mutex<SignerMode>) -> SignerMode {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut left = self.calls_left.lock().expect("signer poisoned");
+        match left.as_mut() {
+            Some(0) => SignerMode::Unavailable,
+            Some(n) => {
+                *n -= 1;
+                *set.lock().expect("signer poisoned")
+            }
+            None => *set.lock().expect("signer poisoned"),
+        }
+    }
+}
+
+#[cfg(feature = "test-seams")]
+impl Signer for SwitchableSigner {
+    fn sign(&self, sha: &[u8; 32]) -> Result<Vec<u8>, SignerError> {
+        match self.mode(&self.sign) {
+            SignerMode::Ok => TestSigner.sign(sha),
+            SignerMode::Invalid => Ok(vec![0; 32]),
+            SignerMode::Unavailable => Err(SignerError::new("test signer unavailable")),
+        }
+    }
+    fn verify(&self, sha: &[u8; 32], sig: &[u8]) -> Result<bool, SignerError> {
+        match self.mode(&self.verify) {
+            SignerMode::Ok => TestSigner.verify(sha, sig),
+            SignerMode::Invalid => Ok(false),
+            SignerMode::Unavailable => Err(SignerError::new("test signer unavailable")),
+        }
     }
 }
 
@@ -894,10 +1082,21 @@ pub mod contract {
             "activate issues above both copies: {g1} > {floor}"
         );
         assert_eq!(primary_view(), want(g1, &e1));
-        assert_eq!(store.read_transaction(), Some((g1, h1)));
+        assert_eq!(
+            store
+                .read_transaction()
+                .expect("the store reads the header"),
+            Some((g1, h1))
+        );
 
         let g2 = store.activate(&e2, &h2).expect("activate e2");
         assert!(g2 > g1, "a second activate issues higher: {g2} > {g1}");
+
+        // check_commit passes on a store that can commit, and writes nothing.
+        let committed = secondary_view();
+        store.check_commit().expect("check_commit");
+        assert_eq!(primary_view(), want(g2, &e2));
+        assert_eq!(secondary_view(), committed, "check_commit writes nothing");
 
         // commit copies the primary to the secondary, idempotently.
         store.commit().expect("commit");
@@ -910,7 +1109,12 @@ pub mod contract {
 
         // write_transaction changes the header and neither copy.
         store.write_transaction(g2, &h3).expect("write_transaction");
-        assert_eq!(store.read_transaction(), Some((g2, h3)));
+        assert_eq!(
+            store
+                .read_transaction()
+                .expect("the store reads the header"),
+            Some((g2, h3))
+        );
         assert_eq!(primary_view(), primary);
         assert_eq!(secondary_view(), primary);
 
@@ -920,7 +1124,12 @@ pub mod contract {
         assert_eq!(store.rollback(&h5).expect("rollback"), g2);
         assert_eq!(primary_view(), secondary_view());
         assert_eq!(primary_view(), primary);
-        assert_eq!(store.read_transaction(), Some((g2, h5.clone())));
+        assert_eq!(
+            store
+                .read_transaction()
+                .expect("the store reads the header"),
+            Some((g2, h5.clone()))
+        );
 
         // Nothing left to restore.
         assert!(store.rollback(&h5).is_err(), "rollback without a trial");

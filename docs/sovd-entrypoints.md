@@ -6,7 +6,9 @@ diagnostics-and-OTA HTTP API the sumo stack exposes under `/vehicle/v1/...`
 wire). The wire is built from the **SOVDd library** (`sovd-core` traits +
 `sovd-api` router); sumo-mm adds the `x-*` vendor routes on top (the
 three-layer rule — SOVDd stays spec-pure, vendor extensions live here in
-`component_mgr::sovd::routes`). This doc inventories every place in the
+`component_mgr::sovd::routes`). Like SOVDd's own routes, every vendor route is
+served on both trees: the spec base `/v1/...` and the legacy `/vehicle/v1/...`
+(e.g. `POST /v1/operations/x-update-commit/executions`). This doc inventories every place in the
 workspace that **binds a port and serves** that API, so "which server is this?"
 has one answer.
 
@@ -52,10 +54,27 @@ repo — that serve the **same** wire from the **same** route library.
 - **Serves:** the host-owned components `host-os`, `vm1`, `vm2`, `hsm` (built via
   `component_factory::build_component`), the standard SOVD surface from
   `sovd_api::create_router`, plus the sumo vendor routes —
-  `hsm_router` (HSM key inventory + `x-csr`) and `update_state_router`
-  (`x-ota-update-state`). See `services/vm-sovd/src/main.rs`.
+  `hsm_router` (HSM key inventory + `x-csr`), `update_state_router`
+  (`x-ota-update-state`) and `node_verdict_router` (node-level
+  `x-update-commit` / `x-update-rollback` operations, same set as the gateway).
+  See `plain_router` in `services/vm-sovd/src/main.rs`.
 - **Bind / port:** `0.0.0.0:4000` by default; override with `--bind <addr>` or a
   positional bind-addr (`services/vm-sovd/src/main.rs`).
+- **Node topology (opt-in, both modes):** `--node-id <id>` (`--node-name <name>`,
+  default the id) serves `/v1` as SOVDd node `<id>` only (SOVDd v0.1.12,
+  hierarchical-only): the components are its subcomponents
+  (`/v1/components/<id>/subcomponents/<component>/...`) and the node-level
+  resources (`status`, `updates`, `operations` — the node verdict ops among
+  them — and `data`, e.g. `x-update-state`) sit under `/v1/components/<id>/...`;
+  the node document carries the identification below as `x-identification`.
+  The flat member and root node-level forms answer 404 naming the node form
+  (`/v1`, `/v1/components`, `/v1/docs` stay); without a node, and on
+  `/vehicle/v1`, nothing changes. A node id that is also a component's id
+  fails startup.
+- **mDNS identification:** `--identification <id>` verbatim, or
+  `--identification-prefix <prefix>` for `<prefix>-<first 16 hex of the ECU
+  id>` (the hsm component's device id, what `x-ecu-id` serves; without an hsm
+  component or ECU id it warns and falls through). `--identification` wins.
 - **Launched by:** `example/run.sh` (alongside the `hsm-sim-service` link-B
   backend and `vhsm-ssd`). Connect-only to the
   pre-spawned link-B HSM backend via `--backend-socket`. Also run in host mode
@@ -79,10 +98,9 @@ repo — that serve the **same** wire from the **same** route library.
   proxying). Secure-by-default authorizer is always wired (`src/main.rs`).
 - **Bind / port:** `cfg.bind`, default `0.0.0.0:4000` (`src/config.rs`);
   `axum::serve` in `src/main.rs`.
-- **Launched by:** a respawn loop with a TOML config — the `qemu-cvc` Docker
-  entrypoint (`examples/qemu-cvc/entrypoint.sh`) for the emulated device, and
-  the host runtime bundle's `start.sh` → `bank_a/start.sh` on the rig
-  (deployed by the `tower-provision` example).
+- **Launched by:** a respawn loop with a TOML config — a QEMU Docker
+  entrypoint for the emulated device, and the host runtime bundle's
+  `start.sh` → `bank_a/start.sh` on target hardware.
 
 ---
 

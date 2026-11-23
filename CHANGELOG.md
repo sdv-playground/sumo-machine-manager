@@ -20,6 +20,308 @@ what a consumer has to touch when it moves its pin.
   alone. One that is installed but cannot be read, or whose presence cannot be checked (an I/O
   or permission error), refuses the envelope; it used to fall back to the factory key. A keystore provisioned without a key authority keeps the factory key, as
   before. **Host-facing:** none.
+- **Bank activation pre-flights the boot-vector seal.** `activate` ran the bank's activator (the
+  physical switch: a raw-partition write, a firmware load, record routing) and then sealed the boot
+  vector; a seal that failed — a signer that is unavailable — left the new content physically in
+  place while NV and the boot vector said old. The boot vector now proves first that its seal can
+  run: `IvdBankProvider::activate` checks before the activator, `PartitionBankProvider::activate`
+  before routing its records, and a vector that cannot seal fails the activation with
+  `boot-vector activate cannot run — nothing activated: …`, nothing physical done. The engine still
+  rolls NV back after a failed activation, as before. Not covered: a signer that answers the
+  pre-flight and fails at the seal, and record writes that fail for other reasons; the activation
+  then fails after the physical step as before. With a healthy signer every file written and every
+  decision are unchanged (one extra, discarded signature per activation).
+
+  Host-facing: `SelectorStore::check_activate(entries, header)`, a default method returning `Ok`
+  (a store with nothing to check ahead needs no change; `RecordSelectorStore` implements it), and
+  `SystemBankManager::check_activate(component_id, bank, images, armed_boot_id)`.
+- **Software HSM (`hsm-sim-backend`): a delivered leaf certificate must certify the device's key.**
+  A leaf was installed as long as it named an EC-P256 slot of the envelope; its public key was never
+  compared with the device's key, so a leaf for another key installed and every verifying TLS client
+  then failed. `provision` now refuses the whole envelope with `PayloadInvalid`, before anything is
+  written (first provision and re-provision), when a leaf does not parse as an X.509 certificate,
+  names a slot with no key on the device, or certifies a key other than the slot's on-disk public
+  key — as the hardware backends do. A leaf for the device's own key installs as before.
+
+  Host-facing: none required. A tower that delivered a leaf for a key the device does not hold now
+  gets an error instead of an unusable TLS identity.
+- **A trial has no boot limit.** A trial ends only by the tester's verdict, or by the boot stage's own
+  rollback when the node cannot start (still recorded at the next start as `rolled_back` /
+  `boot_stage`). The host-set trial boot limit and the node rollback it triggered are removed. Trial
+  boots are still counted per distinct boot id and reported (`trial_boots` in the update state);
+  the count decides nothing. A header an older build resolved at its limit still verifies, loads and
+  reports `reason: "trial_boot_limit"`; nothing writes that reason any more.
+
+  Host-facing: `NodeCoordinator::with_trial_boot_limit` and `trial_boot_limit()` are gone, and
+  `NodeBootOutcome` keeps only `trial_boots` (`limit`, `bailed_out` and `errors` are gone). An
+  embedder deletes its `with_trial_boot_limit(..)` call, its own config key for the limit (a config
+  file that still carries the key keeps loading as long as the config struct does not deny unknown
+  fields), and any use of the removed `NodeBootOutcome` fields. The update-state body on `/v1`
+  (`x-ota-update-state`, `x-update-state`) no longer carries `trial_boot_limit`; the frozen legacy
+  `/vehicle/v1` tree keeps it, always `null`, and its `/docs` are unchanged.
+
+- **vhsm-ssd guest enrolment: an HSM sign error no longer burns the enrolment token.** The
+  enrolment signer returned an empty signature when the HSM could not sign; the CWT minted from it
+  was handed to the guest and the one-shot bootstrap token (or the ENROLL_ASSISTED pending flag) was
+  consumed and saved, so a guest that enrolled during an HSM outage held a certificate that never
+  validates and had to be re-armed. Now the signer reports the error and ENROLL / ENROLL_ASSISTED
+  fail before anything is consumed or saved; the guest gets status `Internal` with no
+  `AuthFailReason` payload (a server fault, not a verdict) and retries the same enrolment once the
+  HSM answers. No wire format change.
+  Host-facing: `vhsm_server::cert::EcuSigner::sign` now returns `Result<Vec<u8>, SignError>` (new
+  `vhsm_server::cert::SignError`; `MintError` gains `Sign`). An out-of-tree `EcuSigner` returns
+  `Err(SignError(..))` where it cannot sign, never a placeholder signature. Hosts that run the
+  `vhsm-ssd` binary change nothing.
+- **component-mgr HSM authorizer: an HSM read error is no longer "no key", and a degraded authorizer
+  is no longer cached.** `build_authorizer_now` read the issuer anchors and the delegation root with
+  `.ok()` and the ECU id with `unwrap_or_default()`, and `CachedHsmAuthorizer` cached the result
+  keyed only on the keystore manifest mtime. An HSM read error therefore fell through to the build's
+  `extra_anchor` (the development recovery key) as if the keystore had no key, made the expected
+  audience `""` (accepted from every trusted issuer and on the delegated path), and was cached: a
+  build made during an outage kept restart and factory reset locked until a keystore push or a
+  process restart. Now a keystore read is present, absent (`KeyNotFound` / `NotProvisioned`, and
+  `NotSupported` for a provider without a trust-anchor store) or unreadable, and:
+  - an unreadable anchor is not trusted; on a build with an `extra_anchor` that anchor still stands
+    in for the ids it answers, now as a logged decision, so a development unit with an unreadable
+    HSM stays factory-resettable;
+  - a build that saw any read error serves that request only and is never cached: the next request
+    rebuilds, so the unit heals by itself once the HSM answers. Degraded states are logged at error
+    when they start or change and at info when they end, not per request;
+  - no ECU id (device key absent or unreadable): no keystore issuer and no delegate is trusted. On a
+    build with an `extra_anchor`, the issuer ids it answers (resolved keystore first, as everywhere)
+    are trusted with audience `""` for the factory reset only (such a unit is badly provisioned and
+    the factory reset clears it); any other request that carries a token, an ECU restart included,
+    is refused. Before, every trusted issuer was accepted with `aud: ""` for every
+    capability.
+
+  A healthy unit accepts and rejects the same tokens as before and caches as before.
+  Host-facing: no API change (`HsmAuthorizerDeps`, `ExtraAnchor`, `build_authorizer_now` keep their
+  signatures). To reset a development unit whose ECU id cannot be read, mint the recovery token with
+  `aud` = `""` (`x-ecu-id` cannot answer in that state).
+- **Software HSM (`hsm-sim-backend`): a re-provision keeps the device's own keys and state.** A
+  second keystore envelope on a provisioned unit (a keystore update, a certificate renewal) built the
+  new keystore in an empty directory, so every device-generated key was created anew — a new
+  `device-decrypt` key (new ECU id), a new `ivd-signing` key (existing bank IVD manifests and the boot
+  selector stopped verifying), a new `tls-identity` (the leaf delivered in that envelope certified the
+  old key), new `iam-signing` / `jwt-signing` keys and a new `storage-key` — and the monotonic
+  counters (the time floor among them), `bootstrap.yaml` and every other file the envelope does not
+  write were dropped. Now the new keystore starts as a copy of everything the envelope does not own,
+  modes kept, and the envelope is applied on top: the manifest, identities, security version,
+  trust-anchor and guest-identity public keys and pinned roots are rewritten (one the new envelope no
+  longer carries is gone); device keys are never regenerated when they exist; a leaf for a kept key
+  stays until a new one is delivered. The keystore swap is still two renames; a start now resolves
+  whatever an interrupted swap left (`SimHsm::recover_interrupted_reprovision`, run first by
+  `ensure_device_keys`), to the complete old or the complete new keystore, instead of generating a
+  new identity into the gap.
+  The monotonic counters, `provision_state`, the manifest, the identities file, every key and
+  certificate file and `bootstrap.yaml` are written atomically (temp file, fsync, rename, directory
+  fsync), so a crash can no longer leave a torn counter that reads as corrupt. A device key created
+  in a keystore that is already provisioned or holds other device keys is logged at ERROR, naming the
+  role and what stops verifying; a fresh keystore keeps its first-boot info line.
+
+  No on-disk format change: an existing keystore reads as before, and a first provision on a fresh
+  keystore writes the same files with the same modes. Host-facing: none required.
+- **node-shell `reset`** (feature `factory-reset`, on by default): the factory-reset engine, moved from
+  a node manager unchanged in behaviour — `WipeTargets`, `component_dirs`,
+  `write_provisioned_banks`, `ensure_under_root`, `execute_wipe` (same order, log dir last),
+  `ShutdownKind`, `FactoryResetState`, `handle` (precheck, authorize, clear flash sessions, resolve,
+  before-wipe, stop guests, synchronous wipe, schedule shutdown; `{ok, wiped, errors}` with 200/500;
+  403 `factory-reset denied: …`) and `route` for `sovd_router`'s slot. The node supplies `ResetHooks`
+  (`resolve`, `precheck`, `before_wipe`, `stop_guests`, `schedule_shutdown`).
+
+  Host-facing: delete your engine copy, implement the hooks, mount `route(..)`. The moved lines now log
+  with the `node_shell::reset` target (texts unchanged).
+- **component-mgr** feature `dev-recovery-anchor` (off by default):
+  `sovd::hsm_authorizer::dev_recovery_anchor()`, the factory-key SPKI for a deployment's development
+  `extra_anchor`. Host-facing: delete your copy; enable the feature only where that anchor is meant to
+  be compiled in.
+
+  Verified: the node manager's served API (540 probes) and a real wipe of a fixture tree are identical before
+  and after the move.
+- **Boot vector: a signer that could not decide is an error, never a verdict.** Before, an HSM error
+  while signing wrote an empty signature and reported success, and an HSM error while verifying read the
+  copy as absent: `commit` returned `Ok` without committing the boot vector (after NV had already
+  committed and raised the security floor), `activate` overwrote the primary at generation 1, and a
+  start with the HSM not answering reseeded a good boot vector from NV (generation, sealed images,
+  transaction header and trial count lost). Now `Ok(false)` (invalid) and `Err` (could not decide)
+  stay apart everywhere: an invalid copy still reads as absent and is reseeded, as before; one that
+  could not be verified fails the read and every verb that reads it; every write verb signs before its
+  first write and fails with nothing written; `IvdBankProvider::commit` checks the boot vector can
+  commit (`SystemBankManager::check_commit`) before the NV commit, so an HSM that is down fails the
+  verdict with NV untouched. If the HSM goes away between the NV commit and the boot-vector commit the
+  error says NV is committed and the vector still in trial; a retry completes it, and so does
+  `seed_selector` at the next start (it commits a vector whose every trial row NV has committed at that
+  bank, with nothing in trial in NV), so a trial boot limit cannot roll a committed update back. A trial
+  boot count or boot-stage rollback record that cannot be written is logged at error level and leaves
+  the previous header. With a working signer every file written and every decision is unchanged.
+
+  A copy that could not be verified is `SelectorError::Unreadable`; one that could not be signed is
+  the new `SelectorError::Unsignable`. A node binary can tell both from a filesystem error.
+
+  Host-facing: `Signer::sign` returns `Result<Vec<u8>, SignerError>` and `Signer::verify`
+  `Result<bool, SignerError>` (`SignerError::new` / `with_source`, exported next to `Signer`): an
+  implementor returns `Ok(false)` only for a signature that does not verify and `Err` whenever it could
+  not decide or sign — never an empty signature or `false` for an error. `HsmSelectorSigner` does this
+  (an empty or non-DER signature is `Ok(false)` without asking the HSM; every HSM error is `Err`); a
+  node carrying its own copy of it must make the same change or switch to
+  `component_mgr::boot_selector_signer`. `SelectorBlob::signed` / `is_valid` return `Result`.
+  `SelectorStore::read_transaction` and `BootRecord::legacy_transaction` return
+  `Result<Option<_>, SelectorError>`; `SelectorStore::check_commit` is new (default `Ok`). Test seams:
+  `SwitchableSigner` / `SignerMode`. `SystemBankManager::load` (and `MachineRegistryBuilder::build`)
+  now also fails while the signer cannot verify: a node binary must fail closed — retry with
+  `SystemBankManager::load_retrying(make_store, LoadRetry { attempts, delay })` (default 5 x 1 s, blocks
+  the thread) for every store, not only a record store, then exit non-zero; never seed or serve over a
+  vector it could not load. The boot stage has already chosen the bank, so a manager that does not
+  start changes nothing on disk.
+
+  Verified: a scripted sequence (seed, activate, trial boots, commit, activate, rollback, reseed after
+  deleting the primary) with the deterministic test signer writes byte-identical files and returns
+  identical values before and after.
+
+## v0.1.29 — SOVDd v0.1.12: /v1 execute is orchestrated without x-ota-control
+
+Tag on `b6d65fb` (2026-11-23), PR #68.
+
+- deps: SOVDd v0.1.12 (every pin) — on `/v1`, `PUT …/updates/{id}/execute` without `x-ota-control` runs
+  orchestrated (was 400 `incomplete-request`); `x-ota-control=orchestrated` stays accepted, any other
+  value still answers 400 before anything runs; the component capabilities drop `x-update.control`,
+  `/v1/docs` lists execute without parameters, `/.well-known/sovd-extensions` marks `x-ota-control`
+  `implied_on: ["/v1"]`. `/vehicle/v1` unchanged. Host-facing: move SOVDd pins together; a `/v1` client
+  may omit `x-ota-control`; a test pinning the 400 on a missing parameter, or reading
+  `x-update.control`, must change.
+
+## v0.1.28 — node-shell: mDNS goodbye on shutdown and before a reset
+
+Tag on `bbccd45` (2026-11-23), PR #67.
+
+- node-shell: `SovdListener::serve` caps the graceful drain at 5 s on both transports (HTTP warns
+  `graceful shutdown timed out after 5 s; closing`) and sends the mDNS/DNS-SD goodbye before it returns
+  — as vm-sovd does. Host-facing: `serve` now returns `Result<(), String>` (it no longer hands back the
+  advertiser guard); drop the `_mdns` binding. `SovdListener::advertisement()` hands out an
+  `Advertisement` whose `withdraw()` sends the goodbye now (idempotent, blocking ~1 s, shared with
+  `serve`), for a reset path that ends the process without the shutdown notify.
+
+## v0.1.27 — node-shell: the SOVD node application shell; SOVDd v0.1.11
+
+Tag on `b532cb7` (2026-11-23), PR #66.
+
+- deps: SOVDd v0.1.11 (every pin) — the whole status family of a node server is node-level (an embedder's
+  `/v1/status/x-boot-id` is served at `/v1/components/{node}/status/x-boot-id`; its root form is 404),
+  node-level data/operations collections, `CapabilityExtensions::with_v1_paths`. Host-facing: move SOVDd
+  pins together; a test reading root-form status paths on a node server must use the node form.
+- **node-shell** (new crate): the SOVD node application shell, moved from a node manager
+  unchanged in behaviour — `ShellConfig` (the `bind`, `sovd_tls`, `sovd_mdns`, `identification`,
+  `identification_prefix`, `node` keys, for `#[serde(flatten)]`), `read_ecu_id` /
+  `configured_identification` / `node_topology` / `sovd_state`, `sovd_router` (SOVDd's router + vendor
+  routes + `status/x-boot-id`, node status, `status/restart`, legacy restart stub, factory-reset route,
+  node topology outermost), `restart_route` / `restart_response`, `SovdListener` (HTTPS from the HSM
+  tls-identity leaf else HTTP, mDNS on both, graceful serve), `shutdown_on_signals`, and
+  `capability_extensions` (`/v1`-only docs rows for the node status and boot id).
+
+  Host-facing: a node binary flattens `ShellConfig` into its config (keys unchanged), deletes its
+  copies, and supplies its backends, vendor routes, boot id, HSM, restart authorizer + reset action and
+  factory-reset handler (verified: the node manager's served API identical before/after the move, 504
+  probes on both trees).
+
+## v0.1.26 — app leaf items from the node manager
+
+Tag on `e1c84e3` (2026-11-23), PR #65.
+
+- **app leaf items** moved from a node manager, unchanged in behaviour (sumo is the pattern: a
+  device manager wires these, it does not carry its own copy):
+  - component-factory: `HsmKeystoreActivator` (the `hsm-keystore` marker: no-op activate,
+    `RequiresEcuReset`) and `builtin_activator(marker)` for the markers sumo implements;
+    `partition_parts(&ComponentSpec)` (the `parts:` list as `PartitionPart`s).
+  - component-mgr: `sovd::ident_data` (read-only `identData` entities over KEY=VALUE version records; the
+    `IdentDataSpec` serde shape is the `ident_data:` config entry) and `boot_selector_signer`
+    (`HsmSelectorSigner` / `make_selector_signer`).
+  - machine-mgr: `node_update::read_or_create_boot_id(path)` (the file-backed per-boot nonce that
+    survives a process re-exec); machine-mgr now depends on `uuid`.
+
+  Host-facing: none required. A node binary deletes its copies and calls these; activator markers,
+  config keys and wire responses are unchanged (verified on target hardware: the served API of the node manager
+  built on this is identical to the build before the move, 408 requests on both trees).
+
+## v0.1.25 — SOVDd v0.1.10: node topology, part read-back, orchestrated execute on /v1
+
+Tag on `852a261` (2026-11-22), PR #61, #62, #63, #64.
+
+- vm-sovd: SOVDd v0.1.7 — the SOVD server is advertised over mDNS / DNS-SD on both transports
+  (`accessurl` scheme `http` before enrolment, `https` once the tls-identity leaf is live), using the
+  sovd-mdns v0.1.6 identity rule: hostname from the TLS leaf, else `--identification`, else the OS
+  hostname; TXT `identification` is `--identification` verbatim when set. New
+  `--identification <id>` option; `--no-mdns` still opts out. SIGTERM / ctrl-c now shut the server
+  down gracefully (5 s cap) on both transports, so the DNS-SD goodbye is sent before exit.
+  Host-facing: none (all SOVDd pins move to v0.1.6; no API change consumed).
+- deps: SOVDd v0.1.8 (every pin: machine-mgr, component-mgr, component-factory, vm-sovd) — opt-in
+  node topology on /v1, `DiagnosticBackend::read_part` behind `GET /v1/…/updates/{id}/bulk-data/{part}`,
+  sovd-mdns leaf instance only from a plain `<label>.local` SAN. Host-facing: none by the bump itself.
+- deps: SOVDd v0.1.10 (every pin) — on /v1, `PUT …/updates/{id}/execute` requires
+  `?x-ota-control=orchestrated` (400 `incomplete-request` without it; `automated` answers 409), and
+  component capabilities carry `x-update.control`; node-level data is served under the node
+  (`/v1/components/{node}/data/x-update-state`). Hierarchical-only on /v1 for a node server:
+  `/v1/components` lists the node alone, and the flat member and root node-level forms answer 404
+  naming the node form (no more Deprecation/Link headers); node-less servers and the legacy tree
+  unchanged. vm-sovd: with `--node-id`, the node document carries the unit's identification
+  (`--identification`, else the `--identification-prefix` result) as `x-identification`.
+  Host-facing: /v1 clients send `x-ota-control=orchestrated` on execute, and address a node
+  server's members and node-level resources by the node form only.
+- component-mgr: `read_part` streams a part back exactly as received. The manifest is kept as
+  received and reads back while its update lasts. A payload reads back only when the bank holds it as
+  received (no decryption, no decompression ran, or a re-sent part whose bytes hash to the staged
+  digest); one kept decoded answers 501 (NotSupported: the part exists, its received form is not
+  kept). In practice fleet payloads are encrypted and compressed, so only the manifest reads back —
+  the intended use: a client checks that its manifest upload landed before uploading the payloads.
+  404 for an unknown file_id and once the part is no longer kept (update aborted / deleted, target
+  bank wiped, next update started, bank file gone). New `BankProvider::open_payload_reader` (default
+  Unsupported; file banks implement it); `InstallRouterDiag` forwards `read_part`. Host-facing: hosts
+  that wrap the backend by hand forward `read_part`; a custom `BankProvider` may implement
+  `open_payload_reader`.
+- component-mgr: no vendor route renders a URL in a JSON body, so node-form requests get the root/flat
+  form's body unchanged (pinned by a test); pull-update's root-form 202 `Location` is rewritten by
+  SOVDd. New `gateway::gateway_router_with_state(machine, state, authorizer, trust_anchor)` — the
+  gateway over a caller-built `AppState` (taken as is), so the same state can be handed to
+  `sovd_api::with_node_topology`; `gateway_router` is unchanged for its callers.
+- vm-sovd: `--node-id <id>` / `--node-name <name>` (default the id) serve /v1 as SOVDd node `<id>`
+  in both modes (the final router wrapped in `with_node_topology`; a bad or colliding id fails
+  startup). `--identification-prefix <prefix>`: identification `<prefix>-<first 16 hex of the ECU
+  id>` (the hsm device id `x-ecu-id` serves), warning and falling through when there is none;
+  `--identification` wins.
+
+## v0.1.24 — SOVDd v0.1.5: restart outcome hooks; host ecu_reset refused as NotSupported
+
+Tag on `108b6e1` (2026-11-21), PR #59, #60.
+
+- component-mgr: a host component whose reset is the node's (`RequiresEcuReset`, no vm-service, not
+  single-bank) refuses `ecu_reset` with NotSupported (501, message pointing to the node-level
+  status/restart) instead of pretending; `restart_supported()` predicate (PR #59).
+- deps: SOVDd v0.1.5 — /v1 `status/restart` answers 202 with no body and `Location: {entity}/status`
+  (ISO 17978-3 §7.19.4); 405 precondition-not-fulfilled and no `restart` href when
+  `supports_restart()` is false; 501 → `vendor-specific`/`not-supported` on both trees.
+  component-mgr implements `supports_restart()` (= `restart_supported()`) and
+  `ecu_reset_outcome()` (`Initiated` for vm-service guests, `Completed` otherwise);
+  `InstallRouterDiag` delegates both. Host-facing: hosts that wrap the backend by hand must forward
+  the two new methods.
+
+## v0.1.23 — SOVDd v0.1.4: /v1 tree on the node, node-level verdict_scope; vendor routes on both trees
+
+Tag on `d0f9740` (2026-11-17), PR #49, #50, #51, #52.
+
+- vm-sovd: the plain (non-gateway) server mounts `node_verdict_router`, so `x-update-commit` /
+  `x-update-rollback` (and the `x-ota-*-trials` aliases) are served there too, not only by `--gateway`.
+- deps: SOVDd v0.1.4 — entity API under /v1 beside /vehicle/v1, node-level /updates, root
+  capability document, x-update.verdict_scope. component-mgr authorizers return
+  `sovd_api::AuthError`; a valid token without rights for the entity answers 403
+  insufficient-access-rights on /v1 (401 on /vehicle/v1 as before).
+- component-mgr: components whose bank provider requires an ECU reset report
+  `VerdictScope::Node`; SOVDd refuses per-update verdicts on them under /v1 (409 naming the node
+  operations) and serves verdict_scope "node"; /vehicle/v1 unchanged.
+- component-mgr: every vendor route (`update_state_router`, `hsm_router`, `node_verdict_router`,
+  `pull_update_router`, `device_id_router`) is served under /v1 as well as /vehicle/v1, so the
+  node operations SOVDd's /v1 409 names (`POST /v1/operations/x-update-commit/executions`, …)
+  resolve. A /v1 pull-update POST answers with a /v1 `Location`; /vehicle/v1 unchanged.
+  `pull_update::PULL_OP_PATH` is replaced by `pull_update::pull_op_path(tree)`, and
+  `execute_pull_update` takes the request's op path (used as the authz `path`).
 
 ## v0.1.22 — QNX: loopback only for wired hostdevs, console follows serial_log
 
@@ -31,13 +333,13 @@ Tag on `bb2ad95` (2026-11-04), PR #36, #37.
   (relative to the bank dir) gets no loopback and logs `… not wired as /dev/… in qvm.conf —
   file-backed, no loopback`, so it stays openable by the pre-launch verify and the bank seeder
   instead of `EBUSY`. A conf that wires `/dev` nodes, and an unreadable conf, keep the old behaviour
-  (PR #36, LYNXION-9004).
+  (PR #36).
 - vm-mgr (QNX runner): the per-VM qvm console file follows the VM's `serial_log` in
   vm-service.yaml when it is an absolute path; a relative one is ignored with a warning; without
-  one it stays `/mnt/common-rw/log/<name>-console.log` (PR #37, LYNXION-9028).
+  one it stays `/mnt/common-rw/log/<name>-console.log` (PR #37).
 
 Host-facing: no config change needed on a host that has `/mnt/common-rw`. A host without it (e.g.
-the CVC 21-layout secure-boot host) sets `serial_log: /var/log/mmgr/<vm>-console.log` per VM. A
+a secure-boot host) sets `serial_log: /var/log/mmgr/<vm>-console.log` per VM. A
 bank whose `qvm.conf` uses `hostdev <file` for its rootfs and declares `partitions: []` needs a host
 with this version; an older host still holds the file behind its loopback and qvm fails with
 `EBUSY`.

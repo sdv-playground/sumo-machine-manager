@@ -2,7 +2,7 @@
 //!
 //! A [`ScoreLogBridge`] is a [`tracing_subscriber::Layer`] that forwards every
 //! `tracing` event into the installed `score_log` global logger. It lets a host
-//! binary that already emits with `tracing` (supernova, and eventually
+//! binary that already emits with `tracing` (the node manager, and eventually
 //! vm-service / vhsm-ssd / vm-sovd) adopt `score_log` as the logging facade
 //! WITHOUT rewriting its `tracing::info!(…)` call sites — the `score_log`
 //! recorder installed via [`score_log::set_global_logger`] (S-CORE's
@@ -212,7 +212,7 @@ mod tests {
 
         let sub = tracing_subscriber::registry().with(ScoreLogBridge::new());
         tracing::subscriber::with_default(sub, || {
-            tracing::info!(target: "supernova", "hello {}", 42);
+            tracing::info!(target: "node", "hello {}", 42);
             tracing::warn!(target: "vm_service", "vm down");
         });
 

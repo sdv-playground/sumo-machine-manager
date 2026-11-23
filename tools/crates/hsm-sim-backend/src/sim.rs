@@ -13,6 +13,8 @@
 ///   encrypted to device public key. Verified with built-in factory key.
 /// - **Re-provision** (has keys): envelope signed with Key Authority,
 ///   encrypted to device public key. `security_version` must exceed current.
+///   Replaces what the envelope owns and keeps everything else — the device's
+///   own keys above all (see `carry_over`).
 ///
 /// # Keystore layout (written by provision)
 ///
@@ -121,8 +123,12 @@ impl SimHsm {
         let current = self.read_monotonic_at(handle)?;
         let raised = current.max(new_value);
         if raised != current {
-            std::fs::write(self.monotonic_path(handle), raised.to_string().as_bytes())
-                .map_err(|e| HsmError::KeystoreError(format!("write monotonic counter: {e}")))?;
+            write_atomic(
+                &self.monotonic_path(handle),
+                raised.to_string().as_bytes(),
+                false,
+            )
+            .map_err(|e| HsmError::KeystoreError(format!("write monotonic counter: {e}")))?;
         }
         Ok(raised)
     }
@@ -130,6 +136,56 @@ impl SimHsm {
     /// Keys subdirectory.
     pub(crate) fn keys_dir(&self) -> PathBuf {
         self.keystore_path.join("keys")
+    }
+
+    /// Resolve what an interrupted re-provision left behind, so a start never
+    /// sees a missing or half-built keystore. A re-provision builds the new
+    /// keystore in `<keystore>.tmp`, renames the live one to `<keystore>.bak`,
+    /// renames `.tmp` to the live path (the commit point), then removes
+    /// `.bak`. Each state a stop can leave, and its outcome:
+    ///
+    /// | live | `.tmp` | `.bak` | stopped | outcome |
+    /// |---|---|---|---|---|
+    /// | yes | yes | – | while building `.tmp`, or before the first rename | old: `.tmp` removed |
+    /// | yes | – | yes | after the commit rename, before removing `.bak` | new: `.bak` removed |
+    /// | no | yes | yes | between the two renames | old: `.bak` renamed back, `.tmp` removed |
+    /// | no | no | yes | (never left by `provision`; `.tmp` lost) | old: `.bak` renamed back |
+    /// | no | yes | no | (never left by `provision`; `.bak` lost) | `.tmp` renamed to live: it holds the carried device keys, and if its build was cut short it has no manifest (written last) and reads as unprovisioned |
+    ///
+    /// No leftovers (a healthy or a fresh keystore) is a no-op. Device keys are
+    /// in every outcome, since `.tmp` starts as a copy of them.
+    pub fn recover_interrupted_reprovision(&self) -> Result<(), HsmError> {
+        let live = &self.keystore_path;
+        let staging = live.with_extension("tmp");
+        let backup = live.with_extension("bak");
+        let discard = |dir: &Path| {
+            if dir.exists() {
+                tracing::warn!(dir = %dir.display(), "removing a leftover of an interrupted re-provision");
+                if let Err(e) = std::fs::remove_dir_all(dir) {
+                    tracing::warn!(dir = %dir.display(), error = %e, "could not remove re-provision leftover");
+                }
+            }
+        };
+        let restore = |from: &Path| {
+            tracing::warn!(
+                from = %from.display(),
+                keystore = %live.display(),
+                "keystore missing after an interrupted re-provision; restoring it"
+            );
+            std::fs::rename(from, live).map_err(|e| {
+                HsmError::KeystoreError(format!("restore keystore from {}: {e}", from.display()))
+            })
+        };
+        if live.exists() {
+            discard(&staging);
+            discard(&backup);
+        } else if backup.exists() {
+            restore(&backup)?;
+            discard(&staging);
+        } else if staging.exists() {
+            restore(&staging)?;
+        }
+        Ok(())
     }
 
     /// Ensure the device-side EC-P256 key pairs exist. Called on first use.
@@ -140,12 +196,32 @@ impl SimHsm {
     /// (b) IVD-sign its own pre-provisioning bank dirs (ivd-signing).
     /// The provisioning envelope is allowed to leave these slots
     /// device-generated; `generate_missing_local_keys` skips existing files,
-    /// so the factory-bootstrapped material persists across re-provision.
+    /// and a re-provision carries every device key into the new keystore, so
+    /// the factory-bootstrapped material persists across re-provision.
+    ///
+    /// First resolves a re-provision the process did not finish
+    /// ([`Self::recover_interrupted_reprovision`]), so a key is never generated
+    /// into the gap a keystore swap leaves.
     #[cfg(feature = "crypto")]
     pub fn ensure_device_keys(&self) -> Result<(), HsmError> {
+        self.recover_interrupted_reprovision()?;
         std::fs::create_dir_all(self.keys_dir())
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
         restrict_dir_700(&self.keys_dir());
+
+        // A keystore that is provisioned or already holds a device key belongs
+        // to an established device: a key created in it now is not first boot.
+        let material = |role: &KeyRole| {
+            let ext = match role.key_type() {
+                KeyType::Aes256 => "bin",
+                _ => "priv",
+            };
+            self.keys_dir().join(format!("{}.{ext}", role.key_id()))
+        };
+        let established = self.manifest_path().exists()
+            || KeyRole::mandatory_roles()
+                .iter()
+                .any(|r| r.is_device_generated() && material(r).exists());
 
         for role in KeyRole::mandatory_roles() {
             if !role.is_device_generated() {
@@ -163,9 +239,13 @@ impl SimHsm {
                 let mut bytes = vec![0u8; 32];
                 use rand::RngCore;
                 rand::rngs::OsRng.fill_bytes(&mut bytes);
-                std::fs::write(&bin_path, &bytes)
+                write_atomic(&bin_path, &bytes, false)
                     .map_err(|e| HsmError::KeystoreError(format!("write {key_id} key: {e}")))?;
-                tracing::info!(key_id = %key_id, "device-side AES-256 key generated (first boot)");
+                if established {
+                    log_device_key_replaced(*role);
+                } else {
+                    tracing::info!(key_id = %key_id, "device-side AES-256 key generated (first boot)");
+                }
                 continue;
             }
 
@@ -178,16 +258,41 @@ impl SimHsm {
             let scalar = sk.to_bytes();
             let pk = sk.verifying_key().to_encoded_point(false);
 
-            write_pem_ec_private(&priv_path, &scalar)
-                .map_err(|e| HsmError::KeystoreError(format!("write {key_id} priv: {e}")))?;
-
+            // Public half first: `.priv` is what marks the pair present, so a
+            // crash between the two writes regenerates the pair rather than
+            // leaving a private key with no public half.
             let pub_path = self.keys_dir().join(format!("{key_id}.pub"));
             write_pem_ec_public(&pub_path, pk.as_bytes())
                 .map_err(|e| HsmError::KeystoreError(format!("write {key_id} pub: {e}")))?;
 
-            tracing::info!(key_id = %key_id, "device-side key pair generated (first boot)");
+            write_pem_ec_private(&priv_path, &scalar)
+                .map_err(|e| HsmError::KeystoreError(format!("write {key_id} priv: {e}")))?;
+
+            if established {
+                log_device_key_replaced(*role);
+            } else {
+                tracing::info!(key_id = %key_id, "device-side key pair generated (first boot)");
+            }
         }
         Ok(())
+    }
+
+    /// Build the re-provisioned keystore for `ks` in `<keystore>.tmp`: what the
+    /// live keystore holds beyond the envelope's files ([`carry_over`]), then
+    /// `ks` written on top, all of it synced to disk. Returns the staging path;
+    /// the live keystore is untouched.
+    fn stage_reprovision(&self, ks: &HsmKeystore) -> Result<PathBuf, HsmError> {
+        let staging = self.keystore_path.with_extension("tmp");
+        // The live keystore exists here, so this only clears leftovers.
+        self.recover_interrupted_reprovision()?;
+        let staged = carry_over(&self.keystore_path, &staging, CarryLevel::Root)
+            .and_then(|()| SimHsm::new(staging.clone()).write_keystore(ks))
+            .and_then(|()| sync_tree(&staging));
+        if let Err(e) = staged {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        Ok(staging)
     }
 
     /// Load the current security_version from provision_state.
@@ -207,8 +312,12 @@ impl SimHsm {
     }
 
     fn save_state(&self, security_version: u64) -> Result<(), HsmError> {
-        std::fs::write(self.state_path(), security_version.to_string().as_bytes())
-            .map_err(|e| HsmError::KeystoreError(format!("write provision_state: {e}")))?;
+        write_atomic(
+            &self.state_path(),
+            security_version.to_string().as_bytes(),
+            false,
+        )
+        .map_err(|e| HsmError::KeystoreError(format!("write provision_state: {e}")))?;
         Ok(())
     }
 
@@ -244,17 +353,65 @@ impl SimHsm {
         // root). Public trust material, not a device key.
         self.write_trust_anchors(&ks.trust_anchors, &keys_dir)?;
 
-        self.write_manifest(&ks.slots)?;
         self.write_identities(ks)?;
         self.save_state(ks.security_version)?;
+        // The manifest last: its presence is what reads as provisioned, so a
+        // keystore interrupted before this point is still unprovisioned and the
+        // same envelope can simply be applied again.
+        self.write_manifest(&ks.slots)?;
 
+        Ok(())
+    }
+
+    /// `Ok` when every leaf in `certs` parses as an X.509 certificate whose
+    /// subject public key is the key this device holds for the leaf's slot:
+    /// the live `{key_id}.pub`, what `get_public_key_der` returns and what the
+    /// CA signed the leaf for. `PayloadInvalid` for a leaf that does not
+    /// parse, names a slot with no key here, or certifies another key — a
+    /// leaf installed for another key would make every verifying TLS client
+    /// fail. Reads only.
+    #[cfg(feature = "crypto")]
+    fn check_leaf_certs(&self, certs: &[hsm::payload::LeafCert]) -> Result<(), HsmError> {
+        use p256::pkcs8::DecodePublicKey;
+        use x509_cert::der::{Decode, Encode};
+        for c in certs {
+            let refuse = |why: String| {
+                HsmError::PayloadInvalid(format!("leaf cert for '{}' {why}", c.key_id))
+            };
+            let leaf_spki = x509_cert::Certificate::from_der(&c.certificate)
+                .and_then(|cert| cert.tbs_certificate.subject_public_key_info.to_der())
+                .map_err(|e| refuse(format!("does not parse as an X.509 certificate: {e}")))?;
+            let pub_path = self.keys_dir().join(format!("{}.pub", c.key_id));
+            let pem = match std::fs::read_to_string(&pub_path) {
+                Ok(pem) => pem,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(refuse("names a slot with no key on this device".into()))
+                }
+                Err(e) => {
+                    return Err(HsmError::KeystoreError(format!(
+                        "read {}: {e}",
+                        pub_path.display()
+                    )))
+                }
+            };
+            let device = decode_pem(&pem, "PUBLIC KEY").and_then(|der| {
+                p256::PublicKey::from_public_key_der(&der).map_err(|e| {
+                    HsmError::KeystoreError(format!("parse {}: {e}", pub_path.display()))
+                })
+            })?;
+            if p256::PublicKey::from_public_key_der(&leaf_spki).ok() != Some(device) {
+                return Err(refuse("does not match the on-disk public key".into()));
+            }
+        }
         Ok(())
     }
 
     /// Write each delivered leaf certificate to `{key_id}.cert` (PEM). The
     /// cert is a public artifact bound to a device-generated key whose
     /// private half never left the HSM; `payload::decode` has already
-    /// checked each names an EC-P256 slot in this keystore.
+    /// checked each names an EC-P256 slot in this keystore, and `provision`
+    /// that each certifies the key the device holds for it
+    /// ([`Self::check_leaf_certs`]).
     fn write_leaf_certs(
         &self,
         certs: &[hsm::payload::LeafCert],
@@ -370,12 +527,14 @@ impl SimHsm {
                     let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
                     let scalar = sk.to_bytes();
                     let pk = sk.verifying_key().to_encoded_point(false);
-                    write_pem_ec_private(&priv_path, &scalar).map_err(|e| {
-                        HsmError::KeystoreError(format!("generate {} priv: {e}", slot.key_id,))
-                    })?;
+                    // Public half first, as in `ensure_device_keys`: `.priv`
+                    // marks the pair present.
                     let pub_path = keys_dir.join(format!("{}.pub", slot.key_id));
                     write_pem_ec_public(&pub_path, pk.as_bytes()).map_err(|e| {
                         HsmError::KeystoreError(format!("generate {} pub: {e}", slot.key_id,))
+                    })?;
+                    write_pem_ec_private(&priv_path, &scalar).map_err(|e| {
+                        HsmError::KeystoreError(format!("generate {} priv: {e}", slot.key_id,))
                     })?;
                     tracing::info!(key_id = %slot.key_id, "generated EC-P256 keypair locally");
                 }
@@ -387,7 +546,7 @@ impl SimHsm {
                     let mut bytes = vec![0u8; 32];
                     use rand::RngCore;
                     rand::rngs::OsRng.fill_bytes(&mut bytes);
-                    std::fs::write(&path, &bytes).map_err(|e| {
+                    write_atomic(&path, &bytes, false).map_err(|e| {
                         HsmError::KeystoreError(format!("write generated {}: {e}", path.display(),))
                     })?;
                     tracing::info!(key_id = %slot.key_id, "generated AES-256 key locally");
@@ -416,8 +575,7 @@ impl SimHsm {
     ///
     /// Format: `key_id type key_path cert_path [allowed_guests=...] [allowed_ops=...]`
     fn write_manifest(&self, slots: &[KeySlot]) -> Result<(), HsmError> {
-        let mut f = std::fs::File::create(self.manifest_path())
-            .map_err(|e| HsmError::KeystoreError(format!("create manifest: {e}")))?;
+        let mut f = Vec::new();
 
         for slot in slots {
             let type_str = match slot.key_kind {
@@ -458,14 +616,14 @@ impl SimHsm {
             writeln!(f).map_err(|e| HsmError::KeystoreError(format!("write manifest: {e}")))?;
         }
 
-        Ok(())
+        write_atomic(&self.manifest_path(), &f, false)
+            .map_err(|e| HsmError::KeystoreError(format!("write manifest: {e}")))
     }
 
     /// Write the identities file for guest registration.
     fn write_identities(&self, ks: &HsmKeystore) -> Result<(), HsmError> {
         let path = self.keystore_path.join("identities");
-        let mut f = std::fs::File::create(&path)
-            .map_err(|e| HsmError::KeystoreError(format!("create identities: {e}")))?;
+        let mut f = Vec::new();
 
         for id in &ks.identities {
             // Write identity public key as PEM file
@@ -476,7 +634,8 @@ impl SimHsm {
                 .map_err(|e| HsmError::KeystoreError(format!("write identities: {e}")))?;
         }
 
-        Ok(())
+        write_atomic(&path, &f, false)
+            .map_err(|e| HsmError::KeystoreError(format!("write identities: {e}")))
     }
 
     /// Parse the manifest file to extract key-slot information.
@@ -743,26 +902,32 @@ impl HsmProvider for SimHsm {
             "provisioning HSM keystore"
         );
 
-        // For re-provision: write to temp dir, then swap atomically
+        // Every delivered leaf must certify the key this device holds for its
+        // slot; one that does not refuses the whole envelope, before anything
+        // is written.
+        #[cfg(feature = "crypto")]
+        self.check_leaf_certs(&keystore.certificates)?;
+
+        // Re-provision: build the new keystore beside the live one, starting
+        // from everything the envelope does not own (the device's keys, its
+        // counters, bootstrap.yaml, ...), then swap it in. See
+        // `recover_interrupted_reprovision` for the swap's crash states.
         if !is_factory {
-            let tmp_dir = self.keystore_path.with_extension("tmp");
-            let orig_path = self.keystore_path.clone();
+            let live = self.keystore_path.clone();
+            let backup = live.with_extension("bak");
+            let staging = self.stage_reprovision(&keystore)?;
 
-            // Temporarily point at the temp dir for writing
-            self.keystore_path = tmp_dir.clone();
-            let result = self.write_keystore(&keystore);
-            self.keystore_path = orig_path.clone();
-
-            result?;
-
-            // Atomic swap: rename old → .bak, new → current
-            let bak = orig_path.with_extension("bak");
-            let _ = std::fs::remove_dir_all(&bak);
-            std::fs::rename(&orig_path, &bak)
+            // The swap. The second rename is the commit point.
+            std::fs::rename(&live, &backup)
                 .map_err(|e| HsmError::KeystoreError(format!("backup old keystore: {e}")))?;
-            std::fs::rename(&tmp_dir, &orig_path)
-                .map_err(|e| HsmError::KeystoreError(format!("swap keystore: {e}")))?;
-            let _ = std::fs::remove_dir_all(&bak);
+            if let Err(e) = std::fs::rename(&staging, &live) {
+                let _ = std::fs::rename(&backup, &live);
+                return Err(HsmError::KeystoreError(format!("swap keystore: {e}")));
+            }
+            if let Some(parent) = live.parent() {
+                sync_dir(parent);
+            }
+            let _ = std::fs::remove_dir_all(&backup);
         } else {
             self.write_keystore(&keystore)?;
         }
@@ -835,23 +1000,8 @@ impl HsmProvider for SimHsm {
             std::fs::create_dir_all(parent)
                 .map_err(|e| HsmError::ProcessError(format!("mkdir {}: {e}", parent.display())))?;
         }
-        let tmp = path.with_extension("yaml.tmp");
-        {
-            use std::io::Write as _;
-            let mut f = std::fs::File::create(&tmp)
-                .map_err(|e| HsmError::ProcessError(format!("create {}: {e}", tmp.display())))?;
-            f.write_all(yaml.as_bytes())
-                .map_err(|e| HsmError::ProcessError(format!("write {}: {e}", tmp.display())))?;
-            f.sync_data()
-                .map_err(|e| HsmError::ProcessError(format!("sync {}: {e}", tmp.display())))?;
-        }
-        std::fs::rename(&tmp, &path).map_err(|e| {
-            HsmError::ProcessError(format!(
-                "rename {} → {}: {e}",
-                tmp.display(),
-                path.display()
-            ))
-        })?;
+        write_atomic(&path, yaml.as_bytes(), false)
+            .map_err(|e| HsmError::ProcessError(format!("write {}: {e}", path.display())))?;
 
         tracing::info!(
             vm_id = %vm_id,
@@ -895,19 +1045,8 @@ impl HsmProvider for SimHsm {
         if removed {
             let yaml = serde_yaml::to_string(&doc)
                 .map_err(|e| HsmError::ProcessError(format!("serialise: {e}")))?;
-            let tmp = path.with_extension("yaml.tmp");
-            {
-                use std::io::Write as _;
-                let mut f = std::fs::File::create(&tmp).map_err(|e| {
-                    HsmError::ProcessError(format!("create {}: {e}", tmp.display()))
-                })?;
-                f.write_all(yaml.as_bytes())
-                    .map_err(|e| HsmError::ProcessError(format!("write {}: {e}", tmp.display())))?;
-                f.sync_data()
-                    .map_err(|e| HsmError::ProcessError(format!("sync {}: {e}", tmp.display())))?;
-            }
-            std::fs::rename(&tmp, &path)
-                .map_err(|e| HsmError::ProcessError(format!("rename: {e}")))?;
+            write_atomic(&path, yaml.as_bytes(), false)
+                .map_err(|e| HsmError::ProcessError(format!("write {}: {e}", path.display())))?;
             tracing::info!(vm_id, "cleared enrolled record");
         }
         Ok(removed)
@@ -1255,13 +1394,160 @@ fn write_pem_file(path: &Path, label: &str, der: &[u8]) -> Result<(), HsmError> 
     }
     writeln!(pem, "-----END {label}-----").unwrap();
 
-    std::fs::write(path, pem.as_bytes())
-        .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))?;
     // Private key material → owner-only (0600). Public keys / certs stay readable.
-    if label.contains("PRIVATE") {
-        restrict_file_600(path);
+    write_atomic(path, pem.as_bytes(), label.contains("PRIVATE"))
+        .map_err(|e| HsmError::KeystoreError(format!("write {}: {e}", path.display())))
+}
+
+/// Replace `path` with `data` so that a crash leaves either the old content or
+/// the new, never a torn file: write a sibling `{name}.tmp`, fsync it, rename it
+/// over `path`, fsync the directory. `private` restricts the file to 0600
+/// (`restrict_file_600`) before it becomes visible under `path`; otherwise it
+/// keeps the mode a plain create gives it.
+pub(crate) fn write_atomic(path: &Path, data: &[u8], private: bool) -> std::io::Result<()> {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        if private {
+            restrict_file_600(&tmp);
+        }
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        sync_dir(dir);
     }
     Ok(())
+}
+
+/// Report a device-generated key that `ensure_device_keys` had to create in an
+/// established keystore: the device's identity or attestation for `role` is now
+/// a different key, and whatever trusted the old one stops verifying.
+#[cfg(feature = "crypto")]
+fn log_device_key_replaced(role: KeyRole) {
+    let breaks = match role {
+        KeyRole::DeviceDecryption => {
+            "the ECU id (the digest of this key) changed and envelopes encrypted to the old key can no longer be decrypted"
+        }
+        KeyRole::IvdSigning => {
+            "existing bank IVD manifests and the boot selector, signed with the old key, no longer verify"
+        }
+        KeyRole::TlsIdentity => "the installed TLS leaf certificate no longer matches the key",
+        KeyRole::Storage => "data encrypted under the old storage key can no longer be decrypted",
+        _ => "anything signed with the old key no longer verifies",
+    };
+    tracing::error!(
+        key_id = %role.key_id(),
+        "device key {} was missing from a keystore that is provisioned or holds other device keys, \
+         and has been created anew: the device's identity/attestation for this role changed; {breaks}",
+        role.key_id(),
+    );
+}
+
+/// Where [`carry_over`] is in the keystore tree; what a re-provision owns
+/// differs per level.
+#[derive(Clone, Copy)]
+enum CarryLevel {
+    Root,
+    Keys,
+    Other,
+}
+
+/// Create `to` and copy into it everything under the live keystore `from` that
+/// a re-provision does not rewrite from its envelope, keeping every directory's
+/// and file's mode. Per file kind:
+///
+/// | file | on re-provision |
+/// |---|---|
+/// | `manifest`, `identities`, `provision_state` | rewritten from the envelope |
+/// | `keys/roots/{anchor_id}.cert` (pinned CA roots) | rewritten; a root the envelope no longer carries is gone |
+/// | `keys/{id}.pub` without `keys/{id}.priv` (trust-anchor slot, guest identity) | rewritten; gone if the envelope no longer carries it |
+/// | device keys: `keys/{id}.priv` + `.pub`, `.bin`, `.aes128.bin`, `.hmac256.bin`, `.ed25519.priv` + `.ed25519.pub` | carried, never regenerated |
+/// | `keys/{id}.cert` beside a carried `keys/{id}.priv` | carried; replaced when the envelope delivers a leaf for that key |
+/// | `keys/{id}.cert` without `keys/{id}.priv` | not carried (nothing writes one) |
+/// | `monotonic_*`, `bootstrap.yaml`, any other file or directory | carried verbatim |
+/// | sockets, FIFOs | not carried: they belong to a running process, not to the keystore |
+fn carry_over(from: &Path, to: &Path, level: CarryLevel) -> Result<(), HsmError> {
+    let err = |p: &Path, e: std::io::Error| {
+        HsmError::KeystoreError(format!("stage keystore {}: {e}", p.display()))
+    };
+    std::fs::create_dir(to).map_err(|e| err(to, e))?;
+    let mode = std::fs::metadata(from).map_err(|e| err(from, e))?;
+    std::fs::set_permissions(to, mode.permissions()).map_err(|e| err(to, e))?;
+    for entry in std::fs::read_dir(from).map_err(|e| err(from, e))? {
+        let entry = entry.map_err(|e| err(from, e))?;
+        let name = entry.file_name();
+        if envelope_owned(from, &name.to_string_lossy(), level) {
+            continue;
+        }
+        let (src, dst) = (entry.path(), to.join(&name));
+        let meta = std::fs::metadata(&src).map_err(|e| err(&src, e))?;
+        if meta.is_dir() {
+            let next = match level {
+                CarryLevel::Root if name == "keys" => CarryLevel::Keys,
+                _ => CarryLevel::Other,
+            };
+            carry_over(&src, &dst, next)?;
+        } else if meta.is_file() {
+            std::fs::copy(&src, &dst).map_err(|e| err(&src, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `dir/name` is rewritten from the envelope on re-provision (the
+/// table on [`carry_over`]).
+fn envelope_owned(dir: &Path, name: &str, level: CarryLevel) -> bool {
+    match level {
+        CarryLevel::Root => matches!(name, "manifest" | "identities" | "provision_state"),
+        CarryLevel::Keys => {
+            if name == "roots" {
+                return true;
+            }
+            match name
+                .strip_suffix(".pub")
+                .or_else(|| name.strip_suffix(".cert"))
+            {
+                Some(stem) => !dir.join(format!("{stem}.priv")).exists(),
+                None => false,
+            }
+        }
+        CarryLevel::Other => false,
+    }
+}
+
+/// fsync every file and directory under `dir`, so a staged keystore is on disk
+/// before it is swapped in.
+fn sync_tree(dir: &Path) -> Result<(), HsmError> {
+    let err = |p: &Path, e: std::io::Error| {
+        HsmError::KeystoreError(format!("sync keystore {}: {e}", p.display()))
+    };
+    for entry in std::fs::read_dir(dir).map_err(|e| err(dir, e))? {
+        let entry = entry.map_err(|e| err(dir, e))?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| err(&path, e))?;
+        if kind.is_dir() {
+            sync_tree(&path)?;
+        } else if kind.is_file() {
+            std::fs::File::open(&path)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| err(&path, e))?;
+        }
+    }
+    sync_dir(dir);
+    Ok(())
+}
+
+/// Best-effort fsync of a directory, so the renames in it are durable. Not every
+/// filesystem accepts an fsync on a directory handle; the file data itself is
+/// already synced by the caller.
+fn sync_dir(dir: &Path) {
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
 }
 
 /// Best-effort: restrict a keystore directory to the owner (0700) so other local
@@ -1864,5 +2150,807 @@ mod tests {
         let yaml = std::fs::read_to_string(keystore.join("bootstrap.yaml")).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed["pending"]["vm9"]["ttl_secs"].as_u64(), Some(9999));
+    }
+
+    /// Run `f` and return the events it logged on this thread (level, fields).
+    /// One process-wide subscriber records into a per-thread buffer, so tests
+    /// running in parallel neither see each other's events nor race on
+    /// callsite interest the way a scoped subscriber per test does.
+    #[cfg(feature = "crypto")]
+    fn capture_logs(f: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        use std::cell::RefCell;
+        type Events = Vec<(tracing::Level, String)>;
+        thread_local!(static CAPTURED: RefCell<Option<Events>> = const { RefCell::new(None) });
+        struct Capture;
+        struct Fields<'a>(&'a mut String);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={v:?} ", f.name()));
+            }
+        }
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                CAPTURED.with(|c| {
+                    if let Some(events) = c.borrow_mut().as_mut() {
+                        let mut fields = String::new();
+                        event.record(&mut Fields(&mut fields));
+                        events.push((*event.metadata().level(), fields));
+                    }
+                });
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| tracing::subscriber::set_global_default(Capture).unwrap());
+        CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        f();
+        CAPTURED.with(|c| c.borrow_mut().take().unwrap())
+    }
+
+    /// A fresh keystore's device keys are first boot: info, no error.
+    #[test]
+    #[cfg(feature = "crypto")]
+    fn first_boot_device_keys_log_info_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hsm = SimHsm::new(tmp.path().to_path_buf());
+        let logs = capture_logs(|| hsm.ensure_device_keys().unwrap());
+        assert!(
+            logs.iter().all(|(l, _)| *l != tracing::Level::ERROR),
+            "{logs:?}"
+        );
+        assert!(logs
+            .iter()
+            .any(|(l, m)| *l == tracing::Level::INFO && m.contains("(first boot)")));
+    }
+
+    /// A device key missing from a keystore that holds other device keys (or is
+    /// provisioned) is created, as before, and reported at ERROR naming the
+    /// role and what stops verifying.
+    #[test]
+    #[cfg(feature = "crypto")]
+    fn device_key_created_in_an_established_keystore_logs_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hsm = SimHsm::new(tmp.path().to_path_buf());
+        hsm.ensure_device_keys().unwrap();
+        std::fs::remove_file(tmp.path().join("keys/ivd-signing.priv")).unwrap();
+        std::fs::remove_file(tmp.path().join("keys/storage-key.bin")).unwrap();
+
+        let logs = capture_logs(|| hsm.ensure_device_keys().unwrap());
+
+        assert!(tmp.path().join("keys/ivd-signing.priv").exists());
+        assert!(tmp.path().join("keys/storage-key.bin").exists());
+        let errors: Vec<_> = logs
+            .iter()
+            .filter(|(l, _)| *l == tracing::Level::ERROR)
+            .map(|(_, m)| m)
+            .collect();
+        assert_eq!(errors.len(), 2, "{logs:?}");
+        assert!(errors[0].contains("ivd-signing") && errors[0].contains("boot selector"));
+        assert!(errors[1].contains("storage-key") && errors[1].contains("identity/attestation"));
+        assert!(!logs.iter().any(|(_, m)| m.contains("first boot")));
+    }
+
+    /// What a crash between writing a counter's temp file and renaming it
+    /// leaves on disk: the counter file untouched and a (possibly torn)
+    /// `{name}.tmp` beside it. The counter reads its old value, and the next
+    /// ratchet replaces the leftover.
+    #[test]
+    fn torn_counter_write_is_never_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hsm = SimHsm::new(dir.path().to_path_buf());
+        let floor = KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR);
+        hsm.raise_monotonic(floor, 10).unwrap();
+        let file = hsm.monotonic_path(floor.get());
+        let mut tmp = file.file_name().unwrap().to_os_string();
+        tmp.push(".tmp");
+        let tmp = file.with_file_name(tmp);
+        for torn in [&b""[..], b"2", b"20"] {
+            std::fs::write(&tmp, torn).unwrap();
+            assert_eq!(hsm.read_monotonic(floor).unwrap(), 10);
+        }
+        assert_eq!(hsm.raise_monotonic(floor, 15).unwrap(), 15);
+        assert_eq!(
+            SimHsm::new(dir.path().into())
+                .read_monotonic(floor)
+                .unwrap(),
+            15
+        );
+        assert!(
+            !tmp.exists(),
+            "the ratchet's own temp file was renamed away"
+        );
+    }
+
+    /// `write_atomic` keeps today's modes: a private file is 0600, any other
+    /// gets the plain-create mode, and no temp file is left behind.
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_keeps_file_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        let create_mode = std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777;
+
+        let public = dir.path().join("a.pub");
+        write_atomic(&public, b"pub", false).unwrap();
+        let private = dir.path().join("a.priv");
+        write_atomic(&private, b"priv", true).unwrap();
+        write_atomic(&private, b"priv2", true).unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&public), create_mode);
+        assert_eq!(mode(&private), 0o600);
+        assert_eq!(std::fs::read(&private).unwrap(), b"priv2");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "temp files left: {left:?}");
+    }
+
+    /// Provisioning through the real `HsmProvider::provision`: signed +
+    /// encrypted SUIT envelopes, the factory anchor for the first one and the
+    /// key authority for the next. Key material is compared for equality only
+    /// and never printed.
+    #[cfg(all(feature = "crypto", feature = "suit"))]
+    mod through_provision {
+        use super::*;
+        use coset::CborSerializable;
+        use sumo_offboard::cose_key::CoseKey;
+        use sumo_offboard::recipient::Recipient;
+        use sumo_offboard::{encryptor, keygen, ImageManifestBuilder};
+
+        /// A time-floor value far above any leaf `notBefore` a test issues, so a
+        /// re-provision's legitimate ratchet is a no-op and "unchanged" is exact.
+        pub(super) const FLOOR: u64 = 4_000_000_000;
+
+        fn signer(scalar: &[u8], public: &[u8]) -> CoseKey {
+            let key = coset::CoseKeyBuilder::new_ec2_priv_key(
+                coset::iana::EllipticCurve::P_256,
+                public[1..33].to_vec(),
+                public[33..65].to_vec(),
+                scalar.to_vec(),
+            )
+            .algorithm(coset::iana::Algorithm::ES256)
+            .build();
+            CoseKey::from_cose_key_bytes(&key.to_vec().unwrap()).unwrap()
+        }
+
+        /// The off-device key authority: (scalar, uncompressed public).
+        pub(super) fn key_authority() -> (Vec<u8>, Vec<u8>) {
+            let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+            let public = sk
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes()
+                .to_vec();
+            (sk.to_bytes().to_vec(), public)
+        }
+
+        /// The keystore a factory tool sends: the key-authority anchor, every
+        /// device-generated role enumerated (no material), one guest identity
+        /// and one pinned trust anchor.
+        pub(super) fn keystore(security_version: u64, ka_public: &[u8]) -> HsmKeystore {
+            let mut slots = vec![KeySlot {
+                key_id: KeyRole::KeyAuthority.key_id().into(),
+                key_kind: KEY_TYPE_EC_P256,
+                anchor_public_key: Some(ka_public.to_vec()),
+                allowed_guests: None,
+                allowed_ops: Some(vec![OP_VERIFY]),
+            }];
+            for role in KeyRole::mandatory_roles() {
+                if !role.is_device_generated() {
+                    continue;
+                }
+                slots.push(KeySlot {
+                    key_id: role.key_id().into(),
+                    key_kind: match role.key_type() {
+                        KeyType::Aes256 => KEY_TYPE_AES_256,
+                        _ => KEY_TYPE_EC_P256,
+                    },
+                    anchor_public_key: None,
+                    allowed_guests: None,
+                    allowed_ops: None,
+                });
+            }
+            let mut guest = vec![0x04];
+            guest.extend_from_slice(&[0x11; 32]);
+            guest.extend_from_slice(&[0x22; 32]);
+            HsmKeystore {
+                schema_version: SCHEMA_VERSION,
+                security_version,
+                identities: vec![IdentityDef {
+                    identity_id: "vm-a".into(),
+                    public_key: guest,
+                }],
+                slots,
+                certificates: Vec::new(),
+                trust_anchors: vec![TrustAnchorCert {
+                    anchor_id: DELEGATION_ROOT_ANCHOR_ID.into(),
+                    certificate: vec![0x30, 0x82, 0x01, 0x00, 0xAB, 0xCD],
+                }],
+            }
+        }
+
+        /// Seal `ks` the way the factory tooling does: CBOR → zstd → ECDH-ES to
+        /// the device's own `device-decrypt` public key → SUIT, signed by
+        /// `(scalar, public)`.
+        pub(super) fn envelope(
+            hsm: &SimHsm,
+            ks: &HsmKeystore,
+            scalar: &[u8],
+            public: &[u8],
+        ) -> Vec<u8> {
+            use sha2::Digest;
+            let pem = std::fs::read_to_string(hsm.keys_dir().join("device-decrypt.pub")).unwrap();
+            let (x, y) = extract_ec_public_from_pem(&pem).unwrap();
+            let mut device =
+                coset::CoseKeyBuilder::new_ec2_pub_key(coset::iana::EllipticCurve::P_256, x, y)
+                    .build();
+            device.alg = None;
+            let recipient = CoseKey::from_cose_key_bytes(&device.to_vec().unwrap()).unwrap();
+
+            let cbor = payload::encode(ks).unwrap();
+            let digest: [u8; 32] = sha2::Sha256::digest(&cbor).into();
+            let compressed = encryptor::compress_firmware(&cbor, 3, None).unwrap();
+            let ephemeral = keygen::generate_device_key(keygen::ES256).unwrap();
+            let encrypted = encryptor::encrypt_firmware_ecdh(
+                &compressed,
+                &ephemeral,
+                &[Recipient {
+                    public_key: recipient,
+                    kid: b"device-decrypt".to_vec(),
+                }],
+            )
+            .unwrap();
+            ImageManifestBuilder::new()
+                .signing_time(1_700_000_000)
+                .component_id(vec!["hsm".to_string(), "keys".to_string()])
+                .sequence_number(ks.security_version)
+                .security_version(ks.security_version)
+                .payload_digest(&digest, cbor.len() as u64)
+                .payload_uri("#hsm-keys".to_string())
+                .encryption_info(&encrypted.encryption_info)
+                .integrated_payload("#hsm-keys".to_string(), encrypted.ciphertext)
+                .build(&signer(scalar, public))
+                .unwrap()
+        }
+
+        /// A CA-issued leaf for the device's current `role` key (what the CA
+        /// returns for that key's CSR).
+        pub(super) fn leaf_for(hsm: &SimHsm, role: KeyRole) -> Vec<u8> {
+            leaf_over(&hsm.get_public_key_der(role.handle()).unwrap())
+        }
+
+        /// A CA-issued leaf certifying the key `spki_der`.
+        pub(super) fn leaf_over(spki_der: &[u8]) -> Vec<u8> {
+            use std::str::FromStr;
+            use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+            use x509_cert::der::{Decode, Encode};
+            let spki = x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(spki_der).unwrap();
+            let ca = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+            let builder = CertificateBuilder::new(
+                Profile::Root,
+                x509_cert::serial_number::SerialNumber::from(7u32),
+                x509_cert::time::Validity::from_now(std::time::Duration::from_secs(3600)).unwrap(),
+                x509_cert::name::Name::from_str("CN=leaf").unwrap(),
+                spki,
+                &ca,
+            )
+            .unwrap();
+            builder
+                .build::<p256::ecdsa::DerSignature>()
+                .unwrap()
+                .to_der()
+                .unwrap()
+        }
+
+        /// The SPKI DER a leaf certifies.
+        pub(super) fn leaf_spki(der: &[u8]) -> Vec<u8> {
+            use x509_cert::der::{Decode, Encode};
+            x509_cert::Certificate::from_der(der)
+                .unwrap()
+                .tbs_certificate
+                .subject_public_key_info
+                .to_der()
+                .unwrap()
+        }
+
+        /// Every device-generated role's material: the public half for EC roles,
+        /// the key bytes for the AES storage key.
+        pub(super) fn device_material(keystore: &Path) -> Vec<(KeyRole, Vec<u8>)> {
+            KeyRole::mandatory_roles()
+                .iter()
+                .filter(|r| r.is_device_generated())
+                .map(|r| {
+                    let file = match r.key_type() {
+                        KeyType::Aes256 => format!("{}.bin", r.key_id()),
+                        _ => format!("{}.pub", r.key_id()),
+                    };
+                    (*r, std::fs::read(keystore.join("keys").join(file)).unwrap())
+                })
+                .collect()
+        }
+
+        /// A started, factory-provisioned keystore with a raised time floor, a
+        /// second counter, an armed enrolment, and the key authority that
+        /// signs its re-provisions.
+        pub(super) fn provisioned() -> (tempfile::TempDir, SimHsm, (Vec<u8>, Vec<u8>)) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut hsm = SimHsm::new(dir.path().join("keystore"));
+            hsm.ensure_device_keys().unwrap();
+            let ka = key_authority();
+            let factory = envelope(
+                &hsm,
+                &keystore(1, &ka.1),
+                &FACTORY_SIGNING_SCALAR,
+                &FACTORY_SIGNING_PUBLIC,
+            );
+            hsm.provision(&factory).unwrap();
+            hsm.raise_monotonic(KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR), FLOOR)
+                .unwrap();
+            hsm.raise_monotonic(KeyHandle(vhsm_proto::HANDLE_IVD_SIGNING), 7)
+                .unwrap();
+            hsm.arm_enrollment("vm9", Some(600)).unwrap();
+            (dir, hsm, ka)
+        }
+
+        /// A re-provision (higher security version, signed by the key
+        /// authority, carrying the CA-issued `tls-identity` leaf) keeps every
+        /// key the device generated, its counters and its enrolment state.
+        #[test]
+        fn reprovision_keeps_device_keys_counters_and_bootstrap() {
+            let (dir, mut hsm, ka) = provisioned();
+            let live = dir.path().join("keystore");
+            let floor = KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR);
+            let other = KeyHandle(vhsm_proto::HANDLE_IVD_SIGNING);
+
+            let keys_before = device_material(&live);
+            let ecu_id_before = hsm
+                .get_public_key_der(KeyRole::DeviceDecryption.handle())
+                .unwrap();
+            let bootstrap_before = std::fs::read(live.join("bootstrap.yaml")).unwrap();
+            let leaf = leaf_for(&hsm, KeyRole::TlsIdentity);
+
+            let mut ks2 = keystore(2, &ka.1);
+            ks2.certificates.push(LeafCert {
+                key_id: KeyRole::TlsIdentity.key_id().into(),
+                certificate: leaf.clone(),
+            });
+            let update = envelope(&hsm, &ks2, &ka.0, &ka.1);
+            hsm.provision(&update).unwrap();
+
+            // Every check is collected so one run names every broken property.
+            let mut broken = Vec::new();
+            let mut check = |ok: bool, what: String| {
+                if !ok {
+                    broken.push(what);
+                }
+            };
+            let keys_after = device_material(&live);
+            for ((role, before), (_, after)) in keys_before.iter().zip(keys_after.iter()) {
+                check(
+                    before == after,
+                    format!("device-generated {role:?} key replaced"),
+                );
+            }
+            let ecu_id_after = hsm
+                .get_public_key_der(KeyRole::DeviceDecryption.handle())
+                .unwrap();
+            check(ecu_id_before == ecu_id_after, "ECU id changed".into());
+            check(
+                hsm.read_monotonic(floor).ok() == Some(FLOOR),
+                format!("time floor now {:?}", hsm.read_monotonic(floor)),
+            );
+            check(
+                hsm.read_monotonic(other).ok() == Some(7),
+                format!("second counter now {:?}", hsm.read_monotonic(other)),
+            );
+            check(
+                std::fs::read(live.join("bootstrap.yaml")).ok() == Some(bootstrap_before),
+                "bootstrap.yaml lost or changed".into(),
+            );
+            let installed = hsm
+                .get_certificate_der(KeyRole::TlsIdentity.handle())
+                .unwrap();
+            check(installed == leaf, "delivered leaf not installed".into());
+            check(
+                leaf_spki(&installed)
+                    == hsm
+                        .get_public_key_der(KeyRole::TlsIdentity.handle())
+                        .unwrap(),
+                "installed tls-identity leaf certifies a key the device no longer has".into(),
+            );
+            check(
+                hsm.load_security_version().ok() == Some(2),
+                "security version not advanced".into(),
+            );
+            assert!(broken.is_empty(), "re-provision broke: {broken:#?}");
+        }
+
+        /// What the envelope owns is replaced: a pinned root or a guest
+        /// identity the new envelope no longer carries is gone. A leaf for a
+        /// kept key stays until an envelope delivers a new one.
+        #[test]
+        fn reprovision_replaces_what_the_envelope_owns() {
+            let (dir, mut hsm, ka) = provisioned();
+            let live = dir.path().join("keystore");
+            assert!(hsm.get_trust_anchor_der(DELEGATION_ROOT_ANCHOR_ID).is_ok());
+            assert!(live.join("keys/vm-a.pub").exists());
+
+            let leaf = leaf_for(&hsm, KeyRole::TlsIdentity);
+            let mut ks2 = keystore(2, &ka.1);
+            ks2.trust_anchors.clear();
+            ks2.identities.clear();
+            ks2.certificates.push(LeafCert {
+                key_id: KeyRole::TlsIdentity.key_id().into(),
+                certificate: leaf.clone(),
+            });
+            hsm.provision(&envelope(&hsm, &ks2, &ka.0, &ka.1)).unwrap();
+
+            assert!(hsm.get_trust_anchor_der(DELEGATION_ROOT_ANCHOR_ID).is_err());
+            assert!(!live.join("keys/roots").exists());
+            assert!(!live.join("keys/vm-a.pub").exists());
+            assert_eq!(
+                std::fs::read_to_string(live.join("identities")).unwrap(),
+                ""
+            );
+            // The key authority the envelope still carries is still the anchor.
+            assert!(hsm.get_public_key(KeyRole::KeyAuthority).is_ok());
+
+            // A third envelope without the leaf keeps the installed one: it
+            // certifies a key the device still holds.
+            let ks3 = keystore(3, &ka.1);
+            hsm.provision(&envelope(&hsm, &ks3, &ka.0, &ka.1)).unwrap();
+            let installed = hsm
+                .get_certificate_der(KeyRole::TlsIdentity.handle())
+                .unwrap();
+            assert!(installed == leaf);
+            let manifest = std::fs::read_to_string(live.join("manifest")).unwrap();
+            assert!(manifest.contains("keys/tls-identity.cert"));
+            // ... and the third envelope's root is back.
+            assert!(hsm.get_trust_anchor_der(DELEGATION_ROOT_ANCHOR_ID).is_ok());
+            assert_eq!(hsm.load_security_version().unwrap(), 3);
+        }
+
+        /// Every file and directory keeps its mode through a re-provision: the
+        /// keys directory 0700, private keys 0600, the rest as created.
+        #[test]
+        #[cfg(unix)]
+        fn reprovision_keeps_file_modes() {
+            use std::collections::BTreeMap;
+            use std::os::unix::fs::PermissionsExt;
+            fn modes(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, u32>) {
+                for e in std::fs::read_dir(dir).unwrap() {
+                    let p = e.unwrap().path();
+                    let m = std::fs::metadata(&p).unwrap();
+                    out.insert(
+                        p.strip_prefix(root).unwrap().into(),
+                        m.permissions().mode() & 0o7777,
+                    );
+                    if m.is_dir() {
+                        modes(root, &p, out);
+                    }
+                }
+            }
+            let (dir, mut hsm, ka) = provisioned();
+            let live = dir.path().join("keystore");
+            let root_mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+            let root_before = root_mode(&live);
+            let mut before = BTreeMap::new();
+            modes(&live, &live, &mut before);
+
+            hsm.provision(&envelope(&hsm, &keystore(2, &ka.1), &ka.0, &ka.1))
+                .unwrap();
+
+            let mut after = BTreeMap::new();
+            modes(&live, &live, &mut after);
+            assert_eq!(root_mode(&live), root_before);
+            assert_eq!(before, after, "file list or modes changed");
+            assert_eq!(after[Path::new("keys")], 0o700);
+            for (path, mode) in &after {
+                if path.extension().is_some_and(|e| e == "priv") {
+                    assert_eq!(*mode, 0o600, "{}", path.display());
+                }
+            }
+        }
+
+        /// Stop a re-provision after each step of the keystore switch, start
+        /// again (`ensure_device_keys`, which recovers first), and check the
+        /// result is the complete old or the complete new keystore with the
+        /// device keys intact — the table on `recover_interrupted_reprovision`.
+        #[test]
+        fn every_interrupted_switch_recovers_to_a_complete_keystore() {
+            enum Stop {
+                BuildingStaging,
+                BeforeFirstRename,
+                BetweenRenames,
+                AfterCommit,
+                BackupOnly,
+                StagingOnly,
+                PartialStagingOnly,
+            }
+            let cases = [
+                (Stop::BuildingStaging, Some(1)),
+                (Stop::BeforeFirstRename, Some(1)),
+                (Stop::BetweenRenames, Some(1)),
+                (Stop::AfterCommit, Some(2)),
+                (Stop::BackupOnly, Some(1)),
+                (Stop::StagingOnly, Some(2)),
+                // Cut short before its manifest: unprovisioned, same device.
+                (Stop::PartialStagingOnly, None),
+            ];
+            for (stop, expect) in cases {
+                let (dir, hsm, ka) = provisioned();
+                let live = dir.path().join("keystore");
+                let (tmp, bak) = (live.with_extension("tmp"), live.with_extension("bak"));
+                let keys = device_material(&live);
+                let mut ks2 = keystore(2, &ka.1);
+                ks2.trust_anchors.clear();
+
+                let staged = hsm.stage_reprovision(&ks2).unwrap();
+                assert_eq!(staged, tmp);
+                let rename = |a: &Path, b: &Path| std::fs::rename(a, b).unwrap();
+                let remove = |d: &Path| std::fs::remove_dir_all(d).unwrap();
+                match stop {
+                    Stop::BuildingStaging => {
+                        std::fs::remove_file(tmp.join("manifest")).unwrap();
+                        std::fs::remove_file(tmp.join("keys/ivd-signing.priv")).unwrap();
+                    }
+                    Stop::BeforeFirstRename => {}
+                    Stop::BetweenRenames => rename(&live, &bak),
+                    Stop::AfterCommit => {
+                        rename(&live, &bak);
+                        rename(&tmp, &live);
+                    }
+                    Stop::BackupOnly => {
+                        rename(&live, &bak);
+                        remove(&tmp);
+                    }
+                    Stop::StagingOnly => {
+                        rename(&live, &bak);
+                        remove(&bak);
+                    }
+                    Stop::PartialStagingOnly => {
+                        std::fs::remove_file(tmp.join("manifest")).unwrap();
+                        rename(&live, &bak);
+                        remove(&bak);
+                    }
+                }
+
+                let restarted = SimHsm::new(live.clone());
+                restarted.ensure_device_keys().unwrap();
+
+                assert!(!tmp.exists() && !bak.exists(), "leftovers remain");
+                assert!(
+                    device_material(&live) == keys,
+                    "device keys changed across an interrupted switch"
+                );
+                match expect {
+                    Some(sv) => {
+                        assert!(restarted.is_provisioned().unwrap());
+                        assert_eq!(restarted.load_security_version().unwrap(), sv);
+                        // A complete keystore, old or new: its root is there
+                        // exactly when its envelope carried one.
+                        assert_eq!(
+                            restarted
+                                .get_trust_anchor_der(DELEGATION_ROOT_ANCHOR_ID)
+                                .is_ok(),
+                            sv == 1
+                        );
+                    }
+                    None => assert!(!restarted.is_provisioned().unwrap()),
+                }
+                assert_eq!(
+                    restarted
+                        .read_monotonic(KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR))
+                        .unwrap(),
+                    FLOOR
+                );
+            }
+        }
+
+        /// A re-provision that fails while building its keystore leaves the
+        /// live one as it was and no staging directory behind.
+        #[test]
+        #[cfg(unix)]
+        fn failed_reprovision_changes_nothing() {
+            use std::os::unix::fs::PermissionsExt;
+            let (dir, mut hsm, ka) = provisioned();
+            let live = dir.path().join("keystore");
+            let keys = device_material(&live);
+            // An unreadable file the re-provision has to carry makes staging fail.
+            let blocked = live.join("bootstrap.yaml");
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&blocked).is_ok() {
+                return; // running as root: permissions do not block the copy
+            }
+            let update = envelope(&hsm, &keystore(2, &ka.1), &ka.0, &ka.1);
+            assert!(hsm.provision(&update).is_err());
+            assert!(!live.with_extension("tmp").exists());
+            assert!(device_material(&live) == keys);
+            assert_eq!(hsm.load_security_version().unwrap(), 1);
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        /// Every file under `dir` (recursively), by relative path, with its
+        /// bytes.
+        fn tree(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            fn walk(
+                root: &Path,
+                dir: &Path,
+                out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+            ) {
+                for e in std::fs::read_dir(dir).unwrap() {
+                    let p = e.unwrap().path();
+                    if p.is_dir() {
+                        walk(root, &p, out);
+                    } else {
+                        let bytes = std::fs::read(&p).unwrap();
+                        out.insert(p.strip_prefix(root).unwrap().into(), bytes);
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeMap::new();
+            walk(dir, dir, &mut out);
+            out
+        }
+
+        /// A started keystore that was never provisioned: the device keys
+        /// only.
+        fn unprovisioned() -> (tempfile::TempDir, SimHsm) {
+            let dir = tempfile::tempdir().unwrap();
+            let hsm = SimHsm::new(dir.path().join("keystore"));
+            hsm.ensure_device_keys().unwrap();
+            (dir, hsm)
+        }
+
+        /// A leaf certifying a key this device does not hold.
+        fn foreign_leaf() -> Vec<u8> {
+            use p256::pkcs8::EncodePublicKey;
+            let other = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+            leaf_over(
+                other
+                    .verifying_key()
+                    .to_public_key_der()
+                    .unwrap()
+                    .as_bytes(),
+            )
+        }
+
+        /// The leaves no envelope may install, each named: for `tls-identity`
+        /// a leaf for another key, garbage, and one good leaf beside a bad
+        /// one; a valid leaf for a slot with no key on the device; a leaf for
+        /// the key-authority anchor slot that certifies another key.
+        fn bad_leaves(hsm: &SimHsm) -> Vec<(&'static str, Vec<LeafCert>)> {
+            let tls = KeyRole::TlsIdentity.key_id();
+            let leaf = |key_id: &str, certificate: Vec<u8>| LeafCert {
+                key_id: key_id.into(),
+                certificate,
+            };
+            let good = leaf_for(hsm, KeyRole::TlsIdentity);
+            vec![
+                ("another key", vec![leaf(tls, foreign_leaf())]),
+                (
+                    "garbage",
+                    vec![leaf(tls, vec![0x30, 0x82, 0x01, 0x00, 0xDE, 0xAD])],
+                ),
+                (
+                    "one good, one bad",
+                    vec![
+                        leaf(tls, good.clone()),
+                        leaf(KeyRole::JwtSigning.key_id(), foreign_leaf()),
+                    ],
+                ),
+                ("a slot without a key", vec![leaf("extra-identity", good)]),
+                (
+                    "the anchor slot",
+                    vec![leaf(KeyRole::KeyAuthority.key_id(), foreign_leaf())],
+                ),
+            ]
+        }
+
+        /// `ks` with `leaves`, and with an EC slot `extra-identity` the
+        /// device has no key for yet.
+        fn with_leaves(mut ks: HsmKeystore, leaves: Vec<LeafCert>) -> HsmKeystore {
+            ks.slots.push(KeySlot {
+                key_id: "extra-identity".into(),
+                key_kind: KEY_TYPE_EC_P256,
+                anchor_public_key: None,
+                allowed_guests: None,
+                allowed_ops: None,
+            });
+            ks.certificates = leaves;
+            ks
+        }
+
+        /// A first provision carrying a leaf for the device's own key
+        /// installs it, as a re-provision does.
+        #[test]
+        fn first_provision_installs_a_leaf_for_the_device_key() {
+            let (_dir, mut hsm) = unprovisioned();
+            let leaf = leaf_for(&hsm, KeyRole::TlsIdentity);
+            let ka = key_authority();
+            let mut ks = keystore(1, &ka.1);
+            ks.certificates.push(LeafCert {
+                key_id: KeyRole::TlsIdentity.key_id().into(),
+                certificate: leaf.clone(),
+            });
+            hsm.provision(&envelope(
+                &hsm,
+                &ks,
+                &FACTORY_SIGNING_SCALAR,
+                &FACTORY_SIGNING_PUBLIC,
+            ))
+            .unwrap();
+            assert!(hsm.is_provisioned().unwrap());
+            assert!(
+                hsm.get_certificate_der(KeyRole::TlsIdentity.handle())
+                    .unwrap()
+                    == leaf
+            );
+        }
+
+        /// A first provision whose leaf does not certify the device's key is
+        /// refused whole: the keystore stays unprovisioned, byte for byte.
+        #[test]
+        fn first_provision_with_a_bad_leaf_is_refused_and_writes_nothing() {
+            let ka = key_authority();
+            let (_dir, probe) = unprovisioned();
+            for (case, _) in bad_leaves(&probe) {
+                let (dir, mut hsm) = unprovisioned();
+                let leaves = bad_leaves(&hsm)
+                    .into_iter()
+                    .find(|(c, _)| *c == case)
+                    .unwrap()
+                    .1;
+                let ks = with_leaves(keystore(1, &ka.1), leaves);
+                let update = envelope(&hsm, &ks, &FACTORY_SIGNING_SCALAR, &FACTORY_SIGNING_PUBLIC);
+                let before = tree(dir.path());
+
+                let err = hsm.provision(&update).expect_err(case);
+                assert!(matches!(err, HsmError::PayloadInvalid(_)), "{case}: {err}");
+                assert!(tree(dir.path()) == before, "{case}: the keystore changed");
+                assert!(!hsm.is_provisioned().unwrap(), "{case}");
+            }
+        }
+
+        /// A re-provision whose leaf does not certify the device's key is
+        /// refused whole, before any staging: the keystore stays as it was,
+        /// byte for byte, and the same envelope without the leaf applies.
+        #[test]
+        fn reprovision_with_a_bad_leaf_is_refused_and_writes_nothing() {
+            let (_probe_dir, probe, _) = provisioned();
+            for (case, _) in bad_leaves(&probe) {
+                let (dir, mut hsm, ka) = provisioned();
+                let leaves = bad_leaves(&hsm)
+                    .into_iter()
+                    .find(|(c, _)| *c == case)
+                    .unwrap()
+                    .1;
+                let update = envelope(&hsm, &with_leaves(keystore(2, &ka.1), leaves), &ka.0, &ka.1);
+                let before = tree(dir.path());
+
+                let err = hsm.provision(&update).expect_err(case);
+                assert!(matches!(err, HsmError::PayloadInvalid(_)), "{case}: {err}");
+                assert!(tree(dir.path()) == before, "{case}: the keystore changed");
+                assert_eq!(hsm.load_security_version().unwrap(), 1, "{case}");
+
+                let retry = envelope(&hsm, &keystore(2, &ka.1), &ka.0, &ka.1);
+                hsm.provision(&retry).expect(case);
+                assert_eq!(hsm.load_security_version().unwrap(), 2, "{case}");
+            }
+        }
     }
 }

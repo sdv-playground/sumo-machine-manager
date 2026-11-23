@@ -22,7 +22,7 @@ use x509_cert::Certificate;
 
 /// OID for the delegated-rights extension.
 ///
-/// **PLACEHOLDER** under a private arc — assign the real TRATON/CSI enterprise arc
+/// **PLACEHOLDER** under a private arc — assign your organisation's enterprise arc
 /// (`1.3.6.1.4.1.<PEN>…`) before this leaves dev.
 pub const DELEGATED_RIGHTS_OID: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1.1");
