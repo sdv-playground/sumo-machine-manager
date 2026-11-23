@@ -2,9 +2,9 @@
 //!
 //! Reads the `slogger2` ring — the QNX system log — with `slog2_parse_all`, which
 //! walks every buffer and invokes a callback per packet. This is the READ half of
-//! the host log pipeline: supernova emits into slog2 (via score-log-slog2), and
+//! the host log pipeline: the node manager emits into slog2 (via score-log-slog2), and
 //! this reads the SAME ring back for SOVD §7.21 — producer and reader decoupled
-//! through the OS ring, which is kernel-owned (survives a supernova crash) and
+//! through the OS ring, which is kernel-owned (survives a node-manager crash) and
 //! also carries the host's driver/eMMC telemetry (devb_sdmmc, CAM), so those
 //! surface over SOVD for free.
 //!

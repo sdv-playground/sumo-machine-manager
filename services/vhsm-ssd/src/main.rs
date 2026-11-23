@@ -262,7 +262,7 @@ fn main() {
     // Policy source is the in-bank policy directory at /etc/sumo/policy
     // (AUTH-ARCH-001 §4). Required — there is no fallback. The legacy
     // single-file `--iam-policy` switch was retired once the partition
-    // path was proven on the managed-cvc; operators must now ship a
+    // path was proven on a managed host; operators must now ship a
     // policy.yaml (and roots/, crl.yaml) under --policy-dir.
     let policy_dir = policy_dir.unwrap_or_else(|| {
         eprintln!("error: --policy-dir is required");

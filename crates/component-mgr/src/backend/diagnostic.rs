@@ -824,7 +824,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// unreachable agent degrades to an empty list (warn), never a 500 — same
     /// discipline as the log / scripts proxies.
     async fn list_diagnostics(&self) -> BackendResult<Vec<DiagnosticInfo>> {
-        // Host in-process probes (supernova / on-box components).
+        // Host in-process probes (the node manager / on-box components).
         if self.config.host_diagnostics {
             return Ok(host_diag_probes());
         }
@@ -850,7 +850,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     /// `Transport` (couldn't dispatch the read — distinct from a probe that ran
     /// and reported `ok=false`).
     async fn read_diagnostic(&self, probe_id: &str) -> BackendResult<DiagnosticResult> {
-        // Host in-process gather (supernova / on-box components).
+        // Host in-process gather (the node manager / on-box components).
         if self.config.host_diagnostics {
             return Ok(host_gather(probe_id));
         }
@@ -2434,7 +2434,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         // below only exists for VM/RT; host-os has none, so the gate would fall
         // back to catching the transient SOVD down→up window, which a fast reboot
         // misses → the gate times out despite a clean reboot. `node_boot_id`
-        // changes on every node reboot (fresh supernova process) and is durable —
+        // changes on every node reboot (fresh node-manager process) and is durable —
         // the gate compares it and can't miss the reboot. See
         // tasks/health-gate-node-bootid.md.
         if let Some(nb) = &self.node_boot_id {
@@ -2498,7 +2498,7 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             // disabled + the probe still reporting a running application ⇒
             // the reboot hasn't happened yet. Clears itself on the real
             // reboot (the loader finds an empty slot ⇒ probe goes quiet) —
-            // immune to supernova respawns, no NV clearing to get wrong.
+            // immune to node-manager respawns, no NV clearing to get wrong.
             if probe.probe().is_some() {
                 runtime.insert("reboot_pending".into(), serde_json::json!(true));
             }

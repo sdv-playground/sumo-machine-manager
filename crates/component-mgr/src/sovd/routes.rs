@@ -1830,12 +1830,12 @@ mod tests {
     }
 
     /// `router` behind SOVDd's node topology, as an embedder serves it: with
-    /// `node`, configured as node `cvc`; without, node-less.
+    /// `node`, configured as node `hpc`; without, node-less.
     fn served(router: Router, node: bool) -> Router {
         let state = sovd_api::AppState::new(std::collections::HashMap::new());
         let state = if node {
             state
-                .with_node(sovd_api::NodeTopology::new("cvc", "CVC"))
+                .with_node(sovd_api::NodeTopology::new("hpc", "HPC"))
                 .unwrap()
         } else {
             state
@@ -1852,7 +1852,7 @@ mod tests {
         let mut bodies = Vec::new();
         for (uri, node) in [
             (
-                "/v1/components/cvc/operations/x-update-commit/executions",
+                "/v1/components/hpc/operations/x-update-commit/executions",
                 true,
             ),
             ("/v1/operations/x-update-commit/executions", false),
@@ -1886,7 +1886,7 @@ mod tests {
             body["message"]
                 .as_str()
                 .unwrap()
-                .contains("/v1/components/cvc/operations/x-update-commit/executions"),
+                .contains("/v1/components/hpc/operations/x-update-commit/executions"),
             "{body}"
         );
         // Everything but the per-execution id and times.
@@ -1904,7 +1904,7 @@ mod tests {
 
         let with = served(device_id_router(machine_with(&[])), true);
         let without = served(device_id_router(machine_with(&[])), false);
-        let member = get_raw(&with, "/v1/components/cvc/subcomponents/hsm/x-ecu-id").await;
+        let member = get_raw(&with, "/v1/components/hpc/subcomponents/hsm/x-ecu-id").await;
         assert_ne!(member.0, StatusCode::NOT_FOUND);
         assert_eq!(
             member,
@@ -1920,7 +1920,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(
             String::from_utf8_lossy(&body)
-                .contains("/v1/components/cvc/subcomponents/hsm/x-ecu-id"),
+                .contains("/v1/components/hpc/subcomponents/hsm/x-ecu-id"),
             "{body:?}"
         );
     }

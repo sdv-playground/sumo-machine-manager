@@ -674,7 +674,7 @@ fn process_plain<R: Read>(
 /// must NOT slurp a whole image into RAM. Returns `(bytes_read, digest)`; the
 /// caller compares the digest. O(64 KiB) resident regardless of file size — the
 /// whole point (a `std::fs::read` of a multi-hundred-MB rootfs OOMs a
-/// memory-pressured CVC; this doesn't). Errors are read errors, stringified.
+/// memory-pressured ECU; this doesn't). Errors are read errors, stringified.
 pub(crate) fn hash_reader<R: Read>(mut reader: R) -> Result<(u64, [u8; 32]), String> {
     let mut hasher = Sha256::new();
     let mut total = 0u64;

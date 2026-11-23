@@ -5,7 +5,7 @@
 //! guest services use it — the buffer set is named after the caller's `context`,
 //! so a reader (`slog2info -b <context>`, or SOVD's `LogSource::Slog2`) can find a
 //! given process's log, and the buffer is kernel-owned (survives a process crash).
-//! For supernova this is the emit half of the bus-decoupled host log pipeline;
+//! For the node manager this is the emit half of the bus-decoupled host log pipeline;
 //! for a guest service it's "log the normal QNX way." See
 //! `tasks/host-log-pipeline-design.md`.
 //!

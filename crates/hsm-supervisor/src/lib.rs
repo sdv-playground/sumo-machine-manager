@@ -24,10 +24,9 @@
 //!
 //! Nothing here is board-specific. It is config→argv, plus liveness,
 //! stale-endpoint reclaim and respawn. It lived in one board's `main.rs` until
-//! there was a second board; a CVC, a CM5 and a DDU manager differ in their
+//! there was a second board; managers for different boards differ in their
 //! guests, their boot vectors and their HSM *hardware*, but not in how the two
-//! daemons are parented. Extracted 2026-09-25 from
-//! `supernova-machine-manager/src/main.rs`.
+//! daemons are parented. Extracted 2026-09-25 from a node manager's `main.rs`.
 //!
 //! The crate is deliberately **dep-light** — `hsm`, `tracing`, `libc`, and
 //! nothing else, enforced as an allowlist by `scripts/feature-matrix.sh`. A node

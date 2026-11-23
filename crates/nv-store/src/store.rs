@@ -485,10 +485,10 @@ pub const fn nv_device_size(slots: usize) -> u64 {
 /// History: 0x88000 (5 slots) → 0x100000 (10 slots) on 2026-05-29, when the
 /// RT/Cortex-M7 component landed on a slot the file had no room for; →
 /// 0x190000 (16 slots) on 2026-09-23 with the runtime slot count. The name is
-/// kept because ~60 test fixtures and the supernova host address it.
+/// kept because ~60 test fixtures and the node manager host address it.
 ///
 /// Growing an existing on-device file is the HOST's job, not this library's:
-/// `supernova-machine-manager/src/main.rs` compares the file against the size
+/// the node manager compares the file against the size
 /// it wants and re-creates (wipes) it when it falls short — operators
 /// re-provision via the factory_reset / provisioning flow. This repo's `boot`
 /// and `vm-sovd` binaries only create the file when it is MISSING; they never

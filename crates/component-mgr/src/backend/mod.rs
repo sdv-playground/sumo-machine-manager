@@ -184,7 +184,7 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// by the binary via [`with_node_boot_id`](Self::with_node_boot_id). Surfaced
     /// in `x-runtime.node_boot_id` on EVERY component's status so the offboard
     /// flash gate has an UNMISSABLE reboot witness: it changes on every node reboot
-    /// (fresh supernova process) and is durable state, unlike the transient SOVD
+    /// (fresh node-manager process) and is durable state, unlike the transient SOVD
     /// down→up window a fast reboot can slip through. The per-component heartbeat
     /// `boot_id` (u32) stays as the VM/RT per-lifetime witness; this is the
     /// node-wide one for no-heartbeat components (host-os). `None` in tests / where

@@ -1540,7 +1540,7 @@ mod journal_native;
 mod slog2_reader;
 
 /// Read the QNX `slogger2` ring (the system log) into records — the HOST's log
-/// source (supernova's own records + driver/eMMC telemetry), read back over SOVD
+/// source (the node manager's own records + driver/eMMC telemetry), read back over SOVD
 /// §7.21 by component-mgr's `LogSource::Slog2`. Distinct from `collect` (which is
 /// the guest log-agent's file/journald path): the host explicitly asks for slog2.
 ///

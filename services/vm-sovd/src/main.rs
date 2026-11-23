@@ -1048,14 +1048,14 @@ mod tests {
     #[test]
     fn identification_prefix_takes_the_first_16_of_the_ecu_id() {
         assert_eq!(
-            prefixed_identification("cvc-vm1", "f88a13a329a72db1c0ffee00c0ffee00").as_deref(),
-            Some("cvc-vm1-f88a13a329a72db1")
+            prefixed_identification("hpc-vm1", "f88a13a329a72db1c0ffee00c0ffee00").as_deref(),
+            Some("hpc-vm1-f88a13a329a72db1")
         );
         assert_eq!(
-            prefixed_identification("cvc-vm1", "f88a13a329a72db1").as_deref(),
-            Some("cvc-vm1-f88a13a329a72db1")
+            prefixed_identification("hpc-vm1", "f88a13a329a72db1").as_deref(),
+            Some("hpc-vm1-f88a13a329a72db1")
         );
-        assert_eq!(prefixed_identification("cvc-vm1", "f88a13a329a72db"), None);
+        assert_eq!(prefixed_identification("hpc-vm1", "f88a13a329a72db"), None);
     }
 
     /// With --node-id the node form of a node-level route reaches the node
@@ -1066,10 +1066,10 @@ mod tests {
     async fn plain_router_serves_the_node_form_with_a_node() {
         let machine = test_machine();
         let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
-        let node_form = "/v1/components/cvc/operations/x-update-commit/executions";
+        let node_form = "/v1/components/hpc/operations/x-update-commit/executions";
         let root_form = "/v1/operations/x-update-commit/executions";
 
-        let node = Some(sovd_api::NodeTopology::new("cvc", "cvc"));
+        let node = Some(sovd_api::NodeTopology::new("hpc", "hpc"));
         let with = plain_router(
             machine.clone(),
             sovd_state(HashMap::new(), node).unwrap(),
@@ -1109,7 +1109,7 @@ mod tests {
         let machine = test_machine();
         let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
         let router = |identification| {
-            let node = node_topology(Some("cvc".into()), None, identification);
+            let node = node_topology(Some("hpc".into()), None, identification);
             plain_router(
                 machine.clone(),
                 sovd_state(HashMap::new(), node).unwrap(),
@@ -1118,21 +1118,21 @@ mod tests {
         };
 
         let (status, body) = get_text(
-            router(Some("cvc-host-f88a13a329a72db1")),
-            "/v1/components/cvc",
+            router(Some("hpc-host-f88a13a329a72db1")),
+            "/v1/components/hpc",
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(
-            body.contains(r#""x-identification":"cvc-host-f88a13a329a72db1""#),
+            body.contains(r#""x-identification":"hpc-host-f88a13a329a72db1""#),
             "{body}"
         );
 
-        let (status, body) = get_text(router(None), "/v1/components/cvc").await;
+        let (status, body) = get_text(router(None), "/v1/components/hpc").await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(!body.contains("x-identification"), "{body}");
 
-        assert!(node_topology(None, None, Some("cvc-host-f88a13a329a72db1")).is_none());
+        assert!(node_topology(None, None, Some("hpc-host-f88a13a329a72db1")).is_none());
     }
 
     /// With --node-id the node form of `x-update-state` serves the body the
@@ -1149,9 +1149,9 @@ mod tests {
                 coord.clone(),
             )
         };
-        let with = router(node_topology(Some("cvc".into()), None, None));
+        let with = router(node_topology(Some("hpc".into()), None, None));
         let without = router(None);
-        let node_form = "/v1/components/cvc/data/x-update-state";
+        let node_form = "/v1/components/hpc/data/x-update-state";
 
         let root = get_text(without.clone(), "/v1/data/x-update-state").await;
         assert_eq!(root.0, StatusCode::OK, "{}", root.1);
