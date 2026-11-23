@@ -54,15 +54,34 @@ use crate::proto::AuthFailReason;
 /// `sign` returns the **raw** 64-byte ECDSA P-256 signature (r||s).
 /// Implementations MUST NOT return ASN.1 DER — the COSE_Sign1 builder
 /// expects the raw form.
+///
+/// A signer that cannot sign (the HSM did not answer) returns
+/// [`SignError`], never a placeholder signature: an enrolment minted
+/// from one would consume the guest's one-shot token for a cert that
+/// can never validate.
 pub trait EcuSigner: Send + Sync {
-    fn sign(&self, data: &[u8]) -> Vec<u8>;
+    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, SignError>;
 }
+
+/// The signer could not produce a signature. Carries the cause for the
+/// daemon log; it is a server-side fault, not a verdict on the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignError(pub String);
+
+impl std::fmt::Display for SignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "signer unavailable: {}", self.0)
+    }
+}
+
+impl std::error::Error for SignError {}
 
 /// Error produced by [`mint_cwt`] when the CBOR encoder or signer
 /// misbehaves. The variants exist only so we can return a typed
-/// failure to the daemon without panicking; both variants collapse
-/// to the same wire signal (`InvalidParam`) since neither can be
-/// triggered by a well-formed client.
+/// failure to the daemon without panicking; the two encode variants
+/// collapse to the same wire signal (`InvalidParam`) since neither can
+/// be triggered by a well-formed client. [`MintError::Sign`] is the
+/// signer being unavailable and goes out as a server fault instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MintError {
     /// `ciborium::ser::into_writer` failed — shouldn't happen for
@@ -72,6 +91,10 @@ pub enum MintError {
     /// `CoseSign1Builder::build()` consumed a signer that returned a
     /// non-64-byte signature, or `to_vec()` rejected the structure.
     EncodeCose,
+    /// The [`EcuSigner`] could not sign. Unlike the two above this is
+    /// transient and not the client's doing: nothing was minted, so
+    /// the caller must leave the enrolment untouched for a retry.
+    Sign,
 }
 
 // CWT claim + cnf COSE_Key labels and the audience: the contract lives in
@@ -406,7 +429,8 @@ pub fn mint_cwt(
     let cose = CoseSign1Builder::new()
         .protected(HeaderBuilder::new().algorithm(CoseAlg::ES256).build())
         .payload(payload_bytes)
-        .create_signature(b"", |data| signer.sign(data))
+        .try_create_signature(b"", |data| signer.sign(data))
+        .map_err(|_| MintError::Sign)?
         .build();
     cose.to_vec().map_err(|_| MintError::EncodeCose)
 }
@@ -426,10 +450,10 @@ impl LocalEcuSigner {
 }
 
 impl EcuSigner for LocalEcuSigner {
-    fn sign(&self, data: &[u8]) -> Vec<u8> {
+    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, SignError> {
         use p256::ecdsa::{signature::Signer as _, Signature};
         let sig: Signature = self.signing_key.sign(data);
-        sig.to_vec()
+        Ok(sig.to_vec())
     }
 }
 
@@ -545,7 +569,7 @@ pub(crate) mod test_helpers {
         let cose = CoseSign1Builder::new()
             .protected(HeaderBuilder::new().algorithm(CoseAlg::ES256).build())
             .payload(payload_bytes)
-            .create_signature(b"", |data| signer.sign(data))
+            .create_signature(b"", |data| signer.sign(data).unwrap())
             .build();
         cose.to_vec().unwrap()
     }
