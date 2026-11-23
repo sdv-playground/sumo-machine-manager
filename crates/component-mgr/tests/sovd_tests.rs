@@ -16,7 +16,7 @@ use tower::ServiceExt;
 
 use machine_mgr::bank_provider::BankProvider;
 use machine_mgr::node_update::NodeCoordinator;
-use machine_mgr::system_bank_state::{boot_id_digest, Outcome, Reason, Resolution, SelectorStore};
+use machine_mgr::system_bank_state::{boot_id_digest, SelectorStore};
 use machine_mgr::{
     DeactivateError, DeactivateOutcome, Deactivator, EntityInfo, FileSelectorStore, ImageEntry,
     InMemorySelectorStore, MachineRegistry, SharedSystemBankState, SystemBankManager, TestSigner,
@@ -1718,7 +1718,7 @@ async fn update_state_in_trial_follows_boot_vector() {
     assert_eq!(vm2["in_trial"], false);
 }
 
-// --- boot-vector transaction header + trial boot limit ---
+// --- boot-vector transaction header + trial boot count ---
 
 /// vm1 + vm2 over on-disk `IvdBankProvider`s sharing one file-backed boot
 /// vector (floor: both on A). vm1 is then activated onto B at node boot
@@ -1841,12 +1841,8 @@ impl TrialNode {
     }
 }
 
-fn coord_at(boot_id: &str, limit: Option<u8>) -> Arc<NodeCoordinator> {
-    Arc::new(
-        NodeCoordinator::new()
-            .with_node_boot_id(boot_id)
-            .with_trial_boot_limit(limit),
-    )
+fn coord_at(boot_id: &str) -> Arc<NodeCoordinator> {
+    Arc::new(NodeCoordinator::new().with_node_boot_id(boot_id))
 }
 
 #[tokio::test]
@@ -1871,78 +1867,20 @@ async fn activate_arms_the_primary_transaction_header() {
     assert_eq!(t.resolution, None);
 }
 
+/// A trial has no boot limit: every boot is counted and reported, and
+/// however many there are, the node stays in trial until a verdict.
 #[tokio::test]
-async fn trial_boot_limit_rolls_the_node_back() {
-    let node = TrialNode::new(false);
-
-    let out = node
-        .machine
-        .observe_node_boot(&coord_at("boot-b", Some(2)))
-        .await;
-    assert_eq!(out.trial_boots, Some(1));
-    assert!(!out.bailed_out);
-    // A process restart within the same boot counts nothing.
-    let out = node
-        .machine
-        .observe_node_boot(&coord_at("boot-b", Some(2)))
-        .await;
-    assert_eq!(
-        out.trial_boots,
-        Some(1),
-        "same boot id is not counted twice"
-    );
-    assert!(!out.bailed_out);
-
-    let coord = coord_at("boot-c", Some(2));
-    let out = node.machine.observe_node_boot(&coord).await;
-    assert_eq!(out.trial_boots, Some(2));
-    assert_eq!(out.limit, Some(2));
-    assert!(out.bailed_out, "{out:?}");
-    assert!(out.errors.is_empty(), "{out:?}");
-
-    let (status, body) = get(&node.router(coord), "/vehicle/v1/data/x-update-state").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["banks"][0]["id"], "vm1");
-    assert_eq!(body["banks"][0]["in_trial"], false);
-    assert_eq!(body["banks"][0]["active"]["bank"], "A");
-    assert_eq!(
-        body["resolution"],
-        serde_json::json!({"outcome": "rolled_back", "reason": "trial_boot_limit"})
-    );
-    assert_eq!(body["trial_boots"], 2);
-    assert_eq!(body["trial_boot_limit"], 2);
-
-    let vm1 = bank_state(&node.nv, slots::VM1);
-    assert!(vm1.committed, "vm1 NV rolled back: {vm1:?}");
-    assert_eq!(vm1.active_bank, Bank::A);
-    // The per-component rollback found the vector already settled: its
-    // verdict-reason rollback was the no-op, so the limit reason survives.
-    let primary = node.store().read_primary().unwrap().unwrap();
-    assert_eq!(primary.entries["vm1"].bank, Bank::A);
-    assert_eq!(
-        node.store()
-            .read_transaction()
-            .unwrap()
-            .unwrap()
-            .1
-            .resolution,
-        Some(Resolution {
-            outcome: Outcome::RolledBack,
-            reason: Reason::TrialBootLimit,
-        })
-    );
-}
-
-#[tokio::test]
-async fn no_trial_boot_limit_never_bails_out() {
+async fn trial_boots_are_counted_and_never_roll_the_node_back() {
     let node = TrialNode::new(false);
     for (i, id) in ["boot-b", "boot-c", "boot-d", "boot-e", "boot-f"]
         .iter()
         .enumerate()
     {
-        let out = node.machine.observe_node_boot(&coord_at(id, None)).await;
+        let out = node.machine.observe_node_boot(&coord_at(id)).await;
         assert_eq!(out.trial_boots, Some(i as u8 + 1));
-        assert!(!out.bailed_out);
+        // A process restart within the same boot counts nothing.
+        let out = node.machine.observe_node_boot(&coord_at(id)).await;
+        assert_eq!(out.trial_boots, Some(i as u8 + 1));
     }
     assert!(
         !bank_state(&node.nv, slots::VM1).committed,
@@ -1952,13 +1890,29 @@ async fn no_trial_boot_limit_never_bails_out() {
         node.store().read_primary().unwrap().unwrap().entries["vm1"].bank,
         Bank::B
     );
+
+    let router = node.router(coord_at("boot-f"));
+    let (status, body) = get(&router, "/v1/data/x-update-state").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["banks"][0]["in_trial"], true);
+    assert_eq!(body["trial_boots"], 5);
+    assert_eq!(body["resolution"], serde_json::Value::Null);
+    assert!(body.get("trial_boot_limit").is_none(), "{body}");
+    // The frozen legacy tree keeps the member, always null.
+    let (status, legacy) = get(&router, "/vehicle/v1/data/x-update-state").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(legacy["trial_boot_limit"], serde_json::Value::Null);
+    assert_eq!(
+        legacy.as_object().unwrap().len(),
+        body.as_object().unwrap().len() + 1
+    );
 }
 
 #[tokio::test]
 async fn verdict_skips_a_component_the_boot_vector_says_is_not_in_trial() {
     // NV holds vm2 in trial, the boot vector does not: vm2 is not a member.
     let node = TrialNode::new(true);
-    let router = node.router(coord_at("boot-b", None));
+    let router = node.router(coord_at("boot-b"));
     let (status, body) = post_json(
         &router,
         "/vehicle/v1/operations/x-update-verdict/executions",
@@ -1972,36 +1926,6 @@ async fn verdict_skips_a_component_the_boot_vector_says_is_not_in_trial() {
     assert!(
         !bank_state(&node.nv, slots::VM2).committed,
         "vm2 left alone"
-    );
-}
-
-#[tokio::test]
-async fn rollback_verdict_after_bail_out_is_idempotent() {
-    let node = TrialNode::new(false);
-    node.machine
-        .observe_node_boot(&coord_at("boot-b", Some(1)))
-        .await;
-    let router = node.router(coord_at("boot-b", Some(1)));
-    let (status, body) = post_json(
-        &router,
-        "/vehicle/v1/operations/x-update-verdict/executions",
-        serde_json::json!({"verdict": "rollback"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let skipped = body["result"]["skipped"].as_array().unwrap();
-    assert!(skipped.contains(&serde_json::json!("vm1")), "{body}");
-    assert_eq!(body["result"]["rolled_back"], serde_json::json!([]));
-    assert_eq!(
-        node.store()
-            .read_transaction()
-            .unwrap()
-            .unwrap()
-            .1
-            .resolution
-            .unwrap()
-            .reason,
-        Reason::TrialBootLimit
     );
 }
 

@@ -8,6 +8,46 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **Bank activation pre-flights the boot-vector seal.** `activate` ran the bank's activator (the
+  physical switch: a raw-partition write, a firmware load, record routing) and then sealed the boot
+  vector; a seal that failed — a signer that is unavailable — left the new content physically in
+  place while NV and the boot vector said old. The boot vector now proves first that its seal can
+  run: `IvdBankProvider::activate` checks before the activator, `PartitionBankProvider::activate`
+  before routing its records, and a vector that cannot seal fails the activation with
+  `boot-vector activate cannot run — nothing activated: …`, nothing physical done. The engine still
+  rolls NV back after a failed activation, as before. Not covered: a signer that answers the
+  pre-flight and fails at the seal, and record writes that fail for other reasons; the activation
+  then fails after the physical step as before. With a healthy signer every file written and every
+  decision are unchanged (one extra, discarded signature per activation).
+
+  Host-facing: `SelectorStore::check_activate(entries, header)`, a default method returning `Ok`
+  (a store with nothing to check ahead needs no change; `RecordSelectorStore` implements it), and
+  `SystemBankManager::check_activate(component_id, bank, images, armed_boot_id)`.
+- **Software HSM (`hsm-sim-backend`): a delivered leaf certificate must certify the device's key.**
+  A leaf was installed as long as it named an EC-P256 slot of the envelope; its public key was never
+  compared with the device's key, so a leaf for another key installed and every verifying TLS client
+  then failed. `provision` now refuses the whole envelope with `PayloadInvalid`, before anything is
+  written (first provision and re-provision), when a leaf does not parse as an X.509 certificate,
+  names a slot with no key on the device, or certifies a key other than the slot's on-disk public
+  key — as the hardware backends do. A leaf for the device's own key installs as before.
+
+  Host-facing: none required. A tower that delivered a leaf for a key the device does not hold now
+  gets an error instead of an unusable TLS identity.
+- **A trial has no boot limit.** A trial ends only by the tester's verdict, or by the boot stage's own
+  rollback when the node cannot start (still recorded at the next start as `rolled_back` /
+  `boot_stage`). The host-set trial boot limit and the node rollback it triggered are removed. Trial
+  boots are still counted per distinct boot id and reported (`trial_boots` in the update state);
+  the count decides nothing. A header an older build resolved at its limit still verifies, loads and
+  reports `reason: "trial_boot_limit"`; nothing writes that reason any more.
+
+  Host-facing: `NodeCoordinator::with_trial_boot_limit` and `trial_boot_limit()` are gone, and
+  `NodeBootOutcome` keeps only `trial_boots` (`limit`, `bailed_out` and `errors` are gone). An
+  embedder deletes its `with_trial_boot_limit(..)` call, its own config key for the limit (a config
+  file that still carries the key keeps loading as long as the config struct does not deny unknown
+  fields), and any use of the removed `NodeBootOutcome` fields. The update-state body on `/v1`
+  (`x-ota-update-state`, `x-update-state`) no longer carries `trial_boot_limit`; the frozen legacy
+  `/vehicle/v1` tree keeps it, always `null`, and its `/docs` are unchanged.
+
 - **vhsm-ssd guest enrolment: an HSM sign error no longer burns the enrolment token.** The
   enrolment signer returned an empty signature when the HSM could not sign; the CWT minted from it
   was handed to the guest and the one-shot bootstrap token (or the ENROLL_ASSISTED pending flag) was
