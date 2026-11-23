@@ -13,6 +13,8 @@
 ///   encrypted to device public key. Verified with built-in factory key.
 /// - **Re-provision** (has keys): envelope signed with Key Authority,
 ///   encrypted to device public key. `security_version` must exceed current.
+///   Replaces what the envelope owns and keeps everything else — the device's
+///   own keys above all (see `carry_over`).
 ///
 /// # Keystore layout (written by provision)
 ///
@@ -136,6 +138,56 @@ impl SimHsm {
         self.keystore_path.join("keys")
     }
 
+    /// Resolve what an interrupted re-provision left behind, so a start never
+    /// sees a missing or half-built keystore. A re-provision builds the new
+    /// keystore in `<keystore>.tmp`, renames the live one to `<keystore>.bak`,
+    /// renames `.tmp` to the live path (the commit point), then removes
+    /// `.bak`. Each state a stop can leave, and its outcome:
+    ///
+    /// | live | `.tmp` | `.bak` | stopped | outcome |
+    /// |---|---|---|---|---|
+    /// | yes | yes | – | while building `.tmp`, or before the first rename | old: `.tmp` removed |
+    /// | yes | – | yes | after the commit rename, before removing `.bak` | new: `.bak` removed |
+    /// | no | yes | yes | between the two renames | old: `.bak` renamed back, `.tmp` removed |
+    /// | no | no | yes | (never left by `provision`; `.tmp` lost) | old: `.bak` renamed back |
+    /// | no | yes | no | (never left by `provision`; `.bak` lost) | `.tmp` renamed to live: it holds the carried device keys, and if its build was cut short it has no manifest (written last) and reads as unprovisioned |
+    ///
+    /// No leftovers (a healthy or a fresh keystore) is a no-op. Device keys are
+    /// in every outcome, since `.tmp` starts as a copy of them.
+    pub fn recover_interrupted_reprovision(&self) -> Result<(), HsmError> {
+        let live = &self.keystore_path;
+        let staging = live.with_extension("tmp");
+        let backup = live.with_extension("bak");
+        let discard = |dir: &Path| {
+            if dir.exists() {
+                tracing::warn!(dir = %dir.display(), "removing a leftover of an interrupted re-provision");
+                if let Err(e) = std::fs::remove_dir_all(dir) {
+                    tracing::warn!(dir = %dir.display(), error = %e, "could not remove re-provision leftover");
+                }
+            }
+        };
+        let restore = |from: &Path| {
+            tracing::warn!(
+                from = %from.display(),
+                keystore = %live.display(),
+                "keystore missing after an interrupted re-provision; restoring it"
+            );
+            std::fs::rename(from, live).map_err(|e| {
+                HsmError::KeystoreError(format!("restore keystore from {}: {e}", from.display()))
+            })
+        };
+        if live.exists() {
+            discard(&staging);
+            discard(&backup);
+        } else if backup.exists() {
+            restore(&backup)?;
+            discard(&staging);
+        } else if staging.exists() {
+            restore(&staging)?;
+        }
+        Ok(())
+    }
+
     /// Ensure the device-side EC-P256 key pairs exist. Called on first use.
     /// Generates `keys/{key_id}.priv` + `.pub` for every device-generated
     /// role that's missing. Runs regardless of provisioning state — these
@@ -144,9 +196,15 @@ impl SimHsm {
     /// (b) IVD-sign its own pre-provisioning bank dirs (ivd-signing).
     /// The provisioning envelope is allowed to leave these slots
     /// device-generated; `generate_missing_local_keys` skips existing files,
-    /// so the factory-bootstrapped material persists across re-provision.
+    /// and a re-provision carries every device key into the new keystore, so
+    /// the factory-bootstrapped material persists across re-provision.
+    ///
+    /// First resolves a re-provision the process did not finish
+    /// ([`Self::recover_interrupted_reprovision`]), so a key is never generated
+    /// into the gap a keystore swap leaves.
     #[cfg(feature = "crypto")]
     pub fn ensure_device_keys(&self) -> Result<(), HsmError> {
+        self.recover_interrupted_reprovision()?;
         std::fs::create_dir_all(self.keys_dir())
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
         restrict_dir_700(&self.keys_dir());
@@ -195,6 +253,24 @@ impl SimHsm {
             tracing::info!(key_id = %key_id, "device-side key pair generated (first boot)");
         }
         Ok(())
+    }
+
+    /// Build the re-provisioned keystore for `ks` in `<keystore>.tmp`: what the
+    /// live keystore holds beyond the envelope's files ([`carry_over`]), then
+    /// `ks` written on top, all of it synced to disk. Returns the staging path;
+    /// the live keystore is untouched.
+    fn stage_reprovision(&self, ks: &HsmKeystore) -> Result<PathBuf, HsmError> {
+        let staging = self.keystore_path.with_extension("tmp");
+        // The live keystore exists here, so this only clears leftovers.
+        self.recover_interrupted_reprovision()?;
+        let staged = carry_over(&self.keystore_path, &staging, CarryLevel::Root)
+            .and_then(|()| SimHsm::new(staging.clone()).write_keystore(ks))
+            .and_then(|()| sync_tree(&staging));
+        if let Err(e) = staged {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        Ok(staging)
     }
 
     /// Load the current security_version from provision_state.
@@ -739,26 +815,26 @@ impl HsmProvider for SimHsm {
             "provisioning HSM keystore"
         );
 
-        // For re-provision: write to temp dir, then swap atomically
+        // Re-provision: build the new keystore beside the live one, starting
+        // from everything the envelope does not own (the device's keys, its
+        // counters, bootstrap.yaml, ...), then swap it in. See
+        // `recover_interrupted_reprovision` for the swap's crash states.
         if !is_factory {
-            let tmp_dir = self.keystore_path.with_extension("tmp");
-            let orig_path = self.keystore_path.clone();
+            let live = self.keystore_path.clone();
+            let backup = live.with_extension("bak");
+            let staging = self.stage_reprovision(&keystore)?;
 
-            // Temporarily point at the temp dir for writing
-            self.keystore_path = tmp_dir.clone();
-            let result = self.write_keystore(&keystore);
-            self.keystore_path = orig_path.clone();
-
-            result?;
-
-            // Atomic swap: rename old → .bak, new → current
-            let bak = orig_path.with_extension("bak");
-            let _ = std::fs::remove_dir_all(&bak);
-            std::fs::rename(&orig_path, &bak)
+            // The swap. The second rename is the commit point.
+            std::fs::rename(&live, &backup)
                 .map_err(|e| HsmError::KeystoreError(format!("backup old keystore: {e}")))?;
-            std::fs::rename(&tmp_dir, &orig_path)
-                .map_err(|e| HsmError::KeystoreError(format!("swap keystore: {e}")))?;
-            let _ = std::fs::remove_dir_all(&bak);
+            if let Err(e) = std::fs::rename(&staging, &live) {
+                let _ = std::fs::rename(&backup, &live);
+                return Err(HsmError::KeystoreError(format!("swap keystore: {e}")));
+            }
+            if let Some(parent) = live.parent() {
+                sync_dir(parent);
+            }
+            let _ = std::fs::remove_dir_all(&backup);
         } else {
             self.write_keystore(&keystore)?;
         }
@@ -1251,6 +1327,100 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8], private: bool) -> std::io::
     if let Some(dir) = path.parent() {
         sync_dir(dir);
     }
+    Ok(())
+}
+
+/// Where [`carry_over`] is in the keystore tree; what a re-provision owns
+/// differs per level.
+#[derive(Clone, Copy)]
+enum CarryLevel {
+    Root,
+    Keys,
+    Other,
+}
+
+/// Create `to` and copy into it everything under the live keystore `from` that
+/// a re-provision does not rewrite from its envelope, keeping every directory's
+/// and file's mode. Per file kind:
+///
+/// | file | on re-provision |
+/// |---|---|
+/// | `manifest`, `identities`, `provision_state` | rewritten from the envelope |
+/// | `keys/roots/{anchor_id}.cert` (pinned CA roots) | rewritten; a root the envelope no longer carries is gone |
+/// | `keys/{id}.pub` without `keys/{id}.priv` (trust-anchor slot, guest identity) | rewritten; gone if the envelope no longer carries it |
+/// | device keys: `keys/{id}.priv` + `.pub`, `.bin`, `.aes128.bin`, `.hmac256.bin`, `.ed25519.priv` + `.ed25519.pub` | carried, never regenerated |
+/// | `keys/{id}.cert` beside a carried `keys/{id}.priv` | carried; replaced when the envelope delivers a leaf for that key |
+/// | `keys/{id}.cert` without `keys/{id}.priv` | not carried (nothing writes one) |
+/// | `monotonic_*`, `bootstrap.yaml`, any other file or directory | carried verbatim |
+/// | sockets, FIFOs | not carried: they belong to a running process, not to the keystore |
+fn carry_over(from: &Path, to: &Path, level: CarryLevel) -> Result<(), HsmError> {
+    let err = |p: &Path, e: std::io::Error| {
+        HsmError::KeystoreError(format!("stage keystore {}: {e}", p.display()))
+    };
+    std::fs::create_dir(to).map_err(|e| err(to, e))?;
+    let mode = std::fs::metadata(from).map_err(|e| err(from, e))?;
+    std::fs::set_permissions(to, mode.permissions()).map_err(|e| err(to, e))?;
+    for entry in std::fs::read_dir(from).map_err(|e| err(from, e))? {
+        let entry = entry.map_err(|e| err(from, e))?;
+        let name = entry.file_name();
+        if envelope_owned(from, &name.to_string_lossy(), level) {
+            continue;
+        }
+        let (src, dst) = (entry.path(), to.join(&name));
+        let meta = std::fs::metadata(&src).map_err(|e| err(&src, e))?;
+        if meta.is_dir() {
+            let next = match level {
+                CarryLevel::Root if name == "keys" => CarryLevel::Keys,
+                _ => CarryLevel::Other,
+            };
+            carry_over(&src, &dst, next)?;
+        } else if meta.is_file() {
+            std::fs::copy(&src, &dst).map_err(|e| err(&src, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `dir/name` is rewritten from the envelope on re-provision (the
+/// table on [`carry_over`]).
+fn envelope_owned(dir: &Path, name: &str, level: CarryLevel) -> bool {
+    match level {
+        CarryLevel::Root => matches!(name, "manifest" | "identities" | "provision_state"),
+        CarryLevel::Keys => {
+            if name == "roots" {
+                return true;
+            }
+            match name
+                .strip_suffix(".pub")
+                .or_else(|| name.strip_suffix(".cert"))
+            {
+                Some(stem) => !dir.join(format!("{stem}.priv")).exists(),
+                None => false,
+            }
+        }
+        CarryLevel::Other => false,
+    }
+}
+
+/// fsync every file and directory under `dir`, so a staged keystore is on disk
+/// before it is swapped in.
+fn sync_tree(dir: &Path) -> Result<(), HsmError> {
+    let err = |p: &Path, e: std::io::Error| {
+        HsmError::KeystoreError(format!("sync keystore {}: {e}", p.display()))
+    };
+    for entry in std::fs::read_dir(dir).map_err(|e| err(dir, e))? {
+        let entry = entry.map_err(|e| err(dir, e))?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| err(&path, e))?;
+        if kind.is_dir() {
+            sync_tree(&path)?;
+        } else if kind.is_file() {
+            std::fs::File::open(&path)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| err(&path, e))?;
+        }
+    }
+    sync_dir(dir);
     Ok(())
 }
 
@@ -2113,6 +2283,211 @@ mod tests {
                 "security version not advanced".into(),
             );
             assert!(broken.is_empty(), "re-provision broke: {broken:#?}");
+        }
+
+        /// What the envelope owns is replaced: a pinned root or a guest
+        /// identity the new envelope no longer carries is gone. A leaf for a
+        /// kept key stays until an envelope delivers a new one.
+        #[test]
+        fn reprovision_replaces_what_the_envelope_owns() {
+            let (dir, mut hsm, ka) = provisioned();
+            let live = dir.path().join("keystore");
+            assert!(hsm.get_trust_anchor_der(DELEGATION_ROOT_ANCHOR_ID).is_ok());
+            assert!(live.join("keys/vm-a.pub").exists());
+
+            let leaf = leaf_for(&hsm, KeyRole::TlsIdentity);
+            let mut ks2 = keystore(2, &ka.1);
+            ks2.trust_anchors.clear();
+            ks2.identities.clear();
+            ks2.certificates.push(LeafCert {
+                key_id: KeyRole::TlsIdentity.key_id().into(),
+                certificate: leaf.clone(),
+            });
+            hsm.provision(&envelope(&hsm, &ks2, &ka.0, &ka.1)).unwrap();
+
+            assert!(hsm.get_trust_anchor_der(DELEGATION_ROOT_ANCHOR_ID).is_err());
+            assert!(!live.join("keys/roots").exists());
+            assert!(!live.join("keys/vm-a.pub").exists());
+            assert_eq!(
+                std::fs::read_to_string(live.join("identities")).unwrap(),
+                ""
+            );
+            // The key authority the envelope still carries is still the anchor.
+            assert!(hsm.get_public_key(KeyRole::KeyAuthority).is_ok());
+
+            // A third envelope without the leaf keeps the installed one: it
+            // certifies a key the device still holds.
+            let ks3 = keystore(3, &ka.1);
+            hsm.provision(&envelope(&hsm, &ks3, &ka.0, &ka.1)).unwrap();
+            let installed = hsm
+                .get_certificate_der(KeyRole::TlsIdentity.handle())
+                .unwrap();
+            assert!(installed == leaf);
+            let manifest = std::fs::read_to_string(live.join("manifest")).unwrap();
+            assert!(manifest.contains("keys/tls-identity.cert"));
+            // ... and the third envelope's root is back.
+            assert!(hsm.get_trust_anchor_der(DELEGATION_ROOT_ANCHOR_ID).is_ok());
+            assert_eq!(hsm.load_security_version().unwrap(), 3);
+        }
+
+        /// Every file and directory keeps its mode through a re-provision: the
+        /// keys directory 0700, private keys 0600, the rest as created.
+        #[test]
+        #[cfg(unix)]
+        fn reprovision_keeps_file_modes() {
+            use std::collections::BTreeMap;
+            use std::os::unix::fs::PermissionsExt;
+            fn modes(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, u32>) {
+                for e in std::fs::read_dir(dir).unwrap() {
+                    let p = e.unwrap().path();
+                    let m = std::fs::metadata(&p).unwrap();
+                    out.insert(
+                        p.strip_prefix(root).unwrap().into(),
+                        m.permissions().mode() & 0o7777,
+                    );
+                    if m.is_dir() {
+                        modes(root, &p, out);
+                    }
+                }
+            }
+            let (dir, mut hsm, ka) = provisioned();
+            let live = dir.path().join("keystore");
+            let root_mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+            let root_before = root_mode(&live);
+            let mut before = BTreeMap::new();
+            modes(&live, &live, &mut before);
+
+            hsm.provision(&envelope(&hsm, &keystore(2, &ka.1), &ka.0, &ka.1))
+                .unwrap();
+
+            let mut after = BTreeMap::new();
+            modes(&live, &live, &mut after);
+            assert_eq!(root_mode(&live), root_before);
+            assert_eq!(before, after, "file list or modes changed");
+            assert_eq!(after[Path::new("keys")], 0o700);
+            for (path, mode) in &after {
+                if path.extension().is_some_and(|e| e == "priv") {
+                    assert_eq!(*mode, 0o600, "{}", path.display());
+                }
+            }
+        }
+
+        /// Stop a re-provision after each step of the keystore switch, start
+        /// again (`ensure_device_keys`, which recovers first), and check the
+        /// result is the complete old or the complete new keystore with the
+        /// device keys intact — the table on `recover_interrupted_reprovision`.
+        #[test]
+        fn every_interrupted_switch_recovers_to_a_complete_keystore() {
+            enum Stop {
+                BuildingStaging,
+                BeforeFirstRename,
+                BetweenRenames,
+                AfterCommit,
+                BackupOnly,
+                StagingOnly,
+                PartialStagingOnly,
+            }
+            let cases = [
+                (Stop::BuildingStaging, Some(1)),
+                (Stop::BeforeFirstRename, Some(1)),
+                (Stop::BetweenRenames, Some(1)),
+                (Stop::AfterCommit, Some(2)),
+                (Stop::BackupOnly, Some(1)),
+                (Stop::StagingOnly, Some(2)),
+                // Cut short before its manifest: unprovisioned, same device.
+                (Stop::PartialStagingOnly, None),
+            ];
+            for (stop, expect) in cases {
+                let (dir, hsm, ka) = provisioned();
+                let live = dir.path().join("keystore");
+                let (tmp, bak) = (live.with_extension("tmp"), live.with_extension("bak"));
+                let keys = device_material(&live);
+                let mut ks2 = keystore(2, &ka.1);
+                ks2.trust_anchors.clear();
+
+                let staged = hsm.stage_reprovision(&ks2).unwrap();
+                assert_eq!(staged, tmp);
+                let rename = |a: &Path, b: &Path| std::fs::rename(a, b).unwrap();
+                let remove = |d: &Path| std::fs::remove_dir_all(d).unwrap();
+                match stop {
+                    Stop::BuildingStaging => {
+                        std::fs::remove_file(tmp.join("manifest")).unwrap();
+                        std::fs::remove_file(tmp.join("keys/ivd-signing.priv")).unwrap();
+                    }
+                    Stop::BeforeFirstRename => {}
+                    Stop::BetweenRenames => rename(&live, &bak),
+                    Stop::AfterCommit => {
+                        rename(&live, &bak);
+                        rename(&tmp, &live);
+                    }
+                    Stop::BackupOnly => {
+                        rename(&live, &bak);
+                        remove(&tmp);
+                    }
+                    Stop::StagingOnly => {
+                        rename(&live, &bak);
+                        remove(&bak);
+                    }
+                    Stop::PartialStagingOnly => {
+                        std::fs::remove_file(tmp.join("manifest")).unwrap();
+                        rename(&live, &bak);
+                        remove(&bak);
+                    }
+                }
+
+                let restarted = SimHsm::new(live.clone());
+                restarted.ensure_device_keys().unwrap();
+
+                assert!(!tmp.exists() && !bak.exists(), "leftovers remain");
+                assert!(
+                    device_material(&live) == keys,
+                    "device keys changed across an interrupted switch"
+                );
+                match expect {
+                    Some(sv) => {
+                        assert!(restarted.is_provisioned().unwrap());
+                        assert_eq!(restarted.load_security_version().unwrap(), sv);
+                        // A complete keystore, old or new: its root is there
+                        // exactly when its envelope carried one.
+                        assert_eq!(
+                            restarted
+                                .get_trust_anchor_der(DELEGATION_ROOT_ANCHOR_ID)
+                                .is_ok(),
+                            sv == 1
+                        );
+                    }
+                    None => assert!(!restarted.is_provisioned().unwrap()),
+                }
+                assert_eq!(
+                    restarted
+                        .read_monotonic(KeyHandle(vhsm_proto::HANDLE_TIME_FLOOR))
+                        .unwrap(),
+                    FLOOR
+                );
+            }
+        }
+
+        /// A re-provision that fails while building its keystore leaves the
+        /// live one as it was and no staging directory behind.
+        #[test]
+        #[cfg(unix)]
+        fn failed_reprovision_changes_nothing() {
+            use std::os::unix::fs::PermissionsExt;
+            let (dir, mut hsm, ka) = provisioned();
+            let live = dir.path().join("keystore");
+            let keys = device_material(&live);
+            // An unreadable file the re-provision has to carry makes staging fail.
+            let blocked = live.join("bootstrap.yaml");
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&blocked).is_ok() {
+                return; // running as root: permissions do not block the copy
+            }
+            let update = envelope(&hsm, &keystore(2, &ka.1), &ka.0, &ka.1);
+            assert!(hsm.provision(&update).is_err());
+            assert!(!live.with_extension("tmp").exists());
+            assert!(device_material(&live) == keys);
+            assert_eq!(hsm.load_security_version().unwrap(), 1);
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
     }
 }
