@@ -224,6 +224,29 @@ what a consumer has to touch when it moves its pin.
   deleting the primary) with the deterministic test signer writes byte-identical files and returns
   identical values before and after.
 
+- vm-mgr (QEMU runner): QNX aarch64 guests boot their IFS with `-kernel` (`images.kernel`, no BIOS,
+  no kernel cmdline); the rootfs, `partitions:` and `disks:` attach as `virtio-blk-device`. The
+  legacy QNX non-x86 path (bare `-drive` on AHCI, at most 6 disks) is gone; it could not boot an
+  aarch64 QNX image.
+- vm-mgr (config): optional virtio-mmio placement for aarch64 guests (Linux and QNX): `slot` (0–31)
+  on `partitions:`, `disks:`, `network` and `bridge` devices, and `images.rootfs_slot`. Once one
+  device of a VM names a slot, every block device and NIC must; a missing slot, a slot outside 0–31
+  or a slot used twice fails the launch with a config error (partitions are checked before their
+  image is flashed). The Linux RNG then goes after the placed devices. No slot anywhere keeps QEMU's
+  own placement. Ignored on x86_64 and by the qvm backend.
+- vm-mgr (config): optional per-VM `accel: auto | kvm | tcg`. `auto` (default) keeps today's choice
+  (KVM when the host can run the guest arch); `kvm` fails the launch when KVM is unavailable; `tcg`
+  always emulates. `cpus` is always honoured.
+- vm-mgr (config): optional per-VM `virtio_net_features` replaces the built-in virtio-net property
+  set for that VM's NICs (`""` = QEMU defaults). The built-in set stays QNX x86_64 only.
+
+Host-facing: every new field is optional, and nothing guest-specific is built in: a guest image's
+slot map, CPU model (`cpu_model`), NIC features and accelerator come from its config. x86_64 QNX,
+Linux without slots and the qvm backend build the same command line as before. The `arch` default
+(`aarch64`) is unchanged; what changes is that a `backend: qemu`, `os_type: qnx` VM without `arch:`
+now takes the `-kernel` path instead of the AHCI one (which could not boot it either). Set
+`arch: x86_64` for an x86 QNX guest.
+
 ## v0.1.29 — SOVDd v0.1.12: /v1 execute is orchestrated without x-ota-control
 
 Tag on `b6d65fb` (2026-11-23), PR #68.
