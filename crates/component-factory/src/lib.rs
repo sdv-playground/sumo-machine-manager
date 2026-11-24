@@ -1321,22 +1321,6 @@ parts:
         assert!(built.component.capabilities().hsm.is_none());
     }
 
-    /// An `hsm` component's backend serves its key inventory as the `/v1`-only
-    /// data item `keys`; no other type's does.
-    #[test]
-    fn the_hsm_backend_serves_the_keys_item() {
-        let mut spec = spec_on_slot("hsm", 0);
-        spec.component_type = "hsm".to_string();
-        spec.single_bank = true;
-        let built = build_component(&spec, &ten_slot_deps()).unwrap();
-        let backend = built.diag_backend.as_ref().unwrap();
-        assert_eq!(backend.v1_only_data(), ["keys"]);
-
-        spec.component_type = "bank".to_string();
-        let built = build_component(&spec, &ten_slot_deps()).unwrap();
-        assert!(built.diag_backend.unwrap().v1_only_data().is_empty());
-    }
-
     /// The node binary late-binds its admin gates (vm-mgr's start gate, the
     /// autostart skip, the witness and M7 sync skips) to this probe, so it exists
     /// exactly where a Deactivator does: on a `bank` given one, not on a plain

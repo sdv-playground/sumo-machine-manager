@@ -10,9 +10,10 @@ what a consumer has to touch when it moves its pin.
 
 - **On `/v1`, sumo's data items are read through SOVDd.** The HSM key inventory and the node's update
   state were answered on `/v1` by routes of sumo's own; SOVDd now serves them as data items in the
-  ISO 17978-3 `ReadValue` form (`{"id", "data"}`, with `schema` on `include-schema=true`), listed in
-  their data collections. `GET /v1/components/hsm/data/keys` is the `keys` item of the hsm
-  component's backend (category `identData`): listed in `GET /v1/components/hsm/data`, read as
+  ISO 17978-3 `ReadValue` form (`{"id", "data"}`), listed in their data collections.
+  `GET /v1/components/hsm/data/keys` is a `/v1`-only item of the hsm component's backend
+  (`list_v1_parameters` / `read_v1_data`, category `identData`), which the legacy tree never asks
+  for: listed in `GET /v1/components/hsm/data`, read as
   `{"id": "keys", "data": {"provisioned", "items"}}`; an inventory that cannot be read is an error
   in SOVDd's error body, and a component that lists no keys has no `keys` item. `GET /v1/data/x-update-state`
   and `GET /v1/data/x-ota-update-state` (the node form `/v1/components/<node>/data/…` with a node)

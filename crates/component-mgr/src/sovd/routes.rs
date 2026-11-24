@@ -1874,11 +1874,13 @@ mod tests {
                     {
                         "id": "x-ota-update-state",
                         "name": "Node update-transaction state",
+                        "category": "currentData",
                         "href": format!("{base}/x-ota-update-state"),
                     },
                     {
                         "id": "x-update-state",
                         "name": "Node update-transaction state (alias of x-ota-update-state)",
+                        "category": "currentData",
                         "href": format!("{base}/x-update-state"),
                     },
                 ]}),
@@ -2084,6 +2086,17 @@ mod tests {
         keys_of: Option<&Arc<dyn Component>>,
         node: bool,
     ) -> Router {
+        served_by_sovdd(
+            hsm_router(machine_with_hsm(hsm.clone())),
+            node,
+            std::collections::HashMap::from([("hsm".to_string(), hsm_backend(keys_of))]),
+            None,
+        )
+    }
+
+    /// The `hsm` component's backend, serving the key inventory of `keys_of`
+    /// (`None`: no `serve_keys_of`).
+    fn hsm_backend(keys_of: Option<&Arc<dyn Component>>) -> Arc<dyn sovd_core::DiagnosticBackend> {
         let backend = crate::backend::ComponentBackend::new(
             nv_store::types::BankSet(0),
             Arc::new(std::sync::Mutex::new(nv_store::store::NvStore::new(
@@ -2096,13 +2109,7 @@ mod tests {
         if let Some(component) = keys_of {
             backend.serve_keys_of(component);
         }
-        let backend: Arc<dyn sovd_core::DiagnosticBackend> = Arc::new(backend);
-        served_by_sovdd(
-            hsm_router(machine_with_hsm(hsm.clone())),
-            node,
-            std::collections::HashMap::from([("hsm".to_string(), backend)]),
-            None,
-        )
+        Arc::new(backend)
     }
 
     /// The legacy keys body of [`ProvisionedHsm`], byte for byte as v0.1.35
@@ -2142,25 +2149,6 @@ mod tests {
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&v1).unwrap(),
                 serde_json::json!({ "id": "keys", "data": inventory }),
-                "{base}"
-            );
-
-            let (status, v1) =
-                get_raw(&server, &format!("{base}/data/keys?include-schema=true")).await;
-            assert_eq!(status, StatusCode::OK, "{base}");
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&v1).unwrap(),
-                serde_json::json!({
-                    "id": "keys",
-                    "data": inventory,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "id": { "type": "string" },
-                            "data": { "type": "object" },
-                        },
-                    },
-                }),
                 "{base}"
             );
 
@@ -2224,6 +2212,39 @@ mod tests {
             assert!(listed(get_json(&with, &format!("{base}/data")).await));
             assert!(!listed(get_json(&without, &format!("{base}/data")).await));
         }
+    }
+
+    /// Without [`hsm_router`], the legacy tree reaches the backend through
+    /// SOVDd's generic routes and answers as without the item: `keys` is the
+    /// backend's unknown parameter.
+    #[tokio::test]
+    async fn without_the_hsm_router_the_legacy_tree_is_unchanged_by_the_keys_item() {
+        let hsm = provisioned_hsm();
+        let server = |keys_of| {
+            served_by_sovdd(
+                Router::new(),
+                false,
+                std::collections::HashMap::from([("hsm".to_string(), hsm_backend(keys_of))]),
+                None,
+            )
+        };
+        let (with, without) = (server(Some(&hsm)), server(None));
+        for uri in [
+            "/vehicle/v1/components/hsm/data/keys",
+            "/vehicle/v1/components/hsm/data",
+            "/vehicle/v1/components/hsm/data-categories",
+        ] {
+            assert_eq!(
+                get_raw(&with, uri).await,
+                get_raw(&without, uri).await,
+                "{uri}"
+            );
+        }
+        let (status, _) = get_raw(&with, "/vehicle/v1/components/hsm/data/keys").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // `/v1` reads the item through the server.
+        let (status, _) = get_raw(&with, "/v1/components/hsm/data/keys").await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// An inventory that cannot be read is an error on `/v1` (SOVDd's standard
