@@ -6,14 +6,18 @@ use super::*;
 /// format-agnostic); the vendor semantics live entirely here in component-mgr.
 pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-ota-installed-manifest";
 
-/// `sw-version`: the release version of the software in the bank a component
-/// serves (during a trial, the bank in trial), as its manifest's SUIT text named
-/// it (component-version), recorded whole at install. In the `{"version",
-/// "items"}` shape of `ident_data`'s `sw-version` (and the DDU's). What a client
-/// that installed a release compares against to verify it. Served on `/v1` only
-/// ([`ComponentBackend`]'s `v1_only_data`): the frozen `/vehicle/v1` tree neither
-/// lists nor serves it.
-pub const SW_VERSION_PARAM_ID: &str = crate::sovd::ident_data::SW_VERSION_ID;
+/// SOVD data-parameter id of the release version of the software in the bank a
+/// component serves (during a trial, the bank in trial): the label its
+/// manifest's SUIT text component-version names, recorded whole at install and
+/// served verbatim as a string. Served on the `/v1` tree only
+/// ([`ComponentBackend`](super::ComponentBackend)'s `list_v1_parameters` /
+/// `read_v1_data`). ISO 17978-3 defines no id for it; ISO 17978-3 uses
+/// `swVersion` as its example id. A different item from `ident_data`'s
+/// `sw-version`.
+pub const SW_VERSION_PARAM_ID: &str = "swVersion";
+
+/// The name of the [`SW_VERSION_PARAM_ID`] data item.
+pub(crate) const SW_VERSION_NAME: &str = "Software version";
 
 /// Vendor SOVD data-parameter id for this component's **update-mode** — how it
 /// updates: A/B-banked + trial + rollback, vs single-bank write-through &

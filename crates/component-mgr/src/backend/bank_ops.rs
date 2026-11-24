@@ -320,6 +320,21 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             .unwrap_or_else(|| *self.running_bank.lock().unwrap())
     }
 
+    /// The release version of the software in the bank this component serves
+    /// ([`Self::serving_bank`]), as its manifest named it: `Ok(None)` when
+    /// nothing is installed there or the manifest named none, `Err` when the
+    /// manifest cannot be read.
+    pub(super) fn serving_release_version(&self) -> BackendResult<Option<String>> {
+        let serving = self.serving_bank();
+        let fw = self.bank_manifest(serving).map_err(|e| {
+            BackendError::Internal(format!(
+                "{SW_VERSION_PARAM_ID}: the manifest of {} bank {serving:?} cannot be read: {e}",
+                self.entity_info.id
+            ))
+        })?;
+        Ok(fw.as_deref().and_then(release_version).map(str::to_string))
+    }
+
     /// Read a bank's installed firmware **report-only** via the bank provider
     /// (decode the on-disk signed manifest; NO HSM verify) and return it as
     /// [`InstalledFirmware`], caching it per-bank so repeated diagnostics reads

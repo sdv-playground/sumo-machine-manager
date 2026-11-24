@@ -44,7 +44,7 @@ pub struct FirmwareIdentity {
     pub tester_serial: Option<String>,       // F198
     /// The release version the manifest names (its SUIT text component-version),
     /// whole: no UDS field width, and `None` when the manifest named none, where
-    /// [`Self::version`] (F189) carries a `seq-N` fallback. What `sw-version`
+    /// [`Self::version`] (F189) carries a `seq-N` fallback. What `swVersion`
     /// serves.
     pub release_version: Option<String>,
 }

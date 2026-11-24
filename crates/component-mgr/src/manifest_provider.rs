@@ -34,7 +34,7 @@ pub struct ValidatedFirmware {
     /// The release version the manifest names (SUIT text component-version),
     /// whole; `None` when it names none. Unlike [`Self::version_display`] it has
     /// no `seq-N` fallback, so it says whether a version was named at all. Sealed
-    /// into the bank's signed identity at install; `sw-version` serves it.
+    /// into the bank's signed identity at install; `swVersion` serves it.
     pub release_version: Option<String>,
     /// Pre-computed image SHA-256 (set by streaming path where image is written to disk directly).
     pub image_sha256: Option<[u8; 32]>,

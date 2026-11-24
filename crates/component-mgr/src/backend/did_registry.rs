@@ -302,12 +302,6 @@ pub(super) fn release_version(fw: &InstalledFirmware) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
-/// `sw-version` of the software in `fw`, when it has a [`release_version`]:
-/// `{"version", "items"}`, the shape of `ident_data`'s `sw-version`.
-pub(super) fn sw_version_json(fw: &InstalledFirmware) -> Option<serde_json::Value> {
-    release_version(fw).map(|v| serde_json::json!({ "version": v, "items": [] }))
-}
-
 /// Render the installed firmware as the `x-ota-installed-manifest` JSON
 /// body: the signed identity + per-file `(path, sha256-hex)` inventory + the
 /// base64 of the raw signature and manifest bytes (so a SW-mapping tool can
