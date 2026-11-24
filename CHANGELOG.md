@@ -8,6 +8,13 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **SOVDd v0.1.13: no verdict watchdog.** An update that waits for its verdict (`awaiting-verdict`)
+  waits without a time limit; SOVDd used to roll it back after 10 minutes. Only a posted commit or
+  rollback, or deleting the update, ends the wait. Also from v0.1.13: `sovd-client` node discovery
+  takes only 404/405 as "flat" and reports any other failure as an error.
+
+  Host-facing: none. (`sovd_api::UpdatesConfig` and `AppState::with_updates_config` are gone; nothing
+  here used them.)
 - **On `/v1`, the HSM keys view is an ISO 17978-3 data item.** `GET /v1/components/hsm/data/keys`
   (and the node form `/v1/components/<node>/subcomponents/hsm/data/keys`) served the inventory bare,
   `{"provisioned", "items"}`, where a SOVD data resource answers a `ReadValue`, the value under
