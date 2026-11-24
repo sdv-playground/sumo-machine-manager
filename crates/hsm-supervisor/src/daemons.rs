@@ -6,12 +6,21 @@
 //! connect-only mode against the same socket. The returned [`HsmDaemons`] is
 //! held for the process lifetime and torn down explicitly — `std::process::exit`
 //! skips `Drop`, so a `Drop` impl would be a lie on the path that matters.
+//!
+//! A backend that exits is respawned by a watchdog thread, with the same
+//! command, after a delay that grows while it keeps dying young. The node's
+//! link-B client and vhsm-ssd's both reconnect on their next call. The node
+//! arms the watchdog itself, with [`HsmDaemons::watch_backend`], once its
+//! start-up is done: what it read from the HSM before then and keeps is not
+//! read again after a respawn. [`HsmDaemons::backend_health`] says whether the
+//! backend is up and whether it is crash-looping, for the host to surface.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hsm::HsmProvider;
 
@@ -25,7 +34,8 @@ use crate::config::{
 /// backend (which keeps serving the keystore).
 pub struct HsmDaemons {
     /// The link-B crypto backend. Owned for lifetime; serves the keystore.
-    pub backend_child: Child,
+    /// Behind a `Mutex` because the watchdog swaps in a respawned process.
+    pub backend_child: Arc<Mutex<Child>>,
     /// The node's own shared link-B crypto client — the SAME connection the
     /// `LinkBProvider` wraps. Hand it to in-process readers (authorizer pubkeys)
     /// as an `Arc<dyn HsmCryptoProvider>`, so PROD code holds no in-process
@@ -36,11 +46,95 @@ pub struct HsmDaemons {
     /// Captured vhsm-ssd spawn spec, shared with the reload hook so a respawn is
     /// byte-for-byte the same argv.
     pub vhsm_spec: Arc<VhsmSpawnSpec>,
+    /// The thread that respawns the backend when it exits: started by
+    /// [`Self::watch_backend`], stopped by [`Self::shutdown`].
+    backend_watch: Option<BackendWatch>,
+    /// What the watchdog runs to respawn the backend: the command `standup` ran.
+    backend_respawn: Respawn,
+    /// What the watchdog saw, for [`Self::backend_health`].
+    backend_seen: Arc<Mutex<Seen>>,
+}
+
+/// The backend respawn the watchdog runs.
+type Respawn = Arc<dyn Fn() -> std::io::Result<Child> + Send + Sync>;
+
+/// Exits in a row, each within a minute of its start, from which the backend
+/// counts as crash-looping.
+pub const CRASH_LOOP_EXITS: u32 = 3;
+
+/// The link-B backend's state, as [`HsmDaemons::backend_health`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendHealth {
+    /// Whether the watchdog runs: [`HsmDaemons::watch_backend`] was called, and
+    /// [`HsmDaemons::shutdown`] was not.
+    pub watching: bool,
+    /// Whether the backend process is running now.
+    pub running: bool,
+    /// Respawns so far.
+    pub respawns: u64,
+    /// Exits in a row, each within a minute of its start. A backend that ran
+    /// longer resets it.
+    pub quick_exits: u32,
+    /// The last exit status, as text; `None` if the backend has not exited.
+    pub last_exit: Option<String>,
+}
+
+impl BackendHealth {
+    /// The backend keeps dying young: at least [`CRASH_LOOP_EXITS`] quick exits
+    /// in a row. The node has no HSM while this holds, whatever the respawns.
+    pub fn crash_looping(&self) -> bool {
+        self.quick_exits >= CRASH_LOOP_EXITS
+    }
+}
+
+/// The watchdog's record of the backend's exits and respawns.
+#[derive(Debug, Default)]
+struct Seen {
+    respawns: u64,
+    quick_exits: u32,
+    last_exit: Option<String>,
 }
 
 impl HsmDaemons {
+    /// Start respawning the backend when it exits. Call it once the node's
+    /// start-up is done, after the HSM reads it keeps for the whole run (is the
+    /// device provisioned, its keys). Until then a backend that dies stays down:
+    /// the next HSM call fails, and the start-up fails with it and starts over
+    /// clean, instead of running on with answers the dead backend never gave. A
+    /// second call does nothing.
+    pub fn watch_backend(&mut self) {
+        if self.backend_watch.is_none() {
+            let respawn = self.backend_respawn.clone();
+            self.backend_watch = Some(BackendWatch::start(
+                self.backend_child.clone(),
+                self.backend_seen.clone(),
+                move || respawn(),
+            ));
+        }
+    }
+
+    /// The backend's state now: whether it runs, whether the watchdog does, and
+    /// its exits and respawns. [`BackendHealth::crash_looping`] is the state a
+    /// host surfaces (a fault, its HSM component's health): log lines alone do
+    /// not tell a tester the node has no HSM.
+    pub fn backend_health(&self) -> BackendHealth {
+        let running = {
+            let mut child = self.backend_child.lock().unwrap_or_else(|p| p.into_inner());
+            matches!(child.try_wait(), Ok(None))
+        };
+        let seen = self.backend_seen.lock().unwrap_or_else(|p| p.into_inner());
+        BackendHealth {
+            watching: self.backend_watch.is_some(),
+            running,
+            respawns: seen.respawns,
+            quick_exits: seen.quick_exits,
+            last_exit: seen.last_exit.clone(),
+        }
+    }
+
     /// Tear both daemons down in order — proxy first, then the backend it talks
-    /// to — SIGTERM with a ~2s grace each, then SIGKILL, reaping both.
+    /// to — SIGTERM with a ~2s grace each, then SIGKILL, reaping both. The
+    /// backend watchdog stops first, so nothing respawns what this terminates.
     ///
     /// A method rather than two open-coded `terminate_child` calls because this
     /// sequence was duplicated at every call site, and the copies disagreed
@@ -49,11 +143,15 @@ impl HsmDaemons {
     /// elsewhere must not turn shutdown into a second panic that leaves both
     /// daemons orphaned with the port and socket still bound.
     pub fn shutdown(&mut self) {
+        if let Some(watch) = self.backend_watch.take() {
+            watch.stop();
+        }
         {
             let mut vhsm = self.vhsm_child.lock().unwrap_or_else(|p| p.into_inner());
             terminate_child(&mut vhsm, "vhsm-ssd");
         }
-        terminate_child(&mut self.backend_child, "hsm-backend");
+        let mut backend = self.backend_child.lock().unwrap_or_else(|p| p.into_inner());
+        terminate_child(&mut backend, "hsm-backend");
     }
 
     /// The `post_provision_reload` hook: kill + respawn the proxy so it re-reads
@@ -210,6 +308,15 @@ pub fn standup(
     let provider: Arc<Mutex<dyn HsmProvider>> =
         Arc::new(Mutex::new(hsm::LinkBProvider::new(client.clone())));
 
+    // 5. The respawn the watchdog runs, the same command. It is armed by the
+    //    node with `watch_backend` once its start-up is done; both link-B
+    //    clients (this one and vhsm-ssd's) reconnect on their next call.
+    let backend_child = Arc::new(Mutex::new(backend_child));
+    let keystore = cfg.keystore.clone();
+    let backend_respawn: Respawn = Arc::new(move || {
+        hsm::link_b::spawn_backend(&backend_cmd, Some(keystore.as_path()), &backend_socket)
+    });
+
     Ok((
         provider,
         HsmDaemons {
@@ -217,8 +324,141 @@ pub fn standup(
             crypto_client: client,
             vhsm_child: Arc::new(Mutex::new(vhsm)),
             vhsm_spec: spec,
+            backend_watch: None,
+            backend_respawn,
+            backend_seen: Arc::new(Mutex::new(Seen::default())),
         },
     ))
+}
+
+/// How often the watchdog looks at the backend.
+const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+/// The wait before the first respawn. It doubles after each respawn whose
+/// backend died young, up to [`RESPAWN_DELAY_MAX`], so a crash loop backs off.
+const RESPAWN_DELAY_MIN: Duration = Duration::from_secs(1);
+const RESPAWN_DELAY_MAX: Duration = Duration::from_secs(30);
+/// A backend that ran this long died of something else than a crash loop: the
+/// next respawn waits [`RESPAWN_DELAY_MIN`] again.
+const STABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// The thread that respawns the link-B backend each time it exits.
+struct BackendWatch {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BackendWatch {
+    /// Start watching `child`, replacing it with `respawn()` each time it exits,
+    /// and recording each exit and respawn in `seen`.
+    fn start(
+        child: Arc<Mutex<Child>>,
+        seen: Arc<Mutex<Seen>>,
+        respawn: impl Fn() -> std::io::Result<Child> + Send + 'static,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let watching = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("hsm-backend-watch".to_string())
+            .spawn(move || watch_backend(&child, &seen, &respawn, &watching))
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    "could not start the HSM backend watchdog: a backend that exits stays down"
+                )
+            })
+            .ok();
+        Self { stop, thread }
+    }
+
+    /// Stop watching. Returns once the watchdog has, so no respawn races the
+    /// caller's teardown.
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Respawn the backend each time it exits, until `stop` is set: wait the
+/// current delay, then put `respawn()`'s child in `child`'s place. A failed
+/// respawn leaves the exited child there, so the next look tries again.
+fn watch_backend(
+    child: &Mutex<Child>,
+    seen: &Mutex<Seen>,
+    respawn: &dyn Fn() -> std::io::Result<Child>,
+    stop: &AtomicBool,
+) {
+    let mut delay = RESPAWN_DELAY_MIN;
+    let mut spawned_at = Instant::now();
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(WATCH_INTERVAL);
+        let status = {
+            let mut guard = child.lock().unwrap_or_else(|p| p.into_inner());
+            match guard.try_wait() {
+                Ok(Some(status)) => status,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "HSM backend watchdog could not check the backend");
+                    continue;
+                }
+            }
+        };
+        let quick_exits = {
+            let mut seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+            seen.last_exit = Some(status.to_string());
+            if spawned_at.elapsed() >= STABLE_AFTER {
+                seen.quick_exits = 0;
+            } else {
+                seen.quick_exits += 1;
+            }
+            seen.quick_exits
+        };
+        if quick_exits == 0 {
+            delay = RESPAWN_DELAY_MIN;
+        }
+        if quick_exits == CRASH_LOOP_EXITS {
+            tracing::error!(
+                quick_exits,
+                "link-B HSM backend is crash-looping: the node has no HSM while it lasts"
+            );
+        }
+        tracing::error!(
+            %status,
+            delay_ms = delay.as_millis() as u64,
+            "link-B HSM backend exited; respawning it"
+        );
+        if !sleep_unless_stopped(delay, stop) {
+            return;
+        }
+        let mut guard = child.lock().unwrap_or_else(|p| p.into_inner());
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        match respawn() {
+            Ok(respawned) => {
+                tracing::info!(pid = respawned.id(), "link-B HSM backend respawned");
+                *guard = respawned;
+                seen.lock().unwrap_or_else(|p| p.into_inner()).respawns += 1;
+            }
+            Err(e) => tracing::error!(error = %e, "link-B HSM backend respawn failed"),
+        }
+        spawned_at = Instant::now();
+        delay = (delay * 2).min(RESPAWN_DELAY_MAX);
+    }
+}
+
+/// Sleep `total`, in [`WATCH_INTERVAL`] steps. Returns false as soon as `stop`
+/// is set.
+fn sleep_unless_stopped(total: Duration, stop: &AtomicBool) -> bool {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        std::thread::sleep(WATCH_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+    !stop.load(Ordering::SeqCst)
 }
 
 /// Probe-bind `listen`; if busy, assume a stale vhsm-ssd orphan from a prior
@@ -511,5 +751,83 @@ mod tests {
         assert_eq!(basename_or(Path::new("vhsm-ssd"), "fb"), "vhsm-ssd");
         // No file name at all → the caller's fallback.
         assert_eq!(basename_or(Path::new("/"), "vhsm-ssd"), "vhsm-ssd");
+    }
+
+    fn sigkill(pid: u32) {
+        // SAFETY: `pid` is a child this test spawned; SIGKILL is a valid signal.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+
+    /// The watchdog replaces an exited backend under the same handle. Once
+    /// stopped, it respawns nothing.
+    #[test]
+    fn the_watchdog_respawns_an_exited_backend_until_stopped() {
+        let spawn = || Command::new("sleep").arg("60").spawn();
+        let child = Arc::new(Mutex::new(spawn().expect("spawn sleep")));
+        let first = child.lock().unwrap().id();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let watch = BackendWatch::start(child.clone(), seen.clone(), spawn);
+
+        sigkill(first);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let respawned = loop {
+            {
+                let mut c = child.lock().unwrap();
+                if c.id() != first && c.try_wait().unwrap().is_none() {
+                    break Some(c.id());
+                }
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let second = respawned.expect("the watchdog respawned the backend");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!((seen.respawns, seen.quick_exits), (1, 1));
+            assert!(seen.last_exit.as_deref().unwrap().contains("9"), "{seen:?}");
+        }
+
+        watch.stop();
+        sigkill(second);
+        std::thread::sleep(RESPAWN_DELAY_MIN + 2 * WATCH_INTERVAL);
+        let mut c = child.lock().unwrap();
+        assert_eq!(c.id(), second, "a stopped watchdog respawns nothing");
+        let _ = c.wait();
+    }
+
+    /// Exits that keep coming within STABLE_AFTER of their start count up to a
+    /// crash loop; health says so once there are CRASH_LOOP_EXITS of them.
+    #[test]
+    fn quick_exits_in_a_row_are_a_crash_loop() {
+        let child = Arc::new(Mutex::new(
+            Command::new("true").spawn().expect("spawn true"),
+        ));
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let watch =
+            BackendWatch::start(child.clone(), seen.clone(), || Command::new("true").spawn());
+        // Delays 1 s, 2 s, 4 s: the third quick exit is seen within ~8 s.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while seen.lock().unwrap().quick_exits < CRASH_LOOP_EXITS && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        watch.stop();
+        let seen = seen.lock().unwrap();
+        let health = BackendHealth {
+            watching: false,
+            running: false,
+            respawns: seen.respawns,
+            quick_exits: seen.quick_exits,
+            last_exit: seen.last_exit.clone(),
+        };
+        assert!(health.crash_looping(), "{health:?}");
+        assert!(
+            health.respawns >= u64::from(CRASH_LOOP_EXITS) - 1,
+            "{health:?}"
+        );
+        let _ = child.lock().unwrap().wait();
     }
 }

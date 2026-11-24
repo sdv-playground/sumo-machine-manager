@@ -223,6 +223,24 @@ what a consumer has to touch when it moves its pin.
   Verified: a scripted sequence (seed, activate, trial boots, commit, activate, rollback, reseed after
   deleting the primary) with the deterministic test signer writes byte-identical files and returns
   identical values before and after.
+- hsm: a `LinkBClient` made by `connect` survives its backend restarting. A call that meets a dead
+  connection fails and drops it (the op is not retried: it may have run), and the next call
+  connects to the same socket again. `link_b::spawn_backend` starts a backend without connecting,
+  with the command `spawn_and_connect` runs. **Host-facing:** none.
+- hsm-supervisor: a watchdog respawns the link-B backend when it exits, with the same command,
+  after a delay that starts at 1 s and doubles while the backend keeps dying within a minute (at
+  most 30 s). The node's link-B client and vhsm-ssd's reconnect on their next call: a respawn
+  restores the HSM link, not what the node read from the HSM and keeps. The node arms the watchdog
+  itself, with `HsmDaemons::watch_backend()`, once its start-up is done, so a backend that dies
+  during start-up still fails it (and the node starts over) instead of the node running on with
+  answers the dead backend never gave. `HsmDaemons::backend_health()` reports whether the backend
+  runs, its respawns and its exits in a row within a minute of starting; `crash_looping()` is true
+  from `CRASH_LOOP_EXITS` (3) of them. `HsmDaemons::shutdown` stops the watchdog first.
+  **Host-facing:** `HsmDaemons::backend_child` is now `Arc<Mutex<Child>>`; code that touched it
+  locks it first. Without a `watch_backend()` call nothing is respawned, as before. A host that
+  wants the respawn calls it at the end of its start-up, and surfaces `backend_health()`'s
+  `crash_looping()` (a fault, its HSM component's health). A host that keeps HSM state past its
+  start-up reads it again, or restarts, after a respawn.
 
 - vm-mgr (QEMU runner): QNX aarch64 guests boot their IFS with `-kernel` (`images.kernel`, no BIOS,
   no kernel cmdline); the rootfs, `partitions:` and `disks:` attach as `virtio-blk-device`. The
