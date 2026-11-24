@@ -8,6 +8,21 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **A component on the shared boot vector is settled only by the node operation.** The boot
+  vector's commit and rollback act on the whole vector, so a per-update verdict on one of its
+  components settles every component in trial on it: with two in trial, "commit A, roll back B" left
+  the vector booting B's new content as committed while NV said rolled back. `verdict_scope` was
+  `node` only for a component that needs an ECU reset; a banked component with a local reset on the
+  vector still took its own verdict on `/v1`. It is now `node` for every component whose bank
+  provider is attached to the shared boot vector, so `/v1` refuses a per-update `x-update-commit` /
+  `x-update-rollback` (and `x-ota-force-rollback`) on it with the error naming the node operations,
+  and reports `verdict_scope: "node"` in its capabilities and update status. The node operations
+  already include such a component. `/vehicle/v1` is unchanged.
+
+  Host-facing: `BankProvider::on_shared_boot_vector()`, a default method returning `false` (a
+  provider that writes no shared vector needs no change; `IvdBankProvider` answers whether a
+  selector is attached, `PartitionBankProvider` follows its inner provider). A `/v1` client that
+  settled a local-reset component on the vector per update sends the node operation instead.
 - **SOVDd v0.1.13: no verdict watchdog.** An update that waits for its verdict (`awaiting-verdict`)
   waits without a time limit; SOVDd used to roll it back after 10 minutes. Only a posted commit or
   rollback, or deleting the update, ends the wait. Also from v0.1.13: `sovd-client` node discovery

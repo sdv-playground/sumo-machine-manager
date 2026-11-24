@@ -2163,3 +2163,155 @@ async fn v1_component_capabilities_report_verdict_scope() {
         );
     }
 }
+
+// --- verdict scope: members of the shared boot vector settle by the node operation ---
+
+/// An empty, unsigned in-memory boot vector.
+fn empty_selector() -> SharedSystemBankState {
+    Arc::new(std::sync::RwLock::new(
+        SystemBankManager::load(Box::new(InMemorySelectorStore::new())).unwrap(),
+    ))
+}
+
+/// A vm1 backend over an `IvdBankProvider` with the given activator and boot
+/// vector (the inline provider's other inputs: no images dir, no HSM).
+fn vm1_backend_on(
+    nv: Arc<Mutex<NvStore<MemBlockDevice>>>,
+    manifest_provider: Arc<dyn ManifestProvider>,
+    activator: Option<Arc<dyn machine_mgr::BankActivator>>,
+    selector: Option<SharedSystemBankState>,
+) -> ComponentBackend<MemBlockDevice> {
+    let provider = IvdBankProvider::new(
+        nv.clone(),
+        slots::VM1,
+        false,
+        None,
+        "vm1".into(),
+        None,
+        activator,
+        selector,
+    )
+    .with_component_id("vm1");
+    ComponentBackend::new(
+        slots::VM1,
+        nv,
+        manifest_provider,
+        ComponentConfig::default(),
+    )
+    .with_id("vm1".to_string())
+    .with_bank_provider(Arc::new(provider))
+}
+
+fn fresh_nv() -> Arc<Mutex<NvStore<MemBlockDevice>>> {
+    let mut nv = NvStore::new(MemBlockDevice::new(MIN_NV_DEVICE_SIZE as usize));
+    nv.write_boot_state(&mut NvBootState::default()).unwrap();
+    Arc::new(Mutex::new(nv))
+}
+
+#[test]
+fn verdict_scope_is_node_for_a_component_on_the_shared_boot_vector() {
+    let keys = generate_test_keys();
+    let manifests: Arc<dyn ManifestProvider> =
+        Arc::new(SuitProvider::new(keys.trust_anchor.clone()));
+    let node_reset = || Some(Arc::new(NodeResetActivator) as Arc<dyn machine_mgr::BankActivator>);
+    for (activator, selector, scope) in [
+        (None, Some(empty_selector()), sovd_core::VerdictScope::Node),
+        (None, None, sovd_core::VerdictScope::Update),
+        (
+            node_reset(),
+            Some(empty_selector()),
+            sovd_core::VerdictScope::Node,
+        ),
+        (node_reset(), None, sovd_core::VerdictScope::Node),
+    ] {
+        let local = activator.is_none();
+        let on_vector = selector.is_some();
+        let backend = vm1_backend_on(fresh_nv(), manifests.clone(), activator, selector);
+        assert_eq!(
+            backend.verdict_scope(),
+            scope,
+            "local reset: {local}, on the vector: {on_vector}"
+        );
+    }
+}
+
+/// vm1 (local reset) attached to the shared boot vector, served through the
+/// SOVDd router on both trees.
+fn make_vector_scope_router() -> (axum::Router, TestKeys) {
+    let keys = generate_test_keys();
+    let suit_provider = SuitProvider::new(keys.trust_anchor.clone());
+    suit_provider.update_keys(keys.trust_anchor.clone(), None, None);
+    let manifest_provider: Arc<dyn ManifestProvider> = Arc::new(suit_provider);
+    let backend = vm1_backend_on(fresh_nv(), manifest_provider, None, Some(empty_selector()));
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".to_string(), Arc::new(backend));
+    (
+        sovd_api::create_router(sovd_api::AppState::new(backends)),
+        keys,
+    )
+}
+
+#[tokio::test]
+async fn v1_refuses_per_update_verdict_on_a_local_reset_vector_member() {
+    let (router, keys) = make_vector_scope_router();
+    let (_, body) = get(&router, "/v1/components/vm1").await;
+    assert_eq!(
+        body["capabilities"]["x-update"]["verdict_scope"], "node",
+        "{body}"
+    );
+
+    let update_id = flash_to_awaiting_verdict(
+        &router,
+        "vm1",
+        make_test_suit_envelope(&keys, "vm1", 2, &vec![0xBB; 1024]),
+    )
+    .await;
+    activation_reset(&router, "vm1").await;
+
+    for verb in ["x-update-commit", "x-update-rollback"] {
+        let (status, body) = put_empty_text(
+            &router,
+            &format!("/v1/components/vm1/updates/{update_id}/{verb}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{verb}: {body}");
+        assert!(
+            body.contains("operations/x-update-commit/executions"),
+            "{verb}: {body}"
+        );
+    }
+    let (_, status) = get(
+        &router,
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/status"),
+    )
+    .await;
+    assert_eq!(status["x-ota-substate"], "awaiting-verdict", "{status}");
+}
+
+#[tokio::test]
+async fn vehicle_v1_per_update_verdict_on_a_local_reset_vector_member_is_unchanged() {
+    let (router, keys) = make_vector_scope_router();
+    let update_id = flash_to_awaiting_verdict(
+        &router,
+        "vm1",
+        make_test_suit_envelope(&keys, "vm1", 2, &vec![0xBB; 1024]),
+    )
+    .await;
+    activation_reset(&router, "vm1").await;
+
+    let (status, body) = put_empty_text(
+        &router,
+        &format!("/vehicle/v1/components/vm1/updates/{update_id}/x-update-commit"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let settled = poll_status_until_terminal(&router, "vm1", &update_id).await;
+    assert_eq!(settled["status"], "completed", "{settled}");
+    let (_, legacy) = get(&router, "/vehicle/v1/components/vm1").await;
+    assert!(
+        legacy["capabilities"]["x-update"]
+            .get("verdict_scope")
+            .is_none(),
+        "{legacy}"
+    );
+}

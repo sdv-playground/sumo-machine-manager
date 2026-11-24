@@ -89,8 +89,9 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.update_shape()
     }
 
-    /// The engine's answer: a node-reset component is settled by the node
-    /// operation whether or not its installs go through the router.
+    /// The engine's answer: a node-reset component, or one on the shared boot
+    /// vector, is settled by the node operation whether or not its installs go
+    /// through the router.
     fn verdict_scope(&self) -> sovd_core::VerdictScope {
         self.engine.verdict_scope()
     }

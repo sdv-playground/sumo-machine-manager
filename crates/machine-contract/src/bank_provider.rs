@@ -375,6 +375,14 @@ pub trait BankProvider: Send + Sync {
         ResetKind::Local
     }
 
+    /// Whether [`Self::activate`], [`Self::commit`] and [`Self::rollback`]
+    /// write the node's shared boot vector. Its commit and rollback act on the
+    /// whole vector, so a component on it is settled only by the node
+    /// operation. Default `false` (no shared vector).
+    fn on_shared_boot_vector(&self) -> bool {
+        false
+    }
+
     /// Whether [`Self::write_disabled_record`] could persist a disable right
     /// now: its refusals, checked without writing anything. The engine asks
     /// BEFORE it stops the component, so a disable that cannot be recorded is

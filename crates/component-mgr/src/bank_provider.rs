@@ -1144,11 +1144,12 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
         // here — the selector tracks the activation regardless of how it
         // physically happened.
         //
-        // TODO(campaign): the selector's seal/commit/rollback are GLOBAL (whole
-        // blob); correct only while <=1 component is mid-trial (the
-        // per-component flash-guard + one-OTA-at-a-time make that the norm —
-        // non-trial components have PRIMARY==SECONDARY so the global op no-ops
-        // them). A future campaign coordinator handles concurrent trials.
+        // The selector's seal/commit/rollback are GLOBAL (whole blob): a
+        // commit or rollback settles every component in trial on the vector,
+        // not this one alone. A component on the shared vector is therefore
+        // settled only by the node operation, which applies one verdict to
+        // all of them (`on_shared_boot_vector` makes its verdict scope
+        // `Node`, so a per-update verdict is refused on `/v1`).
         if let Some(sel) = &self.selector {
             let images = self.sealed_images(bank);
             let mut g = sel.write().expect("selector poisoned");
@@ -1352,6 +1353,10 @@ impl<D: BlockDevice + Send + 'static> BankProvider for IvdBankProvider<D> {
             .as_ref()
             .map(|a| a.reset_kind())
             .unwrap_or(ResetKind::Local)
+    }
+
+    fn on_shared_boot_vector(&self) -> bool {
+        self.selector.is_some()
     }
 
     fn banks(&self) -> Option<ComponentBanks> {
