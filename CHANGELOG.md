@@ -20,8 +20,7 @@ what a consumer has to touch when it moves its pin.
   are node-level data items, listed in `GET /v1/data`, read as `{"id": "x-update-state", "data": {…}}`,
   `data` being the body `/v1` served before (no `trial_boot_limit`). The members inside `data` come
   in name order. `/vehicle/v1` is unchanged: the same routes, bodies, status codes and listings. The
-  `HsmKeysDataItem` schema is gone from the capability description. SOVDd is pinned at a commit of
-  its `/v1` read-value work until its next release.
+  `HsmKeysDataItem` schema is gone from the capability description. SOVDd v0.1.14.
 
   Host-facing: `hsm_router` serves `…/hsm/data/keys` on `/vehicle/v1` only (its `x-csr` operation
   stays on both trees), and `update_state_router` serves both update-state routes on `/vehicle/v1`

@@ -31,11 +31,11 @@ tokio = { version = "1", features = ["net", "signal", "sync", "rt", "macros", "t
 # `Machine` — the hsm component's device id is the ECU id the identification
 # prefix and `x-ecu-id` share.
 machine-mgr = { path = "../machine-mgr" }
-sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", rev = "1ff5f7951583bc07aaaa52019fc96d9694486b08" }
-sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", rev = "1ff5f7951583bc07aaaa52019fc96d9694486b08" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.14" }
+sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.14" }
 # mDNS / DNS-SD advertiser for the SOVD endpoint (ISO 17978-3 §5.11), on both
 # transports; QNX-safe (a pure-Rust responder on `nto`).
-sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", rev = "1ff5f7951583bc07aaaa52019fc96d9694486b08" }
+sovd-mdns = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.14" }
 # factory-reset: the component specs a reset resolves its bank dirs from, the
 # bank staging wipe, the `EBUSY` errno of a mounted partition, and the
 # `ResetHooks` async trait.
