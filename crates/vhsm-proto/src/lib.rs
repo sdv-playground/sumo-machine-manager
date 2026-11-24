@@ -268,7 +268,11 @@ pub const PERM_KEY_GENERATE: u32 = 1 << 10;
 //
 // Layout:
 //   0x0000              HANDLE_INVALID
-//   0x0001 .. 0x007F    sumo core well-known (this file owns numbering)
+//   0x0001 .. 0x007F    sumo core well-known (this file owns numbering),
+//                       except:
+//     0x0010 .. 0x001F  reserved, platform-defined, host-only. A platform's
+//                       own HSM daemon may serve handles here; no core handle
+//                       or slot takes one, and none is a guest-wire handle.
 //   0x0080 .. 0x00FF    project extensions (downstream owns numbering; see
 //                       guest-vm-spec/crates/vhsm-handles-ext and the C
 //                       mirror at guest-vm-spec/shared/include/vhsm_proto.h)
