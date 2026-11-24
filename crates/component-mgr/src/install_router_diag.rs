@@ -109,14 +109,6 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.read_data(param_ids).await
     }
 
-    async fn list_v1_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {
-        self.engine.list_v1_parameters().await
-    }
-
-    async fn read_v1_data(&self, id: &str) -> BackendResult<Option<DataValue>> {
-        self.engine.read_v1_data(id).await
-    }
-
     async fn write_data(&self, param_id: &str, value: &[u8]) -> BackendResult<()> {
         self.engine.write_data(param_id, value).await
     }

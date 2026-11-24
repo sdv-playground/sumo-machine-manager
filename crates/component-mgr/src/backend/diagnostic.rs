@@ -176,19 +176,12 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         Ok(vec![ParameterInfo {
             id: KEYS_PARAM_ID.to_string(),
             name: KEYS_NAME.to_string(),
-            description: Some(
-                "The HSM's provisioning state and every key slot: id, kind, \
-                 certificate presence, allowed operations and, for an \
-                 asymmetric key, its public key. Never key material."
-                    .to_string(),
-            ),
+            description: None,
             unit: None,
             data_type: Some("object".to_string()),
             read_only: true,
-            href: format!(
-                "/v1/components/{}/data/{KEYS_PARAM_ID}",
-                self.entity_info.id
-            ),
+            // The server builds the href of a `/v1`-only item.
+            href: String::new(),
             did: None,
             category: Some(DataCategory::IdentData),
         }])
