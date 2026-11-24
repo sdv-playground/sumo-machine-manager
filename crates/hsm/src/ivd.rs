@@ -216,7 +216,7 @@ pub struct IvdIdentity {
     /// [`Self::version`], which F189 cuts to 32 bytes and fills with a
     /// `seq-N` fallback when the manifest names none). `None` when the manifest
     /// named no version. What a client that installed a release compares
-    /// against (`sw-version`). Optional key: `IVD_MANIFEST_VERSION` is unchanged,
+    /// against (`swVersion`). Optional key: `IVD_MANIFEST_VERSION` is unchanged,
     /// a manifest without it encodes byte-identically to before, and a decoder
     /// that predates it ignores it.
     #[serde(rename = "10", default, skip_serializing_if = "Option::is_none")]
@@ -1736,6 +1736,31 @@ mod tests {
         let older: IdentityWithoutReleaseVersion =
             ciborium::from_reader(id_bytes.as_slice()).unwrap();
         assert_eq!(older, identity_without_release_version());
+    }
+
+    /// The decoder ignores an identity key it does not know, as a decoder that
+    /// predates key 10 ignores key 10.
+    #[test]
+    fn manifest_with_an_unknown_identity_key_decodes() {
+        let m = build_manifest_from_files(Vec::new(), 4, sample_identity());
+        let mut value: ciborium::Value =
+            ciborium::from_reader(encode_manifest(&m).unwrap().as_slice()).unwrap();
+        let identity = value
+            .as_map_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|(k, _)| k.as_text() == Some("5"))
+            .map(|(_, v)| v)
+            .unwrap();
+        identity
+            .as_map_mut()
+            .unwrap()
+            .push(("11".into(), "unknown".into()));
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&value, &mut bytes).unwrap();
+
+        let back = decode_manifest(&bytes).unwrap();
+        assert_eq!(back.identity, m.identity);
     }
 
     /// The manifest as encoded before `update_id` existed: keys 0..6, no key
