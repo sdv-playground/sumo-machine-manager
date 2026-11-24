@@ -73,7 +73,7 @@ pub(crate) use did_registry::{did_value_to_json, is_identity_did, resolve_param,
 pub use health::{GuestHealth, HealthProbe};
 pub(crate) use types::sink_error;
 pub use types::{
-    ComponentConfig, LogSource, ATTEST_TIME_OP_ID, INSTALLED_MANIFEST_PARAM_ID,
+    ComponentConfig, LogSource, ATTEST_TIME_OP_ID, INSTALLED_MANIFEST_PARAM_ID, KEYS_PARAM_ID,
     UPDATE_MODE_PARAM_ID,
 };
 
@@ -157,6 +157,9 @@ pub struct ComponentBackend<D: BlockDevice + Send + 'static> {
     /// Threaded from `FactoryDeps::hsm_crypto` via
     /// [`with_hsm_crypto`](Self::with_hsm_crypto).
     hsm_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
+    /// The component whose key inventory this backend serves as its data item
+    /// `keys`; unset = no such item. Set via [`serve_keys_of`](Self::serve_keys_of).
+    keys_of: OnceLock<std::sync::Weak<dyn machine_mgr::Component>>,
     /// Advertise the device-global `x-attest-time` operation on this
     /// component. Device-global means exactly one component carries it —
     /// the platform decides which and says so via
@@ -444,6 +447,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             // Defaults to the `dyn HsmProvider` path; component-factory injects a
             // crypto-only handle via `with_hsm_crypto` when link-B is configured.
             hsm_crypto: None,
+            keys_of: OnceLock::new(),
             attest_time: false,
             vm_principal: false,
             wall_clock_floor: Arc::new(crate::sovd::time_floor::NoopWallClockFloor),
@@ -556,6 +560,21 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // already carries its own crypto handle, so this rebuild is skipped then.
         self.rebuild_bank_provider();
         self
+    }
+
+    /// Serve `component`'s key inventory ([`Component::list_keys`](machine_mgr::Component::list_keys))
+    /// as this backend's data item `keys`, on the `/v1` tree only: its value is
+    /// the inventory the frozen tree's own `…/hsm/data/keys` route serves bare
+    /// (`crate::sovd::routes::hsm_router`). The item is neither listed nor read
+    /// while `list_keys` answers `NotSupported`. `component` is held weakly,
+    /// since it usually wraps this backend; the first call wins.
+    pub fn serve_keys_of(&self, component: &Arc<dyn machine_mgr::Component>) {
+        let _ = self.keys_of.set(Arc::downgrade(component));
+    }
+
+    /// The component [`serve_keys_of`](Self::serve_keys_of) named, while it lives.
+    fn keys_component(&self) -> Option<Arc<dyn machine_mgr::Component>> {
+        self.keys_of.get()?.upgrade()
     }
 
     /// Inject the wall-clock-floor sink. The real host passes a clock-setting

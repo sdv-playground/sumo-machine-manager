@@ -14,6 +14,14 @@ pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-ota-installed-manifest";
 /// vendor namespace (SOVDd stays spec-pure; the semantics live here in component-mgr).
 pub const UPDATE_MODE_PARAM_ID: &str = "x-ota-update-mode";
 
+/// SOVD data-parameter id of an HSM component's key-slot inventory (public
+/// metadata only), served on the `/v1` tree only
+/// ([`ComponentBackend::serve_keys_of`](super::ComponentBackend::serve_keys_of)).
+pub const KEYS_PARAM_ID: &str = "keys";
+
+/// The name of the [`KEYS_PARAM_ID`] data item.
+pub(crate) const KEYS_NAME: &str = "HSM key slots";
+
 /// Vendor SOVD operation id for **attest-time**: push a SoftwareAuthority-signed
 /// SUIT manifest so the device ratchets its safe-time floor from the manifest's
 /// signed (protected-header) `signing_time`. Lets an operator advance a

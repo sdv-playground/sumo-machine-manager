@@ -152,7 +152,13 @@ async fn server(extra: &str, backends: HashMap<String, Arc<dyn DiagnosticBackend
     let machine = machine();
     let ecu_id = read_ecu_id(&cfg, machine.as_ref()).await;
     let identification = configured_identification(&cfg, ecu_id.as_deref());
-    let state = sovd_state(backends, node_topology(&cfg, identification.as_deref())).unwrap();
+    let coord = Arc::new(machine_mgr::node_update::NodeCoordinator::new());
+    let state = sovd_state(backends, node_topology(&cfg, identification.as_deref()))
+        .unwrap()
+        .with_node_data(Arc::new(component_mgr::sovd::routes::UpdateStateData::new(
+            coord.clone(),
+            machine.clone(),
+        )));
     let vendor = axum::Router::new()
         .merge(component_mgr::sovd::routes::device_id_router(
             machine.clone(),
@@ -161,8 +167,7 @@ async fn server(extra: &str, backends: HashMap<String, Arc<dyn DiagnosticBackend
             machine.clone(),
         ))
         .merge(component_mgr::sovd::routes::update_state_router(
-            Arc::new(machine_mgr::node_update::NodeCoordinator::new()),
-            machine,
+            coord, machine,
         ));
     let factory_reset_paths = Arc::new(Mutex::new(Vec::new()));
     let factory_reset = {
@@ -317,7 +322,7 @@ async fn a_member_through_the_node_is_the_flat_member_without_one() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["value"]["version"], "PSW_1.10", "{body}");
+    assert_eq!(body["data"]["version"], "PSW_1.10", "{body}");
 }
 
 #[tokio::test]
@@ -449,6 +454,10 @@ async fn the_update_state_is_node_level_data() {
         body,
         send(&flat.router, "GET", "/v1/data/x-update-state").await.2
     );
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["id"], "x-update-state", "{body}");
+    assert_eq!(body["data"]["phase"], "Idle", "{body}");
+    assert_eq!(body.as_object().unwrap().len(), 2, "{body}");
     let (status, _, _) = send(&node.router, "GET", "/v1/data/x-update-state").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }

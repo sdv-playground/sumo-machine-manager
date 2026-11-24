@@ -8,6 +8,32 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **On `/v1`, sumo's data items are read through SOVDd.** The HSM key inventory and the node's update
+  state were answered on `/v1` by routes of sumo's own; SOVDd now serves them as data items in the
+  ISO 17978-3 `ReadValue` form (`{"id", "data"}`), listed in their data collections.
+  `GET /v1/components/hsm/data/keys` is a `/v1`-only item of the hsm component's backend
+  (`list_v1_parameters` / `read_v1_data`, category `identData`), which the legacy tree never asks
+  for: listed in `GET /v1/components/hsm/data`, read as
+  `{"id": "keys", "data": {"provisioned", "items"}}`; an inventory that cannot be read is an error
+  in SOVDd's error body, and a component that lists no keys has no `keys` item. `GET /v1/data/x-update-state`
+  and `GET /v1/data/x-ota-update-state` (the node form `/v1/components/<node>/data/…` with a node)
+  are node-level data items, listed in `GET /v1/data`, read as `{"id": "x-update-state", "data": {…}}`,
+  `data` being the body `/v1` served before (no `trial_boot_limit`). The members inside `data` come
+  in name order. `/vehicle/v1` is unchanged: the same routes, bodies, status codes and listings. The
+  `HsmKeysDataItem` schema is gone from the capability description. SOVDd v0.1.14.
+
+  Host-facing: `hsm_router` serves `…/hsm/data/keys` on `/vehicle/v1` only (its `x-csr` operation
+  stays on both trees), and `update_state_router` serves both update-state routes on `/vehicle/v1`
+  only. The hsm backend `build_component` returns serves `keys` by itself; a host that builds its
+  hsm `ComponentBackend` otherwise calls `ComponentBackend::serve_keys_of(&component)` with the hsm
+  `Component`, and a host that registers no hsm backend with the server merges
+  `hsm_keys_v1_router(machine)` next to `hsm_router` to keep its `/v1` keys read. For
+  the update state, a host hands `component_mgr::sovd::routes::UpdateStateData::new(coord, machine)`
+  (the arguments it gives `update_state_router`) to the server state:
+  `state.with_node_data(Arc::new(…))` on the `AppState` `node_shell::sovd_state` returns (or that
+  it passes to `gateway_router_with_state`), before building the router. A host that does not
+  answers 404 on `/v1/data/x-update-state` and `/v1/data/x-ota-update-state`. Both routers keep
+  their signatures; `vm-sovd` is wired.
 - **A component on the shared boot vector is settled only by the node operation.** The boot
   vector's commit and rollback act on the whole vector, so a per-update verdict on one of its
   components settles every component in trial on it: with two in trial, "commit A, roll back B" left

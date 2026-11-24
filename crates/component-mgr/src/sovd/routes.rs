@@ -50,7 +50,10 @@ fn both_trees<const N: usize>(routes: [(&str, MethodRouter); N]) -> Router {
 ///
 /// Also serves `GET /vehicle/v1/data/x-update-state`, an alias with the same
 /// body (both carry `node_boot_id`). The frozen legacy tree keeps the
-/// `trial_boot_limit` member, always null; `/v1` does not carry it.
+/// `trial_boot_limit` member, always null.
+///
+/// The legacy tree only: on `/v1` both are node-level data items SOVDd serves
+/// from an [`UpdateStateData`] (`sovd_api::AppState::with_node_data`).
 ///
 /// `machine` supplies the per-component `banks` member (what each bank holds,
 /// from the installed manifests) and the boot vector's header. The router
@@ -60,24 +63,84 @@ fn both_trees<const N: usize>(routes: [(&str, MethodRouter); N]) -> Router {
 pub fn update_state_router(coord: Arc<NodeCoordinator>, machine: Arc<dyn Machine>) -> Router {
     let alias_coord = coord.clone();
     let alias_machine = machine.clone();
-    both_trees([
-        (
-            "/data/x-ota-update-state",
-            get(move |Extension(tree): Extension<Tree>| {
+    let base = Tree::Legacy.base();
+    Router::new()
+        .route(
+            &format!("{base}/data/x-ota-update-state"),
+            get(move || {
                 let coord = coord.clone();
                 let machine = machine.clone();
-                async move { update_state(tree, coord, machine).await }
+                async move { update_state(coord, machine).await }
             }),
-        ),
-        (
-            "/data/x-update-state",
-            get(move |Extension(tree): Extension<Tree>| {
+        )
+        .route(
+            &format!("{base}/data/x-update-state"),
+            get(move || {
                 let coord = alias_coord.clone();
                 let machine = alias_machine.clone();
-                async move { x_update_state(tree, coord, machine).await }
+                async move { x_update_state(coord, machine).await }
             }),
-        ),
-    ])
+        )
+}
+
+/// The node-level data items `x-ota-update-state` and its alias
+/// `x-update-state` on the `/v1` tree, for `sovd_api::AppState::with_node_data`:
+/// SOVDd lists both under `GET /v1/data` and reads each as an ISO 17978-3
+/// Table 85 `ReadValue` whose `data` is the body [`update_state_router`]
+/// serves on the frozen tree, without `trial_boot_limit`.
+pub struct UpdateStateData {
+    coord: Arc<NodeCoordinator>,
+    machine: Arc<dyn Machine>,
+}
+
+impl UpdateStateData {
+    /// The items over the node's coordinator and machine, as
+    /// [`update_state_router`] takes them.
+    pub fn new(coord: Arc<NodeCoordinator>, machine: Arc<dyn Machine>) -> Self {
+        Self { coord, machine }
+    }
+}
+
+/// The ids [`UpdateStateData`] serves, with their names.
+const UPDATE_STATE_ITEMS: [(&str, &str); 2] = [
+    ("x-ota-update-state", "Node update-transaction state"),
+    (
+        "x-update-state",
+        "Node update-transaction state (alias of x-ota-update-state)",
+    ),
+];
+
+#[async_trait::async_trait]
+impl sovd_core::NodeData for UpdateStateData {
+    async fn list_data(&self) -> sovd_core::BackendResult<Vec<sovd_core::ParameterInfo>> {
+        Ok(UPDATE_STATE_ITEMS
+            .iter()
+            .map(|(id, name)| sovd_core::ParameterInfo {
+                id: id.to_string(),
+                name: name.to_string(),
+                description: None,
+                unit: None,
+                data_type: Some("object".to_string()),
+                read_only: true,
+                // SOVDd renders a node-level item's href itself.
+                href: String::new(),
+                did: None,
+                category: Some(sovd_core::DataCategory::CurrentData),
+            })
+            .collect())
+    }
+
+    async fn read_data(&self, id: &str) -> sovd_core::BackendResult<sovd_core::DataValue> {
+        let Some(&(item, name)) = UPDATE_STATE_ITEMS.iter().find(|(item, _)| *item == id) else {
+            return Err(sovd_core::BackendError::ParameterNotFound(format!(
+                "Node data item not found: {id}"
+            )));
+        };
+        let body = update_state_body(Tree::V1, &self.coord, self.machine.as_ref()).0;
+        let value =
+            serde_json::to_value(body).expect("UpdateStateResponse is infallibly serializable");
+        Ok(sovd_core::DataValue::new(item, name, value))
+    }
 }
 
 /// The `x-ota-update-state` resource body — the node's update-transaction
@@ -219,11 +282,10 @@ impl From<BankContents> for BankContentsResponse {
     ),
 )]
 pub(crate) async fn update_state(
-    tree: Tree,
     coord: Arc<NodeCoordinator>,
     machine: Arc<dyn Machine>,
 ) -> Json<UpdateStateResponse> {
-    update_state_body(tree, &coord, machine.as_ref())
+    update_state_body(Tree::Legacy, &coord, machine.as_ref())
 }
 
 /// `GET /vehicle/v1/data/x-update-state` — alias of
@@ -237,15 +299,14 @@ pub(crate) async fn update_state(
     ),
 )]
 pub(crate) async fn x_update_state(
-    tree: Tree,
     coord: Arc<NodeCoordinator>,
     machine: Arc<dyn Machine>,
 ) -> Json<UpdateStateResponse> {
-    update_state_body(tree, &coord, machine.as_ref())
+    update_state_body(Tree::Legacy, &coord, machine.as_ref())
 }
 
-/// The shared body of [`update_state`] and [`x_update_state`], as served on
-/// `tree`.
+/// The shared body of [`update_state`], [`x_update_state`] (`tree` the legacy
+/// one) and [`UpdateStateData`] (`tree` `/v1`).
 fn update_state_body(
     tree: Tree,
     coord: &NodeCoordinator,
@@ -301,12 +362,12 @@ fn component_banks(machine: &dyn Machine) -> Vec<ComponentBanksResponse> {
 ///
 /// Wire:
 ///
-///   `GET  /vehicle/v1/components/hsm/data/keys`
+///   `GET  /vehicle/v1/components/hsm/data/keys` (the legacy tree only)
 ///        → 200 JSON `{ "provisioned": bool, "items": [ { id, kind,
-///          has_certificate, allowed_ops, public_key_der_base64 } ] }`; on
-///          `/v1` the same inventory as an ISO 17978-3 data item (§7.9.3,
-///          `ReadValue`): `{ "id": "keys", "data": { "provisioned", "items" } }`
-///          ([`HsmKeysDataItem`]). ALWAYS
+///          has_certificate, allowed_ops, public_key_der_base64 } ] }`. On
+///          `/v1` the same inventory is the hsm component's data item `keys`,
+///          read through SOVDd as an ISO 17978-3 Table 85 `ReadValue`
+///          (`ComponentBackend::serve_keys_of`). ALWAYS
 ///          served (device-generated keys exist from first boot); `provisioned`
 ///          is the device's own state, so callers read it instead of inferring
 ///          from a status code. Every slot is listed — key slots (`kind` =
@@ -331,22 +392,20 @@ fn component_banks(machine: &dyn Machine) -> Vec<ComponentBanksResponse> {
 /// old `vm-mgr` name).
 pub fn hsm_router(machine: Arc<dyn Machine>) -> Router {
     let csr = machine.clone();
-    both_trees([
-        (
-            "/components/hsm/data/keys",
-            get(move |Extension(tree): Extension<Tree>| {
-                let machine = machine.clone();
-                async move { hsm_keys_list(tree, machine).await }
-            }),
-        ),
-        (
-            "/components/hsm/operations/x-csr/executions",
-            post(move |Json(req): Json<CsrRequest>| {
-                let machine = csr.clone();
-                async move { hsm_csr_execute(machine, req).await }
-            }),
-        ),
-    ])
+    both_trees([(
+        "/components/hsm/operations/x-csr/executions",
+        post(move |Json(req): Json<CsrRequest>| {
+            let machine = csr.clone();
+            async move { hsm_csr_execute(machine, req).await }
+        }),
+    )])
+    .route(
+        &format!("{}/components/hsm/data/keys", Tree::Legacy.base()),
+        get(move || {
+            let machine = machine.clone();
+            async move { hsm_keys_list(machine).await }
+        }),
+    )
 }
 
 /// One HSM key-slot entry in the [`HsmKeysResponse`] inventory — public
@@ -368,19 +427,82 @@ pub(crate) struct HsmKeysResponse {
     pub items: Vec<HsmKeyEntry>,
 }
 
-/// The `hsm/data/keys` inventory on the `/v1` tree: an ISO 17978-3 data item
-/// (`ReadValue`), whose `data` is the [`HsmKeysResponse`] the legacy tree
-/// serves bare.
-#[derive(serde::Serialize, utoipa::ToSchema)]
-pub(crate) struct HsmKeysDataItem {
-    /// The data resource's id: `keys`.
-    pub id: &'static str,
-    pub data: HsmKeysResponse,
+impl From<machine_mgr::KeyInventory> for HsmKeysResponse {
+    fn from(inv: machine_mgr::KeyInventory) -> Self {
+        use base64::Engine;
+        Self {
+            provisioned: inv.provisioned,
+            items: inv
+                .keys
+                .into_iter()
+                .map(|k| HsmKeyEntry {
+                    id: k.key_id,
+                    kind: k.kind.label().to_string(),
+                    has_certificate: k.has_certificate,
+                    allowed_ops: k.allowed_ops,
+                    public_key_der_base64: k
+                        .public_key
+                        .map(|der| base64::engine::general_purpose::STANDARD.encode(der)),
+                })
+                .collect(),
+        }
+    }
 }
 
-/// `GET …/hsm/data/keys` — the key-slot inventory (public metadata only).
-/// On `/v1` it is the data item [`HsmKeysDataItem`]; on `/vehicle/v1` the
-/// inventory itself.
+/// `component`'s key-slot inventory as the JSON of [`HsmKeysResponse`]: `None`
+/// when it lists no keys (`list_keys` not supported), an error when the
+/// inventory cannot be read. The value of the `/v1` data item `keys`, both
+/// from the hsm backend (`ComponentBackend::serve_keys_of`) and from
+/// [`hsm_keys_v1_router`].
+pub(crate) async fn keys_value(
+    component: &dyn Component,
+) -> sovd_core::BackendResult<Option<serde_json::Value>> {
+    match component.list_keys().await {
+        Ok(inventory) => Ok(Some(
+            serde_json::to_value(HsmKeysResponse::from(inventory))
+                .expect("HsmKeysResponse is infallibly serializable"),
+        )),
+        Err(MachineError::NotSupported(_)) => Ok(None),
+        Err(e) => Err(sovd_core::BackendError::Internal(format!(
+            "list keys error: {e}"
+        ))),
+    }
+}
+
+/// `GET /v1/components/hsm/data/keys` — the data item `keys` (ISO 17978-3
+/// Table 85 `ReadValue`) of `machine`'s hsm component, for a host that
+/// registers no hsm backend with the server, so the server has no `keys` item
+/// to serve. Errors are the server's: 404 when there is no hsm component or it
+/// lists no keys, 500 when its inventory cannot be read.
+///
+/// A host whose hsm backend is registered must not merge this router: the
+/// backend's item is the one to serve, and this literal route would shadow it.
+pub fn hsm_keys_v1_router(machine: Arc<dyn Machine>) -> Router {
+    Router::new().route(
+        &format!("{}/components/hsm/data/keys", Tree::V1.base()),
+        get(move || {
+            let machine = machine.clone();
+            async move {
+                let not_found = || {
+                    sovd_api::ApiError::from(sovd_core::BackendError::ParameterNotFound(
+                        crate::backend::KEYS_PARAM_ID.to_string(),
+                    ))
+                };
+                let component = machine.component("hsm").ok_or_else(not_found)?;
+                let data = keys_value(component.as_ref())
+                    .await?
+                    .ok_or_else(not_found)?;
+                Ok::<_, sovd_api::ApiError>(Json(sovd_api::handlers::data::ReadValue {
+                    id: crate::backend::KEYS_PARAM_ID.to_string(),
+                    data,
+                }))
+            }
+        }),
+    )
+}
+
+/// `GET /vehicle/v1/components/hsm/data/keys` — the key-slot inventory
+/// (public metadata only), served bare on the legacy tree.
 #[utoipa::path(
     get,
     path = "/vehicle/v1/components/hsm/data/keys",
@@ -390,10 +512,7 @@ pub(crate) struct HsmKeysDataItem {
         (status = 503, description = "No HSM component, or the HSM keys are unavailable.", body = String),
     ),
 )]
-pub(crate) async fn hsm_keys_list(
-    tree: Tree,
-    machine: Arc<dyn Machine>,
-) -> axum::response::Response {
+pub(crate) async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
     let Some(comp) = machine.component("hsm") else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -402,38 +521,7 @@ pub(crate) async fn hsm_keys_list(
             .into_response();
     };
     match comp.list_keys().await {
-        Ok(inv) => {
-            let items: Vec<HsmKeyEntry> = inv
-                .keys
-                .into_iter()
-                .map(|k| {
-                    use base64::Engine;
-                    let public_key_der_base64 = k
-                        .public_key
-                        .as_ref()
-                        .map(|der| base64::engine::general_purpose::STANDARD.encode(der));
-                    HsmKeyEntry {
-                        id: k.key_id,
-                        kind: k.kind.label().to_string(),
-                        has_certificate: k.has_certificate,
-                        allowed_ops: k.allowed_ops,
-                        public_key_der_base64,
-                    }
-                })
-                .collect();
-            let inventory = HsmKeysResponse {
-                provisioned: inv.provisioned,
-                items,
-            };
-            match tree {
-                Tree::V1 => Json(HsmKeysDataItem {
-                    id: "keys",
-                    data: inventory,
-                })
-                .into_response(),
-                Tree::Legacy => Json(inventory).into_response(),
-            }
-        }
+        Ok(inv) => Json(HsmKeysResponse::from(inv)).into_response(),
         Err(MachineError::NotSupported(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "HSM keys unavailable".to_string(),
@@ -1788,38 +1876,100 @@ mod tests {
         );
     }
 
-    // Two-tree mount: every vendor route is served under `/v1` exactly as
-    // under the legacy `/vehicle/v1`, but for the update-state body's
-    // `trial_boot_limit`, which the frozen legacy tree keeps.
+    // The update state: node-level data SOVDd serves on `/v1` from
+    // `UpdateStateData`; the frozen legacy tree keeps `update_state_router`'s
+    // body, `trial_boot_limit` included.
 
     /// The legacy update-state body for the fixture below, byte for byte as
     /// v0.1.32 served it (its `trial_boot_limit` then null = disabled).
     const LEGACY_UPDATE_STATE: &str = r#"{"phase":"Trial","components":["vm1"],"reboot_owed":[],"rebooted_since_arming":true,"node_boot_id":"boot-b","banks":[],"trial_boots":null,"trial_boot_limit":null,"resolution":null}"#;
 
     #[tokio::test]
-    async fn x_update_state_is_served_on_the_v1_tree_without_trial_boot_limit() {
-        let router = update_state_router(
-            coord_with(Some((true, false)), Some(true), Some("boot-b")),
-            machine_with(&[]),
-        );
-        let v1_body = LEGACY_UPDATE_STATE.replace(r#""trial_boot_limit":null,"#, "");
-        for suffix in ["/data/x-update-state", "/data/x-ota-update-state"] {
-            for node in [false, true] {
-                let served = served(router.clone(), node);
-                let legacy = get_raw(&served, &format!("/vehicle/v1{suffix}")).await;
-                assert_eq!(legacy.0, StatusCode::OK, "{suffix} node={node}");
-                assert_eq!(legacy.1, LEGACY_UPDATE_STATE, "{suffix} node={node}");
+    async fn on_v1_the_update_state_is_node_level_data_and_the_legacy_tree_keeps_its_body() {
+        let coord = coord_with(Some((true, false)), Some(true), Some("boot-b"));
+        let machine = machine_with(&[]);
+        // The `/v1` value is the legacy body without `trial_boot_limit`.
+        let v1_data: serde_json::Value =
+            serde_json::from_str(&LEGACY_UPDATE_STATE.replace(r#""trial_boot_limit":null,"#, ""))
+                .unwrap();
+        for node in [false, true] {
+            let data: Arc<dyn sovd_core::NodeData> =
+                Arc::new(UpdateStateData::new(coord.clone(), machine.clone()));
+            let server = served_by_sovdd(
+                update_state_router(coord.clone(), machine.clone()),
+                node,
+                std::collections::HashMap::new(),
+                Some(data),
+            );
+            let base = if node {
+                "/v1/components/hpc/data"
+            } else {
+                "/v1/data"
+            };
+            for id in ["x-update-state", "x-ota-update-state"] {
+                let legacy = get_raw(&server, &format!("/vehicle/v1/data/{id}")).await;
+                assert_eq!(legacy.0, StatusCode::OK, "{id} node={node}");
+                assert_eq!(legacy.1, LEGACY_UPDATE_STATE, "{id} node={node}");
 
-                let v1_uri = if node {
-                    format!("/v1/components/hpc{suffix}")
-                } else {
-                    format!("/v1{suffix}")
-                };
-                let v1 = get_raw(&served, &v1_uri).await;
-                assert_eq!(v1.0, StatusCode::OK, "{v1_uri}");
-                assert_eq!(v1.1, v1_body, "{v1_uri}");
+                let uri = format!("{base}/{id}");
+                let (status, body) = get_raw(&server, &uri).await;
+                assert_eq!(status, StatusCode::OK, "{uri}");
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                    serde_json::json!({ "id": id, "data": v1_data }),
+                    "{uri}"
+                );
             }
+            assert_eq!(
+                get_json(&server, base).await,
+                serde_json::json!({ "items": [
+                    {
+                        "id": "x-ota-update-state",
+                        "name": "Node update-transaction state",
+                        "category": "currentData",
+                        "href": format!("{base}/x-ota-update-state"),
+                    },
+                    {
+                        "id": "x-update-state",
+                        "name": "Node update-transaction state (alias of x-ota-update-state)",
+                        "category": "currentData",
+                        "href": format!("{base}/x-update-state"),
+                    },
+                ]}),
+                "{base}"
+            );
         }
+    }
+
+    /// `update_state_router` serves the legacy tree only: without the node-level
+    /// data the `/v1` read is not served.
+    #[tokio::test]
+    async fn without_the_node_level_data_v1_serves_no_update_state() {
+        let coord = coord_with(Some((true, false)), Some(true), Some("boot-b"));
+        let server = served_by_sovdd(
+            update_state_router(coord, machine_with(&[])),
+            false,
+            std::collections::HashMap::new(),
+            None,
+        );
+        for id in ["x-update-state", "x-ota-update-state"] {
+            let (status, _) = get_raw(&server, &format!("/v1/data/{id}")).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+            let legacy = get_raw(&server, &format!("/vehicle/v1/data/{id}")).await;
+            assert_eq!(legacy, (StatusCode::OK, LEGACY_UPDATE_STATE.into()), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_update_state_item_is_parameter_not_found() {
+        let data = UpdateStateData::new(coord_with(None, None, None), machine_with(&[]));
+        let err = sovd_core::NodeData::read_data(&data, "x-nope")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, sovd_core::BackendError::ParameterNotFound(_)),
+            "{err}"
+        );
     }
 
     /// The legacy capability description keeps the update-state schemas as
@@ -1925,7 +2075,42 @@ mod tests {
         }
     }
 
-    fn machine_with_provisioned_hsm() -> Arc<dyn Machine> {
+    /// An `hsm` component whose key inventory cannot be read.
+    struct BrokenHsm {
+        capabilities: Capabilities,
+    }
+
+    const BROKEN_KEYSTORE: &str = "keystore unreadable";
+
+    #[async_trait]
+    impl Component for BrokenHsm {
+        fn id(&self) -> &str {
+            "hsm"
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.capabilities
+        }
+        async fn list_keys(&self) -> MachineResult<machine_mgr::KeyInventory> {
+            Err(MachineError::Internal(BROKEN_KEYSTORE.to_string()))
+        }
+    }
+
+    /// An `hsm` component that lists no keys (`list_keys` not supported).
+    struct KeylessHsm {
+        capabilities: Capabilities,
+    }
+
+    #[async_trait]
+    impl Component for KeylessHsm {
+        fn id(&self) -> &str {
+            "hsm"
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.capabilities
+        }
+    }
+
+    fn machine_with_hsm(hsm: Arc<dyn Component>) -> Arc<dyn Machine> {
         let builder = MachineRegistry::builder(EntityInfo {
             id: "vehicle".into(),
             name: "vehicle".into(),
@@ -1934,15 +2119,65 @@ mod tests {
             href: "/vehicle/v1".into(),
             status: None,
         })
-        .with_arc(Arc::new(ProvisionedHsm {
-            capabilities: Capabilities::default(),
-        }) as Arc<dyn Component>);
+        .with_arc(hsm);
         Arc::new(builder.build().unwrap())
+    }
+
+    fn provisioned_hsm() -> Arc<dyn Component> {
+        Arc::new(ProvisionedHsm {
+            capabilities: Capabilities::default(),
+        })
+    }
+
+    /// The `hsm` component's backend, serving the key inventory of `keys_of`
+    /// (`None`: no `serve_keys_of`), as `/v1` and the legacy tree serve it
+    /// with [`hsm_router`] over `hsm`'s machine, behind a node `hpc` with
+    /// `node`.
+    fn hsm_server(
+        hsm: &Arc<dyn Component>,
+        keys_of: Option<&Arc<dyn Component>>,
+        node: bool,
+    ) -> Router {
+        served_by_sovdd(
+            hsm_router(machine_with_hsm(hsm.clone())),
+            node,
+            std::collections::HashMap::from([("hsm".to_string(), hsm_backend(keys_of))]),
+            None,
+        )
+    }
+
+    /// The `hsm` component's backend, serving the key inventory of `keys_of`
+    /// (`None`: no `serve_keys_of`).
+    fn hsm_backend(keys_of: Option<&Arc<dyn Component>>) -> Arc<dyn sovd_core::DiagnosticBackend> {
+        let backend = crate::backend::ComponentBackend::new(
+            nv_store::types::BankSet(0),
+            Arc::new(std::sync::Mutex::new(nv_store::store::NvStore::new(
+                nv_store::block::MemBlockDevice::new(nv_store::store::MIN_NV_DEVICE_SIZE as usize),
+            ))),
+            Arc::new(crate::suit_provider::SuitProvider::with_factory_authority()),
+            crate::backend::ComponentConfig::default(),
+        )
+        .with_id("hsm".to_string());
+        if let Some(component) = keys_of {
+            backend.serve_keys_of(component);
+        }
+        Arc::new(backend)
+    }
+
+    /// The legacy keys body of [`ProvisionedHsm`], byte for byte as v0.1.35
+    /// served it.
+    const LEGACY_KEYS: &str = r#"{"provisioned":true,"items":[{"id":"tls-identity","kind":"EC-P256","has_certificate":true,"allowed_ops":null,"public_key_der_base64":null}]}"#;
+
+    /// The standard error body SOVDd answers `err` with.
+    async fn error_answer(err: sovd_api::ApiError) -> (StatusCode, serde_json::Value) {
+        let resp = err.into_response();
+        let status = resp.status();
+        (status, body_json(resp).await)
     }
 
     #[tokio::test]
     async fn on_v1_the_keys_view_is_a_data_item_and_the_legacy_tree_keeps_the_bare_inventory() {
-        let router = hsm_router(machine_with_provisioned_hsm());
+        let hsm = provisioned_hsm();
         let inventory = serde_json::json!({
             "provisioned": true,
             "items": [{
@@ -1953,51 +2188,311 @@ mod tests {
                 "public_key_der_base64": null,
             }],
         });
+        for node in [false, true] {
+            let server = hsm_server(&hsm, Some(&hsm), node);
+            let base = if node {
+                "/v1/components/hpc/subcomponents/hsm"
+            } else {
+                "/v1/components/hsm"
+            };
 
-        let (status, v1) = get_raw(&router, "/v1/components/hsm/data/keys").await;
+            let (status, v1) = get_raw(&server, &format!("{base}/data/keys")).await;
+            assert_eq!(status, StatusCode::OK, "{base}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&v1).unwrap(),
+                serde_json::json!({ "id": "keys", "data": inventory }),
+                "{base}"
+            );
+
+            let listing = get_json(&server, &format!("{base}/data")).await;
+            let keys: Vec<_> = listing["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["id"] == "keys")
+                .collect();
+            assert_eq!(
+                keys,
+                [&serde_json::json!({
+                    "id": "keys",
+                    "did": "",
+                    "name": "HSM key slots",
+                    "data_type": "object",
+                    "category": "identData",
+                    "writable": false,
+                    "href": format!("{base}/data/keys"),
+                })],
+                "{base}"
+            );
+
+            let legacy = get_raw(&server, "/vehicle/v1/components/hsm/data/keys").await;
+            assert_eq!(legacy, (StatusCode::OK, LEGACY_KEYS.into()), "node={node}");
+        }
+    }
+
+    /// The legacy tree answers as it did before the item: the hsm data
+    /// listing equals the one of a backend without it, and the keys read is
+    /// `hsm_router`'s.
+    #[tokio::test]
+    async fn the_legacy_tree_is_unchanged_by_the_keys_item() {
+        let hsm = provisioned_hsm();
+        for node in [false, true] {
+            let with = hsm_server(&hsm, Some(&hsm), node);
+            let without = hsm_server(&hsm, None, node);
+            for uri in [
+                "/vehicle/v1/components/hsm/data",
+                "/vehicle/v1/components/hsm/data-categories",
+                "/vehicle/v1/components/hsm/data/keys",
+            ] {
+                let answer = get_raw(&with, uri).await;
+                assert_eq!(answer.0, StatusCode::OK, "{uri}");
+                assert_eq!(answer, get_raw(&without, uri).await, "{uri} node={node}");
+            }
+            // `/v1` lists it only on the backend that serves it.
+            let base = if node {
+                "/v1/components/hpc/subcomponents/hsm"
+            } else {
+                "/v1/components/hsm"
+            };
+            let listed = |listing: serde_json::Value| {
+                listing["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["id"] == "keys")
+            };
+            assert!(listed(get_json(&with, &format!("{base}/data")).await));
+            assert!(!listed(get_json(&without, &format!("{base}/data")).await));
+        }
+    }
+
+    /// Without [`hsm_router`], the legacy tree reaches the backend through
+    /// SOVDd's generic routes and answers as without the item: `keys` is the
+    /// backend's unknown parameter.
+    #[tokio::test]
+    async fn without_the_hsm_router_the_legacy_tree_is_unchanged_by_the_keys_item() {
+        let hsm = provisioned_hsm();
+        let server = |keys_of| {
+            served_by_sovdd(
+                Router::new(),
+                false,
+                std::collections::HashMap::from([("hsm".to_string(), hsm_backend(keys_of))]),
+                None,
+            )
+        };
+        let (with, without) = (server(Some(&hsm)), server(None));
+        for uri in [
+            "/vehicle/v1/components/hsm/data/keys",
+            "/vehicle/v1/components/hsm/data",
+            "/vehicle/v1/components/hsm/data-categories",
+        ] {
+            assert_eq!(
+                get_raw(&with, uri).await,
+                get_raw(&without, uri).await,
+                "{uri}"
+            );
+        }
+        let (status, _) = get_raw(&with, "/vehicle/v1/components/hsm/data/keys").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // `/v1` reads the item through the server.
+        let (status, _) = get_raw(&with, "/v1/components/hsm/data/keys").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&v1).unwrap(),
-            serde_json::json!({ "id": "keys", "data": inventory })
+    }
+
+    /// A host without an hsm backend: SOVDd over no backends, with
+    /// [`hsm_router`] and [`hsm_keys_v1_router`] over `hsm`'s machine (none:
+    /// no hsm component), behind a node `hpc` with `node`.
+    fn backendless_server(hsm: Option<Arc<dyn Component>>, node: bool) -> Router {
+        let machine = match hsm {
+            Some(hsm) => machine_with_hsm(hsm),
+            None => machine_with(&[]),
+        };
+        served_by_sovdd(
+            hsm_router(machine.clone()).merge(hsm_keys_v1_router(machine)),
+            node,
+            std::collections::HashMap::new(),
+            None,
+        )
+    }
+
+    /// The route answers what the backend's item answers for the same
+    /// inventory, in the flat form and, through a node, in the node form.
+    #[tokio::test]
+    async fn the_v1_keys_route_answers_as_the_backend_item() {
+        let hsm = provisioned_hsm();
+        let (status, item) = get_raw(
+            &hsm_server(&hsm, Some(&hsm), false),
+            "/v1/components/hsm/data/keys",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let item: serde_json::Value = serde_json::from_slice(&item).unwrap();
+        assert_eq!(item["id"], "keys", "{item}");
+        for (node, uri) in [
+            (false, "/v1/components/hsm/data/keys"),
+            (true, "/v1/components/hpc/subcomponents/hsm/data/keys"),
+        ] {
+            let (status, body) = get_raw(&backendless_server(Some(hsm.clone()), node), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                item,
+                "{uri}"
+            );
+        }
+    }
+
+    /// Without an hsm component, and for one whose inventory cannot be read,
+    /// the route answers with the server's standard error body.
+    #[tokio::test]
+    async fn the_v1_keys_route_answers_the_server_errors() {
+        let (status, body) = get_raw(
+            &backendless_server(None, false),
+            "/v1/components/hsm/data/keys",
+        )
+        .await;
+        let expected = error_answer(sovd_api::ApiError::from(
+            sovd_core::BackendError::ParameterNotFound("keys".to_string()),
+        ))
+        .await;
+        assert_eq!(expected.0, StatusCode::NOT_FOUND);
+        assert_eq!((status, serde_json::from_slice(&body).unwrap()), expected);
+
+        let broken: Arc<dyn Component> = Arc::new(BrokenHsm {
+            capabilities: Capabilities::default(),
+        });
+        let (status, body) = get_raw(
+            &backendless_server(Some(broken), false),
+            "/v1/components/hsm/data/keys",
+        )
+        .await;
+        let expected = error_answer(sovd_api::ApiError::Internal(format!(
+            "list keys error: {}",
+            MachineError::Internal(BROKEN_KEYSTORE.to_string())
+        )))
+        .await;
+        assert_eq!(expected.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!((status, serde_json::from_slice(&body).unwrap()), expected);
+    }
+
+    /// The route adds no component: the component listing is the one without it.
+    #[tokio::test]
+    async fn the_v1_keys_route_adds_no_component() {
+        let machine = machine_with_hsm(provisioned_hsm());
+        let without = served_by_sovdd(
+            hsm_router(machine.clone()),
+            false,
+            std::collections::HashMap::new(),
+            None,
+        );
+        let with = backendless_server(Some(provisioned_hsm()), false);
+        for uri in ["/v1/components", "/vehicle/v1/components"] {
+            let answer = get_raw(&with, uri).await;
+            assert_eq!(answer.0, StatusCode::OK, "{uri}");
+            assert_eq!(answer, get_raw(&without, uri).await, "{uri}");
+        }
+    }
+
+    /// An inventory that cannot be read is an error on `/v1` (SOVDd's standard
+    /// error body), never an empty inventory; the item stays listed. The
+    /// legacy tree keeps its plain-text 500.
+    #[tokio::test]
+    async fn an_unreadable_keys_inventory_is_an_error() {
+        let hsm: Arc<dyn Component> = Arc::new(BrokenHsm {
+            capabilities: Capabilities::default(),
+        });
+        let server = hsm_server(&hsm, Some(&hsm), false);
+        let message = format!(
+            "list keys error: {}",
+            MachineError::Internal(BROKEN_KEYSTORE.to_string())
         );
 
-        let (status, legacy) = get_raw(&router, "/vehicle/v1/components/hsm/data/keys").await;
-        assert_eq!(status, StatusCode::OK);
+        let (status, body) = get_raw(&server, "/v1/components/hsm/data/keys").await;
+        let expected = error_answer(sovd_api::ApiError::Internal(message.clone())).await;
+        assert_eq!(expected.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&legacy).unwrap(),
-            inventory
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            ),
+            expected
+        );
+        let listing = get_json(&server, "/v1/components/hsm/data").await;
+        assert!(listing["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "keys"));
+
+        let legacy = get_raw(&server, "/vehicle/v1/components/hsm/data/keys").await;
+        assert_eq!(
+            legacy,
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                message.into_bytes().into()
+            )
         );
     }
 
-    /// drive-twin reads the keys view in the node form, as the node's `hsm`
-    /// subcomponent: the data item, as on the flat `/v1` path.
+    /// A component that lists no keys has no `keys` item on `/v1`: neither
+    /// listed nor read. The legacy tree keeps its plain-text 503.
     #[tokio::test]
-    async fn through_the_node_the_keys_view_is_the_data_item() {
-        let router = served(hsm_router(machine_with_provisioned_hsm()), true);
-        let (status, body) =
-            get_raw(&router, "/v1/components/hpc/subcomponents/hsm/data/keys").await;
-        assert_eq!(status, StatusCode::OK);
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["id"], "keys", "{body}");
-        assert_eq!(body["data"]["provisioned"], true, "{body}");
+    async fn keys_a_component_does_not_list_are_not_an_item() {
+        let hsm: Arc<dyn Component> = Arc::new(KeylessHsm {
+            capabilities: Capabilities::default(),
+        });
+        let server = hsm_server(&hsm, Some(&hsm), false);
+        let listing = get_json(&server, "/v1/components/hsm/data").await;
+        assert!(!listing["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "keys"));
+        let (status, _) = get_raw(&server, "/v1/components/hsm/data/keys").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let legacy = get_raw(&server, "/vehicle/v1/components/hsm/data/keys").await;
+        assert_eq!(
+            legacy,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "HSM keys unavailable".into()
+            )
+        );
     }
 
     #[tokio::test]
     async fn hsm_and_device_id_routes_are_served_on_the_v1_tree() {
         // No hsm component: the handlers answer 503, never the router's 404.
-        let routers = [
-            ("/components/hsm/data/keys", hsm_router(machine_with(&[]))),
-            (
-                "/components/hsm/x-ecu-id",
-                device_id_router(machine_with(&[])),
-            ),
-        ];
-        for (suffix, router) in routers {
-            let v1 = get_raw(&router, &format!("/v1{suffix}")).await;
-            let legacy = get_raw(&router, &format!("/vehicle/v1{suffix}")).await;
-            assert_ne!(v1.0, StatusCode::NOT_FOUND, "{suffix}");
-            assert_eq!(v1, legacy, "{suffix}");
+        let router = device_id_router(machine_with(&[]));
+        let suffix = "/components/hsm/x-ecu-id";
+        let v1 = get_raw(&router, &format!("/v1{suffix}")).await;
+        let legacy = get_raw(&router, &format!("/vehicle/v1{suffix}")).await;
+        assert_ne!(v1.0, StatusCode::NOT_FOUND, "{suffix}");
+        assert_eq!(v1, legacy, "{suffix}");
+
+        let router = hsm_router(machine_with(&[]));
+        for base in ["/v1", "/vehicle/v1"] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::post(format!("{base}/components/hsm/operations/x-csr/executions"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"key_id":"tls-identity"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{base}");
         }
+        // The keys view: the legacy tree only (on `/v1` SOVDd serves it).
+        let legacy = get_raw(&router, "/vehicle/v1/components/hsm/data/keys").await;
+        assert_eq!(
+            legacy,
+            (StatusCode::SERVICE_UNAVAILABLE, "no hsm component".into())
+        );
+        let (status, _) = get_raw(&router, "/v1/components/hsm/data/keys").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// `router` behind SOVDd's node topology, as an embedder serves it: with
@@ -2012,6 +2507,29 @@ mod tests {
             state
         };
         sovd_api::with_node_topology(router, &state)
+    }
+
+    /// `router` merged into SOVDd's router over `backends` and the node-level
+    /// data `node_data`, behind the node topology as in [`served`].
+    fn served_by_sovdd(
+        router: Router,
+        node: bool,
+        backends: std::collections::HashMap<String, Arc<dyn sovd_core::DiagnosticBackend>>,
+        node_data: Option<Arc<dyn sovd_core::NodeData>>,
+    ) -> Router {
+        let state = sovd_api::AppState::new(backends);
+        let state = match node_data {
+            Some(data) => state.with_node_data(data),
+            None => state,
+        };
+        let state = if node {
+            state
+                .with_node(sovd_api::NodeTopology::new("hpc", "HPC"))
+                .unwrap()
+        } else {
+            state
+        };
+        sovd_api::with_node_topology(sovd_api::create_router(state.clone()).merge(router), &state)
     }
 
     // Node topology: the vendor bodies carry no URL, so the node form on a
@@ -2099,7 +2617,7 @@ mod tests {
     // Shape-identity guards: the named response structs must serialize to the
     // exact JSON the handlers emitted as ad-hoc `serde_json::json!` before the
     // utoipa refactor (the regen test only covers the doc, not the wire).
-    /// The `/v1` `x-ota-update-state` body with vm1 reporting `vm1`, the node
+    /// The `/v1` `x-ota-update-state` value with vm1 reporting `vm1`, the node
     /// reporting `rebooted` (see [`coord_with`]) and currently booted as
     /// `boot_id`.
     async fn update_state_json(
@@ -2107,16 +2625,12 @@ mod tests {
         rebooted: Option<bool>,
         boot_id: &str,
     ) -> serde_json::Value {
-        serde_json::to_value(
-            update_state(
-                Tree::V1,
-                coord_with(vm1, rebooted, Some(boot_id)),
-                machine_with(&[]),
-            )
+        let data =
+            UpdateStateData::new(coord_with(vm1, rebooted, Some(boot_id)), machine_with(&[]));
+        sovd_core::NodeData::read_data(&data, "x-ota-update-state")
             .await
-            .0,
-        )
-        .unwrap()
+            .unwrap()
+            .value
     }
 
     #[tokio::test]

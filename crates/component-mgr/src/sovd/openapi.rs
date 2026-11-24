@@ -84,7 +84,6 @@ there."
         super::routes::ResolutionResponse,
         super::routes::HsmKeyEntry,
         super::routes::HsmKeysResponse,
-        super::routes::HsmKeysDataItem,
         super::routes::CsrRequest,
         super::routes::CsrResult,
         super::routes::VerdictRequest,

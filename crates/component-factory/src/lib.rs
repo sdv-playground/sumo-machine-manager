@@ -891,6 +891,11 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             }
 
             let component: Arc<dyn Component> = Arc::new(component_inner);
+            // The hsm's key inventory is its SOVD data item `keys` on `/v1`
+            // (listed when the component lists keys).
+            if spec.component_type == "hsm" {
+                backend_arc.serve_keys_of(&component);
+            }
 
             let flash_probe: Arc<dyn Fn() -> bool + Send + Sync> = {
                 let b = backend_arc.clone();

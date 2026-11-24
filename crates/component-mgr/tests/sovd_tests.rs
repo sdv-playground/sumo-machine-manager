@@ -868,6 +868,56 @@ fn provisioned_keystore(tmp: &Path) -> PathBuf {
     ks_dir
 }
 
+/// The hsm component as component-factory builds it — its `ComponentBackend`
+/// serving the keys of its `ComponentAdapter` over a provisioned SimHsm
+/// keystore — read on `/v1` through SOVDd and on the legacy tree through
+/// `hsm_router`: the `/v1` data item `keys` holds the legacy body.
+#[tokio::test]
+async fn the_hsm_keys_item_holds_the_legacy_inventory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ks = provisioned_keystore(tmp.path());
+    let nv = Arc::new(Mutex::new(NvStore::new(MemBlockDevice::new(
+        MIN_NV_DEVICE_SIZE as usize,
+    ))));
+    let backend = Arc::new(
+        ComponentBackend::new(
+            BankSet(0),
+            nv,
+            Arc::new(SuitProvider::with_factory_authority()),
+            ComponentConfig {
+                single_bank: true,
+                ..Default::default()
+            },
+        )
+        .with_id("hsm".to_string()),
+    );
+    let component: Arc<dyn machine_mgr::Component> =
+        Arc::new(ComponentAdapter::new(backend.clone()).with_csr_keystore(ks));
+    backend.serve_keys_of(&component);
+    let machine = MachineRegistry::builder(EntityInfo {
+        id: "vehicle".into(),
+        name: "vehicle".into(),
+        entity_type: "vehicle".into(),
+        description: None,
+        href: "/vehicle/v1".into(),
+        status: None,
+    })
+    .with_arc(component)
+    .build()
+    .unwrap();
+    let backends: HashMap<String, Arc<dyn DiagnosticBackend>> =
+        HashMap::from([("hsm".to_string(), backend as Arc<dyn DiagnosticBackend>)]);
+    let router = sovd_api::create_router(sovd_api::AppState::new(backends))
+        .merge(component_mgr::sovd::routes::hsm_router(Arc::new(machine)));
+
+    let (status, legacy) = get(&router, "/vehicle/v1/components/hsm/data/keys").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(legacy["items"][0]["id"], hsm::ivd::IVD_KEY_ID, "{legacy}");
+    let (status, v1) = get(&router, "/v1/components/hsm/data/keys").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v1, serde_json::json!({ "id": "keys", "data": legacy }));
+}
+
 /// Where a disable lands: the provider (to read the record back) and the
 /// tempdir holding its `images_dir` + keystore, kept alive for the test.
 type SigningBank = (Arc<IvdBankProvider<MemBlockDevice>>, tempfile::TempDir);
@@ -1828,12 +1878,21 @@ impl TrialNode {
         }
     }
 
-    /// The update-state and node verdict routes over this node, reporting
+    /// The update-state (node-level data on `/v1`, `update_state_router` on
+    /// the legacy tree) and node verdict routes over this node, reporting
     /// through `coord`.
     fn router(&self, coord: Arc<NodeCoordinator>) -> axum::Router {
-        component_mgr::sovd::routes::update_state_router(coord, self.machine.clone()).merge(
-            component_mgr::sovd::routes::node_verdict_router(self.machine.clone()),
-        )
+        let state = sovd_api::AppState::new(HashMap::new()).with_node_data(Arc::new(
+            component_mgr::sovd::routes::UpdateStateData::new(coord.clone(), self.machine.clone()),
+        ));
+        sovd_api::create_router(state)
+            .merge(component_mgr::sovd::routes::update_state_router(
+                coord,
+                self.machine.clone(),
+            ))
+            .merge(component_mgr::sovd::routes::node_verdict_router(
+                self.machine.clone(),
+            ))
     }
 
     fn store(&self) -> FileSelectorStore {
@@ -1892,8 +1951,10 @@ async fn trial_boots_are_counted_and_never_roll_the_node_back() {
     );
 
     let router = node.router(coord_at("boot-f"));
-    let (status, body) = get(&router, "/v1/data/x-update-state").await;
+    let (status, read) = get(&router, "/v1/data/x-update-state").await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(read["id"], "x-update-state", "{read}");
+    let body = &read["data"];
     assert_eq!(body["banks"][0]["in_trial"], true);
     assert_eq!(body["trial_boots"], 5);
     assert_eq!(body["resolution"], serde_json::Value::Null);

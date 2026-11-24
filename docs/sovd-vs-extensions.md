@@ -83,6 +83,13 @@ spec; all are `x-`-namespaced.
 | `/operations/x-update-verdict/executions` | POST | alias of `x-update-commit` / `x-update-rollback`, retired together with the x-ota names; the verdict is in the body (`{"verdict": "commit"\|"rollback", "nonce"?: …}`, 422 for a missing/unknown word); result key `committed`\|`rolled_back` follows the verdict |
 | `/operations/x-ota-pull-update/executions` | POST | onboard pull-update (gateway mode); async 202 + poll |
 
+On `/v1`, `x-ota-update-state`, `x-update-state` and `hsm/data/keys` are data items SOVDd serves
+(ISO 17978-3 `ReadValue`: `{"id", "data"}`, the body above under `data`): the update state as
+node-level data from `UpdateStateData` (`AppState::with_node_data`; listed in `GET /v1/data`, without
+`trial_boot_limit`), the keys as the `keys` item of the hsm component's backend
+(`ComponentBackend::serve_keys_of`; listed in its `data`). The routes in the table serve
+`/vehicle/v1` only for these three.
+
 Both update-state routes also carry `banks`: one entry per component that reports bank
 contents, `{id, active, inactive, in_trial, pending_reset}`. `active` is the bank the component boots from
 (the boot vector's selection when one is attached) with its `images` (part name →

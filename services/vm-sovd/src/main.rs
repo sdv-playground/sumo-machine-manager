@@ -872,12 +872,18 @@ async fn ecu_identification(machine: &dyn Machine, prefix: &str) -> Option<Strin
 }
 
 /// The default (non-gateway) router: the standard SOVD surface plus the sumo
-/// vendor routes, behind the node topology when `state` carries a node.
+/// vendor routes, behind the node topology when `state` carries a node. The
+/// node's update state is node-level data on `/v1` (`UpdateStateData`) and
+/// `update_state_router` on the legacy tree.
 fn plain_router(
     machine: Arc<dyn Machine>,
     state: sovd_api::AppState,
     node_coordinator: Arc<machine_mgr::node_update::NodeCoordinator>,
 ) -> axum::Router {
+    let state = state.with_node_data(Arc::new(component_mgr::sovd::routes::UpdateStateData::new(
+        node_coordinator.clone(),
+        machine.clone(),
+    )));
     let router = sovd_api::create_router(state.clone())
         .merge(component_mgr::sovd::routes::hsm_router(machine.clone()))
         .merge(component_mgr::sovd::routes::update_state_router(
@@ -990,7 +996,12 @@ async fn build_gateway_router(
     tracing::info!(
         "vm-sovd GATEWAY: device={device_id}, host={host_url}, proxied={proxy_components:?}"
     );
-    let state = sovd_state(backends, node).unwrap_or_else(|e| fail(&format!("--node-id: {e}")));
+    let state = sovd_state(backends, node)
+        .unwrap_or_else(|e| fail(&format!("--node-id: {e}")))
+        .with_node_data(Arc::new(component_mgr::sovd::routes::UpdateStateData::new(
+            node_coordinator.clone(),
+            machine.clone(),
+        )));
     let router = component_mgr::sovd::gateway::gateway_router_with_state(
         machine.clone(),
         state.clone(),
@@ -1156,15 +1167,35 @@ mod tests {
         let root = get_text(without.clone(), "/v1/data/x-update-state").await;
         assert_eq!(root.0, StatusCode::OK, "{}", root.1);
         assert_eq!(get_text(with.clone(), node_form).await, root);
-        // The frozen legacy alias keeps its `trial_boot_limit`, always null.
-        let legacy_body = root.1.replace(
-            r#""resolution":"#,
-            r#""trial_boot_limit":null,"resolution":"#,
+        // `/v1` reads the data item; the frozen legacy alias serves the bare
+        // body, with its `trial_boot_limit` (always null), in its member order.
+        let read: serde_json::Value = serde_json::from_str(&root.1).unwrap();
+        assert_eq!(read["id"], "x-update-state", "{read}");
+        let mut legacy_value = read["data"].clone();
+        legacy_value["trial_boot_limit"] = serde_json::Value::Null;
+        let legacy = get_text(without.clone(), "/vehicle/v1/data/x-update-state").await;
+        assert_eq!(legacy.0, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&legacy.1).unwrap(),
+            legacy_value
         );
-        for router in [&with, &without] {
-            let legacy = get_text(router.clone(), "/vehicle/v1/data/x-update-state").await;
-            assert_eq!(legacy, (StatusCode::OK, legacy_body.clone()));
-        }
+        let members = [
+            "phase",
+            "components",
+            "reboot_owed",
+            "rebooted_since_arming",
+            "node_boot_id",
+            "banks",
+            "trial_boots",
+            "trial_boot_limit",
+            "resolution",
+        ]
+        .map(|m| legacy.1.find(&format!(r#""{m}":"#)).unwrap());
+        assert!(members.is_sorted(), "{}", legacy.1);
+        assert_eq!(
+            get_text(with.clone(), "/vehicle/v1/data/x-update-state").await,
+            legacy
+        );
 
         let (status, body) = get_text(with, "/v1/data/x-update-state").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");

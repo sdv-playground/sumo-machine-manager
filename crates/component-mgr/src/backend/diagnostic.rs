@@ -164,6 +164,44 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         Ok(params)
     }
 
+    /// The key-slot inventory `keys`, listed while its component lists keys
+    /// at all; one it cannot read now is still listed, and its read fails.
+    async fn list_v1_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {
+        let Some(component) = self.keys_component() else {
+            return Ok(Vec::new());
+        };
+        if let Err(machine_mgr::MachineError::NotSupported(_)) = component.list_keys().await {
+            return Ok(Vec::new());
+        }
+        Ok(vec![ParameterInfo {
+            id: KEYS_PARAM_ID.to_string(),
+            name: KEYS_NAME.to_string(),
+            description: None,
+            unit: None,
+            data_type: Some("object".to_string()),
+            read_only: true,
+            // The server builds the href of a `/v1`-only item.
+            href: String::new(),
+            did: None,
+            category: Some(DataCategory::IdentData),
+        }])
+    }
+
+    /// The key-slot inventory, as the frozen tree's own route serves it. Not
+    /// an item while no component lists keys; an inventory that cannot be
+    /// read is an error, never an empty one.
+    async fn read_v1_data(&self, id: &str) -> BackendResult<Option<DataValue>> {
+        if id != KEYS_PARAM_ID {
+            return Ok(None);
+        }
+        let Some(component) = self.keys_component() else {
+            return Ok(None);
+        };
+        Ok(crate::sovd::routes::keys_value(component.as_ref())
+            .await?
+            .map(|value| DataValue::new(id, KEYS_NAME, value)))
+    }
+
     /// SOVD §7.21 `GET /components/{id}/logs` — served only when the
     /// deployment config gives this component a [`LogSource`]
     /// (`capabilities.logs` gates the route in sovd-api). A guest VM is

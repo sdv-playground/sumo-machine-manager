@@ -43,6 +43,7 @@
 //! #     machine: Arc<dyn machine_mgr::Machine>,
 //! #     backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
 //! #     vendor: axum::Router, // the vendor routes the binary merges in
+//! #     node_data: Arc<dyn sovd_core::NodeData>, // e.g. the node's update state
 //! #     boot_id: String,
 //! #     crypto: Arc<dyn hsm::HsmCryptoProvider>,
 //! #     restart_authz: Arc<dyn sovd_api::Authorizer>,
@@ -51,6 +52,8 @@
 //! let identification = node_shell::configured_identification(&cfg, ecu_id.as_deref());
 //! let node = node_shell::node_topology(&cfg, identification.as_deref());
 //! let state = node_shell::sovd_state(backends, node).expect("SOVD node refused");
+//! // The binary's node-level data items, served on `/v1` (`/v1/data`).
+//! let state = state.with_node_data(node_data);
 //! // The binary's own capability rows (here none) plus the shell's `/v1`-only ones.
 //! let state = state.with_capability_extensions(node_shell::capability_extensions(
 //!     sovd_api::CapabilityExtensions::default(),
