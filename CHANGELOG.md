@@ -223,6 +223,29 @@ what a consumer has to touch when it moves its pin.
   Verified: a scripted sequence (seed, activate, trial boots, commit, activate, rollback, reseed after
   deleting the primary) with the deterministic test signer writes byte-identical files and returns
   identical values before and after.
+- **component-mgr: the host can state the ECU id.** The ECU id (every accepted token's `aud`, and
+  what the HSM component serves as `x-ecu-id`) was always the `device-decrypt` key thumbprint, which
+  changes with every re-mint, HSM reset or backend switch. `sovd::identity::EcuId` says where it
+  comes from: `Thumbprint` (as before), `Injected` (the host's own, built by `EcuId::injected`) or
+  `Unavailable` (the host's id did not read on this unit; nothing stands in for it). The host
+  states it once, in `FactoryDeps::ecu_id`; the factory hands it to the HSM component
+  (`ComponentAdapter::with_ecu_id`), and `FactoryDeps::hsm_authorizer_deps` builds the authorizer's
+  deps with the same id, keystore and crypto handle, so `x-ecu-id` and the accepted `aud` cannot
+  differ on that path. `Unavailable` is a unit with no id: the no-id rule above applies (with a
+  recovery anchor, the factory reset with `aud: ""` and nothing else; without one, nothing).
+  An injected id's contract, in `EcuId`'s docs:
+  - lower-case hex, no separators, at least 16 digits; `EcuId::injected` refuses anything else
+    (`InvalidEcuId`). Reset tooling keeps only the hex digits of the id a device serves, so any
+    other character would yield a token the device refuses; a UUID qualifies without its dashes;
+  - unique per unit, which the host guarantees: two units with one id accept each other's tokens;
+  - it survives a factory reset (a thumbprint does not when the reset re-mints the device key).
+    That is intended; tooling detects a finished reset by `x-boot-id`, not by the ECU id.
+
+  Host-facing: `FactoryDeps` and `HsmAuthorizerDeps` each gain a required field, `ecu_id`
+  (`EcuId::Thumbprint` keeps today's id); `build_authorizer_now` takes `&EcuId` as a new last
+  argument. A host with a factory builds its authorizer deps with
+  `FactoryDeps::hsm_authorizer_deps(time_floor_secs, floor_sink, extra_anchor)` (`None` without
+  `hsm_keystore` or `hsm_crypto`) instead of a literal, so the id is stated once.
 
 - vm-mgr (QEMU runner): QNX aarch64 guests boot their IFS with `-kernel` (`images.kernel`, no BIOS,
   no kernel cmdline); the rootfs, `partitions:` and `disks:` attach as `virtio-blk-device`. The

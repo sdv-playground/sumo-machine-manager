@@ -248,6 +248,12 @@ pub struct FactoryDeps<D: BlockDevice> {
     pub hsm_crypto: Option<Arc<dyn hsm::HsmCryptoProvider>>,
     pub hsm_keystore: Option<PathBuf>,
     pub hsm_port: u16,
+    /// This ECU's id: what the HSM component serves as `x-ecu-id`, and the `aud`
+    /// tokens are checked against. Stated here once; take the authorizer's deps
+    /// from [`Self::hsm_authorizer_deps`], which carries the same value.
+    /// `EcuId::Thumbprint` keeps the device-key thumbprint; see
+    /// [`component_mgr::sovd::identity::EcuId`] for an injected id's contract.
+    pub ecu_id: component_mgr::sovd::identity::EcuId,
     /// Per-component bank activators, keyed by component id.
     /// Only components with an entry here get post-install activation.
     pub bank_activators: HashMap<String, Arc<dyn machine_mgr::BankActivator>>,
@@ -305,6 +311,29 @@ pub struct FactoryDeps<D: BlockDevice> {
     /// via `with_wall_clock_floor`; `None` leaves the log-only no-op default.
     /// The real host injects a clock-setting impl; tests/CI leave it `None`.
     pub wall_clock_floor: Option<Arc<dyn component_mgr::sovd::time_floor::WallClockFloor>>,
+}
+
+impl<D: BlockDevice> FactoryDeps<D> {
+    /// The HSM authorizer's deps on this factory's HSM: its keystore
+    /// (`hsm_keystore`), its crypto handle (`hsm_crypto`) and its ECU id
+    /// (`ecu_id`), so the `aud` the authorizer accepts is the id the HSM
+    /// component serves. `None` when either `hsm_keystore` or `hsm_crypto` is
+    /// unset. Call it once per surface (`destructive` / `general`).
+    pub fn hsm_authorizer_deps(
+        &self,
+        time_floor_secs: Arc<std::sync::atomic::AtomicU64>,
+        floor_sink: Arc<dyn component_mgr::sovd::authz::FloorSink>,
+        extra_anchor: Option<component_mgr::sovd::hsm_authorizer::ExtraAnchor>,
+    ) -> Option<component_mgr::sovd::hsm_authorizer::HsmAuthorizerDeps> {
+        Some(component_mgr::sovd::hsm_authorizer::HsmAuthorizerDeps {
+            keystore: self.hsm_keystore.clone()?,
+            crypto: self.hsm_crypto.clone()?,
+            time_floor_secs,
+            floor_sink,
+            extra_anchor,
+            ecu_id: self.ecu_id.clone(),
+        })
+    }
 }
 
 /// Resolve the bank-set for a `ComponentSpec`: the explicit `slot:`, and
@@ -888,6 +917,7 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
                 if let Some(ref crypto) = deps.hsm_crypto {
                     component_inner = component_inner.with_csr_crypto(crypto.clone());
                 }
+                component_inner = component_inner.with_ecu_id(deps.ecu_id.clone());
             }
 
             let component: Arc<dyn Component> = Arc::new(component_inner);
@@ -994,6 +1024,7 @@ mod tests {
             hsm_crypto: None,
             hsm_keystore: None,
             hsm_port: 5100,
+            ecu_id: component_mgr::sovd::identity::EcuId::Thumbprint,
             bank_activators: HashMap::new(),
             partition_parts: HashMap::new(),
             health_probes: HashMap::new(),
@@ -1319,6 +1350,97 @@ parts:
         spec.component_type = "bank".to_string();
         let built = build_component(&spec, &deps).unwrap();
         assert!(built.component.capabilities().hsm.is_none());
+    }
+
+    /// A crypto handle that answers nothing: `hsm_authorizer_deps` only carries it.
+    struct NoCrypto;
+    impl hsm::HsmCryptoProvider for NoCrypto {
+        fn sign(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn verify(&self, _: hsm::KeyHandle, _: &[u8], _: &[u8]) -> Result<bool, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn encrypt(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn decrypt(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn mac_generate(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn mac_verify(&self, _: hsm::KeyHandle, _: &[u8], _: &[u8]) -> Result<bool, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn derive(&self, _: hsm::KeyHandle, _: &[u8], _: usize) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn random(&self, _: usize) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn get_certificate_der(&self, _: hsm::KeyHandle) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn get_public_key_der(&self, _: hsm::KeyHandle) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn get_trust_anchor_der(&self, _: &str) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+        fn get_slot_info(&self, _: hsm::KeyHandle) -> Result<hsm::SlotInfo, hsm::HsmError> {
+            Err(hsm::HsmError::NotSupported("test".into()))
+        }
+    }
+
+    /// The id is stated once, in `FactoryDeps::ecu_id`: the HSM component
+    /// serves it and the authorizer deps carry it, with this factory's keystore
+    /// and crypto handle.
+    #[test]
+    fn the_hsm_component_and_the_authorizer_share_one_ecu_id() {
+        use component_mgr::sovd::authz::NoopFloorSink;
+        use component_mgr::sovd::identity::EcuId;
+        use std::future::Future;
+
+        let ecu_id = EcuId::injected("4b334ebada044b608d8d8d8d8d8d8d8d").unwrap();
+        let crypto: Arc<dyn hsm::HsmCryptoProvider> = Arc::new(NoCrypto);
+        let mut deps = ten_slot_deps();
+        deps.hsm_keystore = Some(PathBuf::from("/tmp/vhsm-keys"));
+        deps.hsm_crypto = Some(crypto.clone());
+        deps.ecu_id = ecu_id.clone();
+
+        let mut spec = spec_on_slot("hsm", 0);
+        spec.component_type = "hsm".to_string();
+        spec.single_bank = true;
+        let built = build_component(&spec, &deps).unwrap();
+        // The injected id is served without an await on anything.
+        let served = std::pin::pin!(built.component.get_device_id())
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        let std::task::Poll::Ready(Ok(served)) = served else {
+            panic!("get_device_id did not answer at once: {served:?}");
+        };
+        assert_eq!(served.as_deref(), Some("4b334ebada044b608d8d8d8d8d8d8d8d"));
+
+        let authz = deps
+            .hsm_authorizer_deps(
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(NoopFloorSink),
+                None,
+            )
+            .expect("keystore and crypto are set");
+        assert_eq!(authz.ecu_id, ecu_id);
+        assert_eq!(authz.keystore, PathBuf::from("/tmp/vhsm-keys"));
+        assert!(Arc::ptr_eq(&authz.crypto, &crypto));
+
+        deps.hsm_crypto = None;
+        assert!(deps
+            .hsm_authorizer_deps(
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(NoopFloorSink),
+                None,
+            )
+            .is_none());
     }
 
     /// The node binary late-binds its admin gates (vm-mgr's start gate, the

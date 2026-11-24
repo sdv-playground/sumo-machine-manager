@@ -75,7 +75,7 @@ spec; all are `x-`-namespaced.
 | `/data/x-update-state` | GET | alias of `x-ota-update-state` plus `node_boot_id` (the node's current boot id, `null` when unknown) |
 | `/components/hsm/data/keys` | GET | HSM key-slot inventory (public metadata only) |
 | `/components/hsm/operations/x-csr/executions` | POST | generate a PKCS#10 CSR for a key slot |
-| `/components/hsm/x-ecu-id` | GET | ECU id = HSM device-key thumbprint (the token `aud`); `text/plain` |
+| `/components/hsm/x-ecu-id` | GET | ECU id = HSM device-key thumbprint, or the host's injected id (`FactoryDeps::ecu_id`); the token `aud`; `text/plain` |
 | `/operations/x-ota-commit-trials/executions` | POST | node-level commit of all in-trial banked components |
 | `/operations/x-ota-rollback-trials/executions` | POST | node-level rollback of in-trial components |
 | `/operations/x-update-commit/executions` | POST | node-level commit, same as commit-trials; optional body `{"nonce"?: …}` |
@@ -187,7 +187,7 @@ verdict. Before that reboot a new flash joins the armed step.
 Vendor DATA params (served through the standard `/data/{param_id}` route, not
 new routes):
 - `x-ota-installed-manifest` — installed SUIT manifest JSON for the serving bank.
-- `x-ecu-id` (also the route above) — the ECU thumbprint.
+- `x-ecu-id` (also the route above) — the ECU id (the thumbprint, or the host's injected id).
 
 Verbs baked into the STANDARD `/updates` router: `PUT /updates/{id}/x-ota-commit`,
 `/x-ota-rollback`, `PUT /components/{id}/x-ota-force-rollback` — vendor-neutral

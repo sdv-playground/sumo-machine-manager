@@ -95,6 +95,7 @@ mod tests {
             hsm_crypto: None,
             hsm_keystore: None,
             hsm_port: 5100,
+            ecu_id: component_mgr::sovd::identity::EcuId::Thumbprint,
             bank_activators,
             partition_parts: HashMap::new(),
             health_probes: HashMap::new(),
