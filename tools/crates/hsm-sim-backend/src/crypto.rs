@@ -52,6 +52,17 @@ pub(crate) fn key_id_for_handle(handle: KeyHandle) -> Result<String, HsmError> {
 }
 
 impl SimHsm {
+    /// The keystore filename stem for `handle` ([`key_id_for_handle`]). With
+    /// [`SimHsm::with_no_dynamic_handles`] on, a dynamic handle is refused.
+    fn key_id(&self, handle: KeyHandle) -> Result<String, HsmError> {
+        if self.no_dynamic_handles() && handle.0 >= vhsm_proto::HANDLE_DYNAMIC_BASE {
+            return Err(HsmError::NotSupported(format!(
+                "dynamic handle {handle}: this backend serves no dynamic handles"
+            )));
+        }
+        key_id_for_handle(handle)
+    }
+
     /// Resolve a handle to `(key_id, key_type)` for a crypto op. A
     /// monotonic-counter slot (e.g. the time-floor) holds no key material, so a
     /// crypto op on it is a `CryptoError` — crypto never runs on a counter.
@@ -389,7 +400,7 @@ impl HsmCryptoProvider for SimHsm {
             }
         }
 
-        let key_id = key_id_for_handle(handle)?;
+        let key_id = self.key_id(handle)?;
 
         // Manifest lookup (provisioned well-known keys)
         if self.is_provisioned().unwrap_or(false) {
@@ -437,7 +448,7 @@ impl HsmCryptoProvider for SimHsm {
     fn generate_key(&self, handle: KeyHandle, alg: u32) -> Result<Vec<u8>, HsmError> {
         use vhsm_proto::{ALG_AES_128, ALG_AES_256, ALG_ECC_P256, ALG_ED25519, ALG_HMAC_SHA256};
 
-        let key_id = key_id_for_handle(handle)?;
+        let key_id = self.key_id(handle)?;
 
         std::fs::create_dir_all(self.keys_dir())
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
@@ -518,7 +529,7 @@ impl HsmCryptoProvider for SimHsm {
     }
 
     fn generate_csr(&self, handle: KeyHandle, subject_cn: &str) -> Result<Vec<u8>, HsmError> {
-        let key_id = key_id_for_handle(handle)?;
+        let key_id = self.key_id(handle)?;
         let priv_path = self.keys_dir().join(format!("{key_id}.priv"));
         if !priv_path.exists() {
             return Err(HsmError::KeyNotFound(format!(
@@ -560,7 +571,7 @@ impl HsmCryptoProvider for SimHsm {
         handle: KeyHandle,
         wrapped_cek: &[u8],
     ) -> Result<Vec<u8>, HsmError> {
-        let key_id = key_id_for_handle(handle)?;
+        let key_id = self.key_id(handle)?;
         let kek_path = self.keys_dir().join(format!("{key_id}.bin"));
         if !kek_path.exists() {
             return Err(HsmError::KeyNotFound(format!(
@@ -586,7 +597,7 @@ impl HsmCryptoProvider for SimHsm {
         wrapped_cek: &[u8],
         recipient_protected: &[u8],
     ) -> Result<Vec<u8>, HsmError> {
-        let key_id = key_id_for_handle(handle)?;
+        let key_id = self.key_id(handle)?;
         let priv_path = self.keys_dir().join(format!("{key_id}.priv"));
         if !priv_path.exists() {
             return Err(HsmError::KeyNotFound(format!(

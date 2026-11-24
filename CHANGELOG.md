@@ -223,6 +223,18 @@ what a consumer has to touch when it moves its pin.
   Verified: a scripted sequence (seed, activate, trial boots, commit, activate, rollback, reseed after
   deleting the primary) with the deterministic test signer writes byte-identical files and returns
   identical values before and after.
+- **Software HSM (`hsm-sim-backend`): an opt-in "no dynamic handles" mode.** The sim makes and
+  serves a key under any dynamic handle (0x0100 and up) as plain files, so a guest built and tested
+  against it could rely on `KEY_GENERATE`, which fails on a backend that serves only its own slot
+  map (an HSE at user rights, for example, generates no persistent key at a guest's request).
+  `SimHsm::with_no_dynamic_handles(true)`, or `HSM_SIM_NO_DYNAMIC_HANDLES=1` in `hsm-sim-service`'s
+  environment (only the exact value `1`), refuses every op on a dynamic handle with `NotSupported`:
+  a generate, and use of a key made before the mode was on. Well-known and project-extension slots
+  are served as before. Off by default, and the default path is unchanged.
+
+  Host-facing: none. A host that wants the sim to promise no more than its backend sets the variable
+  for the backend it spawns (an environment variable, since `hsm-supervisor` passes the backend only
+  `--keystore` and `--listen`). vhsm-ssd tells a guest `INVALID_PARAM` for the refusal.
 
 - vm-mgr (QEMU runner): QNX aarch64 guests boot their IFS with `-kernel` (`images.kernel`, no BIOS,
   no kernel cmdline); the rootfs, `partitions:` and `disks:` attach as `virtio-blk-device`. The
