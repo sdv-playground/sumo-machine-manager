@@ -42,6 +42,11 @@ pub struct FirmwareIdentity {
     pub system_name: Option<String>,         // F197
     pub programming_date: Option<String>,    // F199
     pub tester_serial: Option<String>,       // F198
+    /// The release version the manifest names (its SUIT text component-version),
+    /// whole: no UDS field width, and `None` when the manifest named none, where
+    /// [`Self::version`] (F189) carries a `seq-N` fallback. What `sw-version`
+    /// serves.
+    pub release_version: Option<String>,
 }
 
 /// One file / region in the installed bank inventory.

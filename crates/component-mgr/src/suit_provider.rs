@@ -287,6 +287,10 @@ impl SuitProvider {
             image_meta: meta,
             image_data: Vec::new(),
             version_display,
+            release_version: manifest
+                .text_version(0)
+                .map(str::to_string)
+                .filter(|v| !v.is_empty()),
             image_sha256: None,
             image_size: None,
             raw_envelope: None,

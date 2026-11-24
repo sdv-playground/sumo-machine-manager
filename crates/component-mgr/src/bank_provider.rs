@@ -752,6 +752,7 @@ fn ivd_identity_to_firmware(id: &hsm::ivd::IvdIdentity) -> FirmwareIdentity {
         system_name: opt(&id.system_name),
         programming_date: opt(&id.programming_date),
         tester_serial: opt(&id.tester_serial),
+        release_version: id.release_version.clone().filter(|v| !v.is_empty()),
     }
 }
 
@@ -771,6 +772,7 @@ pub(crate) fn firmware_to_ivd_identity(id: &FirmwareIdentity) -> hsm::ivd::IvdId
         system_name: s(&id.system_name),
         programming_date: s(&id.programming_date),
         tester_serial: s(&id.tester_serial),
+        release_version: id.release_version.clone().filter(|v| !v.is_empty()),
     }
 }
 

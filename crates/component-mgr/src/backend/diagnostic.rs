@@ -107,6 +107,30 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             }
         }
 
+        // `sw-version` (`/v1` only, see `v1_only_data`): the release version of
+        // the bank this component serves, which during a trial is the bank in
+        // trial. Listed only when that bank's manifest named one, so that list
+        // and read agree (C-031); a bank whose manifest cannot be read is left
+        // out here and answers the read with the error.
+        if matches!(self.bank_manifest(serving), Ok(Some(ref fw)) if release_version(fw).is_some())
+        {
+            params.push(ParameterInfo {
+                id: SW_VERSION_PARAM_ID.to_string(),
+                name: "Software version".to_string(),
+                description: Some(
+                    "The release version of the software in the bank this component serves \
+                     (during a trial, the bank in trial), as its manifest named it."
+                        .to_string(),
+                ),
+                unit: None,
+                data_type: Some("object".to_string()),
+                read_only: true,
+                href: format!("/v1/components/{comp_id}/data/{SW_VERSION_PARAM_ID}"),
+                did: None,
+                category: Some(DataCategory::IdentData),
+            });
+        }
+
         // Vendor data parameter: the booted bank's signed IVD manifest
         // (per-file inventory + identity + signature). Advertised only when a
         // verifiable manifest actually exists — absent on the no-HSM smoke path
@@ -1016,6 +1040,42 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     id: param_id.clone(),
                     name: "Installed firmware manifest (signed IVD)".to_string(),
                     value: installed_manifest_json(&vm),
+                    unit: None,
+                    timestamp: Utc::now(),
+                    raw: None,
+                    did: None,
+                    length: None,
+                });
+                continue;
+            }
+
+            // `sw-version` (`/v1` only): the release version of the bank this
+            // component serves. 404 when nothing is installed there or its manifest
+            // named no version; an error when the manifest cannot be read.
+            if param_id == SW_VERSION_PARAM_ID {
+                // The bank this component serves: during a trial, the bank in
+                // trial, which is the one an installation is verified against.
+                let serving = self.serving_bank();
+                let comp = &self.entity_info.id;
+                let fw = self.bank_manifest(serving).map_err(|e| {
+                    BackendError::Internal(format!(
+                        "{SW_VERSION_PARAM_ID}: the manifest of {comp} bank {serving:?} cannot be read: {e}"
+                    ))
+                })?;
+                let fw = fw.ok_or_else(|| {
+                    BackendError::EntityNotFound(format!(
+                        "{SW_VERSION_PARAM_ID}: nothing is installed in {comp} bank {serving:?}"
+                    ))
+                })?;
+                let value = sw_version_json(&fw).ok_or_else(|| {
+                    BackendError::EntityNotFound(format!(
+                        "{SW_VERSION_PARAM_ID}: the manifest installed in {comp} bank {serving:?} named no version"
+                    ))
+                })?;
+                values.push(DataValue {
+                    id: param_id.clone(),
+                    name: "Software version".to_string(),
+                    value,
                     unit: None,
                     timestamp: Utc::now(),
                     raw: None,

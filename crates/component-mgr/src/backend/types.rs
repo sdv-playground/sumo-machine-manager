@@ -6,6 +6,15 @@ use super::*;
 /// format-agnostic); the vendor semantics live entirely here in component-mgr.
 pub const INSTALLED_MANIFEST_PARAM_ID: &str = "x-ota-installed-manifest";
 
+/// `sw-version`: the release version of the software in the bank a component
+/// serves (during a trial, the bank in trial), as its manifest's SUIT text named
+/// it (component-version), recorded whole at install. In the `{"version",
+/// "items"}` shape of `ident_data`'s `sw-version` (and the DDU's). What a client
+/// that installed a release compares against to verify it. Served on `/v1` only
+/// ([`ComponentBackend`]'s `v1_only_data`): the frozen `/vehicle/v1` tree neither
+/// lists nor serves it.
+pub const SW_VERSION_PARAM_ID: &str = crate::sovd::ident_data::SW_VERSION_ID;
+
 /// Vendor SOVD data-parameter id for this component's **update-mode** — how it
 /// updates: A/B-banked + trial + rollback, vs single-bank write-through &
 /// irreversible (the HSM keystore). A STABLE per-component config property,
