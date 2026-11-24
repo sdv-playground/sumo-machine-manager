@@ -240,9 +240,18 @@ fn handle_key_generate(
     let pubkey = match crypto.generate_key(hsm::KeyHandle(handle), algorithm) {
         Ok(pk) => pk,
         Err(e) => {
+            // No key exists under the handle, so its entry goes too: a failed
+            // generate leaves the table as it found it.
+            handle_table.remove(handle);
             tracing::warn!(key = %key_id, alg = algorithm, error = %e, "generate_key failed");
+            // The wire has no NOT_SUPPORTED. A backend that cannot make this key
+            // (an algorithm it lacks, or no slot for the handle, which is how a
+            // backend serving only its own slot map answers a dynamic one) is
+            // refusing the request, so the guest hears INVALID_PARAM, not INTERNAL.
             let status = match e {
-                hsm::HsmError::NotSupported(_) => StatusCode::InvalidParam,
+                hsm::HsmError::NotSupported(_) | hsm::HsmError::KeyNotFound(_) => {
+                    StatusCode::InvalidParam
+                }
                 _ => StatusCode::Internal,
             };
             return Response::err(req.op, req.session_id, status);
@@ -663,6 +672,79 @@ mod tests {
             StatusCode::InvalidParam as u32,
             "unsupported alg should map to InvalidParam"
         );
+        assert_eq!(table.len(), 0, "a refused generate leaves no handle behind");
+    }
+
+    /// A backend that answers every op with the error `refusal` builds. Only
+    /// `generate_key` is driven; the rest exist to make it a provider.
+    struct Refuses(fn() -> HsmError);
+
+    impl HsmCryptoProvider for Refuses {
+        fn sign(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, HsmError> {
+            Err((self.0)())
+        }
+        fn verify(&self, _: hsm::KeyHandle, _: &[u8], _: &[u8]) -> Result<bool, HsmError> {
+            Err((self.0)())
+        }
+        fn encrypt(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, HsmError> {
+            Err((self.0)())
+        }
+        fn decrypt(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, HsmError> {
+            Err((self.0)())
+        }
+        fn mac_generate(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, HsmError> {
+            Err((self.0)())
+        }
+        fn mac_verify(&self, _: hsm::KeyHandle, _: &[u8], _: &[u8]) -> Result<bool, HsmError> {
+            Err((self.0)())
+        }
+        fn derive(&self, _: hsm::KeyHandle, _: &[u8], _: usize) -> Result<Vec<u8>, HsmError> {
+            Err((self.0)())
+        }
+        fn random(&self, _: usize) -> Result<Vec<u8>, HsmError> {
+            Err((self.0)())
+        }
+        fn get_certificate_der(&self, _: hsm::KeyHandle) -> Result<Vec<u8>, HsmError> {
+            Err((self.0)())
+        }
+        fn get_public_key_der(&self, _: hsm::KeyHandle) -> Result<Vec<u8>, HsmError> {
+            Err((self.0)())
+        }
+        fn get_slot_info(&self, _: hsm::KeyHandle) -> Result<hsm::SlotInfo, HsmError> {
+            Err((self.0)())
+        }
+        fn generate_key(&self, _: hsm::KeyHandle, _: u32) -> Result<Vec<u8>, HsmError> {
+            Err((self.0)())
+        }
+    }
+
+    /// A backend with no slot for the handle (a backend that serves only its own
+    /// slot map answers a dynamic one this way) is refusing, not failing: the
+    /// guest hears INVALID_PARAM. Any other backend error is INTERNAL. Either way
+    /// no entry stays behind for a key that does not exist.
+    #[test]
+    fn key_generate_backend_refusal_maps_its_status_and_leaves_no_handle() {
+        let cases: [(fn() -> HsmError, StatusCode); 2] = [
+            (
+                || HsmError::KeyNotFound("no slot for handle".into()),
+                StatusCode::InvalidParam,
+            ),
+            (
+                || HsmError::KeystoreError("disk full".into()),
+                StatusCode::Internal,
+            ),
+        ];
+        for (refusal, status) in cases {
+            let mut table = HandleTable::new();
+            let req = Request {
+                op: Op::KeyGenerate as u32,
+                session_id: 0,
+                payload: make_keygen_payload(ALG_ECC_P256, PERM_SIGN | PERM_VERIFY),
+            };
+            let resp = handle_key_generate(&req, &caller("vm1"), &mut table, &Refuses(refusal));
+            assert_eq!(resp.status, status as u32, "{:?}", refusal());
+            assert_eq!(table.len(), 0, "{:?} left a handle behind", refusal());
+        }
     }
 
     #[test]

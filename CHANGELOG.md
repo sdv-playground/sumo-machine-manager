@@ -223,6 +223,36 @@ what a consumer has to touch when it moves its pin.
   Verified: a scripted sequence (seed, activate, trial boots, commit, activate, rollback, reseed after
   deleting the primary) with the deterministic test signer writes byte-identical files and returns
   identical values before and after.
+- **vhsm-ssd: a persistent dynamic handle names the same key after a restart.** The reload of
+  `--persist-dir` numbered the saved handles afresh from 0x0100 in directory order while the key
+  files kept their numbers, so a restored handle could serve another key's material, and a new
+  generate could overwrite it. Now:
+  - a restored handle keeps its saved number (`HandleTable::restore`), and new allocations start
+    above every number a saved entry's name carries, whether or not that entry comes back
+    (`HandleTable::reserve_through`);
+  - dynamic numbers are bounded to `HANDLE_DYNAMIC_BASE..=HANDLE_DYNAMIC_LAST` (`0x7FFF_FFFF`): a
+    saved number past it is refused, `allocate` refuses a number outside the range or already in
+    the table and is refused at the top of the range, so the counter never wraps into the
+    well-known slots;
+  - a damaged store no longer empties the table: `Secstore::load_each` reads each entry on its own
+    (an entry whose record names another handle than its file name is damaged), and the others come
+    back. A store that cannot be listed at all stops vhsm-ssd at start, as an unopenable
+    `--audit-log` does;
+  - a saved entry whose key the backend reports absent (`KeyNotFound` / `NotProvisioned`) is
+    skipped and its record kept; one whose key cannot be checked (any other error) comes back;
+  - the software HSM's generate on a numbered handle first removes every file an earlier key under
+    that number left, so a leftover file of another type no longer wins the type probe;
+  - a KEY_GENERATE the backend refuses removes the handle it allocated, and one refused for want of
+    a slot (`KeyNotFound`) answers `INVALID_PARAM`, as `NotSupported` already did, not `INTERNAL`;
+  - `dispatch_request` persists exactly the handle a successful, persistent KEY_GENERATE answered.
+    It persisted the table's last entry whenever the table grew, so a failed generate could be
+    persisted and two concurrent generates could persist one entry twice and lose the other.
+
+  Host-facing: `Secstore::load_each` and `StoredEntry` are new (`load_all` is unchanged), as are
+  `HandleTable::restore`, `reserve_through` and `HANDLE_DYNAMIC_LAST`. A guest that matched
+  `INTERNAL` for a refused KEY_GENERATE sees `INVALID_PARAM`. A `--persist-dir` vhsm-ssd cannot list
+  now refuses to start. Entries of failed generates in a store an older vhsm-ssd wrote are skipped
+  at each start and stay on disk.
 
 - vm-mgr (QEMU runner): QNX aarch64 guests boot their IFS with `-kernel` (`images.kernel`, no BIOS,
   no kernel cmdline); the rootfs, `partitions:` and `disks:` attach as `virtio-blk-device`. The

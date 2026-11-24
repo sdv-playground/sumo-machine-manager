@@ -51,6 +51,19 @@ pub(crate) fn key_id_for_handle(handle: KeyHandle) -> Result<String, HsmError> {
     }
 }
 
+/// Every file a key can leave under its `key_id`: what `generate_key` writes for
+/// each algorithm, and a certificate.
+const KEY_FILE_EXTENSIONS: [&str; 8] = [
+    "bin",
+    "aes128.bin",
+    "hmac256.bin",
+    "priv",
+    "pub",
+    "ed25519.priv",
+    "ed25519.pub",
+    "cert",
+];
+
 impl SimHsm {
     /// Resolve a handle to `(key_id, key_type)` for a crypto op. A
     /// monotonic-counter slot (e.g. the time-floor) holds no key material, so a
@@ -442,6 +455,26 @@ impl HsmCryptoProvider for SimHsm {
         std::fs::create_dir_all(self.keys_dir())
             .map_err(|e| HsmError::KeystoreError(format!("create keys dir: {e}")))?;
         crate::sim::restrict_dir_700(&self.keys_dir());
+
+        // A key named by its handle (`dyn-<handle>`) replaces whatever an earlier
+        // key under that number left: the type of a key is read off which file
+        // exists (`get_slot_info`'s probe order), so a leftover file of another
+        // type would otherwise win over the new key.
+        if vhsm_proto::slot_for_handle(handle.0).is_none() {
+            for ext in KEY_FILE_EXTENSIONS {
+                let path = self.keys_dir().join(format!("{key_id}.{ext}"));
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(HsmError::KeystoreError(format!(
+                            "remove {}: {e}",
+                            path.display()
+                        )))
+                    }
+                }
+            }
+        }
 
         let write_raw = |ext: &str, len: usize| -> Result<(), HsmError> {
             let mut key = vec![0u8; len];
@@ -1077,6 +1110,27 @@ mod tests {
             "Ed25519 SPKI length should be ~44, got {}",
             spki_via_getter.len()
         );
+    }
+
+    /// A generate on a number an earlier key used replaces it whole: the type
+    /// probe sees the new key, not a leftover file of the old one.
+    #[test]
+    fn generate_on_a_used_number_replaces_the_old_key() {
+        let (hsm, _tmp) = new_hsm();
+        hsm.generate_key(H_A, vhsm_proto::ALG_ED25519).unwrap();
+        hsm.generate_key(H_A, ALG_AES_256).unwrap();
+        assert_eq!(
+            hsm.get_slot_info(H_A).unwrap().kind,
+            SlotKind::Key(KeyType::Aes256)
+        );
+        let ct = hsm.encrypt(H_A, b"m").unwrap();
+        assert_eq!(hsm.decrypt(H_A, &ct).unwrap(), b"m");
+        let left: Vec<String> = std::fs::read_dir(hsm.keys_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("dyn-"))
+            .collect();
+        assert_eq!(left, ["dyn-00000100.bin"]);
     }
 
     #[test]
