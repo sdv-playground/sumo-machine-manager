@@ -290,6 +290,10 @@ impl<D: BlockDevice + Send + 'static> BankProvider for PartitionBankProvider<D> 
         // bootloader re-selects — always a full ECU reset.
         ResetKind::RequiresEcuReset
     }
+    fn on_shared_boot_vector(&self) -> bool {
+        // Activate, commit and rollback all end in the inner's selector writes.
+        self.inner.on_shared_boot_vector()
+    }
     fn staging_record(&self, bank: Bank) -> Result<Option<StagingRecord>, BankError> {
         // The record sits beside the metadata dir exactly as for a file bank.
         self.inner.staging_record(bank)
