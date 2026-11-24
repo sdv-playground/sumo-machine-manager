@@ -53,13 +53,35 @@ use hsm::{
 pub struct SimHsm {
     /// Keystore directory (e.g. /tmp/vhsm-keys).
     keystore_path: PathBuf,
+    /// Refuse dynamic handles. See [`Self::with_no_dynamic_handles`].
+    no_dynamic_handles: bool,
 }
 
 impl SimHsm {
     /// Construct a SimHsm over `keystore_path`. No daemon, no port — crypto and
     /// keystore ops read/write the directory directly.
     pub fn new(keystore_path: PathBuf) -> Self {
-        Self { keystore_path }
+        Self {
+            keystore_path,
+            no_dynamic_handles: false,
+        }
+    }
+
+    /// No dynamic handles. With `on`, every op on a dynamic handle (0x0100 and
+    /// up) is refused with `NotSupported`: a generate, and use of a key made
+    /// before the mode was on. Well-known and project-extension slots are served
+    /// as before. This is the sim of a backend that serves only its own slot
+    /// map; an HSE at user rights, for example, generates no persistent key at
+    /// a guest's request. Off (the default), the sim makes and serves dynamic
+    /// keys as files.
+    pub fn with_no_dynamic_handles(mut self, on: bool) -> Self {
+        self.no_dynamic_handles = on;
+        self
+    }
+
+    /// Whether [`Self::with_no_dynamic_handles`] is on.
+    pub fn no_dynamic_handles(&self) -> bool {
+        self.no_dynamic_handles
     }
 
     /// Factory signing public key as COSE_Key CBOR — the built-in provisioning authority.
