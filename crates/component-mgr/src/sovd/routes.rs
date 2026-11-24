@@ -303,7 +303,10 @@ fn component_banks(machine: &dyn Machine) -> Vec<ComponentBanksResponse> {
 ///
 ///   `GET  /vehicle/v1/components/hsm/data/keys`
 ///        → 200 JSON `{ "provisioned": bool, "items": [ { id, kind,
-///          has_certificate, allowed_ops, public_key_der_base64 } ] }` — ALWAYS
+///          has_certificate, allowed_ops, public_key_der_base64 } ] }`; on
+///          `/v1` the same inventory as an ISO 17978-3 data item (§7.9.3,
+///          `ReadValue`): `{ "id": "keys", "data": { "provisioned", "items" } }`
+///          ([`HsmKeysDataItem`]). ALWAYS
 ///          served (device-generated keys exist from first boot); `provisioned`
 ///          is the device's own state, so callers read it instead of inferring
 ///          from a status code. Every slot is listed — key slots (`kind` =
@@ -331,9 +334,9 @@ pub fn hsm_router(machine: Arc<dyn Machine>) -> Router {
     both_trees([
         (
             "/components/hsm/data/keys",
-            get(move || {
+            get(move |Extension(tree): Extension<Tree>| {
                 let machine = machine.clone();
-                async move { hsm_keys_list(machine).await }
+                async move { hsm_keys_list(tree, machine).await }
             }),
         ),
         (
@@ -365,7 +368,19 @@ pub(crate) struct HsmKeysResponse {
     pub items: Vec<HsmKeyEntry>,
 }
 
+/// The `hsm/data/keys` inventory on the `/v1` tree: an ISO 17978-3 data item
+/// (`ReadValue`), whose `data` is the [`HsmKeysResponse`] the legacy tree
+/// serves bare.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct HsmKeysDataItem {
+    /// The data resource's id: `keys`.
+    pub id: &'static str,
+    pub data: HsmKeysResponse,
+}
+
 /// `GET …/hsm/data/keys` — the key-slot inventory (public metadata only).
+/// On `/v1` it is the data item [`HsmKeysDataItem`]; on `/vehicle/v1` the
+/// inventory itself.
 #[utoipa::path(
     get,
     path = "/vehicle/v1/components/hsm/data/keys",
@@ -375,7 +390,10 @@ pub(crate) struct HsmKeysResponse {
         (status = 503, description = "No HSM component, or the HSM keys are unavailable.", body = String),
     ),
 )]
-pub(crate) async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::Response {
+pub(crate) async fn hsm_keys_list(
+    tree: Tree,
+    machine: Arc<dyn Machine>,
+) -> axum::response::Response {
     let Some(comp) = machine.component("hsm") else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -403,11 +421,18 @@ pub(crate) async fn hsm_keys_list(machine: Arc<dyn Machine>) -> axum::response::
                     }
                 })
                 .collect();
-            Json(HsmKeysResponse {
+            let inventory = HsmKeysResponse {
                 provisioned: inv.provisioned,
                 items,
-            })
-            .into_response()
+            };
+            match tree {
+                Tree::V1 => Json(HsmKeysDataItem {
+                    id: "keys",
+                    data: inventory,
+                })
+                .into_response(),
+                Tree::Legacy => Json(inventory).into_response(),
+            }
         }
         Err(MachineError::NotSupported(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1871,6 +1896,90 @@ mod tests {
             .await
             .unwrap();
         (status, bytes)
+    }
+
+    /// An `hsm` component whose keystore is installed, with one key slot.
+    struct ProvisionedHsm {
+        capabilities: Capabilities,
+    }
+
+    #[async_trait]
+    impl Component for ProvisionedHsm {
+        fn id(&self) -> &str {
+            "hsm"
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.capabilities
+        }
+        async fn list_keys(&self) -> MachineResult<machine_mgr::KeyInventory> {
+            Ok(machine_mgr::KeyInventory {
+                provisioned: true,
+                keys: vec![machine_mgr::KeyDescriptor {
+                    key_id: "tls-identity".to_string(),
+                    kind: machine_mgr::SlotKind::Key("EC-P256".to_string()),
+                    has_certificate: true,
+                    allowed_ops: None,
+                    public_key: None,
+                }],
+            })
+        }
+    }
+
+    fn machine_with_provisioned_hsm() -> Arc<dyn Machine> {
+        let builder = MachineRegistry::builder(EntityInfo {
+            id: "vehicle".into(),
+            name: "vehicle".into(),
+            entity_type: "vehicle".into(),
+            description: None,
+            href: "/vehicle/v1".into(),
+            status: None,
+        })
+        .with_arc(Arc::new(ProvisionedHsm {
+            capabilities: Capabilities::default(),
+        }) as Arc<dyn Component>);
+        Arc::new(builder.build().unwrap())
+    }
+
+    #[tokio::test]
+    async fn on_v1_the_keys_view_is_a_data_item_and_the_legacy_tree_keeps_the_bare_inventory() {
+        let router = hsm_router(machine_with_provisioned_hsm());
+        let inventory = serde_json::json!({
+            "provisioned": true,
+            "items": [{
+                "id": "tls-identity",
+                "kind": "EC-P256",
+                "has_certificate": true,
+                "allowed_ops": null,
+                "public_key_der_base64": null,
+            }],
+        });
+
+        let (status, v1) = get_raw(&router, "/v1/components/hsm/data/keys").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&v1).unwrap(),
+            serde_json::json!({ "id": "keys", "data": inventory })
+        );
+
+        let (status, legacy) = get_raw(&router, "/vehicle/v1/components/hsm/data/keys").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&legacy).unwrap(),
+            inventory
+        );
+    }
+
+    /// drive-twin reads the keys view in the node form, as the node's `hsm`
+    /// subcomponent: the data item, as on the flat `/v1` path.
+    #[tokio::test]
+    async fn through_the_node_the_keys_view_is_the_data_item() {
+        let router = served(hsm_router(machine_with_provisioned_hsm()), true);
+        let (status, body) =
+            get_raw(&router, "/v1/components/hpc/subcomponents/hsm/data/keys").await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], "keys", "{body}");
+        assert_eq!(body["data"]["provisioned"], true, "{body}");
     }
 
     #[tokio::test]
