@@ -45,7 +45,7 @@ use vhsm_server::bootstrap::BootstrapState;
 use vhsm_server::cert::{EcuSigner, SignError};
 use vhsm_server::codec;
 use vhsm_server::crossnode;
-use vhsm_server::handle_table::HandleTable;
+use vhsm_server::handle_table::{HandleEntry, HandleTable};
 use vhsm_server::handler::CallerId;
 use vhsm_server::iam::IamPolicy;
 use vhsm_server::proto::*;
@@ -56,7 +56,7 @@ use vhsm_server::transport::{Connection, TcpListener};
 use rustls::pki_types::CertificateDer;
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
-use secstore::{FileBackend, LinuxSimEncryptor, Secstore};
+use secstore::{FileBackend, LinuxSimEncryptor, Secstore, StoredEntry};
 
 const DEFAULT_LISTEN: &str = "10.0.200.1:5100";
 const DEFAULT_CERT_LIFETIME_SECS: u64 = 365 * 24 * 60 * 60; // 1 year
@@ -490,26 +490,24 @@ fn main() {
     let store: Option<Arc<Secstore<LinuxSimEncryptor, FileBackend>>> =
         persist_dir.as_ref().map(|dir| {
             let s = Secstore::new(LinuxSimEncryptor::default_test(), FileBackend::new(dir));
-            match s.load_all() {
-                Ok(metas) => {
-                    for m in &metas {
-                        let mut label = [0u8; LABEL_LEN];
-                        let bytes = m.label.as_bytes();
-                        let copy_len = bytes.len().min(LABEL_LEN - 1);
-                        label[..copy_len].copy_from_slice(&bytes[..copy_len]);
-                        table.allocate(
-                            &m.key_id,
-                            m.algorithm,
-                            m.permitted_ops,
-                            &m.owner_vm_id,
-                            m.persistent,
-                            &label,
-                        );
-                    }
-                    tracing::info!(count = metas.len(), "loaded persisted handles");
+            match s.load_each() {
+                Ok(entries) => {
+                    let restored = restore_persisted(&mut table, &entries, &*crypto);
+                    tracing::info!(
+                        count = restored,
+                        saved = entries.len(),
+                        "loaded persisted handles"
+                    );
                 }
+                // Starting without the saved set would number new handles from
+                // the base again, over the numbers (and the key material) the
+                // saved handles still name. Fail loud, like --audit-log.
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to load persisted handles");
+                    eprintln!(
+                        "error: cannot list the persisted handles in --persist-dir {}: {e}",
+                        dir.display()
+                    );
+                    std::process::exit(1);
                 }
             }
             Arc::new(s)
@@ -1121,6 +1119,82 @@ fn init_handle_table(crypto: &dyn HsmCryptoProvider) -> HandleTable {
     table
 }
 
+/// Put the handles a previous run persisted back into `table`, each under its
+/// saved number, so a guest's persistent handle still names its own key after a
+/// restart. Returns how many came back.
+///
+/// - No number a saved entry's name carries is handed out again, whether or not
+///   the entry comes back: the counter starts above all of them.
+/// - An entry that cannot be read is skipped; the others still come back.
+/// - An entry whose key the backend reports absent is skipped, so a handle with
+///   no key does not take a place in the table. Its record stays on disk: a
+///   backend pointed at the wrong keystore reports every key absent.
+/// - An entry whose key the backend cannot be asked about comes back: the key
+///   may be there.
+/// - One the table refuses (outside the dynamic range, a duplicate, a full
+///   table) is skipped.
+///
+/// Every skip is logged.
+fn restore_persisted(
+    table: &mut HandleTable,
+    entries: &[StoredEntry],
+    crypto: &dyn HsmCryptoProvider,
+) -> usize {
+    for handle in entries.iter().filter_map(|e| e.handle) {
+        table.reserve_through(handle);
+    }
+    let mut restored = 0;
+    for stored in entries {
+        let m = match &stored.meta {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    entry = %stored.name, error = %e,
+                    "persisted handle unreadable: not restored, its number is not reused"
+                );
+                continue;
+            }
+        };
+        match crypto.get_slot_info(hsm::KeyHandle(m.vhsm_handle)) {
+            Ok(_) => {}
+            Err(hsm::HsmError::KeyNotFound(_) | hsm::HsmError::NotProvisioned) => {
+                tracing::warn!(
+                    handle = m.vhsm_handle, key_id = %m.key_id,
+                    "persisted handle has no key in the backend: not restored (record kept)"
+                );
+                continue;
+            }
+            Err(e) => tracing::warn!(
+                handle = m.vhsm_handle, key_id = %m.key_id, error = %e,
+                "persisted handle's key could not be checked: restored"
+            ),
+        }
+        let mut label = [0u8; LABEL_LEN];
+        let bytes = m.label.as_bytes();
+        let copy_len = bytes.len().min(LABEL_LEN - 1);
+        label[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        let entry = HandleEntry {
+            handle: m.vhsm_handle,
+            key_id: m.key_id.clone(),
+            algorithm: m.algorithm,
+            permitted_ops: m.permitted_ops,
+            owner_vm_id: m.owner_vm_id.clone(),
+            persistent: m.persistent,
+            label,
+        };
+        if table.restore(entry) {
+            restored += 1;
+        } else {
+            tracing::warn!(
+                handle = m.vhsm_handle,
+                key_id = %m.key_id,
+                "persisted handle not restored: outside the dynamic range, a duplicate, or the table is full"
+            );
+        }
+    }
+    restored
+}
+
 /// Short lower-hex prefix of a SHA-256 (first 8 bytes / 16 hex chars).
 /// Enough for log-line correlation; full thumbprint is in the audit log.
 fn hex_short(tp: &[u8; 32]) -> String {
@@ -1212,6 +1286,233 @@ mod tests {
     // SimHsm is only needed by these cross-node config tests now that the
     // daemon's crypto backend is an out-of-process link-B client (see backend.rs).
     use hsm_sim_backend::SimHsm;
+
+    use secstore::KeyMetadata;
+
+    fn grant_everything() -> IamPolicy {
+        IamPolicy::parse("version: 1\nstatements:\n  - principals: [\"*\"]\n    handles: [\"*\"]\n    ops: [\"*\"]\n")
+            .expect("grant-everything policy parses")
+    }
+
+    fn vm1() -> CallerId {
+        CallerId {
+            peer_ip: "10.0.200.2".parse().expect("ip"),
+            vm_id: "vm1".to_string(),
+            cert_thumbprint: [0u8; 32],
+        }
+    }
+
+    /// A KEY_GENERATE request: algorithm(4) + permitted_ops(4) + persistent(1) +
+    /// pad(3) + label(32).
+    fn keygen(alg: u32, perms: u32, persistent: bool) -> Request {
+        let mut payload = Vec::with_capacity(44);
+        payload.extend_from_slice(&alg.to_le_bytes());
+        payload.extend_from_slice(&perms.to_le_bytes());
+        payload.push(persistent as u8);
+        payload.extend_from_slice(&[0u8; 3]);
+        payload.extend_from_slice(&[0u8; LABEL_LEN]);
+        Request {
+            op: Op::KeyGenerate as u32,
+            session_id: 1,
+            payload,
+        }
+    }
+
+    fn on_handle(op: Op, handle: u32, data: &[u8]) -> Request {
+        let mut payload = handle.to_le_bytes().to_vec();
+        payload.extend_from_slice(data);
+        Request {
+            op: op as u32,
+            session_id: 1,
+            payload,
+        }
+    }
+
+    fn saved(handle: u32) -> KeyMetadata {
+        KeyMetadata {
+            vhsm_handle: handle,
+            key_id: format!("gen-vm1-{handle:x}"),
+            algorithm: ALG_AES_256,
+            permitted_ops: PERM_ENCRYPT | PERM_DECRYPT,
+            owner_vm_id: "vm1".to_string(),
+            persistent: true,
+            label: "kept".to_string(),
+        }
+    }
+
+    /// The whole path across a restart: a run generates two persistent keys
+    /// with a volatile one between them and persists them; the next run builds
+    /// its table from the keystore and the saved set, and each persistent
+    /// handle signs with its own key (the signature verifies under the public
+    /// key its generate returned). The volatile number is not handed out again.
+    #[test]
+    fn a_persistent_handle_signs_with_its_own_key_after_a_restart() {
+        let keystore = tempfile::tempdir().expect("tempdir");
+        let persist = tempfile::tempdir().expect("tempdir");
+        let crypto = SimHsm::new(keystore.path().to_path_buf());
+        let store = Secstore::new(
+            LinuxSimEncryptor::default_test(),
+            FileBackend::new(persist.path()),
+        );
+        let iam = grant_everything();
+        let caller = vm1();
+        let audit = Arc::new(Mutex::new(AuditLogger::disabled()));
+        let run = |table: &Arc<Mutex<HandleTable>>, req: &Request| {
+            let mut out = Vec::new();
+            serve::dispatch_request(
+                req,
+                &caller,
+                &mut out,
+                table,
+                &iam,
+                &crypto,
+                Some(&store),
+                &audit,
+            );
+            codec::read_response(&mut out.as_slice()).expect("one response written")
+        };
+        let perms = PERM_SIGN | PERM_VERIFY | PERM_GET_PUBKEY;
+        let generated = |resp: Response| {
+            assert_eq!(resp.status, StatusCode::Ok as u32);
+            let handle = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+            (handle, resp.payload[8..].to_vec())
+        };
+
+        let first_run = Arc::new(Mutex::new(init_handle_table(&crypto)));
+        let kept_a = generated(run(&first_run, &keygen(ALG_ECC_P256, perms, true)));
+        let volatile = generated(run(&first_run, &keygen(ALG_ECC_P256, perms, false)));
+        let kept_b = generated(run(&first_run, &keygen(ALG_ECC_P256, perms, true)));
+        drop(first_run);
+
+        let mut table = init_handle_table(&crypto);
+        let entries = store.load_each().expect("store lists");
+        assert_eq!(restore_persisted(&mut table, &entries, &crypto), 2);
+        let restarted = Arc::new(Mutex::new(table));
+        for (handle, spki) in [&kept_a, &kept_b] {
+            let resp = run(
+                &restarted,
+                &on_handle(Op::Sign, *handle, b"after a restart"),
+            );
+            assert_eq!(resp.status, StatusCode::Ok as u32, "sign on 0x{handle:x}");
+            use p256::ecdsa::signature::Verifier;
+            use p256::pkcs8::DecodePublicKey;
+            let vk = p256::ecdsa::VerifyingKey::from_public_key_der(spki).expect("spki");
+            let sig = p256::ecdsa::DerSignature::from_bytes(&resp.payload).expect("der");
+            assert!(
+                vk.verify(b"after a restart", &sig).is_ok(),
+                "0x{handle:x} signs with its own key"
+            );
+        }
+        assert!(restarted.lock().unwrap().get(volatile.0).is_none());
+        let (next, _) = generated(run(&restarted, &keygen(ALG_ECC_P256, perms, false)));
+        assert!(
+            next > kept_b.0,
+            "0x{next:x} is above every number used before"
+        );
+    }
+
+    /// What the reload skips, and what it never hands out again: an entry
+    /// that cannot be read, one whose key the backend reports absent (its
+    /// record stays on disk), and a forged one past the dynamic range. The
+    /// readable entry with a key comes back, and the next number is above every
+    /// number the store's entries carry.
+    #[test]
+    fn a_damaged_or_keyless_saved_entry_is_skipped_and_its_number_not_reused() {
+        let keystore = tempfile::tempdir().expect("tempdir");
+        let persist = tempfile::tempdir().expect("tempdir");
+        let crypto = SimHsm::new(keystore.path().to_path_buf());
+        let store = Secstore::new(
+            LinuxSimEncryptor::default_test(),
+            FileBackend::new(persist.path()),
+        );
+        let with_key = HANDLE_DYNAMIC_BASE + 1;
+        crypto
+            .generate_key(hsm::KeyHandle(with_key), ALG_AES_256)
+            .expect("key");
+        store.store(&saved(with_key)).unwrap();
+        let keyless = HANDLE_DYNAMIC_BASE + 4;
+        store.store(&saved(keyless)).unwrap();
+        store.store(&saved(u32::MAX)).unwrap();
+        std::fs::write(persist.path().join("handle_00000109"), b"damaged").unwrap();
+
+        let mut table = HandleTable::new();
+        let entries = store.load_each().expect("store lists");
+        assert_eq!(entries.len(), 4);
+        assert_eq!(restore_persisted(&mut table, &entries, &crypto), 1);
+        assert!(table.resolve(with_key, "vm1").is_some());
+        assert!(table.get(keyless).is_none());
+        assert!(
+            persist.path().join("handle_00000104").exists(),
+            "record kept"
+        );
+
+        let next = table
+            .allocate(
+                "new",
+                ALG_AES_256,
+                PERM_ENCRYPT,
+                "vm1",
+                false,
+                &[0u8; LABEL_LEN],
+            )
+            .expect("room");
+        assert_eq!(next, 0x10A, "above the damaged entry's number");
+    }
+
+    /// A backend that cannot be asked about any key.
+    struct Unreachable;
+
+    impl HsmCryptoProvider for Unreachable {
+        fn sign(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+        fn verify(&self, _: hsm::KeyHandle, _: &[u8], _: &[u8]) -> Result<bool, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+        fn encrypt(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+        fn decrypt(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+        fn mac_generate(&self, _: hsm::KeyHandle, _: &[u8]) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+        fn mac_verify(&self, _: hsm::KeyHandle, _: &[u8], _: &[u8]) -> Result<bool, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+        fn derive(&self, _: hsm::KeyHandle, _: &[u8], _: usize) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+        fn random(&self, _: usize) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+        fn get_certificate_der(&self, _: hsm::KeyHandle) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+        fn get_public_key_der(&self, _: hsm::KeyHandle) -> Result<Vec<u8>, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+        fn get_slot_info(&self, _: hsm::KeyHandle) -> Result<hsm::SlotInfo, hsm::HsmError> {
+            Err(hsm::HsmError::ProcessError("down".into()))
+        }
+    }
+
+    /// A backend error is not "absent": the saved entry comes back, because
+    /// its key may well be there.
+    #[test]
+    fn a_saved_entry_whose_key_cannot_be_checked_comes_back() {
+        let persist = tempfile::tempdir().expect("tempdir");
+        let store = Secstore::new(
+            LinuxSimEncryptor::default_test(),
+            FileBackend::new(persist.path()),
+        );
+        store.store(&saved(HANDLE_DYNAMIC_BASE + 2)).unwrap();
+        let mut table = HandleTable::new();
+        let entries = store.load_each().expect("store lists");
+        assert_eq!(restore_persisted(&mut table, &entries, &Unreachable), 1);
+        assert!(table.resolve(HANDLE_DYNAMIC_BASE + 2, "vm1").is_some());
+    }
 
     // Both cases fail at the identity-root PEM step, before any keystore/HSM
     // access, so the keystore path need not exist.

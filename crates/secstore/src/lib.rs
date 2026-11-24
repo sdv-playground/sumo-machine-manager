@@ -99,11 +99,65 @@ impl<E: SecstoreEncryptor, B: SecstoreBackend> Secstore<E, B> {
         Ok(result)
     }
 
+    /// Load every stored entry on its own, so one that cannot be read does not
+    /// hide the others. Fails only when the store cannot be listed. Each item is
+    /// an entry's name, the handle its name carries (`None` for a name that is
+    /// not `handle_<8 hex>`), and the entry or why it could not be read. An
+    /// entry whose record names another handle than its name is damaged.
+    pub fn load_each(&self) -> Result<Vec<StoredEntry>, SecstoreError> {
+        let mut result = Vec::new();
+        for name in self.backend.list()? {
+            let handle = handle_from_name(&name);
+            let meta = self.load_named(&name, handle);
+            result.push(StoredEntry { name, handle, meta });
+        }
+        Ok(result)
+    }
+
+    fn load_named(&self, name: &str, handle: Option<u32>) -> Result<KeyMetadata, SecstoreError> {
+        let ciphertext = self
+            .backend
+            .read(name)?
+            .ok_or_else(|| SecstoreError::Format(format!("{name}: gone while loading")))?;
+        let plaintext = self.encryptor.decrypt(&ciphertext)?;
+        let meta = deserialize_metadata(&plaintext)
+            .ok_or_else(|| SecstoreError::Format(format!("{name}: not a metadata record")))?;
+        if handle != Some(meta.vhsm_handle) {
+            return Err(SecstoreError::Format(format!(
+                "{name}: the record names handle 0x{:08x}",
+                meta.vhsm_handle
+            )));
+        }
+        Ok(meta)
+    }
+
     /// Delete key metadata.
     pub fn delete(&self, vhsm_handle: u32) -> Result<(), SecstoreError> {
         let key = format!("handle_{:08x}", vhsm_handle);
         self.backend.delete(&key)
     }
+}
+
+/// One stored entry as [`Secstore::load_each`] found it.
+#[derive(Debug)]
+pub struct StoredEntry {
+    /// The entry's name in the backend.
+    pub name: String,
+    /// The handle the name carries (`handle_<8 hex>`), whether or not the
+    /// entry itself can be read.
+    pub handle: Option<u32>,
+    /// The entry, or why it could not be read.
+    pub meta: Result<KeyMetadata, SecstoreError>,
+}
+
+/// The handle an entry's name carries: `handle_<8 hex>`, as [`Secstore::store`]
+/// names it.
+fn handle_from_name(name: &str) -> Option<u32> {
+    let hex = name.strip_prefix("handle_")?;
+    if hex.len() != 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
 }
 
 #[derive(Debug)]
@@ -353,6 +407,54 @@ mod tests {
         // → entry is silently skipped (per load_all's if-let). Verifies isolation.
         let loaded = store_b.load_all().unwrap();
         assert!(loaded.is_empty(), "wrong key must not decrypt valid data");
+    }
+
+    /// One entry that cannot be read leaves the others readable, and still
+    /// says which handle its name carries.
+    #[test]
+    fn load_each_reads_every_entry_on_its_own() {
+        let (store, tmp) = tmp_store();
+        store.store(&make_meta(0x100, "k1")).unwrap();
+        store.store(&make_meta(0x102, "k3")).unwrap();
+        std::fs::write(tmp.path().join("handle_00000101"), b"\x01\x02damaged").unwrap();
+        // A record copied under another handle's name is damaged too.
+        std::fs::copy(
+            tmp.path().join("handle_00000100"),
+            tmp.path().join("handle_00000103"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("stray"), b"x").unwrap();
+
+        let mut each = store.load_each().unwrap();
+        each.sort_by(|a, b| a.name.cmp(&b.name));
+        let got: Vec<(Option<u32>, bool)> =
+            each.iter().map(|e| (e.handle, e.meta.is_ok())).collect();
+        assert_eq!(
+            got,
+            [
+                (Some(0x100), true),
+                (Some(0x101), false),
+                (Some(0x102), true),
+                (Some(0x103), false),
+                (None, false),
+            ]
+        );
+        assert_eq!(each[2].meta.as_ref().unwrap().key_id, "k3");
+    }
+
+    #[test]
+    fn handle_names_parse_only_as_store_writes_them() {
+        assert_eq!(handle_from_name("handle_00000100"), Some(0x100));
+        assert_eq!(handle_from_name("handle_ffffffff"), Some(u32::MAX));
+        for bad in [
+            "handle_100",
+            "handle_0000010g",
+            "handle_000001000",
+            "x_00000100",
+            "",
+        ] {
+            assert_eq!(handle_from_name(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

@@ -7,6 +7,16 @@
 /// the creating guest's `vm_id`.
 use crate::proto::*;
 
+/// The last dynamic handle this table hands out or takes back. Allocation is
+/// sequential from [`HANDLE_DYNAMIC_BASE`], so a number a real run saved sits
+/// far below it; a saved number above it is damaged or forged and is refused,
+/// and the counter can never wrap into the well-known range.
+pub const HANDLE_DYNAMIC_LAST: u32 = 0x7FFF_FFFF;
+
+fn is_dynamic(handle: u32) -> bool {
+    (HANDLE_DYNAMIC_BASE..=HANDLE_DYNAMIC_LAST).contains(&handle)
+}
+
 /// A single entry in the handle table.
 #[derive(Debug, Clone)]
 pub struct HandleEntry {
@@ -75,7 +85,9 @@ impl HandleTable {
     }
 
     /// Allocate a dynamic handle (from KEY_GENERATE).
-    /// Returns None if the table is full.
+    /// Returns None if the table is full or the dynamic range is used up. It
+    /// never hands out a number outside [`HANDLE_DYNAMIC_BASE`]..=
+    /// [`HANDLE_DYNAMIC_LAST`] or one already in the table.
     pub fn allocate(
         &mut self,
         key_id: &str,
@@ -90,7 +102,12 @@ impl HandleTable {
         }
 
         let handle = self.next_dynamic;
-        self.next_dynamic += 1;
+        if !is_dynamic(handle) || self.get(handle).is_some() {
+            return None;
+        }
+        // `handle` is at most HANDLE_DYNAMIC_LAST, so this cannot overflow; past
+        // the last number the next allocation is refused above.
+        self.next_dynamic = handle.checked_add(1)?;
 
         self.entries.push(HandleEntry {
             handle,
@@ -103,6 +120,36 @@ impl HandleTable {
         });
 
         Some(handle)
+    }
+
+    /// Put back a dynamic handle a previous run persisted, under the number it
+    /// had, so a guest's persistent handle names the same key after a restart
+    /// ([`Self::allocate`] would number it afresh, and a backend that names keys
+    /// by handle would then find another key's material under it). Later
+    /// allocations start above every restored handle. Returns false, and changes
+    /// nothing, for a handle outside the dynamic range, one already in the
+    /// table, or a full table.
+    pub fn restore(&mut self, entry: HandleEntry) -> bool {
+        if !is_dynamic(entry.handle)
+            || self.entries.len() >= MAX_HANDLES
+            || self.get(entry.handle).is_some()
+        {
+            return false;
+        }
+        self.reserve_through(entry.handle);
+        self.entries.push(entry);
+        true
+    }
+
+    /// Never hand out `handle` or any number below it: later allocations start
+    /// above it. For a number a previous run used that is not restored (a saved
+    /// entry that cannot be read, one whose key is gone), so it is not reused.
+    /// A number outside the dynamic range changes nothing.
+    pub fn reserve_through(&mut self, handle: u32) {
+        if is_dynamic(handle) {
+            // At most HANDLE_DYNAMIC_LAST + 1, which `allocate` refuses.
+            self.next_dynamic = self.next_dynamic.max(handle + 1);
+        }
     }
 
     /// Look up a handle. Returns None if not found.
@@ -187,6 +234,118 @@ mod tests {
         // Accessible from any VM
         assert!(table.resolve(HANDLE_JWT_SIGNING, "vm1").is_some());
         assert!(table.resolve(HANDLE_JWT_SIGNING, "vm2").is_some());
+    }
+
+    fn saved(handle: u32) -> HandleEntry {
+        HandleEntry {
+            handle,
+            key_id: format!("gen-vm1-{handle:x}"),
+            algorithm: ALG_AES_256,
+            permitted_ops: PERM_ENCRYPT | PERM_DECRYPT,
+            owner_vm_id: "vm1".to_string(),
+            persistent: true,
+            label: [0u8; LABEL_LEN],
+        }
+    }
+
+    /// A restored handle keeps its number, whatever the gaps before it, and new
+    /// allocations start above the highest one.
+    #[test]
+    fn restore_keeps_the_saved_number_and_allocates_above_it() {
+        let mut table = HandleTable::new();
+        assert!(table.restore(saved(HANDLE_DYNAMIC_BASE + 5)));
+        assert!(table.restore(saved(HANDLE_DYNAMIC_BASE + 1)));
+        assert_eq!(
+            table
+                .resolve(HANDLE_DYNAMIC_BASE + 5, "vm1")
+                .map(|e| e.handle),
+            Some(HANDLE_DYNAMIC_BASE + 5)
+        );
+        assert!(table.resolve(HANDLE_DYNAMIC_BASE + 5, "vm2").is_none());
+        let next = table
+            .allocate(
+                "new",
+                ALG_AES_256,
+                PERM_ENCRYPT,
+                "vm1",
+                false,
+                &[0u8; LABEL_LEN],
+            )
+            .expect("room");
+        assert_eq!(next, HANDLE_DYNAMIC_BASE + 6);
+    }
+
+    /// A saved entry below the dynamic range, or on a number already taken, is
+    /// refused and changes nothing.
+    #[test]
+    fn restore_refuses_a_well_known_number_and_a_duplicate() {
+        let mut table = HandleTable::new();
+        assert!(table.register_well_known(
+            HANDLE_STORAGE,
+            "storage-key",
+            ALG_AES_256,
+            PERM_ENCRYPT
+        ));
+        assert!(!table.restore(saved(HANDLE_STORAGE)));
+        assert!(table.restore(saved(HANDLE_DYNAMIC_BASE)));
+        assert!(!table.restore(saved(HANDLE_DYNAMIC_BASE)));
+        assert_eq!(table.len(), 2);
+        assert_eq!(
+            table.get(HANDLE_STORAGE).map(|e| e.owner_vm_id.as_str()),
+            Some("")
+        );
+    }
+
+    fn allocate_one(table: &mut HandleTable) -> Option<u32> {
+        table.allocate(
+            "new",
+            ALG_AES_256,
+            PERM_ENCRYPT,
+            "vm1",
+            false,
+            &[0u8; LABEL_LEN],
+        )
+    }
+
+    /// A saved number above the dynamic range (damaged or forged) is refused,
+    /// and allocation goes on from the base: the counter never wraps into the
+    /// well-known range.
+    #[test]
+    fn a_saved_number_past_the_range_is_refused_and_allocation_is_unharmed() {
+        let mut table = HandleTable::new();
+        assert!(!table.restore(saved(u32::MAX)));
+        assert!(!table.restore(saved(HANDLE_DYNAMIC_LAST + 1)));
+        table.reserve_through(u32::MAX);
+        assert_eq!(table.len(), 0);
+        assert_eq!(allocate_one(&mut table), Some(HANDLE_DYNAMIC_BASE));
+    }
+
+    /// At the top of the range the last number is handed out once, then
+    /// allocation is refused; nothing wraps.
+    #[test]
+    fn allocation_stops_at_the_last_dynamic_number() {
+        let mut table = HandleTable::new();
+        assert!(table.restore(saved(HANDLE_DYNAMIC_LAST - 1)));
+        assert_eq!(allocate_one(&mut table), Some(HANDLE_DYNAMIC_LAST));
+        assert_eq!(allocate_one(&mut table), None);
+        assert_eq!(allocate_one(&mut table), None);
+        assert!(table.get(HANDLE_DYNAMIC_BASE).is_none());
+        assert_eq!(table.len(), 2);
+
+        let mut table = HandleTable::new();
+        assert!(table.restore(saved(HANDLE_DYNAMIC_LAST)));
+        assert_eq!(allocate_one(&mut table), None);
+    }
+
+    /// A number a previous run used but that is not restored is never handed
+    /// out again.
+    #[test]
+    fn a_reserved_number_is_not_reused() {
+        let mut table = HandleTable::new();
+        table.reserve_through(HANDLE_DYNAMIC_BASE + 7);
+        table.reserve_through(HANDLE_DYNAMIC_BASE + 2);
+        table.reserve_through(HANDLE_STORAGE);
+        assert_eq!(allocate_one(&mut table), Some(HANDLE_DYNAMIC_BASE + 8));
     }
 
     #[test]
