@@ -317,6 +317,26 @@ Spec-native shape; listed here only for completeness (no vendor deltas):
 | filters | `created_before`, `created_after` |
 | download | 200 inline / 307 redirect / 202 async; `logs` is the first category |
 
+### Version items: names not final
+
+The data items that carry a version today:
+
+| Entity | Item id | Value |
+|---|---|---|
+| banked component (a component whose serving bank has a sealed installed manifest) | `swVersion` | `/v1` only: the release label the installed manifest's SUIT text component-version named, a string, verbatim; not an item when that manifest named none |
+| | `fw_version`, `supplier_sw_version` | identification DIDs F189 / F195, from the installed manifest (F189 is cut to 32 bytes) |
+| | `supplier_hw_version` | identification DID F193, from the factory record |
+| | `x-ota-installed-manifest` | the installed manifest; its `identity.version` is F189, and its signed `manifest_b64` holds the release label (identity key `10`) for banks installed since the label is recorded |
+| identification entity (`ident_data`) | `sw-version` | `{"version", "items": [{"name", "version"}]}` from a version record |
+| | configured items, e.g. `platform-version`, `boot-version` | a string from a version record; the ids are the node's configuration |
+| hsm component | `supplier_hw_version` | as on a banked component; its keystore install seals no installed manifest, so it serves none of the manifest-sourced items above, and `keys` carries no version |
+
+ISO 17978-3 defines no ids for these items; ISO 17978-3 uses `swVersion` as its example id.
+
+The software-version name is therefore double today: `swVersion` and `sw-version`. The
+hardware-version and the other identification item names are likewise not unified. They are to
+be unified in a later change.
+
 ---
 
 ## 4. Auth
