@@ -41,6 +41,15 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
     // --- Data ---
 
     async fn list_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {
+        // The key-slot inventory is listed when its component lists keys at
+        // all; one it cannot read now is still listed, and its read fails.
+        let keys_listed = match self.keys_component() {
+            Some(c) => !matches!(
+                c.list_keys().await,
+                Err(machine_mgr::MachineError::NotSupported(_))
+            ),
+            None => false,
+        };
         let nv = self
             .nv
             .lock()
@@ -161,7 +170,36 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
             category: Some(DataCategory::IdentData),
         });
 
+        // The key-slot inventory, on `/v1` only (see `v1_only_data`).
+        if keys_listed {
+            params.push(ParameterInfo {
+                id: KEYS_PARAM_ID.to_string(),
+                name: KEYS_NAME.to_string(),
+                description: Some(
+                    "The HSM's provisioning state and every key slot: id, kind, \
+                     certificate presence, allowed operations and, for an \
+                     asymmetric key, its public key. Never key material."
+                        .to_string(),
+                ),
+                unit: None,
+                data_type: Some("object".to_string()),
+                read_only: true,
+                href: format!("/v1/components/{comp_id}/data/{KEYS_PARAM_ID}"),
+                did: None,
+                category: Some(DataCategory::IdentData),
+            });
+        }
+
         Ok(params)
+    }
+
+    /// The key-slot inventory `keys`, when a component is named for it: the
+    /// frozen tree serves it on a route of its own, with a body of its own.
+    fn v1_only_data(&self) -> Vec<String> {
+        match self.keys_component() {
+            Some(_) => vec![KEYS_PARAM_ID.to_string()],
+            None => Vec::new(),
+        }
     }
 
     /// SOVD §7.21 `GET /components/{id}/logs` — served only when the
@@ -1002,6 +1040,25 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
                     length: None,
                 });
                 continue;
+            }
+
+            // The key-slot inventory, as the frozen tree's route serves it.
+            // Not served (unknown) when no component lists keys; an inventory
+            // that cannot be read is an error, never an empty one.
+            if param_id == KEYS_PARAM_ID {
+                if let Some(component) = self.keys_component() {
+                    let inventory = component.list_keys().await.map_err(|e| match e {
+                        machine_mgr::MachineError::NotSupported(_) => {
+                            BackendError::ParameterNotFound(param_id.clone())
+                        }
+                        e => BackendError::Internal(format!("list keys error: {e}")),
+                    })?;
+                    let value =
+                        serde_json::to_value(crate::sovd::routes::HsmKeysResponse::from(inventory))
+                            .expect("HsmKeysResponse is infallibly serializable");
+                    values.push(DataValue::new(param_id.clone(), KEYS_NAME, value));
+                    continue;
+                }
             }
 
             let (did_num, reg) = resolve_param(param_id)

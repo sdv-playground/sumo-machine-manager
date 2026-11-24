@@ -109,6 +109,10 @@ impl DiagnosticBackend for InstallRouterDiag {
         self.engine.read_data(param_ids).await
     }
 
+    fn v1_only_data(&self) -> Vec<String> {
+        self.engine.v1_only_data()
+    }
+
     async fn write_data(&self, param_id: &str, value: &[u8]) -> BackendResult<()> {
         self.engine.write_data(param_id, value).await
     }

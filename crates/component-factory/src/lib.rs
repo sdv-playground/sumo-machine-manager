@@ -891,6 +891,11 @@ pub fn build_component<D: BlockDevice + Send + Sync + 'static>(
             }
 
             let component: Arc<dyn Component> = Arc::new(component_inner);
+            // The hsm's key inventory is its SOVD data item `keys` on `/v1`
+            // (listed when the component lists keys).
+            if spec.component_type == "hsm" {
+                backend_arc.serve_keys_of(&component);
+            }
 
             let flash_probe: Arc<dyn Fn() -> bool + Send + Sync> = {
                 let b = backend_arc.clone();
@@ -1314,6 +1319,22 @@ parts:
         spec.component_type = "bank".to_string();
         let built = build_component(&spec, &deps).unwrap();
         assert!(built.component.capabilities().hsm.is_none());
+    }
+
+    /// An `hsm` component's backend serves its key inventory as the `/v1`-only
+    /// data item `keys`; no other type's does.
+    #[test]
+    fn the_hsm_backend_serves_the_keys_item() {
+        let mut spec = spec_on_slot("hsm", 0);
+        spec.component_type = "hsm".to_string();
+        spec.single_bank = true;
+        let built = build_component(&spec, &ten_slot_deps()).unwrap();
+        let backend = built.diag_backend.as_ref().unwrap();
+        assert_eq!(backend.v1_only_data(), ["keys"]);
+
+        spec.component_type = "bank".to_string();
+        let built = build_component(&spec, &ten_slot_deps()).unwrap();
+        assert!(built.diag_backend.unwrap().v1_only_data().is_empty());
     }
 
     /// The node binary late-binds its admin gates (vm-mgr's start gate, the
