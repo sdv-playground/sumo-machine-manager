@@ -27,7 +27,8 @@ what a consumer has to touch when it moves its pin.
   stays on both trees), and `update_state_router` serves both update-state routes on `/vehicle/v1`
   only. The hsm backend `build_component` returns serves `keys` by itself; a host that builds its
   hsm `ComponentBackend` otherwise calls `ComponentBackend::serve_keys_of(&component)` with the hsm
-  `Component`, and a host that registers no hsm backend with the server has no `/v1` keys read. For
+  `Component`, and a host that registers no hsm backend with the server merges
+  `hsm_keys_v1_router(machine)` next to `hsm_router` to keep its `/v1` keys read. For
   the update state, a host hands `component_mgr::sovd::routes::UpdateStateData::new(coord, machine)`
   (the arguments it gives `update_state_router`) to the server state:
   `state.with_node_data(Arc::new(…))` on the `AppState` `node_shell::sovd_state` returns (or that

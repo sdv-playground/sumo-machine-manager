@@ -449,6 +449,58 @@ impl From<machine_mgr::KeyInventory> for HsmKeysResponse {
     }
 }
 
+/// `component`'s key-slot inventory as the JSON of [`HsmKeysResponse`]: `None`
+/// when it lists no keys (`list_keys` not supported), an error when the
+/// inventory cannot be read. The value of the `/v1` data item `keys`, both
+/// from the hsm backend (`ComponentBackend::serve_keys_of`) and from
+/// [`hsm_keys_v1_router`].
+pub(crate) async fn keys_value(
+    component: &dyn Component,
+) -> sovd_core::BackendResult<Option<serde_json::Value>> {
+    match component.list_keys().await {
+        Ok(inventory) => Ok(Some(
+            serde_json::to_value(HsmKeysResponse::from(inventory))
+                .expect("HsmKeysResponse is infallibly serializable"),
+        )),
+        Err(MachineError::NotSupported(_)) => Ok(None),
+        Err(e) => Err(sovd_core::BackendError::Internal(format!(
+            "list keys error: {e}"
+        ))),
+    }
+}
+
+/// `GET /v1/components/hsm/data/keys` — the data item `keys` (ISO 17978-3
+/// Table 85 `ReadValue`) of `machine`'s hsm component, for a host that
+/// registers no hsm backend with the server, so the server has no `keys` item
+/// to serve. Errors are the server's: 404 when there is no hsm component or it
+/// lists no keys, 500 when its inventory cannot be read.
+///
+/// A host whose hsm backend is registered must not merge this router: the
+/// backend's item is the one to serve, and this literal route would shadow it.
+pub fn hsm_keys_v1_router(machine: Arc<dyn Machine>) -> Router {
+    Router::new().route(
+        &format!("{}/components/hsm/data/keys", Tree::V1.base()),
+        get(move || {
+            let machine = machine.clone();
+            async move {
+                let not_found = || {
+                    sovd_api::ApiError::from(sovd_core::BackendError::ParameterNotFound(
+                        crate::backend::KEYS_PARAM_ID.to_string(),
+                    ))
+                };
+                let component = machine.component("hsm").ok_or_else(not_found)?;
+                let data = keys_value(component.as_ref())
+                    .await?
+                    .ok_or_else(not_found)?;
+                Ok::<_, sovd_api::ApiError>(Json(sovd_api::handlers::data::ReadValue {
+                    id: crate::backend::KEYS_PARAM_ID.to_string(),
+                    data,
+                }))
+            }
+        }),
+    )
+}
+
 /// `GET /vehicle/v1/components/hsm/data/keys` — the key-slot inventory
 /// (public metadata only), served bare on the legacy tree.
 #[utoipa::path(
@@ -2245,6 +2297,100 @@ mod tests {
         // `/v1` reads the item through the server.
         let (status, _) = get_raw(&with, "/v1/components/hsm/data/keys").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A host without an hsm backend: SOVDd over no backends, with
+    /// [`hsm_router`] and [`hsm_keys_v1_router`] over `hsm`'s machine (none:
+    /// no hsm component), behind a node `hpc` with `node`.
+    fn backendless_server(hsm: Option<Arc<dyn Component>>, node: bool) -> Router {
+        let machine = match hsm {
+            Some(hsm) => machine_with_hsm(hsm),
+            None => machine_with(&[]),
+        };
+        served_by_sovdd(
+            hsm_router(machine.clone()).merge(hsm_keys_v1_router(machine)),
+            node,
+            std::collections::HashMap::new(),
+            None,
+        )
+    }
+
+    /// The route answers what the backend's item answers for the same
+    /// inventory, in the flat form and, through a node, in the node form.
+    #[tokio::test]
+    async fn the_v1_keys_route_answers_as_the_backend_item() {
+        let hsm = provisioned_hsm();
+        let (status, item) = get_raw(
+            &hsm_server(&hsm, Some(&hsm), false),
+            "/v1/components/hsm/data/keys",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let item: serde_json::Value = serde_json::from_slice(&item).unwrap();
+        assert_eq!(item["id"], "keys", "{item}");
+        for (node, uri) in [
+            (false, "/v1/components/hsm/data/keys"),
+            (true, "/v1/components/hpc/subcomponents/hsm/data/keys"),
+        ] {
+            let (status, body) = get_raw(&backendless_server(Some(hsm.clone()), node), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                item,
+                "{uri}"
+            );
+        }
+    }
+
+    /// Without an hsm component, and for one whose inventory cannot be read,
+    /// the route answers with the server's standard error body.
+    #[tokio::test]
+    async fn the_v1_keys_route_answers_the_server_errors() {
+        let (status, body) = get_raw(
+            &backendless_server(None, false),
+            "/v1/components/hsm/data/keys",
+        )
+        .await;
+        let expected = error_answer(sovd_api::ApiError::from(
+            sovd_core::BackendError::ParameterNotFound("keys".to_string()),
+        ))
+        .await;
+        assert_eq!(expected.0, StatusCode::NOT_FOUND);
+        assert_eq!((status, serde_json::from_slice(&body).unwrap()), expected);
+
+        let broken: Arc<dyn Component> = Arc::new(BrokenHsm {
+            capabilities: Capabilities::default(),
+        });
+        let (status, body) = get_raw(
+            &backendless_server(Some(broken), false),
+            "/v1/components/hsm/data/keys",
+        )
+        .await;
+        let expected = error_answer(sovd_api::ApiError::Internal(format!(
+            "list keys error: {}",
+            MachineError::Internal(BROKEN_KEYSTORE.to_string())
+        )))
+        .await;
+        assert_eq!(expected.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!((status, serde_json::from_slice(&body).unwrap()), expected);
+    }
+
+    /// The route adds no component: the component listing is the one without it.
+    #[tokio::test]
+    async fn the_v1_keys_route_adds_no_component() {
+        let machine = machine_with_hsm(provisioned_hsm());
+        let without = served_by_sovdd(
+            hsm_router(machine.clone()),
+            false,
+            std::collections::HashMap::new(),
+            None,
+        );
+        let with = backendless_server(Some(provisioned_hsm()), false);
+        for uri in ["/v1/components", "/vehicle/v1/components"] {
+            let answer = get_raw(&with, uri).await;
+            assert_eq!(answer.0, StatusCode::OK, "{uri}");
+            assert_eq!(answer, get_raw(&without, uri).await, "{uri}");
+        }
     }
 
     /// An inventory that cannot be read is an error on `/v1` (SOVDd's standard

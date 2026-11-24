@@ -197,14 +197,9 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         let Some(component) = self.keys_component() else {
             return Ok(None);
         };
-        let inventory = match component.list_keys().await {
-            Ok(inventory) => inventory,
-            Err(machine_mgr::MachineError::NotSupported(_)) => return Ok(None),
-            Err(e) => return Err(BackendError::Internal(format!("list keys error: {e}"))),
-        };
-        let value = serde_json::to_value(crate::sovd::routes::HsmKeysResponse::from(inventory))
-            .expect("HsmKeysResponse is infallibly serializable");
-        Ok(Some(DataValue::new(id, KEYS_NAME, value)))
+        Ok(crate::sovd::routes::keys_value(component.as_ref())
+            .await?
+            .map(|value| DataValue::new(id, KEYS_NAME, value)))
     }
 
     /// SOVD §7.21 `GET /components/{id}/logs` — served only when the
