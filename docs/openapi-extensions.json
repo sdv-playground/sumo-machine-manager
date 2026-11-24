@@ -11,7 +11,7 @@
         "tags": [
           "x-extensions"
         ],
-        "summary": "`GET …/hsm/data/keys` — the key-slot inventory (public metadata only).",
+        "summary": "`GET …/hsm/data/keys` — the key-slot inventory (public metadata only).\nOn `/v1` it is the data item [`HsmKeysDataItem`]; on `/vehicle/v1` the\ninventory itself.",
         "operationId": "hsm_keys_list",
         "responses": {
           "200": {
@@ -927,6 +927,23 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "HsmKeysDataItem": {
+        "type": "object",
+        "description": "The `hsm/data/keys` inventory on the `/v1` tree: an ISO 17978-3 data item\n(`ReadValue`), whose `data` is the [`HsmKeysResponse`] the legacy tree\nserves bare.",
+        "required": [
+          "id",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/HsmKeysResponse"
+          },
+          "id": {
+            "type": "string",
+            "description": "The data resource's id: `keys`."
           }
         }
       },

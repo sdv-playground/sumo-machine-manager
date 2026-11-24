@@ -8,6 +8,16 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **On `/v1`, the HSM keys view is an ISO 17978-3 data item.** `GET /v1/components/hsm/data/keys`
+  (and the node form `/v1/components/<node>/subcomponents/hsm/data/keys`) served the inventory bare,
+  `{"provisioned", "items"}`, where a SOVD data resource answers a `ReadValue`, the value under
+  `data`. A client that reads the standard form (drive-twin reads `data.provisioned`) found no flag,
+  so it never saw the keystore installed. `/v1` now answers
+  `{"id": "keys", "data": {"provisioned", "items"}}`; the inventory itself is unchanged.
+  `/vehicle/v1` keeps the bare inventory for existing clients.
+
+  Host-facing: none. A client of `/v1/…/hsm/data/keys` that read `provisioned` or `items` at the top
+  level reads them under `data`.
 - **Bank activation pre-flights the boot-vector seal.** `activate` ran the bank's activator (the
   physical switch: a raw-partition write, a firmware load, record routing) and then sealed the boot
   vector; a seal that failed — a signer that is unavailable — left the new content physically in
