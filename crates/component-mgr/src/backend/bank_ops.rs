@@ -295,7 +295,11 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         };
         packages
             .get(&package_id)
-            .map(|p| p.validated.image_meta.to_firmware_identity())
+            .map(|p| FirmwareIdentity {
+                // Whole, and only when the manifest named one; not the F189 field.
+                release_version: p.validated.release_version.clone(),
+                ..p.validated.image_meta.to_firmware_identity()
+            })
             .unwrap_or_default()
     }
 
@@ -336,7 +340,31 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     /// `*self.running_bank`, the same bank whose identity overlay is built in
     /// `refresh_did_cache_locked`.
     pub(super) fn verified_bank_manifest(&self, bank: Bank) -> Option<Arc<InstalledFirmware>> {
-        // Fast path: return the cached firmware if it's for this bank.
+        match self.bank_manifest(bank) {
+            Ok(fw) => fw,
+            Err(e) => {
+                tracing::warn!(
+                    component = %self.entity_info.id,
+                    bank_set = ?self.bank_set,
+                    bank = ?bank,
+                    error = %e,
+                    "ivd-route: installed firmware unreadable or unverifiable; refusing to serve it",
+                );
+                None
+            }
+        }
+    }
+
+    /// The verified installed firmware of `bank`, telling apart "nothing
+    /// installed" (`Ok(None)`: the bank was never flashed, or this component has
+    /// no installed-firmware store) from a manifest that cannot be read or does
+    /// not verify (`Err`), which a caller reports as an error rather than as
+    /// absence. Memoised per bank like [`Self::verified_bank_manifest`].
+    pub(super) fn bank_manifest(
+        &self,
+        bank: Bank,
+    ) -> Result<Option<Arc<InstalledFirmware>>, machine_mgr::bank_provider::BankError> {
+        use machine_mgr::bank_provider::BankError;
         {
             let cache = self
                 .verified_manifest_cache
@@ -345,12 +373,10 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
             if let Some((cached_bank, fw)) = cache.as_ref() {
                 if *cached_bank == bank {
                     tracing::debug!(component = %self.entity_info.id, bank = ?bank, "ivd-route: cache hit -> serving");
-                    return Some(Arc::clone(fw));
+                    return Ok(Some(Arc::clone(fw)));
                 }
             }
         }
-
-        // Slow path: read + verify via the provider, then memoise for this bank.
         match self.bank_provider.read_installed(bank) {
             Ok(fw) => {
                 tracing::info!(component = %self.entity_info.id, bank = ?bank, "ivd-route: installed firmware OK -> serving + caching");
@@ -359,29 +385,21 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
                     .verified_manifest_cache
                     .lock()
                     .expect("verified_manifest_cache poisoned") = Some((bank, Arc::clone(&fw)));
-                Some(fw)
+                Ok(Some(fw))
             }
-            Err(machine_mgr::bank_provider::BankError::Unverifiable(msg)) => {
-                tracing::warn!(
-                    component = %self.entity_info.id,
-                    bank_set = ?self.bank_set,
-                    bank = ?bank,
-                    "ivd-route: installed firmware unverifiable ({msg}); refusing to serve it",
-                );
-                None
-            }
-            Err(e) => {
-                // NotInstalled / no images_dir / no HSM etc. — normal absence.
-                // INFO (not debug) so a fresh-device 404 on the manifest shows
-                // exactly which bank had no installed firmware and why.
+            // Normal absence: a bank never flashed, or a provider without an
+            // installed-firmware store. INFO, so a fresh device's 404 shows which
+            // bank had nothing installed.
+            Err(e @ (BankError::NotInstalled | BankError::Unsupported(_))) => {
                 tracing::info!(
                     component = %self.entity_info.id,
                     bank = ?bank,
                     error = %e,
-                    "ivd-route: no installed manifest for serving bank -> None",
+                    "ivd-route: no installed manifest for bank -> None",
                 );
-                None
+                Ok(None)
             }
+            Err(e) => Err(e),
         }
     }
 

@@ -74,7 +74,7 @@ pub use health::{GuestHealth, HealthProbe};
 pub(crate) use types::sink_error;
 pub use types::{
     ComponentConfig, LogSource, ATTEST_TIME_OP_ID, INSTALLED_MANIFEST_PARAM_ID,
-    UPDATE_MODE_PARAM_ID,
+    SW_VERSION_PARAM_ID, UPDATE_MODE_PARAM_ID,
 };
 
 use agents::*;

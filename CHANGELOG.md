@@ -30,6 +30,25 @@ what a consumer has to touch when it moves its pin.
 
   Host-facing: none. (`sovd_api::UpdatesConfig` and `AppState::with_updates_config` are gone; nothing
   here used them.)
+- **A banked component serves `sw-version`, on `/v1` only.** `GET /v1/components/<component>/data/sw-version`
+  answers the release version of the software in the bank the component serves (during a trial, the
+  bank in trial), in the `{"version", "items"}` shape of `ident_data`'s `sw-version`: what a client
+  that installed a release reads to verify it. The version is the manifest's SUIT text
+  component-version, recorded whole at install in the bank's signed identity (IVD identity key `10`,
+  `release_version`), so a label longer than the 32-byte F189 `fw_version` is not cut, and a manifest
+  that named no version is told apart without guessing from the `seq-N` fallback. 404 when nothing is
+  installed in the bank or its manifest named no version (neither is listed); an error (500) when the
+  manifest cannot be read. A bank sealed before this release has no `release_version` and answers 404
+  until it is installed again. The frozen `/vehicle/v1` tree neither lists nor serves it
+  (`DiagnosticBackend::v1_only_data`, SOVDd #41).
+
+  Host-facing: `FirmwareIdentity::release_version` and `ValidatedFirmware::release_version` are new
+  fields (`None` where no manifest named one); a host that builds either with a struct literal adds
+  it. The IVD manifest version is unchanged: the new identity key is optional, a manifest without it
+  encodes byte-identically to before, and a decoder that predates it ignores it. Needs a SOVDd release
+  with #41 (`v1_only_data`, and `/v1` reads as ISO 17978-3 `ReadValue`) and the pin moved to it.
+
+  Host-facing: none.
 - **On `/v1`, the HSM keys view is an ISO 17978-3 data item.** `GET /v1/components/hsm/data/keys`
   (and the node form `/v1/components/<node>/subcomponents/hsm/data/keys`) served the inventory bare,
   `{"provisioned", "items"}`, where a SOVD data resource answers a `ReadValue`, the value under

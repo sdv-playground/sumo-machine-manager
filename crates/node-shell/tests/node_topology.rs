@@ -317,7 +317,8 @@ async fn a_member_through_the_node_is_the_flat_member_without_one() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["value"]["version"], "PSW_1.10", "{body}");
+    // On `/v1` a data read is the ISO 17978-3 ReadValue, `{"id", "data"}` (SOVDd #41).
+    assert_eq!(body["data"]["version"], "PSW_1.10", "{body}");
 }
 
 #[tokio::test]
