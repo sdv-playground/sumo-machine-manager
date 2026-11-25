@@ -8,6 +8,14 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **A banked component's identity items are readable from start.** After a restart, the identity
+  data items of a banked component (`fw_version`, `system_name`, `programming_date`,
+  `tester_serial`, … — DIDs F187–F19E) were listed but answered 404 until the next install or
+  verdict: their values were read once at construction, through the default bank layout, before the
+  component's own bank dir and provider were set. Setting the bank spec or the bank provider now
+  re-reads them, so they answer from the bank's signed manifest from the start.
+
+  Host-facing: nothing to change.
 - **A banked component serves its release label as `swVersion`, on `/v1` only.**
   `GET /v1/components/<component>/data/swVersion` (and the node form
   `/v1/components/<node>/subcomponents/<component>/data/swVersion`) answers

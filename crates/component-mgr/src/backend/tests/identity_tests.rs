@@ -248,6 +248,95 @@ async fn read_data_identity_did_unavailable_before_sign() {
     cleanup(&images_dir, &keystore);
 }
 
+/// A second backend over `previous`'s NV, images dir and keystore, built the
+/// way the factory builds one at process start: the constructor (which reads
+/// its bank through the default `slot<N>` layout), then the real id and either
+/// the real bank spec or an explicit provider over the real dir. Running bank
+/// B, as NV records it. No NV write.
+fn restarted_backend(
+    previous: &ComponentBackend<MemBlockDevice>,
+    images_dir: &Path,
+    keystore: &Path,
+    inject_provider: bool,
+) -> ComponentBackend<MemBlockDevice> {
+    {
+        let mut nv = previous.nv.lock().unwrap();
+        let mut boot = nv.read_boot_state().unwrap();
+        boot.banks[slots::VM1.as_index()].active_bank = Bank::B;
+        nv.write_boot_state(&mut boot).unwrap();
+    }
+    let hsm: Arc<Mutex<dyn hsm::HsmProvider>> =
+        Arc::new(Mutex::new(SimHsm::new(keystore.to_path_buf())));
+    let backend = ComponentBackend::with_options(
+        slots::VM1,
+        previous.nv.clone(),
+        Arc::new(NoopManifest),
+        ComponentConfig::default(),
+        None,
+        Some(images_dir.to_path_buf()),
+        Some(hsm.clone()),
+    )
+    .with_id("vm1".into());
+    if inject_provider {
+        backend.with_bank_provider(Arc::new(IvdBankProvider::new(
+            previous.nv.clone(),
+            slots::VM1,
+            false,
+            Some(images_dir.to_path_buf()),
+            "vm1".into(),
+            Some(hsm),
+            None,
+            None,
+        )))
+    } else {
+        backend.with_bank_spec(crate::bank_spec::BankSetSpec {
+            dir_name: "vm1".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn identity_items_read_after_restart_without_an_nv_write() {
+    for inject_provider in [false, true] {
+        let tag = format!("restart-{inject_provider}");
+        let (previous, images_dir, keystore) = backend_with_package(&tag, sample_image_meta());
+        previous.ivd_sign_staged_bank(Bank::B).unwrap();
+
+        let backend = restarted_backend(&previous, &images_dir, &keystore, inject_provider);
+        for (param, expected) in [("fw_version", "1.2.0"), ("system_name", "VM1-Linux")] {
+            let vals = backend
+                .read_data(&[param.to_string()])
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{param} (provider injected: {inject_provider}): {e:?}")
+                });
+            assert_eq!(vals[0].value, serde_json::json!(expected), "{param}");
+        }
+
+        cleanup(&images_dir, &keystore);
+    }
+}
+
+#[tokio::test]
+async fn identity_items_unknown_after_restart_when_nothing_is_installed() {
+    for inject_provider in [false, true] {
+        let tag = format!("restart-none-{inject_provider}");
+        let (previous, images_dir, keystore) = backend_with_package(&tag, sample_image_meta());
+
+        let backend = restarted_backend(&previous, &images_dir, &keystore, inject_provider);
+        let err = backend
+            .read_data(&["fw_version".to_string()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BackendError::ParameterNotFound(_)),
+            "expected ParameterNotFound, got {err:?}"
+        );
+
+        cleanup(&images_dir, &keystore);
+    }
+}
+
 #[test]
 fn tampered_manifest_identity_is_reported_report_only() {
     // Report-only diagnostic read: the identity DIDs come from the on-disk
