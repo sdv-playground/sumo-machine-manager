@@ -937,8 +937,8 @@ fn verify_bank_inner(
         // hash of this one. This is the bank's ONE hash pass: `collect_files`
         // above no longer re-hashes for the on-disk path scan. On-device
         // (S32G3, 20-layout, hw SHA via +sha2): read-then-hash at 4 MiB ran at
-        // ~122 MB/s (6.5 s for vm1's 886 MB). Overlapped at 64 KiB it runs at
-        // the eMMC's ~220 MB/s; see HASH_BLOCK_SIZE_DEFAULT.
+        // ~122 MB/s (6.5 s for vm1's 886 MB). Overlapped it runs at ~195 MB/s
+        // and holds up under competing eMMC I/O; see HASH_BLOCK_SIZE_DEFAULT.
         let file_start = std::time::Instant::now();
         let (actual, size) = match sha256_file(&path, block) {
             Ok(r) => r,
@@ -1095,16 +1095,18 @@ const SHA2_HW_COMPILED: bool = cfg!(all(target_arch = "aarch64", target_feature 
 #[cfg(feature = "crypto")]
 static SHA_SELF_TEST: std::sync::Once = std::sync::Once::new();
 
-/// Default block size for streaming the file hash: 64 KiB. Measured on the
+/// Default block size for streaming the file hash: 4 MiB. Measured on the
 /// S32G3 20-layout rig (616 MB `traton-one-pf` on the qnx6 common-rw, cold
-/// io-blk cache), pipelined: 64 KiB 2.8 s (~220 MB/s, the same as `dd` and the
-/// QNX `sha256sum` on that file, i.e. the eMMC), 128 KiB-4 MiB ~3.2 s. Larger
-/// reads lose the filesystem's readahead. The whole file is never held in RAM.
+/// io-blk cache), pipelined, quiet eMMC: 4 MiB ~195 MB/s, 64 KiB ~175 MB/s.
+/// With a competing reader on the same eMMC (the case at boot, when the next
+/// bank is verified while the previous guest boots) small blocks collapse:
+/// 4 MiB 177 / 121 MB/s vs 64 KiB 63 / 28 MB/s (competitor at 64 KiB / 4 MiB).
+/// The whole file is never held in RAM.
 /// Override via `SUMO_IVD_HASH_BLOCK` (bytes) for tuning.
-const HASH_BLOCK_SIZE_DEFAULT: usize = 64 * 1024;
+const HASH_BLOCK_SIZE_DEFAULT: usize = 4 * 1024 * 1024;
 
 /// Effective hash block size — `SUMO_IVD_HASH_BLOCK` (bytes, >= 4096) or the
-/// 64 KiB default. The streaming hash produces the same digest at any block size;
+/// 4 MiB default. The streaming hash produces the same digest at any block size;
 /// this only trades I/O efficiency.
 fn hash_block_size() -> usize {
     std::env::var("SUMO_IVD_HASH_BLOCK")
@@ -1131,8 +1133,8 @@ fn hash_pipelined() -> bool {
 /// A file larger than one block is read on a second thread while the calling
 /// thread hashes the previous block ([`sha256_file_pipelined`]), so the time is
 /// that of the slower of the two instead of their sum. On the S32G3 the file
-/// read and the hash (~370 MB/s) used to add up: 4.8 s for the 616 MB
-/// `traton-one-pf` read-then-hash at 4 MiB, 2.8 s pipelined at 64 KiB.
+/// read and the hash (~370 MB/s) used to add up: ~4.8 s for the 616 MB
+/// `traton-one-pf` read-then-hash at 4 MiB, ~3.2 s pipelined at 4 MiB.
 #[cfg(feature = "crypto")]
 fn sha256_file(path: &Path, block_size: usize) -> std::io::Result<(Vec<u8>, u64)> {
     let file = fs::File::open(path)?;
