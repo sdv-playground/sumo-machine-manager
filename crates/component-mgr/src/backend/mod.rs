@@ -599,6 +599,9 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         // precedes `with_bank_activator` in the builder order, so no activator is
         // stored yet (`self.bank_activator` is still `None`).
         self.rebuild_bank_provider();
+        // The construction-time DID cache read the identity through the old
+        // dir; re-read it through this one.
+        self.refresh_did_cache();
         self
     }
 
@@ -659,6 +662,9 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     pub fn with_bank_provider(mut self, provider: Arc<dyn BankProvider>) -> Self {
         self.bank_provider = provider;
         self.bank_provider_override = true;
+        // The DID cache holds the identity the replaced provider read; re-read
+        // it through this one.
+        self.refresh_did_cache();
         self
     }
 
@@ -695,6 +701,14 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
         self
     }
 
+    /// Re-read the DID cache under the NV lock, as `with_options` does at
+    /// construction. For the builders that change where the bank provider
+    /// reads the installed identity from.
+    fn refresh_did_cache(&self) {
+        let nv_guard = self.nv.lock().unwrap();
+        self.refresh_did_cache_locked(&nv_guard);
+    }
+
     fn next_id(&self) -> String {
         let mut id = self.next_id.lock().unwrap();
         let v = *id;
@@ -719,6 +733,7 @@ impl<D: BlockDevice + Send + 'static> ComponentBackend<D> {
     ///
     /// Called from:
     /// - `with_options` (one-shot at startup)
+    /// - `with_bank_spec` / `with_bank_provider` (the bank is read elsewhere)
     /// - automatic `NvWriteGuard::drop` after every NV write
     /// - factory_reset (full re-population)
     fn refresh_did_cache_locked(&self, nv: &NvStore<D>) {
