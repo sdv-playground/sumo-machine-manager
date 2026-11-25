@@ -8,6 +8,19 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **The IVD bank verify reads the next block while it hashes the current one.** `hsm::ivd` hashed
+  each bank file read-then-hash in 4 MiB blocks, so the file read and the SHA-256 added up; on the
+  S32G3 20-layout rig the 616 MB `traton-one-pf` took 4.8 s (~127 MB/s). A file larger than one
+  block is now read on a second thread with two buffers, and the default block is 64 KiB (larger
+  reads lose the qnx6 readahead): 2.8 s (~220 MB/s), the same as `dd` or the QNX `sha256sum` on that
+  file. The verify is still the complete, blocking check over the same bytes with the same digest;
+  only its duration changes. `SUMO_IVD_HASH_PIPELINE=0` restores the one-thread loop for an A/B,
+  `SUMO_IVD_HASH_BLOCK` still overrides the block size. The once-per-process `sha256 self-test` line
+  now carries `sha2_hw` (whether the binary was built with `-C target-feature=+sha2`, which on QNX
+  alone decides whether the ARMv8 SHA instructions are used), warns when it is off on aarch64, and
+  its reference numbers are the A53's (~370 MB/s hardware, ~80 MB/s portable) instead of
+  "1-2 GB/s". Consumers change nothing.
+
 - **On `/v1`, sumo's data items are read through SOVDd.** The HSM key inventory and the node's update
   state were answered on `/v1` by routes of sumo's own; SOVDd now serves them as data items in the
   ISO 17978-3 `ReadValue` form (`{"id", "data"}`), listed in their data collections.

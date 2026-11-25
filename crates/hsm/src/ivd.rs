@@ -933,13 +933,12 @@ fn verify_bank_inner(
 
         // Stream the file through SHA-256 in `block`-byte chunks — identical
         // digest to hashing the whole file at once, but constant memory + large
-        // sequential reads. This is the bank's ONE hash pass: `collect_files`
+        // sequential reads, with the read of the next block overlapping the
+        // hash of this one. This is the bank's ONE hash pass: `collect_files`
         // above no longer re-hashes for the on-disk path scan. On-device
-        // (S32G3, fresh 593 MB rootfs, cold cache): ~5 s / ~127 MB/s with the
-        // hardware SHA backend (read-bound — build.sh's +sha2 + the hsm sha2
-        // `asm` feature), or ~11 s on pure-software SHA. Both beat the ~22 s
-        // when the rootfs was hashed twice and ~28 s for the old whole-file
-        // `fs::read` + 593 MB allocation.
+        // (S32G3, 20-layout, hw SHA via +sha2): read-then-hash at 4 MiB ran at
+        // ~122 MB/s (6.5 s for vm1's 886 MB). Overlapped at 64 KiB it runs at
+        // the eMMC's ~220 MB/s; see HASH_BLOCK_SIZE_DEFAULT.
         let file_start = std::time::Instant::now();
         let (actual, size) = match sha256_file(&path, block) {
             Ok(r) => r,
@@ -1053,12 +1052,15 @@ pub fn read_manifest_unverified(bank_dir: &Path) -> Result<VerifiedManifest, Ivd
 
 /// One-shot in-memory SHA-256 throughput probe — hashes a fixed 64 MiB buffer
 /// with NO file I/O, isolating the SHA implementation's raw speed from storage.
-/// Logged once per process via [`SHA_SELF_TEST`]. This is how we tell whether
-/// the hardware SHA path engaged: a build with `-C target-feature=+sha2` on an
-/// ARMv8 core that has the crypto extension runs ~1-2 GB/s; the pure-software
-/// fallback is ~150-300 MB/s. (A +sha2 build on a core WITHOUT the extension
-/// faults with an illegal instruction long before this, so reaching here at
-/// software speed means +sha2 did not actually select the hardware backend.)
+/// Logged once per process via [`SHA_SELF_TEST`], together with `sha2_hw`: whether
+/// this binary was compiled with the ARMv8 SHA-2 instructions enabled.
+///
+/// On aarch64 `sha2` picks its backend through `cpufeatures`, which has NO
+/// runtime detection on QNX/NTO: the hardware path is taken only when the build
+/// passes `-C target-feature=+sha2`, and a build without it silently runs the
+/// portable code. On the S32G3's Cortex-A53 @ 1.3 GHz the hardware path measures
+/// ~370 MB/s; the portable code is expected around 80 MB/s (in-order core,
+/// ~15 cycles/byte). Faster cores (x86 dev hosts, A7x) are higher on both.
 #[cfg(feature = "crypto")]
 fn sha256_self_test() {
     use sha2::{Digest, Sha256};
@@ -1070,24 +1072,39 @@ fn sha256_self_test() {
         mib = 64,
         ms,
         mb_per_s = (buf.len() as u64 * 1000) / (ms * 1024 * 1024),
+        sha2_hw = SHA2_HW_COMPILED,
         digest0 = digest[0], // touch the result so the hash isn't optimized away
-        "sha256 self-test (in-memory): ~150-300 MB/s software, ~1-2 GB/s hw (+sha2)",
+        "sha256 self-test (in-memory): S32G3 A53 ~370 MB/s hw (+sha2), ~80 MB/s software",
     );
+    #[cfg(target_arch = "aarch64")]
+    if !SHA2_HW_COMPILED {
+        tracing::warn!(
+            "sha256: built WITHOUT -C target-feature=+sha2 — on QNX this is the \
+             portable SHA-256, several times slower than the ARMv8 instructions",
+        );
+    }
 }
+
+/// Whether the ARMv8 SHA-2 instructions are compiled in. On aarch64 targets
+/// without runtime detection (QNX) this is exactly whether `sha2` uses them;
+/// elsewhere `cpufeatures` may still pick them at runtime.
+#[cfg(feature = "crypto")]
+const SHA2_HW_COMPILED: bool = cfg!(all(target_arch = "aarch64", target_feature = "sha2"));
 
 /// Ensures [`sha256_self_test`] logs exactly once per process.
 #[cfg(feature = "crypto")]
 static SHA_SELF_TEST: std::sync::Once = std::sync::Once::new();
 
-/// Default block size for streaming the file hash: 4 MiB. Big enough that
-/// read() syscall + readahead overhead is negligible, and the whole file is
-/// never loaded into RAM at once (a 646 MB rootfs would otherwise be one giant
-/// `fs::read` Vec on an embedded box — the real cost of the slow verify).
+/// Default block size for streaming the file hash: 64 KiB. Measured on the
+/// S32G3 20-layout rig (616 MB `traton-one-pf` on the qnx6 common-rw, cold
+/// io-blk cache), pipelined: 64 KiB 2.8 s (~220 MB/s, the same as `dd` and the
+/// QNX `sha256sum` on that file, i.e. the eMMC), 128 KiB-4 MiB ~3.2 s. Larger
+/// reads lose the filesystem's readahead. The whole file is never held in RAM.
 /// Override via `SUMO_IVD_HASH_BLOCK` (bytes) for tuning.
-const HASH_BLOCK_SIZE_DEFAULT: usize = 4 * 1024 * 1024;
+const HASH_BLOCK_SIZE_DEFAULT: usize = 64 * 1024;
 
 /// Effective hash block size — `SUMO_IVD_HASH_BLOCK` (bytes, >= 4096) or the
-/// 4 MiB default. The streaming hash produces the same digest at any block size;
+/// 64 KiB default. The streaming hash produces the same digest at any block size;
 /// this only trades I/O efficiency.
 fn hash_block_size() -> usize {
     std::env::var("SUMO_IVD_HASH_BLOCK")
@@ -1097,23 +1114,45 @@ fn hash_block_size() -> usize {
         .unwrap_or(HASH_BLOCK_SIZE_DEFAULT)
 }
 
+/// Whether large files are hashed with read and hash overlapped (the default).
+/// `SUMO_IVD_HASH_PIPELINE=0` selects the one-thread read-then-hash loop, for an
+/// A/B on the rig. Both produce the same digest over the same bytes; this only
+/// changes how long the (blocking) verify takes.
+fn hash_pipelined() -> bool {
+    std::env::var("SUMO_IVD_HASH_PIPELINE").map_or(true, |v| v != "0")
+}
+
 /// SHA-256 a file by STREAMING it through the hasher in `block_size` chunks,
 /// returning `(sha256, byte_count)`. Feeding the same hasher block-by-block
 /// yields the IDENTICAL digest to hashing the whole file at once (SHA-256 is a
-/// running hash over the byte sequence) — but with constant memory (no
-/// whole-file Vec) and large sequential reads. Much faster for big banks on
-/// slow/embedded storage, where the old `fs::read` of the whole file
-/// (allocate + grow + read) dominates.
+/// running hash over the byte sequence), with constant memory and large
+/// sequential reads.
+///
+/// A file larger than one block is read on a second thread while the calling
+/// thread hashes the previous block ([`sha256_file_pipelined`]), so the time is
+/// that of the slower of the two instead of their sum. On the S32G3 the file
+/// read and the hash (~370 MB/s) used to add up: 4.8 s for the 616 MB
+/// `traton-one-pf` read-then-hash at 4 MiB, 2.8 s pipelined at 64 KiB.
 #[cfg(feature = "crypto")]
 fn sha256_file(path: &Path, block_size: usize) -> std::io::Result<(Vec<u8>, u64)> {
+    let file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > block_size as u64 && hash_pipelined() {
+        sha256_file_pipelined(file, block_size)
+    } else {
+        sha256_file_serial(file, block_size)
+    }
+}
+
+/// Read, then hash, block by block on the calling thread.
+#[cfg(feature = "crypto")]
+fn sha256_file_serial(mut file: fs::File, block_size: usize) -> std::io::Result<(Vec<u8>, u64)> {
     use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; block_size];
     let mut total: u64 = 0;
     loop {
-        let n = file.read(&mut buf)?;
+        let n = read_block(&mut file, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -1121,6 +1160,85 @@ fn sha256_file(path: &Path, block_size: usize) -> std::io::Result<(Vec<u8>, u64)
         total += n as u64;
     }
     Ok((hasher.finalize().to_vec(), total))
+}
+
+/// Buffers in flight in [`sha256_file_pipelined`]: one being hashed, one being
+/// read. More doesn't help while the read is the slower side (it is on eMMC).
+#[cfg(feature = "crypto")]
+const HASH_PIPELINE_BUFFERS: usize = 2;
+
+/// Double-buffered streaming hash: a scoped reader thread fills blocks in file
+/// order and hands them over a channel; this thread hashes them in the order
+/// received and hands each buffer back for reuse. The hasher sees exactly the
+/// byte sequence `sha256_file_serial` sees, so the digest is the same. The
+/// first read error is returned and ends both sides; nothing outlives the call.
+#[cfg(feature = "crypto")]
+fn sha256_file_pipelined(mut file: fs::File, block_size: usize) -> std::io::Result<(Vec<u8>, u64)> {
+    use sha2::{Digest, Sha256};
+    use std::sync::mpsc::sync_channel;
+
+    std::thread::scope(|s| {
+        let (full_tx, full_rx) =
+            sync_channel::<std::io::Result<(Vec<u8>, usize)>>(HASH_PIPELINE_BUFFERS);
+        let (free_tx, free_rx) = sync_channel::<Vec<u8>>(HASH_PIPELINE_BUFFERS);
+        for _ in 0..HASH_PIPELINE_BUFFERS {
+            free_tx
+                .send(vec![0u8; block_size])
+                .expect("free channel has room for every buffer");
+        }
+
+        std::thread::Builder::new()
+            .name("ivd-hash-read".into())
+            .spawn_scoped(s, move || {
+                // Ends when the hasher hangs up (free_rx closed), at EOF or on
+                // the first error. Dropping full_tx ends the hasher's loop.
+                while let Ok(mut buf) = free_rx.recv() {
+                    match read_block(&mut file, &mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if full_tx.send(Ok((buf, n))).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = full_tx.send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            })?;
+
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        for block in full_rx.iter() {
+            // On an error return, free_tx and full_rx drop here, which unblocks
+            // the reader before the scope joins it.
+            let (buf, n) = block?;
+            hasher.update(&buf[..n]);
+            total += n as u64;
+            // Cannot block: at most HASH_PIPELINE_BUFFERS buffers exist. Err
+            // only means the reader already finished.
+            let _ = free_tx.send(buf);
+        }
+        Ok((hasher.finalize().to_vec(), total))
+    })
+}
+
+/// Fill `buf` from `file`, returning the bytes read: `buf.len()` except at EOF
+/// (fewer, 0 at EOF). Retries `Interrupted`; short reads are just continued.
+#[cfg(feature = "crypto")]
+fn read_block(file: &mut fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
 }
 
 #[cfg(not(feature = "crypto"))]
@@ -1201,6 +1319,91 @@ mod tests {
         let (digest, size) = sha256_file(&empty, 4096).unwrap();
         assert_eq!(digest, sha256(&[]));
         assert_eq!(size, 0);
+    }
+
+    /// The double-buffered and the one-thread hash agree with the whole-file
+    /// digest on the same file, at block sizes giving a partial last block, an
+    /// exact fit, one block larger than the file, and on the empty file.
+    /// `sha256_file` takes the pipelined path only above one block; this calls
+    /// both directly.
+    #[test]
+    fn pipelined_and_serial_hash_agree() {
+        let dir = temp_bank("hash-pipeline");
+        let path = dir.join("blob.bin");
+        // 3 MiB + 5: several blocks at 64 KiB / 1 MiB, a partial last one.
+        let data: Vec<u8> = (0..(3 * 1024 * 1024 + 5u32))
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        write(&path, &data);
+        let reference = sha256(&data);
+
+        let open = || std::fs::File::open(&path).unwrap();
+        for block in [4096usize, 65536, 1 << 20, data.len(), 8 << 20] {
+            let (d, n) = sha256_file_pipelined(open(), block).unwrap();
+            assert_eq!(d, reference, "pipelined digest at block_size={block}");
+            assert_eq!(n, data.len() as u64);
+            let (d, n) = sha256_file_serial(open(), block).unwrap();
+            assert_eq!(d, reference, "serial digest at block_size={block}");
+            assert_eq!(n, data.len() as u64);
+        }
+
+        let empty = dir.join("empty.bin");
+        write(&empty, &[]);
+        let f = std::fs::File::open(&empty).unwrap();
+        assert_eq!(sha256_file_pipelined(f, 4096).unwrap(), (sha256(&[]), 0));
+    }
+
+    /// A read error comes back from the pipelined hash as an error, not as a
+    /// digest over a truncated stream: read() on a directory fails.
+    #[cfg(unix)]
+    #[test]
+    fn pipelined_hash_returns_read_error() {
+        let dir = temp_bank("hash-pipeline-err");
+        let f = std::fs::File::open(&dir).unwrap();
+        assert!(sha256_file_pipelined(f, 4096).is_err());
+    }
+
+    /// Throughput of the one-thread vs the double-buffered file hash at several
+    /// block sizes. Not pass/fail: on a dev box the page cache makes the read
+    /// side nearly free. On the target, point it at a real bank image (larger
+    /// than the block cache, so each pass reads the eMMC):
+    /// `SUMO_IVD_BENCH_FILE=/mnt/common-rw/vm1/bank_b/traton-one-pf <test-bin> --ignored --nocapture hash_throughput`.
+    #[test]
+    #[ignore]
+    fn hash_throughput() {
+        let path = match std::env::var_os("SUMO_IVD_BENCH_FILE") {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let p = temp_bank("hash-throughput").join("big.bin");
+                write(&p, &vec![0x5Au8; 256 << 20]);
+                p
+            }
+        };
+        let buf = vec![0u8; 64 << 20];
+        let mem = std::time::Instant::now();
+        let _ = sha256(&buf);
+        let mem_ms = mem.elapsed().as_millis().max(1);
+        println!(
+            "in-memory sha256: {} MB/s (sha2_hw={SHA2_HW_COMPILED})",
+            (64u128 << 20) * 1000 / mem_ms / 1_000_000
+        );
+        type HashFn = fn(fs::File, usize) -> std::io::Result<(Vec<u8>, u64)>;
+        let modes: [(&str, HashFn); 2] = [
+            ("serial", sha256_file_serial),
+            ("pipelined", sha256_file_pipelined),
+        ];
+        for block in [32 << 10, 64 << 10, 128 << 10, 256 << 10, 1 << 20, 4 << 20] {
+            for (name, f) in modes {
+                let t = std::time::Instant::now();
+                let (_, n) = f(fs::File::open(&path).unwrap(), block).unwrap();
+                let ms = t.elapsed().as_millis().max(1);
+                println!(
+                    "{name:>9} block={:>5}K: {n} B in {ms} ms = {} MB/s",
+                    block >> 10,
+                    n as u128 * 1000 / ms / 1_000_000
+                );
+            }
+        }
     }
 
     #[test]
