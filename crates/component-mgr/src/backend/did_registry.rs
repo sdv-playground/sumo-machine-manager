@@ -290,6 +290,18 @@ pub(super) fn identity_to_did_bytes(identity: &FirmwareIdentity) -> Vec<(u16, Ve
         .collect()
 }
 
+/// The release version of the software in `fw`: the version its manifest named
+/// (SUIT text component-version), recorded whole in the signed identity at
+/// install. `None` when the manifest named none, and for a bank sealed before
+/// the identity carried it: nothing is derived from the F189 `version`, which is
+/// cut to 32 bytes and holds a `seq-N` fallback when no version was named.
+pub(super) fn release_version(fw: &InstalledFirmware) -> Option<&str> {
+    fw.identity
+        .release_version
+        .as_deref()
+        .filter(|v| !v.is_empty())
+}
+
 /// Render the installed firmware as the `x-ota-installed-manifest` JSON
 /// body: the signed identity + per-file `(path, sha256-hex)` inventory + the
 /// base64 of the raw signature and manifest bytes (so a SW-mapping tool can

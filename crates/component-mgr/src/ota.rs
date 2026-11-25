@@ -111,6 +111,8 @@ impl ImageMeta {
             system_name,
             programming_date: opt(&self.programming_date),
             tester_serial: opt(&self.tester_serial),
+            // Not an NV field: the validated package carries it (see `current_install_identity`).
+            release_version: None,
         }
     }
 
@@ -131,6 +133,7 @@ impl ImageMeta {
             system_name,
             programming_date: fixed_field_to_string(&self.programming_date),
             tester_serial: fixed_field_to_string(&self.tester_serial),
+            release_version: None,
         }
     }
 }

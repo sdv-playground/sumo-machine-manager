@@ -274,6 +274,7 @@ pub async fn process_envelope_stream(
         image_meta: validated.image_meta,
         image_data: Vec::new(),
         version_display: validated.version_display,
+        release_version: validated.release_version,
         image_sha256: Some(last_image_hash),
         image_size: Some(last_image_size as u64),
         raw_envelope: None,

@@ -376,6 +376,7 @@ mod tests {
                 image_meta: ImageMeta::default(),
                 image_data: Vec::new(),
                 version_display: "1.0.0".into(),
+                release_version: None,
                 image_sha256: None,
                 image_size: None,
                 raw_envelope: None,

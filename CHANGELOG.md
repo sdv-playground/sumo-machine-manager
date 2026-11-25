@@ -8,6 +8,32 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **A banked component serves its release label as `swVersion`, on `/v1` only.**
+  `GET /v1/components/<component>/data/swVersion` (and the node form
+  `/v1/components/<node>/subcomponents/<component>/data/swVersion`) answers
+  `{"id": "swVersion", "data": "<label>"}`: the release label of the software in the bank the
+  component serves (during a trial, the bank in trial), as its manifest's SUIT text
+  component-version named it, a string, verbatim. It is listed in `GET /v1/components/<component>/data`
+  (category `identData`); a client that installed a release reads it to verify the installation. The
+  label is recorded whole at install in the bank's signed identity (IVD identity key `10`), so a label
+  longer than the 32-byte F189 `fw_version` is not cut, and no text of it is interpreted. Not listed,
+  and answered as an unknown item, when nothing is installed in the bank or its manifest named no
+  version (so a bank sealed before this release, until it is installed again); listed, and its read a
+  server error (500), when the manifest cannot be read. It is a `/v1`-only item of the component's
+  backend (`list_v1_parameters` / `read_v1_data`, beside `keys`): `/vehicle/v1` is unchanged, its
+  data listing, `data-categories` and reads included (`…/data/swVersion` stays 404).
+  `x-ota-installed-manifest` keeps its members; the signed manifest inside it (`manifest_b64`) carries
+  key `10` for banks installed from now on. ISO 17978-3 defines no id for the item and uses
+  `swVersion` as its example id; `ident_data`'s `sw-version` is a different item and is unchanged
+  ("Version items: names not final" in `docs/sovd-vs-extensions.md`).
+
+  Host-facing: new public fields `machine_contract::bank_provider::FirmwareIdentity::release_version`,
+  `component_mgr::manifest_provider::ValidatedFirmware::release_version` and
+  `hsm::ivd::IvdIdentity::release_version` (all `Option<String>`, `None` where no manifest named a
+  version); a host that builds one with a struct literal adds it. New constant
+  `component_mgr::backend::SW_VERSION_PARAM_ID` (`"swVersion"`). The IVD manifest version is
+  unchanged: the identity key is optional, a manifest without it encodes byte-identically to before,
+  and a decoder that predates it ignores it.
 - **On `/v1`, sumo's data items are read through SOVDd.** The HSM key inventory and the node's update
   state were answered on `/v1` by routes of sumo's own; SOVDd now serves them as data items in the
   ISO 17978-3 `ReadValue` form (`{"id", "data"}`), listed in their data collections.

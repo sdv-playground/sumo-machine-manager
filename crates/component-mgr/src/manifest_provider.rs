@@ -31,6 +31,11 @@ pub struct ValidatedFirmware {
     pub image_meta: ImageMeta,
     pub image_data: Vec<u8>,
     pub version_display: String,
+    /// The release version the manifest names (SUIT text component-version),
+    /// whole; `None` when it names none. Unlike [`Self::version_display`] it has
+    /// no `seq-N` fallback, so it says whether a version was named at all. Sealed
+    /// into the bank's signed identity at install; `swVersion` serves it.
+    pub release_version: Option<String>,
     /// Pre-computed image SHA-256 (set by streaming path where image is written to disk directly).
     pub image_sha256: Option<[u8; 32]>,
     /// Image size in bytes (set by streaming path).
@@ -219,6 +224,7 @@ mod tests {
                 image_meta: ImageMeta::default(),
                 image_data: Vec::new(),
                 version_display: "1.0.0".into(),
+                release_version: None,
                 image_sha256: None,
                 image_size: None,
                 raw_envelope: None,

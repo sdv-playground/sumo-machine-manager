@@ -49,6 +49,8 @@
 //!   7: tstr,           ; system_name      (UDS F197 — kept distinct from name)
 //!   8: tstr,           ; programming_date (UDS F199)
 //!   9: tstr,           ; tester_serial    (UDS F198)
+//!   ? 10: tstr,        ; release_version: the manifest's SUIT text
+//!                      ;   component-version, whole; absent when it named none
 //! }
 //! ```
 //!
@@ -173,9 +175,10 @@ pub struct IvdManifest {
 ///
 /// Readable CBOR text strings; the consumer (`component_mgr::did`) pads /
 /// truncates each to the historical UDS DID field width on read. Every
-/// field is `String` (CBOR `tstr`) — empty string means "not provided"
+/// UDS field is `String` (CBOR `tstr`) — empty string means "not provided"
 /// and reads back as an all-NUL DID value, matching the prior
-/// zero-initialised NV behaviour.
+/// zero-initialised NV behaviour. `release_version` is no UDS field: optional,
+/// absent when not provided.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IvdIdentity {
     /// Human/product name (was sourced from SUIT model/vendor text).
@@ -208,6 +211,16 @@ pub struct IvdIdentity {
     /// Tester serial — UDS F198 (`tester_serial`).
     #[serde(rename = "9")]
     pub tester_serial: String,
+    /// The release version the installed manifest names: its SUIT text
+    /// component-version, recorded whole at install (no UDS field width, unlike
+    /// [`Self::version`], which F189 cuts to 32 bytes and fills with a
+    /// `seq-N` fallback when the manifest names none). `None` when the manifest
+    /// named no version. What a client that installed a release compares
+    /// against (`swVersion`). Optional key: `IVD_MANIFEST_VERSION` is unchanged,
+    /// a manifest without it encodes byte-identically to before, and a decoder
+    /// that predates it ignores it.
+    #[serde(rename = "10", default, skip_serializing_if = "Option::is_none")]
+    pub release_version: Option<String>,
 }
 
 /// One file in the bank inventory.
@@ -1167,6 +1180,7 @@ mod tests {
             system_name: "VM1-Linux".into(),
             programming_date: "20260604".into(),
             tester_serial: "SOVD-OTA".into(),
+            release_version: Some("1.2.0-rc.1+build.7".into()),
         }
     }
 
@@ -1650,6 +1664,103 @@ mod tests {
         let back = decode_manifest(&encode_manifest(&m).unwrap()).unwrap();
         assert_eq!(back.install_boot_id.as_deref(), Some("boot-a"));
         assert_eq!(back.ivd_version, IVD_MANIFEST_VERSION);
+    }
+
+    /// The identity as encoded before `release_version` existed: keys 0..9, no
+    /// key "10". Deserialize too, to stand for a decoder that predates it.
+    #[derive(Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct IdentityWithoutReleaseVersion {
+        #[serde(rename = "0")]
+        name: String,
+        #[serde(rename = "1")]
+        version: String,
+        #[serde(rename = "2")]
+        ecu_sw_number: String,
+        #[serde(rename = "3")]
+        supplier_sw_number: String,
+        #[serde(rename = "4")]
+        supplier_sw_version: String,
+        #[serde(rename = "5")]
+        spare_part_number: String,
+        #[serde(rename = "6")]
+        odx_file_id: String,
+        #[serde(rename = "7")]
+        system_name: String,
+        #[serde(rename = "8")]
+        programming_date: String,
+        #[serde(rename = "9")]
+        tester_serial: String,
+    }
+
+    fn identity_without_release_version() -> IdentityWithoutReleaseVersion {
+        let id = sample_identity();
+        IdentityWithoutReleaseVersion {
+            name: id.name,
+            version: id.version,
+            ecu_sw_number: id.ecu_sw_number,
+            supplier_sw_number: id.supplier_sw_number,
+            supplier_sw_version: id.supplier_sw_version,
+            spare_part_number: id.spare_part_number,
+            odx_file_id: id.odx_file_id,
+            system_name: id.system_name,
+            programming_date: id.programming_date,
+            tester_serial: id.tester_serial,
+        }
+    }
+
+    #[test]
+    fn identity_without_release_version_decodes_as_none_and_encodes_unchanged() {
+        let mut old_bytes = Vec::new();
+        ciborium::into_writer(&identity_without_release_version(), &mut old_bytes).unwrap();
+
+        let back: IvdIdentity = ciborium::from_reader(old_bytes.as_slice()).unwrap();
+        assert_eq!(back.release_version, None);
+        assert_eq!(back.version, "1.2.0");
+        let mut again = Vec::new();
+        ciborium::into_writer(&back, &mut again).unwrap();
+        assert_eq!(again, old_bytes);
+    }
+
+    #[test]
+    fn identity_release_version_roundtrips_whole_and_an_older_decoder_ignores_it() {
+        let m = build_manifest_from_files(Vec::new(), 4, sample_identity());
+        let bytes = encode_manifest(&m).unwrap();
+        let back = decode_manifest(&bytes).unwrap();
+        assert_eq!(
+            back.identity.release_version.as_deref(),
+            Some("1.2.0-rc.1+build.7")
+        );
+
+        let mut id_bytes = Vec::new();
+        ciborium::into_writer(&m.identity, &mut id_bytes).unwrap();
+        let older: IdentityWithoutReleaseVersion =
+            ciborium::from_reader(id_bytes.as_slice()).unwrap();
+        assert_eq!(older, identity_without_release_version());
+    }
+
+    /// The decoder ignores an identity key it does not know, as a decoder that
+    /// predates key 10 ignores key 10.
+    #[test]
+    fn manifest_with_an_unknown_identity_key_decodes() {
+        let m = build_manifest_from_files(Vec::new(), 4, sample_identity());
+        let mut value: ciborium::Value =
+            ciborium::from_reader(encode_manifest(&m).unwrap().as_slice()).unwrap();
+        let identity = value
+            .as_map_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|(k, _)| k.as_text() == Some("5"))
+            .map(|(_, v)| v)
+            .unwrap();
+        identity
+            .as_map_mut()
+            .unwrap()
+            .push(("11".into(), "unknown".into()));
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&value, &mut bytes).unwrap();
+
+        let back = decode_manifest(&bytes).unwrap();
+        assert_eq!(back.identity, m.identity);
     }
 
     /// The manifest as encoded before `update_id` existed: keys 0..6, no key

@@ -164,42 +164,68 @@ impl<D: BlockDevice + Send + 'static> DiagnosticBackend for ComponentBackend<D> 
         Ok(params)
     }
 
-    /// The key-slot inventory `keys`, listed while its component lists keys
-    /// at all; one it cannot read now is still listed, and its read fails.
+    /// The `/v1`-only data items. The key-slot inventory `keys`, listed while
+    /// its component lists keys at all; `swVersion`, listed while the serving
+    /// bank's manifest names a release version. One that cannot be read now is
+    /// still listed, and its read fails.
     async fn list_v1_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {
-        let Some(component) = self.keys_component() else {
-            return Ok(Vec::new());
-        };
-        if let Err(machine_mgr::MachineError::NotSupported(_)) = component.list_keys().await {
-            return Ok(Vec::new());
+        let mut params = Vec::new();
+        if let Some(component) = self.keys_component() {
+            if !matches!(
+                component.list_keys().await,
+                Err(machine_mgr::MachineError::NotSupported(_))
+            ) {
+                params.push(ParameterInfo {
+                    id: KEYS_PARAM_ID.to_string(),
+                    name: KEYS_NAME.to_string(),
+                    description: None,
+                    unit: None,
+                    data_type: Some("object".to_string()),
+                    read_only: true,
+                    // The server builds the href of a `/v1`-only item.
+                    href: String::new(),
+                    did: None,
+                    category: Some(DataCategory::IdentData),
+                });
+            }
         }
-        Ok(vec![ParameterInfo {
-            id: KEYS_PARAM_ID.to_string(),
-            name: KEYS_NAME.to_string(),
-            description: None,
-            unit: None,
-            data_type: Some("object".to_string()),
-            read_only: true,
-            // The server builds the href of a `/v1`-only item.
-            href: String::new(),
-            did: None,
-            category: Some(DataCategory::IdentData),
-        }])
+        if !matches!(self.serving_release_version(), Ok(None)) {
+            params.push(ParameterInfo {
+                id: SW_VERSION_PARAM_ID.to_string(),
+                name: SW_VERSION_NAME.to_string(),
+                description: None,
+                unit: None,
+                data_type: Some("string".to_string()),
+                read_only: true,
+                href: String::new(),
+                did: None,
+                category: Some(DataCategory::IdentData),
+            });
+        }
+        Ok(params)
     }
 
-    /// The key-slot inventory, as the frozen tree's own route serves it. Not
-    /// an item while no component lists keys; an inventory that cannot be
-    /// read is an error, never an empty one.
+    /// A `/v1`-only data item. The key-slot inventory, as the frozen tree's
+    /// own route serves it: not an item while no component lists keys; an
+    /// inventory that cannot be read is an error, never an empty one. The
+    /// release label `swVersion`, verbatim: not an item while the serving bank
+    /// has nothing installed or its manifest names none; a manifest that cannot
+    /// be read is an error.
     async fn read_v1_data(&self, id: &str) -> BackendResult<Option<DataValue>> {
-        if id != KEYS_PARAM_ID {
-            return Ok(None);
+        match id {
+            KEYS_PARAM_ID => {
+                let Some(component) = self.keys_component() else {
+                    return Ok(None);
+                };
+                Ok(crate::sovd::routes::keys_value(component.as_ref())
+                    .await?
+                    .map(|value| DataValue::new(id, KEYS_NAME, value)))
+            }
+            SW_VERSION_PARAM_ID => Ok(self
+                .serving_release_version()?
+                .map(|label| DataValue::new(id, SW_VERSION_NAME, label.into()))),
+            _ => Ok(None),
         }
-        let Some(component) = self.keys_component() else {
-            return Ok(None);
-        };
-        Ok(crate::sovd::routes::keys_value(component.as_ref())
-            .await?
-            .map(|value| DataValue::new(id, KEYS_NAME, value)))
     }
 
     /// SOVD §7.21 `GET /components/{id}/logs` — served only when the

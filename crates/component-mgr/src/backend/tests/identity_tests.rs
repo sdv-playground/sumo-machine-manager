@@ -85,6 +85,16 @@ fn backend_with_package(
     tag: &str,
     meta: ImageMeta,
 ) -> (ComponentBackend<MemBlockDevice>, PathBuf, PathBuf) {
+    backend_with_release(tag, meta, None)
+}
+
+/// [`backend_with_package`] whose package's manifest named `release_version`
+/// (its SUIT text component-version), as `SuitProvider` records it.
+fn backend_with_release(
+    tag: &str,
+    meta: ImageMeta,
+    release_version: Option<&str>,
+) -> (ComponentBackend<MemBlockDevice>, PathBuf, PathBuf) {
     let images_dir = std::env::temp_dir().join(format!("component-mgr-identity-img-{tag}"));
     let _ = std::fs::remove_dir_all(&images_dir);
     std::fs::create_dir_all(&images_dir).unwrap();
@@ -128,6 +138,7 @@ fn backend_with_package(
                 image_meta: meta,
                 image_data: Vec::new(),
                 version_display: "1.2.0".into(),
+                release_version: release_version.map(str::to_string),
                 image_sha256: Some([0xAB; 32]),
                 image_size: Some(16),
                 raw_envelope: None,
@@ -467,6 +478,315 @@ async fn installed_manifest_param_absent_and_404_without_manifest() {
         "expected EntityNotFound (404), got {err:?}"
     );
     assert_eq!(err.status_code(), 404);
+
+    cleanup(&images_dir, &keystore);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// swVersion: the release label of the bank a component serves, `/v1` only
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A 53-byte release label: longer than the 32-byte F189 field.
+const LONG_LABEL: &str = "chore-release-verification-machine-manager-1a2b3c4d5e";
+
+/// A backend serving bank B, sealed with a package whose manifest named
+/// `release_version`.
+fn sealed_backend(
+    tag: &str,
+    release_version: Option<&str>,
+) -> (ComponentBackend<MemBlockDevice>, PathBuf, PathBuf) {
+    let (backend, images_dir, keystore) =
+        backend_with_release(tag, sample_image_meta(), release_version);
+    *backend.running_bank.lock().unwrap() = Bank::B;
+    backend.ivd_sign_staged_bank(Bank::B).unwrap();
+    (backend, images_dir, keystore)
+}
+
+/// Replace the serving bank's signed manifest with bytes that do not decode.
+fn corrupt_manifest(backend: &ComponentBackend<MemBlockDevice>, images_dir: &Path) {
+    let manifest = images_dir
+        .join("vm1")
+        .join("bank_b")
+        .join(hsm::ivd::IVD_MANIFEST_FILE);
+    std::fs::write(&manifest, b"not a manifest").unwrap();
+    backend.verified_manifest_cache.lock().unwrap().take();
+}
+
+/// The backend, as component `vm1`, behind the server's own router, as a node
+/// manager serves it.
+fn served(backend: ComponentBackend<MemBlockDevice>) -> axum::Router {
+    sovd_api::create_router(sovd_api::AppState::new(backends_of(backend)))
+}
+
+fn backends_of(
+    backend: ComponentBackend<MemBlockDevice>,
+) -> std::collections::HashMap<String, Arc<dyn sovd_core::DiagnosticBackend>> {
+    std::collections::HashMap::from([(
+        "vm1".to_string(),
+        Arc::new(backend.with_id("vm1".to_string())) as Arc<dyn sovd_core::DiagnosticBackend>,
+    )])
+}
+
+/// Status and body bytes of `GET uri`.
+async fn get_raw(router: &axum::Router, uri: &str) -> (u16, Vec<u8>) {
+    use tower::ServiceExt;
+    let resp = router
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    (status, bytes.to_vec())
+}
+
+async fn get(router: &axum::Router, uri: &str) -> (u16, serde_json::Value) {
+    let (status, bytes) = get_raw(router, uri).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// How often `id` is listed in a data listing.
+fn listed(listing: &serde_json::Value, id: &str) -> usize {
+    listing["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|i| i["id"] == id)
+        .count()
+}
+
+#[tokio::test]
+async fn sw_version_is_listed_once_and_read_whole_on_v1() {
+    assert_eq!(LONG_LABEL.len(), 53);
+    let (backend, images_dir, keystore) = sealed_backend("swverlong", Some(LONG_LABEL));
+
+    let params = backend.list_v1_parameters().await.unwrap();
+    let p = params
+        .iter()
+        .find(|p| p.id == SW_VERSION_PARAM_ID)
+        .expect("listed when the manifest names a release version");
+    assert_eq!(p.name, "Software version");
+    assert_eq!(p.description, None);
+    assert_eq!(p.data_type.as_deref(), Some("string"));
+    assert!(p.read_only);
+    assert_eq!(p.href, "");
+    assert!(p.did.is_none());
+    assert_eq!(p.category, Some(DataCategory::IdentData));
+
+    let router = served(backend);
+    let (status, list) = get(&router, "/v1/components/vm1/data").await;
+    assert_eq!(status, 200, "{list}");
+    assert_eq!(listed(&list, SW_VERSION_PARAM_ID), 1, "{list}");
+
+    let (status, read) = get(&router, "/v1/components/vm1/data/swVersion").await;
+    assert_eq!(status, 200, "{read}");
+    assert_eq!(
+        read,
+        serde_json::json!({ "id": "swVersion", "data": LONG_LABEL })
+    );
+
+    cleanup(&images_dir, &keystore);
+}
+
+#[tokio::test]
+async fn sw_version_serves_a_label_starting_with_seq() {
+    // A label is opaque: one that starts with `seq-` is served like any other.
+    let (backend, images_dir, keystore) = sealed_backend("swverseqlabel", Some("seq-7-hotfix"));
+    let router = served(backend);
+
+    let (status, read) = get(&router, "/v1/components/vm1/data/swVersion").await;
+    assert_eq!(status, 200, "{read}");
+    assert_eq!(
+        read,
+        serde_json::json!({ "id": "swVersion", "data": "seq-7-hotfix" })
+    );
+
+    cleanup(&images_dir, &keystore);
+}
+
+#[tokio::test]
+async fn sw_version_without_a_release_version_is_an_unknown_item_on_v1() {
+    // F189 holds the sequence-number fallback, as SuitProvider writes it when
+    // the manifest names no version: nothing is derived from it.
+    let mut meta = sample_image_meta();
+    meta.fw_version = [0; 32];
+    meta.fw_version[..6].copy_from_slice(b"seq-42");
+    let (named_none, images_dir, keystore) = backend_with_release("swvernone", meta, None);
+    *named_none.running_bank.lock().unwrap() = Bank::B;
+    named_none.ivd_sign_staged_bank(Bank::B).unwrap();
+    // Nothing installed in the serving bank.
+    let (empty, empty_images, empty_keystore) =
+        backend_with_release("swverempty", sample_image_meta(), Some("1.2.0"));
+    *empty.running_bank.lock().unwrap() = Bank::B;
+
+    for backend in [named_none, empty] {
+        assert_eq!(
+            backend
+                .read_v1_data(SW_VERSION_PARAM_ID)
+                .await
+                .unwrap()
+                .map(|v| v.value),
+            None
+        );
+        let router = served(backend);
+        let (status, list) = get(&router, "/v1/components/vm1/data").await;
+        assert_eq!(status, 200, "{list}");
+        assert_eq!(listed(&list, SW_VERSION_PARAM_ID), 0, "{list}");
+
+        // The answer to an id the component does not have.
+        let (status, mut read) = get(&router, "/v1/components/vm1/data/swVersion").await;
+        let (unknown_status, mut unknown) =
+            get(&router, "/v1/components/vm1/data/no-such-item").await;
+        assert_eq!(status, 404, "{read}");
+        assert_eq!(status, unknown_status);
+        read.as_object_mut().unwrap().remove("message");
+        unknown.as_object_mut().unwrap().remove("message");
+        assert_eq!(read, unknown);
+    }
+
+    cleanup(&images_dir, &keystore);
+    cleanup(&empty_images, &empty_keystore);
+}
+
+#[tokio::test]
+async fn sw_version_of_an_unreadable_manifest_is_listed_and_a_server_error_on_v1() {
+    let (backend, images_dir, keystore) = sealed_backend("swvercorrupt", Some("1.2.0"));
+    corrupt_manifest(&backend, &images_dir);
+    let router = served(backend);
+
+    // Listed, like `keys` that cannot be read now: list and read agree that
+    // the item exists, and the read reports the error.
+    let (status, list) = get(&router, "/v1/components/vm1/data").await;
+    assert_eq!(status, 200, "{list}");
+    assert_eq!(listed(&list, SW_VERSION_PARAM_ID), 1, "{list}");
+
+    let (status, read) = get(&router, "/v1/components/vm1/data/swVersion").await;
+    assert_eq!(status, 500, "{read}");
+    assert_eq!(read["error_code"], "sovd-server-failure", "{read}");
+    assert!(
+        read["message"].as_str().unwrap().contains("cannot be read"),
+        "{read}"
+    );
+
+    cleanup(&images_dir, &keystore);
+}
+
+#[tokio::test]
+async fn sw_version_through_the_node_form_is_the_flat_read() {
+    let (backend, images_dir, keystore) = sealed_backend("swvernode", Some(LONG_LABEL));
+    let state = sovd_api::AppState::new(backends_of(backend));
+    let flat = sovd_api::create_router(state.clone());
+    let state = state
+        .with_node(sovd_api::NodeTopology::new("hpc", "Node"))
+        .unwrap();
+    let node = sovd_api::with_node_topology(sovd_api::create_router(state.clone()), &state);
+
+    let (status, read) = get(&node, "/v1/components/hpc/subcomponents/vm1/data/swVersion").await;
+    assert_eq!(status, 200, "{read}");
+    assert_eq!(
+        (status, read),
+        get(&flat, "/v1/components/vm1/data/swVersion").await
+    );
+
+    cleanup(&images_dir, &keystore);
+}
+
+#[tokio::test]
+async fn the_frozen_tree_answers_the_same_with_and_without_a_release_version() {
+    let (with, with_images, with_keystore) = sealed_backend("swverlegacywith", Some(LONG_LABEL));
+    let (without, without_images, without_keystore) = sealed_backend("swverlegacywithout", None);
+    let (with, without) = (served(with), served(without));
+
+    for path in [
+        "data",
+        "data-categories",
+        "data/swVersion",
+        "data/sw-version",
+    ] {
+        let uri = format!("/vehicle/v1/components/vm1/{path}");
+        let (with_answer, without_answer) =
+            (get_raw(&with, &uri).await, get_raw(&without, &uri).await);
+        assert!(
+            with_answer == without_answer,
+            "{uri}: {} {} != {} {}",
+            with_answer.0,
+            String::from_utf8_lossy(&with_answer.1),
+            without_answer.0,
+            String::from_utf8_lossy(&without_answer.1),
+        );
+    }
+    // The frozen tree neither lists nor serves it: an id this component does
+    // not have.
+    let (status, list) = get(&with, "/vehicle/v1/components/vm1/data").await;
+    assert_eq!(status, 200, "{list}");
+    assert_eq!(listed(&list, SW_VERSION_PARAM_ID), 0, "{list}");
+    let (status, read) = get(&with, "/vehicle/v1/components/vm1/data/swVersion").await;
+    assert_eq!(status, 404, "{read}");
+
+    cleanup(&with_images, &with_keystore);
+    cleanup(&without_images, &without_keystore);
+}
+
+#[tokio::test]
+async fn the_installed_manifest_keeps_its_members_and_signs_the_release_version() {
+    let (backend, images_dir, keystore) = sealed_backend("swvermanifest", Some(LONG_LABEL));
+    let v = backend
+        .read_data(&[INSTALLED_MANIFEST_PARAM_ID.to_string()])
+        .await
+        .unwrap()
+        .remove(0)
+        .value;
+
+    let keys = |o: &serde_json::Value| -> Vec<String> {
+        let mut k: Vec<String> = o.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    };
+    assert_eq!(
+        keys(&v),
+        [
+            "files",
+            "gen",
+            "identity",
+            "ivd_version",
+            "manifest_b64",
+            "signature_b64",
+            "signed_at_unix"
+        ]
+    );
+    assert_eq!(
+        keys(&v["identity"]),
+        [
+            "ecu_sw_number",
+            "name",
+            "odx_file_id",
+            "programming_date",
+            "spare_part_number",
+            "supplier_sw_number",
+            "supplier_sw_version",
+            "system_name",
+            "tester_serial",
+            "version"
+        ]
+    );
+    // The signed manifest inside it carries the label (identity key 10).
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(v["manifest_b64"].as_str().unwrap())
+        .unwrap();
+    let m = hsm::ivd::decode_manifest(&bytes).unwrap();
+    assert_eq!(m.identity.release_version.as_deref(), Some(LONG_LABEL));
 
     cleanup(&images_dir, &keystore);
 }
