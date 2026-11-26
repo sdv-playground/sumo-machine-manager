@@ -131,6 +131,13 @@ license = "Apache-2.0"
 # per-target strip via `rustc -Cstrip=symbols`. Mirrors guest-vm-sdk and
 # the host machine manager (which also strip their release builds).
 strip = "symbols"
+# Size over speed for every build (LYNXION-9655): -O3 / opt-level 3 is not a
+# production setting here; on the S32G3 A53s a smaller hot code set can also
+# be the faster one. The host machine manager went 13.61 -> 10.43 MB (QNX).
+opt-level = "s"
+
+[profile.dev]
+opt-level = "s"
 
 # QNX (nto) cross-compile patch. vhsm-ssd's cross-node mTLS listener pulls in
 # rustls → ring, whose `SystemRandom` only implements `SecureRandom` on nto with

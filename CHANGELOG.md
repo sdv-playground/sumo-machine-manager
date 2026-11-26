@@ -8,6 +8,16 @@ what a consumer has to touch when it moves its pin.
 
 ## Unreleased
 
+- **Every build optimizes for size (`opt-level = "s"`), release and dev.** The workspace
+  `[profile.release]` keeps `strip = "symbols"` and gains `opt-level = "s"`; `[profile.dev]` gets
+  `opt-level = "s"` too. Binaries installed from this repository with `cargo install` (vhsm-ssd,
+  hsm-sim-backend, slog2-drainer in the QNX host bank) come out ~11 % smaller (QNX release: vhsm-ssd
+  3.28 -> 2.87 MB, hsm-sim-service 2.40 -> 2.13 MB, slog2-drainer 0.42 -> 0.39 MB). -O3 / opt-level 3 is not
+  used as a production setting: on the S32G3 A53s the smaller hot code set can also be the faster
+  one. The SHA-256 in the IVD verify drops ~15 % in memory (~378 -> ~320 MB/s), but the file verify
+  stays eMMC-bound (~197 MB/s at both levels, rig .20). A consumer's own profile still decides for
+  the crates it builds (supernova sets the same). Consumers change nothing.
+
 - **A banked component's identity items are readable from start.** After a restart, the identity
   data items of a banked component (`fw_version`, `system_name`, `programming_date`,
   `tester_serial`, … — DIDs F187–F19E) were listed but answered 404 until the next install or
