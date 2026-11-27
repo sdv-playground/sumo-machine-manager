@@ -10,7 +10,7 @@ what a consumer has to touch when it moves its pin.
 
 - **The IVD bank verify reads the next block while it hashes the current one.** `hsm::ivd` hashed
   each bank file read-then-hash in 4 MiB blocks, so the file read and the SHA-256 added up; on the
-  S32G3 20-layout rig the 616 MB `traton-one-pf` took ~4.8 s (~127 MB/s). A file larger than one
+  S32G3 20-layout rig the 616 MB platform VM image took ~4.8 s (~127 MB/s). A file larger than one
   block is now read on a second thread with two buffers, still in 4 MiB blocks: ~3.2 s (~195 MB/s)
   on a quiet eMMC, and 177 / 121 MB/s with a competing reader on the same eMMC (smaller blocks
   collapse there: 64 KiB gave 63 / 28 MB/s). The verify is still the complete, blocking check over

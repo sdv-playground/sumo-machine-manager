@@ -1096,7 +1096,7 @@ const SHA2_HW_COMPILED: bool = cfg!(all(target_arch = "aarch64", target_feature 
 static SHA_SELF_TEST: std::sync::Once = std::sync::Once::new();
 
 /// Default block size for streaming the file hash: 4 MiB. Measured on the
-/// S32G3 20-layout rig (616 MB `traton-one-pf` on the qnx6 common-rw, cold
+/// S32G3 20-layout rig (616 MB platform VM image on the qnx6 common-rw, cold
 /// io-blk cache), pipelined, quiet eMMC: 4 MiB ~195 MB/s, 64 KiB ~175 MB/s.
 /// With a competing reader on the same eMMC (the case at boot, when the next
 /// bank is verified while the previous guest boots) small blocks collapse:
@@ -1134,7 +1134,7 @@ fn hash_pipelined() -> bool {
 /// thread hashes the previous block ([`sha256_file_pipelined`]), so the time is
 /// that of the slower of the two instead of their sum. On the S32G3 the file
 /// read and the hash (~370 MB/s) used to add up: ~4.8 s for the 616 MB
-/// `traton-one-pf` read-then-hash at 4 MiB, ~3.2 s pipelined at 4 MiB.
+/// platform image read-then-hash at 4 MiB, ~3.2 s pipelined at 4 MiB.
 #[cfg(feature = "crypto")]
 fn sha256_file(path: &Path, block_size: usize) -> std::io::Result<(Vec<u8>, u64)> {
     let file = fs::File::open(path)?;
@@ -1369,7 +1369,7 @@ mod tests {
     /// block sizes. Not pass/fail: on a dev box the page cache makes the read
     /// side nearly free. On the target, point it at a real bank image (larger
     /// than the block cache, so each pass reads the eMMC):
-    /// `SUMO_IVD_BENCH_FILE=/mnt/common-rw/vm1/bank_b/traton-one-pf <test-bin> --ignored --nocapture hash_throughput`.
+    /// `SUMO_IVD_BENCH_FILE=/mnt/common-rw/vm1/bank_b/<image> <test-bin> --ignored --nocapture hash_throughput`.
     #[test]
     #[ignore]
     fn hash_throughput() {
