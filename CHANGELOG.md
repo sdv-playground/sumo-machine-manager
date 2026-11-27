@@ -16,7 +16,7 @@ what a consumer has to touch when it moves its pin.
   used as a production setting: on the S32G3 A53s the smaller hot code set can also be the faster
   one. The SHA-256 in the IVD verify drops ~15 % in memory (~378 -> ~320 MB/s), but the file verify
   stays eMMC-bound (~197 MB/s at both levels, rig .20). A consumer's own profile still decides for
-  the crates it builds (supernova sets the same). Consumers change nothing.
+  the crates it builds (the host machine manager sets the same). Consumers change nothing.
 
 - **A banked component's identity items are readable from start.** After a restart, the identity
   data items of a banked component (`fw_version`, `system_name`, `programming_date`,
